@@ -12,6 +12,23 @@
     <UseWinUI>true</UseWinUI>
     <WinUISDKReferences>false</WinUISDKReferences>
     <EnableMsixTooling>true</EnableMsixTooling>
+
+    <!--
+      This app ships UNPACKAGED, through an Inno Setup installer, so both of
+      these are required and neither is set by the template.
+
+      Without WindowsPackageType=None the generated auto-initializer takes the
+      Deployment Manager path, which activates WinRT classes that only a
+      packaged (MSIX) install registers. The app then dies at startup before
+      any of our code runs, with REGDB_E_CLASSNOTREG out of
+      DeploymentManagerAutoInitializer. WindowsAppSDKSelfContained bundles the
+      WinAppSDK runtime next to the exe so no framework package is needed.
+
+      This crashed only the packaged/published build, never a dev F5 run, so
+      the app must be launched from its INSTALLED location to prove it works.
+    -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
