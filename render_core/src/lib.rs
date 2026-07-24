@@ -1932,13 +1932,12 @@ mod tests {
 
     #[test]
     fn saving_twice_does_not_burn_the_same_annotation_twice() {
-        // Models exactly what ViewportViewModel.SaveDocumentAs does: burn into
-        // the in-memory document, save, then reload from the CLEAN original on
-        // disk while keeping the annotation list. Save again and the second
-        // file must be identical in object count to the first. Reloading from
-        // the file just written instead would stack a second copy of every
-        // mark on top of the first, which is the bug this ordering exists to
-        // prevent.
+        // Guards the core burn invariant: flattening the same input onto a
+        // freshly opened document twice yields the same object count both
+        // times, so nothing stacks. The C# save path achieves this by
+        // reopening the saved file with its overlay list cleared, so a second
+        // save finds nothing to burn; this test covers the underlying
+        // property regardless of which reopen source that path chooses.
         let src = "tests/fixtures/sample_20pages.pdf";
         let rects = [BurnRect {
             page_index: 0,

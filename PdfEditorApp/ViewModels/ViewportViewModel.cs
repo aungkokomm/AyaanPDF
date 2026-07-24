@@ -323,19 +323,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         bool saved = RenderCoreNative.save_document(_documentHandle, path) == RenderStatus.OkPdfium;
 
-        if (burned)
+        if (burned && saved)
         {
-            // Reload so the in-memory document is clean again. Prefer the
-            // file we just wrote when the original is gone, so the reload
-            // cannot fail outright; the annotation lists are cleared in that
-            // case because they are already part of the page content.
-            string reloadFrom = _currentDocumentPath is not null && File.Exists(_currentDocumentPath)
-                ? _currentDocumentPath
-                : path;
-            bool reloadedFromSaved = reloadFrom == path;
-
+            // Reopen the file we just wrote, with the overlay lists cleared.
+            //
+            // The saved file already contains the burned marks AND any page
+            // rotations/deletes, so reopening it is both the clean slate that
+            // stops the next save from burning the same marks twice and the
+            // only reload source that keeps the page operations. Reloading the
+            // ORIGINAL instead would silently drop every rotate/delete, since
+            // those live only in the in-memory document, not on the original
+            // on disk. After a Save As the working document becomes the new
+            // file, matching how editors retitle to the saved path.
             int page = CurrentPageIndex;
-            OpenDocument(reloadFrom, preserveAnnotations: !reloadedFromSaved);
+            OpenDocument(path, preserveAnnotations: false);
             GoToPage(Math.Min(page, Math.Max(0, PageCount - 1)));
         }
 
