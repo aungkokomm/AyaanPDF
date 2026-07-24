@@ -81,7 +81,7 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void FitToWidth(bool animate = false)
     {
-        double available = PageScroller.ViewportWidth - ViewportHost.Padding.Left - ViewportHost.Padding.Right;
+        double available = AvailableContentWidth;
         if (available <= 0)
         {
             return;
@@ -100,20 +100,51 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// The slot stack was rebuilt for a new document: fit it to the width.
-    /// Layout has to run first or the ScrollView's extent still reflects the
-    /// previous document.
+    /// True while the viewport should keep tracking fit-width, i.e. the user
+    /// has not taken the zoom over.
+    ///
+    /// This is what fixes the startup thrash. The ScrollView reports a zero
+    /// viewport width and then grows as layout settles, so a one-shot fit
+    /// either runs too early (fitting an intermediate width and leaving the
+    /// page too small) or runs repeatedly with a different zoom each time.
+    /// Staying in fit mode means the zoom simply follows the window until the
+    /// user changes it; the debounced sharpening pass and its stale-result
+    /// check then collapse all those intermediate zooms into a single
+    /// rasterization at the final size. It also makes resizing behave the way
+    /// a document viewer should.
     /// </summary>
-    private void OnLayoutRebuilt() =>
+    private bool _autoFit = true;
+
+    private void OnLayoutRebuilt()
+    {
+        _autoFit = true;
         DispatcherQueue.TryEnqueue(() =>
         {
             FitToWidth();
             PushVisibleWindow();
         });
+    }
+
+    /// <summary>Available content width in DIPs, excluding the canvas padding.</summary>
+    private double AvailableContentWidth =>
+        PageScroller.ViewportWidth - ViewportHost.Padding.Left - ViewportHost.Padding.Right;
 
     private void PageScroller_ViewChanged(ScrollView sender, object args)
     {
         UpdateZoomReadout();
+
+        // A zoom that no longer matches fit-width means the user took over,
+        // by pinch, Ctrl+wheel or a zoom command. Detecting it from the state
+        // rather than from each input path means no gesture can be forgotten.
+        if (_autoFit && AvailableContentWidth > 0)
+        {
+            double fit = ViewModel.FitWidthZoom(AvailableContentWidth);
+            if (Math.Abs(PageScroller.ZoomFactor - fit) > 0.005)
+            {
+                _autoFit = false;
+            }
+        }
+
         PushVisibleWindow();
     }
 
@@ -137,6 +168,12 @@ public sealed partial class MainPage : Page
         }
 
         ViewModel.SetViewportSize(PageScroller.ViewportWidth, PageScroller.ViewportHeight);
+
+        if (_autoFit)
+        {
+            FitToWidth();
+        }
+
         UpdateZoomReadout();
         PushVisibleWindow();
     }
@@ -251,7 +288,12 @@ public sealed partial class MainPage : Page
 
     private void ZoomIn_Click(object sender, RoutedEventArgs e) => ZoomByFactor(ZoomStep);
     private void ZoomOut_Click(object sender, RoutedEventArgs e) => ZoomByFactor(1f / ZoomStep);
-    private void ResetZoom_Click(object sender, RoutedEventArgs e) => FitToWidth(animate: true);
+    /// <summary>Fit Width also re-arms fit tracking, so resizing keeps it fitted.</summary>
+    private void ResetZoom_Click(object sender, RoutedEventArgs e)
+    {
+        _autoFit = true;
+        FitToWidth(animate: true);
+    }
 
     /// <summary>
     /// Animated zoom about the viewport centre. ScrollView runs the animation

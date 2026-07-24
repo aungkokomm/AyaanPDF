@@ -174,7 +174,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public ViewportViewModel()
     {
         _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
-        OpenDocument(Path.Combine(AppContext.BaseDirectory, "sample.pdf"));
+
+        // Deliberately does NOT open a document. It used to load the bundled
+        // sample here, which meant every launch opened, laid out, fitted and
+        // rasterized a document the user never asked for, and then did the
+        // whole thing again the moment they opened their own file. The app
+        // starts on an empty canvas instead.
     }
 
     /// <summary>Re-opens the bundled sample document (the "Re-render" button).</summary>
@@ -767,6 +772,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var raw = await Task.Run(() => PageRenderer.RenderUncachedRaw(handle, pageIndex, targetWidth));
 
         if (handle != _documentHandle)
+        {
+            slot.EndSharpen();
+            return;
+        }
+
+        // Drop a result the zoom has already moved past. A sharp render of a
+        // large page takes long enough that a zoom gesture can finish while it
+        // is in flight, and applying it would show a bitmap at the wrong
+        // resolution until the next pass replaced it.
+        double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
+        int wantedNow = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
+        if (_budget.ShouldResharpen(targetWidth, wantedNow))
         {
             slot.EndSharpen();
             return;
