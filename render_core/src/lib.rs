@@ -103,6 +103,22 @@ static PDFIUM: OnceLock<Option<Pdfium>> = OnceLock::new();
 /// provide that serialization (see the module docs above).
 static CALL_LOCK: Mutex<()> = Mutex::new(());
 
+/// Locks a mutex, recovering from poisoning instead of panicking.
+///
+/// `Mutex::lock().unwrap()` panics forever once any thread has panicked while
+/// holding that lock. The FFI entry points wrap their work in
+/// `catch_unwind`, so a single panic does not kill the host app -- but with
+/// plain `unwrap()` it would leave every shared map permanently poisoned, and
+/// every later call would panic on acquisition. That turns one recoverable
+/// failure into a dead render core for the rest of the process's life.
+///
+/// Everything behind these locks is a plain map or cache with no invariant a
+/// half-finished mutation could break, so taking the data back with
+/// `into_inner()` is safe and strictly better than refusing to work.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Binds PDFium once (relative to the host executable's directory — see
 /// module docs on why cwd can't be trusted) and reuses that single instance
 /// for the process's lifetime. `None` means PDFium isn't available; callers
@@ -165,7 +181,7 @@ fn cache_put(key: TileKey, tile: CachedTile) {
         return;
     }
 
-    let mut cache = core().cache.lock().unwrap();
+    let mut cache = lock(&core().cache);
     cache.put(key, tile);
 
     let mut total: usize = cache.iter().map(|(_, t)| t.bytes.len()).sum();
@@ -246,7 +262,7 @@ fn open_document_inner(path: *const c_char) -> u64 {
     };
 
     let document = {
-        let _guard = CALL_LOCK.lock().unwrap();
+        let _guard = lock(&CALL_LOCK);
         let Some(pdfium) = pdfium() else {
             return 0;
         };
@@ -258,7 +274,7 @@ fn open_document_inner(path: *const c_char) -> u64 {
 
     let core = core();
     let id = core.next_doc_id.fetch_add(1, Ordering::Relaxed);
-    core.documents.lock().unwrap().insert(id, Arc::new(Mutex::new(document)));
+    lock(&core.documents).insert(id, Arc::new(Mutex::new(document)));
     id
 }
 
@@ -275,13 +291,13 @@ pub extern "C" fn close_document(doc_handle: u64) {
     // the last reference) — hold CALL_LOCK across that, same as any other
     // native-touching call.
     {
-        let _guard = CALL_LOCK.lock().unwrap();
-        let removed = core.documents.lock().unwrap().remove(&doc_handle);
+        let _guard = lock(&CALL_LOCK);
+        let removed = lock(&core.documents).remove(&doc_handle);
         drop(removed);
     }
 
     {
-        let mut cache = core.cache.lock().unwrap();
+        let mut cache = lock(&core.cache);
         let stale_keys: Vec<TileKey> =
             cache.iter().filter(|(k, _)| k.doc == doc_handle).map(|(k, _)| *k).collect();
         for key in stale_keys {
@@ -289,15 +305,15 @@ pub extern "C" fn close_document(doc_handle: u64) {
         }
     }
 
-    core.generations.lock().unwrap().retain(|(doc, _), _| *doc != doc_handle);
+    lock(&core.generations).retain(|(doc, _), _| *doc != doc_handle);
 }
 
 /// Returns the page count for a handle, or -1 if the handle is unknown.
 #[unsafe(no_mangle)]
 pub extern "C" fn get_page_count(doc_handle: u64) -> i32 {
-    let _guard = CALL_LOCK.lock().unwrap();
-    match core().documents.lock().unwrap().get(&doc_handle) {
-        Some(doc) => doc.lock().unwrap().pages().len() as i32,
+    let _guard = lock(&CALL_LOCK);
+    match lock(&core().documents).get(&doc_handle) {
+        Some(doc) => lock(&doc).pages().len() as i32,
         None => -1,
     }
 }
@@ -325,8 +341,8 @@ pub extern "C" fn rotate_page(doc_handle: u64, page_index: i32, degrees: i32) ->
 fn rotate_page_inner(doc_handle: u64, page_index: i32, degrees: i32) -> i32 {
     use pdfium_render::prelude::PdfPageRenderRotation;
 
-    let _guard = CALL_LOCK.lock().unwrap();
-    let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
     };
@@ -339,7 +355,7 @@ fn rotate_page_inner(doc_handle: u64, page_index: i32, degrees: i32) -> i32 {
         _ => PdfPageRenderRotation::Degrees270,
     };
 
-    let doc_guard = doc.lock().unwrap();
+    let doc_guard = lock(&doc);
     let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
         return STATUS_INVALID_INPUT;
     };
@@ -364,13 +380,13 @@ pub extern "C" fn delete_page(doc_handle: u64, page_index: i32) -> i32 {
 }
 
 fn delete_page_inner(doc_handle: u64, page_index: i32) -> i32 {
-    let _guard = CALL_LOCK.lock().unwrap();
-    let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
     };
 
-    let doc_guard = doc.lock().unwrap();
+    let doc_guard = lock(&doc);
     let Ok(page) = doc_guard.pages().get(page_index as u16) else {
         return STATUS_INVALID_INPUT;
     };
@@ -381,7 +397,7 @@ fn delete_page_inner(doc_handle: u64, page_index: i32) -> i32 {
     drop(doc);
 
     evict_all_cache_for_doc(doc_handle);
-    core().generations.lock().unwrap().retain(|(d, _), _| *d != doc_handle);
+    lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
     STATUS_OK_PDFIUM
 }
 
@@ -400,21 +416,253 @@ fn save_document_inner(doc_handle: u64, path: *const c_char) -> i32 {
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = CALL_LOCK.lock().unwrap();
-    let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
     };
 
-    let doc_guard = doc.lock().unwrap();
+    let doc_guard = lock(&doc);
     match doc_guard.save_to_file(path_str) {
         Ok(()) => STATUS_OK_PDFIUM,
         Err(_) => STATUS_INVALID_INPUT,
     }
 }
 
+// ---------------------------------------------------------------------
+// Annotation burning: flatten overlay annotations into real page content.
+//
+// Annotations are captured in RENDER-PIXEL space (top-left origin, Y down)
+// at some render width. PDF page objects live in POINTS with a BOTTOM-left
+// origin and Y up. Both conversions are needed:
+//
+//     scale  = page_width_pt / capture_width_px
+//     pdf_x  = x_px * scale
+//     pdf_y  = page_height_pt - y_px * scale
+//
+// The Y flip is the part that has no analogue in a top-down drawing API, so
+// it is easy to omit and produces annotations mirrored about the page's
+// horizontal centre line.
+//
+// These write page CONTENT, not PDF annotation objects, so the marks are
+// permanent and render identically in every viewer.
+// ---------------------------------------------------------------------
+
+/// One axis-aligned filled rectangle (a highlight) in render-pixel space.
+#[repr(C)]
+pub struct BurnRect {
+    pub page_index: i32,
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// One point of a polyline. Strokes are passed as a flat point array plus a
+/// separate array of per-stroke lengths, which keeps the FFI to plain slices
+/// instead of a pointer-to-pointer.
+#[repr(C)]
+pub struct BurnPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Header describing one ink stroke inside the flat point array.
+#[repr(C)]
+pub struct BurnStroke {
+    pub page_index: i32,
+    /// Index of this stroke's first point in the shared point array.
+    pub point_offset: u32,
+    pub point_count: u32,
+    pub width_px: f32,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// Flattens highlights and ink strokes into page content.
+///
+/// `capture_width` is the render width, in pixels, the annotation
+/// coordinates were captured at. Pass 0 pointers/counts for a category with
+/// nothing to burn. Returns STATUS_OK_PDFIUM, STATUS_INVALID_INPUT or
+/// STATUS_PANIC.
+///
+/// Callers must save to a NEW file after this and then reload the document,
+/// otherwise a second save re-burns the same annotations on top of the
+/// already-burned ones.
+#[unsafe(no_mangle)]
+pub extern "C" fn burn_annotations(
+    doc_handle: u64,
+    capture_width: i32,
+    rects: *const BurnRect,
+    rect_count: usize,
+    strokes: *const BurnStroke,
+    stroke_count: usize,
+    points: *const BurnPoint,
+    point_count: usize,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        burn_annotations_inner(
+            doc_handle,
+            capture_width,
+            rects,
+            rect_count,
+            strokes,
+            stroke_count,
+            points,
+            point_count,
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn burn_annotations_inner(
+    doc_handle: u64,
+    capture_width: i32,
+    rects: *const BurnRect,
+    rect_count: usize,
+    strokes: *const BurnStroke,
+    stroke_count: usize,
+    points: *const BurnPoint,
+    point_count: usize,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let rects: &[BurnRect] = if rects.is_null() || rect_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(rects, rect_count) }
+    };
+    let strokes: &[BurnStroke] = if strokes.is_null() || stroke_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(strokes, stroke_count) }
+    };
+    let points: &[BurnPoint] = if points.is_null() || point_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(points, point_count) }
+    };
+
+    if rects.is_empty() && strokes.is_empty() {
+        return STATUS_OK_PDFIUM;
+    }
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    // Group work by page so each page is opened once.
+    let mut pages: Vec<i32> = rects.iter().map(|r| r.page_index).collect();
+    pages.extend(strokes.iter().map(|s| s.page_index));
+    pages.sort_unstable();
+    pages.dedup();
+
+    for page_index in pages {
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            continue;
+        };
+
+        let page_width = page.width().value;
+        let page_height = page.height().value;
+        if page_width <= 0.0 {
+            continue;
+        }
+        let scale = page_width / capture_width as f32;
+
+        // Render pixels to PDF points, flipping the vertical axis.
+        let to_pdf_x = |x: f32| PdfPoints::new(x * scale);
+        let to_pdf_y = |y: f32| PdfPoints::new(page_height - y * scale);
+
+        for rect in rects.iter().filter(|r| r.page_index == page_index) {
+            let bounds = PdfRect::new(
+                to_pdf_y(rect.bottom),
+                to_pdf_x(rect.left),
+                to_pdf_y(rect.top),
+                to_pdf_x(rect.right),
+            );
+            let fill = PdfColor::new(rect.r, rect.g, rect.b, rect.a);
+            if page
+                .objects_mut()
+                .create_path_object_rect(bounds, None, None, Some(fill))
+                .is_err()
+            {
+                return STATUS_INVALID_INPUT;
+            }
+        }
+
+        for stroke in strokes.iter().filter(|s| s.page_index == page_index) {
+            let start = stroke.point_offset as usize;
+            let end = start.saturating_add(stroke.point_count as usize);
+            if stroke.point_count < 2 || end > points.len() {
+                continue;
+            }
+            let pts = &points[start..end];
+
+            let color = PdfColor::new(stroke.r, stroke.g, stroke.b, stroke.a);
+            let width = PdfPoints::new((stroke.width_px * scale).max(0.1));
+
+            // Build one path per stroke: move to the first point, then line
+            // to each subsequent one, so the stroke stays a single object
+            // rather than N disconnected segments.
+            let Ok(mut path) = PdfPagePathObject::new_line(
+                &doc_guard,
+                to_pdf_x(pts[0].x),
+                to_pdf_y(pts[0].y),
+                to_pdf_x(pts[1].x),
+                to_pdf_y(pts[1].y),
+                color,
+                width,
+            ) else {
+                continue;
+            };
+
+            let mut ok = true;
+            for p in &pts[2..] {
+                if path.line_to(to_pdf_x(p.x), to_pdf_y(p.y)).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+
+            if page.objects_mut().add_path_object(path).is_err() {
+                return STATUS_INVALID_INPUT;
+            }
+        }
+
+        // Content must be regenerated for the new objects to appear in the
+        // saved bytes; the default strategy does not do it per change.
+        if page.regenerate_content().is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    drop(doc_guard);
+    drop(doc);
+
+    // Burned pages look different now, so nothing cached for this document
+    // is still valid.
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 fn evict_page_cache(doc_handle: u64, page_index: i32) {
-    let mut cache = core().cache.lock().unwrap();
+    let mut cache = lock(&core().cache);
     let stale: Vec<TileKey> =
         cache.iter().filter(|(k, _)| k.doc == doc_handle && k.page == page_index).map(|(k, _)| *k).collect();
     for key in stale {
@@ -423,7 +671,7 @@ fn evict_page_cache(doc_handle: u64, page_index: i32) {
 }
 
 fn evict_all_cache_for_doc(doc_handle: u64) {
-    let mut cache = core().cache.lock().unwrap();
+    let mut cache = lock(&core().cache);
     let stale: Vec<TileKey> = cache.iter().filter(|(k, _)| k.doc == doc_handle).map(|(k, _)| *k).collect();
     for key in stale {
         cache.pop(&key);
@@ -447,13 +695,13 @@ pub extern "C" fn get_form_field_count(doc_handle: u64) -> i32 {
 }
 
 fn get_form_field_count_inner(doc_handle: u64) -> i32 {
-    let _guard = CALL_LOCK.lock().unwrap();
-    let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return -1;
     };
 
-    let doc_guard = doc.lock().unwrap();
+    let doc_guard = lock(&doc);
     let mut count = 0i32;
     for page in doc_guard.pages().iter() {
         for i in 0..page.annotations().len() {
@@ -488,13 +736,13 @@ fn fill_text_field_inner(doc_handle: u64, field_name: *const c_char, value: *con
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = CALL_LOCK.lock().unwrap();
-    let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
     };
 
-    let doc_guard = doc.lock().unwrap();
+    let doc_guard = lock(&doc);
     let _ = doc_guard.form(); // ensure the form-fill environment is bound before touching fields
 
     for page in doc_guard.pages().iter() {
@@ -569,14 +817,14 @@ pub extern "C" fn get_page_chars(doc_handle: u64, page_index: i32, target_width:
 }
 
 fn get_page_chars_inner(doc_handle: u64, page_index: i32, target_width: i32) -> CharInfoArray {
-    let _guard = CALL_LOCK.lock().unwrap();
+    let _guard = lock(&CALL_LOCK);
 
-    let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return CharInfoArray::failure(STATUS_INVALID_INPUT);
     };
 
-    let doc_guard = doc.lock().unwrap();
+    let doc_guard = lock(&doc);
     let result = extract_char_infos(&doc_guard, page_index, target_width);
     drop(doc_guard);
     drop(doc);
@@ -651,7 +899,7 @@ pub extern "C" fn render_low_res(doc_handle: u64, page_index: i32, target_width:
 fn render_low_res_inner(doc_handle: u64, page_index: i32, target_width: i32) -> RenderResult {
     let key = TileKey { doc: doc_handle, page: page_index, tier: Tier::Low, width: target_width };
 
-    if let Some(tile) = core().cache.lock().unwrap().get(&key) {
+    if let Some(tile) = lock(&core().cache).get(&key) {
         return tile_to_result(tile, STATUS_OK_PDFIUM);
     }
 
@@ -660,10 +908,10 @@ fn render_low_res_inner(doc_handle: u64, page_index: i32, target_width: i32) -> 
         // Arc clone below — dropping the last reference to a PdfDocument
         // runs PDFium's native close, which needs the same serialization as
         // any other native call.
-        let _guard = CALL_LOCK.lock().unwrap();
-        let doc = core().documents.lock().unwrap().get(&doc_handle).cloned();
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
         let result = doc.as_ref().and_then(|d| {
-            let guard = d.lock().unwrap();
+            let guard = lock(&d);
             render_page_via_pdfium(&guard, page_index, target_width)
         });
         drop(doc);
@@ -700,23 +948,23 @@ pub extern "C" fn request_high_res(doc_handle: u64, page_index: i32, target_widt
 
     let core = core();
     let generation = core.next_generation.fetch_add(1, Ordering::Relaxed);
-    core.generations.lock().unwrap().insert((doc_handle, page_index), generation);
+    lock(&core.generations).insert((doc_handle, page_index), generation);
 
     let request_id = core.next_request_id.fetch_add(1, Ordering::Relaxed);
     let key = TileKey { doc: doc_handle, page: page_index, tier: Tier::High, width: target_width };
 
     // Fast path: already cached at this exact width, no thread needed.
-    if let Some(tile) = core.cache.lock().unwrap().get(&key) {
-        core.requests.lock().unwrap().insert(request_id, RequestSlot::Ready(tile.clone()));
+    if let Some(tile) = lock(&core.cache).get(&key) {
+        lock(&core.requests).insert(request_id, RequestSlot::Ready(tile.clone()));
         return request_id;
     }
 
-    core.requests.lock().unwrap().insert(
+    lock(&core.requests).insert(
         request_id,
         RequestSlot::Pending { doc: doc_handle, page: page_index, generation },
     );
 
-    let doc_arc = core.documents.lock().unwrap().get(&doc_handle).cloned();
+    let doc_arc = lock(&core.documents).get(&doc_handle).cloned();
 
     thread::spawn(move || {
         let rendered = {
@@ -724,9 +972,9 @@ pub extern "C" fn request_high_res(doc_handle: u64, page_index: i32, target_widt
             // both the render call and the drop of doc_arc at the end of
             // this scope, since dropping the last Arc<PdfDocument> reference
             // runs PDFium's native close.
-            let _guard = CALL_LOCK.lock().unwrap();
+            let _guard = lock(&CALL_LOCK);
             let result = doc_arc.as_ref().and_then(|doc| {
-                let guard = doc.lock().unwrap();
+                let guard = lock(&doc);
                 render_page_via_pdfium(&guard, page_index, target_width)
             });
             drop(doc_arc);
@@ -734,7 +982,7 @@ pub extern "C" fn request_high_res(doc_handle: u64, page_index: i32, target_widt
         };
 
         let still_current =
-            core.generations.lock().unwrap().get(&(doc_handle, page_index)).copied() == Some(generation);
+            lock(&core.generations).get(&(doc_handle, page_index)).copied() == Some(generation);
 
         let slot = match rendered {
             Some((width, height, bytes)) => {
@@ -745,7 +993,7 @@ pub extern "C" fn request_high_res(doc_handle: u64, page_index: i32, target_widt
             None => RequestSlot::Cancelled,
         };
 
-        let mut requests = core.requests.lock().unwrap();
+        let mut requests = lock(&core.requests);
         if matches!(requests.get(&request_id), Some(RequestSlot::Discarded)) {
             // The caller gave up on this id while we were rendering; drop
             // the tombstone now instead of resurrecting it as Ready/Cancelled.
@@ -781,14 +1029,14 @@ pub extern "C" fn poll_high_res(request_id: u64, out_result: *mut RenderResult) 
     }
 
     let snapshot = {
-        let requests = core.requests.lock().unwrap();
+        let requests = lock(&core.requests);
         match requests.get(&request_id) {
             None => Snapshot::Unknown,
             Some(RequestSlot::Cancelled) | Some(RequestSlot::Discarded) => Snapshot::Cancelled,
             Some(RequestSlot::Ready(tile)) => Snapshot::Ready(tile.clone()),
             Some(RequestSlot::Pending { doc, page, generation }) => {
                 let still_current =
-                    core.generations.lock().unwrap().get(&(*doc, *page)).copied() == Some(*generation);
+                    lock(&core.generations).get(&(*doc, *page)).copied() == Some(*generation);
                 if still_current { Snapshot::StillPending } else { Snapshot::NewlyStale }
             }
         }
@@ -798,15 +1046,15 @@ pub extern "C" fn poll_high_res(request_id: u64, out_result: *mut RenderResult) 
         Snapshot::Unknown => POLL_UNKNOWN_REQUEST,
         Snapshot::StillPending => POLL_PENDING,
         Snapshot::Cancelled => {
-            core.requests.lock().unwrap().remove(&request_id);
+            lock(&core.requests).remove(&request_id);
             POLL_CANCELLED
         }
         Snapshot::NewlyStale => {
-            core.requests.lock().unwrap().insert(request_id, RequestSlot::Cancelled);
+            lock(&core.requests).insert(request_id, RequestSlot::Cancelled);
             POLL_CANCELLED
         }
         Snapshot::Ready(tile) => {
-            core.requests.lock().unwrap().remove(&request_id);
+            lock(&core.requests).remove(&request_id);
             let result = tile_to_result(&tile, STATUS_OK_PDFIUM);
             unsafe {
                 *out_result = result;
@@ -829,7 +1077,7 @@ pub extern "C" fn poll_high_res(request_id: u64, out_result: *mut RenderResult) 
 /// resurrect a `Ready`/`Cancelled` entry nobody will ever poll.
 #[unsafe(no_mangle)]
 pub extern "C" fn discard_request(request_id: u64) {
-    let mut requests = core().requests.lock().unwrap();
+    let mut requests = lock(&core().requests);
     match requests.get(&request_id) {
         Some(RequestSlot::Pending { .. }) => {
             requests.insert(request_id, RequestSlot::Discarded);
@@ -1209,8 +1457,8 @@ mod tests {
         // White-box check: read the rotation straight back off the
         // in-memory document (there's no FFI getter — the app doesn't need
         // one, only render_core's own tests do).
-        let doc = core().documents.lock().unwrap().get(&handle).cloned().unwrap();
-        let rotation = doc.lock().unwrap().pages().get(0).unwrap().rotation().unwrap();
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let rotation = lock(&doc).pages().get(0).unwrap().rotation().unwrap();
         assert_eq!(rotation, PdfPageRenderRotation::Degrees90);
 
         close_document(handle);
@@ -1300,9 +1548,9 @@ mod tests {
         use pdfium_render::prelude::*;
 
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
-        let _guard = CALL_LOCK.lock().unwrap();
-        let doc = core().documents.lock().unwrap().get(&handle).cloned().unwrap();
-        let doc_guard = doc.lock().unwrap();
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(0).unwrap();
 
         let config = PdfRenderConfig::new()
@@ -1352,7 +1600,7 @@ mod tests {
             free_render_result(r);
         }
 
-        let resident: usize = core().cache.lock().unwrap().iter().map(|(_, t)| t.bytes.len()).sum();
+        let resident: usize = lock(&core().cache).iter().map(|(_, t)| t.bytes.len()).sum();
         assert!(
             resident <= CACHE_BUDGET_BYTES,
             "cache held {resident} bytes, over the {CACHE_BUDGET_BYTES} byte budget"
@@ -1363,16 +1611,166 @@ mod tests {
 
     #[test]
     fn oversized_tiles_are_not_cached_at_all() {
-        let before = core().cache.lock().unwrap().len();
+        // Assert on THIS key's presence, not on the cache's total length.
+        // The cache is process-global and the other tests render into it
+        // concurrently, so a length comparison is inherently racy — and when
+        // it failed it did so while holding the cache lock inside assert_eq!,
+        // poisoning the mutex and cascading into every later test.
+        let key = TileKey { doc: u64::MAX, page: 0, tier: Tier::High, width: 1 };
 
         let huge = CachedTile {
             width: 1,
             height: 1,
             bytes: Arc::from(vec![0u8; MAX_CACHEABLE_TILE_BYTES + 1]),
         };
-        cache_put(TileKey { doc: u64::MAX, page: 0, tier: Tier::High, width: 1 }, huge);
+        cache_put(key, huge);
 
-        assert_eq!(core().cache.lock().unwrap().len(), before, "an oversized tile must not enter the cache");
+        let present = lock(&core().cache).contains(&key);
+        assert!(!present, "an oversized tile must not enter the cache");
+    }
+
+    /// Counts page objects, so a burn can be proven by the count going up
+    /// rather than by the call merely returning OK.
+    fn page_object_count(handle: u64, page_index: i32) -> usize {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let page = g.pages().get(page_index as u16).unwrap();
+        page.objects().len() as usize
+    }
+
+    #[test]
+    fn burn_annotations_adds_objects_that_survive_save_and_reopen() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = page_object_count(handle, 0);
+
+        // A highlight band and a 3-point ink stroke, in the coordinate space
+        // of a 1000px-wide render.
+        let rects = [BurnRect {
+            page_index: 0,
+            left: 100.0,
+            top: 100.0,
+            right: 500.0,
+            bottom: 200.0,
+            r: 255, g: 255, b: 0, a: 128,
+        }];
+        let pts = [
+            BurnPoint { x: 100.0, y: 400.0 },
+            BurnPoint { x: 300.0, y: 450.0 },
+            BurnPoint { x: 500.0, y: 400.0 },
+        ];
+        let strokes = [BurnStroke {
+            page_index: 0,
+            point_offset: 0,
+            point_count: 3,
+            width_px: 4.0,
+            r: 255, g: 0, b: 0, a: 255,
+        }];
+
+        assert_eq!(
+            burn_annotations(handle, 1000, rects.as_ptr(), rects.len(),
+                             strokes.as_ptr(), strokes.len(), pts.as_ptr(), pts.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let after = page_object_count(handle, 0);
+        assert_eq!(after, before + 2, "expected one rect object and one ink path object");
+
+        // The real guarantee: the objects must be in the SAVED BYTES, not
+        // just the in-memory document.
+        let mut path = std::env::temp_dir();
+        path.push(format!("render_core_burn_{}.pdf", std::process::id()));
+        let path_str = path.to_str().unwrap().to_owned();
+        let c_path = std::ffi::CString::new(path_str.clone()).unwrap();
+        assert_eq!(save_document(handle, c_path.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let reopened = open_fixture_named(&path_str);
+        assert_eq!(
+            page_object_count(reopened, 0),
+            after,
+            "burned objects did not survive the save/reopen round trip"
+        );
+        close_document(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn burn_annotations_leaves_other_pages_untouched() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before_p1 = page_object_count(handle, 1);
+
+        let rects = [BurnRect {
+            page_index: 0,
+            left: 10.0, top: 10.0, right: 100.0, bottom: 50.0,
+            r: 0, g: 255, b: 0, a: 90,
+        }];
+        assert_eq!(
+            burn_annotations(handle, 800, rects.as_ptr(), rects.len(),
+                             std::ptr::null(), 0, std::ptr::null(), 0),
+            STATUS_OK_PDFIUM
+        );
+
+        assert_eq!(page_object_count(handle, 1), before_p1, "page 1 must be untouched");
+        close_document(handle);
+    }
+
+    #[test]
+    fn burn_annotations_flips_y_into_pdf_space() {
+        // A band near the TOP in render space must land near the TOP of the
+        // page in PDF space, i.e. at a HIGH y value, since PDF's origin is
+        // bottom-left. Getting this wrong mirrors every annotation.
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let rects = [BurnRect {
+            page_index: 0,
+            left: 0.0, top: 0.0, right: 100.0, bottom: 100.0,   // top strip
+            r: 255, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            burn_annotations(handle, 1000, rects.as_ptr(), rects.len(),
+                             std::ptr::null(), 0, std::ptr::null(), 0),
+            STATUS_OK_PDFIUM
+        );
+
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let page = g.pages().get(0).unwrap();
+        let page_height = page.height().value;
+
+        // The object we just added is the last one on the page.
+        let obj = page.objects().iter().last().unwrap();
+        let bounds = obj.bounds().unwrap();
+
+        assert!(
+            bounds.top().value > page_height * 0.8,
+            "a top-of-screen annotation should sit near the top of the page in PDF \
+             coords (y={} of {}), not mirrored to the bottom",
+            bounds.top().value, page_height
+        );
+
+        drop(g);
+        drop(doc);
+        drop(_guard);
+        close_document(handle);
+    }
+
+    #[test]
+    fn burn_annotations_rejects_bad_input() {
+        assert_eq!(
+            burn_annotations(0, 1000, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0),
+            STATUS_INVALID_INPUT
+        );
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            burn_annotations(handle, 0, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0),
+            STATUS_INVALID_INPUT,
+            "a zero capture width would divide by zero"
+        );
+        close_document(handle);
     }
 
     #[test]
@@ -1394,8 +1792,8 @@ mod tests {
 
         // White-box verification: read the field value straight back off
         // the in-memory document rather than trusting the status code alone.
-        let doc = core().documents.lock().unwrap().get(&handle).cloned().unwrap();
-        let doc_guard = doc.lock().unwrap();
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(0).unwrap();
 
         let mut found_value = None;
