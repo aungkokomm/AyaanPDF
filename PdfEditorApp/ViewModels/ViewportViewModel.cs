@@ -62,7 +62,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private double _currentZoomFactor = 1.0;
     private bool _hasEstablishedInitialView;
 
-    private PageTextLayer? _textLayer;
     private int? _selectionAnchorCharIndex;
     private int _selectionStart;
     private int _selectionLength;
@@ -209,6 +208,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Notes.Clear();
         InkStrokes.Clear();
 
+        // Layers are keyed by page index, so carrying them across a document
+        // switch would hand the new document the old one's text.
+        _textLayers.Clear();
+
         // A fresh document has no history and no unsaved edits. A reload after
         // a burn/save (preserveAnnotations) is also a clean slate: those marks
         // are now baked into the page content, so there is nothing to undo.
@@ -288,6 +291,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         IsDirty = true;
         PageCount--;
+
+        // Every page after the deleted one shifted down, so layers cached by
+        // index now describe the wrong pages.
+        _textLayers.Clear();
+        ClearSelection();
 
         // Later pages all shifted down one, so cached thumbnails (rendered at
         // the old indices) are stale; rebuild and let virtualization re-render.
@@ -861,31 +869,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    /// <summary>
-    /// Points the tool machinery at a page, loading its text layer if the page
-    /// changed. Called when a gesture starts, so a drag on page 7 edits page 7
-    /// rather than whatever the scroll position last made current.
-    /// </summary>
-    public void SetActivePageForTools(int pageIndex)
-    {
-        if (pageIndex == CurrentPageIndex || pageIndex < 0 || pageIndex >= PageCount)
-        {
-            return;
-        }
-
-        CurrentPageIndex = pageIndex;
-        _textLayer = null;
-        ClearSelection();
-    }
-
     /// <summary>The card owning a page, or null if the index is out of range.</summary>
     private PageSlot? SlotFor(int pageIndex) =>
         pageIndex >= 0 && pageIndex < PageSlots.Count ? PageSlots[pageIndex] : null;
 
+    /// <summary>
+    /// Scrolling changed which page is current.
+    ///
+    /// This deliberately does NOT clear the selection. A selection can span
+    /// pages, and extending one to a page below necessarily scrolls, so
+    /// discarding it here would make a cross-page drag impossible. Search
+    /// results are re-centred on the new page instead.
+    /// </summary>
     private void OnCurrentPageChangedByScroll()
     {
-        _textLayer = null;
-        ClearSelection();
+        RefreshAnnotationsForCurrentPage();
+        RecomputeSearchMatches();
     }
 
     // ---------------- Thumbnails ----------------
@@ -926,98 +925,200 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     // ---------------- Text selection ----------------
 
-    public void BeginTextSelection(double x, double y)
+    /// <summary>
+    /// The live selection, which can span pages. Null when nothing is
+    /// selected. Held as positions rather than rectangles so it survives a
+    /// text layer being evicted and re-extracted.
+    /// </summary>
+    private DocumentSelection? _selection;
+
+    /// <summary>True while a drag is in progress.</summary>
+    private bool _isSelecting;
+
+    public void BeginTextSelection(int pageIndex, double x, double y)
     {
         ClearSelection();
-        if (_textLayer is null)
+
+        var layer = TextLayerFor(pageIndex);
+        if (layer is null)
         {
             return;
         }
 
-        int index = _textLayer.HitTestNearest(x, y);
+        int index = layer.HitTestNearest(x, y);
         if (index < 0)
         {
             return;
         }
 
-        _selectionAnchorCharIndex = index;
-        SetSelectionRange(index, index);
+        _selection = DocumentSelection.At(pageIndex, index);
+        _isSelecting = true;
+        RefreshSelectionRects();
     }
 
-    public void UpdateTextSelection(double x, double y)
+    /// <summary>
+    /// Extends the selection to a point on <paramref name="pageIndex"/>, which
+    /// may be a DIFFERENT page from where the drag started. The anchor stays
+    /// put, so dragging up the document works the same as dragging down.
+    /// </summary>
+    public void UpdateTextSelection(int pageIndex, double x, double y)
     {
-        if (_textLayer is null || _selectionAnchorCharIndex is not int anchor)
+        if (!_isSelecting || _selection is not DocumentSelection current)
         {
             return;
         }
 
-        int current = _textLayer.HitTestNearest(x, y);
-        if (current < 0)
+        var layer = TextLayerFor(pageIndex);
+        if (layer is null)
         {
             return;
         }
 
-        SetSelectionRange(Math.Min(anchor, current), Math.Max(anchor, current));
+        int index = layer.HitTestNearest(x, y);
+        if (index < 0)
+        {
+            return;
+        }
+
+        _selection = current.ExtendTo(pageIndex, index);
+        RefreshSelectionRects();
     }
 
     public void EndTextSelection()
     {
-        _selectionAnchorCharIndex = null;
+        _isSelecting = false;
 
-        if (ActiveTool != ToolMode.Highlight || _textLayer is null || _selectionLength <= 0)
+        if (ActiveTool != ToolMode.Highlight || _selection is not DocumentSelection selection)
         {
             return;
         }
 
-        var rects = _textLayer.GetRangeRects(_selectionStart, _selectionLength);
-        if (rects.Count == 0)
+        // A selection spanning pages becomes ONE highlight per page. Annotation
+        // coordinates are page-local, and burning writes into a single page's
+        // content stream, so a highlight that straddles a page boundary has no
+        // meaningful single-page representation.
+        var created = new List<HighlightAnnotation>();
+        var (firstPage, lastPage) = selection.PageRange;
+
+        for (int page = firstPage; page <= lastPage; page++)
+        {
+            var layer = TextLayerFor(page);
+            if (layer is null)
+            {
+                continue;
+            }
+
+            if (selection.RangeForPage(page, layer.CharCount) is not (int start, int length))
+            {
+                continue;
+            }
+
+            var rects = layer.GetRangeRects(start, length);
+            if (rects.Count == 0)
+            {
+                continue;
+            }
+
+            created.Add(new HighlightAnnotation(page, rects.Select(NormRect).ToList(), "#FFFF00"));
+        }
+
+        if (created.Count == 0)
         {
             return;
         }
 
-        PushHistory(HistoryScope.Annotations, "Highlight");
-        var highlight = new HighlightAnnotation(
-            CurrentPageIndex,
-            rects.Select(NormRect).ToList(),
-            "#FFFF00");
-        _allHighlights.Add(highlight);
-        Highlights.Add(highlight);
-        SlotFor(highlight.PageIndex)?.Highlights.Add(highlight);
+        // One undo step for the whole gesture, not one per page.
+        PushHistory(HistoryScope.Annotations, created.Count > 1 ? "Highlight pages" : "Highlight");
+        foreach (var highlight in created)
+        {
+            _allHighlights.Add(highlight);
+            SlotFor(highlight.PageIndex)?.Highlights.Add(highlight);
+            if (highlight.PageIndex == CurrentPageIndex)
+            {
+                Highlights.Add(highlight);
+            }
+        }
+
         IsDirty = true;
         ClearSelection();
     }
 
-    public string? GetSelectedText() =>
-        _textLayer is not null && _selectionLength > 0
-            ? _textLayer.Text.Substring(_selectionStart, _selectionLength)
-            : null;
-
-    private void SetSelectionRange(int startIndex, int endIndexInclusive)
+    /// <summary>The selected text, joined across pages with a newline at each seam.</summary>
+    public string? GetSelectedText()
     {
-        _selectionStart = startIndex;
-        _selectionLength = endIndexInclusive - startIndex + 1;
+        if (_selection is not DocumentSelection selection)
+        {
+            return null;
+        }
 
+        var parts = new List<string>();
+        var (firstPage, lastPage) = selection.PageRange;
+
+        for (int page = firstPage; page <= lastPage; page++)
+        {
+            var layer = TextLayerFor(page);
+            if (layer is null)
+            {
+                continue;
+            }
+
+            if (selection.RangeForPage(page, layer.CharCount) is (int start, int length))
+            {
+                parts.Add(layer.Text.Substring(start, length));
+            }
+        }
+
+        return parts.Count > 0 ? string.Join(Environment.NewLine, parts) : null;
+    }
+
+    /// <summary>
+    /// Recomputes selection rectangles for every page the selection touches
+    /// and hands each page's share to its own card.
+    /// </summary>
+    private void RefreshSelectionRects()
+    {
+        foreach (var slot in PageSlots)
+        {
+            slot.SelectionRects.Clear();
+        }
         SelectionRects.Clear();
-        var slot = SlotFor(CurrentPageIndex);
-        slot?.SelectionRects.Clear();
-        if (_textLayer is null)
+
+        if (_selection is not DocumentSelection selection)
         {
             return;
         }
 
-        foreach (var rect in _textLayer.GetRangeRects(_selectionStart, _selectionLength))
+        var (firstPage, lastPage) = selection.PageRange;
+        for (int page = firstPage; page <= lastPage; page++)
         {
-            var normalized = NormRect(rect);
-            SelectionRects.Add(normalized);
-            slot?.SelectionRects.Add(normalized);
+            var layer = TextLayerFor(page);
+            if (layer is null)
+            {
+                continue;
+            }
+
+            if (selection.RangeForPage(page, layer.CharCount) is not (int start, int length))
+            {
+                continue;
+            }
+
+            var slot = SlotFor(page);
+            foreach (var rect in layer.GetRangeRects(start, length))
+            {
+                var normalized = NormRect(rect);
+                slot?.SelectionRects.Add(normalized);
+                if (page == CurrentPageIndex)
+                {
+                    SelectionRects.Add(normalized);
+                }
+            }
         }
     }
 
     private void ClearSelection()
     {
-        _selectionAnchorCharIndex = null;
-        _selectionStart = 0;
-        _selectionLength = 0;
+        _selection = null;
+        _isSelecting = false;
         SelectionRects.Clear();
         foreach (var slot in PageSlots)
         {
@@ -1030,8 +1131,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // Ink points are normalized on the way IN, not on commit, so the live
     // preview MainPage draws from _currentStroke sits in the same coordinate
     // space as the finished strokes and the two cannot disagree.
-    public void BeginInkStroke(double x, double y)
+    /// <summary>
+    /// The page a stroke started on, held for the whole gesture so a stroke
+    /// that wanders past a page edge still belongs to the page it began on
+    /// rather than jumping to whichever page the pointer ended over.
+    /// </summary>
+    private int _inkPageIndex;
+
+    public void BeginInkStroke(int pageIndex, double x, double y)
     {
+        _inkPageIndex = pageIndex;
         _currentStroke = new List<(double, double)> { (Norm(x), Norm(y)) };
         InkStrokeChanged?.Invoke();
     }
@@ -1053,7 +1162,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             PushHistory(HistoryScope.Annotations, "Draw");
             var stroke = new InkStrokeAnnotation(
-                CurrentPageIndex,
+                _inkPageIndex,
                 new List<(double X, double Y)>(_currentStroke),
                 "#FFE00000",
                 Norm(2.0));
@@ -1067,10 +1176,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         InkStrokeChanged?.Invoke();
     }
 
-    public void AddNoteAt(double x, double y)
+    public void AddNoteAt(int pageIndex, double x, double y)
     {
         PushHistory(HistoryScope.Annotations, "Add note");
-        var note = new NoteAnnotation(CurrentPageIndex, Norm(x), Norm(y), string.Empty);
+        var note = new NoteAnnotation(pageIndex, Norm(x), Norm(y), string.Empty);
         _allNotes.Add(note);
         Notes.Add(note);
         SlotFor(note.PageIndex)?.Notes.Add(note);
@@ -1187,6 +1296,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 CloseCurrentDocument();
                 _documentHandle = restored;
 
+                // A document-scope undo can restore a different page count and
+                // ordering, so index-keyed layers are no longer trustworthy.
+                _textLayers.Clear();
+                ClearSelection();
+
                 PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
                 Thumbnails.Clear();
                 for (int i = 0; i < PageCount; i++)
@@ -1240,41 +1354,114 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     partial void OnSearchQueryChanged(string value) => RecomputeSearchMatches();
 
+    /// <summary>
+    /// Highlights every match across the pages currently laid out, not just
+    /// the current one.
+    ///
+    /// With a continuous view several pages are on screen at once, so a
+    /// per-page search would leave visible matches unmarked. Search is capped
+    /// at <see cref="SearchPageBudget"/> pages so a query on a 300-page
+    /// document does not extract every text layer on the UI thread; pages
+    /// nearest the viewport are searched first, since those are the ones whose
+    /// highlights the user can actually see.
+    /// </summary>
+    private const int SearchPageBudget = 40;
+
     private void RecomputeSearchMatches()
     {
         SearchMatchRects.Clear();
-        if (_textLayer is null || string.IsNullOrEmpty(SearchQuery))
+        foreach (var slot in PageSlots)
+        {
+            slot.SearchMatchRects.Clear();
+        }
+
+        if (string.IsNullOrEmpty(SearchQuery) || PageSlots.Count == 0)
         {
             return;
         }
 
-        foreach (var (start, length) in _textLayer.FindMatches(SearchQuery))
+        // Nearest-first ordering: walk outwards from the current page.
+        var order = new List<int> { CurrentPageIndex };
+        for (int d = 1; order.Count < Math.Min(SearchPageBudget, PageSlots.Count); d++)
         {
-            foreach (var rect in _textLayer.GetRangeRects(start, length))
+            if (CurrentPageIndex - d >= 0)
             {
-                SearchMatchRects.Add(NormRect(rect));
+                order.Add(CurrentPageIndex - d);
+            }
+            if (CurrentPageIndex + d < PageSlots.Count)
+            {
+                order.Add(CurrentPageIndex + d);
+            }
+            if (CurrentPageIndex - d < 0 && CurrentPageIndex + d >= PageSlots.Count)
+            {
+                break;
+            }
+        }
+
+        foreach (int page in order)
+        {
+            var layer = TextLayerFor(page);
+            if (layer is null)
+            {
+                continue;
+            }
+
+            var slot = SlotFor(page);
+            foreach (var (start, length) in layer.FindMatches(SearchQuery))
+            {
+                foreach (var rect in layer.GetRangeRects(start, length))
+                {
+                    var normalized = NormRect(rect);
+                    slot?.SearchMatchRects.Add(normalized);
+                    if (page == CurrentPageIndex)
+                    {
+                        SearchMatchRects.Add(normalized);
+                    }
+                }
             }
         }
     }
 
     /// <summary>
-    /// Loads the current page's text layer in SLOT space.
+    /// Text layers by page, loaded on demand.
     ///
-    /// The extraction width is the fixed slot width, NOT whatever the page was
-    /// last rasterized at, so character boxes come back in the same units as
-    /// pointer positions and ink points. That means one divisor normalizes
-    /// everything, and a re-render at a different resolution cannot shift the
-    /// text layer out of step with the marks drawn against it.
+    /// A selection that spans pages needs several layers live at once, so this
+    /// cannot be the single current-page layer it used to be. Extraction is
+    /// cheap next to rasterization and a layer is a few thousand glyph boxes,
+    /// so they are simply kept for the document's lifetime rather than
+    /// evicted; opening another document clears the lot.
     /// </summary>
-    private void EnsureTextLayer()
+    private readonly Dictionary<int, PageTextLayer?> _textLayers = new();
+
+    /// <summary>
+    /// The text layer for a page, extracted in SLOT space on first use.
+    /// Returns null for a page with no text, and caches that too so an
+    /// image-only page is not re-extracted on every pointer move.
+    /// </summary>
+    private PageTextLayer? TextLayerFor(int pageIndex)
     {
-        if (_textLayer is not null || _documentHandle == 0)
+        if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount)
         {
-            return;
+            return null;
         }
 
-        _textLayer = TextLayerLoader.Load(_documentHandle, CurrentPageIndex, (int)SlotLayoutWidth);
-        RecomputeSearchMatches();
+        if (_textLayers.TryGetValue(pageIndex, out var cached))
+        {
+            return cached;
+        }
+
+        var layer = TextLayerLoader.Load(_documentHandle, pageIndex, (int)SlotLayoutWidth);
+        _textLayers[pageIndex] = layer;
+        return layer;
+    }
+
+    /// <summary>Loads the current page's layer and refreshes its search hits.</summary>
+    private void EnsureTextLayer()
+    {
+        if (TextLayerFor(CurrentPageIndex) is not null)
+        {
+            RecomputeSearchMatches();
+        }
     }
 
     // ---------------- Rendering ----------------
@@ -1283,7 +1470,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         _hasEstablishedInitialView = false;
         _currentRenderedWidth = 0;
-        _textLayer = null;
         ClearSelection();
         SearchMatchRects.Clear();
         RefreshAnnotationsForCurrentPage();

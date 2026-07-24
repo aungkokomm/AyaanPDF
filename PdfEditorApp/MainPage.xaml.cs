@@ -461,19 +461,17 @@ public sealed partial class MainPage : Page
     /// scroll position last made current, is what lets a drag on page 7 edit
     /// page 7.
     /// </summary>
-    private Point ContentPoint(PointerRoutedEventArgs e)
+    private readonly record struct PagePoint(int Page, double X, double Y);
+
+    private PagePoint ContentPoint(PointerRoutedEventArgs e)
     {
         var p = e.GetCurrentPoint(ViewportHost).Position;
         double slotX = p.X - ViewportHost.Padding.Left;
         double slotY = p.Y - ViewportHost.Padding.Top;
 
-        if (ViewModel.HitTestSlotSpace(slotX, slotY, out int pageIndex, out double localX, out double localY))
-        {
-            ViewModel.SetActivePageForTools(pageIndex);
-            return new Point(localX, localY);
-        }
-
-        return new Point(slotX, slotY);
+        return ViewModel.HitTestSlotSpace(slotX, slotY, out int pageIndex, out double localX, out double localY)
+            ? new PagePoint(pageIndex, localX, localY)
+            : new PagePoint(ViewModel.CurrentPageIndex, slotX, slotY);
     }
 
     private bool ToolWantsPointer =>
@@ -503,7 +501,7 @@ public sealed partial class MainPage : Page
                 _isSelectingText = true;
                 _dragPointerId = current.PointerId;
                 ViewportHost.CapturePointer(e.Pointer);
-                ViewModel.BeginTextSelection(content.X, content.Y);
+                ViewModel.BeginTextSelection(content.Page, content.X, content.Y);
                 e.Handled = true;
                 break;
 
@@ -511,12 +509,12 @@ public sealed partial class MainPage : Page
                 _isDrawing = true;
                 _dragPointerId = current.PointerId;
                 ViewportHost.CapturePointer(e.Pointer);
-                ViewModel.BeginInkStroke(content.X, content.Y);
+                ViewModel.BeginInkStroke(content.Page, content.X, content.Y);
                 e.Handled = true;
                 break;
 
             case ToolMode.Note:
-                ViewModel.AddNoteAt(content.X, content.Y);
+                ViewModel.AddNoteAt(content.Page, content.X, content.Y);
                 e.Handled = true;
                 break;
         }
@@ -533,7 +531,7 @@ public sealed partial class MainPage : Page
 
         if (_isSelectingText)
         {
-            ViewModel.UpdateTextSelection(content.X, content.Y);
+            ViewModel.UpdateTextSelection(content.Page, content.X, content.Y);
             e.Handled = true;
         }
         else if (_isDrawing)
