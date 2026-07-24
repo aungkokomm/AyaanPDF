@@ -1,0 +1,24 @@
+[package]
+name = "render_core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# No "image" feature: the render path hands PDFium's native BGRA buffer
+# straight through via as_raw_bytes(), so nothing here needs the image crate's
+# decode/encode stack (which also drags in ravif, exr, and friends).
+pdfium-render = { version = "0.8", default-features = false, features = ["pdfium_latest", "thread_safe", "sync"] }
+lru = "0.12"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+
+[[bench]]
+name = "render_timing"
+harness = true

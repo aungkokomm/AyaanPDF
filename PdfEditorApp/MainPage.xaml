@@ -1,0 +1,259 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="PdfEditorApp.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:PdfEditorApp"
+    xmlns:controls="using:PdfEditorApp.Controls"
+    xmlns:viewmodels="using:PdfEditorApp.ViewModels"
+    xmlns:viewport="using:PdfEditorApp.Viewport"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="168" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!--
+            Thumbnail sidebar. ListView virtualizes container realization by
+            default (ItemsStackPanel), so on a 300-page document only the
+            handful of visible (+ buffer) items ever get a container — and
+            each container's Image.Loaded is what triggers that page's
+            thumbnail to actually render (see ThumbnailImage_Loaded), so we
+            never render more than what's on screen.
+        -->
+        <ListView
+            x:Name="ThumbnailList"
+            Grid.Column="0"
+            Padding="8"
+            ItemsSource="{x:Bind ViewModel.Thumbnails}"
+            SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
+            SelectionChanged="ThumbnailList_SelectionChanged">
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="viewmodels:PageThumbnail">
+                    <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
+                        <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+                            <Image
+                                Source="{x:Bind Bitmap, Mode=OneWay}"
+                                Loaded="ThumbnailImage_Loaded"
+                                Stretch="Uniform"
+                                Width="126"
+                                Height="163" />
+                        </Border>
+                        <TextBlock Text="{x:Bind DisplayNumber}" HorizontalAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                    </StackPanel>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <MenuBar Grid.Row="0">
+                <MenuBarItem Title="File">
+                    <MenuFlyoutItem Text="Open..." Click="OpenFile_Click" />
+                    <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click" />
+                    <MenuFlyoutSeparator />
+                    <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
+                </MenuBarItem>
+                <MenuBarItem Title="View">
+                    <MenuFlyoutItem Text="Zoom In" Click="ZoomIn_Click" />
+                    <MenuFlyoutItem Text="Zoom Out" Click="ZoomOut_Click" />
+                    <MenuFlyoutItem Text="Reset Zoom" Click="ResetZoom_Click" />
+                </MenuBarItem>
+            </MenuBar>
+
+            <!-- Annotation tool switcher: changes what plain left-drag/click does in the viewport below. -->
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="4" Padding="8,8,8,4">
+                <Button Content="Hand" Click="HandTool_Click" />
+                <Button Content="Select" Click="SelectTool_Click" />
+                <Button Content="Highlight" Click="HighlightTool_Click" />
+                <Button Content="Note" Click="NoteTool_Click" />
+                <Button Content="Draw" Click="DrawTool_Click" />
+                <TextBlock Text="{x:Bind ViewModel.ActiveTool, Mode=OneWay}" VerticalAlignment="Center" Margin="12,0,0,0" Style="{StaticResource CaptionTextBlockStyle}" />
+
+                <!-- Page operations (phase 5) -->
+                <Button Content="Rotate 90°" Click="RotatePage_Click" Margin="24,0,0,0" />
+                <Button Content="Delete Page" Click="DeletePage_Click" />
+            </StackPanel>
+
+            <!--
+                ScrollView, not a hand-rolled transform.
+                ScrollView/ScrollPresenter drives pan and zoom through
+                InteractionTracker on the COMPOSITOR thread: momentum,
+                rubber-band bounce at the edges, blended pinch+pan, precision
+                touchpad and scrollbars all come for free and keep running at
+                60fps even while the UI thread is busy rasterizing a page.
+                This previously was a plain Grid with a CompositeTransform and
+                a DispatcherQueueTimer re-implementing all of that on the UI
+                thread, which is precisely what made zoom feel steppy.
+                Content coordinates also get simpler: a point relative to
+                PageImage is already page-bitmap space, so tools need no
+                inverse-transform math.
+            -->
+            <ScrollView
+                x:Name="PageScroller"
+                Grid.Row="2"
+                ZoomMode="Enabled"
+                HorizontalScrollBarVisibility="Auto"
+                VerticalScrollBarVisibility="Auto"
+                HorizontalScrollMode="Enabled"
+                VerticalScrollMode="Enabled"
+                MinZoomFactor="0.1"
+                MaxZoomFactor="8"
+                ViewChanged="PageScroller_ViewChanged"
+                SizeChanged="PageScroller_SizeChanged">
+                <!--
+                    Width/Height are pinned to the ViewModel's layout size in
+                    DIPs and the Image stretches to fill it. Sharper renders
+                    therefore change only pixel density, never layout, so
+                    ScrollView.ZoomFactor 1.0 reliably means "fits the width".
+                -->
+                <controls:CursorGrid
+                    x:Name="ViewportHost"
+                    Background="Transparent"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    Width="{x:Bind ViewModel.PageLayoutWidth, Mode=OneWay}"
+                    Height="{x:Bind ViewModel.PageLayoutHeight, Mode=OneWay}"
+                    PointerPressed="ViewportHost_PointerPressed"
+                    PointerMoved="ViewportHost_PointerMoved"
+                    PointerReleased="ViewportHost_PointerReleased"
+                    PointerCanceled="ViewportHost_PointerReleased"
+                    PointerCaptureLost="ViewportHost_PointerReleased">
+
+                    <Image x:Name="PageImage" Source="{x:Bind ViewModel.PageBitmap, Mode=OneWay}" Stretch="Fill" />
+
+                    <!--
+                        Every overlay below positions itself in bitmap-PIXEL
+                        coordinates (that is the space PDFium's text layer and
+                        the ink strokes are captured in), while the page is
+                        laid out in DIPs. This transform bridges the two and is
+                        updated whenever a sharper render changes the pixel
+                        size — see OnContentScaleChanged.
+                    -->
+                    <Grid x:Name="OverlayRoot" HorizontalAlignment="Left" VerticalAlignment="Top">
+                        <Grid.RenderTransform>
+                            <ScaleTransform x:Name="OverlayScale" />
+                        </Grid.RenderTransform>
+
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.SearchMatchRects}" IsHitTestVisible="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <Grid />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:TextRect">
+                                <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                           Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                           HorizontalAlignment="Left" VerticalAlignment="Top" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.SelectionRects}" IsHitTestVisible="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <Grid />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:TextRect">
+                                <Rectangle Fill="#665599FF" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                           Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                           HorizontalAlignment="Left" VerticalAlignment="Top" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <!-- Committed highlights: one HighlightAnnotation can cover several lines, so this is an ItemsControl of ItemsControls. -->
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.Highlights}" IsHitTestVisible="False">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <Grid />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:HighlightAnnotation">
+                                <ItemsControl ItemsSource="{x:Bind Rects}">
+                                    <ItemsControl.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <Grid />
+                                        </ItemsPanelTemplate>
+                                    </ItemsControl.ItemsPanel>
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="viewport:TextRect">
+                                            <Rectangle Fill="#88FFFF00" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                       Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                       HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <!-- Finalized + in-progress ink strokes are managed directly in code-behind (see OnInkStrokesCollectionChanged/OnInkStrokeChanged) — Polyline points don't bind cleanly via x:Bind. -->
+                    <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
+
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.Notes}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <Grid />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="viewmodels:NoteAnnotation">
+                                <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
+                                        Margin="{x:Bind local:MainPage.Offset(X, Y)}"
+                                        HorizontalAlignment="Left" VerticalAlignment="Top">
+                                    <FontIcon Glyph="&#xE70B;" FontSize="14" />
+                                    <Button.Flyout>
+                                        <Flyout>
+                                            <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
+                                        </Flyout>
+                                    </Button.Flyout>
+                                </Button>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    </Grid>
+                </controls:CursorGrid>
+            </ScrollView>
+
+            <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="12" Padding="12" HorizontalAlignment="Center">
+                <TextBlock
+                    Text="{x:Bind ViewModel.Status, Mode=OneWay}"
+                    VerticalAlignment="Center"
+                    Style="{StaticResource BodyTextBlockStyle}" />
+                <TextBlock
+                    Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
+                    VerticalAlignment="Center"
+                    Style="{StaticResource CaptionTextBlockStyle}" />
+
+                <!-- Zoom controls -->
+                <Button Content="−" Click="ZoomOut_Click" MinWidth="32" />
+                <TextBlock x:Name="ZoomPercentText" Text="100%" VerticalAlignment="Center" Width="44" TextAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                <Button Content="+" Click="ZoomIn_Click" MinWidth="32" />
+                <Button Content="Fit Width" Click="ResetZoom_Click" />
+
+                <TextBox
+                    x:Name="SearchBox"
+                    Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}"
+                    PlaceholderText="Find on page (Ctrl+F)"
+                    Width="180"
+                    VerticalAlignment="Center" />
+                <Button Content="Re-render" Command="{x:Bind ViewModel.OpenAndRenderSampleDocumentCommand}" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Page>

@@ -1,0 +1,133 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>PdfEditorApp</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
+    <PublishProfile Condition="Exists('Properties\PublishProfiles\win-$(Platform).pubxml')">win-$(Platform).pubxml</PublishProfile>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\SplashScreen.scale-200.png" />
+    <Content Include="Assets\LockScreenLogo.scale-200.png" />
+    <Content Include="Assets\Square150x150Logo.scale-200.png" />
+    <Content Include="Assets\Square44x44Logo.scale-200.png" />
+    <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
+    <Content Include="Assets\Square44x44Logo.targetsize-48_altform-lightunplated.png" />
+    <Content Include="Assets\StoreLogo.png" />
+    <Content Include="Assets\AppIcon.ico" />
+    <Content Include="Assets\Wide310x150Logo.scale-200.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj" />
+  </ItemGroup>
+
+  <!--
+    Keep render_core.dll current. Without this the Content item below happily
+    copies whatever stale DLL happens to be sitting in target\release, so a
+    Rust edit silently would not reach the running app. cargo is incremental,
+    so this costs well under a second once warm.
+  -->
+  <Target Name="BuildRenderCore" BeforeTargets="BeforeBuild">
+    <Exec Command="cargo build --release"
+          WorkingDirectory="$(MSBuildProjectDirectory)\..\render_core"
+          ContinueOnError="false" />
+  </Target>
+
+  <!--
+    render_core.dll comes from the sibling Rust crate (..\render_core), not NuGet.
+
+    ALWAYS the release build, even for a Debug C# configuration. This used to
+    track $(Configuration), which meant a normal Debug run linked the
+    unoptimized Rust DLL — measured at roughly 16x slower (a 3000px page
+    render went 133ms release vs 2159ms debug), which is slow enough to make
+    zooming feel broken. Nothing here debugs into Rust from the C# side, so
+    there is no reason to ever load the debug cdylib; see tools\build_installer.ps1
+    and BuildRenderCore below, which keep it built.
+  -->
+  <ItemGroup>
+    <Content Include="..\render_core\target\release\render_core.dll" Condition="Exists('..\render_core\target\release\render_core.dll')">
+      <Link>render_core.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- Vendored PDFium binary (bblanchon/pdfium-binaries); see render_core/vendor/pdfium/LICENSE. -->
+    <Content Include="..\render_core\vendor\pdfium\pdfium.dll" Condition="Exists('..\render_core\vendor\pdfium\pdfium.dll')">
+      <Link>pdfium.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- Same 20-page fixture render_core's own tests use; stands in for real document loading until a file-open flow exists. Multi-page so the phase 2 thumbnail sidebar / page navigation has something to show. -->
+    <Content Include="..\render_core\tests\fixtures\sample_20pages.pdf" Condition="Exists('..\render_core\tests\fixtures\sample_20pages.pdf')">
+      <Link>sample.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!--
+    Defining the "Msix" ProjectCapability here allows the Single-project MSIX Packaging
+    Tools extension to be activated for this project even if the Windows App SDK Nuget
+    package has not yet been restored.
+  -->
+  <ItemGroup Condition="'$(DisableMsixProjectCapabilityAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
+    <ProjectCapability Include="Msix" />
+  </ItemGroup>
+
+  <!--
+    Microsoft.Windows.SDK.BuildTools.WinApp adds first-class support for
+    `dotnet run` on packaged WinUI apps: it hooks the .NET CLI Run target to
+    register a debug identity via the winapp CLI and launch the app with
+    package identity (AUMID).
+    Set <EnableWinAppRunSupport>false</EnableWinAppRunSupport> in a
+    <PropertyGroup> above to opt out.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2270" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools.WinApp" Version="0.5.0" />
+  </ItemGroup>
+
+  <!--
+    Defining the "HasPackageAndPublishMenuAddedByProject" property here allows the Solution
+    Explorer "Package and Publish" context menu entry to be enabled for this project even if
+    the Windows App SDK Nuget package has not yet been restored.
+  -->
+  <PropertyGroup Condition="'$(DisableHasPackageAndPublishMenuAddedByProject)'!='true' and '$(EnableMsixTooling)'=='true'">
+    <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
+  </PropertyGroup>
+
+  <!-- Publish Properties -->
+  <PropertyGroup>
+    <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
+    <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
+
+    <!--
+      Trimming stays OFF in every configuration.
+
+      The template turns it on for non-Debug, which builds fine and then dies
+      at startup with an access violation inside Microsoft.UI.Xaml.dll
+      (0xC0000005, then 80004003 "Invalid pointer"). WinUI resolves XAML types
+      reflectively at runtime, so the trimmer removes types nothing appears to
+      reference statically. The IL2104 "produced trim warnings" messages from
+      Microsoft.Windows.SDK.NET and WinRT.Runtime during build are the warning
+      shot for exactly this.
+
+      Re-enabling it needs a full set of TrimmerRootDescriptor entries and an
+      actual launch test, not just a green build.
+    -->
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+</Project>
