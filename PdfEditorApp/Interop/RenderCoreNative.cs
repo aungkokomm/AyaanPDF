@@ -176,6 +176,15 @@ internal static partial class RenderCoreNative
     /// Every page's size in one locked pass. The continuous viewport needs all
     /// sizes before it renders anything, so slot heights are known up front.
     /// </summary>
+    /// <summary>
+    /// Renders bypassing the tile cache entirely, in both directions. The
+    /// sharpening tier's bitmaps are large and short-lived, so caching them
+    /// would evict the whole modest base tier to hold pages about to scroll
+    /// out of view.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern RenderResult render_uncached(ulong docHandle, int pageIndex, int targetWidth);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern PageSizeArray get_page_sizes(ulong docHandle);
 

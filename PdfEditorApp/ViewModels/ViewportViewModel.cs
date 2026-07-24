@@ -486,6 +486,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private const int ReleaseBeyondPages = 6;
 
     private readonly ContinuousLayout _layout = new(pageGap: 16);
+    private readonly RenderBudget _budget = new();
+
+    /// <summary>Last viewport bounds in SLOT space, so the debounced sharpen
+    /// pass knows what was on screen when the view settled.</summary>
+    private double _lastViewTop;
+    private double _lastViewBottom;
 
     public ObservableCollection<PageSlot> PageSlots { get; } = new();
 
@@ -578,6 +584,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         double viewTop = verticalOffset / zoom;
         double viewBottom = (verticalOffset + viewportHeight) / zoom;
+        _lastViewTop = viewTop;
+        _lastViewBottom = viewBottom;
 
         var (first, last) = _layout.VisibleRange(viewTop, viewBottom);
         if (first < 0)
@@ -592,12 +600,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             OnCurrentPageChangedByScroll();
         }
 
-        int renderFrom = Math.Max(0, first - RenderAheadPages);
-        int renderTo = Math.Min(PageSlots.Count - 1, last + RenderAheadPages);
-        int keepFrom = Math.Max(0, first - ReleaseBeyondPages);
-        int keepTo = Math.Min(PageSlots.Count - 1, last + ReleaseBeyondPages);
-
-        int targetWidth = TargetRenderWidth(zoom);
+        var (renderFrom, renderTo) = RenderBudget.Widen(first, last, RenderAheadPages, PageSlots.Count);
+        var (keepFrom, keepTo) = RenderBudget.Widen(first, last, ReleaseBeyondPages, PageSlots.Count);
 
         for (int i = 0; i < PageSlots.Count; i++)
         {
@@ -606,46 +610,41 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             if (i < keepFrom || i > keepTo)
             {
                 // Outside the keep window: drop pixels, keep the slot's size.
-                if (slot.Bitmap is not null)
+                if (slot.Bitmap is not null || slot.BaseBitmap is not null)
                 {
                     slot.ReleaseBitmap();
                 }
                 continue;
             }
 
-            if (i < renderFrom || i > renderTo)
+            // Inside the keep window but outside the sharpening window: give
+            // back the expensive bitmap and show the cached base render. This
+            // is what stops hi-res bitmaps accumulating for every page already
+            // scrolled past.
+            if (slot.IsSharp && (i < first - SharpenAheadPages || i > last + SharpenAheadPages))
             {
-                continue;
+                slot.DropSharpRender();
             }
 
-            // Re-render when the zoom has moved enough that the current bitmap
-            // would visibly soften; the ratio test stops a slow zoom from
-            // re-rendering on every single frame.
-            bool needsRender = slot.Bitmap is null;
-            if (!needsRender && slot.RenderedWidth > 0)
+            if (i >= renderFrom && i <= renderTo && slot.BaseBitmap is null)
             {
-                double ratio = (double)targetWidth / slot.RenderedWidth;
-                needsRender = ratio > 1.5;
-            }
-
-            if (needsRender)
-            {
-                RenderSlot(slot, targetWidth);
+                RenderBaseTier(slot);
             }
         }
+
+        // Sharpening is deferred: during a scroll or a zoom gesture the base
+        // tier is what the user sees, and re-rasterizing on every frame would
+        // just burn the UI thread on bitmaps that are obsolete before they
+        // finish. One pass once the view settles.
+        ScheduleSharpenPass();
     }
 
     /// <summary>
-    /// Pixel width to rasterize a page at, for the current zoom. Capped so a
-    /// deep zoom on a large page cannot ask PDFium for an enormous bitmap.
+    /// Renders the cached, modest tier. Fast, shared through render_core's
+    /// tile cache, and the fallback a page returns to when it stops being
+    /// near the viewport.
     /// </summary>
-    private static int TargetRenderWidth(double zoom)
-    {
-        double onScreen = SlotLayoutWidth * zoom;
-        return (int)Math.Clamp(onScreen, 320, 3000);
-    }
-
-    private async void RenderSlot(PageSlot slot, int targetWidth)
+    private async void RenderBaseTier(PageSlot slot)
     {
         if (!slot.TryBeginRender())
         {
@@ -654,8 +653,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         ulong handle = _documentHandle;
         int pageIndex = slot.PageIndex;
+        int width = _budget.BaseWidth;
 
-        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, targetWidth));
+        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, width));
 
         // The document can be closed or replaced while a render is in flight.
         if (handle != _documentHandle)
@@ -666,12 +666,111 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (raw.Bgra is not null)
         {
-            slot.Bitmap = PageRenderer.ToBitmap(raw).Bitmap;
-            slot.RenderedWidth = raw.Width;
-            Diag.Log($"slot {pageIndex} rendered {raw.Width}x{raw.Height} {raw.Outcome}");
+            slot.SetBaseRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+            Diag.Log($"base {pageIndex}: {raw.Width}x{raw.Height} {raw.Outcome}");
         }
 
         slot.EndRender();
+    }
+
+    // ---------------- Debounced sharpening pass ----------------
+
+    private DispatcherQueueTimer? _sharpenTimer;
+
+    /// <summary>Pages either side of the viewport that are kept sharp.</summary>
+    private const int SharpenAheadPages = 1;
+
+    private void ScheduleSharpenPass()
+    {
+        _sharpenTimer ??= CreateSharpenTimer();
+        if (_sharpenTimer is null)
+        {
+            return;
+        }
+
+        // Restarting on every view change is the debounce: the pass only runs
+        // once the user stops moving.
+        _sharpenTimer.Stop();
+        _sharpenTimer.Start();
+    }
+
+    private DispatcherQueueTimer? CreateSharpenTimer()
+    {
+        var queue = _dispatcherQueue;
+        if (queue is null)
+        {
+            return null;
+        }
+
+        var timer = queue.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(180);
+        timer.IsRepeating = false;
+        timer.Tick += (s, _) =>
+        {
+            s.Stop();
+            SharpenVisiblePages();
+        };
+        return timer;
+    }
+
+    /// <summary>
+    /// Re-renders the pages actually on screen at a DPI- and zoom-aware
+    /// resolution, uncached. Only these few pages pay for a large bitmap, and
+    /// they hand it back as soon as they scroll away.
+    /// </summary>
+    private void SharpenVisiblePages()
+    {
+        if (_documentHandle == 0 || PageSlots.Count == 0)
+        {
+            return;
+        }
+
+        var (first, last) = _layout.VisibleRange(_lastViewTop, _lastViewBottom);
+        if (first < 0)
+        {
+            return;
+        }
+
+        var (from, to) = RenderBudget.Widen(first, last, SharpenAheadPages, PageSlots.Count);
+
+        for (int i = from; i <= to; i++)
+        {
+            var slot = PageSlots[i];
+            double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
+            int desired = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
+
+            if (_budget.ShouldResharpen(slot.RenderedWidth, desired))
+            {
+                SharpenSlot(slot, desired);
+            }
+        }
+    }
+
+    private async void SharpenSlot(PageSlot slot, int targetWidth)
+    {
+        if (!slot.TryBeginSharpen())
+        {
+            return;
+        }
+
+        ulong handle = _documentHandle;
+        int pageIndex = slot.PageIndex;
+
+        var raw = await Task.Run(() => PageRenderer.RenderUncachedRaw(handle, pageIndex, targetWidth));
+
+        if (handle != _documentHandle)
+        {
+            slot.EndSharpen();
+            return;
+        }
+
+        if (raw.Bgra is not null)
+        {
+            slot.SetSharpRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+            Diag.Log($"sharpened {pageIndex} to {raw.Width}x{raw.Height}");
+        }
+
+        slot.EndSharpen();
     }
 
     /// <summary>

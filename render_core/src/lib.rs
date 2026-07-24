@@ -1106,6 +1106,42 @@ fn render_low_res_inner(doc_handle: u64, page_index: i32, target_width: i32) -> 
     }
 }
 
+/// Renders a page WITHOUT touching the tile cache, in either direction: it
+/// neither serves from the cache nor stores what it produces.
+///
+/// This is the sharpening tier for the continuous viewport. Those bitmaps are
+/// huge (a page at deep zoom can be tens of megabytes) and are wanted for
+/// exactly as long as the page is near the viewport, so caching them would
+/// evict the entire modest base tier to hold a couple of pages the user is
+/// about to scroll past. Bypassing the cache keeps the sharpening tier's
+/// memory owned by the caller, which drops it the moment the page leaves.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_uncached(doc_handle: u64, page_index: i32, target_width: i32) -> RenderResult {
+    if target_width <= 0 {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| render_uncached_inner(doc_handle, page_index, target_width))
+        .unwrap_or_else(|_| RenderResult::failure(STATUS_PANIC))
+}
+
+fn render_uncached_inner(doc_handle: u64, page_index: i32, target_width: i32) -> RenderResult {
+    let rendered = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let result = doc.as_ref().and_then(|d| {
+            let guard = lock(&d);
+            render_page_via_pdfium(&guard, page_index, target_width)
+        });
+        drop(doc);
+        result
+    };
+
+    match rendered {
+        Some((width, height, bytes)) => buffer_to_result(width, height, bytes, STATUS_OK_PDFIUM),
+        None => RenderResult::failure(STATUS_INVALID_INPUT),
+    }
+}
+
 // ---------------------------------------------------------------------
 // High-res tier: async, cancellable.
 // ---------------------------------------------------------------------
@@ -2099,6 +2135,61 @@ mod tests {
             free_render_result(res);
             close_document(handle);
         }
+    }
+
+    #[test]
+    fn render_uncached_produces_a_real_page_without_populating_the_cache() {
+        // The sharpening tier must not evict the base tier. A huge bitmap that
+        // landed in the cache would push every modest tile out.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let width = 613; // distinctive, so the key cannot collide with another test
+
+        let key = TileKey { doc: handle, page: 0, tier: Tier::Low, width };
+        assert!(lock(&core().cache).get(&key).is_none(), "precondition: nothing cached yet");
+
+        let r = render_uncached(handle, 0, width);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        assert_eq!(r.width, width);
+        assert!(r.len > 0);
+        free_render_result(r);
+
+        assert!(
+            lock(&core().cache).get(&key).is_none(),
+            "render_uncached must not store its result in the tile cache"
+        );
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_uncached_does_not_serve_a_stale_cached_tile() {
+        // It must also not READ the cache: a sharpen pass asking for width W
+        // has to get a genuine W-wide render, not whatever the base tier
+        // happened to leave under that key.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let width = 617;
+
+        // Poison the cache with a wrong-sized tile under the exact key.
+        lock(&core().cache).put(
+            TileKey { doc: handle, page: 0, tier: Tier::Low, width },
+            CachedTile { width: 4, height: 4, bytes: Arc::from(vec![7u8; 4 * 4 * 4]) },
+        );
+
+        let r = render_uncached(handle, 0, width);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        assert_eq!(r.width, width, "served the poisoned cache entry instead of rendering");
+        free_render_result(r);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_uncached_rejects_bad_input() {
+        assert_eq!(render_uncached(0, 0, 100).status, STATUS_INVALID_INPUT);
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(render_uncached(handle, 0, 0).status, STATUS_INVALID_INPUT);
+        assert_eq!(render_uncached(handle, 9999, 100).status, STATUS_INVALID_INPUT);
+        close_document(handle);
     }
 
     #[test]

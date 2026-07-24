@@ -53,9 +53,77 @@ public partial class PageSlot : ObservableObject
     public double OverlayScale => SlotWidth;
 
     private bool _isRendering;
+    private bool _isSharpening;
 
-    /// <summary>The width, in pixels, the current <see cref="Bitmap"/> was rendered at.</summary>
+    /// <summary>The width, in pixels, the displayed <see cref="Bitmap"/> was rendered at.</summary>
     public int RenderedWidth { get; set; }
+
+    /// <summary>
+    /// The cached base render, kept even while a sharp one is displayed, so a
+    /// page that stops being near the viewport can drop its expensive bitmap
+    /// and fall straight back to this without a blank flash or a re-render.
+    /// </summary>
+    public WriteableBitmap? BaseBitmap { get; private set; }
+
+    public int BaseWidth { get; private set; }
+
+    /// <summary>True while a sharper-than-base render is on display.</summary>
+    public bool IsSharp { get; private set; }
+
+    /// <summary>Records a base-tier render and shows it unless a sharp one is already up.</summary>
+    public void SetBaseRender(WriteableBitmap? bitmap, int width)
+    {
+        BaseBitmap = bitmap;
+        BaseWidth = width;
+
+        if (!IsSharp)
+        {
+            Bitmap = bitmap;
+            RenderedWidth = width;
+        }
+    }
+
+    public void SetSharpRender(WriteableBitmap? bitmap, int width)
+    {
+        if (bitmap is null)
+        {
+            return;
+        }
+
+        Bitmap = bitmap;
+        RenderedWidth = width;
+        IsSharp = true;
+    }
+
+    /// <summary>
+    /// Drops the sharp bitmap and shows the base render again. Called when a
+    /// page leaves the sharpening window, which is what stops hi-res bitmaps
+    /// accumulating for every page the user has scrolled past.
+    /// </summary>
+    public void DropSharpRender()
+    {
+        if (!IsSharp)
+        {
+            return;
+        }
+
+        IsSharp = false;
+        Bitmap = BaseBitmap;
+        RenderedWidth = BaseWidth;
+    }
+
+    public bool TryBeginSharpen()
+    {
+        if (_isSharpening)
+        {
+            return false;
+        }
+
+        _isSharpening = true;
+        return true;
+    }
+
+    public void EndSharpen() => _isSharpening = false;
 
     public PageSlot(int pageIndex, double slotWidth, double slotHeight)
     {
@@ -83,10 +151,13 @@ public partial class PageSlot : ObservableObject
 
     public void EndRender() => _isRendering = false;
 
-    /// <summary>Drops the bitmap but keeps the slot's size.</summary>
+    /// <summary>Drops every bitmap but keeps the slot's size.</summary>
     public void ReleaseBitmap()
     {
         Bitmap = null;
+        BaseBitmap = null;
         RenderedWidth = 0;
+        BaseWidth = 0;
+        IsSharp = false;
     }
 }

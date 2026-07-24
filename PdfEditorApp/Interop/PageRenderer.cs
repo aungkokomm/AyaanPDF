@@ -41,6 +41,10 @@ internal static class PageRenderer
     public static RawPageRender RenderLowResRaw(ulong docHandle, int pageIndex, int targetWidth) =>
         ToRaw(RenderCoreNative.render_low_res(docHandle, pageIndex, targetWidth));
 
+    /// <summary>The sharpening tier: renders without touching the tile cache.</summary>
+    public static RawPageRender RenderUncachedRaw(ulong docHandle, int pageIndex, int targetWidth) =>
+        ToRaw(RenderCoreNative.render_uncached(docHandle, pageIndex, targetWidth));
+
     public static RawPageRender PollHighResRaw(ulong requestId)
     {
         int status = RenderCoreNative.poll_high_res(requestId, out RenderResult result);
