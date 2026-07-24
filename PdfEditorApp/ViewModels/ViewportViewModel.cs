@@ -4,6 +4,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -200,6 +201,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Notes.Clear();
         InkStrokes.Clear();
 
+        // A fresh document has no history and no unsaved edits. A reload after
+        // a burn/save (preserveAnnotations) is also a clean slate: those marks
+        // are now baked into the page content, so there is nothing to undo.
+        _history.Clear();
+        IsDirty = false;
+        NotifyHistoryChanged();
+
         if (_documentHandle == 0)
         {
             PageCount = 0;
@@ -233,11 +241,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void RotateCurrentPage(int degrees)
     {
-        if (_documentHandle == 0 ||
-            RenderCoreNative.rotate_page(_documentHandle, CurrentPageIndex, degrees) != RenderStatus.OkPdfium)
+        if (_documentHandle == 0)
         {
             return;
         }
+
+        // Snapshot before the rotate, since it restructures the page tree.
+        PushHistory(HistoryScope.Document, "Rotate page");
+
+        if (RenderCoreNative.rotate_page(_documentHandle, CurrentPageIndex, degrees) != RenderStatus.OkPdfium)
+        {
+            return;
+        }
+
+        IsDirty = true;
 
         var thumb = PageRenderer.RenderLowRes(_documentHandle, CurrentPageIndex, ThumbnailWidth);
         Thumbnails[CurrentPageIndex].Bitmap = thumb.Bitmap;
@@ -247,12 +264,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Deletes the current page. Refuses to delete the last remaining page.</summary>
     public void DeleteCurrentPage()
     {
-        if (_documentHandle == 0 || PageCount <= 1 ||
-            RenderCoreNative.delete_page(_documentHandle, CurrentPageIndex) != RenderStatus.OkPdfium)
+        if (_documentHandle == 0 || PageCount <= 1)
         {
             return;
         }
 
+        // A delete cannot be reversed object-by-object, so snapshot first.
+        PushHistory(HistoryScope.Document, "Delete page");
+
+        if (RenderCoreNative.delete_page(_documentHandle, CurrentPageIndex) != RenderStatus.OkPdfium)
+        {
+            return;
+        }
+
+        IsDirty = true;
         PageCount--;
 
         // Later pages all shifted down one, so cached thumbnails (rendered at
@@ -312,6 +337,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             int page = CurrentPageIndex;
             OpenDocument(reloadFrom, preserveAnnotations: !reloadedFromSaved);
             GoToPage(Math.Min(page, Math.Max(0, PageCount - 1)));
+        }
+
+        if (saved)
+        {
+            // On disk and in memory now agree. OpenDocument already cleared
+            // this on the burn path; this covers a save with no burnable marks
+            // (e.g. only page rotations/deletes).
+            IsDirty = false;
         }
 
         return saved;
@@ -511,12 +544,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        PushHistory(HistoryScope.Annotations, "Highlight");
         var highlight = new HighlightAnnotation(
             CurrentPageIndex,
             rects.Select(NormRect).ToList(),
             "#FFFF00");
         _allHighlights.Add(highlight);
         Highlights.Add(highlight);
+        IsDirty = true;
         ClearSelection();
     }
 
@@ -576,6 +611,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_currentStroke is { Count: > 1 })
         {
+            PushHistory(HistoryScope.Annotations, "Draw");
             var stroke = new InkStrokeAnnotation(
                 CurrentPageIndex,
                 new List<(double X, double Y)>(_currentStroke),
@@ -583,6 +619,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 Norm(2.0));
             _allInkStrokes.Add(stroke);
             InkStrokes.Add(stroke);
+            IsDirty = true;
         }
 
         _currentStroke = null;
@@ -591,9 +628,134 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void AddNoteAt(double x, double y)
     {
+        PushHistory(HistoryScope.Annotations, "Add note");
         var note = new NoteAnnotation(CurrentPageIndex, Norm(x), Norm(y), string.Empty);
         _allNotes.Add(note);
         Notes.Add(note);
+        IsDirty = true;
+    }
+
+    // ---------------- Undo / redo ----------------
+
+    private readonly DocumentHistory _history = new();
+
+    public bool CanUndo => _history.CanUndo;
+    public bool CanRedo => _history.CanRedo;
+
+    /// <summary>Menu text, e.g. "Undo Delete page". Falls back to plain "Undo".</summary>
+    public string UndoLabel => _history.NextUndoLabel is { } l ? $"Undo {l}" : "Undo";
+
+    public string RedoLabel => _history.NextRedoLabel is { } l ? $"Redo {l}" : "Redo";
+
+    /// <summary>True when there are edits not yet written to disk.</summary>
+    [ObservableProperty]
+    public partial bool IsDirty { get; set; }
+
+    private void NotifyHistoryChanged()
+    {
+        OnPropertyChanged(nameof(CanUndo));
+        OnPropertyChanged(nameof(CanRedo));
+        OnPropertyChanged(nameof(UndoLabel));
+        OnPropertyChanged(nameof(RedoLabel));
+    }
+
+    /// <summary>
+    /// Snapshots the state an undo step would restore. Annotation scope copies
+    /// the three overlay lists; document scope serializes the whole PDF, which
+    /// is the only way to reverse a page delete or rotation.
+    /// </summary>
+    private HistoryEntry Capture(HistoryScope scope, string label)
+    {
+        byte[]? bytes = null;
+        if (scope == HistoryScope.Document && _documentHandle != 0)
+        {
+            var buffer = RenderCoreNative.snapshot_document(_documentHandle);
+            if (buffer.Status == RenderStatus.OkPdfium && buffer.Data != IntPtr.Zero && buffer.Len > 0)
+            {
+                bytes = new byte[(int)buffer.Len];
+                Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+            }
+            RenderCoreNative.free_byte_buffer(buffer);
+        }
+
+        return new HistoryEntry
+        {
+            Scope = scope,
+            Label = label,
+            WasDirty = IsDirty,
+            PageIndex = CurrentPageIndex,
+            DocumentBytes = bytes,
+            // Highlights and ink are immutable records, so copying the list is
+            // a real snapshot. Notes are mutable (their text is edited after
+            // creation), so their VALUES are captured instead.
+            Highlights = _allHighlights.ToList(),
+            InkStrokes = _allInkStrokes.ToList(),
+            Notes = _allNotes.Select(n => new NoteState(n.PageIndex, n.X, n.Y, n.Text)).ToList(),
+        };
+    }
+
+    /// <summary>Records the pre-edit state. Call immediately BEFORE mutating.</summary>
+    private void PushHistory(HistoryScope scope, string label)
+    {
+        _history.Push(Capture(scope, label));
+        NotifyHistoryChanged();
+    }
+
+    public void Undo()
+    {
+        if (_history.Undo(Capture) is { } target)
+        {
+            ApplyHistoryEntry(target);
+        }
+    }
+
+    public void Redo()
+    {
+        if (_history.Redo(Capture) is { } target)
+        {
+            ApplyHistoryEntry(target);
+        }
+    }
+
+    /// <summary>
+    /// The single apply path shared by undo and redo. Restores whatever the
+    /// entry holds; an asymmetry between the two directions is not expressible
+    /// because neither has its own restore code.
+    /// </summary>
+    private void ApplyHistoryEntry(HistoryEntry entry)
+    {
+        if (entry.Scope == HistoryScope.Document && entry.DocumentBytes is { Length: > 0 })
+        {
+            ulong restored = RenderCoreNative.open_document_from_bytes(
+                entry.DocumentBytes, (nuint)entry.DocumentBytes.Length);
+
+            if (restored != 0)
+            {
+                CloseCurrentDocument();
+                _documentHandle = restored;
+
+                PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
+                Thumbnails.Clear();
+                for (int i = 0; i < PageCount; i++)
+                {
+                    Thumbnails.Add(new PageThumbnail(i));
+                }
+            }
+        }
+
+        _allHighlights.Clear();
+        _allHighlights.AddRange(entry.Highlights);
+        _allInkStrokes.Clear();
+        _allInkStrokes.AddRange(entry.InkStrokes);
+        _allNotes.Clear();
+        _allNotes.AddRange(entry.Notes.Select(n => new NoteAnnotation(n.PageIndex, n.X, n.Y, n.Text)));
+
+        CurrentPageIndex = Math.Clamp(entry.PageIndex, 0, Math.Max(0, PageCount - 1));
+        IsDirty = entry.WasDirty;
+
+        RefreshAnnotationsForCurrentPage();
+        RenderCurrentPage();
+        NotifyHistoryChanged();
     }
 
     private void RefreshAnnotationsForCurrentPage()

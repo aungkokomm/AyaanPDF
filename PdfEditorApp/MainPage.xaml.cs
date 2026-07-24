@@ -190,6 +190,10 @@ public sealed partial class MainPage : Page
 
     // ---------------- Page operations ----------------
 
+    private void Undo_Click(object sender, RoutedEventArgs e) => ViewModel.Undo();
+
+    private void Redo_Click(object sender, RoutedEventArgs e) => ViewModel.Redo();
+
     private void RotatePage_Click(object sender, RoutedEventArgs e) => ViewModel.RotateCurrentPage(90);
 
     private void DeletePage_Click(object sender, RoutedEventArgs e) => ViewModel.DeleteCurrentPage();

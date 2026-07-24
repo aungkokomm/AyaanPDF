@@ -429,6 +429,97 @@ fn save_document_inner(doc_handle: u64, path: *const c_char) -> i32 {
     }
 }
 
+/// An owned byte buffer handed across the FFI boundary. Must be released with
+/// `free_byte_buffer`. A non-zero `status` means `data` is null.
+#[repr(C)]
+pub struct ByteBuffer {
+    pub data: *mut u8,
+    pub len: usize,
+    pub status: i32,
+}
+
+impl ByteBuffer {
+    fn err(status: i32) -> Self {
+        ByteBuffer { data: std::ptr::null_mut(), len: 0, status }
+    }
+}
+
+/// Serializes the whole document to memory. This is the document-level undo
+/// snapshot: page deletes and rotations restructure the document in ways no
+/// per-object inverse can express, so the only reliable undo is to keep the
+/// bytes and reopen them.
+#[unsafe(no_mangle)]
+pub extern "C" fn snapshot_document(doc_handle: u64) -> ByteBuffer {
+    if doc_handle == 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| snapshot_document_inner(doc_handle))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn snapshot_document_inner(doc_handle: u64) -> ByteBuffer {
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+    let Ok(bytes) = doc_guard.save_to_bytes() else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    // Hand ownership to the caller as a boxed slice, so free_byte_buffer can
+    // reconstruct it with the exact same layout.
+    let mut boxed = bytes.into_boxed_slice();
+    let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Releases a buffer returned by `snapshot_document`. Safe to call on an
+/// error buffer (null data).
+#[unsafe(no_mangle)]
+pub extern "C" fn free_byte_buffer(buffer: ByteBuffer) {
+    if buffer.data.is_null() || buffer.len == 0 {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(std::slice::from_raw_parts_mut(buffer.data, buffer.len));
+    }
+}
+
+/// Opens a document from an in-memory snapshot, yielding a fresh handle. The
+/// bytes are copied, so the caller keeps ownership of its own buffer and can
+/// restore the same snapshot repeatedly (undo, redo, undo again).
+#[unsafe(no_mangle)]
+pub extern "C" fn open_document_from_bytes(data: *const u8, len: usize) -> u64 {
+    if data.is_null() || len == 0 {
+        return 0;
+    }
+    panic::catch_unwind(|| open_document_from_bytes_inner(data, len)).unwrap_or(0)
+}
+
+fn open_document_from_bytes_inner(data: *const u8, len: usize) -> u64 {
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+
+    let document = {
+        let _guard = lock(&CALL_LOCK);
+        let Some(pdfium) = pdfium() else {
+            return 0;
+        };
+        let Ok(document) = pdfium.load_pdf_from_byte_vec(bytes, None) else {
+            return 0;
+        };
+        document
+    };
+
+    let core = core();
+    let id = core.next_doc_id.fetch_add(1, Ordering::Relaxed);
+    lock(&core.documents).insert(id, Arc::new(Mutex::new(document)));
+    id
+}
+
 // ---------------------------------------------------------------------
 // Annotation burning: flatten overlay annotations into real page content.
 //
@@ -1926,6 +2017,80 @@ mod tests {
             free_render_result(res);
             close_document(handle);
         }
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trips_a_page_delete() {
+        // The document-level undo path. Delete a page, and the snapshot taken
+        // beforehand must still reopen with the original page count.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = get_page_count(handle);
+
+        let snap = snapshot_document(handle);
+        assert_eq!(snap.status, STATUS_OK_PDFIUM);
+        assert!(snap.len > 0, "snapshot should not be empty");
+
+        assert_eq!(delete_page(handle, 3), STATUS_OK_PDFIUM);
+        assert_eq!(get_page_count(handle), before - 1);
+
+        let restored = open_document_from_bytes(snap.data, snap.len);
+        assert_ne!(restored, 0, "snapshot should reopen");
+        assert_eq!(get_page_count(restored), before, "undo must bring the page back");
+
+        // Restoring twice from the same snapshot must work: undo, redo, undo
+        // all replay the same bytes, so the buffer cannot be consumed.
+        let restored_again = open_document_from_bytes(snap.data, snap.len);
+        assert_ne!(restored_again, 0);
+        assert_eq!(get_page_count(restored_again), before);
+
+        close_document(restored);
+        close_document(restored_again);
+        close_document(handle);
+        free_byte_buffer(snap);
+    }
+
+    #[test]
+    fn snapshot_captures_burned_annotations() {
+        // Annotation undo at document granularity: a snapshot taken BEFORE a
+        // burn must reopen without the burned objects.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let clean = snapshot_document(handle);
+        let before = page_object_count(handle, 0);
+
+        let rects = [BurnRect {
+            page_index: 0,
+            left: 100.0, top: 100.0, right: 500.0, bottom: 200.0,
+            r: 255, g: 255, b: 0, a: 128,
+        }];
+        assert_eq!(
+            burn_annotations(handle, 1000, rects.as_ptr(), rects.len(),
+                             std::ptr::null(), 0, std::ptr::null(), 0),
+            STATUS_OK_PDFIUM
+        );
+        assert_eq!(page_object_count(handle, 0), before + 1);
+
+        let restored = open_document_from_bytes(clean.data, clean.len);
+        assert_eq!(
+            page_object_count(restored, 0), before,
+            "restoring the pre-burn snapshot should drop the burned object"
+        );
+
+        close_document(restored);
+        close_document(handle);
+        free_byte_buffer(clean);
+    }
+
+    #[test]
+    fn snapshot_apis_reject_bad_input() {
+        assert_eq!(snapshot_document(0).status, STATUS_INVALID_INPUT);
+        assert_eq!(open_document_from_bytes(std::ptr::null(), 10), 0);
+        let one = [0u8];
+        assert_eq!(open_document_from_bytes(one.as_ptr(), 0), 0);
+        // Not a PDF at all.
+        let garbage = *b"this is not a pdf";
+        assert_eq!(open_document_from_bytes(garbage.as_ptr(), garbage.len()), 0);
+        // Freeing an error buffer must not crash.
+        free_byte_buffer(ByteBuffer::err(STATUS_INVALID_INPUT));
     }
 
     #[test]

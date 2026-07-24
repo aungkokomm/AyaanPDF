@@ -64,6 +64,22 @@
                     <MenuFlyoutSeparator />
                     <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
                 </MenuBarItem>
+                <MenuBarItem Title="Edit">
+                    <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}"
+                                    Click="Undo_Click"
+                                    IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Control" Key="Z" />
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                    <MenuFlyoutItem Text="{x:Bind ViewModel.RedoLabel, Mode=OneWay}"
+                                    Click="Redo_Click"
+                                    IsEnabled="{x:Bind ViewModel.CanRedo, Mode=OneWay}">
+                        <MenuFlyoutItem.KeyboardAccelerators>
+                            <KeyboardAccelerator Modifiers="Control" Key="Y" />
+                        </MenuFlyoutItem.KeyboardAccelerators>
+                    </MenuFlyoutItem>
+                </MenuBarItem>
                 <MenuBarItem Title="View">
                     <MenuFlyoutItem Text="Zoom In" Click="ZoomIn_Click" />
                     <MenuFlyoutItem Text="Zoom Out" Click="ZoomOut_Click" />

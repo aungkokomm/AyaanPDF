@@ -74,6 +74,18 @@ internal struct BurnStroke
     public byte A;
 }
 
+/// <summary>
+/// Mirrors render_core::ByteBuffer (src/lib.rs). Must be released with
+/// <see cref="RenderCoreNative.free_byte_buffer"/>.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct ByteBuffer
+{
+    public IntPtr Data;
+    public nuint Len;
+    public int Status;
+}
+
 /// <summary>Mirrors render_core::{STATUS_*} (src/lib.rs).</summary>
 internal static class RenderStatus
 {
@@ -142,6 +154,24 @@ internal static partial class RenderCoreNative
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int get_form_field_count(ulong docHandle);
+
+    /// <summary>
+    /// Serializes the whole document to memory: the document-level undo
+    /// snapshot. Page deletes and rotations restructure the PDF in ways no
+    /// per-object inverse can express.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer snapshot_document(ulong docHandle);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void free_byte_buffer(ByteBuffer buffer);
+
+    /// <summary>
+    /// Reopens a snapshot. The bytes are copied natively, so the same managed
+    /// array can be restored repeatedly (undo, redo, undo again).
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong open_document_from_bytes([In] byte[] data, nuint len);
 
     /// <summary>
     /// Flattens annotations into page content. Must be followed by a save to
