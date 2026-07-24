@@ -37,8 +37,16 @@ VersionInfoVersion={#AppVersion}
 ; Per-user install so no admin/UAC prompt is needed. Combined with the visible
 ; destination page below, this also allows a separate PORTABLE instance to be
 ; installed to any folder (a USB stick, a test directory) alongside the main one.
+;
+; Deliberately NO PrivilegesRequiredOverridesAllowed. It used to be "dialog",
+; which asks the user to choose all-users vs just-me — but a silent install has
+; nobody to ask, so it silently chose ALL-USERS: app files landed in the
+; per-user folder while the shortcuts went to the common Start Menu and the
+; uninstall entry to HKLM. A half-per-user, half-machine-wide install, and it
+; needed UAC. Omitting the directive pins it to per-user everywhere, which is
+; consistent and never prompts. The destination page still allows a portable
+; install to any writable folder.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 UsePreviousAppDir=yes
 DisableDirPage=no
 DisableProgramGroupPage=yes
