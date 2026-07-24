@@ -99,6 +99,14 @@
                 <!-- Page operations (phase 5) -->
                 <Button Content="Rotate 90°" Click="RotatePage_Click" Margin="24,0,0,0" />
                 <Button Content="Delete Page" Click="DeletePage_Click" />
+
+                <!-- Unsaved-changes marker: visible while IsDirty. -->
+                <TextBlock Text="● Unsaved"
+                           Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                           VerticalAlignment="Center"
+                           Margin="24,0,0,0"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Visibility="{x:Bind ViewModel.DirtyIndicatorVisibility, Mode=OneWay}" />
             </StackPanel>
 
             <!--

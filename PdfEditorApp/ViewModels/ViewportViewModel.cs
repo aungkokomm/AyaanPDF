@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media.Imaging;
 using PdfEditorApp.Interop;
 using PdfEditorApp.Viewport;
@@ -651,6 +652,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>True when there are edits not yet written to disk.</summary>
     [ObservableProperty]
     public partial bool IsDirty { get; set; }
+
+    /// <summary>
+    /// Visibility of the "unsaved" marker. Exposed as a Visibility rather than
+    /// binding IsDirty through a converter, to keep the XAML converter-free
+    /// like the rest of this view.
+    /// </summary>
+    public Visibility DirtyIndicatorVisibility =>
+        IsDirty ? Visibility.Visible : Visibility.Collapsed;
+
+    partial void OnIsDirtyChanged(bool value) =>
+        OnPropertyChanged(nameof(DirtyIndicatorVisibility));
 
     private void NotifyHistoryChanged()
     {

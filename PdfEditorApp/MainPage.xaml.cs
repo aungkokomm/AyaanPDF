@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
+using System.Threading.Tasks;
 using Microsoft.UI;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
@@ -143,7 +144,14 @@ public sealed partial class MainPage : Page
         Debug.WriteLine($"[MainPage] Opened \"{file.Path}\"");
     }
 
-    private async void SaveAs_Click(object sender, RoutedEventArgs e)
+    private async void SaveAs_Click(object sender, RoutedEventArgs e) => await SaveAsAsync();
+
+    /// <summary>
+    /// Runs the Save As picker and save. Returns true only when the user
+    /// picked a file and it saved, so the close prompt can tell a completed
+    /// save from a cancelled picker.
+    /// </summary>
+    private async Task<bool> SaveAsAsync()
     {
         var picker = new Windows.Storage.Pickers.FileSavePicker();
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
@@ -154,14 +162,55 @@ public sealed partial class MainPage : Page
         var file = await picker.PickSaveFileAsync();
         if (file is null)
         {
-            return;
+            return false;
         }
 
         bool saved = ViewModel.SaveDocumentAs(file.Path);
         Debug.WriteLine($"[MainPage] Save As \"{file.Path}\" -> {(saved ? "ok" : "failed")}");
+        return saved;
     }
 
     private void Exit_Click(object sender, RoutedEventArgs e) => App.Window.Close();
+
+    /// <summary>
+    /// Decides whether the window may close, prompting to save unsaved edits.
+    /// Returns true to proceed with closing, false to keep the window open.
+    ///
+    /// Called from MainWindow's Closing handler, which cancels the close up
+    /// front and re-issues it only if this returns true, because a Closing
+    /// handler cannot await a dialog before setting Cancel.
+    /// </summary>
+    public async Task<bool> ConfirmCloseAsync()
+    {
+        if (!ViewModel.IsDirty)
+        {
+            return true;
+        }
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Unsaved changes",
+            Content = "This document has changes that have not been saved. "
+                      + "Save them before closing?",
+            PrimaryButtonText = "Save",
+            SecondaryButtonText = "Don't save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+
+        var result = await dialog.ShowAsync();
+        return result switch
+        {
+            // Save: only close if the save actually went through. A cancelled
+            // picker leaves the document open and unsaved.
+            ContentDialogResult.Primary => await SaveAsAsync(),
+            // Don't save: discard and close.
+            ContentDialogResult.Secondary => true,
+            // Cancel (or dismissed): stay open.
+            _ => false,
+        };
+    }
 
     // ---------------- View menu / zoom toolbar ----------------
 
