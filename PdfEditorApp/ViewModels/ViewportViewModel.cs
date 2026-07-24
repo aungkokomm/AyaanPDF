@@ -896,6 +896,175 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    // ---------------- Annotation layer: select, move, delete ----------------
+
+    /// <summary>
+    /// The selected annotation's id, or null. Held as an id rather than a
+    /// reference because annotations are immutable records: moving one
+    /// produces a new instance, and a reference would go stale mid-drag.
+    /// </summary>
+    private Guid? _selectedAnnotationId;
+
+    /// <summary>Where the current move gesture started, in normalized units.</summary>
+    private (double X, double Y)? _moveOrigin;
+
+    public bool HasSelectedAnnotation => _selectedAnnotationId is not null;
+
+    /// <summary>Every annotation, in draw order, as the layer stack.</summary>
+    private List<IAnnotation> AllAnnotations()
+    {
+        var all = new List<IAnnotation>(_allHighlights.Count + _allInkStrokes.Count);
+        all.AddRange(_allHighlights);
+        all.AddRange(_allInkStrokes);
+        return all;
+    }
+
+    /// <summary>
+    /// Selects the topmost annotation under a normalized page-local point,
+    /// or clears the selection when the point is empty. Returns true if
+    /// something was selected, so the caller knows a drag should move it
+    /// rather than start a new mark.
+    /// </summary>
+    public bool SelectAnnotationAt(int pageIndex, double normX, double normY)
+    {
+        var hit = AnnotationHitTester.HitTest(AllAnnotations(), pageIndex, normX, normY);
+        _selectedAnnotationId = hit?.Id;
+        _moveOrigin = hit is not null ? (normX, normY) : null;
+
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        return hit is not null;
+    }
+
+    public void ClearAnnotationSelection()
+    {
+        if (_selectedAnnotationId is null)
+        {
+            return;
+        }
+
+        _selectedAnnotationId = null;
+        _moveOrigin = null;
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+    }
+
+    /// <summary>
+    /// Drags the selected annotation to a new normalized point.
+    ///
+    /// The whole gesture is ONE undo step: history is pushed on the first
+    /// move, not on every pointer sample, or dragging a mark across a page
+    /// would bury the undo stack under hundreds of entries.
+    /// </summary>
+    public void MoveSelectedAnnotationTo(double normX, double normY)
+    {
+        if (_selectedAnnotationId is not Guid id || _moveOrigin is not (double ox, double oy))
+        {
+            return;
+        }
+
+        double dx = normX - ox;
+        double dy = normY - oy;
+        if (dx == 0 && dy == 0)
+        {
+            return;
+        }
+
+        if (!_isMovingAnnotation)
+        {
+            PushHistory(HistoryScope.Annotations, "Move annotation");
+            _isMovingAnnotation = true;
+        }
+
+        ReplaceAnnotation(id, a => a.Translate(dx, dy));
+        _moveOrigin = (normX, normY);
+        IsDirty = true;
+
+        DistributeAnnotationsToSlots();
+        RefreshSelectionOutline();
+    }
+
+    private bool _isMovingAnnotation;
+
+    /// <summary>Ends a move gesture, so the next one starts a fresh undo step.</summary>
+    public void EndAnnotationMove()
+    {
+        _isMovingAnnotation = false;
+        _moveOrigin = null;
+    }
+
+    public void DeleteSelectedAnnotation()
+    {
+        if (_selectedAnnotationId is not Guid id)
+        {
+            return;
+        }
+
+        int removed = _allHighlights.RemoveAll(h => h.Id == id) + _allInkStrokes.RemoveAll(s => s.Id == id);
+        if (removed == 0)
+        {
+            return;
+        }
+
+        PushHistory(HistoryScope.Annotations, "Delete annotation");
+        _selectedAnnotationId = null;
+        _moveOrigin = null;
+        IsDirty = true;
+
+        DistributeAnnotationsToSlots();
+        RefreshAnnotationsForCurrentPage();
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+    }
+
+    private void ReplaceAnnotation(Guid id, Func<IAnnotation, IAnnotation> edit)
+    {
+        for (int i = 0; i < _allHighlights.Count; i++)
+        {
+            if (_allHighlights[i].Id == id)
+            {
+                _allHighlights[i] = (HighlightAnnotation)edit(_allHighlights[i]);
+                return;
+            }
+        }
+
+        for (int i = 0; i < _allInkStrokes.Count; i++)
+        {
+            if (_allInkStrokes[i].Id == id)
+            {
+                _allInkStrokes[i] = (InkStrokeAnnotation)edit(_allInkStrokes[i]);
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Puts a marquee around the selected annotation, on its page's card. The
+    /// outline is a plain rect collection rather than per-annotation state, so
+    /// nothing in the annotation templates has to know about selection.
+    /// </summary>
+    private void RefreshSelectionOutline()
+    {
+        foreach (var slot in PageSlots)
+        {
+            slot.SelectionOutline.Clear();
+        }
+
+        if (_selectedAnnotationId is not Guid id)
+        {
+            return;
+        }
+
+        var selected = AllAnnotations().FirstOrDefault(a => a.Id == id);
+        if (selected is null)
+        {
+            return;
+        }
+
+        SlotFor(selected.PageIndex)?.SelectionOutline.Add(selected.Bounds);
+        InkStrokeChanged?.Invoke();
+    }
+
     /// <summary>The card owning a page, or null if the index is out of range.</summary>
     private PageSlot? SlotFor(int pageIndex) =>
         pageIndex >= 0 && pageIndex < PageSlots.Count ? PageSlots[pageIndex] : null;

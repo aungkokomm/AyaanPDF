@@ -33,6 +33,7 @@ public sealed partial class MainPage : Page
     private bool _isCtrlDown;
     private bool _isSelectingText;
     private bool _isDrawing;
+    private bool _isMovingAnnotation;
     private uint _dragPointerId;
     private Polyline? _livePreviewStroke;
 
@@ -459,6 +460,17 @@ public sealed partial class MainPage : Page
                 ToggleThumbnails();
                 e.Handled = true;
                 break;
+
+            case VirtualKey.Delete:
+            case VirtualKey.Back:
+                ViewModel.DeleteSelectedAnnotation();
+                e.Handled = true;
+                break;
+
+            case VirtualKey.Escape:
+                ViewModel.ClearAnnotationSelection();
+                e.Handled = true;
+                break;
         }
     }
 
@@ -552,10 +564,35 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
+        // Normalized page-local coordinates, which is the space annotations
+        // live in.
+        double nx = content.X / ViewModel.OverlayScale;
+        double ny = content.Y / ViewModel.OverlayScale;
+
         switch (ViewModel.ActiveTool)
         {
             case ToolMode.Select:
+                // A click on an existing mark picks it up; a click on empty
+                // space falls through to text selection. That is what makes
+                // annotations objects rather than paint.
+                if (ViewModel.SelectAnnotationAt(content.Page, nx, ny))
+                {
+                    _isMovingAnnotation = true;
+                    _dragPointerId = current.PointerId;
+                    ViewportHost.CapturePointer(e.Pointer);
+                    e.Handled = true;
+                    break;
+                }
+
+                _isSelectingText = true;
+                _dragPointerId = current.PointerId;
+                ViewportHost.CapturePointer(e.Pointer);
+                ViewModel.BeginTextSelection(content.Page, content.X, content.Y);
+                e.Handled = true;
+                break;
+
             case ToolMode.Highlight:
+                ViewModel.ClearAnnotationSelection();
                 _isSelectingText = true;
                 _dragPointerId = current.PointerId;
                 ViewportHost.CapturePointer(e.Pointer);
@@ -587,7 +624,14 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
-        if (_isSelectingText)
+        if (_isMovingAnnotation)
+        {
+            ViewModel.MoveSelectedAnnotationTo(
+                content.X / ViewModel.OverlayScale,
+                content.Y / ViewModel.OverlayScale);
+            e.Handled = true;
+        }
+        else if (_isSelectingText)
         {
             ViewModel.UpdateTextSelection(content.Page, content.X, content.Y);
             e.Handled = true;
@@ -606,7 +650,14 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        if (_isSelectingText)
+        if (_isMovingAnnotation)
+        {
+            _isMovingAnnotation = false;
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            ViewModel.EndAnnotationMove();
+            e.Handled = true;
+        }
+        else if (_isSelectingText)
         {
             _isSelectingText = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);

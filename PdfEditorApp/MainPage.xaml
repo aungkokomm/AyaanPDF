@@ -156,6 +156,24 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
+                                        <!-- Marquee around the selected annotation. -->
+                                        <ItemsControl ItemsSource="{x:Bind SelectionOutline}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                    <Rectangle Stroke="{ThemeResource AccentFillColorDefaultBrush}"
+                                                               StrokeThickness="0.004"
+                                                               StrokeDashArray="3,2"
+                                                               Fill="Transparent"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <ItemsControl ItemsSource="{x:Bind Notes}">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>

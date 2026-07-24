@@ -46,6 +46,13 @@ public partial class PageSlot : ObservableObject
     public ObservableCollection<TextRect> SearchMatchRects { get; } = new();
 
     /// <summary>
+    /// Marquee around the selected annotation, at most one entry. A plain rect
+    /// collection rather than per-annotation selection state, so the
+    /// annotation templates stay unaware of selection entirely.
+    /// </summary>
+    public ObservableCollection<TextRect> SelectionOutline { get; } = new();
+
+    /// <summary>
     /// Multiplier turning a normalized overlay coordinate into a slot-space
     /// offset. Both axes use the slot WIDTH so the scale stays uniform, which
     /// matches how the coordinates were normalized when they were captured.
