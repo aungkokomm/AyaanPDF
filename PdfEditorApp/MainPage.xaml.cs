@@ -44,6 +44,17 @@ public sealed partial class MainPage : Page
         ViewModel.PageLayoutEstablished += OnPageLayoutEstablished;
         ViewModel.ContentScaleChanged += OnContentScaleChanged;
         Loaded += (_, _) => RootGrid.Focus(FocusState.Programmatic);
+
+        // Lets the app be driven headlessly for diagnosis: set
+        // PDFEDITOR_AUTOOPEN to a PDF path and it loads on startup.
+        Loaded += (_, _) =>
+        {
+            string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
+            if (probe.Length > 0 && System.IO.File.Exists(probe))
+            {
+                ViewModel.OpenDocument(probe);
+            }
+        };
         Unloaded += (_, _) =>
         {
             ViewModel.InkStrokeChanged -= OnInkStrokeChanged;
@@ -502,9 +513,30 @@ public sealed partial class MainPage : Page
     /// a small buffer), so this is what makes thumbnail rendering
     /// virtualized: a 300-page document never renders more than a handful.
     /// </summary>
-    private void ThumbnailImage_Loaded(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// The virtualization hook for thumbnail rendering.
+    ///
+    /// This must NOT be an Image.Loaded handler reading DataContext, which is
+    /// what it used to be. ListView recycles containers, and on a recycled
+    /// container Loaded fires BEFORE the item is bound, so DataContext is
+    /// still null and the render is never requested. Freshly created
+    /// containers happened to work, which is why thumbnails appeared on the
+    /// document opened at startup but never on one opened via File > Open:
+    /// by then every container was a recycled one.
+    ///
+    /// ContainerContentChanging is the purpose-built callback. It hands over
+    /// the item directly, and it fires on every bind and rebind.
+    /// </summary>
+    private void ThumbnailList_ContainerContentChanging(
+        ListViewBase sender,
+        ContainerContentChangingEventArgs args)
     {
-        if (((FrameworkElement)sender).DataContext is PageThumbnail thumbnail)
+        if (args.InRecycleQueue)
+        {
+            return;
+        }
+
+        if (args.Item is PageThumbnail thumbnail)
         {
             ViewModel.EnsureThumbnailRendered(thumbnail.PageIndex);
         }

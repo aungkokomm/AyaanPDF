@@ -31,14 +31,14 @@
             Padding="8"
             ItemsSource="{x:Bind ViewModel.Thumbnails}"
             SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
-            SelectionChanged="ThumbnailList_SelectionChanged">
+            SelectionChanged="ThumbnailList_SelectionChanged"
+            ContainerContentChanging="ThumbnailList_ContainerContentChanging">
             <ListView.ItemTemplate>
                 <DataTemplate x:DataType="viewmodels:PageThumbnail">
                     <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
                         <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
                             <Image
                                 Source="{x:Bind Bitmap, Mode=OneWay}"
-                                Loaded="ThumbnailImage_Loaded"
                                 Stretch="Uniform"
                                 Width="126"
                                 Height="163" />
@@ -94,7 +94,16 @@
                 <Button Content="Highlight" Click="HighlightTool_Click" />
                 <Button Content="Note" Click="NoteTool_Click" />
                 <Button Content="Draw" Click="DrawTool_Click" />
-                <TextBlock Text="{x:Bind ViewModel.ActiveTool, Mode=OneWay}" VerticalAlignment="Center" Margin="12,0,0,0" Style="{StaticResource CaptionTextBlockStyle}" />
+                <!--
+                    Sat immediately after the tool buttons showing just the tool
+                    name, so "Select" appeared twice in a row and read as a
+                    sixth, broken button. Labelled and separated instead.
+                -->
+                <TextBlock VerticalAlignment="Center" Margin="16,0,0,0" Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}">
+                    <Run Text="Tool:" />
+                    <Run Text="{x:Bind ViewModel.ActiveTool, Mode=OneWay}" FontWeight="SemiBold" />
+                </TextBlock>
 
                 <!-- Page operations (phase 5) -->
                 <Button Content="Rotate 90°" Click="RotatePage_Click" Margin="24,0,0,0" />

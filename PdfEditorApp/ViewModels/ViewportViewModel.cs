@@ -491,6 +491,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        Diag.Log($"thumb {pageIndex}: {raw.Width}x{raw.Height} {raw.Outcome}");
         thumbnail.Bitmap = PageRenderer.ToBitmap(raw).Bitmap;
         thumbnail.EndRender();
     }
