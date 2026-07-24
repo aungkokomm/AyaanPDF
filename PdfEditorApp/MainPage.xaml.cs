@@ -41,8 +41,7 @@ public sealed partial class MainPage : Page
         InitializeComponent();
         ViewModel.InkStrokeChanged += OnInkStrokeChanged;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
-        ViewModel.PageLayoutEstablished += OnPageLayoutEstablished;
-        ViewModel.ContentScaleChanged += OnContentScaleChanged;
+        ViewModel.LayoutRebuilt += OnLayoutRebuilt;
         Loaded += (_, _) => RootGrid.Focus(FocusState.Programmatic);
 
         // Lets the app be driven headlessly for diagnosis: set
@@ -59,8 +58,7 @@ public sealed partial class MainPage : Page
         {
             ViewModel.InkStrokeChanged -= OnInkStrokeChanged;
             ViewModel.InkStrokes.CollectionChanged -= OnInkStrokesCollectionChanged;
-            ViewModel.PageLayoutEstablished -= OnPageLayoutEstablished;
-            ViewModel.ContentScaleChanged -= OnContentScaleChanged;
+            ViewModel.LayoutRebuilt -= OnLayoutRebuilt;
             ViewModel.Dispose();
         };
     }
@@ -76,37 +74,60 @@ public sealed partial class MainPage : Page
     // ---------------- ScrollView-driven zoom ----------------
 
     /// <summary>
-    /// The page's layout box is defined as exactly the viewport width, so
-    /// fit-width is simply zoom factor 1.0 — no arithmetic, and nothing the
-    /// renderer does can move it.
+    /// Pages are laid out at a FIXED slot width, independent of the window, so
+    /// fitting is purely a zoom decision: the zoom that maps that width onto
+    /// the viewport. Nothing the renderer does can move it, and a window
+    /// resize never rebuilds the layout or disturbs the scroll position.
     /// </summary>
-    private void FitToWidth(bool animate = false) =>
+    private void FitToWidth(bool animate = false)
+    {
+        double available = PageScroller.ViewportWidth - ViewportHost.Padding.Left - ViewportHost.Padding.Right;
+        if (available <= 0)
+        {
+            return;
+        }
+
+        float zoom = (float)Math.Clamp(
+            ViewModel.FitWidthZoom(available),
+            PageScroller.MinZoomFactor,
+            PageScroller.MaxZoomFactor);
+
         PageScroller.ZoomTo(
-            1.0f,
+            zoom,
             null,
             new ScrollingZoomOptions(animate ? ScrollingAnimationMode.Enabled : ScrollingAnimationMode.Disabled,
                                      ScrollingSnapPointsMode.Ignore));
-
-    /// <summary>A new page established its layout box: show it fitted.</summary>
-    private void OnPageLayoutEstablished() =>
-        // Layout must run before the ScrollView's extent reflects the new size.
-        DispatcherQueue.TryEnqueue(() => FitToWidth());
-
-    /// <summary>Expands the normalized overlay coordinates into the page's DIP layout box.</summary>
-    private void OnContentScaleChanged()
-    {
-        double scale = ViewModel.OverlayScale;
-        OverlayScale.ScaleX = scale;
-        OverlayScale.ScaleY = scale;
     }
+
+    /// <summary>
+    /// The slot stack was rebuilt for a new document: fit it to the width.
+    /// Layout has to run first or the ScrollView's extent still reflects the
+    /// previous document.
+    /// </summary>
+    private void OnLayoutRebuilt() =>
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            FitToWidth();
+            PushVisibleWindow();
+        });
 
     private void PageScroller_ViewChanged(ScrollView sender, object args)
     {
         UpdateZoomReadout();
-        // Ask for a sharper render once the view settles; the ViewModel
-        // debounces and skips re-renders that would not look any better.
-        ViewModel.OnViewportZoomChanged(PageScroller.ZoomFactor);
+        PushVisibleWindow();
     }
+
+    /// <summary>
+    /// Hands the current scroll position to the view model, which decides
+    /// which pages to render and which bitmaps to release. Offsets go across
+    /// in zoomed pixels together with the zoom factor; the view model divides
+    /// them back into slot space, so that mapping lives in exactly one place.
+    /// </summary>
+    private void PushVisibleWindow() =>
+        ViewModel.UpdateVisibleWindow(
+            PageScroller.VerticalOffset,
+            PageScroller.ViewportHeight,
+            PageScroller.ZoomFactor);
 
     private void PageScroller_SizeChanged(object sender, SizeChangedEventArgs e)
     {
@@ -117,6 +138,7 @@ public sealed partial class MainPage : Page
 
         ViewModel.SetViewportSize(PageScroller.ViewportWidth, PageScroller.ViewportHeight);
         UpdateZoomReadout();
+        PushVisibleWindow();
     }
 
     private void UpdateZoomReadout() =>
@@ -279,18 +301,32 @@ public sealed partial class MainPage : Page
 
         foreach (InkStrokeAnnotation stroke in e.NewItems)
         {
-            var polyline = new Polyline
-            {
-                Stroke = new SolidColorBrush(ColorFromHex(stroke.ColorHex)),
-                StrokeThickness = stroke.StrokeWidth,
-            };
-            foreach (var (x, y) in stroke.Points)
-            {
-                polyline.Points.Add(new Point(x, y));
-            }
-
-            InkCanvas.Children.Add(polyline);
+            InkCanvas.Children.Add(BuildStrokePolyline(stroke));
         }
+    }
+
+    /// <summary>
+    /// Expands a stroke's normalized points into slot space and offsets them
+    /// by its page's position in the stack, so the ink lands on the right page
+    /// of the continuous view.
+    /// </summary>
+    private Polyline BuildStrokePolyline(InkStrokeAnnotation stroke)
+    {
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(stroke.PageIndex);
+
+        var polyline = new Polyline
+        {
+            Stroke = new SolidColorBrush(ColorFromHex(stroke.ColorHex)),
+            StrokeThickness = stroke.StrokeWidth * scale,
+        };
+
+        foreach (var (x, y) in stroke.Points)
+        {
+            polyline.Points.Add(new Point(x * scale, y * scale + pageTop));
+        }
+
+        return polyline;
     }
 
     private void OnInkStrokeChanged()
@@ -308,16 +344,27 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        double scale = ViewModel.OverlayScale;
+
         if (_livePreviewStroke is null)
         {
-            _livePreviewStroke = new Polyline { Stroke = new SolidColorBrush(Colors.Red), StrokeThickness = 2 };
+            _livePreviewStroke = new Polyline
+            {
+                Stroke = new SolidColorBrush(Colors.Red),
+                StrokeThickness = 2,
+            };
             InkCanvas.Children.Add(_livePreviewStroke);
         }
+
+        // The in-progress stroke is normalized on the way in, exactly like a
+        // committed one, so the preview and the finished stroke share a
+        // coordinate space and the line cannot jump when the pointer lifts.
+        double pageTop = ViewModel.SlotTopOf(ViewModel.CurrentPageIndex);
 
         _livePreviewStroke.Points.Clear();
         foreach (var (x, y) in points)
         {
-            _livePreviewStroke.Points.Add(new Point(x, y));
+            _livePreviewStroke.Points.Add(new Point(x * scale, y * scale + pageTop));
         }
     }
 
@@ -404,15 +451,29 @@ public sealed partial class MainPage : Page
     // manual inverse-transform is gone.
 
     /// <summary>
-    /// Pointer position in bitmap-pixel space. The point comes back in the
-    /// page's DIP layout box, so it is divided by the DIPs-per-pixel scale to
-    /// land in the coordinate space the text layer and ink strokes use.
+    /// Pointer position as a point local to the page under it, in slot space.
+    ///
+    /// ViewportHost is the ScrollView's content, so a point measured against
+    /// it is already UNZOOMED: the ScrollView applies zoom above this, which
+    /// is exactly why slot space is worth keeping. Subtracting the host's
+    /// padding lands on the page stack, and the view model resolves which page
+    /// that is. Picking the page here, rather than trusting whatever the
+    /// scroll position last made current, is what lets a drag on page 7 edit
+    /// page 7.
     /// </summary>
     private Point ContentPoint(PointerRoutedEventArgs e)
     {
-        var p = e.GetCurrentPoint(PageImage).Position;
-        double scale = ViewModel.ContentToLayoutScale;
-        return scale > 0 ? new Point(p.X / scale, p.Y / scale) : p;
+        var p = e.GetCurrentPoint(ViewportHost).Position;
+        double slotX = p.X - ViewportHost.Padding.Left;
+        double slotY = p.Y - ViewportHost.Padding.Top;
+
+        if (ViewModel.HitTestSlotSpace(slotX, slotY, out int pageIndex, out double localX, out double localY))
+        {
+            ViewModel.SetActivePageForTools(pageIndex);
+            return new Point(localX, localY);
+        }
+
+        return new Point(slotX, slotY);
     }
 
     private bool ToolWantsPointer =>

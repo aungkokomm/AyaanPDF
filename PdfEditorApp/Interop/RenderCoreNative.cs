@@ -86,6 +86,23 @@ internal struct ByteBuffer
     public int Status;
 }
 
+/// <summary>Mirrors render_core::PageSize (src/lib.rs) — one page in PDF points.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativePageSize
+{
+    public float Width;
+    public float Height;
+}
+
+/// <summary>Mirrors render_core::PageSizeArray (src/lib.rs).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PageSizeArray
+{
+    public IntPtr Sizes;
+    public nuint Len;
+    public int Status;
+}
+
 /// <summary>Mirrors render_core::{STATUS_*} (src/lib.rs).</summary>
 internal static class RenderStatus
 {
@@ -154,6 +171,16 @@ internal static partial class RenderCoreNative
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int get_form_field_count(ulong docHandle);
+
+    /// <summary>
+    /// Every page's size in one locked pass. The continuous viewport needs all
+    /// sizes before it renders anything, so slot heights are known up front.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern PageSizeArray get_page_sizes(ulong docHandle);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void free_page_size_array(PageSizeArray array);
 
     /// <summary>
     /// Serializes the whole document to memory: the document-level undo

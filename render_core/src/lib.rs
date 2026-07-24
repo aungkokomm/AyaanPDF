@@ -429,6 +429,89 @@ fn save_document_inner(doc_handle: u64, path: *const c_char) -> i32 {
     }
 }
 
+/// One page's intrinsic size in PDF points.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PageSize {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Sizes for every page in a document. Must be released with
+/// `free_page_size_array`.
+#[repr(C)]
+pub struct PageSizeArray {
+    pub sizes: *mut PageSize,
+    pub len: usize,
+    pub status: i32,
+}
+
+impl PageSizeArray {
+    fn failure(status: i32) -> Self {
+        PageSizeArray { sizes: std::ptr::null_mut(), len: 0, status }
+    }
+}
+
+/// Returns every page's size in one call.
+///
+/// A continuous-scroll viewport has to lay out ALL page slots before it
+/// renders anything, or the scrollbar and every scroll-offset-to-page
+/// mapping would be wrong until the last page happened to be rasterized.
+/// Rendering 300 pages just to measure them is not viable, and calling a
+/// per-page size function 300 times would take the global PDFium lock 300
+/// times, so sizes come back in a single locked pass.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_page_sizes(doc_handle: u64) -> PageSizeArray {
+    if doc_handle == 0 {
+        return PageSizeArray::failure(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_page_sizes_inner(doc_handle))
+        .unwrap_or_else(|_| PageSizeArray::failure(STATUS_PANIC))
+}
+
+fn get_page_sizes_inner(doc_handle: u64) -> PageSizeArray {
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return PageSizeArray::failure(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+
+    let pages = doc_guard.pages();
+    let count = pages.len();
+    let mut out: Vec<PageSize> = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        match pages.get(i) {
+            Ok(page) => out.push(PageSize {
+                width: page.width().value,
+                height: page.height().value,
+            }),
+            // Keep the array index-aligned with page indices even if one page
+            // fails to load; a zero size is a slot the caller can skip.
+            Err(_) => out.push(PageSize { width: 0.0, height: 0.0 }),
+        }
+    }
+
+    let mut boxed = out.into_boxed_slice();
+    let array = PageSizeArray {
+        sizes: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    array
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn free_page_size_array(array: PageSizeArray) {
+    if array.sizes.is_null() || array.len == 0 {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(std::slice::from_raw_parts_mut(array.sizes, array.len));
+    }
+}
+
 /// An owned byte buffer handed across the FFI boundary. Must be released with
 /// `free_byte_buffer`. A non-zero `status` means `data` is null.
 #[repr(C)]
@@ -2016,6 +2099,54 @@ mod tests {
             free_render_result(res);
             close_document(handle);
         }
+    }
+
+    #[test]
+    fn get_page_sizes_returns_one_entry_per_page_with_real_dimensions() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let array = get_page_sizes(handle);
+        assert_eq!(array.status, STATUS_OK_PDFIUM);
+        assert_eq!(array.len, get_page_count(handle) as usize);
+
+        let sizes = unsafe { std::slice::from_raw_parts(array.sizes, array.len) };
+        for (i, s) in sizes.iter().enumerate() {
+            assert!(s.width > 0.0 && s.height > 0.0, "page {i} reported {}x{}", s.width, s.height);
+        }
+
+        // Sizes must match what a render actually produces, or every slot in
+        // the continuous viewport would be the wrong height.
+        let r = render_low_res(handle, 0, 400);
+        let aspect_from_size = sizes[0].height / sizes[0].width;
+        let aspect_from_render = r.height as f32 / r.width as f32;
+        assert!(
+            (aspect_from_size - aspect_from_render).abs() < 0.02,
+            "reported aspect {aspect_from_size} disagrees with rendered {aspect_from_render}"
+        );
+        free_render_result(r);
+
+        free_page_size_array(array);
+        close_document(handle);
+    }
+
+    #[test]
+    fn get_page_sizes_tracks_a_page_delete() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = get_page_sizes(handle);
+        let n = before.len;
+        free_page_size_array(before);
+
+        assert_eq!(delete_page(handle, 0), STATUS_OK_PDFIUM);
+        let after = get_page_sizes(handle);
+        assert_eq!(after.len, n - 1, "slot list must follow page deletions");
+        free_page_size_array(after);
+        close_document(handle);
+    }
+
+    #[test]
+    fn get_page_sizes_rejects_bad_input() {
+        assert_eq!(get_page_sizes(0).status, STATUS_INVALID_INPUT);
+        assert_eq!(get_page_sizes(999_999).status, STATUS_INVALID_INPUT);
+        free_page_size_array(PageSizeArray::failure(STATUS_INVALID_INPUT));
     }
 
     #[test]

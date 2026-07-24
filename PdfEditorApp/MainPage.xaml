@@ -154,112 +154,148 @@
                     x:Name="ViewportHost"
                     Background="Transparent"
                     HorizontalAlignment="Center"
-                    VerticalAlignment="Center"
-                    Width="{x:Bind ViewModel.PageLayoutWidth, Mode=OneWay}"
-                    Height="{x:Bind ViewModel.PageLayoutHeight, Mode=OneWay}"
+                    VerticalAlignment="Top"
+                    Padding="24"
                     PointerPressed="ViewportHost_PointerPressed"
                     PointerMoved="ViewportHost_PointerMoved"
                     PointerReleased="ViewportHost_PointerReleased"
                     PointerCanceled="ViewportHost_PointerReleased"
                     PointerCaptureLost="ViewportHost_PointerReleased">
 
-                    <Image x:Name="PageImage" Source="{x:Bind ViewModel.PageBitmap, Mode=OneWay}" Stretch="Fill" />
+                    <!--
+                        Continuous page stack.
+
+                        Each card is sized in SLOT space (unzoomed DIPs) from
+                        the page's intrinsic size, fixed the moment the
+                        document opens. Zoom is the ScrollView's own zoom
+                        factor, which grows the scrollable extent, so a card
+                        always occupies its final space and bitmaps can stream
+                        in or be released without anything below shifting.
+
+                        ItemsControl, not ItemsRepeater: the slots already
+                        virtualize their PIXELS in the view model (bitmaps are
+                        released outside the window while heights stay), so
+                        virtualizing the containers as well would buy little
+                        and would make scroll-offset-to-page mapping depend on
+                        realization order.
+                    -->
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.PageSlots}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Vertical" Spacing="16" HorizontalAlignment="Center" />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="viewmodels:PageSlot">
+                                <!-- The page card: white sheet, thin border, drop shadow. -->
+                                <Border Width="{x:Bind SlotWidth}" Height="{x:Bind SlotHeight}"
+                                        Background="White"
+                                        BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                                        BorderThickness="1"
+                                        HorizontalAlignment="Center">
+                                    <Border.Shadow>
+                                        <ThemeShadow />
+                                    </Border.Shadow>
+                                    <Grid>
+                                        <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
+
+                                        <!--
+                                            Overlay layer for this page only.
+                                            Marks are stored NORMALIZED, so the
+                                            scale is the card's slot width and a
+                                            re-render at any resolution cannot
+                                            move them.
+                                        -->
+                                        <Grid HorizontalAlignment="Left" VerticalAlignment="Top">
+                                            <Grid.RenderTransform>
+                                                <ScaleTransform ScaleX="{x:Bind OverlayScale}" ScaleY="{x:Bind OverlayScale}" />
+                                            </Grid.RenderTransform>
+
+                                            <ItemsControl ItemsSource="{x:Bind SearchMatchRects}" IsHitTestVisible="False">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="viewport:TextRect">
+                                                        <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                                   Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                                   HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <ItemsControl ItemsSource="{x:Bind SelectionRects}" IsHitTestVisible="False">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="viewport:TextRect">
+                                                        <Rectangle Fill="#665599FF" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                                   Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                                   HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <ItemsControl ItemsSource="{x:Bind Highlights}" IsHitTestVisible="False">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="viewport:HighlightAnnotation">
+                                                        <ItemsControl ItemsSource="{x:Bind Rects}">
+                                                            <ItemsControl.ItemsPanel>
+                                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                                            </ItemsControl.ItemsPanel>
+                                                            <ItemsControl.ItemTemplate>
+                                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                                    <Rectangle Fill="#88FFFF00" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                                </DataTemplate>
+                                                            </ItemsControl.ItemTemplate>
+                                                        </ItemsControl>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+
+                                            <ItemsControl ItemsSource="{x:Bind Notes}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="viewmodels:NoteAnnotation">
+                                                        <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
+                                                                Margin="{x:Bind local:MainPage.Offset(X, Y)}"
+                                                                HorizontalAlignment="Left" VerticalAlignment="Top">
+                                                            <FontIcon Glyph="&#xE70B;" FontSize="14" />
+                                                            <Button.Flyout>
+                                                                <Flyout>
+                                                                    <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
+                                                                </Flyout>
+                                                            </Button.Flyout>
+                                                        </Button>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
 
                     <!--
-                        Every overlay below positions itself in bitmap-PIXEL
-                        coordinates (that is the space PDFium's text layer and
-                        the ink strokes are captured in), while the page is
-                        laid out in DIPs. This transform bridges the two and is
-                        updated whenever a sharper render changes the pixel
-                        size — see OnContentScaleChanged.
+                        Ink layer, spanning the WHOLE stack rather than sitting
+                        inside a page card. Polyline points cannot be bound
+                        through x:Bind, so strokes are built in code-behind,
+                        and a page-spanning layer means a stroke drawn near a
+                        page edge is never clipped by the card. Positions are
+                        in slot space, so the ScrollView's zoom scales the ink
+                        along with the pages.
                     -->
-                    <Grid x:Name="OverlayRoot" HorizontalAlignment="Left" VerticalAlignment="Top">
-                        <Grid.RenderTransform>
-                            <ScaleTransform x:Name="OverlayScale" />
-                        </Grid.RenderTransform>
-
-                    <ItemsControl ItemsSource="{x:Bind ViewModel.SearchMatchRects}" IsHitTestVisible="False">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <Grid />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="viewport:TextRect">
-                                <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                           Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                           HorizontalAlignment="Left" VerticalAlignment="Top" />
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-
-                    <ItemsControl ItemsSource="{x:Bind ViewModel.SelectionRects}" IsHitTestVisible="False">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <Grid />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="viewport:TextRect">
-                                <Rectangle Fill="#665599FF" Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                           Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                           HorizontalAlignment="Left" VerticalAlignment="Top" />
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-
-                    <!-- Committed highlights: one HighlightAnnotation can cover several lines, so this is an ItemsControl of ItemsControls. -->
-                    <ItemsControl ItemsSource="{x:Bind ViewModel.Highlights}" IsHitTestVisible="False">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <Grid />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="viewport:HighlightAnnotation">
-                                <ItemsControl ItemsSource="{x:Bind Rects}">
-                                    <ItemsControl.ItemsPanel>
-                                        <ItemsPanelTemplate>
-                                            <Grid />
-                                        </ItemsPanelTemplate>
-                                    </ItemsControl.ItemsPanel>
-                                    <ItemsControl.ItemTemplate>
-                                        <DataTemplate x:DataType="viewport:TextRect">
-                                            <Rectangle Fill="#88FFFF00" Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                                       Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                       HorizontalAlignment="Left" VerticalAlignment="Top" />
-                                        </DataTemplate>
-                                    </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-
-                    <!-- Finalized + in-progress ink strokes are managed directly in code-behind (see OnInkStrokesCollectionChanged/OnInkStrokeChanged) — Polyline points don't bind cleanly via x:Bind. -->
                     <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
 
-                    <ItemsControl ItemsSource="{x:Bind ViewModel.Notes}">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <Grid />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="viewmodels:NoteAnnotation">
-                                <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
-                                        Margin="{x:Bind local:MainPage.Offset(X, Y)}"
-                                        HorizontalAlignment="Left" VerticalAlignment="Top">
-                                    <FontIcon Glyph="&#xE70B;" FontSize="14" />
-                                    <Button.Flyout>
-                                        <Flyout>
-                                            <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
-                                        </Flyout>
-                                    </Button.Flyout>
-                                </Button>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                    </Grid>
                 </controls:CursorGrid>
             </ScrollView>
 

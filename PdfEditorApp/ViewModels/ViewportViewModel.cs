@@ -152,10 +152,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// and every earlier mark would silently shift. Normalized coordinates
     /// are resolution-independent, so a re-render can never move them.
     /// </summary>
-    public double OverlayScale => PageLayoutWidth;
+    public double OverlayScale => SlotLayoutWidth;
 
-    /// <summary>Bitmap pixels to normalized units. Returns 0 before the first render.</summary>
-    private double Norm(double px) => _currentRenderedWidth > 0 ? px / _currentRenderedWidth : 0;
+    /// <summary>
+    /// Slot-space DIPs to normalized units.
+    ///
+    /// The divisor is the FIXED slot width, never the current bitmap width.
+    /// Normalizing against the bitmap would tie a mark to whatever resolution
+    /// happened to be on screen when it was drawn, so zooming in and
+    /// re-rendering would silently move every earlier mark.
+    /// </summary>
+    private static double Norm(double slotDips) => slotDips / SlotLayoutWidth;
 
     private TextRect NormRect(TextRect r) =>
         new(Norm(r.Left), Norm(r.Top), Norm(r.Right), Norm(r.Bottom));
@@ -223,6 +230,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         CurrentPageIndex = 0;
+        RebuildContinuousLayout();
         RenderCurrentPage();
     }
 
@@ -460,6 +468,327 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public bool FillFormField(string fieldName, string value) =>
         _documentHandle != 0 && RenderCoreNative.fill_text_field(_documentHandle, fieldName, value) == RenderStatus.OkPdfium;
 
+    // ---------------- Continuous viewport ----------------
+
+    /// <summary>
+    /// Width every page is laid out at in SLOT space (unzoomed DIPs). Fixed
+    /// and independent of the window: zoom, not layout, is what makes a page
+    /// fit the viewport, so resizing never rebuilds the stack or moves the
+    /// scroll position.
+    /// </summary>
+    private const double SlotLayoutWidth = 800;
+
+    /// <summary>Pages beyond the viewport that are kept rendered.</summary>
+    private const int RenderAheadPages = 2;
+
+    /// <summary>Pages beyond which bitmaps are released. Wider than the render
+    /// window so a small scroll oscillation doesn't thrash render and release.</summary>
+    private const int ReleaseBeyondPages = 6;
+
+    private readonly ContinuousLayout _layout = new(pageGap: 16);
+
+    public ObservableCollection<PageSlot> PageSlots { get; } = new();
+
+    /// <summary>Slot-space size of the whole stack, for the scroll content.</summary>
+    public double ContentWidth => _layout.LayoutWidth;
+
+    public double ContentHeight => _layout.TotalHeight;
+
+    /// <summary>Raised after the slot stack is rebuilt, so the view can fit-width.</summary>
+    public event Action? LayoutRebuilt;
+
+    /// <summary>
+    /// Reads every page size in one native call and lays the stack out. Sizes
+    /// are known before any rendering, so each card occupies its final space
+    /// immediately and nothing shifts as bitmaps stream in.
+    /// </summary>
+    private void RebuildContinuousLayout()
+    {
+        PageSlots.Clear();
+        _layout.Rebuild([], SlotLayoutWidth);
+
+        if (_documentHandle == 0)
+        {
+            OnPropertyChanged(nameof(ContentWidth));
+            OnPropertyChanged(nameof(ContentHeight));
+            return;
+        }
+
+        var sizes = new List<PageSizePoints>();
+        var array = RenderCoreNative.get_page_sizes(_documentHandle);
+        try
+        {
+            if (array.Status == RenderStatus.OkPdfium && array.Sizes != IntPtr.Zero)
+            {
+                int count = (int)array.Len;
+                int stride = Marshal.SizeOf<NativePageSize>();
+                for (int i = 0; i < count; i++)
+                {
+                    var native = Marshal.PtrToStructure<NativePageSize>(array.Sizes + i * stride);
+                    sizes.Add(new PageSizePoints(native.Width, native.Height));
+                }
+            }
+        }
+        finally
+        {
+            RenderCoreNative.free_page_size_array(array);
+        }
+
+        _layout.Rebuild(sizes, SlotLayoutWidth);
+        foreach (var slot in _layout.Slots)
+        {
+            PageSlots.Add(new PageSlot(slot.PageIndex, slot.Width, slot.Height));
+        }
+
+        Diag.Log($"layout: {PageSlots.Count} slots, content {ContentWidth:F0}x{ContentHeight:F0}");
+
+        DistributeAnnotationsToSlots();
+        OnPropertyChanged(nameof(ContentWidth));
+        OnPropertyChanged(nameof(ContentHeight));
+        LayoutRebuilt?.Invoke();
+    }
+
+    /// <summary>
+    /// The zoom that makes a page span the viewport width. Pure function of
+    /// the fixed layout width, so it is always correct, even before anything
+    /// has rendered.
+    /// </summary>
+    public double FitWidthZoom(double viewportWidth) => _layout.FitWidthZoom(viewportWidth);
+
+    /// <summary>Slot-space top of a page, for scroll-to-page.</summary>
+    public double SlotTopOf(int pageIndex) => _layout.TopOf(pageIndex);
+
+    /// <summary>
+    /// Drives rendering and release from the current scroll position.
+    ///
+    /// Offsets arrive in ZOOMED pixels and are divided back into slot space,
+    /// which is the single mapping every pass here shares. Called on every
+    /// view change, so it must stay cheap: the work is bounded by the number
+    /// of visible pages, not the document length.
+    /// </summary>
+    public void UpdateVisibleWindow(double verticalOffset, double viewportHeight, double zoomFactor)
+    {
+        if (_documentHandle == 0 || PageSlots.Count == 0)
+        {
+            return;
+        }
+
+        double zoom = Math.Max(0.01, zoomFactor);
+        _currentZoomFactor = zoom;
+
+        double viewTop = verticalOffset / zoom;
+        double viewBottom = (verticalOffset + viewportHeight) / zoom;
+
+        var (first, last) = _layout.VisibleRange(viewTop, viewBottom);
+        if (first < 0)
+        {
+            return;
+        }
+
+        int page = _layout.DominantPage(viewTop, viewBottom);
+        if (page != CurrentPageIndex)
+        {
+            CurrentPageIndex = page;
+            OnCurrentPageChangedByScroll();
+        }
+
+        int renderFrom = Math.Max(0, first - RenderAheadPages);
+        int renderTo = Math.Min(PageSlots.Count - 1, last + RenderAheadPages);
+        int keepFrom = Math.Max(0, first - ReleaseBeyondPages);
+        int keepTo = Math.Min(PageSlots.Count - 1, last + ReleaseBeyondPages);
+
+        int targetWidth = TargetRenderWidth(zoom);
+
+        for (int i = 0; i < PageSlots.Count; i++)
+        {
+            var slot = PageSlots[i];
+
+            if (i < keepFrom || i > keepTo)
+            {
+                // Outside the keep window: drop pixels, keep the slot's size.
+                if (slot.Bitmap is not null)
+                {
+                    slot.ReleaseBitmap();
+                }
+                continue;
+            }
+
+            if (i < renderFrom || i > renderTo)
+            {
+                continue;
+            }
+
+            // Re-render when the zoom has moved enough that the current bitmap
+            // would visibly soften; the ratio test stops a slow zoom from
+            // re-rendering on every single frame.
+            bool needsRender = slot.Bitmap is null;
+            if (!needsRender && slot.RenderedWidth > 0)
+            {
+                double ratio = (double)targetWidth / slot.RenderedWidth;
+                needsRender = ratio > 1.5;
+            }
+
+            if (needsRender)
+            {
+                RenderSlot(slot, targetWidth);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pixel width to rasterize a page at, for the current zoom. Capped so a
+    /// deep zoom on a large page cannot ask PDFium for an enormous bitmap.
+    /// </summary>
+    private static int TargetRenderWidth(double zoom)
+    {
+        double onScreen = SlotLayoutWidth * zoom;
+        return (int)Math.Clamp(onScreen, 320, 3000);
+    }
+
+    private async void RenderSlot(PageSlot slot, int targetWidth)
+    {
+        if (!slot.TryBeginRender())
+        {
+            return;
+        }
+
+        ulong handle = _documentHandle;
+        int pageIndex = slot.PageIndex;
+
+        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, targetWidth));
+
+        // The document can be closed or replaced while a render is in flight.
+        if (handle != _documentHandle)
+        {
+            slot.EndRender();
+            return;
+        }
+
+        if (raw.Bgra is not null)
+        {
+            slot.Bitmap = PageRenderer.ToBitmap(raw).Bitmap;
+            slot.RenderedWidth = raw.Width;
+            Diag.Log($"slot {pageIndex} rendered {raw.Width}x{raw.Height} {raw.Outcome}");
+        }
+
+        slot.EndRender();
+    }
+
+    /// <summary>
+    /// Fans the flat annotation lists out to the slot that owns each one, so a
+    /// card only ever draws its own marks.
+    /// </summary>
+    private void DistributeAnnotationsToSlots()
+    {
+        foreach (var slot in PageSlots)
+        {
+            slot.Highlights.Clear();
+            slot.InkStrokes.Clear();
+            slot.Notes.Clear();
+            slot.SelectionRects.Clear();
+            slot.SearchMatchRects.Clear();
+        }
+
+        foreach (var h in _allHighlights)
+        {
+            if (h.PageIndex >= 0 && h.PageIndex < PageSlots.Count)
+            {
+                PageSlots[h.PageIndex].Highlights.Add(h);
+            }
+        }
+
+        foreach (var s in _allInkStrokes)
+        {
+            if (s.PageIndex >= 0 && s.PageIndex < PageSlots.Count)
+            {
+                PageSlots[s.PageIndex].InkStrokes.Add(s);
+            }
+        }
+
+        foreach (var n in _allNotes)
+        {
+            if (n.PageIndex >= 0 && n.PageIndex < PageSlots.Count)
+            {
+                PageSlots[n.PageIndex].Notes.Add(n);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Scrolling changed which page is current. The text layer belongs to the
+    /// current page, so it is dropped and reloaded lazily rather than kept for
+    /// a page the user has left.
+    /// </summary>
+    /// <summary>
+    /// Resolves a point in SLOT space (unzoomed DIPs from the top-left of the
+    /// page stack) to the page under it plus a point local to that page's
+    /// card. A point in a gap between pages snaps to the nearer page, so a
+    /// drag that crosses a page boundary does not lose its target.
+    ///
+    /// Returns false only when there are no pages at all.
+    /// </summary>
+    public bool HitTestSlotSpace(double slotX, double slotY, out int pageIndex, out double localX, out double localY)
+    {
+        pageIndex = 0;
+        localX = 0;
+        localY = 0;
+
+        if (_layout.PageCount == 0)
+        {
+            return false;
+        }
+
+        var slots = _layout.Slots;
+        int best = 0;
+        for (int i = 0; i < slots.Count; i++)
+        {
+            var s = slots[i];
+            if (slotY >= s.Top && slotY <= s.Top + s.Height)
+            {
+                best = i;
+                break;
+            }
+
+            // Past this page: remember it as the nearest so far and keep going.
+            if (slotY > s.Top)
+            {
+                best = i;
+            }
+        }
+
+        pageIndex = best;
+        localX = slotX;
+        localY = slotY - slots[best].Top;
+        return true;
+    }
+
+    /// <summary>
+    /// Points the tool machinery at a page, loading its text layer if the page
+    /// changed. Called when a gesture starts, so a drag on page 7 edits page 7
+    /// rather than whatever the scroll position last made current.
+    /// </summary>
+    public void SetActivePageForTools(int pageIndex)
+    {
+        if (pageIndex == CurrentPageIndex || pageIndex < 0 || pageIndex >= PageCount)
+        {
+            return;
+        }
+
+        CurrentPageIndex = pageIndex;
+        _textLayer = null;
+        ClearSelection();
+    }
+
+    /// <summary>The card owning a page, or null if the index is out of range.</summary>
+    private PageSlot? SlotFor(int pageIndex) =>
+        pageIndex >= 0 && pageIndex < PageSlots.Count ? PageSlots[pageIndex] : null;
+
+    private void OnCurrentPageChangedByScroll()
+    {
+        _textLayer = null;
+        ClearSelection();
+    }
+
     // ---------------- Thumbnails ----------------
 
     /// <summary>
@@ -554,6 +883,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             "#FFFF00");
         _allHighlights.Add(highlight);
         Highlights.Add(highlight);
+        SlotFor(highlight.PageIndex)?.Highlights.Add(highlight);
         IsDirty = true;
         ClearSelection();
     }
@@ -569,6 +899,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectionLength = endIndexInclusive - startIndex + 1;
 
         SelectionRects.Clear();
+        var slot = SlotFor(CurrentPageIndex);
+        slot?.SelectionRects.Clear();
         if (_textLayer is null)
         {
             return;
@@ -576,7 +908,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         foreach (var rect in _textLayer.GetRangeRects(_selectionStart, _selectionLength))
         {
-            SelectionRects.Add(NormRect(rect));
+            var normalized = NormRect(rect);
+            SelectionRects.Add(normalized);
+            slot?.SelectionRects.Add(normalized);
         }
     }
 
@@ -586,6 +920,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectionStart = 0;
         _selectionLength = 0;
         SelectionRects.Clear();
+        foreach (var slot in PageSlots)
+        {
+            slot.SelectionRects.Clear();
+        }
     }
 
     // ---------------- Ink / notes ----------------
@@ -622,6 +960,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 Norm(2.0));
             _allInkStrokes.Add(stroke);
             InkStrokes.Add(stroke);
+            SlotFor(stroke.PageIndex)?.InkStrokes.Add(stroke);
             IsDirty = true;
         }
 
@@ -635,6 +974,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var note = new NoteAnnotation(CurrentPageIndex, Norm(x), Norm(y), string.Empty);
         _allNotes.Add(note);
         Notes.Add(note);
+        SlotFor(note.PageIndex)?.Notes.Add(note);
         IsDirty = true;
     }
 
@@ -774,6 +1114,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private void RefreshAnnotationsForCurrentPage()
     {
+        // The continuous viewport draws marks per page card, so any change to
+        // the flat lists has to be fanned back out to the slots.
+        DistributeAnnotationsToSlots();
+
         Highlights.Clear();
         foreach (var h in _allHighlights.Where(h => h.PageIndex == CurrentPageIndex))
         {
@@ -814,10 +1158,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void RefreshTextLayer(int renderedWidth)
+    /// <summary>
+    /// Loads the current page's text layer in SLOT space.
+    ///
+    /// The extraction width is the fixed slot width, NOT whatever the page was
+    /// last rasterized at, so character boxes come back in the same units as
+    /// pointer positions and ink points. That means one divisor normalizes
+    /// everything, and a re-render at a different resolution cannot shift the
+    /// text layer out of step with the marks drawn against it.
+    /// </summary>
+    private void EnsureTextLayer()
     {
-        _textLayer = TextLayerLoader.Load(_documentHandle, CurrentPageIndex, renderedWidth);
-        ClearSelection();
+        if (_textLayer is not null || _documentHandle == 0)
+        {
+            return;
+        }
+
+        _textLayer = TextLayerLoader.Load(_documentHandle, CurrentPageIndex, (int)SlotLayoutWidth);
         RecomputeSearchMatches();
     }
 
@@ -1026,11 +1383,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             PageBitmap = polled.Bitmap;
             _hasEstablishedInitialView = true;
 
-            // Text layer coordinates only line up with the bitmap they were
-            // extracted at, so refresh whenever the displayed bitmap changes
-            // (a new page, or a resolution change from zooming).
+            // The text layer is extracted in slot space, not at the bitmap's
+            // resolution, so a sharper render no longer invalidates it.
             _currentRenderedWidth = polled.Bitmap.PixelWidth;
-            RefreshTextLayer(polled.Bitmap.PixelWidth);
+            EnsureTextLayer();
 
             if (isNewPage)
             {
