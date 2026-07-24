@@ -577,6 +577,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Slot-space top of a page, for scroll-to-page.</summary>
     public double SlotTopOf(int pageIndex) => _layout.TopOf(pageIndex);
 
+    /// <summary>"7 / 20", or empty when no document is open.</summary>
+    public string PagePositionLabel =>
+        PageCount > 0 ? $"{CurrentPageIndex + 1} / {PageCount}" : string.Empty;
+
+    partial void OnCurrentPageIndexChanged(int value) =>
+        OnPropertyChanged(nameof(PagePositionLabel));
+
+    partial void OnPageCountChanged(int value) =>
+        OnPropertyChanged(nameof(PagePositionLabel));
+
     /// <summary>
     /// Drives rendering and release from the current scroll position.
     ///

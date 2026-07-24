@@ -288,6 +288,17 @@ public sealed partial class MainPage : Page
 
     private void ZoomIn_Click(object sender, RoutedEventArgs e) => ZoomByFactor(ZoomStep);
     private void ZoomOut_Click(object sender, RoutedEventArgs e) => ZoomByFactor(1f / ZoomStep);
+    /// <summary>
+    /// Shows or hides the pages panel. It overlays the canvas rather than
+    /// taking a column, so toggling it never resizes the viewport and so never
+    /// disturbs the zoom or scroll position.
+    /// </summary>
+    private void ToggleThumbnails_Click(object sender, RoutedEventArgs e) => ToggleThumbnails();
+
+    private void ToggleThumbnails() =>
+        ThumbnailPanel.Visibility =
+            ThumbnailPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+
     /// <summary>Fit Width also re-arms fit tracking, so resizing keeps it fitted.</summary>
     private void ResetZoom_Click(object sender, RoutedEventArgs e)
     {
@@ -441,6 +452,11 @@ public sealed partial class MainPage : Page
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
                 SearchBox.SelectAll();
+                e.Handled = true;
+                break;
+
+            case VirtualKey.Tab:
+                ToggleThumbnails();
                 e.Handled = true;
                 break;
         }

@@ -11,318 +11,334 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp">
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="168" />
-            <ColumnDefinition Width="*" />
-        </Grid.ColumnDefinitions>
+    <!--
+        Canvas-first shell.
+
+        The document canvas fills the whole window and everything else FLOATS
+        over it, rather than the canvas being a panel squeezed between a menu
+        bar, a button strip and a status bar. Permanently visible chrome
+        competes with the page for both attention and pixels; here the tools
+        live in a narrow rail and a status pill that overlay the canvas, and
+        the pages panel is hidden until asked for, so the page is the app.
+
+        The canvas background is a flat neutral deliberately darker than the
+        page, so a white sheet reads as an object sitting on a surface. That
+        contrast is what makes it feel like a canvas rather than a borderless
+        region of the window.
+    -->
+    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
+          Background="{ThemeResource SolidBackgroundFillColorTertiaryBrush}">
+
+        <ScrollView
+            x:Name="PageScroller"
+            Grid.Row="2"
+            ZoomMode="Enabled"
+            HorizontalScrollBarVisibility="Auto"
+            VerticalScrollBarVisibility="Auto"
+            HorizontalScrollMode="Enabled"
+            VerticalScrollMode="Enabled"
+            MinZoomFactor="0.1"
+            MaxZoomFactor="8"
+            ViewChanged="PageScroller_ViewChanged"
+            SizeChanged="PageScroller_SizeChanged">
+            <!--
+                Width/Height are pinned to the ViewModel's layout size in
+                DIPs and the Image stretches to fill it. Sharper renders
+                therefore change only pixel density, never layout, so
+                ScrollView.ZoomFactor 1.0 reliably means "fits the width".
+            -->
+            <controls:CursorGrid
+                x:Name="ViewportHost"
+                Background="Transparent"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Top"
+                Padding="24"
+                PointerPressed="ViewportHost_PointerPressed"
+                PointerMoved="ViewportHost_PointerMoved"
+                PointerReleased="ViewportHost_PointerReleased"
+                PointerCanceled="ViewportHost_PointerReleased"
+                PointerCaptureLost="ViewportHost_PointerReleased">
+
+                <!--
+                    Continuous page stack.
+
+                    Each card is sized in SLOT space (unzoomed DIPs) from
+                    the page's intrinsic size, fixed the moment the
+                    document opens. Zoom is the ScrollView's own zoom
+                    factor, which grows the scrollable extent, so a card
+                    always occupies its final space and bitmaps can stream
+                    in or be released without anything below shifting.
+
+                    ItemsControl, not ItemsRepeater: the slots already
+                    virtualize their PIXELS in the view model (bitmaps are
+                    released outside the window while heights stay), so
+                    virtualizing the containers as well would buy little
+                    and would make scroll-offset-to-page mapping depend on
+                    realization order.
+                -->
+                <ItemsControl ItemsSource="{x:Bind ViewModel.PageSlots}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <StackPanel Orientation="Vertical" Spacing="16" HorizontalAlignment="Center" />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="viewmodels:PageSlot">
+                            <!-- The page card: white sheet, thin border, drop shadow. -->
+                            <Border Width="{x:Bind SlotWidth}" Height="{x:Bind SlotHeight}"
+                                    Background="White"
+                                    BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                                    BorderThickness="1"
+                                    HorizontalAlignment="Center">
+                                <Border.Shadow>
+                                    <ThemeShadow />
+                                </Border.Shadow>
+                                <Grid>
+                                    <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
+
+                                    <!--
+                                        Overlay layer for this page only.
+                                        Marks are stored NORMALIZED, so the
+                                        scale is the card's slot width and a
+                                        re-render at any resolution cannot
+                                        move them.
+                                    -->
+                                    <Grid HorizontalAlignment="Left" VerticalAlignment="Top">
+                                        <Grid.RenderTransform>
+                                            <ScaleTransform ScaleX="{x:Bind OverlayScale}" ScaleY="{x:Bind OverlayScale}" />
+                                        </Grid.RenderTransform>
+
+                                        <ItemsControl ItemsSource="{x:Bind SearchMatchRects}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                    <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <ItemsControl ItemsSource="{x:Bind SelectionRects}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                    <Rectangle Fill="#665599FF" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <ItemsControl ItemsSource="{x:Bind Highlights}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:HighlightAnnotation">
+                                                    <ItemsControl ItemsSource="{x:Bind Rects}">
+                                                        <ItemsControl.ItemsPanel>
+                                                            <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                                        </ItemsControl.ItemsPanel>
+                                                        <ItemsControl.ItemTemplate>
+                                                            <DataTemplate x:DataType="viewport:TextRect">
+                                                                <Rectangle Fill="#88FFFF00" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                                           Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                                           HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                            </DataTemplate>
+                                                        </ItemsControl.ItemTemplate>
+                                                    </ItemsControl>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <ItemsControl ItemsSource="{x:Bind Notes}">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewmodels:NoteAnnotation">
+                                                    <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
+                                                            Margin="{x:Bind local:MainPage.Offset(X, Y)}"
+                                                            HorizontalAlignment="Left" VerticalAlignment="Top">
+                                                        <FontIcon Glyph="&#xE70B;" FontSize="14" />
+                                                        <Button.Flyout>
+                                                            <Flyout>
+                                                                <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
+                                                            </Flyout>
+                                                        </Button.Flyout>
+                                                    </Button>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </Grid>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+                <!--
+                    Ink layer, spanning the WHOLE stack rather than sitting
+                    inside a page card. Polyline points cannot be bound
+                    through x:Bind, so strokes are built in code-behind,
+                    and a page-spanning layer means a stroke drawn near a
+                    page edge is never clipped by the card. Positions are
+                    in slot space, so the ScrollView's zoom scales the ink
+                    along with the pages.
+                -->
+                <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
+
+            </controls:CursorGrid>
+        </ScrollView>
 
         <!--
-            Thumbnail sidebar. ListView virtualizes container realization by
-            default (ItemsStackPanel), so on a 300-page document only the
-            handful of visible (+ buffer) items ever get a container — and
-            each container's Image.Loaded is what triggers that page's
-            thumbnail to actually render (see ThumbnailImage_Loaded), so we
-            never render more than what's on screen.
+            Tool rail: icons only, vertical, hugging the left edge. The tools
+            stay a glanceable column the way a canvas app expects, and cost a
+            fixed 44px of overlay instead of a full toolbar row of height.
         -->
-        <ListView
-            x:Name="ThumbnailList"
-            Grid.Column="0"
-            Padding="8"
-            ItemsSource="{x:Bind ViewModel.Thumbnails}"
-            SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
-            SelectionChanged="ThumbnailList_SelectionChanged"
-            ContainerContentChanging="ThumbnailList_ContainerContentChanging">
-            <ListView.ItemTemplate>
-                <DataTemplate x:DataType="viewmodels:PageThumbnail">
-                    <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
-                        <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
-                            <Image
-                                Source="{x:Bind Bitmap, Mode=OneWay}"
-                                Stretch="Uniform"
-                                Width="126"
-                                Height="163" />
-                        </Border>
-                        <TextBlock Text="{x:Bind DisplayNumber}" HorizontalAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
-                    </StackPanel>
-                </DataTemplate>
-            </ListView.ItemTemplate>
-        </ListView>
+        <Border HorizontalAlignment="Left" VerticalAlignment="Center" Margin="12,0,0,0"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="10" Padding="4">
+            <StackPanel Orientation="Vertical" Spacing="2">
+                <Button Click="HandTool_Click" ToolTipService.ToolTip="Hand (hold Space)"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE7C9;" FontSize="16" />
+                </Button>
+                <Button Click="SelectTool_Click" ToolTipService.ToolTip="Select text"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE8B0;" FontSize="16" />
+                </Button>
+                <Button Click="HighlightTool_Click" ToolTipService.ToolTip="Highlight"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE7E6;" FontSize="16" />
+                </Button>
+                <Button Click="DrawTool_Click" ToolTipService.ToolTip="Draw"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE70F;" FontSize="16" />
+                </Button>
+                <Button Click="NoteTool_Click" ToolTipService.ToolTip="Note"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE70B;" FontSize="16" />
+                </Button>
 
-        <Grid Grid.Column="1">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="*" />
-                <RowDefinition Height="Auto" />
-            </Grid.RowDefinitions>
+                <Rectangle Height="1" Margin="6,4" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
 
-            <MenuBar Grid.Row="0">
-                <MenuBarItem Title="File">
-                    <MenuFlyoutItem Text="Open..." Click="OpenFile_Click" />
-                    <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click" />
-                    <MenuFlyoutSeparator />
-                    <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
-                </MenuBarItem>
-                <MenuBarItem Title="Edit">
-                    <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}"
-                                    Click="Undo_Click"
-                                    IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">
-                        <MenuFlyoutItem.KeyboardAccelerators>
-                            <KeyboardAccelerator Modifiers="Control" Key="Z" />
-                        </MenuFlyoutItem.KeyboardAccelerators>
-                    </MenuFlyoutItem>
-                    <MenuFlyoutItem Text="{x:Bind ViewModel.RedoLabel, Mode=OneWay}"
-                                    Click="Redo_Click"
-                                    IsEnabled="{x:Bind ViewModel.CanRedo, Mode=OneWay}">
-                        <MenuFlyoutItem.KeyboardAccelerators>
-                            <KeyboardAccelerator Modifiers="Control" Key="Y" />
-                        </MenuFlyoutItem.KeyboardAccelerators>
-                    </MenuFlyoutItem>
-                </MenuBarItem>
-                <MenuBarItem Title="View">
-                    <MenuFlyoutItem Text="Zoom In" Click="ZoomIn_Click" />
-                    <MenuFlyoutItem Text="Zoom Out" Click="ZoomOut_Click" />
-                    <MenuFlyoutItem Text="Reset Zoom" Click="ResetZoom_Click" />
-                </MenuBarItem>
-            </MenuBar>
+                <Button Click="ToggleThumbnails_Click" ToolTipService.ToolTip="Pages (Tab)"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE8A9;" FontSize="16" />
+                </Button>
+                <Button ToolTipService.ToolTip="Menu"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE712;" FontSize="16" />
+                    <Button.Flyout>
+                        <MenuFlyout Placement="Right">
+                            <MenuFlyoutItem Text="Open..." Click="OpenFile_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="O" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="S" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}" Click="Undo_Click"
+                                            IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="Z" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="{x:Bind ViewModel.RedoLabel, Mode=OneWay}" Click="Redo_Click"
+                                            IsEnabled="{x:Bind ViewModel.CanRedo, Mode=OneWay}">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="Y" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
+                            <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
+            </StackPanel>
+        </Border>
 
-            <!-- Annotation tool switcher: changes what plain left-drag/click does in the viewport below. -->
-            <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="4" Padding="8,8,8,4">
-                <Button Content="Hand" Click="HandTool_Click" />
-                <Button Content="Select" Click="SelectTool_Click" />
-                <Button Content="Highlight" Click="HighlightTool_Click" />
-                <Button Content="Note" Click="NoteTool_Click" />
-                <Button Content="Draw" Click="DrawTool_Click" />
-                <!--
-                    Sat immediately after the tool buttons showing just the tool
-                    name, so "Select" appeared twice in a row and read as a
-                    sixth, broken button. Labelled and separated instead.
-                -->
-                <TextBlock VerticalAlignment="Center" Margin="16,0,0,0" Style="{StaticResource CaptionTextBlockStyle}"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}">
-                    <Run Text="Tool:" />
-                    <Run Text="{x:Bind ViewModel.ActiveTool, Mode=OneWay}" FontWeight="SemiBold" />
-                </TextBlock>
+        <!--
+            Pages panel as an OVERLAY, not a permanent column, so it never
+            takes width away from the canvas. Hidden until asked for.
+        -->
+        <Border x:Name="ThumbnailPanel" Visibility="Collapsed"
+                HorizontalAlignment="Left" Margin="66,12,0,12" Width="182"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="10">
+            <ListView
+                x:Name="ThumbnailList"
+                Grid.Column="0"
+                Padding="8"
+                ItemsSource="{x:Bind ViewModel.Thumbnails}"
+                SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
+                SelectionChanged="ThumbnailList_SelectionChanged"
+                ContainerContentChanging="ThumbnailList_ContainerContentChanging">
+                <ListView.ItemTemplate>
+                    <DataTemplate x:DataType="viewmodels:PageThumbnail">
+                        <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
+                            <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+                                <Image
+                                    Source="{x:Bind Bitmap, Mode=OneWay}"
+                                    Stretch="Uniform"
+                                    Width="126"
+                                    Height="163" />
+                            </Border>
+                            <TextBlock Text="{x:Bind DisplayNumber}" HorizontalAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                        </StackPanel>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+        </Border>
 
-                <!-- Page operations (phase 5) -->
-                <Button Content="Rotate 90°" Click="RotatePage_Click" Margin="24,0,0,0" />
-                <Button Content="Delete Page" Click="DeletePage_Click" />
-
-                <!-- Unsaved-changes marker: visible while IsDirty. -->
-                <TextBlock Text="● Unsaved"
-                           Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                           VerticalAlignment="Center"
-                           Margin="24,0,0,0"
-                           Style="{StaticResource CaptionTextBlockStyle}"
+        <!--
+            Status pill: page position, zoom, fit and find. Floats bottom
+            centre and stays out of the way, replacing a full-width status bar.
+        -->
+        <Border HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="18" Padding="6,3">
+            <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                <TextBlock Text="{x:Bind ViewModel.PagePositionLabel, Mode=OneWay}"
+                           VerticalAlignment="Center" Margin="10,0,6,0"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                <Button Content="&#xE949;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomOut_Click"
+                        Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Zoom out" />
+                <TextBlock x:Name="ZoomPercentText" Text="100%" VerticalAlignment="Center" Width="42"
+                           TextAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                <Button Content="&#xE948;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomIn_Click"
+                        Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Zoom in" />
+                <Button Content="&#xE9A6;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ResetZoom_Click"
+                        Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Fit width" />
+                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                <TextBox x:Name="SearchBox" Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}"
+                         PlaceholderText="Find" Width="130" Height="28" Margin="2,0,4,0"
+                         VerticalAlignment="Center" BorderThickness="0" Background="Transparent" />
+                <TextBlock Text="&#9679;" Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                           VerticalAlignment="Center" Margin="0,0,10,0" FontSize="14"
+                           ToolTipService.ToolTip="Unsaved changes"
                            Visibility="{x:Bind ViewModel.DirtyIndicatorVisibility, Mode=OneWay}" />
             </StackPanel>
-
-            <!--
-                ScrollView, not a hand-rolled transform.
-                ScrollView/ScrollPresenter drives pan and zoom through
-                InteractionTracker on the COMPOSITOR thread: momentum,
-                rubber-band bounce at the edges, blended pinch+pan, precision
-                touchpad and scrollbars all come for free and keep running at
-                60fps even while the UI thread is busy rasterizing a page.
-                This previously was a plain Grid with a CompositeTransform and
-                a DispatcherQueueTimer re-implementing all of that on the UI
-                thread, which is precisely what made zoom feel steppy.
-                Content coordinates also get simpler: a point relative to
-                PageImage is already page-bitmap space, so tools need no
-                inverse-transform math.
-            -->
-            <ScrollView
-                x:Name="PageScroller"
-                Grid.Row="2"
-                ZoomMode="Enabled"
-                HorizontalScrollBarVisibility="Auto"
-                VerticalScrollBarVisibility="Auto"
-                HorizontalScrollMode="Enabled"
-                VerticalScrollMode="Enabled"
-                MinZoomFactor="0.1"
-                MaxZoomFactor="8"
-                ViewChanged="PageScroller_ViewChanged"
-                SizeChanged="PageScroller_SizeChanged">
-                <!--
-                    Width/Height are pinned to the ViewModel's layout size in
-                    DIPs and the Image stretches to fill it. Sharper renders
-                    therefore change only pixel density, never layout, so
-                    ScrollView.ZoomFactor 1.0 reliably means "fits the width".
-                -->
-                <controls:CursorGrid
-                    x:Name="ViewportHost"
-                    Background="Transparent"
-                    HorizontalAlignment="Center"
-                    VerticalAlignment="Top"
-                    Padding="24"
-                    PointerPressed="ViewportHost_PointerPressed"
-                    PointerMoved="ViewportHost_PointerMoved"
-                    PointerReleased="ViewportHost_PointerReleased"
-                    PointerCanceled="ViewportHost_PointerReleased"
-                    PointerCaptureLost="ViewportHost_PointerReleased">
-
-                    <!--
-                        Continuous page stack.
-
-                        Each card is sized in SLOT space (unzoomed DIPs) from
-                        the page's intrinsic size, fixed the moment the
-                        document opens. Zoom is the ScrollView's own zoom
-                        factor, which grows the scrollable extent, so a card
-                        always occupies its final space and bitmaps can stream
-                        in or be released without anything below shifting.
-
-                        ItemsControl, not ItemsRepeater: the slots already
-                        virtualize their PIXELS in the view model (bitmaps are
-                        released outside the window while heights stay), so
-                        virtualizing the containers as well would buy little
-                        and would make scroll-offset-to-page mapping depend on
-                        realization order.
-                    -->
-                    <ItemsControl ItemsSource="{x:Bind ViewModel.PageSlots}">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <StackPanel Orientation="Vertical" Spacing="16" HorizontalAlignment="Center" />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="viewmodels:PageSlot">
-                                <!-- The page card: white sheet, thin border, drop shadow. -->
-                                <Border Width="{x:Bind SlotWidth}" Height="{x:Bind SlotHeight}"
-                                        Background="White"
-                                        BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                                        BorderThickness="1"
-                                        HorizontalAlignment="Center">
-                                    <Border.Shadow>
-                                        <ThemeShadow />
-                                    </Border.Shadow>
-                                    <Grid>
-                                        <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
-
-                                        <!--
-                                            Overlay layer for this page only.
-                                            Marks are stored NORMALIZED, so the
-                                            scale is the card's slot width and a
-                                            re-render at any resolution cannot
-                                            move them.
-                                        -->
-                                        <Grid HorizontalAlignment="Left" VerticalAlignment="Top">
-                                            <Grid.RenderTransform>
-                                                <ScaleTransform ScaleX="{x:Bind OverlayScale}" ScaleY="{x:Bind OverlayScale}" />
-                                            </Grid.RenderTransform>
-
-                                            <ItemsControl ItemsSource="{x:Bind SearchMatchRects}" IsHitTestVisible="False">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate x:DataType="viewport:TextRect">
-                                                        <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                                                   Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                                   HorizontalAlignment="Left" VerticalAlignment="Top" />
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-
-                                            <ItemsControl ItemsSource="{x:Bind SelectionRects}" IsHitTestVisible="False">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate x:DataType="viewport:TextRect">
-                                                        <Rectangle Fill="#665599FF" Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                                                   Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                                   HorizontalAlignment="Left" VerticalAlignment="Top" />
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-
-                                            <ItemsControl ItemsSource="{x:Bind Highlights}" IsHitTestVisible="False">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate x:DataType="viewport:HighlightAnnotation">
-                                                        <ItemsControl ItemsSource="{x:Bind Rects}">
-                                                            <ItemsControl.ItemsPanel>
-                                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                                            </ItemsControl.ItemsPanel>
-                                                            <ItemsControl.ItemTemplate>
-                                                                <DataTemplate x:DataType="viewport:TextRect">
-                                                                    <Rectangle Fill="#88FFFF00" Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
-                                                                </DataTemplate>
-                                                            </ItemsControl.ItemTemplate>
-                                                        </ItemsControl>
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-
-                                            <ItemsControl ItemsSource="{x:Bind Notes}">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate x:DataType="viewmodels:NoteAnnotation">
-                                                        <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
-                                                                Margin="{x:Bind local:MainPage.Offset(X, Y)}"
-                                                                HorizontalAlignment="Left" VerticalAlignment="Top">
-                                                            <FontIcon Glyph="&#xE70B;" FontSize="14" />
-                                                            <Button.Flyout>
-                                                                <Flyout>
-                                                                    <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
-                                                                </Flyout>
-                                                            </Button.Flyout>
-                                                        </Button>
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                        </Grid>
-                                    </Grid>
-                                </Border>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-
-                    <!--
-                        Ink layer, spanning the WHOLE stack rather than sitting
-                        inside a page card. Polyline points cannot be bound
-                        through x:Bind, so strokes are built in code-behind,
-                        and a page-spanning layer means a stroke drawn near a
-                        page edge is never clipped by the card. Positions are
-                        in slot space, so the ScrollView's zoom scales the ink
-                        along with the pages.
-                    -->
-                    <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
-
-                </controls:CursorGrid>
-            </ScrollView>
-
-            <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="12" Padding="12" HorizontalAlignment="Center">
-                <TextBlock
-                    Text="{x:Bind ViewModel.Status, Mode=OneWay}"
-                    VerticalAlignment="Center"
-                    Style="{StaticResource BodyTextBlockStyle}" />
-                <TextBlock
-                    Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
-                    VerticalAlignment="Center"
-                    Style="{StaticResource CaptionTextBlockStyle}" />
-
-                <!-- Zoom controls -->
-                <Button Content="−" Click="ZoomOut_Click" MinWidth="32" />
-                <TextBlock x:Name="ZoomPercentText" Text="100%" VerticalAlignment="Center" Width="44" TextAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
-                <Button Content="+" Click="ZoomIn_Click" MinWidth="32" />
-                <Button Content="Fit Width" Click="ResetZoom_Click" />
-
-                <TextBox
-                    x:Name="SearchBox"
-                    Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}"
-                    PlaceholderText="Find on page (Ctrl+F)"
-                    Width="180"
-                    VerticalAlignment="Center" />
-                <Button Content="Re-render" Command="{x:Bind ViewModel.OpenAndRenderSampleDocumentCommand}" />
-            </StackPanel>
-        </Grid>
+        </Border>
     </Grid>
 </Page>

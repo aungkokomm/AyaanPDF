@@ -1,0 +1,23 @@
+        <ListView
+            x:Name="ThumbnailList"
+            Grid.Column="0"
+            Padding="8"
+            ItemsSource="{x:Bind ViewModel.Thumbnails}"
+            SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
+            SelectionChanged="ThumbnailList_SelectionChanged"
+            ContainerContentChanging="ThumbnailList_ContainerContentChanging">
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="viewmodels:PageThumbnail">
+                    <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
+                        <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+                            <Image
+                                Source="{x:Bind Bitmap, Mode=OneWay}"
+                                Stretch="Uniform"
+                                Width="126"
+                                Height="163" />
+                        </Border>
+                        <TextBlock Text="{x:Bind DisplayNumber}" HorizontalAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                    </StackPanel>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
