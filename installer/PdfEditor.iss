@@ -8,7 +8,7 @@
 ; Or compile alone with:          ISCC.exe installer\PdfEditor.iss   (after publishing first)
 
 #define AppName    "PdfEditor"
-#define AppVersion "1.1.1"
+#define AppVersion "1.2.0"
 #define Publisher  "Aung Ko Ko"
 #define ExeName    "PdfEditorApp.exe"
 #define SrcDir     "..\PdfEditorApp\publish"
