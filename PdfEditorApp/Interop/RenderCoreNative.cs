@@ -33,6 +33,47 @@ internal struct CharInfoArray
     public int Status;
 }
 
+/// <summary>Mirrors render_core::BurnRect (src/lib.rs) — a filled rect in render-pixel space.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct BurnRect
+{
+    public int PageIndex;
+    public float Left;
+    public float Top;
+    public float Right;
+    public float Bottom;
+    public byte R;
+    public byte G;
+    public byte B;
+    public byte A;
+}
+
+/// <summary>Mirrors render_core::BurnPoint (src/lib.rs).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct BurnPoint
+{
+    public float X;
+    public float Y;
+}
+
+/// <summary>
+/// Mirrors render_core::BurnStroke (src/lib.rs). Strokes index into a shared
+/// flat point array rather than carrying their own, which keeps the FFI to
+/// plain slices instead of a pointer-to-pointer.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct BurnStroke
+{
+    public int PageIndex;
+    public uint PointOffset;
+    public uint PointCount;
+    public float WidthPx;
+    public byte R;
+    public byte G;
+    public byte B;
+    public byte A;
+}
+
 /// <summary>Mirrors render_core::{STATUS_*} (src/lib.rs).</summary>
 internal static class RenderStatus
 {
@@ -101,6 +142,22 @@ internal static partial class RenderCoreNative
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int get_form_field_count(ulong docHandle);
+
+    /// <summary>
+    /// Flattens annotations into page content. Must be followed by a save to
+    /// a NEW path and then a reload of the document, or a second save
+    /// re-burns the same marks on top of the already-burned ones.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int burn_annotations(
+        ulong docHandle,
+        int captureWidth,
+        [In] BurnRect[]? rects,
+        nuint rectCount,
+        [In] BurnStroke[]? strokes,
+        nuint strokeCount,
+        [In] BurnPoint[]? points,
+        nuint pointCount);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int fill_text_field(

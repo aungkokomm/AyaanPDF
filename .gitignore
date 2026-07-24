@@ -10,3 +10,5 @@ render_core/target/
 
 # Vendored native binary (7MB, re-downloadable from bblanchon/pdfium-binaries)
 render_core/vendor/pdfium/pdfium.dll
+
+burn*.log

@@ -131,15 +131,34 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public event Action? PageLayoutEstablished;
 
     /// <summary>
-    /// DIPs per bitmap pixel. Text-layer boxes, selection rects and ink
-    /// strokes are all in bitmap-pixel space, but the page is now laid out in
-    /// DIPs, so overlays scale by this and pointer coordinates divide by it.
-    /// Changes whenever a sharper render lands.
+    /// DIPs per bitmap pixel. Used only to turn a pointer position into
+    /// bitmap-pixel space for text hit-testing, which is the one thing still
+    /// measured against the current bitmap.
     /// </summary>
     public double ContentToLayoutScale =>
         _currentRenderedWidth > 0 && PageLayoutWidth > 0 ? PageLayoutWidth / _currentRenderedWidth : 1.0;
 
-    /// <summary>Raised when <see cref="ContentToLayoutScale"/> changes, so MainPage can restretch the overlays.</summary>
+    /// <summary>
+    /// DIPs per NORMALIZED unit, i.e. the multiplier that turns a stored
+    /// overlay coordinate into a position inside the page's layout box.
+    ///
+    /// Every overlay coordinate is stored normalized against the page WIDTH
+    /// (both axes share that one divisor, so the scale stays uniform and the
+    /// aspect ratio is preserved). Storing raw bitmap pixels instead would
+    /// tie each annotation to whatever resolution happened to be on screen
+    /// when it was drawn: zooming in swaps a 1165px bitmap for an 1820px one
+    /// and every earlier mark would silently shift. Normalized coordinates
+    /// are resolution-independent, so a re-render can never move them.
+    /// </summary>
+    public double OverlayScale => PageLayoutWidth;
+
+    /// <summary>Bitmap pixels to normalized units. Returns 0 before the first render.</summary>
+    private double Norm(double px) => _currentRenderedWidth > 0 ? px / _currentRenderedWidth : 0;
+
+    private TextRect NormRect(TextRect r) =>
+        new(Norm(r.Left), Norm(r.Top), Norm(r.Right), Norm(r.Bottom));
+
+    /// <summary>Raised when the overlay scale changes, so MainPage can restretch the overlays.</summary>
     public event Action? ContentScaleChanged;
 
     // ---------------- Document lifecycle ----------------
@@ -155,19 +174,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void OpenAndRenderSampleDocument() => OpenDocument(Path.Combine(AppContext.BaseDirectory, "sample.pdf"));
 
     /// <summary>Opens any PDF by path - the File&gt;Open entry point.</summary>
-    public void OpenDocument(string path)
+    /// <summary>
+    /// Opens a PDF. <paramref name="preserveAnnotations"/> is only set by the
+    /// save path, which reloads the SAME file to discard a burned copy and
+    /// must keep the overlays that are still pending.
+    /// </summary>
+    public void OpenDocument(string path, bool preserveAnnotations = false)
     {
         CloseCurrentDocument();
 
         _documentHandle = RenderCoreNative.open_document(path);
+        _currentDocumentPath = path;
 
         Thumbnails.Clear();
-        // Annotations are keyed by page index only, so carrying them across a
-        // document switch would misattach them to whatever page shares that
-        // index in the new file.
-        _allHighlights.Clear();
-        _allNotes.Clear();
-        _allInkStrokes.Clear();
+        if (!preserveAnnotations)
+        {
+            // Annotations are keyed by page index only, so carrying them across
+            // a document switch would misattach them to whatever page shares
+            // that index in the new file.
+            _allHighlights.Clear();
+            _allNotes.Clear();
+            _allInkStrokes.Clear();
+        }
         Highlights.Clear();
         Notes.Clear();
         InkStrokes.Clear();
@@ -243,8 +271,151 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RenderCurrentPage();
     }
 
-    public bool SaveDocumentAs(string path) =>
-        _documentHandle != 0 && RenderCoreNative.save_document(_documentHandle, path) == RenderStatus.OkPdfium;
+    /// <summary>
+    /// Path the current document was opened from, so it can be reloaded after
+    /// a save that burned annotations into it.
+    /// </summary>
+    private string? _currentDocumentPath;
+
+    /// <summary>
+    /// Flattens annotations into the document, writes it to <paramref name="path"/>,
+    /// then RELOADS from the original file.
+    ///
+    /// The reload is what stops a second save from burning the same marks
+    /// again on top of the first set. Burning mutates the in-memory document,
+    /// but the annotation lists stay populated so the overlays keep working,
+    /// so without discarding the burned copy every subsequent save would
+    /// stack another layer of the same highlights and strokes.
+    /// </summary>
+    public bool SaveDocumentAs(string path)
+    {
+        if (_documentHandle == 0)
+        {
+            return false;
+        }
+
+        bool burned = BurnAllAnnotations();
+
+        bool saved = RenderCoreNative.save_document(_documentHandle, path) == RenderStatus.OkPdfium;
+
+        if (burned)
+        {
+            // Reload so the in-memory document is clean again. Prefer the
+            // file we just wrote when the original is gone, so the reload
+            // cannot fail outright; the annotation lists are cleared in that
+            // case because they are already part of the page content.
+            string reloadFrom = _currentDocumentPath is not null && File.Exists(_currentDocumentPath)
+                ? _currentDocumentPath
+                : path;
+            bool reloadedFromSaved = reloadFrom == path;
+
+            int page = CurrentPageIndex;
+            OpenDocument(reloadFrom, preserveAnnotations: !reloadedFromSaved);
+            GoToPage(Math.Min(page, Math.Max(0, PageCount - 1)));
+        }
+
+        return saved;
+    }
+
+    /// <summary>
+    /// Burns every stored annotation into page content. Returns false when
+    /// there was nothing to burn, so the caller can skip the reload.
+    /// </summary>
+    private bool BurnAllAnnotations()
+    {
+        if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0)
+        {
+            return false;
+        }
+
+        // Coordinates are stored normalized; render_core wants them in the
+        // pixel space of some capture width, so scale by a reference width.
+        // Any value works as long as both sides agree, since it cancels out.
+        const int CaptureWidth = 1000;
+
+        var rects = new List<BurnRect>();
+        foreach (var h in _allHighlights)
+        {
+            var (r, g, b, a) = ParseHex(h.ColorHex, defaultAlpha: 0x88);
+            foreach (var rect in h.Rects)
+            {
+                rects.Add(new BurnRect
+                {
+                    PageIndex = h.PageIndex,
+                    Left = (float)(rect.Left * CaptureWidth),
+                    Top = (float)(rect.Top * CaptureWidth),
+                    Right = (float)(rect.Right * CaptureWidth),
+                    Bottom = (float)(rect.Bottom * CaptureWidth),
+                    R = r, G = g, B = b, A = a,
+                });
+            }
+        }
+
+        var strokes = new List<BurnStroke>();
+        var points = new List<BurnPoint>();
+        foreach (var s in _allInkStrokes)
+        {
+            if (s.Points.Count < 2)
+            {
+                continue;
+            }
+
+            var (r, g, b, a) = ParseHex(s.ColorHex, defaultAlpha: 0xFF);
+            strokes.Add(new BurnStroke
+            {
+                PageIndex = s.PageIndex,
+                PointOffset = (uint)points.Count,
+                PointCount = (uint)s.Points.Count,
+                WidthPx = (float)(s.StrokeWidth * CaptureWidth),
+                R = r, G = g, B = b, A = a,
+            });
+            foreach (var (x, y) in s.Points)
+            {
+                points.Add(new BurnPoint { X = (float)(x * CaptureWidth), Y = (float)(y * CaptureWidth) });
+            }
+        }
+
+        if (rects.Count == 0 && strokes.Count == 0)
+        {
+            return false;
+        }
+
+        int status = RenderCoreNative.burn_annotations(
+            _documentHandle,
+            CaptureWidth,
+            rects.ToArray(), (nuint)rects.Count,
+            strokes.ToArray(), (nuint)strokes.Count,
+            points.ToArray(), (nuint)points.Count);
+
+        Debug.WriteLine($"[ViewportViewModel] burn: {rects.Count} rects, {strokes.Count} strokes -> status={status}");
+        return status == RenderStatus.OkPdfium;
+    }
+
+    /// <summary>Parses "#RRGGBB" or "#AARRGGBB"; falls back to opaque yellow.</summary>
+    private static (byte R, byte G, byte B, byte A) ParseHex(string hex, byte defaultAlpha)
+    {
+        hex = (hex ?? string.Empty).TrimStart('#');
+        try
+        {
+            if (hex.Length == 8)
+            {
+                return (Convert.ToByte(hex.Substring(2, 2), 16),
+                        Convert.ToByte(hex.Substring(4, 2), 16),
+                        Convert.ToByte(hex.Substring(6, 2), 16),
+                        Convert.ToByte(hex.Substring(0, 2), 16));
+            }
+            if (hex.Length == 6)
+            {
+                return (Convert.ToByte(hex.Substring(0, 2), 16),
+                        Convert.ToByte(hex.Substring(2, 2), 16),
+                        Convert.ToByte(hex.Substring(4, 2), 16),
+                        defaultAlpha);
+            }
+        }
+        catch { /* fall through */ }
+
+        return (0xFF, 0xFF, 0x00, defaultAlpha);
+    }
 
     // ---------------- AcroForm ----------------
 
@@ -340,7 +511,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var highlight = new HighlightAnnotation(CurrentPageIndex, rects, "#FFFF00");
+        var highlight = new HighlightAnnotation(
+            CurrentPageIndex,
+            rects.Select(NormRect).ToList(),
+            "#FFFF00");
         _allHighlights.Add(highlight);
         Highlights.Add(highlight);
         ClearSelection();
@@ -364,7 +538,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         foreach (var rect in _textLayer.GetRangeRects(_selectionStart, _selectionLength))
         {
-            SelectionRects.Add(rect);
+            SelectionRects.Add(NormRect(rect));
         }
     }
 
@@ -378,9 +552,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     // ---------------- Ink / notes ----------------
 
+    // Ink points are normalized on the way IN, not on commit, so the live
+    // preview MainPage draws from _currentStroke sits in the same coordinate
+    // space as the finished strokes and the two cannot disagree.
     public void BeginInkStroke(double x, double y)
     {
-        _currentStroke = new List<(double, double)> { (x, y) };
+        _currentStroke = new List<(double, double)> { (Norm(x), Norm(y)) };
         InkStrokeChanged?.Invoke();
     }
 
@@ -391,7 +568,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _currentStroke.Add((x, y));
+        _currentStroke.Add((Norm(x), Norm(y)));
         InkStrokeChanged?.Invoke();
     }
 
@@ -399,7 +576,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_currentStroke is { Count: > 1 })
         {
-            var stroke = new InkStrokeAnnotation(CurrentPageIndex, _currentStroke, "#FFE00000", 2.0);
+            var stroke = new InkStrokeAnnotation(
+                CurrentPageIndex,
+                new List<(double X, double Y)>(_currentStroke),
+                "#FFE00000",
+                Norm(2.0));
             _allInkStrokes.Add(stroke);
             InkStrokes.Add(stroke);
         }
@@ -410,7 +591,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void AddNoteAt(double x, double y)
     {
-        var note = new NoteAnnotation(CurrentPageIndex, x, y, string.Empty);
+        var note = new NoteAnnotation(CurrentPageIndex, Norm(x), Norm(y), string.Empty);
         _allNotes.Add(note);
         Notes.Add(note);
     }
@@ -452,7 +633,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             foreach (var rect in _textLayer.GetRangeRects(start, length))
             {
-                SearchMatchRects.Add(rect);
+                SearchMatchRects.Add(NormRect(rect));
             }
         }
     }

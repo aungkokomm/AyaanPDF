@@ -80,10 +80,10 @@ public sealed partial class MainPage : Page
         // Layout must run before the ScrollView's extent reflects the new size.
         DispatcherQueue.TryEnqueue(() => FitToWidth());
 
-    /// <summary>Keeps the bitmap-pixel-space overlays aligned with the DIP-space page box.</summary>
+    /// <summary>Expands the normalized overlay coordinates into the page's DIP layout box.</summary>
     private void OnContentScaleChanged()
     {
-        double scale = ViewModel.ContentToLayoutScale;
+        double scale = ViewModel.OverlayScale;
         OverlayScale.ScaleX = scale;
         OverlayScale.ScaleY = scale;
     }

@@ -1102,8 +1102,16 @@ fn render_page_via_pdfium(
 ) -> Option<(i32, i32, Vec<u8>)> {
     let page = doc.pages().get(page_index as u16).ok()?;
 
+    // set_reverse_byte_order defaults to TRUE in PdfRenderConfig::new(), which
+    // makes PDFium write RGBA while bitmap.format() still reports BGRA. Our
+    // consumer is a WinUI WriteableBitmap, whose PixelBuffer is always BGRA8,
+    // so leaving the default on swaps red and blue in every colored page. It
+    // is invisible on black-on-white fixtures, which is why it survived this
+    // long. Turning the flag off makes PDFium write the byte order we want
+    // directly, so the buffer still needs no conversion pass.
     let render_config = PdfRenderConfig::new()
         .set_target_width(target_width)
+        .set_reverse_byte_order(false)
         .rotate_if_landscape(PdfPageRenderRotation::None, false);
 
     let bitmap = page.render_with_config(&render_config).ok()?;
@@ -1756,6 +1764,168 @@ mod tests {
         drop(doc);
         drop(_guard);
         close_document(handle);
+    }
+
+    /// Mean BGRA of a box in a freshly rendered page, sampled at `width` px.
+    fn sample_mean(handle: u64, page: i32, width: i32, x0: i32, y0: i32, x1: i32, y1: i32)
+        -> (f64, f64, f64)
+    {
+        let r = render_low_res(handle, page, width);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len) };
+        let (mut b, mut g, mut rd, mut n) = (0f64, 0f64, 0f64, 0f64);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = ((y * r.width + x) * 4) as usize;
+                b += bytes[i] as f64;
+                g += bytes[i + 1] as f64;
+                rd += bytes[i + 2] as f64;
+                n += 1.0;
+            }
+        }
+        free_render_result(r);
+        (b / n, g / n, rd / n)
+    }
+
+    #[test]
+    fn burned_highlight_is_actually_visible_where_it_was_drawn() {
+        // The object-count tests prove an object was added; they do not prove
+        // it renders, nor that it renders in the right half of the page. An
+        // inverted Y flip, a zero alpha or a bad blend mode all pass a count
+        // check and still show the user nothing (or a mark in the wrong
+        // place). So: burn a saturated blue band across the TOP quarter, then
+        // re-render and compare that band against the BOTTOM quarter.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        const W: i32 = 400;
+
+        // The fixture page is square, so a W-wide render is W tall.
+        let before_top = sample_mean(handle, 0, W, 20, 25, W - 20, 75);
+        let before_bottom = sample_mean(handle, 0, W, 20, 320, W - 20, 390);
+
+        // Coordinates are in the space of a 1000px-wide capture; the render
+        // above is 400px wide, so the burn must survive that rescale too.
+        let rects = [BurnRect {
+            page_index: 0,
+            left: 50.0, top: 50.0, right: 950.0, bottom: 200.0,
+            r: 0, g: 0, b: 255, a: 255,
+        }];
+        assert_eq!(
+            burn_annotations(handle, 1000, rects.as_ptr(), rects.len(),
+                             std::ptr::null(), 0, std::ptr::null(), 0),
+            STATUS_OK_PDFIUM
+        );
+
+        let after_top = sample_mean(handle, 0, W, 20, 25, W - 20, 75);
+        let after_bottom = sample_mean(handle, 0, W, 20, 320, W - 20, 390);
+
+        // The page is already near-white (~235 on every channel), so "blue"
+        // shows up as channel DOMINANCE, not as a rise in absolute blue.
+        let blueness = |(b, _g, r): (f64, f64, f64)| b - r;
+        assert!(
+            blueness(before_top).abs() < 10.0,
+            "fixture should start neutral, got (b,g,r)={before_top:?}"
+        );
+        assert!(
+            blueness(after_top) > 150.0,
+            "top band should be strongly blue after the burn: \
+             before(b,g,r)={before_top:?} after={after_top:?}"
+        );
+        assert!(
+            blueness(after_bottom).abs() < 10.0 && (after_bottom.2 - before_bottom.2).abs() < 5.0,
+            "bottom of the page must be untouched, but it changed: \
+             before={before_bottom:?} after={after_bottom:?} (annotation mirrored?)"
+        );
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn saving_twice_does_not_burn_the_same_annotation_twice() {
+        // Models exactly what ViewportViewModel.SaveDocumentAs does: burn into
+        // the in-memory document, save, then reload from the CLEAN original on
+        // disk while keeping the annotation list. Save again and the second
+        // file must be identical in object count to the first. Reloading from
+        // the file just written instead would stack a second copy of every
+        // mark on top of the first, which is the bug this ordering exists to
+        // prevent.
+        let src = "tests/fixtures/sample_20pages.pdf";
+        let rects = [BurnRect {
+            page_index: 0,
+            left: 100.0, top: 100.0, right: 500.0, bottom: 200.0,
+            r: 255, g: 255, b: 0, a: 128,
+        }];
+
+        let mut counts = Vec::new();
+        let mut outs = Vec::new();
+        for pass in 0..2 {
+            // Every pass starts from the clean original: this is the reload.
+            let handle = open_fixture_named(src);
+            assert_eq!(
+                burn_annotations(handle, 1000, rects.as_ptr(), rects.len(),
+                                 std::ptr::null(), 0, std::ptr::null(), 0),
+                STATUS_OK_PDFIUM
+            );
+            let mut path = std::env::temp_dir();
+            path.push(format!("render_core_double_{}_{pass}.pdf", std::process::id()));
+            let path_str = path.to_str().unwrap().to_owned();
+            let c_path = std::ffi::CString::new(path_str.clone()).unwrap();
+            assert_eq!(save_document(handle, c_path.as_ptr()), STATUS_OK_PDFIUM);
+            close_document(handle);
+
+            let reopened = open_fixture_named(&path_str);
+            counts.push(page_object_count(reopened, 0));
+            close_document(reopened);
+            outs.push(path);
+        }
+
+        assert_eq!(
+            counts[0], counts[1],
+            "the second save added extra objects, so the annotation was burned twice"
+        );
+
+        for p in outs {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn render_buffer_channel_order_is_bgra_not_rgba() {
+        // The buffer goes straight into a WinUI WriteableBitmap, whose
+        // PixelBuffer is always BGRA8. The neutral-grey fixture check cannot
+        // tell BGRA from RGBA, so paint a known ASYMMETRIC color onto the page
+        // and read back which byte it lands in. PdfRenderConfig defaults to
+        // reverse_byte_order(true), which yields RGBA here and silently swaps
+        // red and blue on screen for every colored PDF.
+        for (name, (r, g, b), want) in [
+            ("red", (255u8, 0u8, 0u8), [0u8, 0, 255]),
+            ("blue", (0u8, 0u8, 255u8), [255u8, 0, 0]),
+        ] {
+            let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let rects = [BurnRect {
+                page_index: 0,
+                left: 50.0, top: 50.0, right: 950.0, bottom: 200.0,
+                r, g, b, a: 255,
+            }];
+            assert_eq!(
+                burn_annotations(handle, 1000, rects.as_ptr(), rects.len(),
+                                 std::ptr::null(), 0, std::ptr::null(), 0),
+                STATUS_OK_PDFIUM
+            );
+
+            let res = render_low_res(handle, 0, 400);
+            assert_eq!(res.status, STATUS_OK_PDFIUM);
+            let bytes = unsafe { std::slice::from_raw_parts(res.buffer, res.len) };
+            let i = ((50 * res.width + 200) * 4) as usize;
+            let got = [bytes[i], bytes[i + 1], bytes[i + 2]];
+            assert_eq!(
+                got, want,
+                "pure {name} (rgb {r},{g},{b}) should read back as BGRA {want:?} \
+                 but came out {got:?}; the buffer is RGBA, so WriteableBitmap \
+                 will show red and blue swapped"
+            );
+            free_render_result(res);
+            close_document(handle);
+        }
     }
 
     #[test]
