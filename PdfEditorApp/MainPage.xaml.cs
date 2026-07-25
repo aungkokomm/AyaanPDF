@@ -34,6 +34,8 @@ public sealed partial class MainPage : Page
     private bool _isSelectingText;
     private bool _isDrawing;
     private bool _isMovingAnnotation;
+    private bool _isPanning;
+    private Point _panLastPoint;
     private uint _dragPointerId;
     private Polyline? _livePreviewStroke;
 
@@ -44,7 +46,12 @@ public sealed partial class MainPage : Page
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
         ViewModel.LayoutRebuilt += OnLayoutRebuilt;
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
-        Loaded += (_, _) => RootGrid.Focus(FocusState.Programmatic);
+        Loaded += (_, _) =>
+        {
+            RootGrid.Focus(FocusState.Programmatic);
+            UpdateToolRail();
+            UpdateCursor();
+        };
 
         // Lets the app be driven headlessly for diagnosis: set
         // PDFEDITOR_AUTOOPEN to a PDF path and it loads on startup.
@@ -246,7 +253,28 @@ public sealed partial class MainPage : Page
     private void SetActiveTool(ToolMode tool)
     {
         ViewModel.ActiveTool = tool;
+        UpdateToolRail();
         UpdateCursor();
+    }
+
+    /// <summary>
+    /// Marks the active tool in the rail.
+    ///
+    /// Without this nothing on screen said which tool was armed, so the only
+    /// way to find out was to drag on the page and see what happened. In a
+    /// tool-driven canvas app that is the difference between confident and
+    /// tentative use.
+    /// </summary>
+    private void UpdateToolRail()
+    {
+        var active = (SolidColorBrush)Application.Current.Resources["AccentFillColorDefaultBrush"];
+        var idle = new SolidColorBrush(Colors.Transparent);
+
+        HandToolButton.Background = ViewModel.ActiveTool == ToolMode.Hand ? active : idle;
+        SelectToolButton.Background = ViewModel.ActiveTool == ToolMode.Select ? active : idle;
+        HighlightToolButton.Background = ViewModel.ActiveTool == ToolMode.Highlight ? active : idle;
+        DrawToolButton.Background = ViewModel.ActiveTool == ToolMode.Draw ? active : idle;
+        NoteToolButton.Background = ViewModel.ActiveTool == ToolMode.Note ? active : idle;
     }
 
     // ---------------- File menu ----------------
@@ -349,9 +377,31 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void ToggleThumbnails_Click(object sender, RoutedEventArgs e) => ToggleThumbnails();
 
-    private void ToggleThumbnails() =>
-        ThumbnailPanel.Visibility =
-            ThumbnailPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+    /// <summary>Left chrome the canvas must stay clear of: the tool rail.</summary>
+    private const double RailInset = 64;
+
+    /// <summary>Additional inset while the pages panel is open.</summary>
+    private const double PanelInset = 194;
+
+    private void ToggleThumbnails()
+    {
+        bool showing = ThumbnailPanel.Visibility != Visibility.Visible;
+        ThumbnailPanel.Visibility = showing ? Visibility.Visible : Visibility.Collapsed;
+
+        // The canvas is inset so the page never sits UNDER the chrome. The
+        // panel and the rail overlay the window, but the usable canvas is only
+        // what they do not cover, so the scroller is given that region and the
+        // page refits into it. Without this the page hid behind the panel.
+        PageScroller.Margin = new Thickness(showing ? PanelInset : RailInset, 0, 0, 0);
+
+        // Refit only if the user has not taken the zoom over; if they have,
+        // their zoom is respected and only the visible region changes.
+        if (_autoFit)
+        {
+            // Layout has to settle at the new size before fitting to it.
+            DispatcherQueue.TryEnqueue(() => FitToWidth(animate: true));
+        }
+    }
 
     /// <summary>Fit Width also re-arms fit tracking, so resizing keeps it fitted.</summary>
     private void ResetZoom_Click(object sender, RoutedEventArgs e)
@@ -620,11 +670,23 @@ public sealed partial class MainPage : Page
         }
     }
 
+    /// <summary>
+    /// The cursor says what the current tool will do. An arrow over every
+    /// tool leaves the pointer lying about the mode it is in, which is the
+    /// main feedback a canvas app has between clicks.
+    /// </summary>
     private void UpdateCursor()
     {
-        var shape = _isSpaceHandActive || ViewModel.ActiveTool == ToolMode.Hand
-            ? InputSystemCursorShape.Hand
-            : InputSystemCursorShape.Arrow;
+        var shape = (_isSpaceHandActive, ViewModel.ActiveTool) switch
+        {
+            (true, _) => InputSystemCursorShape.SizeAll,
+            (_, ToolMode.Hand) => InputSystemCursorShape.SizeAll,
+            (_, ToolMode.Select) => InputSystemCursorShape.IBeam,
+            (_, ToolMode.Highlight) => InputSystemCursorShape.IBeam,
+            (_, ToolMode.Draw) => InputSystemCursorShape.Cross,
+            (_, ToolMode.Note) => InputSystemCursorShape.Cross,
+            _ => InputSystemCursorShape.Arrow,
+        };
         ViewportHost.SetCursorShape(shape);
     }
 
@@ -672,10 +734,28 @@ public sealed partial class MainPage : Page
             return;   // let ScrollView handle touch/pen pan + pinch
         }
 
-        // Hand tool, Space-hand and middle-drag are all just panning: leave
-        // the event unhandled so ScrollView performs it on the compositor.
-        if (!ToolWantsPointer || !current.Properties.IsLeftButtonPressed)
+        if (!current.Properties.IsLeftButtonPressed)
         {
+            return;
+        }
+
+        // Hand tool and Space-hand pan by dragging.
+        //
+        // This used to just leave the event unhandled "so ScrollView pans on
+        // the compositor", which was wrong: ScrollView pans by drag for TOUCH
+        // and pen, not for a left mouse drag, so with a mouse the event was
+        // simply dropped and the hand tool never moved anything. Panning is
+        // driven explicitly below instead.
+        if (!ToolWantsPointer)
+        {
+            _isPanning = true;
+            _dragPointerId = current.PointerId;
+            // Measured against the SCROLLER, not the content: content moves as
+            // we scroll it, so measuring there would feed the scroll back into
+            // the delta and the page would run away from the pointer.
+            _panLastPoint = e.GetCurrentPoint(PageScroller).Position;
+            ViewportHost.CapturePointer(e.Pointer);
+            e.Handled = true;
             return;
         }
 
@@ -741,6 +821,23 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
+        if (_isPanning)
+        {
+            var now = e.GetCurrentPoint(PageScroller).Position;
+
+            // Drag the CONTENT with the pointer, so the offset moves opposite
+            // to the pointer: dragging right pulls the page right, which means
+            // scrolling left.
+            PageScroller.ScrollTo(
+                PageScroller.HorizontalOffset - (now.X - _panLastPoint.X),
+                PageScroller.VerticalOffset - (now.Y - _panLastPoint.Y),
+                new ScrollingScrollOptions(ScrollingAnimationMode.Disabled, ScrollingSnapPointsMode.Ignore));
+
+            _panLastPoint = now;
+            e.Handled = true;
+            return;
+        }
+
         if (_isMovingAnnotation)
         {
             ViewModel.MoveSelectedAnnotationTo(
@@ -767,7 +864,13 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        if (_isMovingAnnotation)
+        if (_isPanning)
+        {
+            _isPanning = false;
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }
+        else if (_isMovingAnnotation)
         {
             _isMovingAnnotation = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);

@@ -630,11 +630,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public string PagePositionLabel =>
         PageCount > 0 ? $"{CurrentPageIndex + 1} / {PageCount}" : string.Empty;
 
+    /// <summary>Shown only when nothing is open, so the canvas is never a blank void.</summary>
+    public Visibility EmptyStateVisibility =>
+        PageCount == 0 ? Visibility.Visible : Visibility.Collapsed;
+
     partial void OnCurrentPageIndexChanged(int value) =>
         OnPropertyChanged(nameof(PagePositionLabel));
 
-    partial void OnPageCountChanged(int value) =>
+    partial void OnPageCountChanged(int value)
+    {
         OnPropertyChanged(nameof(PagePositionLabel));
+        OnPropertyChanged(nameof(EmptyStateVisibility));
+    }
 
     /// <summary>
     /// Drives rendering and release from the current scroll position.

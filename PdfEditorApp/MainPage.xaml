@@ -38,8 +38,15 @@
             <SolidColorBrush Color="#3A3A3D" />
         </Grid.Background>
 
+        <!--
+            Margin keeps the canvas clear of the tool rail, and grows while the
+            pages panel is open so the page and the thumbnails coexist instead
+            of the page hiding behind the panel. Kept in sync from
+            ToggleThumbnails.
+        -->
         <ScrollView
             x:Name="PageScroller"
+            Margin="64,0,0,0"
             ZoomMode="Enabled"
             HorizontalScrollBarVisibility="Auto"
             VerticalScrollBarVisibility="Auto"
@@ -223,6 +230,20 @@
         </ScrollView>
 
         <!--
+            Empty state. Without it a fresh launch is an unexplained grey void
+            with no indication that anything works or what to do next.
+        -->
+        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10"
+                    IsHitTestVisible="False"
+                    Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
+            <FontIcon Glyph="&#xEA90;" FontSize="40" Foreground="#8AFFFFFF" HorizontalAlignment="Center" />
+            <TextBlock Text="No document open" Foreground="#C8FFFFFF" HorizontalAlignment="Center"
+                       Style="{StaticResource SubtitleTextBlockStyle}" />
+            <TextBlock Text="Ctrl+O to open a PDF" Foreground="#8AFFFFFF" HorizontalAlignment="Center"
+                       Style="{StaticResource BodyTextBlockStyle}" />
+        </StackPanel>
+
+        <!--
             Tool rail: icons only, vertical, hugging the left edge. The tools
             stay a glanceable column the way a canvas app expects, and cost a
             fixed 44px of overlay instead of a full toolbar row of height.
@@ -232,23 +253,23 @@
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="10" Padding="4">
             <StackPanel Orientation="Vertical" Spacing="2">
-                <Button Click="HandTool_Click" ToolTipService.ToolTip="Hand (hold Space)"
+                <Button x:Name="HandToolButton" Click="HandTool_Click" ToolTipService.ToolTip="Hand (hold Space)"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE7C9;" FontSize="16" />
                 </Button>
-                <Button Click="SelectTool_Click" ToolTipService.ToolTip="Select text"
+                <Button x:Name="SelectToolButton" Click="SelectTool_Click" ToolTipService.ToolTip="Select text"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE8B0;" FontSize="16" />
                 </Button>
-                <Button Click="HighlightTool_Click" ToolTipService.ToolTip="Highlight"
+                <Button x:Name="HighlightToolButton" Click="HighlightTool_Click" ToolTipService.ToolTip="Highlight"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE7E6;" FontSize="16" />
                 </Button>
-                <Button Click="DrawTool_Click" ToolTipService.ToolTip="Draw"
+                <Button x:Name="DrawToolButton" Click="DrawTool_Click" ToolTipService.ToolTip="Draw"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE70F;" FontSize="16" />
                 </Button>
-                <Button Click="NoteTool_Click" ToolTipService.ToolTip="Note"
+                <Button x:Name="NoteToolButton" Click="NoteTool_Click" ToolTipService.ToolTip="Note"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE70B;" FontSize="16" />
                 </Button>
