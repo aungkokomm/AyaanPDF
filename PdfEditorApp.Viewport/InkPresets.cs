@@ -45,6 +45,29 @@ public static class InkPresets
         new("Pink", "#88FF66CC"),
     ];
 
+    /// <summary>
+    /// The highlighter colour matching a pen colour, by NAME.
+    ///
+    /// These two lists are different lengths (a highlighter has no useful
+    /// "Black"), so pairing them by index silently mismatched: picking the
+    /// fifth pen colour indexed past the end of the highlight list and left
+    /// the highlighter on whatever it was. Matching by name pairs only the
+    /// colours that genuinely correspond and falls back to the default
+    /// otherwise, so adding a colour to either list cannot reintroduce it.
+    /// </summary>
+    public static InkColor HighlightFor(InkColor pen)
+    {
+        foreach (var h in HighlightColors)
+        {
+            if (string.Equals(h.Name, pen.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return h;
+            }
+        }
+
+        return DefaultHighlightColor;
+    }
+
     public static InkColor DefaultColor => Colors[0];
 
     public static InkWidth DefaultWidth => Widths[1];

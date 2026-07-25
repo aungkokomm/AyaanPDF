@@ -190,26 +190,43 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
-                                        <ItemsControl ItemsSource="{x:Bind Notes}">
-                                            <ItemsControl.ItemsPanel>
-                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                            </ItemsControl.ItemsPanel>
-                                            <ItemsControl.ItemTemplate>
-                                                <DataTemplate x:DataType="viewmodels:NoteAnnotation">
-                                                    <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
-                                                            Margin="{x:Bind local:MainPage.Offset(X, Y)}"
-                                                            HorizontalAlignment="Left" VerticalAlignment="Top">
-                                                        <FontIcon Glyph="&#xE70B;" FontSize="14" />
-                                                        <Button.Flyout>
-                                                            <Flyout>
-                                                                <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
-                                                            </Flyout>
-                                                        </Button.Flyout>
-                                                    </Button>
-                                                </DataTemplate>
-                                            </ItemsControl.ItemTemplate>
-                                        </ItemsControl>
                                     </Grid>
+
+                                    <!--
+                                        Notes live OUTSIDE the scaled overlay.
+
+                                        The overlay above is scaled by the slot
+                                        width (800x) so that normalized rect
+                                        sizes come out right. A note marker is
+                                        a real control with an intrinsic size,
+                                        so the same transform blew a 30px
+                                        button up to 24000px: it covered the
+                                        whole page and, being hit-testable,
+                                        swallowed every pointer event meant for
+                                        the tools underneath. Positioned here
+                                        by pre-multiplied offset instead, so it
+                                        stays a normal-sized button.
+                                    -->
+                                    <ItemsControl ItemsSource="{x:Bind Notes}"
+                                                  HorizontalAlignment="Left" VerticalAlignment="Top">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="viewmodels:NoteAnnotation">
+                                                <Button Padding="4" Background="#FFFFD700" CornerRadius="12"
+                                                        Margin="{x:Bind local:MainPage.ScaledOffset(X, Y, Scale)}"
+                                                        HorizontalAlignment="Left" VerticalAlignment="Top">
+                                                    <FontIcon Glyph="&#xE70B;" FontSize="14" Foreground="#FF1A1A1A" />
+                                                    <Button.Flyout>
+                                                        <Flyout>
+                                                            <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
+                                                        </Flyout>
+                                                    </Button.Flyout>
+                                                </Button>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
                                 </Grid>
                             </Border>
                         </DataTemplate>

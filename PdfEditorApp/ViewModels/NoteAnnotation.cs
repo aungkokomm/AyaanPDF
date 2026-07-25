@@ -14,6 +14,14 @@ public partial class NoteAnnotation : ObservableObject
     public double X { get; }
     public double Y { get; }
 
+    /// <summary>
+    /// Slot width, so the marker can convert its normalized position without
+    /// living inside the scaled overlay. A note marker is a real control with
+    /// an intrinsic size, and the overlay's 800x transform would blow it up to
+    /// cover the whole page.
+    /// </summary>
+    public double Scale { get; init; } = 1.0;
+
     [ObservableProperty]
     public partial string Text { get; set; }
 

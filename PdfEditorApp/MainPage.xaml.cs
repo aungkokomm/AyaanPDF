@@ -36,6 +36,7 @@ public sealed partial class MainPage : Page
     private bool _isMovingAnnotation;
     private bool _isPanning;
     private Point _panLastPoint;
+    private Point _panTarget;
     private uint _dragPointerId;
     private Polyline? _livePreviewStroke;
 
@@ -81,6 +82,14 @@ public sealed partial class MainPage : Page
     /// rather than a silently mispositioned rectangle.
     /// </summary>
     public static Thickness Offset(double left, double top) => new(left, top, 0, 0);
+
+    /// <summary>
+    /// Positions an element from a NORMALIZED coordinate, multiplying by the
+    /// slot scale. For overlays that must not sit inside the scaled layer,
+    /// because they have an intrinsic size the transform would magnify.
+    /// </summary>
+    public static Thickness ScaledOffset(double x, double y, double scale) =>
+        new(x * scale, y * scale, 0, 0);
 
     /// <summary>
     /// Turns a stored "#AARRGGBB" into a brush, for x:Bind in the annotation
@@ -303,13 +312,10 @@ public sealed partial class MainPage : Page
             // The pen and the highlighter are separate colours: a highlighter
             // must stay translucent or it covers the text it marks, so picking
             // a pen colour maps to the matching translucent highlight rather
-            // than making the highlighter opaque.
+            // than making the highlighter opaque. Matched by NAME, since the
+            // two lists are different lengths.
             ViewModel.InkColorHex = c.Hex;
-            int i = ColorChoices.SelectedIndex;
-            if (i >= 0 && i < InkPresets.HighlightColors.Count)
-            {
-                ViewModel.HighlightColorHex = InkPresets.HighlightColors[i].Hex;
-            }
+            ViewModel.HighlightColorHex = InkPresets.HighlightFor(c).Hex;
             UpdatePenSwatch();
         }
     }
@@ -446,8 +452,20 @@ public sealed partial class MainPage : Page
     /// <summary>Left chrome the canvas must stay clear of: the tool rail.</summary>
     private const double RailInset = 64;
 
-    /// <summary>Additional inset while the pages panel is open.</summary>
-    private const double PanelInset = 194;
+    /// <summary>Breathing room between the pages panel and the page.</summary>
+    private const double PanelGap = 10;
+
+    /// <summary>
+    /// How far the canvas must be inset to clear the pages panel, DERIVED from
+    /// where the panel actually is rather than written down separately.
+    ///
+    /// It was a hand-written 194 while the panel spanned 66 to 248, so the
+    /// panel covered the page by 54px. Two numbers that must agree, kept in
+    /// two places, will eventually disagree; reading the real geometry means
+    /// moving or resizing the panel cannot reintroduce the overlap.
+    /// </summary>
+    private double PanelInset =>
+        ThumbnailPanel.Margin.Left + ThumbnailPanel.ActualWidth + PanelGap;
 
     private void ToggleThumbnails()
     {
@@ -879,6 +897,8 @@ public sealed partial class MainPage : Page
     private void ViewportHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         var current = e.GetCurrentPoint(ViewportHost);
+        Diag.Log($"PRESS arrived: device={e.Pointer.PointerDeviceType} left={current.Properties.IsLeftButtonPressed} tool={ViewModel.ActiveTool}");
+
         if (e.Pointer.PointerDeviceType != Microsoft.UI.Input.PointerDeviceType.Mouse)
         {
             return;   // let ScrollView handle touch/pen pan + pinch
@@ -904,6 +924,7 @@ public sealed partial class MainPage : Page
             // we scroll it, so measuring there would feed the scroll back into
             // the delta and the page would run away from the pointer.
             _panLastPoint = e.GetCurrentPoint(PageScroller).Position;
+            _panTarget = new Point(PageScroller.HorizontalOffset, PageScroller.VerticalOffset);
             ViewportHost.CapturePointer(e.Pointer);
             e.Handled = true;
             return;
@@ -915,6 +936,9 @@ public sealed partial class MainPage : Page
         // live in.
         double nx = content.X / ViewModel.OverlayScale;
         double ny = content.Y / ViewModel.OverlayScale;
+
+        Diag.Log($"press tool={ViewModel.ActiveTool} raw=({e.GetCurrentPoint(ViewportHost).Position.X:F0},{e.GetCurrentPoint(ViewportHost).Position.Y:F0}) " +
+                 $"page={content.Page} local=({content.X:F1},{content.Y:F1}) norm=({nx:F3},{ny:F3})");
 
         switch (ViewModel.ActiveTool)
         {
@@ -975,12 +999,20 @@ public sealed partial class MainPage : Page
         {
             var now = e.GetCurrentPoint(PageScroller).Position;
 
-            // Drag the CONTENT with the pointer, so the offset moves opposite
-            // to the pointer: dragging right pulls the page right, which means
-            // scrolling left.
+            // Accumulate against our OWN target, not the scroller's reported
+            // offset. ScrollTo is asynchronous, so the reported offset still
+            // lags the previous call when the next move arrives; computing
+            // from it discards part of every delta and the page drifts behind
+            // the pointer, which is what made panning feel sticky. Tracking
+            // the intended position means every pixel of pointer movement is
+            // applied exactly once.
+            _panTarget = new Point(
+                _panTarget.X - (now.X - _panLastPoint.X),
+                _panTarget.Y - (now.Y - _panLastPoint.Y));
+
             PageScroller.ScrollTo(
-                PageScroller.HorizontalOffset - (now.X - _panLastPoint.X),
-                PageScroller.VerticalOffset - (now.Y - _panLastPoint.Y),
+                Math.Clamp(_panTarget.X, 0, Math.Max(0, PageScroller.ExtentWidth * PageScroller.ZoomFactor - PageScroller.ViewportWidth)),
+                Math.Clamp(_panTarget.Y, 0, Math.Max(0, PageScroller.ExtentHeight * PageScroller.ZoomFactor - PageScroller.ViewportHeight)),
                 new ScrollingScrollOptions(ScrollingAnimationMode.Disabled, ScrollingSnapPointsMode.Ignore));
 
             _panLastPoint = now;

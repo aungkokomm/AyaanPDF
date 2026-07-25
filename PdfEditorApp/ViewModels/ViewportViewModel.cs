@@ -1504,7 +1504,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public void AddNoteAt(int pageIndex, double x, double y)
     {
         PushHistory(HistoryScope.Annotations, "Add note");
-        var note = new NoteAnnotation(pageIndex, Norm(x), Norm(y), string.Empty);
+        var note = new NoteAnnotation(pageIndex, Norm(x), Norm(y), string.Empty) { Scale = SlotLayoutWidth };
         _allNotes.Add(note);
         Notes.Add(note);
         SlotFor(note.PageIndex)?.Notes.Add(note);
@@ -1640,7 +1640,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _allInkStrokes.Clear();
         _allInkStrokes.AddRange(entry.InkStrokes);
         _allNotes.Clear();
-        _allNotes.AddRange(entry.Notes.Select(n => new NoteAnnotation(n.PageIndex, n.X, n.Y, n.Text)));
+        _allNotes.AddRange(entry.Notes.Select(
+            n => new NoteAnnotation(n.PageIndex, n.X, n.Y, n.Text) { Scale = SlotLayoutWidth }));
 
         CurrentPageIndex = Math.Clamp(entry.PageIndex, 0, Math.Max(0, PageCount - 1));
         IsDirty = entry.WasDirty;

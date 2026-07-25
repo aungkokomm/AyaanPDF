@@ -67,6 +67,37 @@ public class InkPresetsTests
     }
 
     [Fact]
+    public void every_pen_colour_maps_to_a_translucent_highlighter()
+    {
+        // The two lists are different lengths, so index pairing ran off the
+        // end for the last pen colour and left the highlighter unchanged.
+        // Every pen colour must yield a usable highlighter.
+        foreach (var pen in InkPresets.Colors)
+        {
+            var h = InkPresets.HighlightFor(pen);
+            Assert.Contains(h, InkPresets.HighlightColors);
+
+            var (alpha, _, _, _) = InkPresets.ParseHex(h.Hex);
+            Assert.True(alpha < 0xFF, $"{pen.Name} mapped to an opaque highlighter");
+        }
+    }
+
+    [Fact]
+    public void matching_pen_and_highlighter_names_pair_up()
+    {
+        var green = InkPresets.Colors.Single(c => c.Name == "Green");
+        Assert.Equal("Green", InkPresets.HighlightFor(green).Name);
+    }
+
+    [Fact]
+    public void a_pen_colour_with_no_highlighter_falls_back_to_the_default()
+    {
+        // Black has no sensible highlighter equivalent.
+        var black = InkPresets.Colors.Single(c => c.Name == "Black");
+        Assert.Equal(InkPresets.DefaultHighlightColor, InkPresets.HighlightFor(black));
+    }
+
+    [Fact]
     public void every_preset_is_named()
     {
         Assert.All(InkPresets.Colors, c => Assert.False(string.IsNullOrWhiteSpace(c.Name)));
