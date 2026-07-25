@@ -947,6 +947,173 @@ pub struct BurnNote {
 /// text annotation keeps the text as text, so other readers show it as a note
 /// and it stays selectable and searchable. That also means notes are naturally
 /// idempotent to re-save in a way burned content is not.
+/// Places an image as a real PDF `/Stamp` annotation object.
+///
+/// Pixels arrive already decoded, as tightly packed BGRA, rather than as PNG
+/// bytes. Decoding happens on the app side, which already has an image decoder
+/// and needs the same pixels to show a preview of the stamp anyway. Doing it
+/// there keeps the `image` crate and its encoder stack out of this binary,
+/// which is a decision the crate's dependencies were deliberately chosen for,
+/// and reuses the BGRA convention every other buffer in this FFI already uses.
+///
+/// `capture_width` and the rectangle follow the same top-left capture space as
+/// the highlight, ink and note paths.
+#[unsafe(no_mangle)]
+pub extern "C" fn add_stamp_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    bgra: *const u8,
+    byte_len: usize,
+    pixel_width: i32,
+    pixel_height: i32,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 || page_index < 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if bgra.is_null() || pixel_width <= 0 || pixel_height <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // The buffer is handed straight to PDFium, so a length that disagrees with
+    // the stated dimensions would read past the end of it.
+    let expected = (pixel_width as usize)
+        .saturating_mul(pixel_height as usize)
+        .saturating_mul(4);
+    if byte_len != expected {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // A stamp with no area would be invisible and impossible to grab again.
+    if !(right > left) || !(bottom > top) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        add_stamp_annotation_inner(
+            doc_handle, page_index, capture_width,
+            left, top, right, bottom,
+            bgra, byte_len, pixel_width, pixel_height,
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_stamp_annotation_inner(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    bgra: *const u8,
+    byte_len: usize,
+    pixel_width: i32,
+    pixel_height: i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let Some(pdfium) = pdfium() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let media = page.boundaries().media().map(|b| b.bounds);
+    let (origin_x, origin_top) = match media {
+        Ok(b) => (b.left().value, b.top().value),
+        Err(_) => (0.0, page.height().value),
+    };
+    let scale = page_w / capture_width as f32;
+
+    let x0 = origin_x + left * scale;
+    let x1 = origin_x + right * scale;
+    let y1 = origin_top - top * scale;
+    let y0 = origin_top - bottom * scale;
+
+    let bounds = PdfRect::new(
+        PdfPoints::new(y0),
+        PdfPoints::new(x0),
+        PdfPoints::new(y1),
+        PdfPoints::new(x1),
+    );
+
+    let Ok(mut annotation) = page.annotations_mut().create_stamp_annotation() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // Bounds BEFORE objects, for the same reason as ink: PDFium builds the
+    // annotation's appearance form from its rect.
+    if annotation.set_bounds(bounds).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // PdfBitmap borrows the buffer mutably, so this needs an owned copy rather
+    // than the caller's memory, which is only valid for the call.
+    let mut pixels: Vec<u8> = unsafe { std::slice::from_raw_parts(bgra, byte_len) }.to_vec();
+
+    let bitmap = unsafe {
+        PdfBitmap::from_bytes(
+            pixel_width,
+            pixel_height,
+            PdfBitmapFormat::BGRA,
+            pixels.as_mut_slice(),
+            pdfium.bindings(),
+        )
+    };
+    let Ok(bitmap) = bitmap else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let Ok(mut image) = PdfPageImageObject::new(&doc_guard) else {
+        return STATUS_INVALID_INPUT;
+    };
+    if image.set_bitmap(&bitmap).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // A PDF image object draws the UNIT SQUARE, so its matrix is what gives it
+    // a size and a position. Without this every stamp would be one point
+    // square in the corner of the page regardless of the rectangle asked for.
+    //
+    // apply_matrix composes with what is already there, which is the identity
+    // on a freshly created object, so this sets exactly this matrix.
+    let matrix = PdfMatrix::new(x1 - x0, 0.0, 0.0, y1 - y0, x0, y0);
+    if image.apply_matrix(matrix).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    if annotation.objects_mut().add_image_object(image).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    drop(annotation);
+    drop(page);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Adds freehand strokes as real PDF `/Ink` annotation objects.
 ///
 /// One annotation per stroke, each holding a single path object, so a stroke
@@ -3383,6 +3550,195 @@ mod tests {
         assert!(height >= 0.04, "box height {height} does not cover a 40px pen");
         assert!(left < 0.1, "box should extend left of the first point");
         assert!(right > 0.4, "box should extend right of the last point");
+
+        close_document(handle);
+    }
+
+    /// A tiny BGRA image: a solid square with a fully transparent left half,
+    /// so transparency is actually exercised rather than assumed.
+    fn test_stamp_pixels(w: i32, h: i32) -> Vec<u8> {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                if x < w / 2 {
+                    px.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    px.extend_from_slice(&[32, 64, 200, 255]);
+                }
+            }
+        }
+        px
+    }
+
+    #[test]
+    fn a_png_stamp_survives_save_and_reopen_as_an_editable_object() {
+        // The user's own stamps: place a PNG, and have it still be a movable,
+        // resizable object after the file has been written and reopened.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let px = test_stamp_pixels(16, 16);
+
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 200.0, 300.0, 400.0, 400.0,
+                                 px.as_ptr(), px.len(), 16, 16),
+            STATUS_OK_PDFIUM
+        );
+
+        let before = read_annotations(handle, 0);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, ANNOT_STAMP);
+
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0);
+
+        let after = read_annotations(reopened, 0);
+        println!("STAMP before={before:?} after={after:?}");
+        assert_eq!(after.len(), 1, "the stamp should still be an annotation after reopening");
+        assert_eq!(after[0].1, ANNOT_STAMP);
+
+        for (b, a) in [(before[0].2, after[0].2), (before[0].3, after[0].3),
+                       (before[0].4, after[0].4), (before[0].5, after[0].5)] {
+            assert!((b - a).abs() < 0.001, "geometry drifted across the round trip: {b} vs {a}");
+        }
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn a_stamp_lands_at_the_size_and_place_it_was_given() {
+        // A PDF image object draws the unit square, so without a matrix every
+        // stamp would come out one point square in the corner of the page no
+        // matter what rectangle was asked for. This is that guard.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let px = test_stamp_pixels(8, 8);
+
+        // Capture width 1000 on a 200pt page: a quarter of the width across,
+        // starting a quarter in.
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 250.0, 100.0, 500.0, 350.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_OK_PDFIUM
+        );
+
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        let (_, _, left, top, right, bottom) = found[0];
+        println!("STAMP PLACE: l={left} t={top} r={right} b={bottom}");
+
+        assert!((left - 0.25).abs() < 0.001, "left {left} should be 0.25");
+        assert!((top - 0.10).abs() < 0.001, "top {top} should be 0.10");
+        assert!((right - 0.50).abs() < 0.001, "right {right} should be 0.50");
+        assert!((bottom - 0.35).abs() < 0.001, "bottom {bottom} should be 0.35");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_stamp_actually_draws_and_keeps_its_transparency() {
+        // Bounds being right does not mean anything appeared. The annotation
+        // could hold no image, or an image transformed off its own rect, and
+        // every geometry assertion above would still pass. So this renders the
+        // page and looks at the pixels.
+        //
+        // Comparing before against after, rather than checking for an absolute
+        // colour, keeps it honest whatever the fixture already has on the page.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        const W: i32 = 400;
+
+        let sample = |result: &RenderResult, x: usize, y: usize| -> (u8, u8, u8) {
+            let bytes = unsafe { std::slice::from_raw_parts(result.buffer, result.len as usize) };
+            let i = (y * result.width as usize + x) * 4;
+            (bytes[i], bytes[i + 1], bytes[i + 2]) // BGRA
+        };
+
+        let before = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        assert_eq!(before.status, STATUS_OK_PDFIUM);
+
+        // Left half of these pixels is fully transparent, right half is opaque
+        // B=32 G=64 R=200.
+        let px = test_stamp_pixels(16, 16);
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 250.0, 100.0, 500.0, 350.0,
+                                 px.as_ptr(), px.len(), 16, 16),
+            STATUS_OK_PDFIUM
+        );
+
+        let after = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        assert_eq!(after.status, STATUS_OK_PDFIUM);
+
+        // The stamp covers normalized x 0.25..0.50, y 0.10..0.35, so on a
+        // 400px render that is x 100..200, y 40..140.
+        let clear_px = (125, 90); // inside the transparent half
+        let solid_px = (175, 90); // inside the opaque half
+
+        let clear_before = sample(&before, clear_px.0, clear_px.1);
+        let clear_after = sample(&after, clear_px.0, clear_px.1);
+        let solid_before = sample(&before, solid_px.0, solid_px.1);
+        let solid_after = sample(&after, solid_px.0, solid_px.1);
+
+        println!("TRANSPARENT half: {clear_before:?} -> {clear_after:?}");
+        println!("OPAQUE half:      {solid_before:?} -> {solid_after:?}");
+
+        free_render_result(before);
+        free_render_result(after);
+        close_document(handle);
+
+        assert_eq!(
+            clear_before, clear_after,
+            "the transparent half of the stamp changed the page, so alpha was lost"
+        );
+
+        assert_ne!(
+            solid_before, solid_after,
+            "the opaque half of the stamp did not draw at all"
+        );
+        let (b, g, r) = solid_after;
+        assert!(
+            r > 150 && g < 120 && b < 100,
+            "opaque half rendered as B={b} G={g} R={r}, not the stamp's colour, \
+             so the channels are being swapped somewhere"
+        );
+    }
+
+    #[test]
+    fn stamp_input_that_does_not_add_up_is_rejected() {
+        // The pixel buffer goes straight to PDFium, so a length that disagrees
+        // with the stated dimensions would read past the end of it.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let px = test_stamp_pixels(8, 8);
+
+        // Buffer says 8x8 but the dimensions claim 32x32.
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 0.0, 0.0, 100.0, 100.0,
+                                 px.as_ptr(), px.len(), 32, 32),
+            STATUS_INVALID_INPUT
+        );
+
+        // A rectangle with no area would be invisible and impossible to grab.
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 100.0, 100.0, 100.0, 200.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_INVALID_INPUT
+        );
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 200.0, 100.0, 100.0, 200.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_INVALID_INPUT,
+            "a right edge left of the left edge is not a rectangle"
+        );
+
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 0.0, 0.0, 10.0, 10.0,
+                                 std::ptr::null(), 0, 8, 8),
+            STATUS_INVALID_INPUT
+        );
+        assert_eq!(
+            add_stamp_annotation(0, 0, 1000, 0.0, 0.0, 10.0, 10.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_INVALID_INPUT
+        );
 
         close_document(handle);
     }
