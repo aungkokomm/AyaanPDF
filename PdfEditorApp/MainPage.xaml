@@ -313,7 +313,8 @@
                 Padding="8"
                 ItemsSource="{x:Bind ViewModel.Thumbnails}"
                 SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
-                SelectionChanged="ThumbnailList_SelectionChanged"
+                IsItemClickEnabled="True"
+                ItemClick="ThumbnailList_ItemClick"
                 ContainerContentChanging="ThumbnailList_ContainerContentChanging">
                 <ListView.ItemTemplate>
                     <DataTemplate x:DataType="viewmodels:PageThumbnail">

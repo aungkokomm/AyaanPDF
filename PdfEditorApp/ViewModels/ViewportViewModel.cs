@@ -243,15 +243,31 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Navigates to a page (e.g. a thumbnail click).</summary>
-    public void GoToPage(int pageIndex)
+    /// <summary>
+    /// Asks the view to bring a page into view. Carries the page index and
+    /// whether the move should be animated.
+    ///
+    /// The view model cannot scroll: the ScrollView owns the scroll position
+    /// and runs the animation on the compositor. So navigation is a REQUEST
+    /// the view fulfils, which also keeps the slot-space to scroll-offset
+    /// conversion in the one place that already does it.
+    /// </summary>
+    public event Action<int, bool>? ScrollToPageRequested;
+
+    public void GoToPage(int pageIndex, bool animate = true)
     {
-        if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount || pageIndex == CurrentPageIndex)
+        if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount)
         {
             return;
         }
 
+        // Deliberately NOT short-circuited on pageIndex == CurrentPageIndex.
+        // Scrolling makes a partly visible page current long before it is
+        // actually in view, so clicking its thumbnail has to still scroll to
+        // it; bailing out early is why clicking a thumbnail could do nothing.
         CurrentPageIndex = pageIndex;
         RenderCurrentPage();
+        ScrollToPageRequested?.Invoke(pageIndex, animate);
     }
 
     // ---------------- Page operations ----------------
@@ -359,7 +375,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // file, matching how editors retitle to the saved path.
             int page = CurrentPageIndex;
             OpenDocument(path, preserveAnnotations: false);
-            GoToPage(Math.Min(page, Math.Max(0, PageCount - 1)));
+            // Not animated: this is restoring the position the user was
+            // already at after a save reloaded the document, not navigating
+            // somewhere. Animating it would look like the app moved on its own.
+            GoToPage(Math.Min(page, Math.Max(0, PageCount - 1)), animate: false);
         }
 
         if (saved)
@@ -1692,23 +1711,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     // ---------------- Rendering ----------------
 
+    /// <summary>
+    /// Resets the per-page state that follows the current page.
+    ///
+    /// This used to also rasterize the page synchronously on the UI thread
+    /// into <c>PageBitmap</c> and kick the old single-page high-res pipeline.
+    /// Nothing binds PageBitmap any more (the continuous viewport draws from
+    /// each slot's own bitmap), so that was a blocking PDFium render on every
+    /// page change and every document open, producing an image no one ever
+    /// saw. Page pixels are entirely the slot renderer's job now.
+    /// </summary>
     private void RenderCurrentPage()
     {
-        _hasEstablishedInitialView = false;
         _currentRenderedWidth = 0;
         ClearSelection();
         SearchMatchRects.Clear();
         RefreshAnnotationsForCurrentPage();
-
-        var low = PageRenderer.RenderLowRes(_documentHandle, CurrentPageIndex, LowResWidth);
-        PageBitmap = low.Bitmap;
-        Status = Describe("low-res", low.Outcome, low.Bitmap);
-        Log("low-res", low.Outcome, low.Bitmap);
-
-        if (_viewportSizeKnown)
-        {
-            RequestInitialFitRender();
-        }
     }
 
     /// <summary>

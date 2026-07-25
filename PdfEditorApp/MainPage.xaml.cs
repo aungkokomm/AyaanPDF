@@ -43,6 +43,7 @@ public sealed partial class MainPage : Page
         ViewModel.InkStrokeChanged += OnInkStrokeChanged;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
         ViewModel.LayoutRebuilt += OnLayoutRebuilt;
+        ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
         Loaded += (_, _) => RootGrid.Focus(FocusState.Programmatic);
 
         // Lets the app be driven headlessly for diagnosis: set
@@ -60,6 +61,7 @@ public sealed partial class MainPage : Page
             ViewModel.InkStrokeChanged -= OnInkStrokeChanged;
             ViewModel.InkStrokes.CollectionChanged -= OnInkStrokesCollectionChanged;
             ViewModel.LayoutRebuilt -= OnLayoutRebuilt;
+            ViewModel.ScrollToPageRequested -= OnScrollToPageRequested;
             ViewModel.Dispose();
         };
     }
@@ -145,6 +147,37 @@ public sealed partial class MainPage : Page
     /// <summary>Available content width in DIPs, excluding the canvas padding.</summary>
     private double AvailableContentWidth =>
         PageScroller.ViewportWidth - ViewportHost.Padding.Left - ViewportHost.Padding.Right;
+
+    private void OnScrollToPageRequested(int pageIndex, bool animate) =>
+        DispatcherQueue.TryEnqueue(() => ScrollToPage(pageIndex, animate));
+
+    /// <summary>
+    /// Brings a page to the top of the viewport, animated by default.
+    ///
+    /// The page top is in SLOT space (unzoomed DIPs), and the ScrollView wants
+    /// a zoomed offset, so it is multiplied by the zoom factor. The host's top
+    /// padding is part of the content, so it is included; a small lead-in is
+    /// subtracted so the page does not sit flush against the top edge, which
+    /// looks like it has been cut off rather than scrolled to.
+    /// </summary>
+    private void ScrollToPage(int pageIndex, bool animate)
+    {
+        double slotTop = ViewModel.SlotTopOf(pageIndex);
+        double zoom = PageScroller.ZoomFactor;
+
+        const double LeadIn = 12;
+        double target = (slotTop + ViewportHost.Padding.Top) * zoom - LeadIn;
+        target = Math.Max(0, target);
+
+        Diag.Log($"scrollToPage {pageIndex}: from {PageScroller.VerticalOffset:F0} to {target:F0} animate={animate}");
+
+        PageScroller.ScrollTo(
+            PageScroller.HorizontalOffset,
+            target,
+            new ScrollingScrollOptions(
+                animate ? ScrollingAnimationMode.Enabled : ScrollingAnimationMode.Disabled,
+                ScrollingSnapPointsMode.Ignore));
+    }
 
     private void PageScroller_ViewChanged(ScrollView sender, object args)
     {
@@ -523,6 +556,26 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
+            // Page navigation, all animated: a jump that teleports gives no
+            // sense of where you moved to, which in a continuous document is
+            // most of how you stay oriented.
+            case VirtualKey.PageDown:
+                ViewModel.GoToPage(ViewModel.CurrentPageIndex + 1);
+                e.Handled = true;
+                break;
+            case VirtualKey.PageUp:
+                ViewModel.GoToPage(ViewModel.CurrentPageIndex - 1);
+                e.Handled = true;
+                break;
+            case VirtualKey.Home when _isCtrlDown:
+                ViewModel.GoToPage(0);
+                e.Handled = true;
+                break;
+            case VirtualKey.End when _isCtrlDown:
+                ViewModel.GoToPage(ViewModel.PageCount - 1);
+                e.Handled = true;
+                break;
+
             case VirtualKey.Delete:
             case VirtualKey.Back:
                 ViewModel.DeleteSelectedAnnotation();
@@ -774,12 +827,20 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void ThumbnailList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    /// <summary>
+    /// Navigates to a clicked thumbnail.
+    ///
+    /// ItemClick, NOT SelectionChanged. SelectedIndex is bound to the current
+    /// page, and scrolling changes the current page, so SelectionChanged would
+    /// fire from scrolling and navigate back to the top of that page: the
+    /// viewport would fight every attempt to scroll freely. ItemClick fires
+    /// only for a real click, which breaks that loop at the source.
+    /// </summary>
+    private void ThumbnailList_ItemClick(object sender, ItemClickEventArgs e)
     {
-        var listView = (ListView)sender;
-        if (listView.SelectedIndex >= 0)
+        if (e.ClickedItem is PageThumbnail thumbnail)
         {
-            ViewModel.GoToPage(listView.SelectedIndex);
+            ViewModel.GoToPage(thumbnail.PageIndex);
         }
     }
 }
