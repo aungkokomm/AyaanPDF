@@ -124,23 +124,25 @@
                                     <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
 
                                     <!--
-                                        Overlay layer for this page only.
-                                        Marks are stored NORMALIZED, so the
-                                        scale is the card's slot width and a
-                                        re-render at any resolution cannot
-                                        move them.
+                                        Overlay layer for this page.
+
+                                        NO ScaleTransform. Every rect below is
+                                        already multiplied into slot DIPs by
+                                        the view model. A RenderTransform runs
+                                        AFTER layout, so normalized rects were
+                                        laid out at sub-pixel sizes (about
+                                        0.3 x 0.02 DIP) and produced no
+                                        geometry to scale up: selections,
+                                        highlights and search hits were all
+                                        computed correctly and drew nothing.
                                     -->
                                     <Grid HorizontalAlignment="Left" VerticalAlignment="Top">
-                                        <Grid.RenderTransform>
-                                            <ScaleTransform ScaleX="{x:Bind OverlayScale}" ScaleY="{x:Bind OverlayScale}" />
-                                        </Grid.RenderTransform>
-
                                         <ItemsControl ItemsSource="{x:Bind SearchMatchRects}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
-                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
                                                     <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
@@ -153,7 +155,7 @@
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
-                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
                                                     <Rectangle Fill="#665599FF" Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
@@ -161,25 +163,17 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
-                                        <ItemsControl ItemsSource="{x:Bind Highlights}" IsHitTestVisible="False">
+                                        <!-- Highlights arrive flattened: one entry per rectangle, carrying its colour. -->
+                                        <ItemsControl ItemsSource="{x:Bind HighlightRects}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
-                                                <DataTemplate x:DataType="viewport:HighlightAnnotation">
-                                                    <ItemsControl ItemsSource="{x:Bind ColoredRects}">
-                                                        <ItemsControl.ItemsPanel>
-                                                            <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
-                                                        </ItemsControl.ItemsPanel>
-                                                        <ItemsControl.ItemTemplate>
-                                                            <DataTemplate x:DataType="viewport:ColoredRect">
-                                                                <Rectangle Fill="{x:Bind local:MainPage.HexBrush(ColorHex)}"
-                                                                           Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                                                           Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                                           HorizontalAlignment="Left" VerticalAlignment="Top" />
-                                                            </DataTemplate>
-                                                        </ItemsControl.ItemTemplate>
-                                                    </ItemsControl>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Fill="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
@@ -190,18 +184,15 @@
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
-                                                <DataTemplate x:DataType="viewport:TextRect">
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
                                                     <Rectangle Stroke="{ThemeResource AccentFillColorDefaultBrush}"
-                                                               StrokeThickness="0.004"
-                                                               StrokeDashArray="3,2"
-                                                               Fill="Transparent"
+                                                               StrokeThickness="2" StrokeDashArray="3,2" Fill="Transparent"
                                                                Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
-
                                     </Grid>
 
                                     <!--
@@ -451,6 +442,12 @@
             <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
                 <TextBlock Text="{x:Bind ViewModel.PagePositionLabel, Mode=OneWay}"
                            VerticalAlignment="Center" Margin="10,0,6,0"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+                <!-- Says why text selection is unavailable, instead of the
+                     tool silently doing nothing on a scanned page. -->
+                <TextBlock Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
+                           VerticalAlignment="Center" Margin="0,0,6,0"
+                           Foreground="{ThemeResource SystemFillColorCautionBrush}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
                 <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
                 <Button Content="&#xE949;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomOut_Click"

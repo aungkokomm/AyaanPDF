@@ -2524,6 +2524,26 @@ mod tests {
     }
 
     #[test]
+    fn a_page_with_no_text_reports_zero_chars_rather_than_failing() {
+        // A scanned page is an image with no text operators. The viewer must
+        // be able to tell "this page has no selectable text" apart from "the
+        // extraction failed", because the first needs a message to the user
+        // and the second is a bug. Returning a hard error for both made a
+        // scanned document look identical to a broken one.
+        let handle = open_fixture_named("tests/fixtures/sample_scanned.pdf");
+        let array = get_page_chars(handle, 0, 800);
+
+        assert_eq!(
+            array.status, STATUS_OK_PDFIUM,
+            "an image-only page is a valid page, not an extraction failure"
+        );
+        assert_eq!(array.len, 0, "an image-only page has no characters");
+
+        free_char_info_array(array);
+        close_document(handle);
+    }
+
+    #[test]
     fn burn_annotations_rejects_bad_input() {
         assert_eq!(
             burn_annotations(0, 1000, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0),

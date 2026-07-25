@@ -676,13 +676,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public Visibility EmptyStateVisibility =>
         PageCount == 0 ? Visibility.Visible : Visibility.Collapsed;
 
-    partial void OnCurrentPageIndexChanged(int value) =>
+    partial void OnCurrentPageIndexChanged(int value)
+    {
         OnPropertyChanged(nameof(PagePositionLabel));
+        OnPropertyChanged(nameof(TextAvailabilityLabel));
+    }
 
     partial void OnPageCountChanged(int value)
     {
         OnPropertyChanged(nameof(PagePositionLabel));
         OnPropertyChanged(nameof(EmptyStateVisibility));
+        OnPropertyChanged(nameof(TextAvailabilityLabel));
     }
 
     /// <summary>
@@ -934,6 +938,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
         }
 
+        foreach (var slot in PageSlots)
+        {
+            slot.RebuildHighlightRects();
+        }
+
         foreach (var s in _allInkStrokes)
         {
             if (s.PageIndex >= 0 && s.PageIndex < PageSlots.Count)
@@ -1164,7 +1173,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        SlotFor(selected.PageIndex)?.SelectionOutline.Add(selected.Bounds);
+        SlotFor(selected.PageIndex)?.SelectionOutline.Add(
+            ScaledRect.From(selected.Bounds, SlotLayoutWidth));
         InkStrokeChanged?.Invoke();
     }
 
@@ -1254,6 +1264,107 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         return $"x {r.Min(v => v.Left):F0}..{r.Max(v => v.Right):F0}  y {r.Min(v => v.Top):F0}..{r.Max(v => v.Bottom):F0}";
     }
+
+    /// <summary>
+    /// True when a page carries real, selectable text.
+    ///
+    /// A scanned document is images all the way down: PDFium reports zero
+    /// characters, which is a perfectly valid page, not a failure. Selection
+    /// and text highlighting are impossible there, and silently doing nothing
+    /// is the worst possible response because it is indistinguishable from a
+    /// broken tool. Callers use this to switch to a geometric marquee and to
+    /// say so in the UI.
+    /// </summary>
+    public bool PageHasText(int pageIndex) => (TextLayerFor(pageIndex)?.CharCount ?? 0) > 0;
+
+    /// <summary>Shown in the status pill so "why can't I select?" answers itself.</summary>
+    public string TextAvailabilityLabel =>
+        PageCount == 0 ? string.Empty
+        : PageHasText(CurrentPageIndex) ? string.Empty
+        : "Scanned page – no text";
+
+    // ---------------- Marquee (geometric) selection ----------------
+
+    private (double X, double Y)? _marqueeAnchor;
+    private int _marqueePage;
+
+    /// <summary>
+    /// Starts a rectangular selection, for pages with no text layer.
+    ///
+    /// On a scan there is nothing to select by character, but marking a REGION
+    /// is still meaningful and is what a reader actually wants. Coordinates
+    /// are normalized on the way in, exactly like every other annotation, so a
+    /// marquee highlight is indistinguishable from a text one once committed.
+    /// </summary>
+    public void BeginMarquee(int pageIndex, double x, double y)
+    {
+        ClearSelection();
+        _marqueePage = pageIndex;
+        _marqueeAnchor = (Norm(x), Norm(y));
+    }
+
+    public void UpdateMarquee(double x, double y)
+    {
+        if (_marqueeAnchor is not (double ax, double ay))
+        {
+            return;
+        }
+
+        var rect = MarqueeRect(ax, ay, Norm(x), Norm(y));
+
+        var slot = SlotFor(_marqueePage);
+        if (slot is null)
+        {
+            return;
+        }
+
+        slot.SelectionRects.Clear();
+        slot.SelectionRects.Add(ScaledRect.From(rect, SlotLayoutWidth));
+    }
+
+    /// <summary>Commits the marquee as a highlight, if it is big enough to be deliberate.</summary>
+    public void EndMarquee()
+    {
+        if (_marqueeAnchor is not (double ax, double ay))
+        {
+            return;
+        }
+
+        var slot = SlotFor(_marqueePage);
+        // The preview is stored pre-scaled for display; the annotation itself
+        // must be normalized like every other, so convert back.
+        var scaled = slot?.SelectionRects.Count > 0 ? slot.SelectionRects[0] : default;
+        var rect = new TextRect(
+            scaled.Left / SlotLayoutWidth,
+            scaled.Top / SlotLayoutWidth,
+            (scaled.Left + scaled.Width) / SlotLayoutWidth,
+            (scaled.Top + scaled.Height) / SlotLayoutWidth);
+        _marqueeAnchor = null;
+        slot?.SelectionRects.Clear();
+
+        // A click, or a stray one-pixel drag, is not an attempt to highlight.
+        const double MinSize = 0.01;
+        if (ActiveTool != ToolMode.Highlight || rect.Width < MinSize || rect.Height < MinSize)
+        {
+            return;
+        }
+
+        PushHistory(HistoryScope.Annotations, "Highlight");
+        var highlight = new HighlightAnnotation(_marqueePage, new[] { rect }, HighlightColorHex);
+        _allHighlights.Add(highlight);
+        var mSlot = SlotFor(_marqueePage);
+        mSlot?.Highlights.Add(highlight);
+        mSlot?.RebuildHighlightRects();
+        if (_marqueePage == CurrentPageIndex)
+        {
+            Highlights.Add(highlight);
+        }
+
+        IsDirty = true;
+    }
+
+    private static TextRect MarqueeRect(double ax, double ay, double bx, double by) =>
+        new(Math.Min(ax, bx), Math.Min(ay, by), Math.Max(ax, bx), Math.Max(ay, by));
 
     public void BeginTextSelection(int pageIndex, double x, double y)
     {
@@ -1352,7 +1463,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         foreach (var highlight in created)
         {
             _allHighlights.Add(highlight);
-            SlotFor(highlight.PageIndex)?.Highlights.Add(highlight);
+            var hSlot = SlotFor(highlight.PageIndex);
+            hSlot?.Highlights.Add(highlight);
+            hSlot?.RebuildHighlightRects();
             if (highlight.PageIndex == CurrentPageIndex)
             {
                 Highlights.Add(highlight);
@@ -1426,7 +1539,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             foreach (var rect in layer.GetRangeRects(start, length))
             {
                 var normalized = NormRect(rect);
-                slot?.SelectionRects.Add(normalized);
+                // Pre-multiplied into slot DIPs: a normalized rect inside a
+                // scaled layer lays out sub-pixel and never draws.
+                var sr = ScaledRect.From(normalized, SlotLayoutWidth);
+                if (sr.IsVisible)
+                {
+                    slot?.SelectionRects.Add(sr);
+                }
                 if (page == CurrentPageIndex)
                 {
                     SelectionRects.Add(normalized);
@@ -1808,7 +1927,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 foreach (var rect in layer.GetRangeRects(start, length))
                 {
                     var normalized = NormRect(rect);
-                    slot?.SearchMatchRects.Add(normalized);
+                    var mr = ScaledRect.From(normalized, SlotLayoutWidth);
+                    if (mr.IsVisible)
+                    {
+                        slot?.SearchMatchRects.Add(mr);
+                    }
                     if (page == CurrentPageIndex)
                     {
                         SearchMatchRects.Add(normalized);

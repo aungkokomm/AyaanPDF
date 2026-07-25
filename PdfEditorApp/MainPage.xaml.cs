@@ -34,6 +34,7 @@ public sealed partial class MainPage : Page
     private bool _isSelectingText;
     private bool _isDrawing;
     private bool _isMovingAnnotation;
+    private bool _isMarqueeing;
     private bool _isPanning;
     private Point _panLastPoint;
     private Point _panTarget;
@@ -923,8 +924,6 @@ public sealed partial class MainPage : Page
     private void ViewportHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         var current = e.GetCurrentPoint(ViewportHost);
-        Diag.Log($"PRESS arrived: device={e.Pointer.PointerDeviceType} left={current.Properties.IsLeftButtonPressed} tool={ViewModel.ActiveTool}");
-
         if (e.Pointer.PointerDeviceType != Microsoft.UI.Input.PointerDeviceType.Mouse)
         {
             return;   // let ScrollView handle touch/pen pan + pinch
@@ -990,10 +989,24 @@ public sealed partial class MainPage : Page
 
             case ToolMode.Highlight:
                 ViewModel.ClearAnnotationSelection();
-                _isSelectingText = true;
                 _dragPointerId = current.PointerId;
                 ViewportHost.CapturePointer(e.Pointer);
-                ViewModel.BeginTextSelection(content.Page, content.X, content.Y);
+
+                // A scanned page has no characters to select, so highlighting
+                // by text run is impossible there. Marking a REGION still is,
+                // and is what a reader wants, so the tool falls back to a
+                // rectangular marquee rather than silently doing nothing.
+                if (ViewModel.PageHasText(content.Page))
+                {
+                    _isSelectingText = true;
+                    ViewModel.BeginTextSelection(content.Page, content.X, content.Y);
+                }
+                else
+                {
+                    _isMarqueeing = true;
+                    ViewModel.BeginMarquee(content.Page, content.X, content.Y);
+                }
+
                 e.Handled = true;
                 break;
 
@@ -1053,6 +1066,11 @@ public sealed partial class MainPage : Page
                 content.Y / ViewModel.OverlayScale);
             e.Handled = true;
         }
+        else if (_isMarqueeing)
+        {
+            ViewModel.UpdateMarquee(content.X, content.Y);
+            e.Handled = true;
+        }
         else if (_isSelectingText)
         {
             ViewModel.UpdateTextSelection(content.Page, content.X, content.Y);
@@ -1083,6 +1101,13 @@ public sealed partial class MainPage : Page
             _isMovingAnnotation = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);
             ViewModel.EndAnnotationMove();
+            e.Handled = true;
+        }
+        else if (_isMarqueeing)
+        {
+            _isMarqueeing = false;
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            ViewModel.EndMarquee();
             e.Handled = true;
         }
         else if (_isSelectingText)

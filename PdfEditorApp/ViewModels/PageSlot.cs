@@ -41,16 +41,40 @@ public partial class PageSlot : ObservableObject
 
     public ObservableCollection<NoteAnnotation> Notes { get; } = new();
 
-    public ObservableCollection<TextRect> SelectionRects { get; } = new();
+    // Every collection below is in SLOT-SPACE DIPs, already multiplied by the
+    // slot width, because a normalized rect inside a scaled layer lays out
+    // sub-pixel and never draws. See ScaledRect.
 
-    public ObservableCollection<TextRect> SearchMatchRects { get; } = new();
+    public ObservableCollection<ScaledRect> SelectionRects { get; } = new();
+
+    public ObservableCollection<ScaledRect> SearchMatchRects { get; } = new();
+
+    /// <summary>Every highlight's rectangles, flattened and pre-scaled.</summary>
+    public ObservableCollection<ScaledRect> HighlightRects { get; } = new();
 
     /// <summary>
     /// Marquee around the selected annotation, at most one entry. A plain rect
     /// collection rather than per-annotation selection state, so the
     /// annotation templates stay unaware of selection entirely.
     /// </summary>
-    public ObservableCollection<TextRect> SelectionOutline { get; } = new();
+    public ObservableCollection<ScaledRect> SelectionOutline { get; } = new();
+
+    /// <summary>Rebuilds the flattened highlight rectangles from the annotations.</summary>
+    public void RebuildHighlightRects()
+    {
+        HighlightRects.Clear();
+        foreach (var h in Highlights)
+        {
+            foreach (var r in h.Rects)
+            {
+                var sr = ScaledRect.From(r, SlotWidth, h.ColorHex);
+                if (sr.IsVisible)
+                {
+                    HighlightRects.Add(sr);
+                }
+            }
+        }
+    }
 
     /// <summary>
     /// Multiplier turning a normalized overlay coordinate into a slot-space

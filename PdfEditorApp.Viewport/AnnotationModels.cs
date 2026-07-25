@@ -30,6 +30,33 @@ public interface IAnnotation
 }
 
 /// <summary>
+/// A rectangle already multiplied into slot-space DIPs, ready to bind.
+///
+/// Overlays used to hold NORMALIZED rects inside a Grid carrying a
+/// ScaleTransform of the slot width. That fails: RenderTransform runs after
+/// layout, so a selection rect was laid out at roughly 0.3 x 0.02 DIPs, a
+/// sub-pixel box that never produced any visible geometry to scale up. The
+/// data was right and nothing appeared, which is why text selection,
+/// highlights and search matches were all invisible while ink — drawn on a
+/// separate canvas from pre-multiplied points — worked fine.
+///
+/// Pre-multiplying means every overlay element is laid out at its real
+/// on-screen size and no transform is involved.
+/// </summary>
+public readonly record struct ScaledRect(double Left, double Top, double Width, double Height, string ColorHex)
+{
+    public static ScaledRect From(TextRect r, double scale, string colorHex = "") =>
+        new(r.Left * scale, r.Top * scale, (r.Right - r.Left) * scale, (r.Bottom - r.Top) * scale, colorHex);
+
+    /// <summary>
+    /// False for degenerate rects. Line breaks and zero-width joiners produce
+    /// empty glyph boxes, and a rect with no area is an invisible element that
+    /// still costs a container to lay out.
+    /// </summary>
+    public bool IsVisible => Width > 0.5 && Height > 0.5;
+}
+
+/// <summary>
 /// One highlight rectangle paired with its colour.
 ///
 /// Exists because the inner item template is per-RECT while the colour lives
