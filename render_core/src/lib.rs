@@ -65,6 +65,12 @@ pub const STATUS_INVALID_INPUT: i32 = 1;
 pub const STATUS_PANIC: i32 = 2;
 pub const STATUS_OK_PLACEHOLDER: i32 = 3;
 
+/// The request was well formed but PDFium cannot carry it out at this version.
+///
+/// Distinct from STATUS_INVALID_INPUT so a caller can tell "you asked wrongly"
+/// from "ask a different way", and fall back rather than surface an error.
+pub const STATUS_UNSUPPORTED: i32 = 4;
+
 pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
 pub const POLL_CANCELLED: i32 = 2;
@@ -947,6 +953,206 @@ pub struct BurnNote {
 /// text annotation keeps the text as text, so other readers show it as a note
 /// and it stays selectable and searchable. That also means notes are naturally
 /// idempotent to re-save in a way burned content is not.
+/// Removes one annotation from a page.
+///
+/// `index` is the position reported by `get_annotations`, and is only valid
+/// until the page's annotation list next changes.
+#[unsafe(no_mangle)]
+pub extern "C" fn delete_annotation(doc_handle: u64, page_index: i32, index: i32) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| delete_annotation_inner(doc_handle, page_index, index))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn delete_annotation_inner(doc_handle: u64, page_index: i32, index: i32) -> i32 {
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let annotations = page.annotations_mut();
+    let Ok(annotation) = annotations.get(index as usize) else {
+        return STATUS_INVALID_INPUT;
+    };
+    if annotations.delete_annotation(annotation).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    drop(page);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
+/// Moves, and where possible resizes, an annotation to a new rectangle.
+///
+/// An annotation's rectangle is not always what gets drawn, so what has to
+/// happen depends on where the annotation keeps its shape:
+///
+/// - Notes and shapes are drawn from the rectangle, so setting it is enough.
+/// - A highlight's shape is its QUAD POINTS, which are transformed to match.
+/// - A stamp and ink own page objects. PDFium repositions their appearance to
+///   follow the rectangle, so moving works, but it does NOT scale it.
+///
+/// That last case is a real limit rather than an oversight. Transforming the
+/// contained objects is the obvious fix and it does nothing: an object taken
+/// from `objects_mut().get()` is detached, and `apply_matrix` on it never
+/// reaches the stored annotation. Verified by running the same resize with the
+/// transform skipped and getting a pixel-identical render.
+///
+/// So a request to SCALE one of those returns STATUS_UNSUPPORTED, and the
+/// caller should delete it and add it again at the new size. That is not a
+/// hardship: the app holds the source PNG or the stroke points already, and
+/// re-adding produces a correct appearance instead of a stretched one.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_annotation_bounds(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if !(right > left) || !(bottom > top) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        set_annotation_bounds_inner(doc_handle, page_index, index, capture_width,
+                                    left, top, right, bottom)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_annotation_bounds_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let media = page.boundaries().media().map(|b| b.bounds);
+    let (origin_x, origin_top) = match media {
+        Ok(b) => (b.left().value, b.top().value),
+        Err(_) => (0.0, page.height().value),
+    };
+    let scale = page_w / capture_width as f32;
+
+    let new_x0 = origin_x + left * scale;
+    let new_x1 = origin_x + right * scale;
+    let new_y1 = origin_top - top * scale;
+    let new_y0 = origin_top - bottom * scale;
+
+    let Ok(mut annotation) = page.annotations_mut().get(index as usize) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let Ok(old) = annotation.bounds() else {
+        return STATUS_INVALID_INPUT;
+    };
+    let (old_x0, old_y0) = (old.left().value, old.bottom().value);
+    let (old_w, old_h) = (old.right().value - old_x0, old.top().value - old_y0);
+    if old_w.abs() < 1e-6 || old_h.abs() < 1e-6 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // The affine taking the old rectangle onto the new one: scale about the
+    // old origin, then move that origin to the new one.
+    let sx = (new_x1 - new_x0) / old_w;
+    let sy = (new_y1 - new_y0) / old_h;
+    let tx = new_x0 - sx * old_x0;
+    let ty = new_y0 - sy * old_y0;
+    let delta = PdfMatrix::new(sx, 0.0, 0.0, sy, tx, ty);
+
+    // Whether this is a pure move or also a scale. A scale is what the
+    // object-owning kinds cannot do.
+    let is_scaling = (sx - 1.0).abs() > 1e-4 || (sy - 1.0).abs() > 1e-4;
+
+    /// Markup kinds whose shape is their quad points, not their rectangle.
+    macro_rules! move_quads {
+        ($a:expr) => {{
+            let points = $a.attachment_points_mut();
+            let count = points.len();
+            for i in 0..count {
+                if let Ok(quad) = points.get(i) {
+                    let _ = points.set_attachment_point_at_index(i, quad.transform(delta));
+                }
+            }
+        }};
+    }
+
+    match &mut annotation {
+        PdfPageAnnotation::Highlight(a) => move_quads!(a),
+        PdfPageAnnotation::Underline(a) => move_quads!(a),
+        PdfPageAnnotation::Strikeout(a) => move_quads!(a),
+        PdfPageAnnotation::Squiggly(a) => move_quads!(a),
+
+        // Stamps and ink: PDFium carries their appearance along with the
+        // rectangle, so a move needs nothing extra, but it will not scale it
+        // and there is no way from here to make it. Say so rather than
+        // silently leaving the picture at its old size inside a bigger box.
+        PdfPageAnnotation::Stamp(_) | PdfPageAnnotation::Ink(_) if is_scaling => {
+            return STATUS_UNSUPPORTED;
+        }
+
+        // Notes and the rest are drawn from their rectangle alone, so setting
+        // it below is all they need.
+        _ => {}
+    }
+
+    let bounds = PdfRect::new(
+        PdfPoints::new(new_y0),
+        PdfPoints::new(new_x0),
+        PdfPoints::new(new_y1),
+        PdfPoints::new(new_x1),
+    );
+    if annotation.set_bounds(bounds).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    drop(annotation);
+    drop(page);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Places an image as a real PDF `/Stamp` annotation object.
 ///
 /// Pixels arrive already decoded, as tightly packed BGRA, rather than as PNG
@@ -1356,11 +1562,11 @@ fn add_highlight_annotations_inner(
         };
         let scale = page_w / capture_width as f32;
 
-        let Ok(mut annotation) = page.annotations_mut().create_highlight_annotation() else {
-            return STATUS_INVALID_INPUT;
-        };
-
-        // Union of the quads, for the annotation's own bounding box.
+        // Convert every quad first, so the bounding box is known before the
+        // annotation exists. Order matters here: PDFium builds a markup
+        // annotation's appearance from its rectangle, colour and quad points,
+        // and setting them after the fact does not make it regenerate.
+        let mut rects = Vec::with_capacity(end - start);
         let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
         let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
 
@@ -1377,25 +1583,17 @@ fn add_highlight_annotations_inner(
             min_y = min_y.min(bottom);
             max_y = max_y.max(top);
 
-            let rect = PdfRect::new(
+            rects.push(PdfRect::new(
                 PdfPoints::new(bottom),
                 PdfPoints::new(left),
                 PdfPoints::new(top),
                 PdfPoints::new(right),
-            );
-
-            // from_rect rather than hand-ordered corners: PDF quad points run
-            // upper-left, upper-right, lower-left, lower-right, an order that
-            // is easy to get subtly wrong and that renders as a bow tie when
-            // you do.
-            if annotation
-                .attachment_points_mut()
-                .create_attachment_point_at_end(PdfQuadPoints::from_rect(&rect))
-                .is_err()
-            {
-                return STATUS_INVALID_INPUT;
-            }
+            ));
         }
+
+        let Ok(mut annotation) = page.annotations_mut().create_highlight_annotation() else {
+            return STATUS_INVALID_INPUT;
+        };
 
         let bounds = PdfRect::new(
             PdfPoints::new(min_y),
@@ -1407,11 +1605,29 @@ fn add_highlight_annotations_inner(
             return STATUS_INVALID_INPUT;
         }
 
+        // set_STROKE_color, despite this being a fill, because that is the one
+        // that writes the annotation's /C entry. set_fill_color writes /IC,
+        // the interior colour, and PDFium generates a markup annotation's
+        // appearance from /C.
         if annotation
-            .set_fill_color(PdfColor::new(spec.r, spec.g, spec.b, spec.a))
+            .set_stroke_color(PdfColor::new(spec.r, spec.g, spec.b, spec.a))
             .is_err()
         {
             return STATUS_INVALID_INPUT;
+        }
+
+        for rect in &rects {
+            // from_rect rather than hand-ordered corners: PDF quad points run
+            // upper-left, upper-right, lower-left, lower-right, an order that
+            // is easy to get subtly wrong and that renders as a bow tie when
+            // you do.
+            if annotation
+                .attachment_points_mut()
+                .create_attachment_point_at_end(PdfQuadPoints::from_rect(rect))
+                .is_err()
+            {
+                return STATUS_INVALID_INPUT;
+            }
         }
     }
 
@@ -1941,16 +2157,21 @@ fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
         // colour for ink and stamps it created, and a foreign one still draws
         // correctly because PDFium renders it from its own appearance stream.
         //
-        // Otherwise: markup annotations carry their colour as the fill, and a
-        // shape drawn as an outline carries it as the stroke, so preferring
-        // fill and falling back keeps one field meaningful for both.
+        // Otherwise, read /C first and fall back to /IC.
+        //
+        // /C is the annotation's own colour and is what a markup annotation
+        // like a highlight is drawn from; /IC is the INTERIOR colour, which
+        // only shapes use. pdfium-render names them the other way round from
+        // how they read here: stroke_color is /C and fill_color is /IC.
+        // Preferring /IC returned a stale default yellow for highlights rather
+        // than the colour actually set on them.
         let owns_page_objects = matches!(subtype, ANNOT_INK | ANNOT_STAMP);
         let colour = if owns_page_objects {
             None
         } else {
             annotation
-                .fill_color()
-                .or_else(|_| annotation.stroke_color())
+                .stroke_color()
+                .or_else(|_| annotation.fill_color())
                 .ok()
         };
 
@@ -3700,6 +3921,213 @@ mod tests {
             "opaque half rendered as B={b} G={g} R={r}, not the stamp's colour, \
              so the channels are being swapped somewhere"
         );
+    }
+
+    #[test]
+    fn moving_a_stamp_moves_the_picture_and_not_just_the_handle() {
+        // The trap this whole function exists to avoid. A stamp's picture
+        // lives in an image object with its OWN matrix in page coordinates, so
+        // setting the annotation's rectangle alone would move its handle and
+        // hit box while the visible stamp stayed exactly where it was. Every
+        // bounds assertion would pass and the user would see nothing move.
+        //
+        // So this checks the PIXELS: the old place must go back to how it was,
+        // and the new place must now hold the stamp.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        const W: i32 = 400;
+
+        let sample = |result: &RenderResult, x: usize, y: usize| -> (u8, u8, u8) {
+            let bytes = unsafe { std::slice::from_raw_parts(result.buffer, result.len as usize) };
+            let i = (y * result.width as usize + x) * 4;
+            (bytes[i], bytes[i + 1], bytes[i + 2])
+        };
+
+        let clean = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+
+        // Fully opaque so every sampled pixel is the stamp.
+        let px: Vec<u8> = std::iter::repeat([32u8, 64, 200, 255]).take(64).flatten().collect();
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 100.0, 100.0, 200.0, 200.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_OK_PDFIUM
+        );
+
+        // Normalized 0.1..0.2 both axes, so pixels 40..80 on a 400px render.
+        let old_spot = (60, 60);
+        let placed = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        assert_ne!(sample(&clean, old_spot.0, old_spot.1), sample(&placed, old_spot.0, old_spot.1),
+                   "the stamp did not draw in the first place");
+
+        // Move it to 0.5..0.6, pixels 200..240.
+        assert_eq!(
+            set_annotation_bounds(handle, 0, 0, 1000, 500.0, 500.0, 600.0, 600.0),
+            STATUS_OK_PDFIUM
+        );
+        let new_spot = (220, 220);
+        let moved = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+
+        let old_after = sample(&moved, old_spot.0, old_spot.1);
+        let new_after = sample(&moved, new_spot.0, new_spot.1);
+        let clean_old = sample(&clean, old_spot.0, old_spot.1);
+        println!("MOVE: old spot clean={clean_old:?} after={old_after:?},                   new spot after={new_after:?}");
+
+        // And the annotation's own rectangle should agree with where it drew.
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        assert!((found[0].2 - 0.5).abs() < 0.001, "rect left is {}", found[0].2);
+
+        free_render_result(clean);
+        free_render_result(placed);
+        free_render_result(moved);
+        close_document(handle);
+
+        assert_eq!(
+            old_after, clean_old,
+            "the old position did not go back to how the page looked before the stamp,              so the picture is still drawn there and only the rectangle moved"
+        );
+        assert_eq!(
+            new_after, (32, 64, 200),
+            "nothing was drawn at the new position"
+        );
+    }
+
+    #[test]
+    fn scaling_an_object_owning_annotation_reports_that_it_cannot() {
+        // A limit PDFium imposes, pinned so it cannot regress into silence.
+        //
+        // Stamps and ink keep their drawing in page objects. PDFium carries
+        // that appearance along when the rectangle MOVES, but it will not
+        // scale it, and transforming the contained objects from here does
+        // nothing: an object taken from objects_mut().get() is detached, and
+        // apply_matrix on it never reaches the stored annotation. That was
+        // confirmed by running the same resize with the transform skipped and
+        // getting a pixel-identical render.
+        //
+        // Silently leaving the picture at its old size inside a bigger box is
+        // the worst outcome, so a scale is refused and the caller re-adds the
+        // stamp at the new size instead, which it can do because it holds the
+        // source pixels.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let px: Vec<u8> = std::iter::repeat([32u8, 64, 200, 255]).take(64).flatten().collect();
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 100.0, 100.0, 200.0, 200.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_OK_PDFIUM
+        );
+
+        // Same size, different place: a move, which works.
+        assert_eq!(
+            set_annotation_bounds(handle, 0, 0, 1000, 500.0, 500.0, 600.0, 600.0),
+            STATUS_OK_PDFIUM,
+            "moving a stamp should work"
+        );
+
+        // Different size: refused, and distinguishable from bad input.
+        assert_eq!(
+            set_annotation_bounds(handle, 0, 0, 1000, 500.0, 500.0, 800.0, 800.0),
+            STATUS_UNSUPPORTED,
+            "scaling a stamp should report that it cannot, not fail as bad input"
+        );
+
+        // The refusal must leave the annotation untouched.
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        assert!((found[0].2 - 0.5).abs() < 0.001, "left moved to {} despite the refusal", found[0].2);
+        assert!((found[0].4 - 0.6).abs() < 0.001, "right moved to {} despite the refusal", found[0].4);
+
+        close_document(handle);
+    }
+    #[test]
+    fn moving_a_highlight_moves_its_rectangle_and_quads() {
+        // Geometry only. Checking the drawn pixels would be better, but a
+        // created /Highlight does not render at all yet, which is tracked
+        // separately: PDFium does not generate an appearance for it and the
+        // safe API exposes no way to supply one.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let quads = [HighlightQuad { left: 500.0, top: 500.0, right: 600.0, bottom: 600.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1,
+            r: 255, g: 235, b: 59, a: 255,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let before = read_annotations(handle, 0);
+        assert_eq!(before.len(), 1);
+        assert!((before[0].2 - 0.5).abs() < 0.001);
+
+        assert_eq!(
+            set_annotation_bounds(handle, 0, 0, 1000, 700.0, 700.0, 800.0, 800.0),
+            STATUS_OK_PDFIUM
+        );
+
+        let after = read_annotations(handle, 0);
+        assert_eq!(after.len(), 1);
+        println!("HL MOVE: {before:?} -> {after:?}");
+        assert!((after[0].2 - 0.7).abs() < 0.001, "left is {}", after[0].2);
+        assert!((after[0].3 - 0.7).abs() < 0.001, "top is {}", after[0].3);
+        assert!((after[0].4 - 0.8).abs() < 0.001, "right is {}", after[0].4);
+
+        close_document(handle);
+    }
+    #[test]
+    fn deleting_an_annotation_removes_it() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let text = std::ffi::CString::new("gone").unwrap();
+        let notes = [BurnNote { page_index: 0, x: 50.0, y: 50.0, text: text.as_ptr() }];
+        assert_eq!(add_note_annotations(handle, 1000, notes.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let quads = [HighlightQuad { left: 100.0, top: 100.0, right: 200.0, bottom: 140.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1, r: 0, g: 255, b: 0, a: 128,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+            STATUS_OK_PDFIUM
+        );
+        assert_eq!(read_annotations(handle, 0).len(), 2);
+
+        // Remove the first: the second must survive and become index 0.
+        assert_eq!(delete_annotation(handle, 0, 0), STATUS_OK_PDFIUM);
+        let left = read_annotations(handle, 0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].1, ANNOT_HIGHLIGHT, "the wrong annotation was deleted");
+        assert_eq!(left[0].0, 0, "indices should close up after a delete");
+
+        assert_eq!(delete_annotation(handle, 0, 0), STATUS_OK_PDFIUM);
+        assert_eq!(read_annotations(handle, 0).len(), 0);
+
+        // Deleting past the end is refused rather than doing something worse.
+        assert_eq!(delete_annotation(handle, 0, 0), STATUS_INVALID_INPUT);
+        assert_eq!(delete_annotation(handle, 0, 99), STATUS_INVALID_INPUT);
+        assert_eq!(delete_annotation(0, 0, 0), STATUS_INVALID_INPUT);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn bounds_edits_that_do_not_add_up_are_rejected() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let text = std::ffi::CString::new("n").unwrap();
+        let notes = [BurnNote { page_index: 0, x: 50.0, y: 50.0, text: text.as_ptr() }];
+        assert_eq!(add_note_annotations(handle, 1000, notes.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        // Degenerate and inverted rectangles.
+        assert_eq!(set_annotation_bounds(handle, 0, 0, 1000, 10.0, 10.0, 10.0, 50.0),
+                   STATUS_INVALID_INPUT);
+        assert_eq!(set_annotation_bounds(handle, 0, 0, 1000, 50.0, 10.0, 10.0, 50.0),
+                   STATUS_INVALID_INPUT);
+        // No such annotation.
+        assert_eq!(set_annotation_bounds(handle, 0, 7, 1000, 10.0, 10.0, 50.0, 50.0),
+                   STATUS_INVALID_INPUT);
+        assert_eq!(set_annotation_bounds(handle, 0, 0, 0, 10.0, 10.0, 50.0, 50.0),
+                   STATUS_INVALID_INPUT);
+
+        close_document(handle);
     }
 
     #[test]
