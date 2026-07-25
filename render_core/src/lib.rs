@@ -947,6 +947,164 @@ pub struct BurnNote {
 /// text annotation keeps the text as text, so other readers show it as a note
 /// and it stays selectable and searchable. That also means notes are naturally
 /// idempotent to re-save in a way burned content is not.
+/// Adds freehand strokes as real PDF `/Ink` annotation objects.
+///
+/// One annotation per stroke, each holding a single path object, so a stroke
+/// stays one thing to select, move, recolour or delete. Takes the same stroke
+/// and point layout as the burn path, so the only difference at the call site
+/// is which function you call.
+#[unsafe(no_mangle)]
+pub extern "C" fn add_ink_annotations(
+    doc_handle: u64,
+    capture_width: i32,
+    strokes: *const BurnStroke,
+    stroke_count: usize,
+    points: *const BurnPoint,
+    point_count: usize,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if strokes.is_null() || stroke_count == 0 {
+        return STATUS_OK_PDFIUM;
+    }
+    if points.is_null() && point_count > 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        add_ink_annotations_inner(doc_handle, capture_width, strokes, stroke_count, points, point_count)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn add_ink_annotations_inner(
+    doc_handle: u64,
+    capture_width: i32,
+    strokes: *const BurnStroke,
+    stroke_count: usize,
+    points: *const BurnPoint,
+    point_count: usize,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let strokes: &[BurnStroke] = unsafe { std::slice::from_raw_parts(strokes, stroke_count) };
+    let points: &[BurnPoint] = if point_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(points, point_count) }
+    };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    for stroke in strokes {
+        let start = stroke.point_offset as usize;
+        let end = start.saturating_add(stroke.point_count as usize);
+
+        // A stroke needs two points to be a line at all, and the offset/count
+        // pair indexes a shared flat array, so a bad pair would read past its
+        // end.
+        if stroke.point_count < 2 || end > points.len() {
+            return STATUS_INVALID_INPUT;
+        }
+        let pts = &points[start..end];
+
+        let Ok(mut page) = doc_guard.pages().get(stroke.page_index as u16) else {
+            continue;
+        };
+
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            continue;
+        }
+
+        let media = page.boundaries().media().map(|b| b.bounds);
+        let (origin_x, origin_top) = match media {
+            Ok(b) => (b.left().value, b.top().value),
+            Err(_) => (0.0, page.height().value),
+        };
+        let scale = page_w / capture_width as f32;
+
+        let to_pdf_x = |x: f32| PdfPoints::new(origin_x + x * scale);
+        let to_pdf_y = |y: f32| PdfPoints::new(origin_top - y * scale);
+
+        let color = PdfColor::new(stroke.r, stroke.g, stroke.b, stroke.a);
+        let width_pts = (stroke.width_px * scale).max(0.1);
+
+        let Ok(mut path) = PdfPagePathObject::new_line(
+            &doc_guard,
+            to_pdf_x(pts[0].x),
+            to_pdf_y(pts[0].y),
+            to_pdf_x(pts[1].x),
+            to_pdf_y(pts[1].y),
+            color,
+            PdfPoints::new(width_pts),
+        ) else {
+            continue;
+        };
+
+        let mut ok = true;
+        for p in &pts[2..] {
+            if path.line_to(to_pdf_x(p.x), to_pdf_y(p.y)).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+
+        // Bounds must actually contain the stroke, padded by half the pen
+        // width. PDFium clips an annotation's appearance to its box, so a box
+        // measured from the centre line alone would shave the outer edge off
+        // every stroke, worst at the thickest pen.
+        let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+        for p in pts {
+            let x = origin_x + p.x * scale;
+            let y = origin_top - p.y * scale;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        let pad = width_pts / 2.0 + 1.0;
+
+        let bounds = PdfRect::new(
+            PdfPoints::new(min_y - pad),
+            PdfPoints::new(min_x - pad),
+            PdfPoints::new(max_y + pad),
+            PdfPoints::new(max_x + pad),
+        );
+
+        let Ok(mut annotation) = page.annotations_mut().create_ink_annotation() else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        // Bounds BEFORE objects. PDFium builds the annotation's appearance
+        // form from its rect, and appending an object to an annotation that
+        // has no rect yet crashes inside the library rather than failing.
+        if annotation.set_bounds(bounds).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let _ = annotation.set_stroke_color(color);
+
+        if annotation.objects_mut().add_path_object(path).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Adds highlights as real PDF `/Highlight` annotation objects.
 ///
 /// The editable counterpart to burning them into page content. A burned
@@ -1605,13 +1763,29 @@ fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
         let top = (page_top - bounds.top().value) / page_w;
         let bottom = (page_top - bounds.bottom().value) / page_w;
 
-        // Markup annotations carry their colour as the fill; a shape drawn as
-        // an outline carries it as the stroke. Preferring fill and falling
-        // back keeps one field meaningful for both.
-        let colour = annotation
-            .fill_color()
-            .or_else(|_| annotation.stroke_color())
-            .ok();
+        // Annotations that own page objects, meaning Ink and Stamp, must NOT
+        // be asked for a colour: PDFium access-violates on the query. This is
+        // measured, not guessed, and both fill_color and stroke_color crash,
+        // so there is no safe variant to fall back to. It is a hard crash
+        // rather than an error return, so it cannot be caught: the only
+        // defence is not asking.
+        //
+        // Reporting no colour for these is a small loss. The app keeps its own
+        // colour for ink and stamps it created, and a foreign one still draws
+        // correctly because PDFium renders it from its own appearance stream.
+        //
+        // Otherwise: markup annotations carry their colour as the fill, and a
+        // shape drawn as an outline carries it as the stroke, so preferring
+        // fill and falling back keeps one field meaningful for both.
+        let owns_page_objects = matches!(subtype, ANNOT_INK | ANNOT_STAMP);
+        let colour = if owns_page_objects {
+            None
+        } else {
+            annotation
+                .fill_color()
+                .or_else(|_| annotation.stroke_color())
+                .ok()
+        };
 
         let (color, opacity) = match colour {
             Some(c) => (
@@ -3129,6 +3303,145 @@ mod tests {
         close_document(reopened);
         close_document(handle);
         free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn an_ink_stroke_survives_save_and_reopen_as_an_editable_object() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let points = [
+            BurnPoint { x: 100.0, y: 100.0 },
+            BurnPoint { x: 200.0, y: 150.0 },
+            BurnPoint { x: 300.0, y: 120.0 },
+        ];
+        let strokes = [BurnStroke {
+            page_index: 0,
+            point_offset: 0,
+            point_count: 3,
+            width_px: 4.0,
+            r: 33, g: 150, b: 243, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, strokes.as_ptr(), strokes.len(),
+                                points.as_ptr(), points.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let before = read_annotations(handle, 0);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, ANNOT_INK, "should be an /Ink annotation");
+
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0);
+
+        let after = read_annotations(reopened, 0);
+        println!("INK before={before:?} after={after:?}");
+        assert_eq!(after.len(), 1, "the stroke should still be an annotation after reopening");
+        assert_eq!(after[0].1, ANNOT_INK);
+
+        for (b, a) in [(before[0].2, after[0].2), (before[0].3, after[0].3),
+                       (before[0].4, after[0].4), (before[0].5, after[0].5)] {
+            assert!((b - a).abs() < 0.001, "geometry drifted across the round trip: {b} vs {a}");
+        }
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn ink_bounds_contain_the_whole_pen_width() {
+        // PDFium clips an annotation's appearance to its bounding box, so a
+        // box measured from the stroke's centre line would shave the outer
+        // edge off every stroke, worst at the thickest pen. The box must be
+        // padded by at least half the pen width.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // A dead flat horizontal line: with no padding its box would have zero
+        // height and the stroke would vanish entirely.
+        let points = [BurnPoint { x: 100.0, y: 200.0 }, BurnPoint { x: 400.0, y: 200.0 }];
+        let strokes = [BurnStroke {
+            page_index: 0, point_offset: 0, point_count: 2,
+            width_px: 40.0,
+            r: 0, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, strokes.as_ptr(), strokes.len(),
+                                points.as_ptr(), points.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        let (_, _, left, top, right, bottom) = found[0];
+        let height = bottom - top;
+        println!("INK BOUNDS: l={left} t={top} r={right} b={bottom} height={height}");
+
+        // 40px at capture width 1000 on a 200pt page is 8pt of pen, so the box
+        // needs at least 8pt of height: 0.04 of the page width.
+        assert!(height >= 0.04, "box height {height} does not cover a 40px pen");
+        assert!(left < 0.1, "box should extend left of the first point");
+        assert!(right > 0.4, "box should extend right of the last point");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn reading_a_page_holding_object_owning_annotations_does_not_crash() {
+        // Regression guard for a hard crash, not a wrong answer. Asking PDFium
+        // for the colour of an annotation that owns page objects, which Ink and
+        // Stamp both do, access-violates: it takes the process down rather than
+        // returning an error, so no amount of catch_unwind helps.
+        //
+        // get_annotations shipped without this guard because it had only ever
+        // been pointed at /Text and /Highlight. Opening any PDF containing an
+        // ink annotation would have killed the app.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let points = [BurnPoint { x: 10.0, y: 10.0 }, BurnPoint { x: 90.0, y: 90.0 }];
+        let strokes = [BurnStroke {
+            page_index: 0, point_offset: 0, point_count: 2,
+            width_px: 3.0, r: 200, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, strokes.as_ptr(), 1, points.as_ptr(), points.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        // Reaching the next line at all is the assertion.
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, ANNOT_INK);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn ink_input_that_does_not_add_up_is_rejected() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let points = [BurnPoint { x: 0.0, y: 0.0 }, BurnPoint { x: 10.0, y: 10.0 }];
+
+        let overrun = [BurnStroke {
+            page_index: 0, point_offset: 0, point_count: 9,
+            width_px: 2.0, r: 0, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, overrun.as_ptr(), 1, points.as_ptr(), points.len()),
+            STATUS_INVALID_INPUT
+        );
+
+        // A single point is not a stroke.
+        let single = [BurnStroke {
+            page_index: 0, point_offset: 0, point_count: 1,
+            width_px: 2.0, r: 0, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, single.as_ptr(), 1, points.as_ptr(), points.len()),
+            STATUS_INVALID_INPUT
+        );
+
+        close_document(handle);
     }
 
     #[test]
