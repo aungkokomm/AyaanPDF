@@ -898,6 +898,34 @@ pub struct BurnStroke {
     pub a: u8,
 }
 
+/// One axis-aligned quad of a highlight, in render-pixel space.
+#[repr(C)]
+pub struct HighlightQuad {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+/// Header describing one highlight ANNOTATION inside the flat quad array.
+///
+/// A highlight over several lines of text is one annotation carrying several
+/// quads, not several annotations. That is what makes it behave as a single
+/// object afterwards: one click selects the whole highlight, one delete
+/// removes it, one colour change recolours all of it. Splitting it per line
+/// would leave the user picking fragments apart.
+#[repr(C)]
+pub struct HighlightSpec {
+    pub page_index: i32,
+    /// Index of this highlight's first quad in the shared quad array.
+    pub quad_offset: u32,
+    pub quad_count: u32,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
 /// A sticky note: a position in render-pixel space plus its text.
 ///
 /// The text is a separate NUL-terminated UTF-8 pointer rather than an inline
@@ -919,6 +947,154 @@ pub struct BurnNote {
 /// text annotation keeps the text as text, so other readers show it as a note
 /// and it stays selectable and searchable. That also means notes are naturally
 /// idempotent to re-save in a way burned content is not.
+/// Adds highlights as real PDF `/Highlight` annotation objects.
+///
+/// The editable counterpart to burning them into page content. A burned
+/// highlight is pixels: reopening the file gives you something that cannot be
+/// moved, recoloured or removed, and no other viewer sees it as markup. An
+/// annotation stays an object, so it round-trips through this app, Acrobat and
+/// anything else that reads PDF.
+///
+/// `capture_width` is the render width, in pixels, the coordinates were
+/// captured at, matching the burn and note paths.
+#[unsafe(no_mangle)]
+pub extern "C" fn add_highlight_annotations(
+    doc_handle: u64,
+    capture_width: i32,
+    specs: *const HighlightSpec,
+    spec_count: usize,
+    quads: *const HighlightQuad,
+    quad_count: usize,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if specs.is_null() || spec_count == 0 {
+        return STATUS_OK_PDFIUM;
+    }
+    if quads.is_null() && quad_count > 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        add_highlight_annotations_inner(doc_handle, capture_width, specs, spec_count, quads, quad_count)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn add_highlight_annotations_inner(
+    doc_handle: u64,
+    capture_width: i32,
+    specs: *const HighlightSpec,
+    spec_count: usize,
+    quads: *const HighlightQuad,
+    quad_count: usize,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let specs: &[HighlightSpec] = unsafe { std::slice::from_raw_parts(specs, spec_count) };
+    let quads: &[HighlightQuad] = if quad_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(quads, quad_count) }
+    };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    for spec in specs {
+        let start = spec.quad_offset as usize;
+        let end = start + spec.quad_count as usize;
+        if spec.quad_count == 0 || end > quads.len() {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let Ok(mut page) = doc_guard.pages().get(spec.page_index as u16) else {
+            continue;
+        };
+
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            continue;
+        }
+
+        // Page origin from the media box, not assumed to be zero, so the
+        // geometry matches what get_annotations reads back.
+        let media = page.boundaries().media().map(|b| b.bounds);
+        let (origin_x, origin_top) = match media {
+            Ok(b) => (b.left().value, b.top().value),
+            Err(_) => (0.0, page.height().value),
+        };
+        let scale = page_w / capture_width as f32;
+
+        let Ok(mut annotation) = page.annotations_mut().create_highlight_annotation() else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        // Union of the quads, for the annotation's own bounding box.
+        let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+
+        for quad in &quads[start..end] {
+            // Capture space is top-left origin and Y-down; PDF is bottom-left
+            // and Y-up.
+            let left = origin_x + quad.left * scale;
+            let right = origin_x + quad.right * scale;
+            let top = origin_top - quad.top * scale;
+            let bottom = origin_top - quad.bottom * scale;
+
+            min_x = min_x.min(left);
+            max_x = max_x.max(right);
+            min_y = min_y.min(bottom);
+            max_y = max_y.max(top);
+
+            let rect = PdfRect::new(
+                PdfPoints::new(bottom),
+                PdfPoints::new(left),
+                PdfPoints::new(top),
+                PdfPoints::new(right),
+            );
+
+            // from_rect rather than hand-ordered corners: PDF quad points run
+            // upper-left, upper-right, lower-left, lower-right, an order that
+            // is easy to get subtly wrong and that renders as a bow tie when
+            // you do.
+            if annotation
+                .attachment_points_mut()
+                .create_attachment_point_at_end(PdfQuadPoints::from_rect(&rect))
+                .is_err()
+            {
+                return STATUS_INVALID_INPUT;
+            }
+        }
+
+        let bounds = PdfRect::new(
+            PdfPoints::new(min_y),
+            PdfPoints::new(min_x),
+            PdfPoints::new(max_y),
+            PdfPoints::new(max_x),
+        );
+        if annotation.set_bounds(bounds).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+
+        if annotation
+            .set_fill_color(PdfColor::new(spec.r, spec.g, spec.b, spec.a))
+            .is_err()
+        {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn add_note_annotations(
     doc_handle: u64,
@@ -2887,6 +3063,143 @@ mod tests {
         assert!(left.abs() < 0.01, "placed at x=0, read back at {left}");
         assert!(top.abs() < 0.01, "placed at the top, read back at {top}");
         assert!(bottom > top, "top must be ABOVE bottom in a Y-down space");
+
+        close_document(handle);
+    }
+
+    /// Full colour and opacity for one annotation, for assertions.
+    fn read_annotation_colour(handle: u64, page_index: i32, index: usize) -> (i32, f32) {
+        let array = get_annotations(handle, page_index);
+        assert_eq!(array.status, STATUS_OK_PDFIUM);
+        assert!(index < array.len, "no annotation at index {index}");
+        let item = unsafe { &*array.items.add(index) };
+        let out = (item.color, item.opacity);
+        free_annotation_array(array);
+        out
+    }
+
+    #[test]
+    fn a_highlight_survives_save_and_reopen_as_an_editable_object() {
+        // THE point of Phase A. Burning a highlight into page content makes it
+        // pixels: reopen the file and it cannot be moved, recoloured or
+        // removed. As an annotation object it comes back as an object, which
+        // is what every editing feature after this depends on.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let quads = [HighlightQuad { left: 100.0, top: 100.0, right: 500.0, bottom: 140.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0,
+            quad_offset: 0,
+            quad_count: 1,
+            r: 255,
+            g: 235,
+            b: 59,
+            a: 128,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), specs.len(),
+                                      quads.as_ptr(), quads.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let before = read_annotations(handle, 0);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, ANNOT_HIGHLIGHT);
+
+        // Round trip through actual PDF bytes, not just the in-memory page.
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0, "the saved document should reopen");
+
+        let after = read_annotations(reopened, 0);
+        println!("HIGHLIGHT before={before:?}\n           after={after:?}");
+
+        assert_eq!(after.len(), 1, "the highlight should still be an annotation after reopening");
+        assert_eq!(after[0].1, ANNOT_HIGHLIGHT, "and still a highlight");
+
+        for (b, a) in [(before[0].2, after[0].2), (before[0].3, after[0].3),
+                       (before[0].4, after[0].4), (before[0].5, after[0].5)] {
+            assert!((b - a).abs() < 0.001, "geometry drifted across the round trip: {b} vs {a}");
+        }
+
+        let (colour, opacity) = read_annotation_colour(reopened, 0, 0);
+        assert_eq!(colour, 0xFFEB3B, "the highlight colour should survive");
+        assert!((opacity - 128.0 / 255.0).abs() < 0.01, "opacity {opacity} should survive");
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn a_highlight_over_several_lines_is_one_annotation() {
+        // A highlight spanning three lines of text must behave as ONE object,
+        // so that a click selects all of it and a delete removes all of it.
+        // Writing one annotation per line would leave the user picking
+        // fragments apart, which is exactly what a highlight is not.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let quads = [
+            HighlightQuad { left: 100.0, top: 100.0, right: 500.0, bottom: 130.0 },
+            HighlightQuad { left: 100.0, top: 140.0, right: 480.0, bottom: 170.0 },
+            HighlightQuad { left: 100.0, top: 180.0, right: 300.0, bottom: 210.0 },
+        ];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 3,
+            r: 0, g: 255, b: 0, a: 100,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), specs.len(),
+                                      quads.as_ptr(), quads.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1, "three lines must be one annotation, not three");
+
+        // Its bounds must cover the union of all three lines, or hit-testing
+        // and the selection marquee would miss part of the highlight.
+        let (_, _, left, top, right, bottom) = found[0];
+        println!("UNION: l={left} t={top} r={right} b={bottom}");
+        assert!((left - 0.1).abs() < 0.001, "left should be the leftmost quad");
+        assert!((right - 0.5).abs() < 0.001, "right should be the widest quad");
+        assert!((top - 0.1).abs() < 0.001, "top should be the highest quad");
+        assert!((bottom - 0.21).abs() < 0.001, "bottom should be the lowest quad");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn highlight_input_that_does_not_add_up_is_rejected() {
+        // The offset/count pair indexes a shared flat array, so a bad pair
+        // would read past the end of it. Cheap to check, catastrophic to miss.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let quads = [HighlightQuad { left: 0.0, top: 0.0, right: 10.0, bottom: 10.0 }];
+
+        let overrun = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 5,
+            r: 255, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, overrun.as_ptr(), overrun.len(),
+                                      quads.as_ptr(), quads.len()),
+            STATUS_INVALID_INPUT
+        );
+
+        let empty = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 0,
+            r: 255, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, empty.as_ptr(), empty.len(),
+                                      quads.as_ptr(), quads.len()),
+            STATUS_INVALID_INPUT
+        );
+
+        assert_eq!(add_highlight_annotations(0, 1000, overrun.as_ptr(), 1,
+                                             quads.as_ptr(), 1), STATUS_INVALID_INPUT);
+        assert_eq!(add_highlight_annotations(handle, 0, overrun.as_ptr(), 1,
+                                             quads.as_ptr(), 1), STATUS_INVALID_INPUT);
 
         close_document(handle);
     }
