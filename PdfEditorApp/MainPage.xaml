@@ -391,6 +391,48 @@
                 </Button>
 
                 <!--
+                    Stamp. The flyout both arms the tool and chooses which
+                    image it places, because a stamp tool with no stamp
+                    selected has nothing to do.
+                -->
+                <Button x:Name="StampToolButton" ToolTipService.ToolTip="Stamp"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE7B8;" FontSize="16" />
+                    <Button.Flyout>
+                        <Flyout Placement="Right" Opening="StampFlyout_Opening">
+                            <StackPanel Spacing="10" Width="248">
+                                <TextBlock Text="Stamps" Style="{StaticResource CaptionTextBlockStyle}" />
+
+                                <TextBlock x:Name="StampEmptyHint"
+                                           Text="No stamps yet. Add a PNG to get started."
+                                           TextWrapping="Wrap"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                           Style="{StaticResource CaptionTextBlockStyle}" />
+
+                                <GridView x:Name="StampChoices" SelectionMode="Single"
+                                          MaxHeight="240"
+                                          SelectionChanged="StampChoice_SelectionChanged">
+                                    <GridView.ItemTemplate>
+                                        <DataTemplate x:DataType="local:StampEntry">
+                                            <Grid Width="64" Height="64" Padding="4"
+                                                  ToolTipService.ToolTip="{x:Bind Name}">
+                                                <Image Stretch="Uniform"
+                                                       Source="{x:Bind Path}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </GridView.ItemTemplate>
+                                </GridView>
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button Content="Add PNG..." Click="AddStamp_Click" />
+                                    <Button Content="Open folder" Click="OpenStampFolder_Click" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Flyout>
+                    </Button.Flyout>
+                </Button>
+
+                <!--
                     Pen options, shown only while a drawing tool is armed, so
                     the rail stays minimal when they are irrelevant.
                 -->

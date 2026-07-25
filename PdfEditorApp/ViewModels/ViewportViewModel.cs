@@ -38,6 +38,8 @@ public enum ToolMode
     Draw,
     /// <summary>Plain left-drag pans, same as holding Space with any other tool active.</summary>
     Hand,
+    /// <summary>Click places the chosen stamp image.</summary>
+    Stamp,
 }
 
 public partial class ViewportViewModel : ObservableObject, IDisposable
@@ -2161,6 +2163,69 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Notes.Add(note);
         SlotFor(note.PageIndex)?.Notes.Add(note);
         IsDirty = true;
+    }
+
+    /// <summary>
+    /// Places a stamp image on a page, centred on the point clicked.
+    ///
+    /// Written STRAIGHT into the document as a real annotation, rather than
+    /// held in an overlay list until save like highlights and ink are. That is
+    /// deliberate: the moment it is an annotation object, everything built for
+    /// annotations already in a file applies to it, so a stamp can be clicked,
+    /// dragged and deleted with no code of its own. The overlay model exists
+    /// because text markup has to follow selected text; a stamp has no such
+    /// need.
+    ///
+    /// <paramref name="widthFraction"/> is the stamp's width as a fraction of
+    /// the page width. Height follows the image's own aspect, so a stamp is
+    /// never squashed.
+    /// </summary>
+    public bool PlaceStamp(int pageIndex, double x, double y, StampPixels pixels,
+                           double widthFraction = 0.25)
+    {
+        if (_documentHandle == 0 || pixels.Width <= 0 || pixels.Height <= 0)
+        {
+            return false;
+        }
+
+        // Normalized, top-left origin, both axes over the page WIDTH, which is
+        // the convention render_core reads and writes in.
+        double cx = Norm(x);
+        double cy = Norm(y);
+
+        double w = Math.Clamp(widthFraction, 0.02, 1.0);
+        double h = w * pixels.Height / pixels.Width;
+
+        // Centred on the click, then nudged so it cannot hang off the left or
+        // top edge, where its handle would be unreachable.
+        double left = Math.Max(0, cx - w / 2);
+        double top = Math.Max(0, cy - h / 2);
+
+        // BEFORE the edit. PushHistory captures the state to restore TO, so
+        // pushing afterwards would record the document WITH the stamp and undo
+        // would do nothing. Document scope, because a stamp goes into the file
+        // itself rather than into an overlay list.
+        PushHistory(HistoryScope.Document, "Place stamp");
+
+        const int CaptureWidth = 1000;
+        int status = RenderCoreNative.add_stamp_annotation(
+            _documentHandle, pageIndex, CaptureWidth,
+            (float)(left * CaptureWidth), (float)(top * CaptureWidth),
+            (float)((left + w) * CaptureWidth), (float)((top + h) * CaptureWidth),
+            pixels.Bgra, (nuint)pixels.Bgra.Length, pixels.Width, pixels.Height);
+
+        Diag.Log($"place stamp p{pageIndex} at ({left:F3},{top:F3}) " +
+                 $"{w:F3}x{h:F3} from {pixels.Width}x{pixels.Height}px -> {status}");
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not place that stamp.";
+            return false;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(pageIndex);
+        return true;
     }
 
     // ---------------- Undo / redo ----------------

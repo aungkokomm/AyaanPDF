@@ -415,6 +415,99 @@ public sealed partial class MainPage : Page
     private void NoteTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Note);
     private void DrawTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Draw);
 
+    // ---------------- Stamps ----------------
+
+    /// <summary>The stamp a click will place, or null when none is chosen.</summary>
+    private StampEntry? _selectedStamp;
+
+    private void StampFlyout_Opening(object? sender, object e)
+    {
+        var stamps = StampLibrary.List();
+        StampChoices.ItemsSource = stamps;
+        StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        // Keep the previous choice selected across openings, so placing several
+        // copies of one stamp does not mean re-picking it every time.
+        if (_selectedStamp is not null)
+        {
+            StampChoices.SelectedItem = stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path);
+        }
+    }
+
+    private void StampChoice_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (StampChoices.SelectedItem is StampEntry entry)
+        {
+            _selectedStamp = entry;
+            // Choosing a stamp arms the tool: picking one and then having to
+            // find the tool button as well would be a pointless second step.
+            SetActiveTool(ToolMode.Stamp);
+        }
+    }
+
+    private async void AddStamp_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new Windows.Storage.Pickers.FileOpenPicker();
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
+        picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.PicturesLibrary;
+        picker.FileTypeFilter.Add(".png");
+
+        var file = await picker.PickSingleFileAsync();
+        if (file is null)
+        {
+            return;
+        }
+
+        var added = await StampLibrary.ImportAsync(file);
+        if (added is null)
+        {
+            ViewModel.Status = "Could not add that stamp.";
+            return;
+        }
+
+        var stamps = StampLibrary.List();
+        StampChoices.ItemsSource = stamps;
+        StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        StampChoices.SelectedItem = stamps.FirstOrDefault(s => s.Path == added.Path);
+    }
+
+    /// <summary>
+    /// Opens the stamp folder in Explorer, so stamps can be added, renamed or
+    /// removed as ordinary files. They are the user's images, not something
+    /// this app should be the only way to manage.
+    /// </summary>
+    private async void OpenStampFolder_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string folder = StampLibrary.EnsureFolder();
+            await Windows.System.Launcher.LaunchFolderPathAsync(folder);
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"could not open the stamp folder: {ex.Message}");
+        }
+    }
+
+    /// <summary>Decodes the armed stamp and places it at a page point.</summary>
+    private async Task PlaceSelectedStampAsync(int pageIndex, double x, double y)
+    {
+        if (_selectedStamp is null)
+        {
+            ViewModel.Status = "Choose a stamp first.";
+            return;
+        }
+
+        var pixels = await StampLibrary.DecodeAsync(_selectedStamp.Path);
+        if (pixels is null)
+        {
+            ViewModel.Status = $"Could not read {_selectedStamp.Name}.";
+            return;
+        }
+
+        ViewModel.PlaceStamp(pageIndex, x, y, pixels);
+    }
+
     private void SetActiveTool(ToolMode tool)
     {
         // Switching tools abandons whatever the previous one was part way
@@ -603,6 +696,7 @@ public sealed partial class MainPage : Page
         HighlightToolButton.Background = ViewModel.ActiveTool == ToolMode.Highlight ? active : idle;
         DrawToolButton.Background = ViewModel.ActiveTool == ToolMode.Draw ? active : idle;
         NoteToolButton.Background = ViewModel.ActiveTool == ToolMode.Note ? active : idle;
+        StampToolButton.Background = ViewModel.ActiveTool == ToolMode.Stamp ? active : idle;
     }
 
     // ---------------- File menu ----------------
@@ -1433,6 +1527,14 @@ public sealed partial class MainPage : Page
 
             case ToolMode.Note:
                 ViewModel.AddNoteAt(content.Page, content.X, content.Y);
+                e.Handled = true;
+                break;
+
+            case ToolMode.Stamp:
+                // Fire and forget: decoding is async, and a pointer handler
+                // cannot await without letting the gesture continue underneath
+                // it. Nothing later in this handler depends on the result.
+                _ = PlaceSelectedStampAsync(content.Page, content.X, content.Y);
                 e.Handled = true;
                 break;
         }
