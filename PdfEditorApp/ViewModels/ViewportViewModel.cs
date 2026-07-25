@@ -852,7 +852,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var (from, to) = RenderBudget.Widen(first, last, SharpenAheadPages, PageSlots.Count);
+        // Zoomed deep, one page fills the viewport, so sharpening its
+        // neighbours spends the budget on pixels nobody can see. Narrowing to
+        // the visible page alone is what pays for the much larger per-page
+        // resolution the budget now allows.
+        int ahead = _currentZoomFactor > RenderBudget.SoloSharpenZoom ? 0 : SharpenAheadPages;
+        var (from, to) = RenderBudget.Widen(first, last, ahead, PageSlots.Count);
 
         for (int i = from; i <= to; i++)
         {
@@ -1228,6 +1233,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>True while a drag is in progress.</summary>
     private bool _isSelecting;
+
+    /// <summary>Diagnostics only: how many glyphs a page's text layer holds.</summary>
+    public int DebugTextLayerCharCount(int pageIndex) => TextLayerFor(pageIndex)?.CharCount ?? -1;
+
+    /// <summary>Diagnostics only: the extent the text layer's glyph boxes occupy.</summary>
+    public string DebugTextLayerBounds(int pageIndex)
+    {
+        var layer = TextLayerFor(pageIndex);
+        if (layer is null || layer.CharCount == 0)
+        {
+            return "none";
+        }
+
+        var r = layer.GetRangeRects(0, layer.CharCount);
+        if (r.Count == 0)
+        {
+            return "no rects";
+        }
+
+        return $"x {r.Min(v => v.Left):F0}..{r.Max(v => v.Right):F0}  y {r.Min(v => v.Top):F0}..{r.Max(v => v.Bottom):F0}";
+    }
 
     public void BeginTextSelection(int pageIndex, double x, double y)
     {

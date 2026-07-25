@@ -39,14 +39,26 @@
         </Grid.Background>
 
         <!--
-            Margin keeps the canvas clear of the tool rail, and grows while the
-            pages panel is open so the page and the thumbnails coexist instead
-            of the page hiding behind the panel. Kept in sync from
-            ToggleThumbnails.
+            Chrome occupies real COLUMNS; the canvas gets what is left.
+
+            This was twice attempted with the canvas overlaid and inset by a
+            margin, and the page was covered both times: first because the
+            inset was a hand-written number that disagreed with the panel's
+            geometry, then because it was derived from ActualWidth, which is
+            zero while the panel is collapsed and had not been laid out yet
+            when the inset was read. Any arithmetic that reproduces what the
+            layout engine already knows will eventually disagree with it.
+            Giving the panel a column means overlap is not expressible.
         -->
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition x:Name="ThumbnailColumn" Width="Auto" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
         <ScrollView
             x:Name="PageScroller"
-            Margin="64,0,0,0"
+            Grid.Column="2"
             ZoomMode="Enabled"
             HorizontalScrollBarVisibility="Auto"
             VerticalScrollBarVisibility="Auto"
@@ -258,7 +270,7 @@
             Empty state. Without it a fresh launch is an unexplained grey void
             with no indication that anything works or what to do next.
         -->
-        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10"
+        <StackPanel Grid.Column="2" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10"
                     IsHitTestVisible="False"
                     Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
             <FontIcon Glyph="&#xEA90;" FontSize="40" Foreground="#8AFFFFFF" HorizontalAlignment="Center" />
@@ -273,7 +285,7 @@
             stay a glanceable column the way a canvas app expects, and cost a
             fixed 44px of overlay instead of a full toolbar row of height.
         -->
-        <Border HorizontalAlignment="Left" VerticalAlignment="Center" Margin="12,0,0,0"
+        <Border Grid.Column="0" VerticalAlignment="Center" Margin="12,0,12,0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="10" Padding="4">
@@ -398,7 +410,7 @@
             takes width away from the canvas. Hidden until asked for.
         -->
         <Border x:Name="ThumbnailPanel" Visibility="Collapsed"
-                HorizontalAlignment="Left" Margin="66,12,0,12" Width="182"
+                Grid.Column="1" Margin="0,12,12,12" Width="182"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="10">
@@ -432,7 +444,7 @@
             Status pill: page position, zoom, fit and find. Floats bottom
             centre and stays out of the way, replacing a full-width status bar.
         -->
-        <Border HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
+        <Border Grid.Column="2" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="18" Padding="6,3">

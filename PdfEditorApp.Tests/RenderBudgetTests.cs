@@ -112,6 +112,21 @@ public class RenderBudgetTests
     }
 
     [Fact]
+    public void deep_zoom_gets_a_much_sharper_render_than_before()
+    {
+        // At 800% on a 150% display an 800-DIP page wants 9600px. It will
+        // still be capped, but the cap has to be high enough that text is not
+        // obviously upscaled: 2600px was a 3.7x magnification of the render.
+        int w = Budget.SharpWidthFor(800, zoom: 8.0, rasterizationScale: 1.5, aspect: 1.4);
+
+        Assert.True(w >= 4000, $"deep zoom should render at least 4000px wide, got {w}");
+
+        // And still inside the area budget for a portrait page.
+        long pixels = (long)w * (long)(w * 1.4);
+        Assert.True(pixels <= Budget.MaxSharpPixels, $"{pixels} exceeds the area cap");
+    }
+
+    [Fact]
     public void widen_clamps_to_the_document_bounds()
     {
         Assert.Equal((0, 5), RenderBudget.Widen(0, 3, margin: 2, pageCount: 20));

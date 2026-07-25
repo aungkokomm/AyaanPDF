@@ -48,10 +48,21 @@ public sealed class RenderBudget
     /// </summary>
     public double ResharpenRatio { get; }
 
+    /// <summary>
+    /// Above this zoom, only the page you are looking at is sharpened.
+    ///
+    /// At a normal zoom several pages are on screen and all deserve to be
+    /// crisp. Zoomed deep, one page fills the viewport, so spending the budget
+    /// on its neighbours buys nothing visible and forces the per-page cap down
+    /// to keep total memory sane. Concentrating on one page is what allows the
+    /// caps below to be as high as they are.
+    /// </summary>
+    public const double SoloSharpenZoom = 2.0;
+
     public RenderBudget(
         int baseWidth = 900,
-        int maxSharpWidth = 2600,
-        long maxSharpPixels = 12_000_000,
+        int maxSharpWidth = 4200,
+        long maxSharpPixels = 26_000_000,
         double resharpenRatio = 1.2)
     {
         BaseWidth = baseWidth;
@@ -89,7 +100,10 @@ public sealed class RenderBudget
         double areaLimited = Math.Sqrt(MaxSharpPixels / safeAspect);
         width = Math.Min(width, areaLimited);
 
-        return (int)Math.Max(1, Math.Round(width));
+        // Floor, not round: when the AREA cap is what binds, rounding up can
+        // push the result back over the budget it was just clamped to. The
+        // sub-pixel difference is invisible; exceeding the cap is not.
+        return (int)Math.Max(1, Math.Floor(width));
     }
 
     /// <summary>

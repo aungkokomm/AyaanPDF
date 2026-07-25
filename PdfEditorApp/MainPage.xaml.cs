@@ -457,43 +457,17 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void ToggleThumbnails_Click(object sender, RoutedEventArgs e) => ToggleThumbnails();
 
-    /// <summary>Left chrome the canvas must stay clear of: the tool rail.</summary>
-    private const double RailInset = 64;
-
-    /// <summary>Breathing room between the pages panel and the page.</summary>
-    private const double PanelGap = 10;
-
     /// <summary>
-    /// How far the canvas must be inset to clear the pages panel, DERIVED from
-    /// where the panel actually is rather than written down separately.
+    /// Shows or hides the pages panel.
     ///
-    /// It was a hand-written 194 while the panel spanned 66 to 248, so the
-    /// panel covered the page by 54px. Two numbers that must agree, kept in
-    /// two places, will eventually disagree; reading the real geometry means
-    /// moving or resizing the panel cannot reintroduce the overlap.
+    /// No inset arithmetic: the panel owns a grid column, so collapsing it
+    /// collapses the column and the canvas column absorbs the space. Overlap
+    /// is not expressible, and the ScrollView's own SizeChanged drives the
+    /// refit, so this does not have to reason about layout timing either.
     /// </summary>
-    private double PanelInset =>
-        ThumbnailPanel.Margin.Left + ThumbnailPanel.ActualWidth + PanelGap;
-
-    private void ToggleThumbnails()
-    {
-        bool showing = ThumbnailPanel.Visibility != Visibility.Visible;
-        ThumbnailPanel.Visibility = showing ? Visibility.Visible : Visibility.Collapsed;
-
-        // The canvas is inset so the page never sits UNDER the chrome. The
-        // panel and the rail overlay the window, but the usable canvas is only
-        // what they do not cover, so the scroller is given that region and the
-        // page refits into it. Without this the page hid behind the panel.
-        PageScroller.Margin = new Thickness(showing ? PanelInset : RailInset, 0, 0, 0);
-
-        // Refit only if the user has not taken the zoom over; if they have,
-        // their zoom is respected and only the visible region changes.
-        if (_autoFit)
-        {
-            // Layout has to settle at the new size before fitting to it.
-            DispatcherQueue.TryEnqueue(() => FitToWidth(animate: true));
-        }
-    }
+    private void ToggleThumbnails() =>
+        ThumbnailPanel.Visibility =
+            ThumbnailPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
 
     private void DeleteNote_Click(object sender, RoutedEventArgs e)
     {
