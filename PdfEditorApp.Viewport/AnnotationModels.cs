@@ -29,11 +29,29 @@ public interface IAnnotation
     IAnnotation Translate(double dx, double dy);
 }
 
+/// <summary>
+/// One highlight rectangle paired with its colour.
+///
+/// Exists because the inner item template is per-RECT while the colour lives
+/// on the parent highlight, and x:Bind cannot reach up out of a template.
+/// Carrying the colour on each rect keeps the binding compiled rather than
+/// falling back to a runtime ancestor lookup.
+/// </summary>
+public readonly record struct ColoredRect(double Left, double Top, double Right, double Bottom, string ColorHex)
+{
+    public double Width => Right - Left;
+    public double Height => Bottom - Top;
+}
+
 /// <summary>A committed highlight over a run of text, as normalized rects.</summary>
 public sealed record HighlightAnnotation(int PageIndex, IReadOnlyList<TextRect> Rects, string ColorHex)
     : IAnnotation
 {
     public Guid Id { get; init; } = Guid.NewGuid();
+
+    /// <summary>The rects with the colour attached, for binding.</summary>
+    public IReadOnlyList<ColoredRect> ColoredRects =>
+        Rects.Select(r => new ColoredRect(r.Left, r.Top, r.Right, r.Bottom, ColorHex)).ToList();
 
     public TextRect Bounds => Rects.Count == 0
         ? new TextRect(0, 0, 0, 0)

@@ -659,6 +659,113 @@ pub struct BurnStroke {
     pub a: u8,
 }
 
+/// A sticky note: a position in render-pixel space plus its text.
+///
+/// The text is a separate NUL-terminated UTF-8 pointer rather than an inline
+/// buffer because note text is unbounded, and a fixed-size array would either
+/// truncate what the user wrote or make every note pay for the longest one.
+#[repr(C)]
+pub struct BurnNote {
+    pub page_index: i32,
+    pub x: f32,
+    pub y: f32,
+    pub text: *const c_char,
+}
+
+/// Adds sticky notes as real PDF text annotations.
+///
+/// Notes are NOT burned into the content stream like highlights and ink. A
+/// note's value is its TEXT, and flattening it to a marker graphic would throw
+/// exactly that away: the mark would survive and the words would not. A PDF
+/// text annotation keeps the text as text, so other readers show it as a note
+/// and it stays selectable and searchable. That also means notes are naturally
+/// idempotent to re-save in a way burned content is not.
+#[unsafe(no_mangle)]
+pub extern "C" fn add_note_annotations(
+    doc_handle: u64,
+    capture_width: i32,
+    notes: *const BurnNote,
+    note_count: usize,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if notes.is_null() || note_count == 0 {
+        return STATUS_OK_PDFIUM;
+    }
+
+    panic::catch_unwind(|| add_note_annotations_inner(doc_handle, capture_width, notes, note_count))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn add_note_annotations_inner(
+    doc_handle: u64,
+    capture_width: i32,
+    notes: *const BurnNote,
+    note_count: usize,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let notes: &[BurnNote] = unsafe { std::slice::from_raw_parts(notes, note_count) };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    // Standard sticky-note icon box, in points.
+    const NOTE_SIZE: f32 = 20.0;
+
+    for note in notes {
+        let Ok(mut page) = doc_guard.pages().get(note.page_index as u16) else {
+            continue;
+        };
+
+        let page_width = page.width().value;
+        let page_height = page.height().value;
+        if page_width <= 0.0 {
+            continue;
+        }
+        let scale = page_width / capture_width as f32;
+
+        let text = if note.text.is_null() {
+            String::new()
+        } else {
+            match unsafe { CStr::from_ptr(note.text) }.to_str() {
+                Ok(s) => s.to_owned(),
+                Err(_) => continue,
+            }
+        };
+
+        // Same vertical flip as the burn path: capture space is top-left
+        // origin, PDF is bottom-left.
+        let x = note.x * scale;
+        let y = page_height - note.y * scale;
+
+        let Ok(mut annotation) = page.annotations_mut().create_text_annotation(&text) else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        // The icon hangs DOWN from the anchor, so the click point stays the
+        // top-left of the marker and matches where the user placed it.
+        let bounds = PdfRect::new(
+            PdfPoints::new(y - NOTE_SIZE),
+            PdfPoints::new(x),
+            PdfPoints::new(y),
+            PdfPoints::new(x + NOTE_SIZE),
+        );
+        if annotation.set_bounds(bounds).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Flattens highlights and ink strokes into page content.
 ///
 /// `capture_width` is the render width, in pixels, the annotation
@@ -2312,6 +2419,108 @@ mod tests {
         assert_eq!(open_document_from_bytes(garbage.as_ptr(), garbage.len()), 0);
         // Freeing an error buffer must not crash.
         free_byte_buffer(ByteBuffer::err(STATUS_INVALID_INPUT));
+    }
+
+    /// Number of annotations on a page.
+    fn page_annotation_count(handle: u64, page_index: i32) -> usize {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let page = g.pages().get(page_index as u16).unwrap();
+        page.annotations().len() as usize
+    }
+
+    #[test]
+    fn notes_survive_a_save_with_their_text_intact() {
+        // The whole point of a note is its text. Burning it to a marker
+        // graphic would keep the mark and lose the words, which is the data
+        // loss this exists to prevent, so the test reads the TEXT back.
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = page_annotation_count(handle, 0);
+
+        let body = std::ffi::CString::new("Check this figure against table 3").unwrap();
+        let notes = [BurnNote { page_index: 0, x: 200.0, y: 300.0, text: body.as_ptr() }];
+        assert_eq!(
+            add_note_annotations(handle, 1000, notes.as_ptr(), notes.len()),
+            STATUS_OK_PDFIUM
+        );
+        assert_eq!(page_annotation_count(handle, 0), before + 1);
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("render_core_note_{}.pdf", std::process::id()));
+        let path_str = path.to_str().unwrap().to_owned();
+        let c_path = std::ffi::CString::new(path_str.clone()).unwrap();
+        assert_eq!(save_document(handle, c_path.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let reopened = open_fixture_named(&path_str);
+        assert_eq!(page_annotation_count(reopened, 0), before + 1, "note did not survive the save");
+
+        let found = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&reopened).cloned().unwrap();
+            let g = lock(&doc);
+            let page = g.pages().get(0).unwrap();
+            page.annotations()
+                .iter()
+                .filter_map(|a| a.contents())
+                .any(|c| c.contains("table 3"))
+        };
+        assert!(found, "the note's TEXT was lost; only a marker survived");
+
+        close_document(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn notes_land_on_their_own_page_and_flip_into_pdf_space() {
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before_p0 = page_annotation_count(handle, 0);
+
+        let body = std::ffi::CString::new("on page two").unwrap();
+        let notes = [BurnNote { page_index: 1, x: 0.0, y: 0.0, text: body.as_ptr() }];
+        assert_eq!(
+            add_note_annotations(handle, 1000, notes.as_ptr(), notes.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        assert_eq!(page_annotation_count(handle, 0), before_p0, "page 0 must be untouched");
+        assert_eq!(page_annotation_count(handle, 1), 1);
+
+        // Placed at the TOP of the capture, so it must sit near the top of the
+        // page in PDF coords, i.e. a HIGH y.
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let page = g.pages().get(1).unwrap();
+        let page_height = page.height().value;
+        let bounds = page.annotations().iter().next().unwrap().bounds().unwrap();
+        assert!(
+            bounds.top().value > page_height * 0.9,
+            "note placed at the top should be near the page top (y={} of {}), not mirrored",
+            bounds.top().value, page_height
+        );
+
+        drop(g);
+        drop(doc);
+        drop(_guard);
+        close_document(handle);
+    }
+
+    #[test]
+    fn add_note_annotations_rejects_bad_input() {
+        assert_eq!(add_note_annotations(0, 1000, std::ptr::null(), 0), STATUS_INVALID_INPUT);
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_note_annotations(handle, 0, std::ptr::null(), 0), STATUS_INVALID_INPUT);
+        // No notes is success, not failure: saving a document with no notes
+        // must not report an error.
+        assert_eq!(add_note_annotations(handle, 1000, std::ptr::null(), 0), STATUS_OK_PDFIUM);
+        close_document(handle);
     }
 
     #[test]

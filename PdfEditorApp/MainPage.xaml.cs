@@ -49,6 +49,7 @@ public sealed partial class MainPage : Page
         Loaded += (_, _) =>
         {
             RootGrid.Focus(FocusState.Programmatic);
+            InitializePenPickers();
             UpdateToolRail();
             UpdateCursor();
         };
@@ -80,6 +81,17 @@ public sealed partial class MainPage : Page
     /// rather than a silently mispositioned rectangle.
     /// </summary>
     public static Thickness Offset(double left, double top) => new(left, top, 0, 0);
+
+    /// <summary>
+    /// Turns a stored "#AARRGGBB" into a brush, for x:Bind in the annotation
+    /// templates. Compiled like <see cref="Offset"/>, so a mistake is a build
+    /// error rather than a silently invisible mark.
+    /// </summary>
+    public static Brush HexBrush(string hex)
+    {
+        var (a, r, g, b) = InkPresets.ParseHex(hex);
+        return new SolidColorBrush(Color.FromArgb(a, r, g, b));
+    }
 
     // ---------------- ScrollView-driven zoom ----------------
 
@@ -265,8 +277,62 @@ public sealed partial class MainPage : Page
     /// tool-driven canvas app that is the difference between confident and
     /// tentative use.
     /// </summary>
+    /// <summary>Row height previewing a stroke width in the picker.</summary>
+    public static double WidthPreview(double normalizedWidth) =>
+        Math.Clamp(normalizedWidth * 800, 1.5, 14);
+
+    /// <summary>
+    /// Populates the pen pickers once and selects the current values. Done in
+    /// code rather than bound because the two lists come from static preset
+    /// tables that never change, and binding them would add view-model surface
+    /// for no benefit.
+    /// </summary>
+    private void InitializePenPickers()
+    {
+        ColorChoices.ItemsSource = InkPresets.Colors;
+        WidthChoices.ItemsSource = InkPresets.Widths;
+        ColorChoices.SelectedIndex = 0;
+        WidthChoices.SelectedIndex = 1;
+        UpdatePenSwatch();
+    }
+
+    private void InkColor_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ColorChoices.SelectedItem is InkColor c)
+        {
+            // The pen and the highlighter are separate colours: a highlighter
+            // must stay translucent or it covers the text it marks, so picking
+            // a pen colour maps to the matching translucent highlight rather
+            // than making the highlighter opaque.
+            ViewModel.InkColorHex = c.Hex;
+            int i = ColorChoices.SelectedIndex;
+            if (i >= 0 && i < InkPresets.HighlightColors.Count)
+            {
+                ViewModel.HighlightColorHex = InkPresets.HighlightColors[i].Hex;
+            }
+            UpdatePenSwatch();
+        }
+    }
+
+    private void InkWidth_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (WidthChoices.SelectedItem is InkWidth w)
+        {
+            ViewModel.InkWidth = w.Value;
+        }
+    }
+
+    private void UpdatePenSwatch() =>
+        PenSwatch.Background = HexBrush(ViewModel.InkColorHex);
+
     private void UpdateToolRail()
     {
+        // Pen options are only meaningful for tools that lay down colour.
+        PenOptionsButton.Visibility =
+            ViewModel.ActiveTool is ToolMode.Draw or ToolMode.Highlight
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
         var active = (SolidColorBrush)Application.Current.Resources["AccentFillColorDefaultBrush"];
         var idle = new SolidColorBrush(Colors.Transparent);
 
@@ -401,6 +467,66 @@ public sealed partial class MainPage : Page
             // Layout has to settle at the new size before fitting to it.
             DispatcherQueue.TryEnqueue(() => FitToWidth(animate: true));
         }
+    }
+
+    private void SearchNext_Click(object sender, RoutedEventArgs e) => ViewModel.StepSearchMatch(1);
+
+    private void SearchPrev_Click(object sender, RoutedEventArgs e) => ViewModel.StepSearchMatch(-1);
+
+    /// <summary>
+    /// Enter steps to the next match, Shift+Enter to the previous, which is
+    /// what every find bar does and avoids reaching for the mouse mid-search.
+    /// Handled on the box itself, since the canvas shortcuts deliberately do
+    /// not fire while a text field has focus.
+    /// </summary>
+    private void SearchBox_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key != VirtualKey.Enter)
+        {
+            return;
+        }
+
+        bool back = InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Shift)
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+
+        ViewModel.StepSearchMatch(back ? -1 : 1);
+        e.Handled = true;
+    }
+
+    private void ZoomFitPage_Click(object sender, RoutedEventArgs e)
+    {
+        _fitMode = FitMode.Page;
+        _autoFit = true;
+        FitToWidth(animate: true);
+    }
+
+    private void ZoomFitWidth_Click(object sender, RoutedEventArgs e)
+    {
+        _fitMode = FitMode.Width;
+        _autoFit = true;
+        FitToWidth(animate: true);
+    }
+
+    /// <summary>
+    /// Jumps to an absolute zoom. Auto-fit is switched off, since asking for
+    /// 200% and then having a window resize quietly undo it would be worse
+    /// than not offering the preset at all.
+    /// </summary>
+    private void ZoomPreset_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuFlyoutItem item ||
+            !double.TryParse(item.Tag?.ToString(), System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture, out double factor))
+        {
+            return;
+        }
+
+        _autoFit = false;
+        PageScroller.ZoomTo(
+            (float)Math.Clamp(factor, PageScroller.MinZoomFactor, PageScroller.MaxZoomFactor),
+            null,
+            new ScrollingZoomOptions(ScrollingAnimationMode.Enabled, ScrollingSnapPointsMode.Ignore));
     }
 
     /// <summary>Fit Width also re-arms fit tracking, so resizing keeps it fitted.</summary>
@@ -603,6 +729,30 @@ public sealed partial class MainPage : Page
             // how the pages panel came to be open on launch.
             case VirtualKey.F4:
                 ToggleThumbnails();
+                e.Handled = true;
+                break;
+
+            // Single-key tool switching, Photoshop-style. Guarded by the
+            // text-focus check above, so typing "h" in the search box does not
+            // switch tools.
+            case VirtualKey.H when !_isCtrlDown:
+                SetActiveTool(ToolMode.Hand);
+                e.Handled = true;
+                break;
+            case VirtualKey.V when !_isCtrlDown:
+                SetActiveTool(ToolMode.Select);
+                e.Handled = true;
+                break;
+            case VirtualKey.B when !_isCtrlDown:
+                SetActiveTool(ToolMode.Draw);
+                e.Handled = true;
+                break;
+            case VirtualKey.U when !_isCtrlDown:
+                SetActiveTool(ToolMode.Highlight);
+                e.Handled = true;
+                break;
+            case VirtualKey.N when !_isCtrlDown:
+                SetActiveTool(ToolMode.Note);
                 e.Handled = true;
                 break;
 

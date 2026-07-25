@@ -393,14 +393,75 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Writes notes into the document as PDF text annotations.
+    ///
+    /// Notes were previously dropped entirely on save: highlights and ink were
+    /// flattened and notes were simply not passed to the burn call, so a user
+    /// who annotated a document with notes and saved it lost every one of them
+    /// without being told. They are not flattened either, because a note IS
+    /// its text and a flattened marker would keep the mark and lose the words.
+    ///
+    /// Returns true if anything was added, so the caller knows the document
+    /// changed and must be reloaded.
+    /// </summary>
+    private bool AddNoteAnnotations()
+    {
+        if (_documentHandle == 0 || _allNotes.Count == 0)
+        {
+            return false;
+        }
+
+        const int CaptureWidth = 1000;
+
+        var notes = new BurnNote[_allNotes.Count];
+        // The native side reads these pointers during the call, so the
+        // unmanaged copies have to outlive it and then be freed by hand.
+        var allocated = new IntPtr[_allNotes.Count];
+
+        try
+        {
+            for (int i = 0; i < _allNotes.Count; i++)
+            {
+                var note = _allNotes[i];
+                allocated[i] = Marshal.StringToCoTaskMemUTF8(note.Text ?? string.Empty);
+                notes[i] = new BurnNote
+                {
+                    PageIndex = note.PageIndex,
+                    X = (float)(note.X * CaptureWidth),
+                    Y = (float)(note.Y * CaptureWidth),
+                    Text = allocated[i],
+                };
+            }
+
+            return RenderCoreNative.add_note_annotations(
+                _documentHandle, CaptureWidth, notes, (nuint)notes.Length) == RenderStatus.OkPdfium;
+        }
+        finally
+        {
+            foreach (var ptr in allocated)
+            {
+                if (ptr != IntPtr.Zero)
+                {
+                    Marshal.FreeCoTaskMem(ptr);
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Burns every stored annotation into page content. Returns false when
     /// there was nothing to burn, so the caller can skip the reload.
     /// </summary>
     private bool BurnAllAnnotations()
     {
+        // Notes go first and by a different mechanism: they become real PDF
+        // text annotations rather than flattened content, so their text
+        // survives. See AddNoteAnnotations.
+        bool addedNotes = AddNoteAnnotations();
+
         if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0)
         {
-            return false;
+            return addedNotes;
         }
 
         // Coordinates are stored normalized; render_core wants them in the
@@ -1271,7 +1332,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 continue;
             }
 
-            created.Add(new HighlightAnnotation(page, rects.Select(NormRect).ToList(), "#FFFF00"));
+            created.Add(new HighlightAnnotation(page, rects.Select(NormRect).ToList(), HighlightColorHex));
         }
 
         if (created.Count == 0)
@@ -1408,6 +1469,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         InkStrokeChanged?.Invoke();
     }
 
+    /// <summary>Pen colour for new ink strokes.</summary>
+    [ObservableProperty]
+    public partial string InkColorHex { get; set; } = InkPresets.DefaultColor.Hex;
+
+    /// <summary>Pen width for new ink strokes, in normalized page units.</summary>
+    [ObservableProperty]
+    public partial double InkWidth { get; set; } = InkPresets.DefaultWidth.Value;
+
+    /// <summary>Fill colour for new highlights.</summary>
+    [ObservableProperty]
+    public partial string HighlightColorHex { get; set; } = InkPresets.DefaultHighlightColor.Hex;
+
     public void EndInkStroke()
     {
         if (_currentStroke is { Count: > 1 })
@@ -1416,8 +1489,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             var stroke = new InkStrokeAnnotation(
                 _inkPageIndex,
                 new List<(double X, double Y)>(_currentStroke),
-                "#FFE00000",
-                Norm(2.0));
+                InkColorHex,
+                InkWidth);
             _allInkStrokes.Add(stroke);
             InkStrokes.Add(stroke);
             SlotFor(stroke.PageIndex)?.InkStrokes.Add(stroke);
@@ -1619,6 +1692,41 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private const int SearchPageBudget = 40;
 
+    /// <summary>Pages holding at least one match, ascending, for step navigation.</summary>
+    private readonly List<int> _matchPages = new();
+
+    private int _currentMatch = -1;
+
+    /// <summary>"3 of 12 pages", or empty when there is no active search.</summary>
+    public string SearchStatus =>
+        string.IsNullOrEmpty(SearchQuery) ? string.Empty
+        : _matchPages.Count == 0 ? "No matches"
+        : $"{Math.Max(0, _currentMatch) + 1} of {_matchPages.Count}";
+
+    public bool HasSearchMatches => _matchPages.Count > 0;
+
+    /// <summary>
+    /// Moves to the next or previous page containing a match and asks the view
+    /// to scroll there, wrapping at the ends.
+    ///
+    /// Search previously highlighted matches but could not navigate to them,
+    /// so a hit on a page you were not already looking at was invisible.
+    /// </summary>
+    public void StepSearchMatch(int direction)
+    {
+        if (_matchPages.Count == 0)
+        {
+            return;
+        }
+
+        _currentMatch = _currentMatch < 0
+            ? (direction >= 0 ? 0 : _matchPages.Count - 1)
+            : (_currentMatch + direction + _matchPages.Count) % _matchPages.Count;
+
+        OnPropertyChanged(nameof(SearchStatus));
+        GoToPage(_matchPages[_currentMatch]);
+    }
+
     private void RecomputeSearchMatches()
     {
         SearchMatchRects.Clear();
@@ -1627,8 +1735,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.SearchMatchRects.Clear();
         }
 
+        _matchPages.Clear();
+        _currentMatch = -1;
+
         if (string.IsNullOrEmpty(SearchQuery) || PageSlots.Count == 0)
         {
+            OnPropertyChanged(nameof(SearchStatus));
+            OnPropertyChanged(nameof(HasSearchMatches));
             return;
         }
 
@@ -1659,8 +1772,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
 
             var slot = SlotFor(page);
+            bool pageHasMatch = false;
+
             foreach (var (start, length) in layer.FindMatches(SearchQuery))
             {
+                pageHasMatch = true;
                 foreach (var rect in layer.GetRangeRects(start, length))
                 {
                     var normalized = NormRect(rect);
@@ -1671,7 +1787,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     }
                 }
             }
+
+            if (pageHasMatch)
+            {
+                _matchPages.Add(page);
+            }
         }
+
+        // Pages were visited nearest-first for responsiveness, but stepping
+        // through matches has to run in document order or Next would jump
+        // backwards and forwards unpredictably.
+        _matchPages.Sort();
+
+        OnPropertyChanged(nameof(SearchStatus));
+        OnPropertyChanged(nameof(HasSearchMatches));
     }
 
     /// <summary>

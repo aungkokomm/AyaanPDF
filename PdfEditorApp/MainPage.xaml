@@ -155,13 +155,14 @@
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate x:DataType="viewport:HighlightAnnotation">
-                                                    <ItemsControl ItemsSource="{x:Bind Rects}">
+                                                    <ItemsControl ItemsSource="{x:Bind ColoredRects}">
                                                         <ItemsControl.ItemsPanel>
                                                             <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
                                                         </ItemsControl.ItemsPanel>
                                                         <ItemsControl.ItemTemplate>
-                                                            <DataTemplate x:DataType="viewport:TextRect">
-                                                                <Rectangle Fill="#88FFFF00" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                            <DataTemplate x:DataType="viewport:ColoredRect">
+                                                                <Rectangle Fill="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                                           Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                            Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                            HorizontalAlignment="Left" VerticalAlignment="Top" />
                                                             </DataTemplate>
@@ -274,6 +275,55 @@
                     <FontIcon Glyph="&#xE70B;" FontSize="16" />
                 </Button>
 
+                <!--
+                    Pen options, shown only while a drawing tool is armed, so
+                    the rail stays minimal when they are irrelevant.
+                -->
+                <Button x:Name="PenOptionsButton" Visibility="Collapsed"
+                        ToolTipService.ToolTip="Colour and width"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <Border x:Name="PenSwatch" Width="16" Height="16" CornerRadius="8"
+                            BorderBrush="#66FFFFFF" BorderThickness="1" />
+                    <Button.Flyout>
+                        <Flyout Placement="Right">
+                            <StackPanel Spacing="10" Width="188">
+                                <TextBlock Text="Colour" Style="{StaticResource CaptionTextBlockStyle}" />
+                                <GridView x:Name="ColorChoices" SelectionMode="Single"
+                                          SelectionChanged="InkColor_SelectionChanged">
+                                    <GridView.ItemTemplate>
+                                        <DataTemplate x:DataType="viewport:InkColor">
+                                            <Border Width="30" Height="30" CornerRadius="15" Margin="2"
+                                                    ToolTipService.ToolTip="{x:Bind Name}"
+                                                    Background="{x:Bind local:MainPage.HexBrush(Hex)}"
+                                                    BorderBrush="#66000000" BorderThickness="1" />
+                                        </DataTemplate>
+                                    </GridView.ItemTemplate>
+                                </GridView>
+
+                                <TextBlock Text="Width" Style="{StaticResource CaptionTextBlockStyle}" />
+                                <ListView x:Name="WidthChoices" SelectionMode="Single"
+                                          SelectionChanged="InkWidth_SelectionChanged">
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate x:DataType="viewport:InkWidth">
+                                            <Grid Height="30" ColumnSpacing="10">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="52" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="{x:Bind Name}" VerticalAlignment="Center"
+                                                           Style="{StaticResource CaptionTextBlockStyle}" />
+                                                <Rectangle Grid.Column="1" VerticalAlignment="Center" RadiusX="4" RadiusY="4"
+                                                           Height="{x:Bind local:MainPage.WidthPreview(Value)}"
+                                                           Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                </ListView>
+                            </StackPanel>
+                        </Flyout>
+                    </Button.Flyout>
+                </Button>
+
                 <Rectangle Height="1" Margin="6,4" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
 
                 <Button Click="ToggleThumbnails_Click" ToolTipService.ToolTip="Pages (F4)"
@@ -370,8 +420,24 @@
                 <Button Content="&#xE949;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomOut_Click"
                         Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom out" />
-                <TextBlock x:Name="ZoomPercentText" Text="100%" VerticalAlignment="Center" Width="42"
-                           TextAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                <!-- Zoom readout doubles as a preset menu. -->
+                <Button x:Name="ZoomMenuButton" Width="52" Height="28" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Zoom presets">
+                    <TextBlock x:Name="ZoomPercentText" Text="100%" TextAlignment="Center"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <Button.Flyout>
+                        <MenuFlyout Placement="Top">
+                            <MenuFlyoutItem Text="Fit page" Click="ZoomFitPage_Click" />
+                            <MenuFlyoutItem Text="Fit width" Click="ZoomFitWidth_Click" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="50%" Click="ZoomPreset_Click" Tag="0.5" />
+                            <MenuFlyoutItem Text="100%" Click="ZoomPreset_Click" Tag="1.0" />
+                            <MenuFlyoutItem Text="200%" Click="ZoomPreset_Click" Tag="2.0" />
+                            <MenuFlyoutItem Text="400%" Click="ZoomPreset_Click" Tag="4.0" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
                 <Button Content="&#xE948;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomIn_Click"
                         Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom in" />
@@ -379,9 +445,22 @@
                         Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Fit width" />
                 <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
-                <TextBox x:Name="SearchBox" Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay}"
-                         PlaceholderText="Find" Width="130" Height="28" Margin="2,0,4,0"
-                         VerticalAlignment="Center" BorderThickness="0" Background="Transparent" />
+                <TextBox x:Name="SearchBox" Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                         PlaceholderText="Find" Width="120" Height="28" Margin="2,0,0,0"
+                         VerticalAlignment="Center" BorderThickness="0" Background="Transparent"
+                         KeyDown="SearchBox_KeyDown" />
+                <TextBlock Text="{x:Bind ViewModel.SearchStatus, Mode=OneWay}" VerticalAlignment="Center"
+                           MinWidth="52" TextAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+                <Button Content="&#xE70E;" FontFamily="Segoe MDL2 Assets" FontSize="10" Click="SearchPrev_Click"
+                        Width="24" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        IsEnabled="{x:Bind ViewModel.HasSearchMatches, Mode=OneWay}"
+                        ToolTipService.ToolTip="Previous match (Shift+Enter)" />
+                <Button Content="&#xE70D;" FontFamily="Segoe MDL2 Assets" FontSize="10" Click="SearchNext_Click"
+                        Width="24" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        IsEnabled="{x:Bind ViewModel.HasSearchMatches, Mode=OneWay}"
+                        ToolTipService.ToolTip="Next match (Enter)" />
                 <TextBlock Text="&#9679;" Foreground="{ThemeResource SystemFillColorCautionBrush}"
                            VerticalAlignment="Center" Margin="0,0,10,0" FontSize="14"
                            ToolTipService.ToolTip="Unsaved changes"

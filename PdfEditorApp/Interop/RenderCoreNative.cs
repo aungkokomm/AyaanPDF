@@ -103,6 +103,19 @@ internal struct PageSizeArray
     public int Status;
 }
 
+/// <summary>
+/// Mirrors render_core::BurnNote (src/lib.rs). Text is a pointer, so the
+/// caller must keep it alive for the duration of the call.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct BurnNote
+{
+    public int PageIndex;
+    public float X;
+    public float Y;
+    public IntPtr Text;
+}
+
 /// <summary>Mirrors render_core::{STATUS_*} (src/lib.rs).</summary>
 internal static class RenderStatus
 {
@@ -224,6 +237,18 @@ internal static partial class RenderCoreNative
         nuint strokeCount,
         [In] BurnPoint[]? points,
         nuint pointCount);
+
+    /// <summary>
+    /// Adds notes as real PDF text annotations rather than burning them.
+    /// A note's value is its text, and flattening it to a marker graphic
+    /// would keep the mark and lose the words.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_note_annotations(
+        ulong docHandle,
+        int captureWidth,
+        [In] BurnNote[]? notes,
+        nuint noteCount);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int fill_text_field(
