@@ -255,7 +255,7 @@
 
                 <Rectangle Height="1" Margin="6,4" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
 
-                <Button Click="ToggleThumbnails_Click" ToolTipService.ToolTip="Pages (Tab)"
+                <Button Click="ToggleThumbnails_Click" ToolTipService.ToolTip="Pages (F4)"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE8A9;" FontSize="16" />
                 </Button>

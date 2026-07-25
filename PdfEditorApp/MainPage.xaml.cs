@@ -50,8 +50,6 @@ public sealed partial class MainPage : Page
         Loaded += (_, _) =>
         {
             string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
-            Diag.Log($"Loaded: thumbnailPanel={ThumbnailPanel.Visibility}");
-
             if (probe.Length > 0 && System.IO.File.Exists(probe))
             {
                 ViewModel.OpenDocument(probe);
@@ -77,12 +75,6 @@ public sealed partial class MainPage : Page
     // ---------------- ScrollView-driven zoom ----------------
 
     /// <summary>
-    /// Pages are laid out at a FIXED slot width, independent of the window, so
-    /// fitting is purely a zoom decision: the zoom that maps that width onto
-    /// the viewport. Nothing the renderer does can move it, and a window
-    /// resize never rebuilds the layout or disturbs the scroll position.
-    /// </summary>
-    /// <summary>
     /// How the viewport is currently auto-fitting. Fit-page is the default,
     /// because a page that spans the viewport exactly reads as a region of
     /// the window rather than a sheet on a canvas.
@@ -91,6 +83,14 @@ public sealed partial class MainPage : Page
 
     private FitMode _fitMode = FitMode.Page;
 
+    /// <summary>
+    /// Applies the current fit mode.
+    ///
+    /// Pages are laid out at a FIXED slot width, independent of the window, so
+    /// fitting is purely a zoom decision and nothing the renderer does can
+    /// move it. A window resize therefore never rebuilds the layout or
+    /// disturbs the scroll position.
+    /// </summary>
     private void FitToWidth(bool animate = false)
     {
         double available = AvailableContentWidth;
@@ -457,18 +457,52 @@ public sealed partial class MainPage : Page
 
     // ---------------- Keyboard: Space = hand tool, track Ctrl for wheel-zoom ----------------
 
+    /// <summary>
+    /// True when a text field has focus, so canvas shortcuts must not fire.
+    ///
+    /// This handler sits on the root Grid and KeyDown BUBBLES, so without this
+    /// check every keystroke typed into the search box also ran a canvas
+    /// command: Backspace deleted the selected annotation (and marked the
+    /// event handled, so it did not even edit the text), Space armed the hand
+    /// tool, Ctrl+C copied the page selection instead of the field. Losing an
+    /// annotation while correcting a typo is the worst of those, and it was
+    /// silent.
+    /// </summary>
+    private bool IsTextInputFocused =>
+        FocusManager.GetFocusedElement(XamlRoot) is TextBox or RichEditBox or AutoSuggestBox or PasswordBox;
+
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
+        // Modifier state is tracked even while typing, or releasing Ctrl in a
+        // text field would leave the canvas thinking it is still held and the
+        // next wheel scroll would zoom instead of pan.
+        switch (e.Key)
+        {
+            case VirtualKey.Control:
+            case VirtualKey.LeftControl:
+            case VirtualKey.RightControl:
+                _isCtrlDown = true;
+                return;
+        }
+
+        if (IsTextInputFocused)
+        {
+            // Escape leaves the field and hands the canvas back, which is the
+            // one command worth honouring from inside a text box.
+            if (e.Key == VirtualKey.Escape)
+            {
+                RootGrid.Focus(FocusState.Programmatic);
+                e.Handled = true;
+            }
+
+            return;
+        }
+
         switch (e.Key)
         {
             case VirtualKey.Space when !_isSpaceHandActive:
                 _isSpaceHandActive = true;
                 UpdateCursor();
-                break;
-            case VirtualKey.Control:
-            case VirtualKey.LeftControl:
-            case VirtualKey.RightControl:
-                _isCtrlDown = true;
                 break;
             case VirtualKey.C when _isCtrlDown:
                 CopySelectedText();
@@ -479,7 +513,12 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
-            case VirtualKey.Tab:
+            // NOT Tab. Tab is the focus-traversal key, and binding it here
+            // meant keyboard users could never move focus anywhere in the app.
+            // It also fired from any stray Tab the app received, including one
+            // that arrived while a system dialog was being dismissed, which is
+            // how the pages panel came to be open on launch.
+            case VirtualKey.F4:
                 ToggleThumbnails();
                 e.Handled = true;
                 break;
@@ -514,6 +553,8 @@ public sealed partial class MainPage : Page
     {
         switch (e.Key)
         {
+            // Released unconditionally, including from a text field: the hand
+            // tool must never stay armed because focus moved mid-gesture.
             case VirtualKey.Space:
                 _isSpaceHandActive = false;
                 UpdateCursor();
