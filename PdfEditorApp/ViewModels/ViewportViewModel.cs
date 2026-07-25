@@ -178,6 +178,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Layers are keyed by page index, so carrying them across a document
         // switch would hand the new document the old one's text.
         _textLayers.Clear();
+        ClearLoadedAnnotations();
 
         // A fresh document has no history and no unsaved edits. A reload after
         // a burn/save (preserveAnnotations) is also a clean slate: those marks
@@ -203,6 +204,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RebuildContinuousLayout();
         RenderCurrentPage();
         ReportExistingAnnotations();
+    }
+
+    /// <summary>
+    /// Forgets which annotations each page carried. Indices belong to a
+    /// specific document, so carrying them across an open would address
+    /// whatever now happens to sit at that position.
+    /// </summary>
+    private void ClearLoadedAnnotations()
+    {
+        _loadedByPage.Clear();
+        _selectedLoaded = null;
+        _loadedDrag = null;
     }
 
     /// <summary>
@@ -1253,7 +1266,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Where the current move gesture started, in normalized units.</summary>
     private (double X, double Y)? _moveOrigin;
 
-    public bool HasSelectedAnnotation => _selectedAnnotationId is not null;
+    public bool HasSelectedAnnotation => _selectedAnnotationId is not null || _selectedLoaded is not null;
 
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
@@ -1276,19 +1289,39 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectedAnnotationId = hit?.Id;
         _moveOrigin = hit is not null ? (normX, normY) : null;
 
+        if (hit is not null)
+        {
+            _selectedLoaded = null;
+            _loadedDrag = null;
+            RefreshSelectionOutline();
+            OnPropertyChanged(nameof(HasSelectedAnnotation));
+            return true;
+        }
+
+        // Nothing of ours here, so try what the file already had. Marks made
+        // this session sit in the overlay ABOVE the page, so they win a tie.
+        _selectedLoaded = null;
+        _loadedDrag = null;
+        if (SelectLoadedAt(pageIndex, normX, normY))
+        {
+            return true;
+        }
+
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
-        return hit is not null;
+        return false;
     }
 
     public void ClearAnnotationSelection()
     {
-        if (_selectedAnnotationId is null)
+        if (_selectedAnnotationId is null && _selectedLoaded is null)
         {
             return;
         }
 
         _selectedAnnotationId = null;
+        _selectedLoaded = null;
+        _loadedDrag = null;
         _moveOrigin = null;
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
@@ -1303,6 +1336,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public void MoveSelectedAnnotationTo(double normX, double normY)
     {
+        if (_selectedLoaded is not null)
+        {
+            DragLoadedTo(normX, normY);
+            return;
+        }
+
         if (_selectedAnnotationId is not Guid id || _moveOrigin is not (double ox, double oy))
         {
             return;
@@ -1334,12 +1373,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Ends a move gesture, so the next one starts a fresh undo step.</summary>
     public void EndAnnotationMove()
     {
+        // A loaded annotation is written through here, at the END of the drag,
+        // rather than on every pointer sample.
+        CommitLoadedMove();
+
         _isMovingAnnotation = false;
         _moveOrigin = null;
     }
 
     public void DeleteSelectedAnnotation()
     {
+        if (DeleteSelectedLoaded())
+        {
+            return;
+        }
+
         if (_selectedAnnotationId is not Guid id)
         {
             return;
@@ -1395,6 +1443,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.SelectionOutline.Clear();
         }
 
+        if (_selectedLoaded is LoadedSelection sel)
+        {
+            SlotFor(sel.PageIndex)?.SelectionOutline.Add(new ScaledRect(
+                sel.Left * SlotLayoutWidth,
+                sel.Top * SlotLayoutWidth,
+                (sel.Right - sel.Left) * SlotLayoutWidth,
+                (sel.Bottom - sel.Top) * SlotLayoutWidth,
+                string.Empty));
+            InkStrokeChanged?.Invoke();
+            return;
+        }
+
         if (_selectedAnnotationId is not Guid id)
         {
             return;
@@ -1409,6 +1469,183 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         SlotFor(selected.PageIndex)?.SelectionOutline.Add(
             ScaledRect.From(selected.Bounds, SlotLayoutWidth));
         InkStrokeChanged?.Invoke();
+    }
+
+    // ---------------- Annotations already in the file ----------------
+    //
+    // Marks made this session live in _allHighlights / _allInkStrokes and are
+    // drawn by the overlay. Marks that were ALREADY in the opened file are a
+    // different thing: PDFium draws them as part of the page, and the only
+    // handle we have on one is its index and bounding box.
+    //
+    // Rebuilding them into the overlay model would need each kind's own
+    // geometry, quad points for a highlight and a point list for a stroke, and
+    // would then have to keep two representations of the same mark in step.
+    // Editing them where they live is simpler and works for EVERY subtype,
+    // including ones this app cannot draw, so a file marked up in Acrobat is
+    // editable here too.
+
+    /// <summary>A selected annotation that came from the file, in normalized units.</summary>
+    private readonly record struct LoadedSelection(
+        int PageIndex, int Index, double Left, double Top, double Right, double Bottom);
+
+    private LoadedSelection? _selectedLoaded;
+
+    /// <summary>Where a drag of a loaded annotation began, and its rect then.</summary>
+    private (double X, double Y, LoadedSelection Start)? _loadedDrag;
+
+    /// <summary>Per-page cache of what the file already carries.</summary>
+    private readonly Dictionary<int, List<Interop.ExistingAnnotation>> _loadedByPage = new();
+
+    private List<Interop.ExistingAnnotation> LoadedFor(int pageIndex)
+    {
+        if (_loadedByPage.TryGetValue(pageIndex, out var cached))
+        {
+            return cached;
+        }
+
+        var list = _documentHandle == 0
+            ? new List<Interop.ExistingAnnotation>()
+            : Interop.AnnotationLoader.Load(_documentHandle, pageIndex);
+        _loadedByPage[pageIndex] = list;
+        return list;
+    }
+
+    /// <summary>
+    /// Picks the topmost annotation already in the file under a point.
+    /// Later entries are drawn on top, so the search runs backwards.
+    /// </summary>
+    private bool SelectLoadedAt(int pageIndex, double normX, double normY)
+    {
+        var candidates = LoadedFor(pageIndex);
+        for (int i = candidates.Count - 1; i >= 0; i--)
+        {
+            var a = candidates[i];
+            if (normX >= a.Left && normX <= a.Right && normY >= a.Top && normY <= a.Bottom)
+            {
+                _selectedLoaded = new LoadedSelection(pageIndex, a.Index, a.Left, a.Top, a.Right, a.Bottom);
+                _loadedDrag = (normX, normY, _selectedLoaded.Value);
+                RefreshSelectionOutline();
+                OnPropertyChanged(nameof(HasSelectedAnnotation));
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Drags the marquee only. The document is not touched until the gesture
+    /// ends: committing on every pointer sample would mean a PDFium write and
+    /// a full page re-render per sample, which no amount of caching makes
+    /// smooth.
+    /// </summary>
+    private void DragLoadedTo(double normX, double normY)
+    {
+        if (_loadedDrag is not (double ox, double oy, LoadedSelection start))
+        {
+            return;
+        }
+
+        double dx = normX - ox;
+        double dy = normY - oy;
+        _selectedLoaded = start with
+        {
+            Left = start.Left + dx,
+            Top = start.Top + dy,
+            Right = start.Right + dx,
+            Bottom = start.Bottom + dy,
+        };
+        RefreshSelectionOutline();
+    }
+
+    /// <summary>Writes a finished drag through to the document.</summary>
+    private void CommitLoadedMove()
+    {
+        if (_loadedDrag is not (_, _, LoadedSelection start) || _selectedLoaded is not LoadedSelection now)
+        {
+            return;
+        }
+
+        _loadedDrag = null;
+
+        // Nothing actually moved, so do not dirty the document or reflow.
+        if (Math.Abs(now.Left - start.Left) < 1e-6 && Math.Abs(now.Top - start.Top) < 1e-6)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+        int status = RenderCoreNative.set_annotation_bounds(
+            _documentHandle, now.PageIndex, now.Index, CaptureWidth,
+            (float)(now.Left * CaptureWidth), (float)(now.Top * CaptureWidth),
+            (float)(now.Right * CaptureWidth), (float)(now.Bottom * CaptureWidth));
+
+        Diag.Log($"move loaded annotation p{now.PageIndex}#{now.Index} -> {status}");
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            // Put the marquee back where the mark still is, rather than
+            // leaving it somewhere the document does not agree with.
+            _selectedLoaded = start;
+            RefreshSelectionOutline();
+            Status = status == RenderStatus.Unsupported
+                ? "That annotation cannot be moved."
+                : "Could not move that annotation.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(now.PageIndex);
+        _selectedLoaded = now;
+        RefreshSelectionOutline();
+    }
+
+    /// <summary>Deletes the selected annotation from the file itself.</summary>
+    private bool DeleteSelectedLoaded()
+    {
+        if (_selectedLoaded is not LoadedSelection sel)
+        {
+            return false;
+        }
+
+        int status = RenderCoreNative.delete_annotation(_documentHandle, sel.PageIndex, sel.Index);
+        Diag.Log($"delete loaded annotation p{sel.PageIndex}#{sel.Index} -> {status}");
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not delete that annotation.";
+            return true;
+        }
+
+        _selectedLoaded = null;
+        _loadedDrag = null;
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        return true;
+    }
+
+    /// <summary>
+    /// Drops the cached annotation list for a page and redraws it.
+    ///
+    /// Both halves matter: the indices shift after a delete, so a stale list
+    /// would address the wrong annotation next time, and the marks are part of
+    /// the page bitmap, so without a re-render the change stays invisible.
+    /// </summary>
+    private void InvalidateLoadedPage(int pageIndex)
+    {
+        _loadedByPage.Remove(pageIndex);
+
+        var slot = SlotFor(pageIndex);
+        if (slot is not null)
+        {
+            slot.ClearTiles();
+            slot.ReleaseBitmap();
+            RenderBaseTier(slot);
+            ScheduleSharpenPass();
+        }
     }
 
     /// <summary>The card owning a page, or null if the index is out of range.</summary>

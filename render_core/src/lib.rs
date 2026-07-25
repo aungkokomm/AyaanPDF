@@ -4207,6 +4207,84 @@ mod tests {
         close_document(handle);
     }
     #[test]
+    fn the_exact_sequence_the_app_performs_on_a_loaded_annotation() {
+        // Mirrors what the app does when you click a mark that was already in
+        // the file and drag it: read the page's annotations, then move one by
+        // index, on a document that carries BOTH a highlight and an ink
+        // stroke, since ink is the subtype with the colour-query landmine.
+        //
+        // Doing it in-process here rather than by launching the app, because
+        // an access violation takes the whole app down with a dialog and no
+        // log line, which tells you nothing about where it happened.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1,
+            r: 255, g: 235, b: 59, a: 200,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let pts = [BurnPoint { x: 300.0, y: 500.0 },
+                   BurnPoint { x: 500.0, y: 600.0 },
+                   BurnPoint { x: 700.0, y: 500.0 }];
+        let strokes = [BurnStroke {
+            page_index: 0, point_offset: 0, point_count: 3,
+            width_px: 8.0, r: 220, g: 30, b: 30, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, strokes.as_ptr(), 1, pts.as_ptr(), 3),
+            STATUS_OK_PDFIUM
+        );
+
+        // Save and reopen, so these are genuinely LOADED annotations rather
+        // than ones still warm in memory. This is the state the app is in.
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        close_document(handle);
+        free_byte_buffer(saved);
+        assert_ne!(reopened, 0);
+
+        let found = read_annotations(reopened, 0);
+        println!("APP SEQUENCE: read {} annotations: {found:?}", found.len());
+        assert_eq!(found.len(), 2);
+
+        // Move each one, including a re-read in between, exactly as the app
+        // does when it invalidates the page after an edit.
+        for (index, subtype, left, top, right, bottom) in found {
+            let (w, h) = (right - left, bottom - top);
+            let status = set_annotation_bounds(
+                reopened, 0, index, 1000,
+                (left + 0.1) * 1000.0, (top + 0.1) * 1000.0,
+                (left + 0.1 + w) * 1000.0, (top + 0.1 + h) * 1000.0);
+            println!("APP SEQUENCE: move #{index} subtype={subtype} -> {status}");
+            assert!(
+                status == STATUS_OK_PDFIUM || status == STATUS_UNSUPPORTED,
+                "moving annotation {index} of subtype {subtype} failed with {status}"
+            );
+
+            let again = read_annotations(reopened, 0);
+            assert_eq!(again.len(), 2, "re-reading after a move lost an annotation");
+        }
+
+        // And a render, since the app redraws the page after every edit.
+        let r = render_region(reopened, 0, 0.0, 0.0, 1.0, 1.0, 400);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        free_render_result(r);
+
+        // Then delete one and re-read, which is where stale indices bite.
+        assert_eq!(delete_annotation(reopened, 0, 0), STATUS_OK_PDFIUM);
+        let left_over = read_annotations(reopened, 0);
+        println!("APP SEQUENCE: after delete {left_over:?}");
+        assert_eq!(left_over.len(), 1);
+
+        close_document(reopened);
+    }
+
+    #[test]
     fn deleting_an_annotation_removes_it() {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
 
