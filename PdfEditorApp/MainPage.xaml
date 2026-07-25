@@ -58,14 +58,22 @@
         </Grid.ColumnDefinitions>
 
         <!--
-            MaxZoomFactor is 64, i.e. 6400%, matching Acrobat. It used to be 8
-            because a whole-page bitmap grows with the SQUARE of the zoom: past
-            a few hundred percent it hit the render caps and the page was simply
-            upscaled, so a higher ceiling would only have bought blurrier text.
-            Tiles removed that reason. Only the tiles on screen are rendered, so
-            the cost is about one viewport at ANY zoom and every tile is
-            pixel-exact. The ceiling can now sit where the user wants it rather
-            than where the renderer gave out.
+            MaxZoomFactor is 8, i.e. 800%. This was briefly raised to 64 to
+            match Acrobat, on the theory that tiles had removed the reason for
+            the cap. They had not: the page went visibly BLURRY at 6400%, and
+            the tile counts in the trace, which looked healthy, said nothing
+            about it.
+
+            The reason is the tiles' LAYOUT size. Tile position and size are in
+            unzoomed slot DIPs, and the level doubles with the zoom, so a tile
+            shrinks as you go in: about 12 DIP at 800%, but 1.6 DIP at 6400%.
+            The ScrollView's zoom is a compositor scale over content laid out at
+            that size, so past some point the tiles are rasterized far smaller
+            than they are displayed and magnified back up.
+
+            Raising this again needs a floor on how small a tile may be in slot
+            DIPs, with the level chosen against that floor, NOT just a bigger
+            number here.
         -->
         <ScrollView
             x:Name="PageScroller"
@@ -76,7 +84,7 @@
             HorizontalScrollMode="Enabled"
             VerticalScrollMode="Enabled"
             MinZoomFactor="0.1"
-            MaxZoomFactor="64"
+            MaxZoomFactor="8"
             ViewChanged="PageScroller_ViewChanged"
             SizeChanged="PageScroller_SizeChanged">
             <!--
