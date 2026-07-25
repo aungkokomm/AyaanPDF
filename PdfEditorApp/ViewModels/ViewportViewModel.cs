@@ -574,6 +574,36 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public double FitWidthZoom(double viewportWidth) => _layout.FitWidthZoom(viewportWidth);
 
+    /// <summary>
+    /// The zoom that shows the WHOLE first page with air around it.
+    ///
+    /// This is the default view, not fit-width. Fit-width makes the page span
+    /// the viewport exactly, so the sheet runs edge to edge and reads as a
+    /// region of the window rather than an object on a canvas. Fitting the
+    /// page instead leaves the surface visible on all sides, which is what
+    /// makes it feel like something sitting on a work surface.
+    /// </summary>
+    public double FitPageZoom(double viewportWidth, double viewportHeight)
+    {
+        if (PageSlots.Count == 0 || viewportWidth <= 0 || viewportHeight <= 0)
+        {
+            return 1.0;
+        }
+
+        var first = PageSlots[0];
+        if (first.SlotWidth <= 0 || first.SlotHeight <= 0)
+        {
+            return 1.0;
+        }
+
+        // Breathing room on every side, as a fraction of the viewport.
+        const double Margin = 0.94;
+
+        double byWidth = viewportWidth * Margin / first.SlotWidth;
+        double byHeight = viewportHeight * Margin / first.SlotHeight;
+        return Math.Min(byWidth, byHeight);
+    }
+
     /// <summary>Slot-space top of a page, for scroll-to-page.</summary>
     public double SlotTopOf(int pageIndex) => _layout.TopOf(pageIndex);
 

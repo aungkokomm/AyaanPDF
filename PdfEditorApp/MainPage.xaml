@@ -26,12 +26,20 @@
         contrast is what makes it feel like a canvas rather than a borderless
         region of the window.
     -->
-    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
-          Background="{ThemeResource SolidBackgroundFillColorTertiaryBrush}">
+    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp">
+        <!--
+            The canvas surface. A fixed neutral grey rather than a theme
+            brush: theme surface colours are near-white in light mode, so a
+            white page on one is invisible as an object. The page needs to sit
+            on something clearly darker than itself in BOTH themes, which is
+            exactly the case for not deferring to the theme here.
+        -->
+        <Grid.Background>
+            <SolidColorBrush Color="#3A3A3D" />
+        </Grid.Background>
 
         <ScrollView
             x:Name="PageScroller"
-            Grid.Row="2"
             ZoomMode="Enabled"
             HorizontalScrollBarVisibility="Auto"
             VerticalScrollBarVisibility="Auto"

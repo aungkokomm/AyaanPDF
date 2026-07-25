@@ -50,6 +50,8 @@ public sealed partial class MainPage : Page
         Loaded += (_, _) =>
         {
             string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
+            Diag.Log($"Loaded: thumbnailPanel={ThumbnailPanel.Visibility}");
+
             if (probe.Length > 0 && System.IO.File.Exists(probe))
             {
                 ViewModel.OpenDocument(probe);
@@ -80,16 +82,30 @@ public sealed partial class MainPage : Page
     /// the viewport. Nothing the renderer does can move it, and a window
     /// resize never rebuilds the layout or disturbs the scroll position.
     /// </summary>
+    /// <summary>
+    /// How the viewport is currently auto-fitting. Fit-page is the default,
+    /// because a page that spans the viewport exactly reads as a region of
+    /// the window rather than a sheet on a canvas.
+    /// </summary>
+    private enum FitMode { Page, Width }
+
+    private FitMode _fitMode = FitMode.Page;
+
     private void FitToWidth(bool animate = false)
     {
         double available = AvailableContentWidth;
+        double availableHeight = PageScroller.ViewportHeight - ViewportHost.Padding.Top - ViewportHost.Padding.Bottom;
         if (available <= 0)
         {
             return;
         }
 
+        double target = _fitMode == FitMode.Width
+            ? ViewModel.FitWidthZoom(available)
+            : ViewModel.FitPageZoom(available, availableHeight);
+
         float zoom = (float)Math.Clamp(
-            ViewModel.FitWidthZoom(available),
+            target,
             PageScroller.MinZoomFactor,
             PageScroller.MaxZoomFactor);
 
@@ -139,7 +155,11 @@ public sealed partial class MainPage : Page
         // rather than from each input path means no gesture can be forgotten.
         if (_autoFit && AvailableContentWidth > 0)
         {
-            double fit = ViewModel.FitWidthZoom(AvailableContentWidth);
+            double availableHeight = PageScroller.ViewportHeight - ViewportHost.Padding.Top - ViewportHost.Padding.Bottom;
+            double fit = _fitMode == FitMode.Width
+                ? ViewModel.FitWidthZoom(AvailableContentWidth)
+                : ViewModel.FitPageZoom(AvailableContentWidth, availableHeight);
+
             if (Math.Abs(PageScroller.ZoomFactor - fit) > 0.005)
             {
                 _autoFit = false;
@@ -303,6 +323,9 @@ public sealed partial class MainPage : Page
     /// <summary>Fit Width also re-arms fit tracking, so resizing keeps it fitted.</summary>
     private void ResetZoom_Click(object sender, RoutedEventArgs e)
     {
+        // Toggles between showing the whole page and filling the width, which
+        // are the two framings worth one click.
+        _fitMode = _fitMode == FitMode.Page ? FitMode.Width : FitMode.Page;
         _autoFit = true;
         FitToWidth(animate: true);
     }
