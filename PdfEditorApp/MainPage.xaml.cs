@@ -134,11 +134,77 @@ public sealed partial class MainPage : Page
             float target = steps.Dequeue();
             float clamped = (float)Math.Clamp(
                 (double)target, (double)PageScroller.MinZoomFactor, (double)PageScroller.MaxZoomFactor);
+            // Disarm auto-fit first, exactly as the zoom presets do. Leaving it
+            // armed means the fit pass quietly puts the zoom straight back and
+            // the harness silently measures the wrong thing.
+            _autoFit = false;
             PageScroller.ZoomTo(clamped, null,
                 new ScrollingZoomOptions(ScrollingAnimationMode.Disabled, ScrollingSnapPointsMode.Ignore));
-            Diag.Log($"autozoom: requested {target} applied {clamped}");
+            Diag.Log($"autozoom: requested {target} clamped {clamped} " +
+                     $"viewport={PageScroller.ViewportWidth:F0}x{PageScroller.ViewportHeight:F0}");
+            ScheduleTileGeometryDump();
         };
         _autoZoomTimer.Start();
+    }
+
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _tileGeomTimer;
+
+    private void ScheduleTileGeometryDump()
+    {
+        _tileGeomTimer ??= DispatcherQueue.CreateTimer();
+        _tileGeomTimer.Interval = TimeSpan.FromMilliseconds(1500);
+        _tileGeomTimer.IsRepeating = false;
+        _tileGeomTimer.Tick -= OnTileGeometryTick;
+        _tileGeomTimer.Tick += OnTileGeometryTick;
+        _tileGeomTimer.Start();
+    }
+
+    private void OnTileGeometryTick(Microsoft.UI.Dispatching.DispatcherQueueTimer t, object _)
+    {
+        t.Stop();
+        DumpTileGeometry();
+    }
+
+    /// <summary>
+    /// Logs the LAID OUT geometry of the tiles on screen.
+    ///
+    /// Tile counts only say that rendering happened. What decides whether the
+    /// page looks right is the size and position XAML actually gave each tile,
+    /// which is not necessarily the size and position it was asked for: layout
+    /// rounding snaps elements to whole physical pixels, and a tile is a
+    /// fraction of a DIP wide at deep zoom. This logs both so they can be
+    /// compared instead of assumed.
+    /// </summary>
+    private void DumpTileGeometry()
+    {
+        int logged = 0;
+
+        void Walk(DependencyObject node)
+        {
+            int count = VisualTreeHelper.GetChildrenCount(node);
+            for (int i = 0; i < count && logged < 5; i++)
+            {
+                var child = VisualTreeHelper.GetChild(node, i);
+                if (child is Image img && img.DataContext is ViewModels.PageTile tile)
+                {
+                    var bmp = img.Source as Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap;
+                    Diag.Log(
+                        $"tilegeom L{tile.Address.Level} ({tile.Address.Col},{tile.Address.Row}): " +
+                        $"want {tile.Size:F4} at ({tile.Left:F4},{tile.Top:F4}) | " +
+                        $"got {img.ActualWidth:F4}x{img.ActualHeight:F4} at " +
+                        $"({img.Margin.Left:F4},{img.Margin.Top:F4}) | " +
+                        $"bitmap {bmp?.PixelWidth ?? -1}px | rounding={img.UseLayoutRounding}");
+                    logged++;
+                }
+
+                Walk(child);
+            }
+        }
+
+        Walk(PageScroller);
+        Diag.Log($"tilegeom: zoom={PageScroller.ZoomFactor:F2} " +
+                 $"rasterScale={(XamlRoot is null ? 0 : XamlRoot.RasterizationScale):F2} " +
+                 $"tilesFound={logged}");
     }
 
     /// <summary>

@@ -550,7 +550,12 @@ fn render_region_inner(
 /// 256 is the usual choice and it is a balance: smaller tiles waste time on
 /// per-call overhead and produce more seams to manage, larger ones lose the
 /// benefit of fine-grained reuse when panning and cost more to discard.
-pub const TILE_SIZE: i32 = 256;
+/// Pixel edge of one tile. MUST equal TileGrid.TileSize in the app, since the
+/// two sides derive the same grid geometry from it independently.
+///
+/// See TileGrid.TileSize for why this is 512: fewer, larger tiles cover a
+/// viewport, so there is less to arrive one piece at a time and less to line up.
+pub const TILE_SIZE: i32 = 512;
 
 /// Renders one tile of a page's level-of-detail pyramid, with caching.
 ///
@@ -2862,11 +2867,18 @@ mod tests {
 
     #[test]
     fn tile_level_grows_with_the_resolution_needed() {
-        assert_eq!(tile_level_for_width(256), 0);
-        assert_eq!(tile_level_for_width(512), 1);
-        assert_eq!(tile_level_for_width(1024), 2);
-        assert_eq!(tile_level_for_width(1025), 3, "must round UP, never render softer than asked");
-        assert_eq!(tile_level_for_width(8192), 5);
+        // Written against TILE_SIZE, not literals, so that changing the tile
+        // size cannot leave this test and TileGrid describing different
+        // pyramids while both still pass.
+        assert_eq!(tile_level_for_width(TILE_SIZE), 0);
+        assert_eq!(tile_level_for_width(TILE_SIZE * 2), 1);
+        assert_eq!(tile_level_for_width(TILE_SIZE * 4), 2);
+        assert_eq!(
+            tile_level_for_width(TILE_SIZE * 4 + 1),
+            3,
+            "must round UP, never render softer than asked"
+        );
+        assert_eq!(tile_level_for_width(TILE_SIZE * 32), 5);
     }
 
     #[test]
@@ -2976,6 +2988,150 @@ mod tests {
         );
 
         close_document(handle);
+    }
+
+    /// Page height divided by width, from a cheap render.
+    fn page_aspect(handle: u64) -> f64 {
+        let probe = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 100);
+        assert_eq!(probe.status, STATUS_OK_PDFIUM);
+        let aspect = probe.height as f64 / probe.width as f64;
+        free_render_result(probe);
+        aspect
+    }
+
+    /// Normalized (x of width, y of height) of the darkest pixel on the page.
+    ///
+    /// Sampling a fixed spot is a trap that already cost a wrong diagnosis
+    /// here: tile (0,0) is the top-left CORNER and the middle of a synthetic
+    /// fixture is blank paper, so both read as zero detail at every level and
+    /// prove nothing about the renderer. Find where the ink actually is, then
+    /// zoom in on THAT.
+    fn darkest_point(handle: u64) -> (f32, f32) {
+        let full = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 512);
+        assert_eq!(full.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(full.buffer, full.len as usize) };
+        let (w, h) = (full.width as usize, full.height as usize);
+
+        let mut best = (255i32, 0usize, 0usize);
+        for y in 0..h {
+            for x in 0..w {
+                let g = bytes[(y * w + x) * 4 + 1] as i32;
+                if g < best.0 {
+                    best = (g, x, y);
+                }
+            }
+        }
+
+        let point = (best.1 as f32 / w as f32, best.2 as f32 / h as f32);
+        free_render_result(full);
+        assert!(best.0 < 200, "fixture page is blank, nothing to zoom into");
+        point
+    }
+
+    #[test]
+    fn a_tile_matches_the_same_patch_of_a_full_resolution_render() {
+        // The honest test of the tile path, and the one that does not depend on
+        // guessing where the ink is: at level L the page is TILE_SIZE * 2^L
+        // pixels wide, so tile (col,row) must be pixel-for-pixel the block at
+        // (col*256, row*256) of a single render at that width. If the crop-box
+        // arithmetic is off by anything, or the region comes back soft, this
+        // diverges immediately.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let level = 4i32;
+        let across = 1i32 << level;
+        let aspect = page_aspect(handle) as f32;
+
+        let full = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, TILE_SIZE * across);
+        assert_eq!(full.status, STATUS_OK_PDFIUM);
+        let fw = full.width as usize;
+        let full_bytes = unsafe { std::slice::from_raw_parts(full.buffer, full.len as usize) };
+
+        // Compare the tile over known ink, so the patch is not blank paper.
+        let point = darkest_point(handle);
+        let col = (point.0 * across as f32) as i32;
+        let row = (point.1 * across as f32 * aspect) as i32;
+
+        let tile = render_tile(handle, 0, level, col, row);
+        assert_eq!(tile.status, STATUS_OK_PDFIUM);
+        let tile_bytes = unsafe { std::slice::from_raw_parts(tile.buffer, tile.len as usize) };
+
+        let (x0, y0) = ((col * TILE_SIZE) as usize, (row * TILE_SIZE) as usize);
+        let side = TILE_SIZE as usize;
+
+        let mut diff = 0.0f64;
+        let mut tile_ink = 0u32;
+        for y in 0..side {
+            for x in 0..side {
+                let t = tile_bytes[(y * side + x) * 4 + 1] as f64;
+                let f = full_bytes[((y0 + y) * fw + (x0 + x)) * 4 + 1] as f64;
+                diff += (t - f).abs();
+                if t < 200.0 {
+                    tile_ink += 1;
+                }
+            }
+        }
+        let mean_diff = diff / (side * side) as f64;
+
+        println!(
+            "TILE vs FULL: level={level} tile=({col},{row}) mean_diff={mean_diff:.2} ink_px={tile_ink}"
+        );
+
+        free_render_result(tile);
+        free_render_result(full);
+        close_document(handle);
+
+        assert!(tile_ink > 0, "the compared patch is blank, the test proves nothing");
+        assert!(
+            mean_diff < 8.0,
+            "tile does not match the same patch of a full-resolution render \
+             (mean channel difference {mean_diff:.2}), so tiling is not reproducing the page"
+        );
+    }
+
+    #[test]
+    fn the_crop_box_still_resolves_at_deep_tile_sizes() {
+        // The primitive every deep tile rests on. At level 10 a tile is about a
+        // thousandth of the page, so if PDFium quietly floored a crop box at
+        // some minimum, deep tiles would silently render the wrong area while
+        // every status code stayed OK.
+        use pdfium_render::prelude::*;
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let mut page = g.pages().get(0).unwrap();
+
+        let media = page.boundaries().media().map(|b| b.bounds).unwrap();
+        let page_w = page.width().value;
+
+        let mut observed = Vec::new();
+        for divisor in [4.0f32, 64.0, 1024.0] {
+            let wanted = page_w / divisor;
+            let rect = PdfRect::new(
+                PdfPoints::new(media.bottom().value),
+                PdfPoints::new(media.left().value),
+                PdfPoints::new(media.bottom().value + wanted),
+                PdfPoints::new(media.left().value + wanted),
+            );
+            page.boundaries_mut().set_crop(rect).unwrap();
+            observed.push((wanted, page.width().value));
+        }
+        page.boundaries_mut().set_crop(media).unwrap();
+
+        println!("CROP RESOLUTION: {observed:?}");
+
+        drop(page);
+        drop(g);
+        drop(_guard);
+        close_document(handle);
+
+        for (wanted, got) in observed {
+            assert!(
+                (got - wanted).abs() < 0.01,
+                "asked for a {wanted}pt crop and the page reported {got}pt, \
+                 so the box was clamped and deep tiles cannot address the page"
+            );
+        }
     }
 
     #[test]

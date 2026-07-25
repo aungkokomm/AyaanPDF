@@ -153,17 +153,36 @@
                                         multiplied, so the tiles line up with
                                         the page exactly and no transform sits
                                         between layout and geometry.
+
+                                        UseLayoutRounding MUST be False here.
+                                        Tiles are a fraction of a DIP wide in
+                                        slot space (12.5 at 800%, 1.6 at 6400%)
+                                        and the default rounding snaps each one
+                                        UP to the next whole physical pixel
+                                        while leaving its position exact. At
+                                        150% scale that turned a 12.5 DIP tile
+                                        into 12.6667, so every tile overlapped
+                                        its neighbour by a sixth of a DIP: a
+                                        grid of seams magnified by the zoom into
+                                        1.3 DIP of doubled content across the
+                                        whole page. Deeper levels are worse, the
+                                        overlap becoming a gap once a tile
+                                        rounds DOWN. This is measured in
+                                        diag.log by the tilegeom lines: want and
+                                        got must agree.
                                     -->
                                     <ItemsControl ItemsSource="{x:Bind Tiles}" IsHitTestVisible="False"
-                                                  HorizontalAlignment="Left" VerticalAlignment="Top">
+                                                  HorizontalAlignment="Left" VerticalAlignment="Top"
+                                                  UseLayoutRounding="False">
                                         <ItemsControl.ItemsPanel>
-                                            <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            <ItemsPanelTemplate><Grid UseLayoutRounding="False" /></ItemsPanelTemplate>
                                         </ItemsControl.ItemsPanel>
                                         <ItemsControl.ItemTemplate>
                                             <DataTemplate x:DataType="viewmodels:PageTile">
                                                 <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill"
                                                        Width="{x:Bind Size}" Height="{x:Bind Size}"
                                                        HorizontalAlignment="Left" VerticalAlignment="Top"
+                                                       UseLayoutRounding="False"
                                                        Margin="{x:Bind local:MainPage.Offset(Left, Top)}" />
                                             </DataTemplate>
                                         </ItemsControl.ItemTemplate>

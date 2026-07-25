@@ -11,27 +11,45 @@ public class TileGridTests
     {
         // Must agree exactly with tile_level_for_width in render_core, or the
         // app asks for tiles from a different grid than the one it draws.
-        Assert.Equal(0, TileGrid.LevelForWidth(256));
-        Assert.Equal(1, TileGrid.LevelForWidth(512));
-        Assert.Equal(2, TileGrid.LevelForWidth(1024));
-        Assert.Equal(5, TileGrid.LevelForWidth(8192));
+        // Written against the constant so that changing the tile size cannot
+        // leave the two sides describing different pyramids.
+        Assert.Equal(0, TileGrid.LevelForWidth(TileGrid.TileSize));
+        Assert.Equal(1, TileGrid.LevelForWidth(TileGrid.TileSize * 2));
+        Assert.Equal(2, TileGrid.LevelForWidth(TileGrid.TileSize * 4));
+        Assert.Equal(5, TileGrid.LevelForWidth(TileGrid.TileSize * 32));
     }
 
     [Fact]
     public void level_rounds_up_so_a_tile_is_never_softer_than_asked()
     {
-        Assert.Equal(3, TileGrid.LevelForWidth(1025));
-        Assert.Equal(1, TileGrid.LevelForWidth(257));
+        Assert.Equal(3, TileGrid.LevelForWidth(TileGrid.TileSize * 4 + 1));
+        Assert.Equal(1, TileGrid.LevelForWidth(TileGrid.TileSize + 1));
     }
 
     [Fact]
     public void a_tile_shrinks_in_dips_as_the_level_rises()
     {
         // The page keeps its slot size; higher levels just divide it more
-        // finely, which is what keeps a tile a fixed 256px of detail.
+        // finely, which is what keeps a tile a fixed square of detail.
         Assert.Equal(800, TileGrid.TileDip(800, 0), 6);
         Assert.Equal(400, TileGrid.TileDip(800, 1), 6);
         Assert.Equal(25, TileGrid.TileDip(800, 5), 6);
+    }
+
+    [Fact]
+    public void a_tile_stays_big_enough_in_dips_to_lay_out_cleanly()
+    {
+        // Why the tile size matters beyond bandwidth. A page is 800 slot DIPs,
+        // and at the top of the zoom range the level needed is what decides how
+        // small a tile gets laid out. Sub-DIP tiles are where fractional layout
+        // stops surviving the trip to the screen, so the tile size is chosen to
+        // keep the deepest level in use comfortably above that.
+        int deepest = TileGrid.LevelForWidth(800 * 8 * 1.5);
+        double dip = TileGrid.TileDip(800, deepest);
+
+        Assert.True(dip >= 10.0,
+            $"at the top of the zoom range a tile is only {dip} slot DIPs, " +
+            "which is too small to lay out reliably");
     }
 
     [Fact]

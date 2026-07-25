@@ -21,7 +21,22 @@ public readonly record struct TilePlacement(TileAddress Address, double Left, do
 /// </summary>
 public static class TileGrid
 {
-    public const int TileSize = 256;
+    /// <summary>
+    /// Pixel edge of one tile. MUST equal TILE_SIZE in render_core.
+    ///
+    /// 512 rather than 256, because the tile count is what the smoothness
+    /// costs: a bigger tile halves the level needed for a given resolution,
+    /// which doubles a tile's size in slot DIPs and quarters how many of them
+    /// cover the viewport. At 800% that is about 20 tiles instead of 80, so
+    /// there are a quarter as many separate renders arriving one at a time and
+    /// a quarter as many seams. It also keeps tiles further away from the
+    /// sub-DIP layout sizes where anything to do with rounding starts to hurt.
+    ///
+    /// The cost is coarser reuse when panning, since a tile that scrolls off
+    /// takes four times as much with it, and 1MB per tile instead of 256KB.
+    /// Both are cheap next to a page that stutters.
+    /// </summary>
+    public const int TileSize = 512;
 
     /// <summary>Highest level allowed, matching render_core's guard.</summary>
     public const int MaxLevel = 20;
