@@ -416,6 +416,17 @@ public sealed partial class MainPage : Page
 
     private void SetActiveTool(ToolMode tool)
     {
+        // Switching tools abandons whatever the previous one was part way
+        // through.
+        //
+        // Without this, drag state set by one tool keeps running under the
+        // next. PointerMoved tests _isPanning FIRST, so a pan flag left set
+        // makes every later tool pan instead of doing its own job: pick the
+        // hand, then pick highlight or draw, and the page just keeps moving.
+        // It reads as the hand tool having taken the app over and the other
+        // tools being dead.
+        ResetPointerInteraction();
+
         ViewModel.ActiveTool = tool;
         UpdateToolRail();
         UpdateCursor();
@@ -441,25 +452,119 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void InitializePenPickers()
     {
-        ColorChoices.ItemsSource = InkPresets.Colors;
         WidthChoices.ItemsSource = InkPresets.Widths;
-        ColorChoices.SelectedIndex = 0;
         WidthChoices.SelectedIndex = 1;
+        ShowPaletteFor(ViewModel.ActiveTool);
+    }
+
+    /// <summary>
+    /// Points the colour picker at the palette belonging to the active tool.
+    ///
+    /// The picker used to always show the PEN colours, even with the
+    /// highlighter armed. So the highlighter palette existed and was simply
+    /// never on screen: you picked from opaque pen swatches and got whichever
+    /// translucent highlight happened to share that colour's name, and Black,
+    /// having no highlighter counterpart, silently did nothing at all.
+    /// </summary>
+    private void ShowPaletteFor(ToolMode tool)
+    {
+        bool highlighting = tool == ToolMode.Highlight;
+        var palette = InkPresets.PaletteFor(highlighting);
+        string wanted = highlighting ? ViewModel.HighlightColorHex : ViewModel.InkColorHex;
+
+        // Rebinding raises SelectionChanged with nothing selected, which would
+        // otherwise be read as the user clearing the colour.
+        _suppressColorChange = true;
+        ColorChoices.ItemsSource = palette;
+
+        int index = 0;
+        for (int i = 0; i < palette.Count; i++)
+        {
+            if (string.Equals(palette[i].Hex, wanted, StringComparison.OrdinalIgnoreCase))
+            {
+                index = i;
+                break;
+            }
+        }
+        ColorChoices.SelectedIndex = index;
+        _suppressColorChange = false;
+
+        ApplyColor(palette[index], highlighting);
+    }
+
+    private bool _suppressColorChange;
+
+    /// <summary>
+    /// Applies a chosen colour to the tool it belongs to.
+    ///
+    /// The pen and highlighter keep SEPARATE colours: a highlighter has to
+    /// stay translucent or it hides the text it is marking, so choosing one
+    /// must never make the other opaque.
+    /// </summary>
+    private void ApplyColor(InkColor c, bool highlighting)
+    {
+        if (highlighting)
+        {
+            ViewModel.HighlightColorHex = c.Hex;
+        }
+        else
+        {
+            ViewModel.InkColorHex = c.Hex;
+        }
+
         UpdatePenSwatch();
     }
 
+    /// <summary>
+    /// Abandons any in-progress pointer interaction and clears every drag flag.
+    ///
+    /// One place rather than per-flag cleanup at each call site, because the
+    /// flags are read in priority order and a single stale one silently
+    /// changes what every tool does.
+    /// </summary>
+    private void ResetPointerInteraction()
+    {
+        // Tell the view model first, so a half-finished stroke or selection is
+        // closed off properly rather than left hanging.
+        if (_isMovingAnnotation)
+        {
+            ViewModel.EndAnnotationMove();
+        }
+        if (_isMarqueeing)
+        {
+            ViewModel.EndMarquee();
+        }
+        if (_isSelectingText)
+        {
+            ViewModel.EndTextSelection();
+        }
+        if (_isDrawing)
+        {
+            ViewModel.EndInkStroke();
+        }
+
+        _isPanning = false;
+        _isMovingAnnotation = false;
+        _isMarqueeing = false;
+        _isSelectingText = false;
+        _isDrawing = false;
+    }
+
+    /// <summary>
+    /// Capture can be lost without a matching release, for instance when a
+    /// flyout opens or the window loses activation mid-drag. That leaves the
+    /// drag flags set, and the normal release handler ignores the event
+    /// because the pointer id no longer matches. So this clears
+    /// unconditionally: losing capture always ends the interaction.
+    /// </summary>
+    private void ViewportHost_PointerCaptureLost(object sender, PointerRoutedEventArgs e) =>
+        ResetPointerInteraction();
+
     private void InkColor_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (ColorChoices.SelectedItem is InkColor c)
+        if (!_suppressColorChange && ColorChoices.SelectedItem is InkColor c)
         {
-            // The pen and the highlighter are separate colours: a highlighter
-            // must stay translucent or it covers the text it marks, so picking
-            // a pen colour maps to the matching translucent highlight rather
-            // than making the highlighter opaque. Matched by NAME, since the
-            // two lists are different lengths.
-            ViewModel.InkColorHex = c.Hex;
-            ViewModel.HighlightColorHex = InkPresets.HighlightFor(c).Hex;
-            UpdatePenSwatch();
+            ApplyColor(c, ViewModel.ActiveTool == ToolMode.Highlight);
         }
     }
 
@@ -471,16 +576,23 @@ public sealed partial class MainPage : Page
         }
     }
 
+    /// <summary>Shows the colour of whichever tool is armed, not always the pen's.</summary>
     private void UpdatePenSwatch() =>
-        PenSwatch.Background = HexBrush(ViewModel.InkColorHex);
+        PenSwatch.Background = HexBrush(
+            ViewModel.ActiveTool == ToolMode.Highlight
+                ? ViewModel.HighlightColorHex
+                : ViewModel.InkColorHex);
 
     private void UpdateToolRail()
     {
         // Pen options are only meaningful for tools that lay down colour.
-        PenOptionsButton.Visibility =
-            ViewModel.ActiveTool is ToolMode.Draw or ToolMode.Highlight
-                ? Visibility.Visible
-                : Visibility.Collapsed;
+        bool inks = ViewModel.ActiveTool is ToolMode.Draw or ToolMode.Highlight;
+        PenOptionsButton.Visibility = inks ? Visibility.Visible : Visibility.Collapsed;
+
+        if (inks)
+        {
+            ShowPaletteFor(ViewModel.ActiveTool);
+        }
 
         var active = (SolidColorBrush)Application.Current.Resources["AccentFillColorDefaultBrush"];
         var idle = new SolidColorBrush(Colors.Transparent);

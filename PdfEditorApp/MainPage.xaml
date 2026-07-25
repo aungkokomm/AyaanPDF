@@ -103,7 +103,7 @@
                 PointerMoved="ViewportHost_PointerMoved"
                 PointerReleased="ViewportHost_PointerReleased"
                 PointerCanceled="ViewportHost_PointerReleased"
-                PointerCaptureLost="ViewportHost_PointerReleased">
+                PointerCaptureLost="ViewportHost_PointerCaptureLost">
 
                 <!--
                     Continuous page stack.

@@ -106,6 +106,36 @@ public class InkPresetsTests
     }
 
     [Fact]
+    public void the_highlighter_offers_the_highlighter_palette()
+    {
+        // The gap this closes: the four highlighter colours were correct, and
+        // the test above proved it, while the picker on screen stayed bound to
+        // the PEN list. Arming the highlighter showed opaque pen swatches, so
+        // the requested colours were never reachable. Being right and being
+        // reachable are different things, and only one of them was tested.
+        Assert.Equal(InkPresets.HighlightColors, InkPresets.PaletteFor(highlighting: true));
+        Assert.Equal(InkPresets.Colors, InkPresets.PaletteFor(highlighting: false));
+    }
+
+    [Fact]
+    public void every_highlighter_colour_is_translucent()
+    {
+        // A highlighter that is opaque hides the text it is marking. The pen
+        // colours are deliberately the opposite.
+        foreach (var c in InkPresets.HighlightColors)
+        {
+            var (a, _, _, _) = InkPresets.ParseHex(c.Hex);
+            Assert.True(a < 0xFF, $"{c.Name} is opaque ({c.Hex}) and would cover the text");
+        }
+
+        foreach (var c in InkPresets.Colors)
+        {
+            var (a, _, _, _) = InkPresets.ParseHex(c.Hex);
+            Assert.Equal(0xFF, a);
+        }
+    }
+
+    [Fact]
     public void every_preset_is_named()
     {
         Assert.All(InkPresets.Colors, c => Assert.False(string.IsNullOrWhiteSpace(c.Name)));

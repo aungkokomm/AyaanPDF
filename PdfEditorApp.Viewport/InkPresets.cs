@@ -73,6 +73,19 @@ public static class InkPresets
         return DefaultHighlightColor;
     }
 
+    /// <summary>
+    /// The palette a tool should OFFER.
+    ///
+    /// This exists because the highlighter palette being correct is not the
+    /// same as it being reachable. The colours below were right, and a test
+    /// asserted they were right, while the picker on screen stayed bound to
+    /// the pen list the whole time: you armed the highlighter and were shown
+    /// opaque pen swatches. Which list a tool offers is now a decision that
+    /// can be tested rather than a binding nobody looks at.
+    /// </summary>
+    public static IReadOnlyList<InkColor> PaletteFor(bool highlighting) =>
+        highlighting ? HighlightColors : Colors;
+
     public static InkColor DefaultColor => Colors[0];
 
     public static InkWidth DefaultWidth => Widths[1];
