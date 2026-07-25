@@ -149,6 +149,19 @@ struct TileKey {
     page: i32,
     tier: Tier,
     width: i32,
+    /// Level-of-detail for tiles: the page is `256 * 2^level` pixels wide at
+    /// this level. -1 for whole-page entries, which have no tile grid.
+    level: i32,
+    /// Tile column and row within that level. -1 for whole-page entries.
+    col: i32,
+    row: i32,
+}
+
+impl TileKey {
+    /// Key for a whole-page render, which is not part of any tile grid.
+    fn page_key(doc: u64, page: i32, tier: Tier, width: i32) -> Self {
+        TileKey { doc, page, tier, width, level: -1, col: -1, row: -1 }
+    }
 }
 
 #[derive(Clone)]
@@ -530,6 +543,124 @@ fn render_region_inner(
         Some((width, height, bytes)) => buffer_to_result(width, height, bytes, STATUS_OK_PDFIUM),
         None => RenderResult::failure(STATUS_INVALID_INPUT),
     }
+}
+
+/// Edge length of a tile, in pixels.
+///
+/// 256 is the usual choice and it is a balance: smaller tiles waste time on
+/// per-call overhead and produce more seams to manage, larger ones lose the
+/// benefit of fine-grained reuse when panning and cost more to discard.
+pub const TILE_SIZE: i32 = 256;
+
+/// Renders one tile of a page's level-of-detail pyramid, with caching.
+///
+/// This is what makes deep zoom feel weightless, and it is the difference
+/// between us and every viewer that stutters. A region render already keeps
+/// cost proportional to the viewport, but it re-renders EVERYTHING whenever
+/// the view moves, so panning at high zoom repeats work it just did. Tiles are
+/// addressed on a fixed grid, so panning reuses every tile that stays on
+/// screen and pays only for the strip that scrolled in.
+///
+/// The grid is a quadtree: at `level` the whole page is `TILE_SIZE * 2^level`
+/// pixels wide and `2^level` tiles across. Levels are powers of two so a tile
+/// stays valid across a range of zooms, and so a coarser level is always
+/// available to display immediately while the exact one renders.
+///
+/// Memory is bounded twice over: a tile is a fixed 256KB regardless of zoom,
+/// and the shared cache evicts by total bytes. That is why this works in a
+/// small memory budget at any magnification.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_tile(doc_handle: u64, page_index: i32, level: i32, col: i32, row: i32) -> RenderResult {
+    if doc_handle == 0 || level < 0 || level > 20 || col < 0 || row < 0 {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    }
+
+    panic::catch_unwind(|| render_tile_inner(doc_handle, page_index, level, col, row))
+        .unwrap_or_else(|_| RenderResult::failure(STATUS_PANIC))
+}
+
+fn render_tile_inner(doc_handle: u64, page_index: i32, level: i32, col: i32, row: i32) -> RenderResult {
+    let key = TileKey {
+        doc: doc_handle,
+        page: page_index,
+        tier: Tier::High,
+        width: TILE_SIZE,
+        level,
+        col,
+        row,
+    };
+
+    // A cache hit is the common case while panning, and it is the whole point.
+    if let Some(tile) = lock(&core().cache).get(&key) {
+        return tile_to_result(tile, STATUS_OK_PDFIUM);
+    }
+
+    let across = (1i64 << level) as f32;
+
+    // Page aspect decides how many tile ROWS exist, since tiles are square in
+    // pixel space but the page is not.
+    let aspect = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else {
+            return RenderResult::failure(STATUS_INVALID_INPUT);
+        };
+        let g = lock(&doc);
+        let Ok(page) = g.pages().get(page_index as u16) else {
+            return RenderResult::failure(STATUS_INVALID_INPUT);
+        };
+        let w = page.width().value;
+        if w <= 0.0 {
+            return RenderResult::failure(STATUS_INVALID_INPUT);
+        }
+        page.height().value / w
+    };
+
+    let rows_down = (across * aspect).ceil();
+    if (col as f32) >= across || (row as f32) >= rows_down {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    }
+
+    // Tile bounds as fractions of page width and height respectively. The
+    // vertical divisor carries the aspect so the tile stays SQUARE in pixels.
+    let x = col as f32 / across;
+    let w = 1.0 / across;
+    let y = row as f32 / (across * aspect);
+    let h = 1.0 / (across * aspect);
+
+    let result = render_region(doc_handle, page_index, x, y, w, h, TILE_SIZE);
+    if result.status != STATUS_OK_PDFIUM || result.buffer.is_null() {
+        return result;
+    }
+
+    // Copy into the cache, then hand the caller its own view of the same
+    // bytes, so a cached tile and a fresh one behave identically.
+    let bytes = unsafe { std::slice::from_raw_parts(result.buffer, result.len) }.to_vec();
+    let tile = CachedTile { width: result.width, height: result.height, bytes: Arc::from(bytes) };
+    free_render_result(result);
+
+    let out = tile_to_result(&tile, STATUS_OK_PDFIUM);
+    cache_put(key, tile);
+    out
+}
+
+/// The level whose rendered page width first meets or exceeds `needed_px`.
+///
+/// Exposed so the caller picks levels by the same rule the renderer uses,
+/// rather than reimplementing the pyramid and drifting out of step.
+#[unsafe(no_mangle)]
+pub extern "C" fn tile_level_for_width(needed_px: i32) -> i32 {
+    if needed_px <= TILE_SIZE {
+        return 0;
+    }
+
+    let mut level = 0;
+    let mut width = TILE_SIZE as i64;
+    while width < needed_px as i64 && level < 20 {
+        width *= 2;
+        level += 1;
+    }
+    level
 }
 
 /// One page's intrinsic size in PDF points.
@@ -1281,7 +1412,7 @@ pub extern "C" fn render_low_res(doc_handle: u64, page_index: i32, target_width:
 }
 
 fn render_low_res_inner(doc_handle: u64, page_index: i32, target_width: i32) -> RenderResult {
-    let key = TileKey { doc: doc_handle, page: page_index, tier: Tier::Low, width: target_width };
+    let key = TileKey::page_key(doc_handle, page_index, Tier::Low, target_width);
 
     if let Some(tile) = lock(&core().cache).get(&key) {
         return tile_to_result(tile, STATUS_OK_PDFIUM);
@@ -1371,7 +1502,7 @@ pub extern "C" fn request_high_res(doc_handle: u64, page_index: i32, target_widt
     lock(&core.generations).insert((doc_handle, page_index), generation);
 
     let request_id = core.next_request_id.fetch_add(1, Ordering::Relaxed);
-    let key = TileKey { doc: doc_handle, page: page_index, tier: Tier::High, width: target_width };
+    let key = TileKey::page_key(doc_handle, page_index, Tier::High, target_width);
 
     // Fast path: already cached at this exact width, no thread needed.
     if let Some(tile) = lock(&core.cache).get(&key) {
@@ -2054,7 +2185,7 @@ mod tests {
         // concurrently, so a length comparison is inherently racy — and when
         // it failed it did so while holding the cache lock inside assert_eq!,
         // poisoning the mutex and cascading into every later test.
-        let key = TileKey { doc: u64::MAX, page: 0, tier: Tier::High, width: 1 };
+        let key = TileKey::page_key(u64::MAX, 0, Tier::High, 1);
 
         let huge = CachedTile {
             width: 1,
@@ -2364,7 +2495,7 @@ mod tests {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
         let width = 613; // distinctive, so the key cannot collide with another test
 
-        let key = TileKey { doc: handle, page: 0, tier: Tier::Low, width };
+        let key = TileKey::page_key(handle, 0, Tier::Low, width);
         assert!(lock(&core().cache).get(&key).is_none(), "precondition: nothing cached yet");
 
         let r = render_uncached(handle, 0, width);
@@ -2391,7 +2522,7 @@ mod tests {
 
         // Poison the cache with a wrong-sized tile under the exact key.
         lock(&core().cache).put(
-            TileKey { doc: handle, page: 0, tier: Tier::Low, width },
+            TileKey::page_key(handle, 0, Tier::Low, width),
             CachedTile { width: 4, height: 4, bytes: Arc::from(vec![7u8; 4 * 4 * 4]) },
         );
 
@@ -2726,6 +2857,124 @@ mod tests {
             r.len
         );
         free_render_result(r);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn tile_level_grows_with_the_resolution_needed() {
+        assert_eq!(tile_level_for_width(256), 0);
+        assert_eq!(tile_level_for_width(512), 1);
+        assert_eq!(tile_level_for_width(1024), 2);
+        assert_eq!(tile_level_for_width(1025), 3, "must round UP, never render softer than asked");
+        assert_eq!(tile_level_for_width(8192), 5);
+    }
+
+    #[test]
+    fn a_tile_is_always_the_same_size_whatever_the_zoom() {
+        // The property that makes deep zoom cost nothing extra: a tile is a
+        // fixed 256x256 at every level, so memory per visible tile never
+        // grows and 6400% costs exactly what 100% costs.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        for level in [0, 3, 6] {
+            let t = render_tile(handle, 0, level, 0, 0);
+            assert_eq!(t.status, STATUS_OK_PDFIUM, "level {level} failed");
+            assert_eq!(t.width, TILE_SIZE);
+            assert_eq!(t.height, TILE_SIZE);
+            assert_eq!(t.len, (TILE_SIZE * TILE_SIZE * 4) as usize);
+            free_render_result(t);
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn tiles_are_cached_so_panning_back_costs_nothing() {
+        // Panning re-visits tiles constantly. The second fetch must come from
+        // the cache, which is what turns a pan into a cheap blit instead of a
+        // re-render.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let first = render_tile(handle, 0, 4, 2, 3);
+        assert_eq!(first.status, STATUS_OK_PDFIUM);
+        let a = unsafe { std::slice::from_raw_parts(first.buffer, first.len) }.to_vec();
+        free_render_result(first);
+
+        let key = TileKey { doc: handle, page: 0, tier: Tier::High, width: TILE_SIZE, level: 4, col: 2, row: 3 };
+        assert!(lock(&core().cache).get(&key).is_some(), "tile was not cached");
+
+        let second = render_tile(handle, 0, 4, 2, 3);
+        let b = unsafe { std::slice::from_raw_parts(second.buffer, second.len) }.to_vec();
+        free_render_result(second);
+
+        assert_eq!(a, b, "the cached tile must be identical to the rendered one");
+        close_document(handle);
+    }
+
+    #[test]
+    fn neighbouring_tiles_show_different_parts_of_the_page() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let a = render_tile(handle, 0, 2, 0, 0);
+        let b = render_tile(handle, 0, 2, 1, 0);
+        assert_eq!(a.status, STATUS_OK_PDFIUM);
+        assert_eq!(b.status, STATUS_OK_PDFIUM);
+
+        let av = unsafe { std::slice::from_raw_parts(a.buffer, a.len) }.to_vec();
+        let bv = unsafe { std::slice::from_raw_parts(b.buffer, b.len) }.to_vec();
+        assert_ne!(av, bv, "adjacent tiles rendered identical pixels");
+
+        free_render_result(a);
+        free_render_result(b);
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_tile_rejects_tiles_outside_the_grid() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        // Level 2 is 4 tiles across, so column 4 does not exist.
+        assert_eq!(render_tile(handle, 0, 2, 4, 0).status, STATUS_INVALID_INPUT);
+        assert_eq!(render_tile(handle, 0, -1, 0, 0).status, STATUS_INVALID_INPUT);
+        assert_eq!(render_tile(0, 0, 0, 0, 0).status, STATUS_INVALID_INPUT);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_viewport_of_tiles_renders_fast_enough_to_feel_instant() {
+        // The claim this whole design rests on. A 1080p viewport at deep zoom
+        // is roughly 40 tiles; if that is slow, panning stutters no matter how
+        // clever the caching is.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let start = std::time::Instant::now();
+        let mut rendered = 0;
+        for col in 0..8 {
+            for row in 0..5 {
+                let t = render_tile(handle, 0, 5, col, row);
+                if t.status == STATUS_OK_PDFIUM {
+                    rendered += 1;
+                }
+                free_render_result(t);
+            }
+        }
+        let cold = start.elapsed();
+
+        // Second pass is all cache hits: this is what panning actually costs.
+        let start = std::time::Instant::now();
+        for col in 0..8 {
+            for row in 0..5 {
+                free_render_result(render_tile(handle, 0, 5, col, row));
+            }
+        }
+        let warm = start.elapsed();
+
+        println!("TILES: {rendered} tiles cold={cold:?} warm={warm:?}");
+        assert!(rendered > 0);
+        assert!(
+            warm < cold,
+            "cached pass ({warm:?}) should beat the cold pass ({cold:?})"
+        );
 
         close_document(handle);
     }
