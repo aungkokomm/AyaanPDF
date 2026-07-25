@@ -202,6 +202,42 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         CurrentPageIndex = 0;
         RebuildContinuousLayout();
         RenderCurrentPage();
+        ReportExistingAnnotations();
+    }
+
+    /// <summary>
+    /// Number of annotation objects the opened document already carries.
+    /// </summary>
+    public int ExistingAnnotationCount { get; private set; }
+
+    /// <summary>
+    /// Notes what markup the opened file already has.
+    ///
+    /// These already DRAW, because PDFium renders annotations as part of the
+    /// page, so a file annotated in Acrobat or saved by this app now opens
+    /// looking right. What is not yet possible is selecting and editing them:
+    /// that needs each kind's own geometry, quad points for a highlight and
+    /// the point list for a stroke, which reading their bounding boxes cannot
+    /// supply. Counting them at least means the app knows they are there
+    /// instead of silently treating the page as unmarked.
+    /// </summary>
+    private void ReportExistingAnnotations()
+    {
+        if (_documentHandle == 0 || PageCount == 0)
+        {
+            ExistingAnnotationCount = 0;
+            return;
+        }
+
+        // Bounded: a 300-page document should not pay for a full sweep just to
+        // put a number in the status bar.
+        int scanned = Math.Min(PageCount, 25);
+        ExistingAnnotationCount = Interop.AnnotationLoader.CountAll(_documentHandle, scanned);
+
+        if (ExistingAnnotationCount > 0)
+        {
+            Diag.Log($"open: {ExistingAnnotationCount} existing annotations in the first {scanned} pages");
+        }
     }
 
     /// <summary>Navigates to a page (e.g. a thumbnail click).</summary>
@@ -303,23 +339,36 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private string? _currentDocumentPath;
 
     /// <summary>
-    /// Flattens annotations into the document, writes it to <paramref name="path"/>,
-    /// then RELOADS from the original file.
+    /// Writes annotations into the document as real annotation OBJECTS, saves
+    /// it to <paramref name="path"/>, then reloads from what was written.
     ///
-    /// The reload is what stops a second save from burning the same marks
-    /// again on top of the first set. Burning mutates the in-memory document,
-    /// but the annotation lists stay populated so the overlays keep working,
-    /// so without discarding the burned copy every subsequent save would
-    /// stack another layer of the same highlights and strokes.
+    /// Objects rather than flattened pixels, which is the whole point: reopen
+    /// the saved file and the marks are still marks. They can be moved,
+    /// recoloured and deleted, other viewers see them as annotations, and a
+    /// file annotated elsewhere opens here with its markup intact. Flattening
+    /// is still available, but as a deliberate command rather than as the
+    /// silent consequence of pressing Save.
+    ///
+    /// The reload is what stops a second save from writing the same marks
+    /// again on top of the first set. Writing mutates the in-memory document
+    /// while the overlay lists stay populated so the canvas keeps working, so
+    /// without discarding that copy every subsequent save would stack another
+    /// duplicate set.
     /// </summary>
-    public bool SaveDocumentAs(string path)
+    public bool SaveDocumentAs(string path) => SaveDocumentAs(path, flatten: false);
+
+    /// <summary>
+    /// As above, but <paramref name="flatten"/> burns the marks into page
+    /// content instead, which is permanent and cannot be undone by reopening.
+    /// </summary>
+    public bool SaveDocumentAs(string path, bool flatten)
     {
         if (_documentHandle == 0)
         {
             return false;
         }
 
-        bool burned = BurnAllAnnotations();
+        bool burned = flatten ? BurnAllAnnotations() : WriteAnnotationObjects();
 
         bool saved = RenderCoreNative.save_document(_documentHandle, path) == RenderStatus.OkPdfium;
 
@@ -411,8 +460,117 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Writes every stored annotation into the document as a real annotation
+    /// object. Returns false when there was nothing to write, so the caller
+    /// can skip the reload.
+    ///
+    /// Coordinates are stored normalized; render_core wants them in the pixel
+    /// space of some capture width, so both sides agree on a reference width
+    /// and it cancels out.
+    /// </summary>
+    private bool WriteAnnotationObjects()
+    {
+        bool addedNotes = AddNoteAnnotations();
+
+        if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0)
+        {
+            return addedNotes;
+        }
+
+        const int CaptureWidth = 1000;
+
+        // One SPEC per highlight, however many lines it spans, so a multi-line
+        // highlight stays a single object to click, recolour and delete.
+        var specs = new List<HighlightSpec>();
+        var quads = new List<HighlightQuad>();
+        foreach (var h in _allHighlights)
+        {
+            if (h.Rects.Count == 0)
+            {
+                continue;
+            }
+
+            var (r, g, b, a) = ParseHex(h.ColorHex, defaultAlpha: 0x88);
+            specs.Add(new HighlightSpec
+            {
+                PageIndex = h.PageIndex,
+                QuadOffset = (uint)quads.Count,
+                QuadCount = (uint)h.Rects.Count,
+                R = r, G = g, B = b, A = a,
+            });
+
+            foreach (var rect in h.Rects)
+            {
+                quads.Add(new HighlightQuad
+                {
+                    Left = (float)(rect.Left * CaptureWidth),
+                    Top = (float)(rect.Top * CaptureWidth),
+                    Right = (float)(rect.Right * CaptureWidth),
+                    Bottom = (float)(rect.Bottom * CaptureWidth),
+                });
+            }
+        }
+
+        var strokes = new List<BurnStroke>();
+        var points = new List<BurnPoint>();
+        foreach (var s in _allInkStrokes)
+        {
+            if (s.Points.Count < 2)
+            {
+                continue;
+            }
+
+            var (r, g, b, a) = ParseHex(s.ColorHex, defaultAlpha: 0xFF);
+            strokes.Add(new BurnStroke
+            {
+                PageIndex = s.PageIndex,
+                PointOffset = (uint)points.Count,
+                PointCount = (uint)s.Points.Count,
+                WidthPx = (float)(s.StrokeWidth * CaptureWidth),
+                R = r, G = g, B = b, A = a,
+            });
+            foreach (var (x, y) in s.Points)
+            {
+                points.Add(new BurnPoint { X = (float)(x * CaptureWidth), Y = (float)(y * CaptureWidth) });
+            }
+        }
+
+        if (specs.Count == 0 && strokes.Count == 0)
+        {
+            return addedNotes;
+        }
+
+        bool ok = true;
+
+        if (specs.Count > 0)
+        {
+            int status = RenderCoreNative.add_highlight_annotations(
+                _documentHandle, CaptureWidth,
+                specs.ToArray(), (nuint)specs.Count,
+                quads.ToArray(), (nuint)quads.Count);
+            ok &= status == RenderStatus.OkPdfium;
+            Diag.Log($"save: {specs.Count} highlight annotations ({quads.Count} quads) -> {status}");
+        }
+
+        if (strokes.Count > 0)
+        {
+            int status = RenderCoreNative.add_ink_annotations(
+                _documentHandle, CaptureWidth,
+                strokes.ToArray(), (nuint)strokes.Count,
+                points.ToArray(), (nuint)points.Count);
+            ok &= status == RenderStatus.OkPdfium;
+            Diag.Log($"save: {strokes.Count} ink annotations -> {status}");
+        }
+
+        return ok;
+    }
+
+    /// <summary>
     /// Burns every stored annotation into page content. Returns false when
     /// there was nothing to burn, so the caller can skip the reload.
+    ///
+    /// This is now only reached through the explicit Flatten command. Saving
+    /// writes annotation OBJECTS instead, see <see cref="WriteAnnotationObjects"/>.
     /// </summary>
     private bool BurnAllAnnotations()
     {

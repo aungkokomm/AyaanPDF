@@ -460,6 +460,13 @@
                                     <KeyboardAccelerator Modifiers="Control" Key="S" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
+                            <!--
+                                Flattening used to be what an ordinary Save did,
+                                silently. It is now its own command, confirmed
+                                first, because it is the one save whose result
+                                cannot be undone by reopening the file.
+                            -->
+                            <MenuFlyoutItem Text="Flatten and save a copy..." Click="FlattenSaveAs_Click" />
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}" Click="Undo_Click"
                                             IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">

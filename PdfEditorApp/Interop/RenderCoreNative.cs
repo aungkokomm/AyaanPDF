@@ -56,6 +56,80 @@ internal struct BurnPoint
     public float Y;
 }
 
+/// <summary>Mirrors render_core::HighlightQuad (src/lib.rs).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct HighlightQuad
+{
+    public float Left;
+    public float Top;
+    public float Right;
+    public float Bottom;
+}
+
+/// <summary>
+/// Mirrors render_core::HighlightSpec (src/lib.rs). One highlight ANNOTATION,
+/// indexing however many quads it spans in a shared flat array, because a
+/// highlight over several lines has to stay a single object.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct HighlightSpec
+{
+    public int PageIndex;
+    public uint QuadOffset;
+    public uint QuadCount;
+    public byte R;
+    public byte G;
+    public byte B;
+    public byte A;
+}
+
+/// <summary>Mirrors render_core::AnnotationInfo (src/lib.rs).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct AnnotationInfo
+{
+    /// <summary>Position on the page, and the handle for edits and deletes.</summary>
+    public int Index;
+
+    /// <summary>One of <see cref="AnnotSubtype"/>.</summary>
+    public int Subtype;
+
+    // Top-left origin, both axes divided by the page WIDTH, matching how the
+    // app normalizes its own annotations.
+    public float Left;
+    public float Top;
+    public float Right;
+    public float Bottom;
+
+    /// <summary>0xRRGGBB, or -1 when the annotation carries no colour.</summary>
+    public int Color;
+
+    public float Opacity;
+}
+
+/// <summary>Mirrors render_core::AnnotationArray (src/lib.rs).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct AnnotationArray
+{
+    public IntPtr Items;
+    public nuint Len;
+    public int Status;
+}
+
+/// <summary>Annotation subtypes, matching the ANNOT_* constants in render_core.</summary>
+internal static class AnnotSubtype
+{
+    public const int Other = 0;
+    public const int Text = 1;
+    public const int Highlight = 2;
+    public const int Ink = 3;
+    public const int Stamp = 4;
+    public const int Square = 5;
+    public const int FreeText = 6;
+    public const int Underline = 7;
+    public const int Strikeout = 8;
+    public const int Squiggly = 9;
+}
+
 /// <summary>
 /// Mirrors render_core::BurnStroke (src/lib.rs). Strokes index into a shared
 /// flat point array rather than carrying their own, which keeps the FFI to
@@ -123,6 +197,14 @@ internal static class RenderStatus
     public const int InvalidInput = 1;
     public const int Panic = 2;
     public const int OkPlaceholder = 3;
+
+    /// <summary>
+    /// Well formed, but PDFium cannot do it. Distinct from
+    /// <see cref="InvalidInput"/> so a caller can fall back rather than
+    /// report an error: the only case today is scaling a stamp or ink stroke,
+    /// which has to be done by deleting and re-adding at the new size.
+    /// </summary>
+    public const int Unsupported = 4;
 }
 
 /// <summary>Mirrors render_core::{POLL_*} (src/lib.rs).</summary>
@@ -267,6 +349,86 @@ internal static partial class RenderCoreNative
         int captureWidth,
         [In] BurnNote[]? notes,
         nuint noteCount);
+
+    // ---------------- Annotations as editable objects ----------------
+    //
+    // The counterpart to burning. A burned mark is pixels: reopen the file and
+    // it cannot be moved, recoloured or removed, and no other viewer sees it
+    // as markup. These write real annotation objects instead.
+
+    /// <summary>
+    /// Every annotation on a page. Free the result with
+    /// <see cref="free_annotation_array"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern AnnotationArray get_annotations(ulong docHandle, int pageIndex);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void free_annotation_array(AnnotationArray array);
+
+    /// <summary>
+    /// Adds highlights as real /Highlight annotations. A highlight spanning
+    /// several lines is ONE spec pointing at several quads, so it stays a
+    /// single object to select and delete.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_highlight_annotations(
+        ulong docHandle,
+        int captureWidth,
+        [In] HighlightSpec[]? specs,
+        nuint specCount,
+        [In] HighlightQuad[]? quads,
+        nuint quadCount);
+
+    /// <summary>Adds freehand strokes as real /Ink annotations, one per stroke.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_ink_annotations(
+        ulong docHandle,
+        int captureWidth,
+        [In] BurnStroke[]? strokes,
+        nuint strokeCount,
+        [In] BurnPoint[]? points,
+        nuint pointCount);
+
+    /// <summary>
+    /// Places an image as a real /Stamp annotation. Pixels must be tightly
+    /// packed BGRA: decoding happens here rather than in the core, which keeps
+    /// the image crate out of the native binary.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_stamp_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        [In] byte[] bgra,
+        nuint byteLen,
+        int pixelWidth,
+        int pixelHeight);
+
+    /// <summary>Removes one annotation by the index <see cref="get_annotations"/> reported.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int delete_annotation(ulong docHandle, int pageIndex, int index);
+
+    /// <summary>
+    /// Moves an annotation to a new rectangle. Returns
+    /// <see cref="RenderStatus.Unsupported"/> when asked to SCALE a stamp or
+    /// ink stroke, which PDFium cannot do: delete and re-add at the new size
+    /// instead.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_annotation_bounds(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int fill_text_field(

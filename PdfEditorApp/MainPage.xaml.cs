@@ -518,12 +518,14 @@ public sealed partial class MainPage : Page
     /// picked a file and it saved, so the close prompt can tell a completed
     /// save from a cancelled picker.
     /// </summary>
-    private async Task<bool> SaveAsAsync()
+    private Task<bool> SaveAsAsync() => SaveAsAsync(flatten: false);
+
+    private async Task<bool> SaveAsAsync(bool flatten)
     {
         var picker = new Windows.Storage.Pickers.FileSavePicker();
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
-        picker.SuggestedFileName = "edited";
+        picker.SuggestedFileName = flatten ? "flattened" : "edited";
         picker.FileTypeChoices.Add("PDF Document", new List<string> { ".pdf" });
 
         var file = await picker.PickSaveFileAsync();
@@ -532,9 +534,42 @@ public sealed partial class MainPage : Page
             return false;
         }
 
-        bool saved = ViewModel.SaveDocumentAs(file.Path);
-        Debug.WriteLine($"[MainPage] Save As \"{file.Path}\" -> {(saved ? "ok" : "failed")}");
+        bool saved = ViewModel.SaveDocumentAs(file.Path, flatten);
+        Debug.WriteLine($"[MainPage] Save As \"{file.Path}\" flatten={flatten} -> {(saved ? "ok" : "failed")}");
         return saved;
+    }
+
+    /// <summary>
+    /// Flatten and Save As: burns the marks into the page instead of writing
+    /// them as annotation objects.
+    ///
+    /// Confirmed first, because it is the one save that cannot be undone by
+    /// reopening the file. A normal save keeps every mark editable; this one
+    /// turns them into part of the page forever, which is occasionally exactly
+    /// what you want (sending a form somewhere that mishandles annotations)
+    /// and otherwise a trap.
+    /// </summary>
+    private async void FlattenSaveAs_Click(object sender, RoutedEventArgs e)
+    {
+        var confirm = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Flatten annotations?",
+            Content = "Highlights, drawings and notes will be burned into the page. "
+                    + "In the flattened copy they can no longer be moved, recoloured or "
+                    + "deleted, by this app or any other. Your current document is not "
+                    + "changed.",
+            PrimaryButtonText = "Flatten and save a copy",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+        };
+
+        if (await confirm.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        await SaveAsAsync(flatten: true);
     }
 
     private void EmptyState_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e) =>
