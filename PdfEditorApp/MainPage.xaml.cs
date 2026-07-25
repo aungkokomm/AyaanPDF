@@ -64,6 +64,7 @@ public sealed partial class MainPage : Page
             {
                 ViewModel.OpenDocument(probe);
             }
+
         };
         Unloaded += (_, _) =>
         {
@@ -249,8 +250,6 @@ public sealed partial class MainPage : Page
             ViewModel.RasterizationScale = XamlRoot.RasterizationScale;
         }
 
-        ViewModel.SetViewportSize(PageScroller.ViewportWidth, PageScroller.ViewportHeight);
-
         if (_autoFit)
         {
             FitToWidth();
@@ -259,6 +258,15 @@ public sealed partial class MainPage : Page
         UpdateZoomReadout();
         PushVisibleWindow();
     }
+
+    /// <summary>Arrow-key scroll distance in DIPs, close to Acrobat's nudge.</summary>
+    private const double ArrowScrollStep = 64;
+
+    private void ScrollBy(double dx, double dy) =>
+        PageScroller.ScrollTo(
+            PageScroller.HorizontalOffset + dx,
+            PageScroller.VerticalOffset + dy,
+            new ScrollingScrollOptions(ScrollingAnimationMode.Enabled, ScrollingSnapPointsMode.Ignore));
 
     private void UpdateZoomReadout() =>
         ZoomPercentText.Text = $"{Math.Round(PageScroller.ZoomFactor * 100)}%";
@@ -487,6 +495,14 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void DeleteNote_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: NoteAnnotation note })
+        {
+            ViewModel.DeleteNote(note);
+        }
+    }
+
     private void SearchNext_Click(object sender, RoutedEventArgs e) => ViewModel.StepSearchMatch(1);
 
     private void SearchPrev_Click(object sender, RoutedEventArgs e) => ViewModel.StepSearchMatch(-1);
@@ -586,24 +602,26 @@ public sealed partial class MainPage : Page
 
     // ---------------- Ink stroke rendering (Polyline points don't bind cleanly via x:Bind) ----------------
 
-    private void OnInkStrokesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    /// <summary>
+    /// Rebuilds the ink canvas from EVERY stroke in the document.
+    ///
+    /// This used to mirror only the current page's collection, which is wrong
+    /// in a continuous viewport: two or three pages are visible at once, so
+    /// ink on a visible neighbouring page vanished the instant scrolling made
+    /// another page current. The current-page collection still serves as the
+    /// change signal (it churns on every edit and page change), but the canvas
+    /// is always drawn from the full set. Stroke counts are small, so a full
+    /// rebuild is cheaper than being clever.
+    /// </summary>
+    private void OnInkStrokesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
+        RebuildInkCanvas();
+
+    private void RebuildInkCanvas()
     {
-        if (e.Action == NotifyCollectionChangedAction.Reset)
-        {
-            // Page switch: ViewModel.InkStrokes was cleared and is about to
-            // be repopulated with the new page's strokes (as Add events) —
-            // without this, the previous page's Polylines would linger on
-            // screen forever, accumulating across every page navigation.
-            InkCanvas.Children.Clear();
-            return;
-        }
+        InkCanvas.Children.Clear();
+        _livePreviewStroke = null;
 
-        if (e.Action != NotifyCollectionChangedAction.Add || e.NewItems is null)
-        {
-            return;
-        }
-
-        foreach (InkStrokeAnnotation stroke in e.NewItems)
+        foreach (var stroke in ViewModel.AllInkStrokes)
         {
             InkCanvas.Children.Add(BuildStrokePolyline(stroke));
         }
@@ -663,7 +681,10 @@ public sealed partial class MainPage : Page
         // The in-progress stroke is normalized on the way in, exactly like a
         // committed one, so the preview and the finished stroke share a
         // coordinate space and the line cannot jump when the pointer lifts.
-        double pageTop = ViewModel.SlotTopOf(ViewModel.CurrentPageIndex);
+        // Anchored to the page the stroke STARTED on, not the current page:
+        // in continuous view you can start drawing on a visible page that is
+        // not the current one, and the preview must land where the ink will.
+        double pageTop = ViewModel.SlotTopOf(ViewModel.ActiveInkPage);
 
         _livePreviewStroke.Points.Clear();
         foreach (var (x, y) in points)
@@ -774,6 +795,46 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
+            // Acrobat's zoom keys: Ctrl+0 fit page, Ctrl+1 actual size,
+            // Ctrl+2 fit width. Matching them means zoom muscle memory from
+            // Acrobat transfers wholesale.
+            case VirtualKey.Number0 when _isCtrlDown:
+                ZoomFitPage_Click(this, null!);
+                e.Handled = true;
+                break;
+            case VirtualKey.Number1 when _isCtrlDown:
+                _autoFit = false;
+                PageScroller.ZoomTo(1.0f, null,
+                    new ScrollingZoomOptions(ScrollingAnimationMode.Enabled, ScrollingSnapPointsMode.Ignore));
+                e.Handled = true;
+                break;
+            case VirtualKey.Number2 when _isCtrlDown:
+                ZoomFitWidth_Click(this, null!);
+                e.Handled = true;
+                break;
+
+            // Arrow keys nudge the scroll, as in Acrobat. Without these the
+            // keyboard could jump pages but not move within one.
+            case VirtualKey.Down:
+            case VirtualKey.Up:
+                ScrollBy(0, e.Key == VirtualKey.Down ? ArrowScrollStep : -ArrowScrollStep);
+                e.Handled = true;
+                break;
+            case VirtualKey.Right:
+            case VirtualKey.Left:
+                ScrollBy(e.Key == VirtualKey.Right ? ArrowScrollStep : -ArrowScrollStep, 0);
+                e.Handled = true;
+                break;
+
+            case VirtualKey.Home:
+                ViewModel.GoToPage(0);
+                e.Handled = true;
+                break;
+            case VirtualKey.End:
+                ViewModel.GoToPage(ViewModel.PageCount - 1);
+                e.Handled = true;
+                break;
+
             // Page navigation, all animated: a jump that teleports gives no
             // sense of where you moved to, which in a continuous document is
             // most of how you stay oriented.
@@ -785,15 +846,6 @@ public sealed partial class MainPage : Page
                 ViewModel.GoToPage(ViewModel.CurrentPageIndex - 1);
                 e.Handled = true;
                 break;
-            case VirtualKey.Home when _isCtrlDown:
-                ViewModel.GoToPage(0);
-                e.Handled = true;
-                break;
-            case VirtualKey.End when _isCtrlDown:
-                ViewModel.GoToPage(ViewModel.PageCount - 1);
-                e.Handled = true;
-                break;
-
             case VirtualKey.Delete:
             case VirtualKey.Back:
                 ViewModel.DeleteSelectedAnnotation();

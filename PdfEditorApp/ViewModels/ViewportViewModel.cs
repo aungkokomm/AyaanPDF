@@ -89,7 +89,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial string SearchQuery { get; set; } = string.Empty;
 
-    /// <summary>Highlight rects for the current text selection, in the same render-pixel space as PageBitmap.</summary>
+    /// <summary>Selection rects for the current page, normalized. The per-slot copies are what the cards draw.</summary>
     public ObservableCollection<TextRect> SelectionRects { get; } = new();
 
     /// <summary>Highlight rects for every match of <see cref="SearchQuery"/> on the current page.</summary>
@@ -106,38 +106,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>The stroke currently being drawn (Draw tool, drag in progress), or null between strokes.</summary>
     public IReadOnlyList<(double X, double Y)>? CurrentStrokeInProgress => _currentStroke;
 
+    /// <summary>
+    /// Every ink stroke on every page. The ink canvas draws from THIS, not the
+    /// current-page collection: the continuous viewport shows several pages at
+    /// once, so rebuilding from only the current page made ink on a visible
+    /// neighbouring page vanish the moment scrolling changed the current page.
+    /// </summary>
+    public IReadOnlyList<InkStrokeAnnotation> AllInkStrokes => _allInkStrokes;
+
+    /// <summary>The page the in-progress stroke belongs to, for the live preview.</summary>
+    public int ActiveInkPage => _inkPageIndex;
+
     /// <summary>Fires on every point added to the in-progress ink stroke, so MainPage can redraw its live preview.</summary>
     public event Action? InkStrokeChanged;
-
-    /// <summary>
-    /// Layout size of the page in DIPs. The Image is pinned to this, so a
-    /// sharper re-render fills the SAME box with more pixels instead of
-    /// changing the element's size.
-    ///
-    /// This decoupling is the whole point: layout size and render resolution
-    /// used to be the same number (Stretch="None" on a raw bitmap), so every
-    /// re-render resized the content, which moved the fit reference, which
-    /// moved the zoom readout, and forced a counter-scale to stop the page
-    /// visibly jumping. Fit Width could never win against that. Now
-    /// ZoomFactor 1.0 always means "page spans the viewport width" and
-    /// nothing the renderer does can disturb it.
-    /// </summary>
-    [ObservableProperty]
-    public partial double PageLayoutWidth { get; set; }
-
-    [ObservableProperty]
-    public partial double PageLayoutHeight { get; set; }
-
-    /// <summary>Raised when a new page's layout size is established, so MainPage can reset the zoom to fit.</summary>
-    public event Action? PageLayoutEstablished;
-
-    /// <summary>
-    /// DIPs per bitmap pixel. Used only to turn a pointer position into
-    /// bitmap-pixel space for text hit-testing, which is the one thing still
-    /// measured against the current bitmap.
-    /// </summary>
-    public double ContentToLayoutScale =>
-        _currentRenderedWidth > 0 && PageLayoutWidth > 0 ? PageLayoutWidth / _currentRenderedWidth : 1.0;
 
     /// <summary>
     /// DIPs per NORMALIZED unit, i.e. the multiplier that turns a stored
@@ -1501,6 +1482,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         InkStrokeChanged?.Invoke();
     }
 
+    /// <summary>
+    /// Removes a specific note, as one undo step. Reached from the note's own
+    /// flyout: unlike highlights and ink, a note marker is a button whose
+    /// click opens the editor, so the Select-tool click-to-pick path can never
+    /// reach it and it needs its own way to die.
+    /// </summary>
+    public void DeleteNote(NoteAnnotation note)
+    {
+        if (!_allNotes.Contains(note))
+        {
+            return;
+        }
+
+        PushHistory(HistoryScope.Annotations, "Delete note");
+        _allNotes.Remove(note);
+        Notes.Remove(note);
+        SlotFor(note.PageIndex)?.Notes.Remove(note);
+        IsDirty = true;
+    }
+
     public void AddNoteAt(int pageIndex, double x, double y)
     {
         PushHistory(HistoryScope.Annotations, "Add note");
@@ -1860,110 +1861,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void RenderCurrentPage()
     {
-        _currentRenderedWidth = 0;
         ClearSelection();
         SearchMatchRects.Clear();
         RefreshAnnotationsForCurrentPage();
-    }
-
-    /// <summary>
-    /// Fixes the page's on-screen box, in DIPs, to span the viewport width at
-    /// ZoomFactor 1.0. Only called when the page itself changes — never on a
-    /// resolution change — so the zoom reference stays put.
-    /// </summary>
-    private void EstablishLayoutSize(int pixelWidth, int pixelHeight)
-    {
-        if (pixelWidth <= 0 || pixelHeight <= 0)
-        {
-            return;
-        }
-
-        double aspect = (double)pixelHeight / pixelWidth;
-        double width = _viewportWidth > 0 ? _viewportWidth : pixelWidth;
-
-        PageLayoutWidth = width;
-        PageLayoutHeight = width * aspect;
-        PageLayoutEstablished?.Invoke();
-    }
-
-    /// <summary>Viewport size in DIPs, pushed in by MainPage from the ScrollView.</summary>
-    public void SetViewportSize(double width, double height)
-    {
-        _viewportWidth = width;
-        _viewportHeight = height;
-        bool nowKnown = width > 0 && height > 0;
-
-        if (!_viewportSizeKnown && nowKnown && _documentHandle != 0 && !_hasEstablishedInitialView)
-        {
-            _viewportSizeKnown = true;
-            RequestInitialFitRender();
-            return;
-        }
-
-        _viewportSizeKnown = nowKnown;
-    }
-
-    /// <summary>
-    /// Called on every ScrollView view change. Debounced, so a zoom gesture
-    /// schedules exactly one high-res render once it settles.
-    /// </summary>
-    public void OnViewportZoomChanged(double zoomFactor)
-    {
-        _currentZoomFactor = zoomFactor;
-        ScheduleRenderSettle();
-    }
-
-    // ---------------- Debounced full-res re-render ----------------
-
-    private void ScheduleRenderSettle()
-    {
-        _renderSettleTimer ??= _dispatcherQueue.CreateTimer();
-        _renderSettleTimer.Interval = RenderSettleDelay;
-        _renderSettleTimer.IsRepeating = false;
-        _renderSettleTimer.Tick -= OnRenderSettleTick;
-        _renderSettleTimer.Tick += OnRenderSettleTick;
-        _renderSettleTimer.Stop();
-        _renderSettleTimer.Start();
-    }
-
-    private void OnRenderSettleTick(DispatcherQueueTimer sender, object args) => RequestHighResAtCurrentZoom();
-
-    /// <summary>
-    /// The very first high-res request for a freshly opened document (or a
-    /// freshly navigated-to page): sized to the viewport (a "fit width"
-    /// default) rather than to whatever tiny footprint the low-res bitmap
-    /// currently occupies on screen.
-    /// </summary>
-    private void RequestInitialFitRender()
-    {
-        if (_documentHandle == 0)
-        {
-            return;
-        }
-
-        // force: this establishes the baseline for a new page, so the
-        // "would this actually be sharper" gate must not suppress it.
-        IssueHighResRequest(ToDeviceWidth(_viewportWidth), force: true);
-    }
-
-    /// <summary>Subsequent re-renders once interaction settles: sized to whatever the user has currently zoomed to.</summary>
-    private void RequestHighResAtCurrentZoom()
-    {
-        if (_documentHandle == 0)
-        {
-            return;
-        }
-
-        // On-screen width in DIPs = the fixed layout box scaled by zoom. It no
-        // longer depends on the current bitmap's pixel size, so re-rendering
-        // cannot feed back into the geometry that decides the next render.
-        double onScreenWidth = PageLayoutWidth * _currentZoomFactor;
-        if (onScreenWidth <= 0)
-        {
-            return;
-        }
-
-        IssueHighResRequest(ToDeviceWidth(onScreenWidth));
     }
 
     /// <summary>
@@ -1972,122 +1872,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public double RasterizationScale { get; set; } = 1.0;
 
-    /// <summary>
-    /// Converts a width in DIPs to physical pixels. Rendering at DIP width on
-    /// a scaled display hands the compositor an undersized bitmap, which it
-    /// then upscales — soft text that no amount of re-rendering fixes,
-    /// because the render was never asked for the missing pixels.
-    /// </summary>
-    private int ToDeviceWidth(double dipWidth) =>
-        (int)Math.Clamp(Math.Round(dipWidth * Math.Max(1.0, RasterizationScale)), MinRenderWidth, MaxRenderWidth);
-
-    /// <summary>
-    /// Width of the bitmap currently on screen, so a re-render can be skipped
-    /// when it would not actually be sharper.
-    /// </summary>
-    private int _currentRenderedWidth;
-
-    /// <summary>
-    /// A re-render below this ratio of what is already displayed is not
-    /// visibly sharper, so it is pure cost. Panning at a fixed zoom, or
-    /// nudging the zoom a few percent, used to fire a full-page rasterization
-    /// every time interaction settled.
-    /// </summary>
-    private const double ResharpenThreshold = 1.25;
-
-    private void IssueHighResRequest(int targetWidth, bool force = false)
-    {
-        if (!force && _currentRenderedWidth > 0)
-        {
-            double ratio = (double)targetWidth / _currentRenderedWidth;
-            // Skip only marginal *increases*; always honour a meaningful
-            // shrink so zooming out releases the oversized bitmap.
-            if (ratio < ResharpenThreshold && ratio > 1.0 / ResharpenThreshold)
-            {
-                return;
-            }
-        }
-
-        // Give up on whatever the previous request was rather than leaving
-        // it to complete unpolled — without this, render_core would keep
-        // its result (a full bitmap) alive forever every time the viewport
-        // moves on before a request finishes.
-        if (_pendingHighResRequestId != 0)
-        {
-            RenderCoreNative.discard_request(_pendingHighResRequestId);
-        }
-
-        _pendingHighResRequestId = RenderCoreNative.request_high_res(_documentHandle, CurrentPageIndex, targetWidth);
-        StartPolling();
-    }
-
-    private void StartPolling()
-    {
-        _pollTimer ??= _dispatcherQueue.CreateTimer();
-        _pollTimer.Interval = TimeSpan.FromMilliseconds(16);
-        _pollTimer.IsRepeating = true;
-        _pollTimer.Tick -= OnPollTick;
-        _pollTimer.Tick += OnPollTick;
-        _pollTimer.Start();
-    }
-
-    private void OnPollTick(DispatcherQueueTimer sender, object args)
-    {
-        var polled = PageRenderer.PollHighRes(_pendingHighResRequestId);
-        if (polled.Outcome == PageRenderOutcome.Pending)
-        {
-            return;
-        }
-
-        sender.Stop();
-        _pendingHighResRequestId = 0;
-
-        if (polled.Outcome is PageRenderOutcome.RealPage or PageRenderOutcome.Placeholder && polled.Bitmap is not null)
-        {
-            bool isNewPage = !_hasEstablishedInitialView;
-
-            PageBitmap = polled.Bitmap;
-            _hasEstablishedInitialView = true;
-
-            // The text layer is extracted in slot space, not at the bitmap's
-            // resolution, so a sharper render no longer invalidates it.
-            _currentRenderedWidth = polled.Bitmap.PixelWidth;
-            EnsureTextLayer();
-
-            if (isNewPage)
-            {
-                EstablishLayoutSize(polled.Bitmap.PixelWidth, polled.Bitmap.PixelHeight);
-            }
-
-            // The bitmap's pixel size changed, so overlay scaling must follow.
-            ContentScaleChanged?.Invoke();
-        }
-
-        Status = Describe("high-res", polled.Outcome, polled.Bitmap);
-        Log("high-res", polled.Outcome, polled.Bitmap);
-    }
-
-    private static string Describe(string tier, PageRenderOutcome outcome, WriteableBitmap? bitmap) => outcome switch
-    {
-        PageRenderOutcome.RealPage => $"{tier}: {bitmap!.PixelWidth}x{bitmap.PixelHeight} via PDFium",
-        PageRenderOutcome.Placeholder => $"{tier}: placeholder (PDFium unavailable or page failed to load)",
-        PageRenderOutcome.Cancelled => $"{tier}: superseded by a newer request",
-        _ => $"{tier}: render failed",
-    };
-
-    private static void Log(string tier, PageRenderOutcome outcome, WriteableBitmap? bitmap) =>
-        Debug.WriteLine($"[ViewportViewModel] tier={tier} outcome={outcome} size={bitmap?.PixelWidth}x{bitmap?.PixelHeight}");
-
     private void CloseCurrentDocument()
     {
-        _pollTimer?.Stop();
-        _renderSettleTimer?.Stop();
-
-        if (_pendingHighResRequestId != 0)
-        {
-            RenderCoreNative.discard_request(_pendingHighResRequestId);
-            _pendingHighResRequestId = 0;
-        }
+        // The sharpen pass is the only timer this pipeline still owns.
+        _sharpenTimer?.Stop();
 
         if (_documentHandle != 0)
         {

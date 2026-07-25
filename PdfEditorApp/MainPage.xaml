@@ -220,7 +220,14 @@
                                                     <FontIcon Glyph="&#xE70B;" FontSize="14" Foreground="#FF1A1A1A" />
                                                     <Button.Flyout>
                                                         <Flyout>
-                                                            <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Width="220" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
+                                                            <StackPanel Spacing="8" Width="220">
+                                                                <TextBox Text="{x:Bind Text, Mode=TwoWay}" PlaceholderText="Note text" Height="90" AcceptsReturn="True" TextWrapping="Wrap" />
+                                                                <!-- A note marker is a button whose click opens this flyout,
+                                                                     so the Select tool can never pick it; without this there
+                                                                     was no way to remove a note at all. -->
+                                                                <Button Content="Delete note" HorizontalAlignment="Right"
+                                                                        Click="DeleteNote_Click" Tag="{x:Bind}" />
+                                                            </StackPanel>
                                                         </Flyout>
                                                     </Button.Flyout>
                                                 </Button>
