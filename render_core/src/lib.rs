@@ -429,6 +429,109 @@ fn save_document_inner(doc_handle: u64, path: *const c_char) -> i32 {
     }
 }
 
+/// Renders only a RECTANGLE of a page, at whatever resolution is asked for.
+///
+/// This is what makes deep zoom viable. Rendering a whole page at the
+/// resolution deep zoom needs is quadratic: at 800% an A4 page wants roughly
+/// 9600x13500 pixels, over 500MB, so the render has to be capped and the
+/// result is upscaled and soft. Rendering only the part actually on screen
+/// makes cost track the VIEWPORT instead of the page, so 800% and 6400% cost
+/// the same and both stay sharp.
+///
+/// The region arrives in NORMALIZED page coordinates with a top-left origin
+/// (the same space annotations use), so callers never deal in PDF points.
+///
+/// Implemented by temporarily narrowing the page's CropBox, which is the
+/// PDF-native way to say "this is the visible area" (ISO 32000 14.11.2).
+/// PDFium then renders exactly that box. The original box is always put back,
+/// including on failure, because page width and height are DERIVED from it and
+/// leaving it narrowed would silently corrupt every later layout and save.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_region(
+    doc_handle: u64,
+    page_index: i32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    out_width: i32,
+) -> RenderResult {
+    if doc_handle == 0 || out_width <= 0 || w <= 0.0 || h <= 0.0 {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    }
+
+    panic::catch_unwind(|| render_region_inner(doc_handle, page_index, x, y, w, h, out_width))
+        .unwrap_or_else(|_| RenderResult::failure(STATUS_PANIC))
+}
+
+fn render_region_inner(
+    doc_handle: u64,
+    page_index: i32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    out_width: i32,
+) -> RenderResult {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    };
+
+    let page_w = page.width().value;
+    let page_h = page.height().value;
+    if page_w <= 0.0 || page_h <= 0.0 {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    }
+
+    // Remember the box to restore. A page without an explicit CropBox falls
+    // back to its MediaBox, which is what PDFium was already using.
+    let original = page
+        .boundaries()
+        .crop()
+        .map(|b| b.bounds)
+        .or_else(|_| page.boundaries().media().map(|b| b.bounds));
+    let Ok(original) = original else {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    };
+
+    // Normalized, top-left origin -> PDF points, bottom-left origin.
+    let left = original.left().value + x * page_w;
+    let right = left + w * page_w;
+    let top = original.top().value - y * page_h;
+    let bottom = top - h * page_h;
+
+    let region = PdfRect::new(
+        PdfPoints::new(bottom),
+        PdfPoints::new(left),
+        PdfPoints::new(top),
+        PdfPoints::new(right),
+    );
+
+    if page.boundaries_mut().set_crop(region).is_err() {
+        return RenderResult::failure(STATUS_INVALID_INPUT);
+    }
+
+    let rendered = render_page_via_pdfium_page(&page, out_width);
+
+    // ALWAYS restore, including when the render failed: page dimensions are
+    // derived from this box, so a leaked crop would corrupt layout and saving.
+    let _ = page.boundaries_mut().set_crop(original);
+
+    match rendered {
+        Some((width, height, bytes)) => buffer_to_result(width, height, bytes, STATUS_OK_PDFIUM),
+        None => RenderResult::failure(STATUS_INVALID_INPUT),
+    }
+}
+
 /// One page's intrinsic size in PDF points.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1418,6 +1521,16 @@ fn render_page_via_pdfium(
     target_width: i32,
 ) -> Option<(i32, i32, Vec<u8>)> {
     let page = doc.pages().get(page_index as u16).ok()?;
+    render_page_via_pdfium_page(&page, target_width)
+}
+
+/// Rasterizes an already-resolved page. Split out so the region renderer can
+/// share it after narrowing the page's crop box.
+fn render_page_via_pdfium_page(
+    page: &pdfium_render::prelude::PdfPage<'_>,
+    target_width: i32,
+) -> Option<(i32, i32, Vec<u8>)> {
+    use pdfium_render::prelude::*;
 
     // set_reverse_byte_order defaults to TRUE in PdfRenderConfig::new(), which
     // makes PDFium write RGBA while bitmap.format() still reports BGRA. Our
@@ -2540,6 +2653,90 @@ mod tests {
         assert_eq!(array.len, 0, "an image-only page has no characters");
 
         free_char_info_array(array);
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_region_restores_the_page_box_afterwards() {
+        // The most dangerous part of cropping to render: page width and height
+        // are DERIVED from the crop box, so a leaked crop would silently
+        // corrupt every later layout, text extraction and save.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let before = get_page_sizes(handle);
+        let (w0, h0) = {
+            let s = unsafe { std::slice::from_raw_parts(before.sizes, before.len) };
+            (s[0].width, s[0].height)
+        };
+        free_page_size_array(before);
+
+        let r = render_region(handle, 0, 0.25, 0.25, 0.5, 0.5, 400);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        free_render_result(r);
+
+        let after = get_page_sizes(handle);
+        let (w1, h1) = {
+            let s = unsafe { std::slice::from_raw_parts(after.sizes, after.len) };
+            (s[0].width, s[0].height)
+        };
+        free_page_size_array(after);
+
+        assert!(
+            (w0 - w1).abs() < 0.01 && (h0 - h1).abs() < 0.01,
+            "page box was left cropped: {w0}x{h0} became {w1}x{h1}"
+        );
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_region_returns_different_pixels_for_different_regions() {
+        // Proves the region is actually honoured rather than the whole page
+        // being rendered and scaled. The fixture has its text near the top, so
+        // the top strip and the bottom strip must not be identical.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let top = render_region(handle, 0, 0.0, 0.0, 1.0, 0.25, 300);
+        let bottom = render_region(handle, 0, 0.0, 0.75, 1.0, 0.25, 300);
+        assert_eq!(top.status, STATUS_OK_PDFIUM);
+        assert_eq!(bottom.status, STATUS_OK_PDFIUM);
+
+        let a = unsafe { std::slice::from_raw_parts(top.buffer, top.len) }.to_vec();
+        let b = unsafe { std::slice::from_raw_parts(bottom.buffer, bottom.len) }.to_vec();
+        assert_ne!(a, b, "two different regions rendered identical pixels");
+
+        free_render_result(top);
+        free_render_result(bottom);
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_region_cost_tracks_the_region_not_the_zoom() {
+        // The whole point: a deep zoom asks for a SMALL slice at high
+        // resolution. The bitmap must be the size requested, so memory is
+        // bounded by the viewport and 800% costs the same as 6400%.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let r = render_region(handle, 0, 0.4, 0.4, 0.05, 0.05, 900);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        assert_eq!(r.width, 900, "bitmap must be exactly the width asked for");
+        assert!(
+            r.len < 4 * 1024 * 1024,
+            "a viewport-sized slice should stay small, was {} bytes",
+            r.len
+        );
+        free_render_result(r);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn render_region_rejects_bad_input() {
+        assert_eq!(render_region(0, 0, 0.0, 0.0, 1.0, 1.0, 100).status, STATUS_INVALID_INPUT);
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(render_region(handle, 0, 0.0, 0.0, 0.0, 1.0, 100).status, STATUS_INVALID_INPUT);
+        assert_eq!(render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 0).status, STATUS_INVALID_INPUT);
+        assert_eq!(render_region(handle, 9999, 0.0, 0.0, 1.0, 1.0, 100).status, STATUS_INVALID_INPUT);
         close_document(handle);
     }
 

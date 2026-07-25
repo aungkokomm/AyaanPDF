@@ -45,6 +45,12 @@ internal static class PageRenderer
     public static RawPageRender RenderUncachedRaw(ulong docHandle, int pageIndex, int targetWidth) =>
         ToRaw(RenderCoreNative.render_uncached(docHandle, pageIndex, targetWidth));
 
+    /// <summary>Renders one rectangle of a page, for deep zoom.</summary>
+    public static RawPageRender RenderRegionRaw(
+        ulong docHandle, int pageIndex, double x, double y, double w, double h, int outWidth) =>
+        ToRaw(RenderCoreNative.render_region(
+            docHandle, pageIndex, (float)x, (float)y, (float)w, (float)h, outWidth));
+
     public static RawPageRender PollHighResRaw(ulong requestId)
     {
         int status = RenderCoreNative.poll_high_res(requestId, out RenderResult result);

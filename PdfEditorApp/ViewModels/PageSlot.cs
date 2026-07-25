@@ -101,6 +101,71 @@ public partial class PageSlot : ObservableObject
     /// <summary>True while a sharper-than-base render is on display.</summary>
     public bool IsSharp { get; private set; }
 
+    /// <summary>
+    /// A high-resolution render of just the visible RECTANGLE of this page,
+    /// drawn on top of the stretched full-page bitmap.
+    ///
+    /// At deep zoom a whole-page render at the resolution the screen wants is
+    /// enormous and has to be capped, which is what makes text soft. Rendering
+    /// only the part on screen keeps cost proportional to the viewport, so the
+    /// visible text is pixel-exact no matter how far in the user has zoomed.
+    /// </summary>
+    [ObservableProperty]
+    public partial WriteableBitmap? RegionBitmap { get; set; }
+
+    /// <summary>Where <see cref="RegionBitmap"/> sits, in slot-space DIPs.</summary>
+    [ObservableProperty]
+    public partial ScaledRect RegionPlacement { get; set; }
+
+    /// <summary>The normalized region currently displayed, to avoid redundant re-renders.</summary>
+    public (double X, double Y, double W, double H) RegionSource { get; private set; }
+
+    public int RegionRenderedWidth { get; private set; }
+
+    public void SetRegionRender(WriteableBitmap? bitmap, int renderedWidth,
+                                (double X, double Y, double W, double H) source)
+    {
+        if (bitmap is null)
+        {
+            return;
+        }
+
+        RegionPlacement = new ScaledRect(
+            source.X * SlotWidth, source.Y * SlotWidth,
+            source.W * SlotWidth, source.H * SlotWidth, string.Empty);
+        RegionBitmap = bitmap;
+        RegionRenderedWidth = renderedWidth;
+        RegionSource = source;
+    }
+
+    /// <summary>Drops the region overlay, revealing the full-page bitmap beneath.</summary>
+    public void ClearRegion()
+    {
+        if (RegionBitmap is null)
+        {
+            return;
+        }
+
+        RegionBitmap = null;
+        RegionRenderedWidth = 0;
+        RegionSource = default;
+    }
+
+    private bool _isRegionRendering;
+
+    public bool TryBeginRegionRender()
+    {
+        if (_isRegionRendering)
+        {
+            return false;
+        }
+
+        _isRegionRendering = true;
+        return true;
+    }
+
+    public void EndRegionRender() => _isRegionRendering = false;
+
     /// <summary>Records a base-tier render and shows it unless a sharp one is already up.</summary>
     public void SetBaseRender(WriteableBitmap? bitmap, int width)
     {
@@ -190,5 +255,6 @@ public partial class PageSlot : ObservableObject
         RenderedWidth = 0;
         BaseWidth = 0;
         IsSharp = false;
+        ClearRegion();
     }
 }

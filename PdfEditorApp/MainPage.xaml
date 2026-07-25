@@ -124,6 +124,19 @@
                                     <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
 
                                     <!--
+                                        Deep-zoom overlay: a pixel-exact render
+                                        of just the visible rectangle, laid over
+                                        the stretched full-page bitmap. Sized
+                                        and positioned in slot DIPs, so it lines
+                                        up with the page underneath exactly.
+                                    -->
+                                    <Image Source="{x:Bind RegionBitmap, Mode=OneWay}" Stretch="Fill"
+                                           HorizontalAlignment="Left" VerticalAlignment="Top"
+                                           Width="{x:Bind RegionPlacement.Width, Mode=OneWay}"
+                                           Height="{x:Bind RegionPlacement.Height, Mode=OneWay}"
+                                           Margin="{x:Bind local:MainPage.Offset(RegionPlacement.Left, RegionPlacement.Top), Mode=OneWay}" />
+
+                                    <!--
                                         Overlay layer for this page.
 
                                         NO ScaleTransform. Every rect below is

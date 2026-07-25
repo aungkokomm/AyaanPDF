@@ -59,6 +59,24 @@ public sealed class RenderBudget
     /// </summary>
     public const double SoloSharpenZoom = 2.0;
 
+    /// <summary>
+    /// Above this zoom the visible RECTANGLE is rendered separately.
+    ///
+    /// A whole-page render grows with the square of the zoom, so past a
+    /// certain point it hits the caps above and the result is upscaled: that
+    /// is the soft text at high magnification. A region render is always about
+    /// one viewport, so its cost is flat and it stays pixel-exact however far
+    /// in the user goes.
+    /// </summary>
+    public const double RegionZoom = 1.8;
+
+    /// <summary>
+    /// Ceiling on a region render's width. Generous, because a region is
+    /// viewport-sized rather than page-sized: this bounds a pathological
+    /// ultra-wide window, not normal use.
+    /// </summary>
+    public const int MaxRegionWidth = 6000;
+
     public RenderBudget(
         int baseWidth = 900,
         int maxSharpWidth = 4200,

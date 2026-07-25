@@ -242,7 +242,11 @@ public sealed partial class MainPage : Page
         ViewModel.UpdateVisibleWindow(
             PageScroller.VerticalOffset,
             PageScroller.ViewportHeight,
-            PageScroller.ZoomFactor);
+            PageScroller.ZoomFactor,
+            // Horizontal too: at deep zoom the page is wider than the window,
+            // so which COLUMN is on screen decides what needs rendering.
+            PageScroller.HorizontalOffset,
+            PageScroller.ViewportWidth);
 
     private void PageScroller_SizeChanged(object sender, SizeChangedEventArgs e)
     {

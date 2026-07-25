@@ -566,6 +566,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// pass knows what was on screen when the view settled.</summary>
     private double _lastViewTop;
     private double _lastViewBottom;
+    private double _lastViewLeft;
+    private double _lastViewRight;
 
     public ObservableCollection<PageSlot> PageSlots { get; } = new();
 
@@ -697,7 +699,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// view change, so it must stay cheap: the work is bounded by the number
     /// of visible pages, not the document length.
     /// </summary>
-    public void UpdateVisibleWindow(double verticalOffset, double viewportHeight, double zoomFactor)
+    public void UpdateVisibleWindow(
+        double verticalOffset, double viewportHeight, double zoomFactor,
+        double horizontalOffset = 0, double viewportWidth = 0)
     {
         if (_documentHandle == 0 || PageSlots.Count == 0)
         {
@@ -711,6 +715,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         double viewBottom = (verticalOffset + viewportHeight) / zoom;
         _lastViewTop = viewTop;
         _lastViewBottom = viewBottom;
+        _lastViewLeft = horizontalOffset / zoom;
+        _lastViewRight = (horizontalOffset + viewportWidth) / zoom;
 
         var (first, last) = _layout.VisibleRange(viewTop, viewBottom);
         if (first < 0)
@@ -873,7 +879,98 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 SharpenSlot(slot, desired);
             }
+
+            // Past the point where a whole-page render would be capped, the
+            // full-page tier can no longer keep up with the screen, so the
+            // visible rectangle is rendered separately at true resolution.
+            if (_currentZoomFactor > RenderBudget.RegionZoom)
+            {
+                RenderVisibleRegion(slot);
+            }
+            else
+            {
+                slot.ClearRegion();
+            }
         }
+    }
+
+    /// <summary>
+    /// Renders the part of a page that is actually on screen, at the exact
+    /// resolution the display needs.
+    ///
+    /// A whole-page render at deep zoom grows with the SQUARE of the zoom and
+    /// has to be capped, which is precisely why text goes soft past a few
+    /// hundred percent. The visible rectangle, by contrast, is always about
+    /// one viewport, so its cost is flat: 800% and 6400% render the same
+    /// number of pixels and both are pixel-exact.
+    /// </summary>
+    private async void RenderVisibleRegion(PageSlot slot)
+    {
+        double top = _layout.TopOf(slot.PageIndex);
+
+        // Intersect the viewport with this page, in slot space, then convert
+        // to the normalized page coordinates render_region expects.
+        double interLeft = Math.Max(0, _lastViewLeft);
+        double interRight = Math.Min(slot.SlotWidth, _lastViewRight);
+        double interTop = Math.Max(top, _lastViewTop);
+        double interBottom = Math.Min(top + slot.SlotHeight, _lastViewBottom);
+
+        if (interRight - interLeft < 1 || interBottom - interTop < 1 || slot.SlotWidth <= 0)
+        {
+            slot.ClearRegion();
+            return;
+        }
+
+        // A margin either side, so a small scroll does not immediately expose
+        // unrendered edges.
+        const double Overscan = 0.08;
+        double nx = Math.Max(0, interLeft / slot.SlotWidth - Overscan);
+        double ny = Math.Max(0, (interTop - top) / slot.SlotWidth - Overscan);
+        double nw = Math.Min(1 - nx, (interRight - interLeft) / slot.SlotWidth + Overscan * 2);
+        double nh = Math.Min(slot.SlotHeight / slot.SlotWidth - ny,
+                             (interBottom - interTop) / slot.SlotWidth + Overscan * 2);
+
+        var source = (nx, ny, nw, nh);
+
+        // Pixel width for a pixel-exact result: the region's on-screen size.
+        int outWidth = (int)Math.Clamp(
+            nw * slot.SlotWidth * _currentZoomFactor * Math.Max(1.0, RasterizationScale),
+            64, RenderBudget.MaxRegionWidth);
+
+        // Skip when the same area is already up at a comparable resolution.
+        if (slot.RegionBitmap is not null &&
+            Math.Abs(slot.RegionSource.X - nx) < 0.01 &&
+            Math.Abs(slot.RegionSource.Y - ny) < 0.01 &&
+            Math.Abs(slot.RegionSource.W - nw) < 0.01 &&
+            !_budget.ShouldResharpen(slot.RegionRenderedWidth, outWidth))
+        {
+            return;
+        }
+
+        if (!slot.TryBeginRegionRender())
+        {
+            return;
+        }
+
+        ulong handle = _documentHandle;
+        int pageIndex = slot.PageIndex;
+
+        var raw = await Task.Run(() =>
+            PageRenderer.RenderRegionRaw(handle, pageIndex, nx, ny, nw, nh, outWidth));
+
+        if (handle != _documentHandle)
+        {
+            slot.EndRegionRender();
+            return;
+        }
+
+        if (raw.Bgra is not null)
+        {
+            slot.SetRegionRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width, source);
+            Diag.Log($"region p{pageIndex}: {nw:F2}x{nh:F2} of page at {raw.Width}x{raw.Height}px");
+        }
+
+        slot.EndRegionRender();
     }
 
     private async void SharpenSlot(PageSlot slot, int targetWidth)

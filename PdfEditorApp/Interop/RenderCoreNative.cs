@@ -198,6 +198,15 @@ internal static partial class RenderCoreNative
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern RenderResult render_uncached(ulong docHandle, int pageIndex, int targetWidth);
 
+    /// <summary>
+    /// Renders only a rectangle of a page, in normalized top-left-origin
+    /// coordinates. Cost tracks the region, so deep zoom stays sharp without
+    /// the whole-page bitmap growing quadratically.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern RenderResult render_region(
+        ulong docHandle, int pageIndex, float x, float y, float w, float h, int outWidth);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern PageSizeArray get_page_sizes(ulong docHandle);
 
