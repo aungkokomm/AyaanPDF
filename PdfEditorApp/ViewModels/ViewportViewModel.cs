@@ -236,7 +236,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void ReportExistingAnnotations()
     {
-        if (_documentHandle == 0 || PageCount == 0)
+        // This sweep runs while the first pages are still rendering on
+        // background threads, which is exactly the race described on
+        // CanReadExistingAnnotations. It is the reason a crash could happen
+        // simply on OPENING a file, before touching anything.
+        if (_documentHandle == 0 || PageCount == 0 || !CanReadExistingAnnotations)
         {
             ExistingAnnotationCount = 0;
             return;
@@ -1531,6 +1535,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Per-page cache of what the file already carries.</summary>
     private readonly Dictionary<int, List<Interop.ExistingAnnotation>> _loadedByPage = new();
 
+    /// <summary>
+    /// Whether the app may read a document's existing annotations.
+    ///
+    /// OFF, because doing so is not currently safe. Reading a page's
+    /// annotations while background threads render the same document
+    /// access-violates inside PDFium and takes the app down with it. There is
+    /// a reproduction, editing_an_annotation_while_the_page_renders_does_not_fault
+    /// in AnnotationInteropTests, which faults reliably; the identical loop
+    /// without the render threads passes, so it is a race rather than anything
+    /// about the edits themselves. The root cause is not found yet: every
+    /// native entry point does hold the global call lock across its PDFium
+    /// work, so something outside that is reaching the same memory.
+    ///
+    /// Everything that WRITES annotations is unaffected and stays on: saving
+    /// still produces real annotation objects, and they still render. What is
+    /// switched off is reading them back, which means marks already in a file
+    /// cannot yet be selected, moved or deleted. They are still visible,
+    /// because PDFium draws them as part of the page.
+    ///
+    /// Turn this back on once the reproduction passes.
+    /// </summary>
+    private const bool CanReadExistingAnnotations = false;
+
     private List<Interop.ExistingAnnotation> LoadedFor(int pageIndex)
     {
         if (_loadedByPage.TryGetValue(pageIndex, out var cached))
@@ -1538,7 +1565,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return cached;
         }
 
-        var list = _documentHandle == 0
+        var list = _documentHandle == 0 || !CanReadExistingAnnotations
             ? new List<Interop.ExistingAnnotation>()
             : Interop.AnnotationLoader.Load(_documentHandle, pageIndex);
         _loadedByPage[pageIndex] = list;

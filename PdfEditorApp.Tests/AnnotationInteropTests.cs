@@ -87,9 +87,33 @@ public class AnnotationInteropTests
     private static extern int delete_annotation(ulong docHandle, int pageIndex, int index);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int save_document(
+        ulong docHandle, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern int set_annotation_bounds(
         ulong docHandle, int pageIndex, int index, int captureWidth,
         float left, float top, float right, float bottom);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RenderResult
+    {
+        public IntPtr Buffer;
+        public nuint Len;
+        public int Width;
+        public int Height;
+        public int Status;
+    }
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern RenderResult render_low_res(ulong docHandle, int pageIndex, int targetWidth);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern RenderResult render_tile(
+        ulong docHandle, int pageIndex, int level, int col, int row);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern void free_render_result(RenderResult result);
 
     private const int OkPdfium = 0;
     private const int Unsupported = 4;
@@ -258,6 +282,178 @@ public class AnnotationInteropTests
         }
         finally
         {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void the_users_reported_sequence_save_reopen_select_drag()
+    {
+        // Highlight, Save As, reopen THE SAVED FILE, click the highlight and
+        // drag it. Reported as an access violation, and the earlier tests all
+        // missed it because none of them saved to a real file and reopened
+        // from that path: they either edited the still-open document or went
+        // through an in-memory byte round trip. The app does neither.
+        string saved = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), $"ayaan-a6b-{Guid.NewGuid():N}.pdf");
+
+        ulong first = OpenFixture();
+        try
+        {
+            var quads = new[] { new HighlightQuad { Left = 300, Top = 300, Right = 700, Bottom = 380 } };
+            var specs = new[]
+            {
+                new HighlightSpec { PageIndex = 0, QuadOffset = 0, QuadCount = 1, R = 255, G = 235, B = 59, A = 200 },
+            };
+            Assert.Equal(OkPdfium, add_highlight_annotations(first, 1000, specs, 1, quads, 1));
+            Assert.Equal(OkPdfium, save_document(first, saved));
+        }
+        finally
+        {
+            close_document(first);
+        }
+
+        Assert.True(System.IO.File.Exists(saved), "the save produced no file");
+
+        // Reopen from the PATH, which is what the app does after a Save As.
+        ulong reopened = open_document(saved);
+        Assert.NotEqual(0UL, reopened);
+        try
+        {
+            // Click: read the page's annotations and pick one.
+            var array = get_annotations(reopened, 0);
+            int index;
+            float left, top, right, bottom;
+            try
+            {
+                Assert.Equal(OkPdfium, array.Status);
+                Assert.Equal(1u, (uint)array.Len);
+                var info = Marshal.PtrToStructure<AnnotationInfo>(array.Items);
+                (index, left, top, right, bottom) = (info.Index, info.Left, info.Top, info.Right, info.Bottom);
+            }
+            finally
+            {
+                free_annotation_array(array);
+            }
+
+            // Drag: commit the move on release.
+            const int CaptureWidth = 1000;
+            const float dx = 0.05f, dy = 0.05f;
+            int status = set_annotation_bounds(
+                reopened, 0, index, CaptureWidth,
+                (left + dx) * CaptureWidth, (top + dy) * CaptureWidth,
+                (right + dx) * CaptureWidth, (bottom + dy) * CaptureWidth);
+            Assert.True(status == OkPdfium || status == Unsupported, $"move returned {status}");
+
+            // And the app re-reads the page straight afterwards.
+            var after = get_annotations(reopened, 0);
+            Assert.Equal(OkPdfium, after.Status);
+            free_annotation_array(after);
+        }
+        finally
+        {
+            close_document(reopened);
+            try { System.IO.File.Delete(saved); } catch { /* best effort */ }
+        }
+    }
+
+    [Fact]
+    public void adding_and_deleting_repeatedly_does_not_fault()
+    {
+        // The same loop as the concurrency test with the render threads taken
+        // away, to separate two explanations for the same crash: a genuine
+        // race, or a bug in add-delete-re-read that no earlier test hit
+        // because they all ran the cycle exactly once.
+        ulong handle = OpenFixture();
+        try
+        {
+            var quads = new[] { new HighlightQuad { Left = 300, Top = 300, Right = 700, Bottom = 380 } };
+            var specs = new[]
+            {
+                new HighlightSpec { PageIndex = 0, QuadOffset = 0, QuadCount = 1, R = 255, G = 235, B = 59, A = 200 },
+            };
+
+            for (int round = 0; round < 25; round++)
+            {
+                Assert.Equal(OkPdfium, add_highlight_annotations(handle, 1000, specs, 1, quads, 1));
+
+                var array = get_annotations(handle, 0);
+                Assert.Equal(OkPdfium, array.Status);
+                Assert.True(array.Items != IntPtr.Zero, $"round {round}: no annotations after adding one");
+                int index = Marshal.PtrToStructure<AnnotationInfo>(array.Items).Index;
+                free_annotation_array(array);
+
+                set_annotation_bounds(handle, 0, index, 1000, 350, 350, 750, 430);
+                Assert.Equal(OkPdfium, delete_annotation(handle, 0, index));
+            }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact(Skip = "REPRODUCES A REAL CRASH. Enable to work on it; it aborts the whole run. " +
+                 "Reading a page's annotations while background threads render the same " +
+                 "document access-violates (0xC0000005) inside get_annotations. The identical " +
+                 "loop without the render threads passes, see the test above, so it is a race " +
+                 "and not the add-delete cycle. Root cause not yet found: every native entry " +
+                 "point does hold CALL_LOCK across its PDFium work.")]
+    public void editing_an_annotation_while_the_page_renders_does_not_fault()
+    {
+        // The last interaction the other tests do not cover, and the only one
+        // left that matches the reported crash.
+        //
+        // The app never edits a document in isolation: base renders, the
+        // sharpen pass and tile renders are all running on background threads
+        // against the SAME document while the click, drag and commit happen on
+        // the UI thread. PDFium is not thread-safe, so everything that touches
+        // it has to serialize, and this is what proves it does. Reasoning
+        // about the locks is not proof; a fault here would be.
+        ulong handle = OpenFixture();
+        using var stop = new System.Threading.CancellationTokenSource();
+
+        var renderers = new List<System.Threading.Tasks.Task>();
+        for (int t = 0; t < 3; t++)
+        {
+            renderers.Add(System.Threading.Tasks.Task.Run(() =>
+            {
+                var rng = new Random(Environment.CurrentManagedThreadId);
+                while (!stop.IsCancellationRequested)
+                {
+                    free_render_result(render_low_res(handle, rng.Next(0, 20), 900));
+                    free_render_result(render_tile(handle, 0, 4, rng.Next(0, 16), rng.Next(0, 16)));
+                }
+            }));
+        }
+
+        try
+        {
+            var quads = new[] { new HighlightQuad { Left = 300, Top = 300, Right = 700, Bottom = 380 } };
+            var specs = new[]
+            {
+                new HighlightSpec { PageIndex = 0, QuadOffset = 0, QuadCount = 1, R = 255, G = 235, B = 59, A = 200 },
+            };
+
+            // Add, read, move and delete repeatedly while the renders hammer
+            // the same document.
+            for (int round = 0; round < 25; round++)
+            {
+                Assert.Equal(OkPdfium, add_highlight_annotations(handle, 1000, specs, 1, quads, 1));
+
+                var array = get_annotations(handle, 0);
+                Assert.Equal(OkPdfium, array.Status);
+                int index = Marshal.PtrToStructure<AnnotationInfo>(array.Items).Index;
+                free_annotation_array(array);
+
+                set_annotation_bounds(handle, 0, index, 1000, 350, 350, 750, 430);
+                Assert.Equal(OkPdfium, delete_annotation(handle, 0, index));
+            }
+        }
+        finally
+        {
+            stop.Cancel();
+            System.Threading.Tasks.Task.WaitAll([.. renderers]);
             close_document(handle);
         }
     }
