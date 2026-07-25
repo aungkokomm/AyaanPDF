@@ -85,8 +85,16 @@ public class InkPresetsTests
     [Fact]
     public void matching_pen_and_highlighter_names_pair_up()
     {
-        var green = InkPresets.Colors.Single(c => c.Name == "Green");
-        Assert.Equal("Green", InkPresets.HighlightFor(green).Name);
+        var lime = InkPresets.Colors.Single(c => c.Name == "Lime");
+        Assert.Equal("Lime", InkPresets.HighlightFor(lime).Name);
+    }
+
+    [Fact]
+    public void the_four_highlighter_colours_are_the_requested_set()
+    {
+        Assert.Equal(
+            new[] { "Lime", "Orange", "Pink", "Red" },
+            InkPresets.HighlightColors.Select(c => c.Name).ToArray());
     }
 
     [Fact]

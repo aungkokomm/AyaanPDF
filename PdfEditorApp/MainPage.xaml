@@ -54,6 +54,7 @@
             <ColumnDefinition Width="Auto" />
             <ColumnDefinition x:Name="ThumbnailColumn" Width="Auto" />
             <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
         <ScrollView
@@ -274,26 +275,49 @@
             Empty state. Without it a fresh launch is an unexplained grey void
             with no indication that anything works or what to do next.
         -->
-        <StackPanel Grid.Column="2" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10"
-                    IsHitTestVisible="False"
-                    Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
-            <FontIcon Glyph="&#xEA90;" FontSize="40" Foreground="#8AFFFFFF" HorizontalAlignment="Center" />
-            <TextBlock Text="No document open" Foreground="#C8FFFFFF" HorizontalAlignment="Center"
-                       Style="{StaticResource SubtitleTextBlockStyle}" />
-            <TextBlock Text="Ctrl+O to open a PDF" Foreground="#8AFFFFFF" HorizontalAlignment="Center"
-                       Style="{StaticResource BodyTextBlockStyle}" />
-        </StackPanel>
+        <!--
+            Empty state. Hit-testable and double-tappable, so the obvious
+            gesture on a blank canvas actually opens a file.
+        -->
+        <Border Grid.Column="2" Background="Transparent"
+                DoubleTapped="EmptyState_DoubleTapped"
+                Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10">
+                <FontIcon Glyph="&#xEA90;" FontSize="40" Foreground="#8AFFFFFF" HorizontalAlignment="Center" />
+                <TextBlock Text="No document open" Foreground="#C8FFFFFF" HorizontalAlignment="Center"
+                           Style="{StaticResource SubtitleTextBlockStyle}" />
+                <TextBlock Text="Double-click here, or press Ctrl+O" Foreground="#8AFFFFFF"
+                           HorizontalAlignment="Center" Style="{StaticResource BodyTextBlockStyle}" />
+            </StackPanel>
+        </Border>
 
         <!--
             Tool rail: icons only, vertical, hugging the left edge. The tools
             stay a glanceable column the way a canvas app expects, and cost a
             fixed 44px of overlay instead of a full toolbar row of height.
         -->
-        <Border Grid.Column="0" VerticalAlignment="Center" Margin="12,0,12,0"
+        <Border x:Name="ToolRail" Grid.Column="0" VerticalAlignment="Center" Margin="12,0,12,0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="10" Padding="4">
             <StackPanel Orientation="Vertical" Spacing="2">
+                <!--
+                    Drag handle. Dragging the rail DOCKS it to the nearer side
+                    rather than leaving it floating anywhere: a floating rail
+                    would sit on top of the page, which is the overlap problem
+                    the column layout exists to prevent. Docking keeps it
+                    movable and keeps non-overlap guaranteed by layout.
+                -->
+                <Border x:Name="RailGrip" Height="18" Background="Transparent"
+                        ToolTipService.ToolTip="Drag to move the toolbar to the other side"
+                        PointerPressed="RailGrip_PointerPressed"
+                        PointerMoved="RailGrip_PointerMoved"
+                        PointerReleased="RailGrip_PointerReleased"
+                        PointerCaptureLost="RailGrip_PointerReleased">
+                    <Rectangle Width="18" Height="3" RadiusX="2" RadiusY="2"
+                               VerticalAlignment="Center" HorizontalAlignment="Center"
+                               Fill="{ThemeResource TextFillColorTertiaryBrush}" />
+                </Border>
                 <Button x:Name="HandToolButton" Click="HandTool_Click" ToolTipService.ToolTip="Hand (hold Space)"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE7C9;" FontSize="16" />
@@ -402,6 +426,7 @@
                             <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
                             <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
                             <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
                             <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
                         </MenuFlyout>
                     </Button.Flyout>

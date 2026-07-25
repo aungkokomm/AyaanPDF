@@ -7,8 +7,8 @@
 ; Build both steps at once with:  pwsh -File tools\build_installer.ps1
 ; Or compile alone with:          ISCC.exe installer\PdfEditor.iss   (after publishing first)
 
-#define AppName    "PdfEditor"
-#define AppVersion "1.14.0"
+#define AppName    "Ayaan PDF"
+#define AppVersion "1.15.0"
 #define Publisher  "Aung Ko Ko"
 #define ExeName    "PdfEditorApp.exe"
 #define SrcDir     "..\PdfEditorApp\publish"
@@ -26,7 +26,7 @@ DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
 OutputDir=..\dist
-OutputBaseFilename=PdfEditor-Setup-{#AppVersion}
+OutputBaseFilename=AyaanPDF-Setup-{#AppVersion}
 SetupIconFile={#AppIcon}
 UninstallDisplayIcon={app}\{#ExeName}
 UninstallDisplayName={#AppName}
@@ -75,3 +75,4 @@ Filename: "{app}\{#ExeName}"; Description: "Launch {#AppName}"; Flags: nowait po
 ; NOTE: deliberately no [UninstallDelete] entry — the app has no persistent
 ; per-user state yet (annotations are in-memory only; nothing is written to
 ; LocalAppData). Revisit once annotations/settings gain real persistence.
+

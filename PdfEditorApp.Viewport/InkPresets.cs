@@ -19,12 +19,17 @@ public readonly record struct InkWidth(string Name, double Value);
 /// </summary>
 public static class InkPresets
 {
+    /// <summary>
+    /// Pen colours. The first four deliberately share NAMES with the
+    /// highlighter set, because picking a colour maps pen to highlighter by
+    /// name; a pen colour with no namesake falls back to the default.
+    /// </summary>
     public static IReadOnlyList<InkColor> Colors { get; } =
     [
         new("Red", "#FFE00000"),
-        new("Yellow", "#FFFFD400"),
-        new("Green", "#FF00A650"),
-        new("Blue", "#FF0072C6"),
+        new("Orange", "#FFFF7A00"),
+        new("Lime", "#FF7CB800"),
+        new("Pink", "#FFE0308A"),
         new("Black", "#FF1A1A1A"),
     ];
 
@@ -39,10 +44,10 @@ public static class InkPresets
     /// <summary>Highlighter colours carry alpha, so text stays readable underneath.</summary>
     public static IReadOnlyList<InkColor> HighlightColors { get; } =
     [
-        new("Yellow", "#88FFFF00"),
-        new("Green", "#8800FF66"),
-        new("Blue", "#8800AAFF"),
-        new("Pink", "#88FF66CC"),
+        new("Lime", "#88CCFF00"),
+        new("Orange", "#88FF9500"),
+        new("Pink", "#88FF4FA3"),
+        new("Red", "#88FF2D2D"),
     ];
 
     /// <summary>

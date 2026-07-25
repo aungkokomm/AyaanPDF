@@ -407,7 +407,59 @@ public sealed partial class MainPage : Page
         return saved;
     }
 
+    private void EmptyState_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e) =>
+        OpenFile_Click(this, null!);
+
     private void Exit_Click(object sender, RoutedEventArgs e) => App.Window.Close();
+
+    /// <summary>
+    /// About dialog. Reports the app version and the render core's, since the
+    /// two ship together but are built separately and a mismatched pair is
+    /// exactly the sort of thing a bug report needs to state.
+    /// </summary>
+    private async void About_Click(object sender, RoutedEventArgs e)
+    {
+        var asm = System.Reflection.Assembly.GetExecutingAssembly();
+        string version = asm.GetName().Version?.ToString(3) ?? "unknown";
+        string informational = asm
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion ?? version;
+
+        string core = "not loaded";
+        try
+        {
+            string dll = System.IO.Path.Combine(AppContext.BaseDirectory, "render_core.dll");
+            if (System.IO.File.Exists(dll))
+            {
+                core = $"{new System.IO.FileInfo(dll).Length / 1024} KB, " +
+                       $"{System.IO.File.GetLastWriteTime(dll):yyyy-MM-dd}";
+            }
+        }
+        catch
+        {
+            // Version reporting must never be the thing that breaks the app.
+        }
+
+        var body = new StackPanel { Spacing = 6 };
+        body.Children.Add(new TextBlock { Text = AppInfo.Name, Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"] });
+        body.Children.Add(new TextBlock { Text = $"Version {informational}" });
+        body.Children.Add(new TextBlock { Text = $"Render core: {core}", Opacity = 0.75 });
+        body.Children.Add(new TextBlock
+        {
+            Text = "PDF rendering by PDFium.",
+            Opacity = 0.75,
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        await new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = $"About {AppInfo.Name}",
+            Content = body,
+            CloseButtonText = "Close",
+        }.ShowAsync();
+    }
 
     /// <summary>
     /// Decides whether the window may close, prompting to save unsaved edits.
@@ -470,6 +522,72 @@ public sealed partial class MainPage : Page
     /// is not expressible, and the ScrollView's own SizeChanged drives the
     /// refit, so this does not have to reason about layout timing either.
     /// </summary>
+    // ---------------- Movable tool rail ----------------
+
+    private bool _isDraggingRail;
+    private double _railDragStartX;
+
+    /// <summary>
+    /// The rail docks to a SIDE rather than floating freely.
+    ///
+    /// A rail that can sit anywhere sits on top of the page, which is the
+    /// overlap this layout was rebuilt to make impossible. Snapping to
+    /// whichever half of the window it is dropped in keeps it movable while
+    /// the grid keeps guaranteeing that nothing covers the document.
+    /// </summary>
+    private void RailGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        _isDraggingRail = true;
+        _railDragStartX = e.GetCurrentPoint(RootGrid).Position.X;
+        RailGrip.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void RailGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_isDraggingRail)
+        {
+            return;
+        }
+
+        // Nudge the rail with the pointer so the drag reads as direct
+        // manipulation rather than a gesture with a delayed result.
+        double dx = e.GetCurrentPoint(RootGrid).Position.X - _railDragStartX;
+        ToolRail.RenderTransform = new TranslateTransform { X = dx };
+        e.Handled = true;
+    }
+
+    private void RailGrip_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_isDraggingRail)
+        {
+            return;
+        }
+
+        _isDraggingRail = false;
+        RailGrip.ReleasePointerCapture(e.Pointer);
+        ToolRail.RenderTransform = null;
+
+        DockRail(e.GetCurrentPoint(RootGrid).Position.X > RootGrid.ActualWidth / 2);
+        e.Handled = true;
+    }
+
+    /// <summary>Moves the rail to the left (column 0) or right (column 3) edge.</summary>
+    private void DockRail(bool right)
+    {
+        Grid.SetColumn(ToolRail, right ? 3 : 0);
+
+        // The pages panel belongs beside the rail, not stranded on the far
+        // side of the document from it.
+        Grid.SetColumn(ThumbnailPanel, right ? 3 : 1);
+        ThumbnailPanel.Margin = right ? new Thickness(12, 12, 0, 12) : new Thickness(0, 12, 12, 12);
+
+        if (_autoFit)
+        {
+            DispatcherQueue.TryEnqueue(() => FitToWidth(animate: true));
+        }
+    }
+
     private void ToggleThumbnails() =>
         ThumbnailPanel.Visibility =
             ThumbnailPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
@@ -737,6 +855,19 @@ public sealed partial class MainPage : Page
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
                 SearchBox.SelectAll();
+                e.Handled = true;
+                break;
+
+            // Ctrl+O and Ctrl+S are handled HERE, not only as accelerators on
+            // the menu items: a KeyboardAccelerator inside a MenuFlyout is only
+            // live while that flyout is open, so from the canvas they did
+            // nothing at all.
+            case VirtualKey.O when _isCtrlDown:
+                OpenFile_Click(this, null!);
+                e.Handled = true;
+                break;
+            case VirtualKey.S when _isCtrlDown:
+                SaveAs_Click(this, null!);
                 e.Handled = true;
                 break;
 
