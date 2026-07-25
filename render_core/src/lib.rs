@@ -1296,6 +1296,190 @@ fn fill_text_field_inner(doc_handle: u64, field_name: *const c_char, value: *con
 // search highlighting without further PDFium calls.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// Reading the annotations a document already carries.
+//
+// Until this existed the app could only ever see marks it had made itself
+// in the current session: highlights and ink were flattened into the page
+// content on save, so reopening your own file gave you pixels, and a file
+// annotated in Acrobat looked completely unmarked. Everything editable
+// about an annotation starts with being able to read it back.
+// ---------------------------------------------------------------------
+
+/// The annotation kinds the app can display and edit. Anything else in the
+/// file is reported as Other so it can be listed and left strictly alone
+/// rather than silently dropped on the next save.
+pub const ANNOT_OTHER: i32 = 0;
+pub const ANNOT_TEXT: i32 = 1;
+pub const ANNOT_HIGHLIGHT: i32 = 2;
+pub const ANNOT_INK: i32 = 3;
+pub const ANNOT_STAMP: i32 = 4;
+pub const ANNOT_SQUARE: i32 = 5;
+pub const ANNOT_FREE_TEXT: i32 = 6;
+pub const ANNOT_UNDERLINE: i32 = 7;
+pub const ANNOT_STRIKEOUT: i32 = 8;
+pub const ANNOT_SQUIGGLY: i32 = 9;
+
+#[repr(C)]
+pub struct AnnotationInfo {
+    /// Position in the page's annotation list. This is the handle passed back
+    /// to update_annotation and delete_annotation, so it is only valid until
+    /// the page's annotations are next added to or removed from.
+    pub index: i32,
+
+    /// One of the ANNOT_* constants.
+    pub subtype: i32,
+
+    /// Bounds with a TOP-LEFT origin, both axes divided by the page WIDTH.
+    ///
+    /// The same convention the app normalizes its own annotations into, so
+    /// these drop straight into the overlay model. Dividing both axes by the
+    /// width (rather than each by its own extent) keeps the scale uniform, so
+    /// a square stays square.
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+
+    /// 0xRRGGBB, or -1 when the annotation carries no colour of its own.
+    pub color: i32,
+
+    /// 0.0 to 1.0, from the colour's alpha. 1.0 when there is no colour.
+    pub opacity: f32,
+}
+
+#[repr(C)]
+pub struct AnnotationArray {
+    pub items: *mut AnnotationInfo,
+    pub len: usize,
+    /// 0 = ok, 1 = invalid input / unknown handle, 2 = panic.
+    pub status: i32,
+}
+
+impl AnnotationArray {
+    fn failure(status: i32) -> Self {
+        AnnotationArray { items: std::ptr::null_mut(), len: 0, status }
+    }
+}
+
+/// Every annotation on a page, in document order.
+///
+/// A page with no annotations is a successful, EMPTY result, not a failure:
+/// most pages of most documents are exactly that, and making it an error
+/// would put an error path on the common case.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_annotations(doc_handle: u64, page_index: i32) -> AnnotationArray {
+    if doc_handle == 0 || page_index < 0 {
+        return AnnotationArray::failure(STATUS_INVALID_INPUT);
+    }
+
+    panic::catch_unwind(|| get_annotations_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| AnnotationArray::failure(STATUS_PANIC))
+}
+
+fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return AnnotationArray::failure(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return AnnotationArray::failure(STATUS_INVALID_INPUT);
+    };
+
+    let page_w = page.width().value;
+    let page_top = page.boundaries().media().map(|b| b.bounds.top().value).unwrap_or(page.height().value);
+    let page_left = page.boundaries().media().map(|b| b.bounds.left().value).unwrap_or(0.0);
+    if page_w <= 0.0 {
+        return AnnotationArray::failure(STATUS_INVALID_INPUT);
+    }
+
+    let annotations = page.annotations();
+    let mut items = Vec::with_capacity(annotations.len() as usize);
+
+    for i in 0..annotations.len() {
+        let Ok(annotation) = annotations.get(i) else {
+            continue;
+        };
+
+        let subtype = match annotation.annotation_type() {
+            PdfPageAnnotationType::Text => ANNOT_TEXT,
+            PdfPageAnnotationType::Highlight => ANNOT_HIGHLIGHT,
+            PdfPageAnnotationType::Ink => ANNOT_INK,
+            PdfPageAnnotationType::Stamp => ANNOT_STAMP,
+            PdfPageAnnotationType::Square => ANNOT_SQUARE,
+            PdfPageAnnotationType::FreeText => ANNOT_FREE_TEXT,
+            PdfPageAnnotationType::Underline => ANNOT_UNDERLINE,
+            PdfPageAnnotationType::Strikeout => ANNOT_STRIKEOUT,
+            PdfPageAnnotationType::Squiggly => ANNOT_SQUIGGLY,
+            _ => ANNOT_OTHER,
+        };
+
+        let Ok(bounds) = annotation.bounds() else {
+            continue;
+        };
+
+        // PDF is bottom-left origin and Y-up; the app is top-left and Y-down.
+        let left = (bounds.left().value - page_left) / page_w;
+        let right = (bounds.right().value - page_left) / page_w;
+        let top = (page_top - bounds.top().value) / page_w;
+        let bottom = (page_top - bounds.bottom().value) / page_w;
+
+        // Markup annotations carry their colour as the fill; a shape drawn as
+        // an outline carries it as the stroke. Preferring fill and falling
+        // back keeps one field meaningful for both.
+        let colour = annotation
+            .fill_color()
+            .or_else(|_| annotation.stroke_color())
+            .ok();
+
+        let (color, opacity) = match colour {
+            Some(c) => (
+                ((c.red() as i32) << 16) | ((c.green() as i32) << 8) | c.blue() as i32,
+                c.alpha() as f32 / 255.0,
+            ),
+            None => (-1, 1.0),
+        };
+
+        items.push(AnnotationInfo {
+            index: i as i32,
+            subtype,
+            left,
+            top,
+            right,
+            bottom,
+            color,
+            opacity,
+        });
+    }
+
+    let len = items.len();
+    if len == 0 {
+        return AnnotationArray { items: std::ptr::null_mut(), len: 0, status: STATUS_OK_PDFIUM };
+    }
+
+    let boxed = items.into_boxed_slice();
+    AnnotationArray {
+        items: Box::into_raw(boxed) as *mut AnnotationInfo,
+        len,
+        status: STATUS_OK_PDFIUM,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn free_annotation_array(array: AnnotationArray) {
+    if array.items.is_null() || array.len == 0 {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(std::slice::from_raw_parts_mut(array.items, array.len));
+    }
+}
+
 #[repr(C)]
 pub struct CharInfo {
     pub left: f32,
@@ -2624,6 +2808,87 @@ mod tests {
         close_document(restored_again);
         close_document(handle);
         free_byte_buffer(snap);
+    }
+
+    /// Collects a page's annotations and frees the FFI array.
+    fn read_annotations(handle: u64, page_index: i32) -> Vec<(i32, i32, f32, f32, f32, f32)> {
+        let array = get_annotations(handle, page_index);
+        assert_eq!(array.status, STATUS_OK_PDFIUM);
+        let out = if array.items.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(array.items, array.len) }
+                .iter()
+                .map(|a| (a.index, a.subtype, a.left, a.top, a.right, a.bottom))
+                .collect()
+        };
+        free_annotation_array(array);
+        out
+    }
+
+    #[test]
+    fn a_clean_page_reports_no_annotations_rather_than_failing() {
+        // Most pages of most documents have none. An error here would put an
+        // error path on the overwhelmingly common case.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let array = get_annotations(handle, 0);
+        assert_eq!(array.status, STATUS_OK_PDFIUM);
+        assert_eq!(array.len, 0);
+        free_annotation_array(array);
+        close_document(handle);
+    }
+
+    #[test]
+    fn annotations_can_be_read_back_after_being_added() {
+        // The capability the app never had: seeing markup that is already in
+        // the file. Notes are the one kind already written as real annotation
+        // objects, so they are what proves the read path end to end.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert!(read_annotations(handle, 0).is_empty());
+
+        let text = std::ffi::CString::new("a note").unwrap();
+        let notes = [BurnNote { page_index: 0, x: 100.0, y: 150.0, text: text.as_ptr() }];
+        assert_eq!(
+            add_note_annotations(handle, 1000, notes.as_ptr(), notes.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let found = read_annotations(handle, 0);
+        println!("READ BACK: {found:?}");
+        assert_eq!(found.len(), 1, "the note just added should be readable");
+        assert_eq!(found[0].0, 0, "first annotation on the page is index 0");
+        assert_eq!(found[0].1, ANNOT_TEXT);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn read_back_bounds_land_where_the_annotation_was_put() {
+        // Guards the coordinate flip. PDF is bottom-left origin and Y-up, the
+        // app is top-left and Y-down, and both axes are normalized by the page
+        // WIDTH. Getting this wrong would put every loaded annotation in the
+        // wrong place, mirrored vertically, which is easy to miss on a mark
+        // that happens to sit near the middle of the page.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // Place a note near the TOP of the page in capture space.
+        let text = std::ffi::CString::new("top").unwrap();
+        let notes = [BurnNote { page_index: 0, x: 0.0, y: 0.0, text: text.as_ptr() }];
+        assert_eq!(
+            add_note_annotations(handle, 1000, notes.as_ptr(), notes.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        let (_, _, left, top, _, bottom) = found[0];
+        println!("BOUNDS: left={left} top={top} bottom={bottom}");
+
+        assert!(left.abs() < 0.01, "placed at x=0, read back at {left}");
+        assert!(top.abs() < 0.01, "placed at the top, read back at {top}");
+        assert!(bottom > top, "top must be ABOVE bottom in a Y-down space");
+
+        close_document(handle);
     }
 
     #[test]
