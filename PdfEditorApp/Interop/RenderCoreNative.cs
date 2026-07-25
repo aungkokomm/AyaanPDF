@@ -207,6 +207,15 @@ internal static partial class RenderCoreNative
     public static extern RenderResult render_region(
         ulong docHandle, int pageIndex, float x, float y, float w, float h, int outWidth);
 
+    /// <summary>
+    /// One 256x256 tile of a page's level-of-detail pyramid, served from
+    /// render_core's byte-budgeted cache when already rendered. This is what
+    /// makes panning at deep zoom cheap: tiles still on screen are reused.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern RenderResult render_tile(
+        ulong docHandle, int pageIndex, int level, int col, int row);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern PageSizeArray get_page_sizes(ulong docHandle);
 

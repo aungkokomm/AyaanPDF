@@ -45,6 +45,10 @@ internal static class PageRenderer
     public static RawPageRender RenderUncachedRaw(ulong docHandle, int pageIndex, int targetWidth) =>
         ToRaw(RenderCoreNative.render_uncached(docHandle, pageIndex, targetWidth));
 
+    /// <summary>One tile of a page's LOD pyramid, cached in render_core.</summary>
+    public static RawPageRender RenderTileRaw(ulong docHandle, int pageIndex, int level, int col, int row) =>
+        ToRaw(RenderCoreNative.render_tile(docHandle, pageIndex, level, col, row));
+
     /// <summary>Renders one rectangle of a page, for deep zoom.</summary>
     public static RawPageRender RenderRegionRaw(
         ulong docHandle, int pageIndex, double x, double y, double w, double h, int outWidth) =>

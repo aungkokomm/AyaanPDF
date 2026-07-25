@@ -57,6 +57,16 @@
             <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
+        <!--
+            MaxZoomFactor is 64, i.e. 6400%, matching Acrobat. It used to be 8
+            because a whole-page bitmap grows with the SQUARE of the zoom: past
+            a few hundred percent it hit the render caps and the page was simply
+            upscaled, so a higher ceiling would only have bought blurrier text.
+            Tiles removed that reason. Only the tiles on screen are rendered, so
+            the cost is about one viewport at ANY zoom and every tile is
+            pixel-exact. The ceiling can now sit where the user wants it rather
+            than where the renderer gave out.
+        -->
         <ScrollView
             x:Name="PageScroller"
             Grid.Column="2"
@@ -66,7 +76,7 @@
             HorizontalScrollMode="Enabled"
             VerticalScrollMode="Enabled"
             MinZoomFactor="0.1"
-            MaxZoomFactor="8"
+            MaxZoomFactor="64"
             ViewChanged="PageScroller_ViewChanged"
             SizeChanged="PageScroller_SizeChanged">
             <!--
@@ -125,17 +135,31 @@
                                     <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
 
                                     <!--
-                                        Deep-zoom overlay: a pixel-exact render
-                                        of just the visible rectangle, laid over
-                                        the stretched full-page bitmap. Sized
-                                        and positioned in slot DIPs, so it lines
-                                        up with the page underneath exactly.
+                                        Deep-zoom tiles, laid over the stretched
+                                        full-page bitmap so the page underneath
+                                        shows through until each tile arrives.
+                                        That is the progressive effect: the view
+                                        is never blank, it just gets sharper.
+
+                                        Positions are slot DIPs, already
+                                        multiplied, so the tiles line up with
+                                        the page exactly and no transform sits
+                                        between layout and geometry.
                                     -->
-                                    <Image Source="{x:Bind RegionBitmap, Mode=OneWay}" Stretch="Fill"
-                                           HorizontalAlignment="Left" VerticalAlignment="Top"
-                                           Width="{x:Bind RegionPlacement.Width, Mode=OneWay}"
-                                           Height="{x:Bind RegionPlacement.Height, Mode=OneWay}"
-                                           Margin="{x:Bind local:MainPage.Offset(RegionPlacement.Left, RegionPlacement.Top), Mode=OneWay}" />
+                                    <ItemsControl ItemsSource="{x:Bind Tiles}" IsHitTestVisible="False"
+                                                  HorizontalAlignment="Left" VerticalAlignment="Top">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="viewmodels:PageTile">
+                                                <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill"
+                                                       Width="{x:Bind Size}" Height="{x:Bind Size}"
+                                                       HorizontalAlignment="Left" VerticalAlignment="Top"
+                                                       Margin="{x:Bind local:MainPage.Offset(Left, Top)}" />
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
 
                                     <!--
                                         Overlay layer for this page.

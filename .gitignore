@@ -12,3 +12,8 @@ render_core/target/
 render_core/vendor/pdfium/pdfium.dll
 
 burn*.log
+diag.log
+
+# Disposable installs used to verify the real installer payload, never the
+# live installed copy.
+testrun/

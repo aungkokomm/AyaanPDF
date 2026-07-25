@@ -57,7 +57,10 @@ public sealed partial class MainPage : Page
         };
 
         // Lets the app be driven headlessly for diagnosis: set
-        // PDFEDITOR_AUTOOPEN to a PDF path and it loads on startup.
+        // PDFEDITOR_AUTOOPEN to a PDF path and it loads on startup, and
+        // PDFEDITOR_AUTOZOOM to a factor to zoom there once it has settled.
+        // Deep zoom is where the interesting render behaviour lives, and
+        // without this it can only be reached by hand.
         Loaded += (_, _) =>
         {
             string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
@@ -66,6 +69,11 @@ public sealed partial class MainPage : Page
                 ViewModel.OpenDocument(probe);
             }
 
+            string zooms = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOZOOM") ?? "";
+            if (zooms.Length > 0)
+            {
+                ScheduleAutoZoom(zooms);
+            }
         };
         Unloaded += (_, _) =>
         {
@@ -75,6 +83,62 @@ public sealed partial class MainPage : Page
             ViewModel.ScrollToPageRequested -= OnScrollToPageRequested;
             ViewModel.Dispose();
         };
+    }
+
+    /// <summary>
+    /// Held in a field, not a local: a DispatcherQueueTimer that nothing
+    /// references is collected before it ever ticks.
+    /// </summary>
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _autoZoomTimer;
+
+    /// <summary>
+    /// Steps through a comma-separated list of zoom factors once the document
+    /// has laid out, for PDFEDITOR_AUTOZOOM.
+    ///
+    /// A list rather than a single value because the interesting behaviour is
+    /// in the TRANSITIONS: zooming in hands the page to the tile grid, and
+    /// zooming back out has to hand it back and re-sharpen. A single zoom can
+    /// only ever show half of that.
+    ///
+    /// Delays rather than events, because the state worth reading is after the
+    /// debounced render pass has run, not merely after layout.
+    /// </summary>
+    private void ScheduleAutoZoom(string factors)
+    {
+        var steps = new Queue<float>();
+        foreach (string part in factors.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (float.TryParse(part.Trim(), System.Globalization.CultureInfo.InvariantCulture, out float f)
+                && f > 0)
+            {
+                steps.Enqueue(f);
+            }
+        }
+
+        if (steps.Count == 0)
+        {
+            return;
+        }
+
+        _autoZoomTimer = DispatcherQueue.CreateTimer();
+        _autoZoomTimer.Interval = TimeSpan.FromSeconds(3);
+        _autoZoomTimer.IsRepeating = true;
+        _autoZoomTimer.Tick += (t, _) =>
+        {
+            if (steps.Count == 0)
+            {
+                t.Stop();
+                return;
+            }
+
+            float target = steps.Dequeue();
+            float clamped = (float)Math.Clamp(
+                (double)target, (double)PageScroller.MinZoomFactor, (double)PageScroller.MaxZoomFactor);
+            PageScroller.ZoomTo(clamped, null,
+                new ScrollingZoomOptions(ScrollingAnimationMode.Disabled, ScrollingSnapPointsMode.Ignore));
+            Diag.Log($"autozoom: requested {target} applied {clamped}");
+        };
+        _autoZoomTimer.Start();
     }
 
     /// <summary>

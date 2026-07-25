@@ -141,4 +141,63 @@ public class RenderBudgetTests
         Assert.Equal((-1, -1), RenderBudget.Widen(-1, -1, margin: 2, pageCount: 20));
         Assert.Equal((-1, -1), RenderBudget.Widen(0, 3, margin: 2, pageCount: 0));
     }
+
+    // ---------------- When tiles take over ----------------
+
+    [Fact]
+    public void a_whole_page_render_is_kept_while_it_is_still_exact()
+    {
+        // 800 DIP page at 2x on a 150% display wants 2400px, well inside the
+        // 4200px cap, so one bitmap is both exact and cheaper than a grid.
+        Assert.False(Budget.NeedsTiles(800, zoom: 2.0, rasterizationScale: 1.5, aspect: 1.29));
+    }
+
+    [Fact]
+    public void tiles_take_over_once_the_page_would_be_upscaled()
+    {
+        // 800 * 8 * 1.5 = 9600px wanted against a 4200px cap: everything past
+        // the cap is upscaling, which is exactly the soft text tiles exist to
+        // remove.
+        Assert.True(Budget.NeedsTiles(800, zoom: 8.0, rasterizationScale: 1.5, aspect: 1.29));
+    }
+
+    [Fact]
+    public void the_switch_tracks_the_caps_rather_than_a_fixed_zoom()
+    {
+        // The same zoom that needs tiles under the shipping caps must not need
+        // them once the whole-page cap is raised past what the screen wants.
+        var generous = new RenderBudget(maxSharpWidth: 20000, maxSharpPixels: 800_000_000);
+
+        Assert.True(Budget.NeedsTiles(800, zoom: 8.0, rasterizationScale: 1.5, aspect: 1.29));
+        Assert.False(generous.NeedsTiles(800, zoom: 8.0, rasterizationScale: 1.5, aspect: 1.29));
+    }
+
+    [Fact]
+    public void the_area_cap_can_trigger_tiles_at_a_legal_width()
+    {
+        // A panoramic page: 3000px wide is under the width cap, but at aspect 6
+        // that is 18000px tall and 54M pixels, so the AREA cap binds and the
+        // page has outgrown a single bitmap even though its width has not.
+        Assert.True(Budget.NeedsTiles(2000, zoom: 1.5, rasterizationScale: 1.0, aspect: 6.0));
+    }
+
+    [Fact]
+    public void a_page_with_no_width_never_asks_for_tiles()
+    {
+        // Slots exist before their size is known; tiling an unsized page would
+        // divide by zero in the grid.
+        Assert.False(Budget.NeedsTiles(0, zoom: 8.0, rasterizationScale: 2.0, aspect: 1.29));
+    }
+
+    [Fact]
+    public void the_switch_has_a_dead_zone_so_it_cannot_flicker()
+    {
+        // Zoom exactly at the cap must stay on the whole-page path, and stay
+        // there for a sliver beyond it, or a view parked on the boundary would
+        // flip between the two renderers on every pass.
+        // 4200px cap / 800 DIP / 1.0 scale = zoom 5.25.
+        Assert.False(Budget.NeedsTiles(800, zoom: 5.25, rasterizationScale: 1.0, aspect: 1.29));
+        Assert.False(Budget.NeedsTiles(800, zoom: 5.30, rasterizationScale: 1.0, aspect: 1.29));
+        Assert.True(Budget.NeedsTiles(800, zoom: 6.00, rasterizationScale: 1.0, aspect: 1.29));
+    }
 }

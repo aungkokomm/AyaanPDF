@@ -45,26 +45,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private const int LowResWidth = 200;
     private const int ThumbnailWidth = 120;
     private const int MinRenderWidth = 100;
-    private const int MaxRenderWidth = 6000;
-
-    private static readonly TimeSpan RenderSettleDelay = TimeSpan.FromMilliseconds(150);
-
     private readonly DispatcherQueue _dispatcherQueue;
 
-    private DispatcherQueueTimer? _pollTimer;
-    private DispatcherQueueTimer? _renderSettleTimer;
-
     private ulong _documentHandle;
-    private ulong _pendingHighResRequestId;
-    private bool _viewportSizeKnown;
-    private double _viewportWidth;
-    private double _viewportHeight;
     private double _currentZoomFactor = 1.0;
-    private bool _hasEstablishedInitialView;
-
-    private int? _selectionAnchorCharIndex;
-    private int _selectionStart;
-    private int _selectionLength;
 
     private readonly List<HighlightAnnotation> _allHighlights = new();
     private readonly List<NoteAnnotation> _allNotes = new();
@@ -146,9 +130,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private TextRect NormRect(TextRect r) =>
         new(Norm(r.Left), Norm(r.Top), Norm(r.Right), Norm(r.Bottom));
-
-    /// <summary>Raised when the overlay scale changes, so MainPage can restretch the overlays.</summary>
-    public event Action? ContentScaleChanged;
 
     // ---------------- Document lifecycle ----------------
 
@@ -873,104 +854,101 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             var slot = PageSlots[i];
             double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
-            int desired = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
 
+            // Past the point where a whole-page render has to be capped, the
+            // full-page tier can no longer keep up with the screen, so the
+            // visible area is drawn from the tile pyramid instead. The sharp
+            // render is dropped rather than kept underneath: it would be both
+            // expensive and blurrier than the tiles covering it, and the cheap
+            // base bitmap is a better stand-in for the moment before a tile
+            // lands.
+            if (_budget.NeedsTiles(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect))
+            {
+                slot.DropSharpRender();
+                RenderVisibleTiles(slot);
+                continue;
+            }
+
+            slot.ClearTiles();
+
+            int desired = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
             if (_budget.ShouldResharpen(slot.RenderedWidth, desired))
             {
                 SharpenSlot(slot, desired);
-            }
-
-            // Past the point where a whole-page render would be capped, the
-            // full-page tier can no longer keep up with the screen, so the
-            // visible rectangle is rendered separately at true resolution.
-            if (_currentZoomFactor > RenderBudget.RegionZoom)
-            {
-                RenderVisibleRegion(slot);
-            }
-            else
-            {
-                slot.ClearRegion();
             }
         }
     }
 
     /// <summary>
-    /// Renders the part of a page that is actually on screen, at the exact
-    /// resolution the display needs.
+    /// Brings the page's visible tiles up to date.
     ///
-    /// A whole-page render at deep zoom grows with the SQUARE of the zoom and
-    /// has to be capped, which is precisely why text goes soft past a few
-    /// hundred percent. The visible rectangle, by contrast, is always about
-    /// one viewport, so its cost is flat: 800% and 6400% render the same
-    /// number of pixels and both are pixel-exact.
+    /// This is the pass that makes deep zoom feel weightless. Tiles sit on a
+    /// fixed grid, so a pan keeps every tile still on screen and pays only for
+    /// the strip that scrolled in; render_core serves the rest from its cache
+    /// in about two milliseconds for a whole viewport.
+    ///
+    /// Work is bounded on both sides: the grid returns only the tiles the
+    /// viewport touches plus one ring of prefetch, and each tile is a fixed
+    /// 256px however far the user has zoomed.
     /// </summary>
-    private async void RenderVisibleRegion(PageSlot slot)
+    private void RenderVisibleTiles(PageSlot slot)
     {
         double top = _layout.TopOf(slot.PageIndex);
 
-        // Intersect the viewport with this page, in slot space, then convert
-        // to the normalized page coordinates render_region expects.
-        double interLeft = Math.Max(0, _lastViewLeft);
-        double interRight = Math.Min(slot.SlotWidth, _lastViewRight);
-        double interTop = Math.Max(top, _lastViewTop);
-        double interBottom = Math.Min(top + slot.SlotHeight, _lastViewBottom);
+        // Viewport intersected with this page, in page-local slot DIPs.
+        double left = Math.Max(0, _lastViewLeft);
+        double right = Math.Min(slot.SlotWidth, _lastViewRight);
+        double pageTop = Math.Max(0, _lastViewTop - top);
+        double pageBottom = Math.Min(slot.SlotHeight, _lastViewBottom - top);
 
-        if (interRight - interLeft < 1 || interBottom - interTop < 1 || slot.SlotWidth <= 0)
+        if (right - left < 1 || pageBottom - pageTop < 1)
         {
-            slot.ClearRegion();
+            slot.ClearTiles();
             return;
         }
 
-        // A margin either side, so a small scroll does not immediately expose
-        // unrendered edges.
-        const double Overscan = 0.08;
-        double nx = Math.Max(0, interLeft / slot.SlotWidth - Overscan);
-        double ny = Math.Max(0, (interTop - top) / slot.SlotWidth - Overscan);
-        double nw = Math.Min(1 - nx, (interRight - interLeft) / slot.SlotWidth + Overscan * 2);
-        double nh = Math.Min(slot.SlotHeight / slot.SlotWidth - ny,
-                             (interBottom - interTop) / slot.SlotWidth + Overscan * 2);
+        // Level from what the screen actually needs across the whole page.
+        int level = TileGrid.LevelForWidth(
+            slot.SlotWidth * _currentZoomFactor * Math.Max(1.0, RasterizationScale));
 
-        var source = (nx, ny, nw, nh);
+        var wanted = TileGrid.VisibleTiles(
+            slot.SlotWidth, slot.SlotHeight, level, left, pageTop, right, pageBottom);
 
-        // Pixel width for a pixel-exact result: the region's on-screen size.
-        int outWidth = (int)Math.Clamp(
-            nw * slot.SlotWidth * _currentZoomFactor * Math.Max(1.0, RasterizationScale),
-            64, RenderBudget.MaxRegionWidth);
+        var added = slot.SyncTiles(wanted, level);
 
-        // Skip when the same area is already up at a comparable resolution.
-        if (slot.RegionBitmap is not null &&
-            Math.Abs(slot.RegionSource.X - nx) < 0.01 &&
-            Math.Abs(slot.RegionSource.Y - ny) < 0.01 &&
-            Math.Abs(slot.RegionSource.W - nw) < 0.01 &&
-            !_budget.ShouldResharpen(slot.RegionRenderedWidth, outWidth))
+        // Reuse is the whole point of tiling, so it is the number worth
+        // watching: after a pan, most of the wanted tiles should already be on
+        // the card and only the strip that scrolled in should be new.
+        Diag.Log($"tiles p{slot.PageIndex}: level={level} want={wanted.Count} " +
+                 $"new={added.Count} reused={wanted.Count - added.Count}");
+
+        foreach (var tile in added)
         {
-            return;
+            RenderTile(slot, tile);
         }
+    }
 
-        if (!slot.TryBeginRegionRender())
-        {
-            return;
-        }
-
+    private async void RenderTile(PageSlot slot, PageTile tile)
+    {
         ulong handle = _documentHandle;
         int pageIndex = slot.PageIndex;
+        var addr = tile.Address;
 
         var raw = await Task.Run(() =>
-            PageRenderer.RenderRegionRaw(handle, pageIndex, nx, ny, nw, nh, outWidth));
+            PageRenderer.RenderTileRaw(handle, pageIndex, addr.Level, addr.Col, addr.Row));
 
-        if (handle != _documentHandle)
+        // The document can close, or the tile can be scrolled away and
+        // discarded, while its render is in flight.
+        if (handle != _documentHandle || slot.TileLevel != addr.Level)
         {
-            slot.EndRegionRender();
             return;
         }
 
         if (raw.Bgra is not null)
         {
-            slot.SetRegionRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width, source);
-            Diag.Log($"region p{pageIndex}: {nw:F2}x{nh:F2} of page at {raw.Width}x{raw.Height}px");
+            tile.Bitmap = PageRenderer.ToBitmap(raw).Bitmap;
+            tile.IsExact = true;
         }
-
-        slot.EndRegionRender();
     }
 
     private async void SharpenSlot(PageSlot slot, int targetWidth)

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.UI.Xaml.Media.Imaging;
@@ -102,69 +103,79 @@ public partial class PageSlot : ObservableObject
     public bool IsSharp { get; private set; }
 
     /// <summary>
-    /// A high-resolution render of just the visible RECTANGLE of this page,
-    /// drawn on top of the stretched full-page bitmap.
+    /// Rendered tiles currently on this card, in draw order.
     ///
-    /// At deep zoom a whole-page render at the resolution the screen wants is
-    /// enormous and has to be capped, which is what makes text soft. Rendering
-    /// only the part on screen keeps cost proportional to the viewport, so the
-    /// visible text is pixel-exact no matter how far in the user has zoomed.
+    /// The tile grid supersedes the single region bitmap at deep zoom: a
+    /// region has to be re-rendered whenever the view moves, whereas tiles sit
+    /// on a fixed grid so panning reuses everything still on screen.
     /// </summary>
-    [ObservableProperty]
-    public partial WriteableBitmap? RegionBitmap { get; set; }
+    public ObservableCollection<PageTile> Tiles { get; } = new();
 
-    /// <summary>Where <see cref="RegionBitmap"/> sits, in slot-space DIPs.</summary>
-    [ObservableProperty]
-    public partial ScaledRect RegionPlacement { get; set; }
+    private readonly Dictionary<TileAddress, PageTile> _tilesByAddress = new();
 
-    /// <summary>The normalized region currently displayed, to avoid redundant re-renders.</summary>
-    public (double X, double Y, double W, double H) RegionSource { get; private set; }
+    /// <summary>The level the tile set is currently built for. -1 when tiling is off.</summary>
+    public int TileLevel { get; private set; } = -1;
 
-    public int RegionRenderedWidth { get; private set; }
-
-    public void SetRegionRender(WriteableBitmap? bitmap, int renderedWidth,
-                                (double X, double Y, double W, double H) source)
+    /// <summary>
+    /// Reconciles the tile set against what should now be visible.
+    ///
+    /// Diffs rather than rebuilds: a rebuild would drop and re-add every tile
+    /// on every scroll event, which throws away exactly the reuse tiling
+    /// exists to provide and makes the card flash. Returns the tiles that are
+    /// new and therefore need rendering.
+    /// </summary>
+    public List<PageTile> SyncTiles(IReadOnlyList<TilePlacement> wanted, int level)
     {
-        if (bitmap is null)
+        // A level change invalidates every tile, since their sizes change.
+        if (level != TileLevel)
+        {
+            TileLevel = level;
+            Tiles.Clear();
+            _tilesByAddress.Clear();
+        }
+
+        var keep = new HashSet<TileAddress>();
+        var added = new List<PageTile>();
+
+        foreach (var placement in wanted)
+        {
+            keep.Add(placement.Address);
+            if (_tilesByAddress.ContainsKey(placement.Address))
+            {
+                continue;
+            }
+
+            var tile = new PageTile(placement);
+            _tilesByAddress[placement.Address] = tile;
+            Tiles.Add(tile);
+            added.Add(tile);
+        }
+
+        for (int i = Tiles.Count - 1; i >= 0; i--)
+        {
+            if (!keep.Contains(Tiles[i].Address))
+            {
+                _tilesByAddress.Remove(Tiles[i].Address);
+                Tiles.RemoveAt(i);
+            }
+        }
+
+        return added;
+    }
+
+    /// <summary>Drops all tiles, e.g. when the page leaves the render window.</summary>
+    public void ClearTiles()
+    {
+        if (Tiles.Count == 0 && TileLevel < 0)
         {
             return;
         }
 
-        RegionPlacement = new ScaledRect(
-            source.X * SlotWidth, source.Y * SlotWidth,
-            source.W * SlotWidth, source.H * SlotWidth, string.Empty);
-        RegionBitmap = bitmap;
-        RegionRenderedWidth = renderedWidth;
-        RegionSource = source;
+        Tiles.Clear();
+        _tilesByAddress.Clear();
+        TileLevel = -1;
     }
 
-    /// <summary>Drops the region overlay, revealing the full-page bitmap beneath.</summary>
-    public void ClearRegion()
-    {
-        if (RegionBitmap is null)
-        {
-            return;
-        }
-
-        RegionBitmap = null;
-        RegionRenderedWidth = 0;
-        RegionSource = default;
-    }
-
-    private bool _isRegionRendering;
-
-    public bool TryBeginRegionRender()
-    {
-        if (_isRegionRendering)
-        {
-            return false;
-        }
-
-        _isRegionRendering = true;
-        return true;
-    }
-
-    public void EndRegionRender() => _isRegionRendering = false;
 
     /// <summary>Records a base-tier render and shows it unless a sharp one is already up.</summary>
     public void SetBaseRender(WriteableBitmap? bitmap, int width)
@@ -255,6 +266,6 @@ public partial class PageSlot : ObservableObject
         RenderedWidth = 0;
         BaseWidth = 0;
         IsSharp = false;
-        ClearRegion();
+        ClearTiles();
     }
 }

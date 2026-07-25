@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use lru::LruCache;
-use pdfium_render::prelude::{Pdfium, PdfDocument, PdfPageRenderRotation, PdfRenderConfig};
+use pdfium_render::prelude::{Pdfium, PdfDocument};
 
 // ---------------------------------------------------------------------
 // FFI result type
@@ -2667,7 +2667,6 @@ mod tests {
 
     /// Number of annotations on a page.
     fn page_annotation_count(handle: u64, page_index: i32) -> usize {
-        use pdfium_render::prelude::*;
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);

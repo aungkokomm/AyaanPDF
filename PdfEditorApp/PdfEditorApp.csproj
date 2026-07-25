@@ -31,6 +31,23 @@
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!--
+      THE version. The About dialog reads it off this assembly and the
+      installer script reads it back off the built exe, so there is one place
+      to change and nothing to keep in sync. Before this, the assembly was
+      still at the SDK default of 1.0.0 while the installer said 1.15.0, and
+      the About dialog dutifully reported the wrong one.
+    -->
+    <Version>1.16.0</Version>
+
+    <!--
+      The SDK otherwise appends "+<git sha>" to the informational version, which
+      is what both the About dialog and the installer read. Useful for a server
+      build, noise on a desktop app: it would put a 40-character hash in the
+      About box and in the setup filename.
+    -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

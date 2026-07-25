@@ -8,11 +8,17 @@
 ; Or compile alone with:          ISCC.exe installer\PdfEditor.iss   (after publishing first)
 
 #define AppName    "Ayaan PDF"
-#define AppVersion "1.15.0"
 #define Publisher  "Aung Ko Ko"
 #define ExeName    "PdfEditorApp.exe"
 #define SrcDir     "..\PdfEditorApp\publish"
 #define AppIcon    "..\PdfEditorApp\Assets\AppIcon.ico"
+
+; Version comes off the published exe, which gets it from <Version> in
+; PdfEditorApp.csproj. Hardcoding it here is how the installer ended up saying
+; 1.15.0 while the app's own About dialog said 1.0.0: two sources of truth, and
+; the one the user can see was the stale one. Compiling before publishing now
+; fails loudly here rather than shipping a wrong number.
+#define AppVersion GetStringFileInfo(SrcDir + "\" + ExeName, "ProductVersion")
 
 [Setup]
 ; Stable identity for upgrades. Never change this across versions.
@@ -62,7 +68,13 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [Files]
 ; The entire self-contained publish output (exe + WinUI runtime + render_core.dll +
 ; pdfium.dll + sample.pdf).
-Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+;
+; diag.log is excluded because it is WRITTEN INTO this folder whenever the app
+; runs there with PDFEDITOR_DIAG=1, which is exactly how the publish output gets
+; verified. Without this it ships inside the installer, and every user's first
+; launch appends to a trace of someone else's session.
+Source: "{#SrcDir}\*"; DestDir: "{app}"; Excludes: "diag.log"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}";           Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"

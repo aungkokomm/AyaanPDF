@@ -60,22 +60,50 @@ public sealed class RenderBudget
     public const double SoloSharpenZoom = 2.0;
 
     /// <summary>
-    /// Above this zoom the visible RECTANGLE is rendered separately.
+    /// How far a whole-page render may be upscaled before tiles take over.
     ///
-    /// A whole-page render grows with the square of the zoom, so past a
-    /// certain point it hits the caps above and the result is upscaled: that
-    /// is the soft text at high magnification. A region render is always about
-    /// one viewport, so its cost is flat and it stays pixel-exact however far
-    /// in the user goes.
+    /// Purely a dead zone around the switch: without it, a zoom parked exactly
+    /// on the boundary would flip between the two paths. A tenth of a pixel per
+    /// pixel is not visible; the flicker would be.
     /// </summary>
-    public const double RegionZoom = 1.8;
+    private const double TileSwitchSlack = 1.1;
 
     /// <summary>
-    /// Ceiling on a region render's width. Generous, because a region is
-    /// viewport-sized rather than page-sized: this bounds a pathological
-    /// ultra-wide window, not normal use.
+    /// Ceiling on a single region render's width, the primitive tiles are
+    /// built on. Generous, because a region is viewport-sized rather than
+    /// page-sized: this bounds a pathological request, not normal use.
     /// </summary>
     public const int MaxRegionWidth = 6000;
+
+    /// <summary>
+    /// Whether this page has outgrown a single bitmap and should be drawn from
+    /// the tile pyramid instead.
+    ///
+    /// The test is not a zoom threshold but the caps themselves: a whole-page
+    /// render is pixel-exact right up until <see cref="SharpWidthFor"/> has to
+    /// clamp it, and below that point one render is both exact and far cheaper
+    /// than a grid of them. Past it, no amount of spending makes the page
+    /// sharper, because the result is being upscaled to fit the screen. That is
+    /// the soft text every viewer shows at high magnification, and it is the
+    /// moment to switch to tiles, whose cost is about one viewport at any zoom
+    /// and which stay exact however far in the user goes.
+    ///
+    /// Deriving it this way also means it tracks the caps: raise
+    /// <see cref="MaxSharpWidth"/> and the switch moves out on its own.
+    /// </summary>
+    public bool NeedsTiles(double slotWidth, double zoom, double rasterizationScale, double aspect)
+    {
+        if (slotWidth <= 0)
+        {
+            return false;
+        }
+
+        double scale = rasterizationScale > 0 ? rasterizationScale : 1.0;
+        double ideal = slotWidth * Math.Max(0.01, zoom) * scale;
+        int capped = SharpWidthFor(slotWidth, zoom, rasterizationScale, aspect);
+
+        return ideal > capped * TileSwitchSlack;
+    }
 
     public RenderBudget(
         int baseWidth = 900,
