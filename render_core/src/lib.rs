@@ -2159,42 +2159,29 @@ fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
         let top = (page_top - bounds.top().value) / page_w;
         let bottom = (page_top - bounds.bottom().value) / page_w;
 
-        // Annotations that own page objects, meaning Ink and Stamp, must NOT
-        // be asked for a colour: PDFium access-violates on the query. This is
-        // measured, not guessed, and both fill_color and stroke_color crash,
-        // so there is no safe variant to fall back to. It is a hard crash
-        // rather than an error return, so it cannot be caught: the only
-        // defence is not asking.
+        // Colour is deliberately NOT queried, for any subtype. Ever.
         //
-        // Reporting no colour for these is a small loss. The app keeps its own
-        // colour for ink and stamps it created, and a foreign one still draws
-        // correctly because PDFium renders it from its own appearance stream.
+        // FPDFAnnot_GetColor access-violates on an annotation that has an
+        // appearance stream. That sounds avoidable until you know that
+        // RENDERING a page GENERATES appearance streams for annotations that
+        // lack them. So a freshly created highlight answers the colour query
+        // safely, and the same annotation kills the process the moment the
+        // page has been drawn once, which in the app is immediately and on a
+        // background thread. That timing is why this survived every test that
+        // read before rendering and then took the app down in the field: the
+        // fault was measured at exactly add -> render -> read, single
+        // threaded, round zero.
         //
-        // Otherwise, read /C first and fall back to /IC.
+        // An earlier guard skipped Ink and Stamp because those crashed when
+        // measured; that was the right instances and the wrong rule. The rule
+        // is appearance streams, this crate's API exposes no way to check for
+        // one, and the crash cannot be caught. The only defence is not asking.
         //
-        // /C is the annotation's own colour and is what a markup annotation
-        // like a highlight is drawn from; /IC is the INTERIOR colour, which
-        // only shapes use. pdfium-render names them the other way round from
-        // how they read here: stroke_color is /C and fill_color is /IC.
-        // Preferring /IC returned a stale default yellow for highlights rather
-        // than the colour actually set on them.
-        let owns_page_objects = matches!(subtype, ANNOT_INK | ANNOT_STAMP);
-        let colour = if owns_page_objects {
-            None
-        } else {
-            annotation
-                .stroke_color()
-                .or_else(|_| annotation.fill_color())
-                .ok()
-        };
-
-        let (color, opacity) = match colour {
-            Some(c) => (
-                ((c.red() as i32) << 16) | ((c.green() as i32) << 8) | c.blue() as i32,
-                c.alpha() as f32 / 255.0,
-            ),
-            None => (-1, 1.0),
-        };
+        // Costs nothing today: PDFium draws every annotation from its own
+        // appearance, and the app keeps its own colours for marks it makes.
+        // When a property bar needs a loaded annotation's colour, it must
+        // come from a path that never touches FPDFAnnot_GetColor.
+        let (color, opacity) = (-1, 1.0);
 
         items.push(AnnotationInfo {
             index: i as i32,
@@ -3642,17 +3629,6 @@ mod tests {
         close_document(handle);
     }
 
-    /// Full colour and opacity for one annotation, for assertions.
-    fn read_annotation_colour(handle: u64, page_index: i32, index: usize) -> (i32, f32) {
-        let array = get_annotations(handle, page_index);
-        assert_eq!(array.status, STATUS_OK_PDFIUM);
-        assert!(index < array.len, "no annotation at index {index}");
-        let item = unsafe { &*array.items.add(index) };
-        let out = (item.color, item.opacity);
-        free_annotation_array(array);
-        out
-    }
-
     #[test]
     fn a_highlight_survives_save_and_reopen_as_an_editable_object() {
         // THE point of Phase A. Burning a highlight into page content makes it
@@ -3681,6 +3657,14 @@ mod tests {
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].1, ANNOT_HIGHLIGHT);
 
+        // Render BEFORE saving, as the app inevitably does since the page is
+        // on screen. This is not incidental: rendering is what makes PDFium
+        // generate the highlight's appearance stream, and the appearance is
+        // what a viewer draws. A file saved without ever rendering carries an
+        // AP-less highlight that PDFium itself will NOT draw after reopening,
+        // which this test originally proved by accident.
+        free_render_result(render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 400));
+
         // Round trip through actual PDF bytes, not just the in-memory page.
         let saved = snapshot_document(handle);
         let reopened = open_document_from_bytes(saved.data, saved.len);
@@ -3697,9 +3681,24 @@ mod tests {
             assert!((b - a).abs() < 0.001, "geometry drifted across the round trip: {b} vs {a}");
         }
 
-        let (colour, opacity) = read_annotation_colour(reopened, 0, 0);
-        assert_eq!(colour, 0xFFEB3B, "the highlight colour should survive");
-        assert!((opacity - 128.0 / 255.0).abs() < 0.01, "opacity {opacity} should survive");
+        // Colour must survive IN THE FILE. get_annotations no longer reports
+        // it, deliberately: FPDFAnnot_GetColor access-violates on an
+        // annotation with an appearance stream, and rendering generates
+        // those. So the proof is the pixels: render the reopened page and the
+        // highlight must still draw in its yellow, which PDFium takes from
+        // the stored /C.
+        let r = render_region(reopened, 0, 0.0, 0.0, 1.0, 1.0, 400);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        // The quads are normalized 0.1..0.5 x, 0.1..0.14 y, so on a 400px
+        // render (120, 48) is inside the highlight.
+        let i = (48 * r.width as usize + 120) * 4;
+        let (b, g, red) = (bytes[i], bytes[i + 1], bytes[i + 2]);
+        free_render_result(r);
+        assert!(
+            red > 200 && g > 200 && b < 160,
+            "reopened highlight rendered B={b} G={g} R={red}, not its yellow,              so the colour did not survive the round trip"
+        );
 
         close_document(reopened);
         close_document(handle);
@@ -4206,6 +4205,122 @@ mod tests {
 
         close_document(handle);
     }
+    /// One round of what the crashing C# test does per iteration:
+    /// render the page the annotation lives on, then edit it.
+    fn one_render_edit_round(handle: u64, round: i32) {
+        // Renders FIRST, so the page's annotation state is built by the
+        // renderer before the edits touch it.
+        free_render_result(render_low_res(handle, 0, 900));
+        free_render_result(render_tile(handle, 0, 4, (round % 16) as i32, ((round / 16) % 16) as i32));
+
+        let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1,
+            r: 255, g: 235, b: 59, a: 200,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+            STATUS_OK_PDFIUM, "add failed on round {round}"
+        );
+
+        // Render BETWEEN the add and the read, matching the app: the page
+        // redraws the moment the annotation lands, before any click.
+        free_render_result(render_low_res(handle, 0, 900));
+
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1, "read lost the annotation on round {round}");
+        let index = found[0].0;
+
+        let _ = set_annotation_bounds(handle, 0, index, 1000, 350.0, 350.0, 750.0, 430.0);
+
+        // And again after the move, matching InvalidateLoadedPage.
+        free_render_result(render_low_res(handle, 0, 900));
+
+        assert_eq!(delete_annotation(handle, 0, index), STATUS_OK_PDFIUM,
+                   "delete failed on round {round}");
+    }
+
+
+
+
+    #[test]
+    fn reading_annotations_after_a_render_does_not_crash() {
+        // The minimal form of the crash the user reported from the app, found
+        // by bisection: add an annotation, RENDER the page, then read the
+        // page's annotations. Rendering generates appearance streams for
+        // annotations that lack them, and FPDFAnnot_GetColor access-violates
+        // on an annotation that has one, so any colour query in the read path
+        // turns this exact sequence into a process kill. get_annotations must
+        // therefore never ask for colour; this pins that.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        for _round in 0..25i32 {
+            let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
+            let specs = [HighlightSpec {
+                page_index: 0, quad_offset: 0, quad_count: 1,
+                r: 255, g: 235, b: 59, a: 200,
+            }];
+            assert_eq!(
+                add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+                STATUS_OK_PDFIUM
+            );
+
+            free_render_result(render_low_res(handle, 0, 900));
+
+            let found = read_annotations(handle, 0);
+            let index = found.last().expect("read lost the annotation").0;
+            assert_eq!(delete_annotation(handle, 0, index), STATUS_OK_PDFIUM);
+        }
+        close_document(handle);
+    }
+
+    #[test]
+    fn renders_interleaved_with_edits_single_threaded() {
+        // The C# reproduction that faults changes TWO things against the
+        // passing test: it adds threads AND it adds renders between the edits.
+        // This runs the same mix on ONE thread. If this faults, the crash was
+        // never a race: it is deterministic state corruption from mixing
+        // rendering and annotation editing, which is a very different, much
+        // easier bug.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        for round in 0..25 {
+            one_render_edit_round(handle, round);
+        }
+        close_document(handle);
+    }
+
+    #[test]
+    fn renders_racing_edits_across_threads() {
+        // The other half: same mix, with renders genuinely concurrent on the
+        // SAME document. The cargo suite runs tests in parallel, but each test
+        // opens its own document, so same-document concurrency has never been
+        // exercised natively. This is the C# reproduction minus the C#.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for t in 0..3u64 {
+            let stop = stop.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut i = t;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    free_render_result(render_low_res(handle, (i % 20) as i32, 900));
+                    free_render_result(render_tile(handle, 0, 4, (i % 16) as i32, ((i / 16) % 16) as i32));
+                    i += 1;
+                }
+            }));
+        }
+
+        for round in 0..25 {
+            one_render_edit_round(handle, round);
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in workers {
+            let _ = w.join();
+        }
+        close_document(handle);
+    }
+
     #[test]
     fn the_exact_sequence_the_app_performs_on_a_loaded_annotation() {
         // Mirrors what the app does when you click a mark that was already in

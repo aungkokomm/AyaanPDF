@@ -100,7 +100,12 @@ internal struct AnnotationInfo
     public float Right;
     public float Bottom;
 
-    /// <summary>0xRRGGBB, or -1 when the annotation carries no colour.</summary>
+    /// <summary>
+    /// Always -1. Colour is deliberately never reported: FPDFAnnot_GetColor
+    /// access-violates on an annotation that has an appearance stream, and
+    /// RENDERING generates appearance streams, so in an app that draws its
+    /// pages the query is never safe. The field stays for layout stability.
+    /// </summary>
     public int Color;
 
     public float Opacity;

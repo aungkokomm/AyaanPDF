@@ -95,13 +95,17 @@ public class AnnotationInteropTests
         ulong docHandle, int pageIndex, int index, int captureWidth,
         float left, float top, float right, float bottom);
 
+    // Field ORDER matters and must match Rust: (width, height, buffer, len,
+    // status). An earlier version of this file had it wrong; it happened to be
+    // harmless because the struct only ever passes through unchanged, but a
+    // test that reads Width would have read half a pointer.
     [StructLayout(LayoutKind.Sequential)]
     private struct RenderResult
     {
-        public IntPtr Buffer;
-        public nuint Len;
         public int Width;
         public int Height;
+        public IntPtr Buffer;
+        public nuint Len;
         public int Status;
     }
 
@@ -208,8 +212,12 @@ public class AnnotationInteropTests
                 Assert.Equal(0.30, info.Top, 3);
                 Assert.Equal(0.70, info.Right, 3);
                 Assert.Equal(0.38, info.Bottom, 3);
-                Assert.Equal(0xFFEB3B, info.Color);
-                Assert.InRange(info.Opacity, 0.75, 0.80);       // 200/255
+                // Colour is deliberately NOT reported. FPDFAnnot_GetColor
+                // access-violates on an annotation that has an appearance
+                // stream, and RENDERING generates appearance streams, so in
+                // an app that draws its pages the query is never safe.
+                Assert.Equal(-1, info.Color);
+                Assert.Equal(1.0f, info.Opacity, 2);
             }
             finally
             {
@@ -393,12 +401,12 @@ public class AnnotationInteropTests
         }
     }
 
-    [Fact(Skip = "REPRODUCES A REAL CRASH. Enable to work on it; it aborts the whole run. " +
-                 "Reading a page's annotations while background threads render the same " +
-                 "document access-violates (0xC0000005) inside get_annotations. The identical " +
-                 "loop without the render threads passes, see the test above, so it is a race " +
-                 "and not the add-delete cycle. Root cause not yet found: every native entry " +
-                 "point does hold CALL_LOCK across its PDFium work.")]
+    [Fact] // Was skipped while it reproduced a real crash: reading a page's
+           // annotations after the page had been rendered access-violated in
+           // FPDFAnnot_GetColor, because rendering generates appearance
+           // streams and the colour query dies on annotations that have one.
+           // get_annotations no longer queries colour at all, so this now
+           // doubles as the end-to-end regression for that fix.
     public void editing_an_annotation_while_the_page_renders_does_not_fault()
     {
         // The last interaction the other tests do not cover, and the only one
