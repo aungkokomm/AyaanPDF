@@ -1617,13 +1617,26 @@ fn add_highlight_annotations_inner(
         }
 
         for rect in &rects {
-            // from_rect rather than hand-ordered corners: PDF quad points run
-            // upper-left, upper-right, lower-left, lower-right, an order that
-            // is easy to get subtly wrong and that renders as a bow tie when
-            // you do.
+            // Corners in the order PDF actually defines for /QuadPoints:
+            // top-left, top-right, bottom-left, bottom-right.
+            //
+            // NOT PdfQuadPoints::from_rect, which winds them counter-clockwise
+            // from the bottom-left instead. PDFium reads pair 1 as the
+            // top-right corner and pair 2 as the bottom-left, so a rectangle
+            // built that way hands it two corners with the same x, it computes
+            // a zero-width rectangle, and the highlight draws NOTHING at all
+            // while remaining a perfectly well formed annotation with correct
+            // bounds, colour and quad count. That is what it did.
+            let quad = PdfQuadPoints::new_from_values(
+                rect.left().value,  rect.top().value,     // top-left
+                rect.right().value, rect.top().value,     // top-right
+                rect.left().value,  rect.bottom().value,  // bottom-left
+                rect.right().value, rect.bottom().value,  // bottom-right
+            );
+
             if annotation
                 .attachment_points_mut()
-                .create_attachment_point_at_end(PdfQuadPoints::from_rect(rect))
+                .create_attachment_point_at_end(quad)
                 .is_err()
             {
                 return STATUS_INVALID_INPUT;
@@ -4035,6 +4048,126 @@ mod tests {
         assert!((found[0].2 - 0.5).abs() < 0.001, "left moved to {} despite the refusal", found[0].2);
         assert!((found[0].4 - 0.6).abs() < 0.001, "right moved to {} despite the refusal", found[0].4);
 
+        close_document(handle);
+    }
+    /// Pixels changed on page 0 by whatever `build` does to the document.
+    fn pixels_changed_by(build: &dyn Fn(u64)) -> usize {
+        const W: i32 = 400;
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        let bb = unsafe { std::slice::from_raw_parts(before.buffer, before.len as usize) }.to_vec();
+
+        build(handle);
+
+        let after = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        let ab = unsafe { std::slice::from_raw_parts(after.buffer, after.len as usize) };
+        let changed = bb.chunks(4).zip(ab.chunks(4)).filter(|(a, b)| a != b).count();
+
+        free_render_result(before);
+        free_render_result(after);
+        close_document(handle);
+        changed
+    }
+
+    #[test]
+    fn every_kind_of_annotation_we_create_actually_draws() {
+        // The test that was missing, and whose absence let a highlight that
+        // drew NOTHING pass as working through three earlier steps. Existing
+        // with the right subtype, geometry and colour is not the same as
+        // appearing on the page, and only one of those is what a user sees.
+        //
+        // Each kind is placed on blank paper at the same spot so the fixture's
+        // own printing cannot be mistaken for the mark.
+        let highlight = pixels_changed_by(&|h| {
+            let quads = [HighlightQuad { left: 500.0, top: 500.0, right: 600.0, bottom: 600.0 }];
+            let specs = [HighlightSpec {
+                page_index: 0, quad_offset: 0, quad_count: 1,
+                r: 255, g: 235, b: 59, a: 255,
+            }];
+            add_highlight_annotations(h, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1);
+        });
+
+        let ink = pixels_changed_by(&|h| {
+            let pts = [BurnPoint { x: 500.0, y: 500.0 }, BurnPoint { x: 600.0, y: 600.0 }];
+            let strokes = [BurnStroke {
+                page_index: 0, point_offset: 0, point_count: 2,
+                width_px: 20.0, r: 255, g: 0, b: 0, a: 255,
+            }];
+            add_ink_annotations(h, 1000, strokes.as_ptr(), 1, pts.as_ptr(), 2);
+        });
+
+        let stamp = pixels_changed_by(&|h| {
+            let px: Vec<u8> = std::iter::repeat([32u8, 64, 200, 255]).take(64).flatten().collect();
+            add_stamp_annotation(h, 0, 1000, 500.0, 500.0, 600.0, 600.0,
+                                 px.as_ptr(), px.len(), 8, 8);
+        });
+
+        let note = pixels_changed_by(&|h| {
+            let t = std::ffi::CString::new("x").unwrap();
+            let notes = [BurnNote { page_index: 0, x: 500.0, y: 500.0, text: t.as_ptr() }];
+            add_note_annotations(h, 1000, notes.as_ptr(), 1);
+        });
+
+        println!("DRAWS: highlight={highlight} ink={ink} stamp={stamp} note={note}");
+
+        assert!(highlight > 0, "a highlight draws nothing");
+        assert!(ink > 0, "an ink stroke draws nothing");
+        assert!(stamp > 0, "a stamp draws nothing");
+        assert!(note > 0, "a note draws nothing");
+    }
+
+    #[test]
+    fn highlight_quad_points_use_the_order_pdf_defines() {
+        // The root cause of the highlight drawing nothing, pinned directly.
+        //
+        // PDF orders /QuadPoints top-left, top-right, bottom-left,
+        // bottom-right. PdfQuadPoints::from_rect winds them counter-clockwise
+        // from the bottom-left instead, so PDFium read two corners with the
+        // same x, computed a zero-width rectangle, and drew nothing at all
+        // while every other property of the annotation stayed correct.
+        use pdfium_render::prelude::*;
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // 0.5..0.6 of a 200pt page: x 100..120, and y 100 down to 80.
+        let quads = [HighlightQuad { left: 500.0, top: 500.0, right: 600.0, bottom: 600.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1,
+            r: 255, g: 235, b: 59, a: 255,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let mut page = g.pages().get(0).unwrap();
+        let mut annot = page.annotations_mut().get(0).unwrap();
+
+        let PdfPageAnnotation::Highlight(h) = &mut annot else {
+            panic!("expected a highlight");
+        };
+        let points = h.attachment_points_mut();
+        assert_eq!(points.len(), 1);
+        let q = points.get(0).unwrap();
+        println!("QUAD: ({},{}) ({},{}) ({},{}) ({},{})",
+                 q.x1.value, q.y1.value, q.x2.value, q.y2.value,
+                 q.x3.value, q.y3.value, q.x4.value, q.y4.value);
+
+        assert_eq!((q.x1.value, q.y1.value), (100.0, 100.0), "pair 1 must be TOP-LEFT");
+        assert_eq!((q.x2.value, q.y2.value), (120.0, 100.0), "pair 2 must be TOP-RIGHT");
+        assert_eq!((q.x3.value, q.y3.value), (100.0, 80.0), "pair 3 must be BOTTOM-LEFT");
+        assert_eq!((q.x4.value, q.y4.value), (120.0, 80.0), "pair 4 must be BOTTOM-RIGHT");
+
+        // The two corners PDFium derives its rectangle from must not collapse.
+        assert_ne!(q.x2.value, q.x3.value,
+                   "top-right and bottom-left share an x, so the rectangle is zero-width");
+
+        drop(annot);
+        drop(page);
+        drop(g);
+        drop(_guard);
         close_document(handle);
     }
     #[test]
