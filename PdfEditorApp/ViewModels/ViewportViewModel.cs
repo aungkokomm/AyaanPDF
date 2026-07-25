@@ -1551,21 +1551,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private bool SelectLoadedAt(int pageIndex, double normX, double normY)
     {
-        var candidates = LoadedFor(pageIndex);
-        for (int i = candidates.Count - 1; i >= 0; i--)
+        var boxes = LoadedFor(pageIndex)
+            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom))
+            .ToList();
+
+        if (LoadedAnnotationPicker.PickTopmost(boxes, normX, normY) is not AnnotationBox hit)
         {
-            var a = candidates[i];
-            if (normX >= a.Left && normX <= a.Right && normY >= a.Top && normY <= a.Bottom)
-            {
-                _selectedLoaded = new LoadedSelection(pageIndex, a.Index, a.Left, a.Top, a.Right, a.Bottom);
-                _loadedDrag = (normX, normY, _selectedLoaded.Value);
-                RefreshSelectionOutline();
-                OnPropertyChanged(nameof(HasSelectedAnnotation));
-                return true;
-            }
+            return false;
         }
 
-        return false;
+        _selectedLoaded = new LoadedSelection(
+            pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
+        _loadedDrag = (normX, normY, _selectedLoaded.Value);
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        return true;
     }
 
     /// <summary>
@@ -1581,14 +1581,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        double dx = normX - ox;
-        double dy = normY - oy;
+        var moved = LoadedAnnotationPicker.Dragged(
+            new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom),
+            ox, oy, normX, normY);
+
         _selectedLoaded = start with
         {
-            Left = start.Left + dx,
-            Top = start.Top + dy,
-            Right = start.Right + dx,
-            Bottom = start.Bottom + dy,
+            Left = moved.Left, Top = moved.Top, Right = moved.Right, Bottom = moved.Bottom,
         };
         RefreshSelectionOutline();
     }
@@ -1604,7 +1603,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _loadedDrag = null;
 
         // Nothing actually moved, so do not dirty the document or reflow.
-        if (Math.Abs(now.Left - start.Left) < 1e-6 && Math.Abs(now.Top - start.Top) < 1e-6)
+        if (!LoadedAnnotationPicker.IsRealMove(
+                new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom),
+                new AnnotationBox(now.Index, now.Left, now.Top, now.Right, now.Bottom)))
         {
             return;
         }
