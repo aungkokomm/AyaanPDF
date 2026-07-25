@@ -76,7 +76,21 @@ internal static class PageRenderer
                 return new RawPageRender(0, 0, null, PageRenderOutcome.Failed);
             }
 
-            var managed = new byte[(int)result.Len];
+            // Len has to agree with the dimensions before it is used as a copy
+            // length. Marshal.Copy reads exactly this many bytes out of native
+            // memory: a Len larger than the buffer really holds reads past the
+            // end of it, which is an access violation that kills the process
+            // with no managed exception to catch. Checking is far cheaper than
+            // trusting the two sides to stay in step forever.
+            long expected = (long)result.Width * result.Height * 4;
+            if ((ulong)result.Len != (ulong)expected)
+            {
+                Diag.Log($"render buffer mismatch: {result.Width}x{result.Height} " +
+                         $"implies {expected} bytes, native reported {result.Len}");
+                return new RawPageRender(0, 0, null, PageRenderOutcome.Failed);
+            }
+
+            var managed = new byte[expected];
             Marshal.Copy(result.Buffer, managed, 0, managed.Length);
 
             var outcome = result.Status == RenderStatus.OkPdfium ? PageRenderOutcome.RealPage : PageRenderOutcome.Placeholder;
@@ -99,9 +113,15 @@ internal static class PageRenderer
         }
 
         var bitmap = new WriteableBitmap(raw.Width, raw.Height);
+
+        // The pixel buffer holds exactly Width * Height * 4 bytes, so write no
+        // more than that even if the caller handed over something longer.
+        // ToRaw already rejects a mismatch; this is the second line of defence
+        // on the one buffer in this app that is written to by absolute size.
+        int capacity = raw.Width * raw.Height * 4;
         using (var stream = bitmap.PixelBuffer.AsStream())
         {
-            stream.Write(raw.Bgra, 0, raw.Bgra.Length);
+            stream.Write(raw.Bgra, 0, Math.Min(capacity, raw.Bgra.Length));
         }
 
         bitmap.Invalidate();

@@ -934,26 +934,39 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        ulong handle = _documentHandle;
-        int pageIndex = slot.PageIndex;
-        int width = _budget.BaseWidth;
+        // try/finally, not a call to EndRender on each exit: an exception
+        // between TryBeginRender and EndRender would leave the slot marked as
+        // rendering forever, so it would never draw again. And async void
+        // means an escaping exception is raised where nothing observes it and
+        // takes the process down with no message, so it is caught and logged.
+        try
+        {
+            ulong handle = _documentHandle;
+            int pageIndex = slot.PageIndex;
+            int width = _budget.BaseWidth;
 
-        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, width));
+            var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, width));
 
-        // The document can be closed or replaced while a render is in flight.
-        if (handle != _documentHandle)
+            // The document can be closed or replaced while a render is in flight.
+            if (handle != _documentHandle)
+            {
+                return;
+            }
+
+            if (raw.Bgra is not null)
+            {
+                slot.SetBaseRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                Diag.Log($"base {pageIndex}: {raw.Width}x{raw.Height} {raw.Outcome}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"RenderBaseTier p{slot.PageIndex} failed: {ex}");
+        }
+        finally
         {
             slot.EndRender();
-            return;
         }
-
-        if (raw.Bgra is not null)
-        {
-            slot.SetBaseRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
-            Diag.Log($"base {pageIndex}: {raw.Width}x{raw.Height} {raw.Outcome}");
-        }
-
-        slot.EndRender();
     }
 
     // ---------------- Debounced sharpening pass ----------------
@@ -1101,24 +1114,35 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private async void RenderTile(PageSlot slot, PageTile tile)
     {
-        ulong handle = _documentHandle;
-        int pageIndex = slot.PageIndex;
-        var addr = tile.Address;
-
-        var raw = await Task.Run(() =>
-            PageRenderer.RenderTileRaw(handle, pageIndex, addr.Level, addr.Col, addr.Row));
-
-        // The document can close, or the tile can be scrolled away and
-        // discarded, while its render is in flight.
-        if (handle != _documentHandle || slot.TileLevel != addr.Level)
+        // async void, so an exception escaping here has nowhere to go: it is
+        // raised on the thread pool, nothing observes it, and the process
+        // dies with no message. Catching and logging turns a silent death
+        // into a line in the trace. See RenderBaseTier for the same reason.
+        try
         {
-            return;
+            ulong handle = _documentHandle;
+            int pageIndex = slot.PageIndex;
+            var addr = tile.Address;
+
+            var raw = await Task.Run(() =>
+                PageRenderer.RenderTileRaw(handle, pageIndex, addr.Level, addr.Col, addr.Row));
+
+            // The document can close, or the tile can be scrolled away and
+            // discarded, while its render is in flight.
+            if (handle != _documentHandle || slot.TileLevel != addr.Level)
+            {
+                return;
+            }
+
+            if (raw.Bgra is not null)
+            {
+                tile.Bitmap = PageRenderer.ToBitmap(raw).Bitmap;
+                tile.IsExact = true;
+            }
         }
-
-        if (raw.Bgra is not null)
+        catch (Exception ex)
         {
-            tile.Bitmap = PageRenderer.ToBitmap(raw).Bitmap;
-            tile.IsExact = true;
+            Diag.Log($"RenderTile p{slot.PageIndex} failed: {ex}");
         }
     }
 
@@ -1129,36 +1153,46 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        ulong handle = _documentHandle;
-        int pageIndex = slot.PageIndex;
+        // See RenderBaseTier: try/finally so an exception cannot leave the
+        // slot permanently marked as sharpening, and a catch so an async void
+        // failure is logged instead of taking the process down silently.
+        try
+        {
+            ulong handle = _documentHandle;
+            int pageIndex = slot.PageIndex;
 
-        var raw = await Task.Run(() => PageRenderer.RenderUncachedRaw(handle, pageIndex, targetWidth));
+            var raw = await Task.Run(() => PageRenderer.RenderUncachedRaw(handle, pageIndex, targetWidth));
 
-        if (handle != _documentHandle)
+            if (handle != _documentHandle)
+            {
+                return;
+            }
+
+            // Drop a result the zoom has already moved past. A sharp render of
+            // a large page takes long enough that a zoom gesture can finish
+            // while it is in flight, and applying it would show a bitmap at
+            // the wrong resolution until the next pass replaced it.
+            double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
+            int wantedNow = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
+            if (_budget.ShouldResharpen(targetWidth, wantedNow))
+            {
+                return;
+            }
+
+            if (raw.Bgra is not null)
+            {
+                slot.SetSharpRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                Diag.Log($"sharpened {pageIndex} to {raw.Width}x{raw.Height}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"SharpenSlot p{slot.PageIndex} failed: {ex}");
+        }
+        finally
         {
             slot.EndSharpen();
-            return;
         }
-
-        // Drop a result the zoom has already moved past. A sharp render of a
-        // large page takes long enough that a zoom gesture can finish while it
-        // is in flight, and applying it would show a bitmap at the wrong
-        // resolution until the next pass replaced it.
-        double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
-        int wantedNow = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
-        if (_budget.ShouldResharpen(targetWidth, wantedNow))
-        {
-            slot.EndSharpen();
-            return;
-        }
-
-        if (raw.Bgra is not null)
-        {
-            slot.SetSharpRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
-            Diag.Log($"sharpened {pageIndex} to {raw.Width}x{raw.Height}");
-        }
-
-        slot.EndSharpen();
     }
 
     /// <summary>
