@@ -22,4 +22,32 @@
     <ProjectReference Include="..\PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj" />
   </ItemGroup>
 
+  <!--
+    The native core and a fixture, so the FFI boundary itself can be tested.
+
+    This is the layer that had no test at all: the Rust side is covered by
+    cargo, and the pure viewport logic is covered here, but the P/Invoke
+    signatures and struct layouts BETWEEN them were only ever exercised by
+    running the app. A mismatch there does not throw, it reads the wrong
+    memory, and the process dies with a dialog and no stack. Testing it needs
+    nothing more than the DLLs sitting next to the test assembly.
+  -->
+  <ItemGroup>
+    <Content Include="..\render_core\target\release\render_core.dll"
+             Condition="Exists('..\render_core\target\release\render_core.dll')">
+      <Link>render_core.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\render_core\vendor\pdfium\pdfium.dll"
+             Condition="Exists('..\render_core\vendor\pdfium\pdfium.dll')">
+      <Link>pdfium.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\render_core\tests\fixtures\sample_20pages.pdf"
+             Condition="Exists('..\render_core\tests\fixtures\sample_20pages.pdf')">
+      <Link>sample_20pages.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
 </Project>

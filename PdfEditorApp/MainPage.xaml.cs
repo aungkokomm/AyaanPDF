@@ -75,16 +75,6 @@ public sealed partial class MainPage : Page
                 ScheduleAutoZoom(zooms);
             }
 
-            // Drives select / move / delete on an annotation already in the
-            // file, which otherwise needs a mouse. Format: "x,y" normalized
-            // page coordinates, optionally followed by ",move,dx,dy" or
-            // ",delete".
-            string probeAnnot = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOANNOT") ?? "";
-            Diag.Log($"annotprobe: env=\"{probeAnnot}\"");
-            if (probeAnnot.Length > 0)
-            {
-                ScheduleAnnotationProbe(probeAnnot);
-            }
         };
         Unloaded += (_, _) =>
         {
@@ -156,53 +146,6 @@ public sealed partial class MainPage : Page
             ScheduleTileGeometryDump();
         };
         _autoZoomTimer.Start();
-    }
-
-    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _annotProbeTimer;
-
-    /// <summary>
-    /// Exercises selecting, moving and deleting an annotation that is already
-    /// in the file, for PDFEDITOR_AUTOANNOT.
-    ///
-    /// These paths need a pointer, so without this they can only be checked by
-    /// hand, which is exactly how a broken one ships.
-    /// </summary>
-    private void ScheduleAnnotationProbe(string spec)
-    {
-        var parts = spec.Split(',', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length < 2 ||
-            !double.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture, out double x) ||
-            !double.TryParse(parts[1], System.Globalization.CultureInfo.InvariantCulture, out double y))
-        {
-            return;
-        }
-
-        _annotProbeTimer = DispatcherQueue.CreateTimer();
-        _annotProbeTimer.Interval = TimeSpan.FromSeconds(3);
-        _annotProbeTimer.IsRepeating = false;
-        _annotProbeTimer.Tick += (t, _) =>
-        {
-            t.Stop();
-            Diag.Log($"annotprobe: tick, selecting at ({x},{y})");
-
-            bool hit = ViewModel.SelectAnnotationAt(0, x, y);
-            Diag.Log($"annotprobe: select at ({x},{y}) -> {hit} selected={ViewModel.HasSelectedAnnotation}");
-
-            if (parts.Length >= 5 && parts[2] == "move" &&
-                double.TryParse(parts[3], System.Globalization.CultureInfo.InvariantCulture, out double dx) &&
-                double.TryParse(parts[4], System.Globalization.CultureInfo.InvariantCulture, out double dy))
-            {
-                ViewModel.MoveSelectedAnnotationTo(x + dx, y + dy);
-                ViewModel.EndAnnotationMove();
-                Diag.Log($"annotprobe: moved by ({dx},{dy})");
-            }
-            else if (parts.Length >= 3 && parts[2] == "delete")
-            {
-                ViewModel.DeleteSelectedAnnotation();
-                Diag.Log($"annotprobe: deleted, selected={ViewModel.HasSelectedAnnotation}");
-            }
-        };
-        _annotProbeTimer.Start();
     }
 
     private Microsoft.UI.Dispatching.DispatcherQueueTimer? _tileGeomTimer;
