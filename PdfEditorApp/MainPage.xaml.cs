@@ -48,6 +48,10 @@ public sealed partial class MainPage : Page
         InitializeComponent();
         ViewModel.InkStrokeChanged += OnInkStrokeChanged;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
+        // Shapes are a SEPARATE collection but share the ink canvas, so without
+        // this a finished shape was added to the model and nothing ever redrew
+        // it: the drag preview vanished on mouse-up and left an empty page.
+        ViewModel.Shapes.CollectionChanged += OnInkStrokesCollectionChanged;
         ViewModel.LayoutRebuilt += OnLayoutRebuilt;
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
         Loaded += (_, _) =>
@@ -102,6 +106,7 @@ public sealed partial class MainPage : Page
         {
             ViewModel.InkStrokeChanged -= OnInkStrokeChanged;
             ViewModel.InkStrokes.CollectionChanged -= OnInkStrokesCollectionChanged;
+            ViewModel.Shapes.CollectionChanged -= OnInkStrokesCollectionChanged;
             ViewModel.LayoutRebuilt -= OnLayoutRebuilt;
             ViewModel.ScrollToPageRequested -= OnScrollToPageRequested;
             ViewModel.Dispose();
