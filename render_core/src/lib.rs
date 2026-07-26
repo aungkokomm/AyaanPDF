@@ -1537,6 +1537,272 @@ fn add_stamp_annotation_inner(
     STATUS_OK_PDFIUM
 }
 
+/// Line spacing as a multiple of the font size, and the inset of the text from
+/// the box edge in multiples of it. Kept here so the app's overlay can lay text
+/// out the same way and the two cannot disagree about where a line sits.
+const TEXTBOX_LINE_HEIGHT: f32 = 1.3;
+const TEXTBOX_PADDING: f32 = 0.35;
+
+/// Marks a stamp annotation as one of our text boxes, and records what it takes
+/// to redraw it: `AyaanText:sizePx:RRGGBBAA:base64(text)`.
+///
+/// A text box is real vector text inside a stamp annotation, which is the only
+/// annotation kind this binding lets us give drawable objects to. Once saved it
+/// is otherwise indistinguishable from a placed image, so the tag is what lets
+/// the box be recognised and its words edited again rather than only moved.
+///
+/// The text is base64 so a newline or a colon in it cannot be mistaken for a
+/// field separator.
+const TEXTBOX_TAG: &str = "AyaanText:";
+
+fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
+    format!(
+        "{TEXTBOX_TAG}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}",
+        size_px,
+        r,
+        g,
+        b,
+        a,
+        base64_encode(text.as_bytes())
+    )
+}
+
+/// The size, colour and text recorded on a text box, or None if the annotation
+/// is not one of ours.
+fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
+    let rest = contents.strip_prefix(TEXTBOX_TAG)?;
+    let mut parts = rest.splitn(3, ':');
+
+    let size: f32 = parts.next()?.parse().ok()?;
+    if !size.is_finite() || size <= 0.0 {
+        return None;
+    }
+
+    let rgba = parts.next()?;
+    if rgba.len() != 8 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
+
+    let text = String::from_utf8(base64_decode(parts.next()?)?).ok()?;
+    Some((size, byte(0)?, byte(2)?, byte(4)?, byte(6)?, text))
+}
+
+/// Minimal base64, so the core needs no extra dependency for one small string.
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = input.bytes().filter(|&c| c != b'=').collect();
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Places text as a real, editable text box: vector text inside a stamp
+/// annotation.
+///
+/// A `/FreeText` annotation would be the right label, but it draws nothing here
+/// for the same reason a bare `/Square` does: no way to attach the appearance
+/// stream it needs. A stamp annotation, by contrast, gets its appearance built
+/// from the objects put inside it, and this binding lets us add real text
+/// objects to one. So the text is genuine vector text, crisp at any zoom, and
+/// the box round-trips as an editable object because the words are stored in
+/// its `/Contents` tag.
+///
+/// `capture_width` is the render width the box and font size were captured at.
+/// `font_size_px` is in that same capture space. Lines are split on `\n`.
+#[unsafe(no_mangle)]
+pub extern "C" fn add_text_box_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    text_utf8: *const u8,
+    text_len: usize,
+    font_size_px: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || capture_width <= 0 || font_size_px <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if right <= left || bottom <= top {
+        return STATUS_INVALID_INPUT;
+    }
+    if text_utf8.is_null() || text_len == 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let text = {
+        let slice = unsafe { std::slice::from_raw_parts(text_utf8, text_len) };
+        match std::str::from_utf8(slice) {
+            Ok(t) => t.to_string(),
+            Err(_) => return STATUS_INVALID_INPUT,
+        }
+    };
+
+    panic::catch_unwind(|| {
+        add_text_box_inner(
+            doc_handle, page_index, capture_width, left, top, right, bottom, &text, font_size_px, r,
+            g, b, a,
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_text_box_inner(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    text: &str,
+    font_size_px: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let mut doc_guard = lock(&doc);
+
+    // The font token is a plain handle, so taking it here (a brief mutable
+    // borrow) releases the document before the page borrows it below.
+    let font = doc_guard.fonts_mut().helvetica();
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+    let scale = page_w / capture_width as f32;
+
+    let (origin_x, origin_top) = match page.boundaries().media().map(|bx| bx.bounds) {
+        Ok(bx) => (bx.left().value, bx.top().value),
+        Err(_) => (0.0, page.height().value),
+    };
+
+    let x0 = origin_x + left * scale;
+    let x1 = origin_x + right * scale;
+    let y_top = origin_top - top * scale;
+    let y_bottom = origin_top - bottom * scale;
+
+    let size_pts = font_size_px * scale;
+    let line_h = size_pts * TEXTBOX_LINE_HEIGHT;
+    let pad = size_pts * TEXTBOX_PADDING;
+
+    let color = PdfColor::new(r, g, b, a);
+
+    let bounds = PdfRect::new(
+        PdfPoints::new(y_bottom),
+        PdfPoints::new(x0),
+        PdfPoints::new(y_top),
+        PdfPoints::new(x1),
+    );
+
+    let Ok(mut annotation) = page.annotations_mut().create_stamp_annotation() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // Bounds BEFORE objects, as everywhere: PDFium builds the appearance form
+    // from the rect.
+    if annotation.set_bounds(bounds).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // One text object per line. Positioned BEFORE being added, because an object
+    // fetched back from an annotation is detached and a transform on it never
+    // reaches the stored copy; see the stamp resize path.
+    //
+    // A text object's origin is its baseline, so the first line sits one full
+    // size below the top inset, and each line below is a line-height lower.
+    for (i, line) in text.split('\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+
+        let baseline = y_top - pad - size_pts - (i as f32) * line_h;
+        if baseline < y_bottom {
+            break; // Ran out of box; a scroll/clip would need a real text layer.
+        }
+
+        let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, line, font, PdfPoints::new(size_pts))
+        else {
+            return STATUS_INVALID_INPUT;
+        };
+        let _ = obj.set_fill_color(color);
+        if obj.translate(PdfPoints::new(x0 + pad), PdfPoints::new(baseline)).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+        if annotation.objects_mut().add_text_object(obj).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    let _ = annotation.set_contents(&textbox_tag(text, font_size_px, r, g, b, a));
+
+    drop(annotation);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
+
 /// Shape kinds. These numbers cross the FFI boundary and are mirrored by
 /// `ShapeKind` in the C# viewport library, so they may be appended to but never
 /// reordered.
@@ -4679,6 +4945,165 @@ mod tests {
         let (_, _, (lx, ly), _) = arrow_parts(0.0, 0.0, 100.0, 0.0, 0.01);
         let reach = ((100.0f32 - lx).powi(2) + ly.powi(2)).sqrt();
         assert!(reach >= ARROW_HEAD_MIN - 0.001, "hairline arrow head reached only {reach}");
+    }
+
+    // ---- Text boxes: real vector text inside a stamp annotation ----
+
+    fn add_box(handle: u64, text: &str, size: f32) -> i32 {
+        let bytes = text.as_bytes();
+        add_text_box_annotation(
+            handle, 0, 1000, 100.0, 100.0, 700.0, 400.0,
+            bytes.as_ptr(), bytes.len(), size, 20, 20, 20, 255,
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_text_box_for_inspection() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let text = "Ayaan PDF text box
+Second line here
+Third, with punctuation: 10:30!";
+        let b = text.as_bytes();
+        assert_eq!(
+            add_text_box_annotation(handle, 0, 1000, 60.0, 80.0, 720.0, 340.0,
+                b.as_ptr(), b.len(), 26.0, 200, 0, 0, 255),
+            STATUS_OK_PDFIUM);
+        let r = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 900);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        std::fs::write(std::env::var("TB_DUMP").unwrap(), bytes).unwrap();
+        println!("DUMP {}x{}", r.width, r.height);
+        free_render_result(r);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_text_box_actually_draws_its_text() {
+        // The whole risk. A /FreeText annotation draws nothing here; this puts
+        // real text objects inside a stamp, whose appearance PDFium builds from
+        // them. If the text does not draw, this counts zero extra pixels.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = marked_pixels(handle, 0);
+
+        assert_eq!(add_box(handle, "Hello Ayaan", 24.0), STATUS_OK_PDFIUM);
+
+        let after = marked_pixels(handle, 0);
+        assert!(after > before, "the text box drew nothing: {before} -> {after}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn more_text_draws_more_ink() {
+        // A stronger check than "something drew": the words have to be there,
+        // so a longer line must cover more of the page than a shorter one.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let base = marked_pixels(handle, 0);
+        assert_eq!(add_box(handle, "Hi", 24.0), STATUS_OK_PDFIUM);
+        let short = marked_pixels(handle, 0) - base;
+        close_document(handle);
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let base = marked_pixels(handle, 0);
+        assert_eq!(add_box(handle, "Hi there, this is a much longer sentence", 24.0), STATUS_OK_PDFIUM);
+        let long = marked_pixels(handle, 0) - base;
+        close_document(handle);
+
+        assert!(long > short, "the longer text drew {long}, the shorter {short}");
+    }
+
+    #[test]
+    fn a_multi_line_box_draws_each_line() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let base = marked_pixels(handle, 0);
+        assert_eq!(add_box(handle, "One", 20.0), STATUS_OK_PDFIUM);
+        let one = marked_pixels(handle, 0) - base;
+        close_document(handle);
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let base = marked_pixels(handle, 0);
+        assert_eq!(add_box(handle, "One\nTwo\nThree", 20.0), STATUS_OK_PDFIUM);
+        let three = marked_pixels(handle, 0) - base;
+        close_document(handle);
+
+        assert!(three > one * 2, "three lines drew {three}, one line {one}");
+    }
+
+    #[test]
+    fn a_text_box_is_still_text_after_a_save_and_reopen() {
+        // The tag is what lets a reopened box be edited again rather than only
+        // moved. It must survive the round trip, text and all.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_box(handle, "Line one\nLine two", 18.0), STATUS_OK_PDFIUM);
+
+        free_render_result(render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 200));
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0);
+
+        // Still draws.
+        let base = {
+            let clean = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let b = marked_pixels(clean, 0);
+            close_document(clean);
+            b
+        };
+        assert!(marked_pixels(reopened, 0) > base, "the reopened text box drew nothing new");
+
+        // And its words come back.
+        let contents = contents_of(reopened, 0, 0).expect("reopened box has no contents");
+        let parsed = parse_textbox_tag(&contents).expect("tag did not parse");
+        assert_eq!(parsed.5, "Line one\nLine two");
+        assert!((parsed.0 - 18.0).abs() < 0.01, "font size came back as {}", parsed.0);
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn the_text_tag_round_trips_awkward_text() {
+        // Colons and newlines in the text must not be read as field separators,
+        // which is why the text is base64 in the tag.
+        for text in ["", "a:b:c", "line\nbreak", "10:30 meeting\nroom: 4B", "unicode \u{2713} \u{00e9}"] {
+            let tag = textbox_tag(text, 14.0, 1, 2, 3, 4);
+            let parsed = parse_textbox_tag(&tag);
+            if text.is_empty() {
+                // Empty text still tags, and comes back empty.
+                assert_eq!(parsed.map(|p| p.5), Some(String::new()));
+            } else {
+                assert_eq!(parsed.expect("did not parse").5, text, "lost {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_comment_is_not_mistaken_for_a_text_box() {
+        assert!(parse_textbox_tag("Please review").is_none());
+        assert!(parse_textbox_tag("AyaanText:").is_none());
+        assert!(parse_textbox_tag("AyaanText:14:GGGGGGGG:aGk=").is_none());
+        assert!(parse_textbox_tag("AyaanText:0:FFFFFFFF:aGk=").is_none());
+    }
+
+    #[test]
+    fn text_box_rejects_bad_input() {
+        let t = b"hi";
+        assert_eq!(
+            add_text_box_annotation(0, 0, 1000, 0.0, 0.0, 10.0, 10.0, t.as_ptr(), t.len(), 12.0, 0, 0, 0, 255),
+            STATUS_INVALID_INPUT
+        );
+        let handle = open_fixture();
+        // Inverted box.
+        assert_eq!(
+            add_text_box_annotation(handle, 0, 1000, 50.0, 10.0, 10.0, 50.0, t.as_ptr(), t.len(), 12.0, 0, 0, 0, 255),
+            STATUS_INVALID_INPUT
+        );
+        // Empty text.
+        assert_eq!(
+            add_text_box_annotation(handle, 0, 1000, 0.0, 0.0, 100.0, 100.0, t.as_ptr(), 0, 12.0, 0, 0, 0, 255),
+            STATUS_INVALID_INPUT
+        );
+        close_document(handle);
     }
 
     // ---- The tag that keeps a shape a shape ----

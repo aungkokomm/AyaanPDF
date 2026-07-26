@@ -737,6 +737,48 @@
                     </ListView>
                 </StackPanel>
 
+                <!-- Font size -->
+                <StackPanel x:Name="FontSizeSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <FontIcon Glyph="&#xE8E9;" FontSize="13" VerticalAlignment="Center"
+                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                              ToolTipService.ToolTip="Font size" />
+                    <ListView x:Name="FontSizeChoices" SelectionMode="Single"
+                              SelectionChanged="FontSize_SelectionChanged"
+                              Padding="0" BorderThickness="0" Background="Transparent"
+                              AutomationProperties.Name="Font size"
+                              ScrollViewer.HorizontalScrollMode="Disabled"
+                              ScrollViewer.VerticalScrollMode="Disabled"
+                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                              ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                        <ListView.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ListView.ItemsPanel>
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinWidth" Value="0" />
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Height" Value="30" />
+                                <Setter Property="Padding" Value="8,0" />
+                                <Setter Property="Margin" Value="1,0" />
+                                <Setter Property="CornerRadius" Value="6" />
+                                <Setter Property="VerticalContentAlignment" Value="Center" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:FontSize">
+                                <TextBlock Text="{x:Bind Name}" VerticalAlignment="Center"
+                                           AutomationProperties.Name="{x:Bind Name}"
+                                           Style="{StaticResource CaptionTextBlockStyle}" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+
                 <!-- Opacity -->
                 <StackPanel x:Name="OpacitySection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">

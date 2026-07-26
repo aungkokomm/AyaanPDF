@@ -421,6 +421,28 @@ internal static partial class RenderCoreNative
         [In] NativeShapeSpec[]? specs,
         nuint specCount);
 
+    /// <summary>
+    /// Places text as a real, editable text box: vector text inside a stamp
+    /// annotation. <paramref name="fontSizePx"/> is in the same capture space
+    /// as the rectangle. Lines are split on '\n'.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_text_box_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        [In] byte[] textUtf8,
+        nuint textLen,
+        float fontSizePx,
+        byte r,
+        byte g,
+        byte b,
+        byte a);
+
     /// <summary>Adds freehand strokes as real /Ink annotations, one per stroke.</summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int add_ink_annotations(

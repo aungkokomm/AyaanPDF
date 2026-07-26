@@ -21,6 +21,8 @@ public enum ToolMode
     Stamp,
     /// <summary>Drag draws a rectangle, ellipse, line or arrow.</summary>
     Shape,
+    /// <summary>Click places an editable text box.</summary>
+    Text,
 }
 
 /// <summary>Which extra controls a tool needs in the property bar.</summary>
@@ -36,6 +38,8 @@ public enum ToolOptions
     Stamp = 4,
     /// <summary>Offers the shape kind picker: rectangle, ellipse, line, arrow.</summary>
     Shape = 8,
+    /// <summary>Offers the font-size picker.</summary>
+    FontSize = 16,
 }
 
 /// <summary>
@@ -84,6 +88,7 @@ public static class ToolCatalog
         new(ToolMode.Highlight, "Highlight", "", 'U', ToolOptions.Color),
         new(ToolMode.Draw, "Draw", "", 'D', ToolOptions.Color | ToolOptions.Width),
         new(ToolMode.Shape, "Shape", "", 'R', ToolOptions.Color | ToolOptions.Width | ToolOptions.Shape),
+        new(ToolMode.Text, "Text", "", 'T', ToolOptions.Color | ToolOptions.FontSize),
         new(ToolMode.Note, "Note", "", 'N', ToolOptions.None),
         new(ToolMode.Stamp, "Stamp", "", 'S', ToolOptions.Stamp, StampIcon),
     ];

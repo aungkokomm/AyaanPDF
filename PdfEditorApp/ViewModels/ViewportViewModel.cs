@@ -2570,6 +2570,62 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    /// <summary>Font size for new text boxes, as a fraction of page width.</summary>
+    [ObservableProperty]
+    public partial double TextFontSize { get; set; } = TextBoxPresets.DefaultSize.Value;
+
+    /// <summary>
+    /// Writes a text box to the document as real vector text, then hands it back
+    /// as an ordinary loaded annotation.
+    ///
+    /// Committed straight into the PDF, the same way a stamp is, rather than
+    /// held in a parallel overlay list: a text box is a stamp annotation
+    /// underneath, so writing it immediately means it is selected, moved,
+    /// resized and deleted by the machinery every loaded annotation already
+    /// uses, instead of a second copy of all of it.
+    /// </summary>
+    /// <returns>True if it was written; the caller then selects the newest.</returns>
+    public bool PlaceTextBox(int pageIndex, double x, double y, string text,
+                             string colorHex, double fontSizeNorm)
+    {
+        if (_documentHandle == 0 || string.IsNullOrEmpty(text))
+        {
+            return false;
+        }
+
+        // The click is the TOP-LEFT of the box, and it is given a default
+        // extent so PDFium has a rectangle to build the appearance in. The box
+        // only needs to be big enough to hold the text; the exact size is not
+        // load-bearing, since the text is what is measured on reopen.
+        var (left, top, right, bottom) = TextBoxPlacement.Compute(
+            Norm(x), Norm(y), text, fontSizeNorm);
+
+        PushHistory(HistoryScope.Document, "Add text");
+
+        const int CaptureWidth = 1000;
+        var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
+
+        int status = RenderCoreNative.add_text_box_annotation(
+            _documentHandle, pageIndex, CaptureWidth,
+            (float)(left * CaptureWidth), (float)(top * CaptureWidth),
+            (float)(right * CaptureWidth), (float)(bottom * CaptureWidth),
+            utf8, (nuint)utf8.Length,
+            (float)(fontSizeNorm * CaptureWidth), r, g, b, a);
+
+        Diag.Log($"place text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" -> {status}");
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not add that text.";
+            return false;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(pageIndex);
+        return true;
+    }
+
     // ---------------- Undo / redo ----------------
 
     private readonly DocumentHistory _history = new();

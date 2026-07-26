@@ -687,6 +687,105 @@ public sealed partial class MainPage : Page
         ViewModel.SelectNewestAnnotation(pageIndex);
     }
 
+    // ---------------- Text boxes ----------------
+
+    private TextBox? _textEditor;
+    private int _textEditorPage;
+    private double _textEditorX;
+    private double _textEditorY;
+
+    /// <summary>
+    /// Opens a live editor where the text will land, so what is typed is seen
+    /// in place rather than in a dialog. Committed on Escape, on Enter without
+    /// Shift, or when focus leaves it.
+    /// </summary>
+    private void BeginTextEdit(int page, double normX, double normY)
+    {
+        CommitTextEdit();
+
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(page);
+
+        _textEditor = new TextBox
+        {
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.NoWrap,
+            MinWidth = 40,
+            Padding = new Thickness(2),
+            BorderThickness = new Thickness(1),
+            Background = new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF)),
+            Foreground = HexBrush(ViewModel.InkColorHex),
+            // The editor's text is sized to match what will be placed, so the
+            // box is a true preview: font-size fraction times the slot width.
+            FontSize = System.Math.Max(8, ViewModel.TextFontSize * scale),
+        };
+
+        Canvas.SetLeft(_textEditor, normX * scale);
+        Canvas.SetTop(_textEditor, (normY * scale) + pageTop);
+        InkCanvas.Children.Add(_textEditor);
+
+        _textEditorPage = page;
+        _textEditorX = normX;
+        _textEditorY = normY;
+
+        _textEditor.KeyDown += TextEditor_KeyDown;
+        _textEditor.LostFocus += (_, _) => CommitTextEdit();
+        _textEditor.Focus(FocusState.Programmatic);
+    }
+
+    private void TextEditor_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        // Escape commits and keeps what was typed; Shift+Enter adds a line.
+        // Plain Enter commits, which is what most people expect of a small text
+        // box, with Shift+Enter as the deliberate multi-line gesture.
+        if (e.Key == VirtualKey.Escape)
+        {
+            CommitTextEdit();
+            e.Handled = true;
+        }
+        else if (e.Key == VirtualKey.Enter && !IsShiftDown())
+        {
+            CommitTextEdit();
+            e.Handled = true;
+        }
+    }
+
+    private static bool IsShiftDown() =>
+        Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Shift)
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+
+    /// <summary>
+    /// Writes the editor's text to the page and hands the result over as an
+    /// ordinary loaded annotation, or just closes the editor if it is empty.
+    /// </summary>
+    private void CommitTextEdit()
+    {
+        if (_textEditor is null)
+        {
+            return;
+        }
+
+        var editor = _textEditor;
+        _textEditor = null; // First, so the LostFocus this triggers is a no-op.
+        editor.KeyDown -= TextEditor_KeyDown;
+
+        string text = editor.Text.TrimEnd('\r', '\n');
+        InkCanvas.Children.Remove(editor);
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        if (ViewModel.PlaceTextBox(_textEditorPage, _textEditorX, _textEditorY,
+                                   text, ViewModel.InkColorHex, ViewModel.TextFontSize))
+        {
+            SetActiveTool(ToolMode.Select);
+            ViewModel.SelectNewestAnnotation(_textEditorPage);
+        }
+    }
+
     private void SetActiveTool(ToolMode tool)
     {
         // Switching tools abandons whatever the previous one was part way
@@ -699,6 +798,11 @@ public sealed partial class MainPage : Page
         // It reads as the hand tool having taken the app over and the other
         // tools being dead.
         ResetPointerInteraction();
+
+        // A half-typed text box is finished, not abandoned: switching tools is
+        // a natural way to say "done typing", and dropping it would lose what
+        // was written.
+        CommitTextEdit();
 
         ViewModel.ActiveTool = tool;
         UpdateToolRail();
@@ -727,6 +831,7 @@ public sealed partial class MainPage : Page
     {
         WidthChoices.ItemsSource = InkPresets.Widths;
         WidthChoices.SelectedIndex = 1;
+        FontSizeChoices.ItemsSource = TextBoxPresets.Sizes;
         ShowPaletteFor(ViewModel.ActiveTool);
 
         // Only now is the opacity slider allowed to speak. Anything it raised
@@ -941,6 +1046,32 @@ public sealed partial class MainPage : Page
         }
     }
 
+    /// <summary>Points the font-size picker at the tool's current size.</summary>
+    private void ShowFontSize()
+    {
+        var sizes = TextBoxPresets.Sizes;
+        int index = 0;
+        for (int i = 0; i < sizes.Count; i++)
+        {
+            if (System.Math.Abs(sizes[i].Value - ViewModel.TextFontSize) < 1e-6)
+            {
+                index = i;
+                break;
+            }
+        }
+
+        FontSizeChoices.SelectedIndex = index;
+    }
+
+    private void FontSize_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (FontSizeChoices.SelectedItem is FontSize s)
+        {
+            ViewModel.TextFontSize = s.Value;
+            ReturnFocusAfterPointerUse();
+        }
+    }
+
     /// <summary>
     /// The kind is carried on each item's Tag and parsed back to the enum,
     /// rather than the list being bound to the enum's values. The items are
@@ -992,6 +1123,13 @@ public sealed partial class MainPage : Page
         if (shapes)
         {
             ShapeChoices.SelectedIndex = (int)ViewModel.ActiveShapeKind;
+        }
+
+        bool fontSize = tool.Offers(ToolOptions.FontSize);
+        FontSizeSection.Visibility = Show(fontSize);
+        if (fontSize)
+        {
+            ShowFontSize();
         }
 
         // A bar with every section collapsed is an empty pill floating over the
@@ -1797,6 +1935,7 @@ public sealed partial class MainPage : Page
             (_, ToolMode.Highlight) => InputSystemCursorShape.IBeam,
             (_, ToolMode.Draw) => InputSystemCursorShape.Cross,
             (_, ToolMode.Shape) => InputSystemCursorShape.Cross,
+            (_, ToolMode.Text) => InputSystemCursorShape.IBeam,
             (_, ToolMode.Note) => InputSystemCursorShape.Cross,
             (_, ToolMode.Stamp) => InputSystemCursorShape.Cross,
             _ => InputSystemCursorShape.Arrow,
@@ -1942,6 +2081,11 @@ public sealed partial class MainPage : Page
                 _dragPointerId = current.PointerId;
                 ViewportHost.CapturePointer(e.Pointer);
                 ViewModel.BeginShape(content.Page, content.X, content.Y);
+                e.Handled = true;
+                break;
+
+            case ToolMode.Text:
+                BeginTextEdit(content.Page, content.X, content.Y);
                 e.Handled = true;
                 break;
 
