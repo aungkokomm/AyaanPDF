@@ -5690,6 +5690,86 @@ mod tests {
         close_document(h);
     }
 
+    // ---- Styled text boxes: alignment, fill, outline ----
+
+    /// The rendered page, as raw BGRA bytes at the given width.
+    fn render_bytes(handle: u64, page: i32, width: i32) -> (Vec<u8>, usize) {
+        let r = render_region(handle, page, 0.0, 0.0, 1.0, 1.0, width);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) }.to_vec();
+        let w = r.width as usize;
+        free_render_result(r);
+        (bytes, w)
+    }
+
+    #[test]
+    fn left_and_right_aligned_boxes_render_differently() {
+        // The clearest proof alignment takes effect: identical text and box,
+        // only the alignment differs, so the pages must not be identical.
+        let text = "one two three four five six".as_bytes();
+
+        let make = |align: i32| {
+            let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            assert_eq!(
+                add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 800.0, 200.0,
+                    text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255, align, 0, 0, 0.0),
+                STATUS_OK_PDFIUM);
+            let (bytes, _) = render_bytes(h, 0, 400);
+            close_document(h);
+            bytes
+        };
+
+        assert_ne!(make(ALIGN_LEFT), make(ALIGN_RIGHT),
+            "left and right aligned text rendered identically");
+    }
+
+    #[test]
+    fn a_filled_box_paints_its_background() {
+        // A box with a red fill must actually put red where the page was white.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let text = "x".as_bytes();
+        // Solid red fill: RRGGBBAA = FF0000FF.
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 300.0,
+                text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0xFF0000FF, 0, 0.0),
+            STATUS_OK_PDFIUM);
+
+        let (bytes, w) = render_bytes(h, 0, 400);
+        // A point well inside the box (normalized ~0.3, 0.12) but away from the
+        // text, sampled as BGRA.
+        let px = ((0.12 * 400.0) as usize * w + (0.30 * 400.0) as usize) * 4;
+        let (b, g, r) = (bytes[px], bytes[px + 1], bytes[px + 2]);
+        close_document(h);
+
+        assert!(r > 180 && g < 90 && b < 90, "fill sampled B={b} G={g} R={r}, not red");
+    }
+
+    #[test]
+    fn a_styled_box_keeps_its_style_tag_across_a_reopen() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let text = "styled".as_bytes();
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 600.0, 260.0,
+                text.as_ptr(), text.len(), 22.0, 20, 20, 20, 255,
+                ALIGN_CENTER, 0xFFF7C8FF, 0x1565C0FF, 2.0),
+            STATUS_OK_PDFIUM);
+
+        free_render_result(render_region(h, 0, 0.0, 0.0, 1.0, 1.0, 200));
+        let saved = snapshot_document(h);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0);
+
+        // The styled tag round-trips, and still parses back to the same words.
+        let contents = contents_of(reopened, 0, 0).expect("no contents after reopen");
+        assert!(contents.starts_with("AyaanTextB:"), "styled tag lost: {contents}");
+        assert_eq!(parse_textbox_tag(&contents).map(|t| t.5), Some("styled".to_string()));
+
+        close_document(reopened);
+        close_document(h);
+        free_byte_buffer(saved);
+    }
+
     #[test]
     fn get_annotation_contents_reads_a_text_box_back_across_the_boundary() {
         // The app reads this to re-open the editor on an existing box. It has
