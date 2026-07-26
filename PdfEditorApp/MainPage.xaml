@@ -822,6 +822,100 @@
                     </ListView>
                 </StackPanel>
 
+                <!-- Text alignment, fill and outline -->
+                <StackPanel x:Name="TextStyleSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                    <!-- Alignment: one of four, radio-style. -->
+                    <StackPanel Orientation="Horizontal" Spacing="1">
+                        <ToggleButton x:Name="AlignLeftBtn" Tag="Left" Click="Align_Click"
+                                      Width="30" Height="30" Padding="0"
+                                      AutomationProperties.Name="Align left"
+                                      ToolTipService.ToolTip="Align left">
+                            <FontIcon Glyph="&#xE8E4;" FontSize="14" />
+                        </ToggleButton>
+                        <ToggleButton x:Name="AlignCenterBtn" Tag="Center" Click="Align_Click"
+                                      Width="30" Height="30" Padding="0"
+                                      AutomationProperties.Name="Center"
+                                      ToolTipService.ToolTip="Center">
+                            <FontIcon Glyph="&#xE8E3;" FontSize="14" />
+                        </ToggleButton>
+                        <ToggleButton x:Name="AlignRightBtn" Tag="Right" Click="Align_Click"
+                                      Width="30" Height="30" Padding="0"
+                                      AutomationProperties.Name="Align right"
+                                      ToolTipService.ToolTip="Align right">
+                            <FontIcon Glyph="&#xE8E2;" FontSize="14" />
+                        </ToggleButton>
+                        <ToggleButton x:Name="AlignJustifyBtn" Tag="Justify" Click="Align_Click"
+                                      Width="30" Height="30" Padding="0"
+                                      AutomationProperties.Name="Justify"
+                                      ToolTipService.ToolTip="Justify">
+                            <!-- No Segoe glyph reads as justify, so it is drawn:
+                                 four full, equal lines. -->
+                            <StackPanel Spacing="2.5" VerticalAlignment="Center">
+                                <Rectangle Width="16" Height="1.6" Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                                <Rectangle Width="16" Height="1.6" Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                                <Rectangle Width="16" Height="1.6" Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                                <Rectangle Width="16" Height="1.6" Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                            </StackPanel>
+                        </ToggleButton>
+                    </StackPanel>
+
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                    <!-- Fill -->
+                    <Button x:Name="FillButton" Width="30" Height="30" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            AutomationProperties.Name="Fill colour"
+                            ToolTipService.ToolTip="Fill">
+                        <Grid Width="20" Height="20">
+                            <Border x:Name="FillSwatch" CornerRadius="4"
+                                    BorderBrush="#66000000" BorderThickness="1" />
+                            <!-- Diagonal shown when there is no fill. -->
+                            <Line x:Name="FillNoneSlash" X1="2" Y1="18" X2="18" Y2="2"
+                                  Stroke="#C0D13438" StrokeThickness="1.5" />
+                        </Grid>
+                        <Button.Flyout>
+                            <Flyout x:Name="FillFlyout" Placement="Bottom" Opening="FillFlyout_Opening">
+                                <StackPanel Spacing="8" Width="288">
+                                    <ColorPicker x:Name="FillPicker" IsAlphaEnabled="False"
+                                                 IsMoreButtonVisible="True" ColorSpectrumShape="Box"
+                                                 Width="280" ColorChanged="FillColor_Changed" />
+                                    <Button Content="No fill" HorizontalAlignment="Stretch"
+                                            Click="NoFill_Click" />
+                                </StackPanel>
+                            </Flyout>
+                        </Button.Flyout>
+                    </Button>
+
+                    <!-- Outline -->
+                    <Button x:Name="OutlineButton" Width="30" Height="30" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            AutomationProperties.Name="Outline colour"
+                            ToolTipService.ToolTip="Outline">
+                        <Grid Width="20" Height="20">
+                            <Border x:Name="OutlineSwatch" CornerRadius="4" Background="Transparent"
+                                    BorderBrush="#FF1565C0" BorderThickness="2" />
+                            <Line x:Name="OutlineNoneSlash" X1="2" Y1="18" X2="18" Y2="2"
+                                  Stroke="#C0D13438" StrokeThickness="1.5" />
+                        </Grid>
+                        <Button.Flyout>
+                            <Flyout x:Name="OutlineFlyout" Placement="Bottom" Opening="OutlineFlyout_Opening">
+                                <StackPanel Spacing="8" Width="288">
+                                    <ColorPicker x:Name="OutlinePicker" IsAlphaEnabled="False"
+                                                 IsMoreButtonVisible="True" ColorSpectrumShape="Box"
+                                                 Width="280" ColorChanged="OutlineColor_Changed" />
+                                    <Button Content="No outline" HorizontalAlignment="Stretch"
+                                            Click="NoOutline_Click" />
+                                </StackPanel>
+                            </Flyout>
+                        </Button.Flyout>
+                    </Button>
+                </StackPanel>
+
                 <!-- Opacity -->
                 <StackPanel x:Name="OpacitySection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">

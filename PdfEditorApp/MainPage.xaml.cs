@@ -777,12 +777,16 @@ public sealed partial class MainPage : Page
 
         // Caret at the end, so re-editing appends rather than overwriting.
         _textEditor.SelectionStart = _textEditor.Text.Length;
+
+        // Apply the box's fill, outline and alignment, so the editor is a true
+        // preview of what will be placed.
+        UpdateOpenEditorStyle();
     }
 
     /// <summary>
-    /// Brings an OPEN editor into line with the tool's current colour and size,
-    /// so changing either in the property bar mid-edit is reflected at once
-    /// rather than only after committing.
+    /// Brings an OPEN editor into line with the tool's current colour, size,
+    /// alignment, fill and outline, so changing any of them in the property bar
+    /// mid-edit is reflected at once rather than only after committing.
     /// </summary>
     private void UpdateOpenEditorStyle()
     {
@@ -793,6 +797,127 @@ public sealed partial class MainPage : Page
 
         _textEditor.Foreground = HexBrush(ViewModel.InkColorHex);
         _textEditor.FontSize = System.Math.Max(8, ViewModel.TextFontSize * ViewModel.OverlayScale);
+        _textEditor.TextAlignment = ViewModel.TextAlign switch
+        {
+            TextAlign.Center => TextAlignment.Center,
+            TextAlign.Right => TextAlignment.Right,
+            TextAlign.Justify => TextAlignment.Justify,
+            _ => TextAlignment.Left,
+        };
+
+        // Fill: the box's own background, or a faint white so the text stays
+        // readable over the page while typing when there is no fill.
+        _textEditor.Background = string.IsNullOrEmpty(ViewModel.TextFillHex)
+            ? new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF))
+            : HexBrush(ViewModel.TextFillHex);
+
+        // Outline: the box's border, or none.
+        if (string.IsNullOrEmpty(ViewModel.TextOutlineHex))
+        {
+            _textEditor.BorderThickness = new Thickness(1);
+            _textEditor.BorderBrush = new SolidColorBrush(Color.FromArgb(0x40, 0x00, 0x00, 0x00));
+        }
+        else
+        {
+            double w = System.Math.Max(1, ViewModel.TextOutlineWidthNorm * ViewModel.OverlayScale);
+            _textEditor.BorderThickness = new Thickness(w);
+            _textEditor.BorderBrush = HexBrush(ViewModel.TextOutlineHex);
+        }
+    }
+
+    // ---------------- Text alignment, fill, outline ----------------
+
+    /// <summary>Reflects the chosen alignment, and keeps the four buttons radio-style.</summary>
+    private void Align_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag } && Enum.TryParse(tag, out TextAlign align))
+        {
+            ViewModel.TextAlign = align;
+        }
+
+        SyncTextStyleControls();
+        UpdateOpenEditorStyle();
+        ReturnFocusAfterPointerUse();
+    }
+
+    private bool _suppressFillChange;
+    private bool _suppressOutlineChange;
+
+    private void FillFlyout_Opening(object? sender, object e)
+    {
+        _suppressFillChange = true;
+        FillPicker.Color = string.IsNullOrEmpty(ViewModel.TextFillHex)
+            ? Microsoft.UI.Colors.White
+            : ColorFromHex(ViewModel.TextFillHex);
+        _suppressFillChange = false;
+    }
+
+    private void FillColor_Changed(ColorPicker sender, ColorChangedEventArgs args)
+    {
+        if (_suppressFillChange)
+        {
+            return;
+        }
+
+        var c = args.NewColor;
+        ViewModel.TextFillHex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
+        SyncTextStyleControls();
+        UpdateOpenEditorStyle();
+    }
+
+    private void NoFill_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.TextFillHex = "";
+        SyncTextStyleControls();
+        UpdateOpenEditorStyle();
+        FillFlyout.Hide();
+    }
+
+    private void OutlineFlyout_Opening(object? sender, object e)
+    {
+        _suppressOutlineChange = true;
+        OutlinePicker.Color = string.IsNullOrEmpty(ViewModel.TextOutlineHex)
+            ? ColorFromHex("#FF1565C0")
+            : ColorFromHex(ViewModel.TextOutlineHex);
+        _suppressOutlineChange = false;
+    }
+
+    private void OutlineColor_Changed(ColorPicker sender, ColorChangedEventArgs args)
+    {
+        if (_suppressOutlineChange)
+        {
+            return;
+        }
+
+        var c = args.NewColor;
+        ViewModel.TextOutlineHex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
+        SyncTextStyleControls();
+        UpdateOpenEditorStyle();
+    }
+
+    private void NoOutline_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.TextOutlineHex = "";
+        SyncTextStyleControls();
+        UpdateOpenEditorStyle();
+        OutlineFlyout.Hide();
+    }
+
+    /// <summary>Brings the alignment buttons and the fill/outline swatches into line with the tool.</summary>
+    private void SyncTextStyleControls()
+    {
+        AlignLeftBtn.IsChecked = ViewModel.TextAlign == TextAlign.Left;
+        AlignCenterBtn.IsChecked = ViewModel.TextAlign == TextAlign.Center;
+        AlignRightBtn.IsChecked = ViewModel.TextAlign == TextAlign.Right;
+        AlignJustifyBtn.IsChecked = ViewModel.TextAlign == TextAlign.Justify;
+
+        bool hasFill = !string.IsNullOrEmpty(ViewModel.TextFillHex);
+        FillSwatch.Background = hasFill ? HexBrush(ViewModel.TextFillHex) : new SolidColorBrush(Colors.Transparent);
+        FillNoneSlash.Visibility = hasFill ? Visibility.Collapsed : Visibility.Visible;
+
+        bool hasOutline = !string.IsNullOrEmpty(ViewModel.TextOutlineHex);
+        OutlineSwatch.BorderBrush = hasOutline ? HexBrush(ViewModel.TextOutlineHex) : new SolidColorBrush(Color.FromArgb(0x60, 0, 0, 0));
+        OutlineNoneSlash.Visibility = hasOutline ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void TextEditor_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -1277,9 +1402,13 @@ public sealed partial class MainPage : Page
 
         bool fontSize = tool.Offers(ToolOptions.FontSize);
         FontSizeSection.Visibility = Show(fontSize);
+        // Alignment, fill and outline are text-box properties, so they ride
+        // with the font-size section that marks the text tool.
+        TextStyleSection.Visibility = Show(fontSize);
         if (fontSize)
         {
             ShowFontSize();
+            SyncTextStyleControls();
         }
 
         // A bar with every section collapsed is an empty pill floating over the
