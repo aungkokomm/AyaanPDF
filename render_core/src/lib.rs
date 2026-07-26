@@ -420,6 +420,81 @@ fn delete_page_inner(doc_handle: u64, page_index: i32) -> i32 {
     STATUS_OK_PDFIUM
 }
 
+/// Rebuilds the document as a new sequence of its own pages.
+///
+/// One primitive covers every page-organising action, because each is just a
+/// different list of source indices:
+///   reorder   = a permutation, e.g. [2, 0, 1]
+///   duplicate = a repeated index, e.g. [0, 1, 1, 2]
+///   delete    = an omitted index, e.g. [0, 2]
+///   extract   = a subset, e.g. [3, 4]
+///
+/// Done by importing the chosen pages, in order, into a fresh document and
+/// swapping it in behind the same handle. Import copies each page whole, its
+/// content AND its annotations, which the reorder test proves. The handle is
+/// preserved so nothing on the app side has to be re-opened.
+///
+/// `indices` are zero-based source page numbers; `count` is how many. Every
+/// index must be in range, and there must be at least one, so a document can
+/// never be rebuilt to zero pages.
+#[unsafe(no_mangle)]
+pub extern "C" fn rebuild_page_order(doc_handle: u64, indices: *const i32, count: usize) -> i32 {
+    if doc_handle == 0 || indices.is_null() || count == 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| rebuild_page_order_inner(doc_handle, indices, count)).unwrap_or(STATUS_PANIC)
+}
+
+fn rebuild_page_order_inner(doc_handle: u64, indices: *const i32, count: usize) -> i32 {
+    let order: &[i32] = unsafe { std::slice::from_raw_parts(indices, count) };
+
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let new_doc = {
+        let doc_guard = lock(&doc);
+        let page_count = doc_guard.pages().len() as i32;
+
+        // Every source index must exist. A bad index would otherwise import
+        // nothing for that slot and silently drop a page.
+        if order.iter().any(|&i| i < 0 || i >= page_count) {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let Some(pdfium) = pdfium() else {
+            return STATUS_INVALID_INPUT;
+        };
+        let Ok(mut new_doc) = pdfium.create_new_pdf() else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        // pdfium's import takes a 1-indexed, comma-separated page list.
+        let range = order.iter().map(|&i| (i + 1).to_string()).collect::<Vec<_>>().join(",");
+
+        if new_doc
+            .pages_mut()
+            .copy_pages_from_document(&doc_guard, &range, 0)
+            .is_err()
+        {
+            return STATUS_INVALID_INPUT;
+        }
+
+        new_doc
+    };
+
+    // Swap the rebuilt document in behind the same handle. Done under CALL_LOCK,
+    // so no render or edit can be holding the old one across this.
+    lock(&core().documents).insert(doc_handle, Arc::new(Mutex::new(new_doc)));
+
+    evict_all_cache_for_doc(doc_handle);
+    lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Saves the document (including any rotate/delete/form-fill changes) to a
 /// new file path.
 #[unsafe(no_mangle)]
@@ -4072,6 +4147,112 @@ mod tests {
     #[test]
     fn delete_page_rejects_invalid_handle() {
         assert_eq!(delete_page(0, 0), STATUS_INVALID_INPUT);
+    }
+
+    // ---- Page organising: rebuild_page_order ----
+
+    #[test]
+    fn reordering_pages_moves_the_right_page_and_keeps_the_rest() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // Move page 0 ("Page 1 of 20") to the end of a 3-page rebuild: [1, 2, 0].
+        let order = [1i32, 2, 0];
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+
+        assert_eq!(get_page_count(h), 3);
+        assert_eq!(page_text(h, 0), "Page 2 of 20");
+        assert_eq!(page_text(h, 1), "Page 3 of 20");
+        assert_eq!(page_text(h, 2), "Page 1 of 20");
+
+        close_document(h);
+    }
+
+    #[test]
+    fn reordering_carries_a_pages_annotations_with_it() {
+        // THE question the whole feature hinges on: does importing a page bring
+        // its annotations along? If not, reordering would silently drop every
+        // mark on a moved page.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // Put a distinctive text box on page 0.
+        let t = "MOVE ME".as_bytes();
+        assert_eq!(
+            add_text_box_annotation(h, 0, 1000, 100.0, 100.0, 500.0, 200.0,
+                t.as_ptr(), t.len(), 24.0, 200, 0, 0, 255),
+            STATUS_OK_PDFIUM);
+        assert_eq!(read_annotations(h, 0).len(), 1);
+        // Render so the appearance stream exists before the page is copied.
+        free_render_result(render_region(h, 0, 0.0, 0.0, 1.0, 1.0, 200));
+
+        // Move page 0 to index 2: [1, 2, 0].
+        let order = [1i32, 2, 0];
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+
+        // The annotation is now on the LAST page, and nowhere else.
+        assert_eq!(read_annotations(h, 2).len(), 1, "the text box did not travel with its page");
+        assert_eq!(read_annotations(h, 0).len(), 0, "an annotation was left on the wrong page");
+
+        // And it still draws.
+        let base = {
+            let clean = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let b = marked_pixels(clean, 1); // page index 1 == "Page 2 of 20", now at new index 0
+            close_document(clean);
+            b
+        };
+        assert!(marked_pixels(h, 2) > base, "the moved page's text box drew nothing");
+
+        close_document(h);
+    }
+
+    #[test]
+    fn a_page_can_be_duplicated_by_repeating_its_index() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // [0, 0, 1]: page 0 twice, then page 1.
+        let order = [0i32, 0, 1];
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+
+        assert_eq!(get_page_count(h), 3);
+        assert_eq!(page_text(h, 0), "Page 1 of 20");
+        assert_eq!(page_text(h, 1), "Page 1 of 20");
+        assert_eq!(page_text(h, 2), "Page 2 of 20");
+
+        close_document(h);
+    }
+
+    #[test]
+    fn the_document_handle_survives_a_rebuild() {
+        // The app keeps using the same handle after a reorder, so it must stay
+        // valid and keep rendering.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let order = [2i32, 1, 0];
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+
+        let r = render_low_res(h, 0, 150);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        free_render_result(r);
+
+        close_document(h);
+    }
+
+    #[test]
+    fn rebuild_rejects_a_bad_index_or_empty_order() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let out_of_range = [0i32, 99];
+        assert_eq!(rebuild_page_order(h, out_of_range.as_ptr(), 2), STATUS_INVALID_INPUT);
+
+        let negative = [0i32, -1];
+        assert_eq!(rebuild_page_order(h, negative.as_ptr(), 2), STATUS_INVALID_INPUT);
+
+        let order = [0i32];
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), 0), STATUS_INVALID_INPUT);
+        assert_eq!(rebuild_page_order(0, order.as_ptr(), 1), STATUS_INVALID_INPUT);
+
+        // The document is untouched after a rejected rebuild.
+        assert_eq!(get_page_count(h), 20);
+
+        close_document(h);
     }
 
     #[test]

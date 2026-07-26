@@ -352,6 +352,14 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_annotation_contents(ulong docHandle, int pageIndex, int index);
 
     /// <summary>
+    /// Rebuilds the document from a list of its own page indices: reorder,
+    /// duplicate (repeat an index), delete (omit one) or extract (a subset).
+    /// The handle is preserved. Pages keep their annotations.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int rebuild_page_order(ulong docHandle, [In] int[] indices, nuint count);
+
+    /// <summary>
     /// Reopens a snapshot. The bytes are copied natively, so the same managed
     /// array can be restored repeatedly (undo, redo, undo again).
     /// </summary>
