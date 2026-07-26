@@ -2645,41 +2645,55 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             tag.Text, tag.ColorHex, tag.FontSizeNorm);
     }
 
-    /// <summary>Replaces a text box with a freshly typed one, as one undo step.</summary>
-    public bool ReplaceTextBox(int pageIndex, int oldIndex,
-                               double normLeft, double normTop, double normRight, double normBottom,
-                               string text, string colorHex, double fontSizeNorm)
+    /// <summary>
+    /// Removes a text box from the document so it can be re-edited on a clean
+    /// page, and re-renders so it disappears from behind the editor.
+    ///
+    /// This is what stops the box showing as TWO layers while editing: the
+    /// rendered box used to stay baked into the page under the live editor. Now
+    /// the page shows nothing there and the editor is the only thing on it, so
+    /// what is typed is what will be, immediately. The box is added back on
+    /// commit; the single snapshot here makes the whole edit one undo step.
+    /// </summary>
+    public bool BeginLoadedTextBoxEdit(int pageIndex, int index)
     {
         if (_documentHandle == 0)
         {
             return false;
         }
 
-        // One snapshot for the whole edit, so undo restores the original text in
-        // a single step rather than leaving the box deleted.
         PushHistory(HistoryScope.Document, "Edit text");
 
-        int del = RenderCoreNative.delete_annotation(_documentHandle, pageIndex, oldIndex);
-        if (del != RenderStatus.OkPdfium)
+        if (RenderCoreNative.delete_annotation(_documentHandle, pageIndex, index) != RenderStatus.OkPdfium)
         {
             Status = "Could not edit that text.";
             return false;
         }
 
-        // The selection pointed at the annotation just removed; clear it before
-        // the indices shift underneath it.
         _selectedLoaded = null;
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        RefreshSelectionOutline();
 
-        // Empty text is a deletion: the box is gone and nothing replaces it.
-        if (string.IsNullOrWhiteSpace(text))
+        IsDirty = true;
+        InvalidateLoadedPage(pageIndex);   // re-render: the box vanishes from the page
+        return true;
+    }
+
+    /// <summary>
+    /// Writes the edited text back as a box. The old one was already removed by
+    /// <see cref="BeginLoadedTextBoxEdit"/>, so this only ADDS, and shares that
+    /// edit's single undo snapshot. Empty text leaves the box gone, which is
+    /// how a box is cleared by emptying it.
+    /// </summary>
+    public bool CommitEditedTextBox(int pageIndex,
+                                    double normLeft, double normTop, double normRight, double normBottom,
+                                    string text, string colorHex, double fontSizeNorm)
+    {
+        if (_documentHandle == 0 || string.IsNullOrWhiteSpace(text))
         {
-            IsDirty = true;
-            InvalidateLoadedPage(pageIndex);
-            RefreshSelectionOutline();
-            return true;
+            return false;
         }
 
         return AddTextBoxNormalized(pageIndex, normLeft, normTop, normRight, normBottom,

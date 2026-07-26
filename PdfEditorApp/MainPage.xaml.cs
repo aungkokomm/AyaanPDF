@@ -779,6 +779,22 @@ public sealed partial class MainPage : Page
         _textEditor.SelectionStart = _textEditor.Text.Length;
     }
 
+    /// <summary>
+    /// Brings an OPEN editor into line with the tool's current colour and size,
+    /// so changing either in the property bar mid-edit is reflected at once
+    /// rather than only after committing.
+    /// </summary>
+    private void UpdateOpenEditorStyle()
+    {
+        if (_textEditor is null)
+        {
+            return;
+        }
+
+        _textEditor.Foreground = HexBrush(ViewModel.InkColorHex);
+        _textEditor.FontSize = System.Math.Max(8, ViewModel.TextFontSize * ViewModel.OverlayScale);
+    }
+
     private void TextEditor_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         // Escape commits and keeps what was typed; Shift+Enter adds a line.
@@ -826,8 +842,10 @@ public sealed partial class MainPage : Page
         // want, so this path runs even when the text is blank.
         if (target is ViewportViewModel.TextBoxEditTarget t)
         {
-            if (ViewModel.ReplaceTextBox(t.PageIndex, t.Index, t.Left, t.Top, t.Right, t.Bottom,
-                                         text, ViewModel.InkColorHex, ViewModel.TextFontSize)
+            // The old box was already removed when editing began, so this only
+            // adds the new one. Empty text leaves it removed.
+            if (ViewModel.CommitEditedTextBox(t.PageIndex, t.Left, t.Top, t.Right, t.Bottom,
+                                              text, ViewModel.InkColorHex, ViewModel.TextFontSize)
                 && !string.IsNullOrWhiteSpace(text))
             {
                 SetActiveTool(ToolMode.Select);
@@ -1088,6 +1106,7 @@ public sealed partial class MainPage : Page
         }
 
         ShowOpacity();
+        UpdateOpenEditorStyle();
     }
 
     /// <summary>Compares two colours by RGB, ignoring their opacity.</summary>
@@ -1198,6 +1217,7 @@ public sealed partial class MainPage : Page
         if (FontSizeChoices.SelectedItem is FontSize s)
         {
             ViewModel.TextFontSize = s.Value;
+            UpdateOpenEditorStyle();
             ReturnFocusAfterPointerUse();
         }
     }
@@ -2142,6 +2162,14 @@ public sealed partial class MainPage : Page
         ViewModel.InkColorHex = target.ColorHex;
         ViewModel.TextFontSize = target.FontSizeNorm;
         UpdateToolRail();
+
+        // Remove the box from the page FIRST, so the editor is the only layer.
+        // Without this the rendered box stayed under the editor, which is the
+        // "two layers" the edit showed.
+        if (!ViewModel.BeginLoadedTextBoxEdit(target.PageIndex, target.Index))
+        {
+            return;
+        }
 
         BeginTextEdit(target.PageIndex, target.Left, target.Top, target.Right, target.Bottom,
                       initialText: target.Text, editing: target);
