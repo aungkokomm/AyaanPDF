@@ -19,6 +19,7 @@ public class ShapeInteropTests
     private const string Lib = "render_core";
     private const int OkPdfium = 0;
     private const int InvalidInput = 1;
+    private const int Unsupported = 4;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct ShapeSpec
@@ -68,6 +69,37 @@ public class ShapeInteropTests
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern void free_annotation_array(AnnotationArray array);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BurnPoint
+    {
+        public float X;
+        public float Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BurnStroke
+    {
+        public int PageIndex;
+        public uint PointOffset;
+        public uint PointCount;
+        public float WidthPx;
+        public byte R;
+        public byte G;
+        public byte B;
+        public byte A;
+    }
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int add_ink_annotations(
+        ulong docHandle, int captureWidth,
+        [In] BurnStroke[]? strokes, nuint strokeCount,
+        [In] BurnPoint[]? points, nuint pointCount);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int resize_shape_annotation(
+        ulong docHandle, int pageIndex, int index, int captureWidth,
+        float left, float top, float right, float bottom, out int newIndex);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern int add_shape_annotations(
@@ -245,6 +277,110 @@ public class ShapeInteropTests
             {
                 free_annotation_array(array);
             }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void a_shape_can_be_resized_across_the_boundary()
+    {
+        // The app calls this for every resize drag of a mark loaded from a
+        // file. It is also the only annotation edit that reports a NEW index,
+        // because the shape is rebuilt rather than stretched, and losing track
+        // of that index means the selection outline ends up on the wrong mark.
+        ulong handle = OpenFixture();
+        try
+        {
+            var specs = new[] { Spec(ShapeKind.Ellipse, 100, 100, 300, 200) };
+            Assert.Equal(OkPdfium, add_shape_annotations(handle, 1000, specs, 1));
+
+            Assert.Equal(
+                OkPdfium,
+                resize_shape_annotation(handle, 0, 0, 1000, 100, 100, 800, 600, out int newIndex));
+            Assert.True(newIndex >= 0, "resize did not report where the shape went");
+
+            var array = get_annotations(handle, 0);
+            try
+            {
+                // One annotation still: rebuilt, not duplicated.
+                Assert.Equal(1, (int)array.Len);
+
+                var info = Marshal.PtrToStructure<AnnotationInfo>(array.Items);
+                Assert.True(info.Right - info.Left > 0.6, $"resized width is only {info.Right - info.Left}");
+            }
+            finally
+            {
+                free_annotation_array(array);
+            }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void resizing_a_mark_that_is_not_a_shape_reports_unsupported()
+    {
+        // The app falls back to the general resize path on this exact code, so
+        // it has to arrive intact rather than as a generic failure. An ink
+        // stroke is the case that matters: it is a real annotation with no
+        // description to rebuild from.
+        ulong handle = OpenFixture();
+        try
+        {
+            var points = new[]
+            {
+                new BurnPoint { X = 100, Y = 100 },
+                new BurnPoint { X = 200, Y = 180 },
+                new BurnPoint { X = 300, Y = 120 },
+            };
+            var strokes = new[]
+            {
+                new BurnStroke
+                {
+                    PageIndex = 0, PointOffset = 0, PointCount = 3,
+                    WidthPx = 3f, R = 0, G = 0, B = 0, A = 255,
+                },
+            };
+            Assert.Equal(OkPdfium, add_ink_annotations(handle, 1000, strokes, 1, points, 3));
+
+            Assert.Equal(
+                Unsupported,
+                resize_shape_annotation(handle, 0, 0, 1000, 10, 10, 100, 100, out _));
+
+            // And the stroke is still there, untouched.
+            var array = get_annotations(handle, 0);
+            try
+            {
+                Assert.Equal(1, (int)array.Len);
+            }
+            finally
+            {
+                free_annotation_array(array);
+            }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void resizing_an_annotation_that_does_not_exist_is_invalid_input()
+    {
+        // Distinct from Unsupported on purpose. Unsupported means "this mark
+        // cannot be resized this way, try the other path"; a missing index is
+        // a bug in the caller and must not be silently retried.
+        ulong handle = OpenFixture();
+        try
+        {
+            Assert.Equal(
+                InvalidInput,
+                resize_shape_annotation(handle, 0, 0, 1000, 10, 10, 100, 100, out _));
         }
         finally
         {

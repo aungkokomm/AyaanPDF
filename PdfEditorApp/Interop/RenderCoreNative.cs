@@ -455,11 +455,23 @@ internal static partial class RenderCoreNative
     public static extern int delete_annotation(ulong docHandle, int pageIndex, int index);
 
     /// <summary>
-    /// Moves an annotation to a new rectangle. Returns
-    /// <see cref="RenderStatus.Unsupported"/> when asked to SCALE a stamp or
-    /// ink stroke, which PDFium cannot do: delete and re-add at the new size
-    /// instead.
+    /// Resizes a SHAPE by redrawing it inside a new rectangle, which is only
+    /// possible because a shape records what kind it is, in what colour and at
+    /// what width. Returns <see cref="RenderStatus.Unsupported"/> for anything
+    /// else, so the caller can fall back.
     /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int resize_shape_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        out int newIndex);
+
     /// <summary>
     /// Resizes an annotation, rebuilding it when PDFium will not scale it in
     /// place. Rebuilding reads the image back out of the annotation, so it

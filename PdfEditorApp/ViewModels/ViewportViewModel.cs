@@ -1765,11 +1765,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Rebuilding moves it to the end of the page's list, so the index it
         // reports back is the one to keep.
         const int CaptureWidth = 1000;
-        int status = RenderCoreNative.resize_annotation(
-            _documentHandle, now.PageIndex, now.Index, CaptureWidth,
-            (float)(now.Left * CaptureWidth), (float)(now.Top * CaptureWidth),
-            (float)(now.Right * CaptureWidth), (float)(now.Bottom * CaptureWidth),
-            out int newIndex);
+
+        float l = (float)(now.Left * CaptureWidth);
+        float t = (float)(now.Top * CaptureWidth);
+        float r = (float)(now.Right * CaptureWidth);
+        float b = (float)(now.Bottom * CaptureWidth);
+
+        // Shapes go through their own path first, and ONLY when actually being
+        // resized. A shape records its kind, colour and width, so it can be
+        // redrawn at any size; that is the one thing an arbitrary mark cannot
+        // do, and it is why a rectangle drawn last week can still be dragged
+        // bigger today. Anything else reports Unsupported here and falls
+        // through to the general path below, which handles moves for every
+        // kind of annotation and rebuilds a stamp from its own image.
+        int status = RenderStatus.Unsupported;
+        int newIndex = now.Index;
+
+        if (resizing)
+        {
+            status = RenderCoreNative.resize_shape_annotation(
+                _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
+        }
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            status = RenderCoreNative.resize_annotation(
+                _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
+        }
 
         Diag.Log($"{(resizing ? "resize" : "move")} loaded annotation " +
                  $"p{now.PageIndex}#{now.Index} -> {status}, index now {newIndex}");

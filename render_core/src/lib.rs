@@ -1553,6 +1553,62 @@ const ARROW_HEAD_ANGLE: f32 = 0.45;
 const ARROW_HEAD_SCALE: f32 = 6.0;
 const ARROW_HEAD_MIN: f32 = 6.0;
 
+/// Marks an annotation as one of our shapes, and records what it takes to
+/// redraw it: `AyaanShape:kind:RRGGBBAA:width:fx:fy`.
+///
+/// This lives in `/Contents` because a shape written as ink is otherwise
+/// indistinguishable from a freehand scribble once the file is reopened, and
+/// then it can only be moved and deleted, never resized as the shape it is.
+/// `/NM`, the annotation name field, would be the tidier home for machine data
+/// since viewers do not display it, but this binding exposes `/NM` read-only.
+///
+/// The colour and width are in the tag because they cannot be read back:
+/// querying an annotation's colour access-violates once it has an appearance
+/// stream, and rendering creates one. See `get_annotations`.
+///
+/// `fx` and `fy` record which corner of the box the drag STARTED at, so a line
+/// or arrow keeps pointing the way it was drawn. A bounding box alone cannot
+/// say that.
+const SHAPE_TAG: &str = "AyaanShape:";
+
+fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
+    let fx = u8::from(spec.x2 >= spec.x1);
+    let fy = u8::from(spec.y2 >= spec.y1);
+    format!(
+        "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}",
+        spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts
+    )
+}
+
+/// The kind, colour, width and drag direction recorded on an annotation, or
+/// None if it is not one of our shapes.
+fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool)> {
+    let rest = contents.strip_prefix(SHAPE_TAG)?;
+    let mut parts = rest.split(':');
+
+    let kind: i32 = parts.next()?.parse().ok()?;
+    if !matches!(kind, SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_LINE | SHAPE_ARROW) {
+        return None;
+    }
+
+    let rgba = parts.next()?;
+    if rgba.len() != 8 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
+
+    let width: f32 = parts.next()?.parse().ok()?;
+    if !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+
+    let flag = |s: Option<&str>| matches!(s, Some("1"));
+    let fx = flag(parts.next());
+    let fy = flag(parts.next());
+
+    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy))
+}
+
 /// One shape to add, in render-pixel space.
 ///
 /// Carries the drag's START and END rather than a normalized rectangle, because
@@ -1773,6 +1829,10 @@ fn add_shape_annotations_inner(
 
         let _ = annotation.set_stroke_color(color);
 
+        // Records what this mark IS, so a reopened file still knows. Without
+        // it a shape is just ink, and can then only be moved or deleted.
+        let _ = annotation.set_contents(&shape_tag(spec, width_pts));
+
         if annotation.objects_mut().add_path_object(path).is_err() {
             return STATUS_INVALID_INPUT;
         }
@@ -1780,6 +1840,144 @@ fn add_shape_annotations_inner(
 
     drop(doc_guard);
     evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
+/// Resizes a shape by redrawing it inside a new rectangle.
+///
+/// A shape is the one mark that can be resized exactly, because it is fully
+/// described by its kind and its box. Ink cannot: an arbitrary point cloud has
+/// no such description, which is why scaling one is refused. Stamps get there
+/// only by pulling their own image back out and re-placing it.
+///
+/// The old annotation is removed and a new one built, so `out_new_index`
+/// reports where the replacement landed; it may differ from `index`.
+#[unsafe(no_mangle)]
+pub extern "C" fn resize_shape_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if right <= left || bottom <= top {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        resize_shape_annotation_inner(
+            doc_handle, page_index, index, capture_width, left, top, right, bottom, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resize_shape_annotation_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let tag = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else {
+            return STATUS_INVALID_INPUT;
+        };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        // Reached by position rather than by the collection's own index type,
+        // which is not nameable from here.
+        let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        // Contents is read BEFORE anything is removed, so a mark that turns out
+        // not to be one of ours leaves the page untouched.
+        match annotation.contents().as_deref().and_then(parse_shape_tag) {
+            Some(t) => t,
+            None => return STATUS_UNSUPPORTED,
+        }
+    };
+
+    let (kind, r, g, b, a, width_pts, fx, fy) = tag;
+
+    if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // The stored corner flags put the drag back the way round it was drawn, so
+    // an arrow resized by its opposite corner does not flip.
+    let (x1, x2) = if fx { (left, right) } else { (right, left) };
+    let (y1, y2) = if fy { (top, bottom) } else { (bottom, top) };
+
+    // Width was stored in PDF points and the spec wants capture-space pixels,
+    // so it goes back through the same scale the writer applied.
+    let width_px = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else {
+            return STATUS_INVALID_INPUT;
+        };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            return STATUS_INVALID_INPUT;
+        }
+        width_pts * capture_width as f32 / page_w
+    };
+
+    let spec = ShapeSpec {
+        page_index,
+        kind,
+        x1,
+        y1,
+        x2,
+        y2,
+        r,
+        g,
+        b,
+        a,
+        width_px,
+    };
+
+    let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
+    if status != STATUS_OK_PDFIUM {
+        return status;
+    }
+
+    // The rebuild is appended, so it is the last annotation on the page.
+    if !out_new_index.is_null() {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        if let Some(doc) = doc {
+            let doc_guard = lock(&doc);
+            if let Ok(page) = doc_guard.pages().get(page_index as u16) {
+                let count = page.annotations().len() as i32;
+                unsafe { *out_new_index = count - 1 };
+            }
+        }
+    }
+
     STATUS_OK_PDFIUM
 }
 
@@ -4204,6 +4402,101 @@ mod tests {
         }
     }
 
+    /// Why shapes are not `/Square` and `/Circle` annotations.
+    ///
+    /// A rectangle SHOULD be a `/Square`: it would resize by changing four
+    /// numbers and would read as a rectangle in other PDF software. This test
+    /// is the measurement that says we cannot have that, and it is kept so we
+    /// find out if it ever changes.
+    ///
+    /// A `/Square` carrying `/Rect` and a stroke colour draws NOTHING, both in
+    /// the session that created it and after a full save and reopen. PDFium
+    /// does generate missing appearance streams, but only while building a
+    /// page's annotation list, and an annotation added afterwards has missed
+    /// that pass. Reopening does not rescue it either.
+    ///
+    /// Supplying the appearance ourselves needs `FPDFAnnot_SetAP`, which takes
+    /// a raw `FPDF_ANNOTATION`. That function is public on the bindings trait,
+    /// but every raw handle in pdfium-render is `pub(crate)`, so an annotation
+    /// created through its safe API can never be handed to it. Ink and stamp
+    /// annotations escape this only because `FPDFAnnot_AppendObject` writes the
+    /// appearance stream itself, which is precisely why shapes ride on ink.
+    ///
+    /// The kind goes in `/Contents` instead, which this test also proves round
+    /// trips, so a reopened shape is still a shape to us.
+    #[test]
+    fn a_bare_square_annotation_still_draws_nothing() {
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let before = marked_pixels(handle, 0);
+
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let mut page = doc_guard.pages().get(0).unwrap();
+
+            let mut annot = page.annotations_mut().create_square_annotation().unwrap();
+            annot.set_bounds(PdfRect::new(
+                PdfPoints::new(300.0),
+                PdfPoints::new(100.0),
+                PdfPoints::new(500.0),
+                PdfPoints::new(400.0),
+            )).unwrap();
+            let _ = annot.set_stroke_color(PdfColor::new(220, 0, 0, 255));
+            let _ = annot.set_contents("AyaanShape:Rectangle");
+        }
+        evict_all_cache_for_doc(handle);
+
+        let after = marked_pixels(handle, 0);
+        println!("BARE SQUARE: {before} marked pixels before, {after} after");
+
+        // Also prove the kind survives in a field we can read back.
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let annot = page.annotations().get(0).unwrap();
+            println!("CONTENTS READ BACK: {:?}", annot.contents());
+        }
+
+        println!("SAME SESSION: bare square drew {} extra pixels", after as i64 - before as i64);
+
+        // The real question is the FILE. PDFium builds a page's annotation list
+        // once, and generates missing appearance streams while doing so, so an
+        // annotation added afterwards may simply have missed that pass. A save
+        // and reopen rebuilds the list from scratch.
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        let after_reopen = marked_pixels(reopened, 0);
+        println!("AFTER REOPEN: {before} before, {after_reopen} after");
+
+        let annots = read_annotations(reopened, 0);
+        println!("REOPENED ANNOTS: {annots:?}");
+
+        // Asserting the LIMITATION, not the wish. If a future PDFium starts
+        // generating this appearance, these fail and tell us that shapes can
+        // become real /Square and /Circle annotations.
+        assert_eq!(
+            after, before,
+            "a bare /Square now draws in-session; the /Square upgrade has become possible"
+        );
+        assert_eq!(
+            after_reopen, before,
+            "a bare /Square now draws after a reopen; the /Square upgrade has become possible"
+        );
+
+        // The subtype itself survives, so all that is missing is the appearance.
+        assert_eq!(annots.len(), 1);
+        assert_eq!(annots[0].1, ANNOT_SQUARE);
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
     #[test]
     fn every_shape_kind_actually_draws_on_the_page() {
         for kind in [SHAPE_RECTANGLE, SHAPE_ELLIPSE, SHAPE_LINE, SHAPE_ARROW] {
@@ -4342,6 +4635,202 @@ mod tests {
         let ((lx, ly), _) = arrow_head(0.0, 0.0, 100.0, 0.0, 0.01);
         let reach = ((100.0f32 - lx).powi(2) + ly.powi(2)).sqrt();
         assert!(reach >= ARROW_HEAD_MIN - 0.001, "hairline arrow head reached only {reach}");
+    }
+
+    // ---- The tag that keeps a shape a shape ----
+
+    fn contents_of(handle: u64, page_index: i32, index: usize) -> Option<String> {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned()?;
+        let doc_guard = lock(&doc);
+        let page = doc_guard.pages().get(page_index as u16).ok()?;
+        let annotation = page.annotations().iter().nth(index)?;
+        annotation.contents()
+    }
+
+    #[test]
+    fn a_shapes_kind_and_style_survive_a_save_and_reopen() {
+        // The whole point of the tag. Written as ink, a reopened shape is
+        // otherwise indistinguishable from a freehand scribble, and can then
+        // only be moved or deleted.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let mut spec = shape(SHAPE_ELLIPSE, 100.0, 100.0, 600.0, 400.0);
+        spec.r = 0x12;
+        spec.g = 0x34;
+        spec.b = 0x56;
+        spec.a = 0x78;
+        assert_eq!(add_shape_annotations(handle, 1000, [spec].as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        free_render_result(render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 200));
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0);
+
+        let contents = contents_of(reopened, 0, 0).expect("the reopened shape has no contents");
+        let parsed = parse_shape_tag(&contents);
+        assert!(parsed.is_some(), "tag did not parse: {contents}");
+        let (kind, r, g, b, a, width, _, _) = parsed.unwrap();
+
+        assert_eq!(kind, SHAPE_ELLIPSE);
+        assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x78));
+        assert!(width > 0.0, "width came back as {width}");
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn the_tag_round_trips_every_kind_and_direction() {
+        for kind in [SHAPE_RECTANGLE, SHAPE_ELLIPSE, SHAPE_LINE, SHAPE_ARROW] {
+            for (x1, x2, fx) in [(10.0, 90.0, true), (90.0, 10.0, false)] {
+                for (y1, y2, fy) in [(20.0, 80.0, true), (80.0, 20.0, false)] {
+                    let mut s = shape(kind, x1, y1, x2, y2);
+                    s.a = 0xC0;
+                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5)).expect("tag did not parse");
+
+                    assert_eq!(parsed.0, kind);
+                    assert_eq!(parsed.4, 0xC0);
+                    assert!((parsed.5 - 2.5).abs() < 0.001);
+                    assert_eq!(parsed.6, fx, "x direction lost for kind {kind}");
+                    assert_eq!(parsed.7, fy, "y direction lost for kind {kind}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anything_that_is_not_our_tag_is_left_alone() {
+        // A comment written by the user, or an annotation from another app,
+        // must never be mistaken for a shape and rebuilt as one.
+        for text in ["", "Please review this", "AyaanShape", "AyaanShape:", "AyaanShape:9:FFFFFFFF:1:1:1"] {
+            assert!(parse_shape_tag(text).is_none(), "wrongly parsed {text:?}");
+        }
+
+        // Malformed values must fail rather than produce a shape with a
+        // nonsense width that then draws as nothing.
+        assert!(parse_shape_tag("AyaanShape:0:GGGGGGGG:2:1:1").is_none());
+        assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:0:1:1").is_none());
+        assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:abc:1:1").is_none());
+    }
+
+    #[test]
+    fn resizing_a_shape_redraws_it_in_the_new_box() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+        free_render_result(render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 200));
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, 1000, 100.0, 100.0, 800.0, 600.0, &mut new_index),
+            STATUS_OK_PDFIUM
+        );
+        assert!(new_index >= 0, "resize did not report where the shape went");
+
+        // Still exactly one annotation: the old one is gone, not left behind.
+        let after = read_annotations(handle, 0);
+        assert_eq!(after.len(), 1, "resize left a duplicate or removed too much");
+
+        // And it occupies the larger box it was given.
+        let (_, _, left, top, right, bottom) = after[0];
+        assert!(right - left > 0.6, "resized width is only {}", right - left);
+        assert!(bottom - top > 0.4, "resized height is only {}", bottom - top);
+
+        // The tag survives the rebuild, so it can be resized again.
+        let contents = contents_of(handle, 0, new_index as usize).expect("rebuilt shape lost its tag");
+        assert_eq!(parse_shape_tag(&contents).map(|t| t.0), Some(SHAPE_RECTANGLE));
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_resized_shape_still_draws() {
+        // Rebuilding is only worth anything if the result is visible. An
+        // annotation with correct bounds and no appearance would pass every
+        // other check in this file.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let base = marked_pixels(handle, 0);
+
+        let specs = [shape(SHAPE_ELLIPSE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+        let small = marked_pixels(handle, 0) - base;
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, 1000, 100.0, 100.0, 800.0, 600.0, &mut new_index),
+            STATUS_OK_PDFIUM
+        );
+
+        let large = marked_pixels(handle, 0) - base;
+        assert!(large > small, "the resized ellipse drew {large} pixels against {small} before");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn resizing_something_that_is_not_a_shape_is_refused_not_mangled() {
+        // An ink stroke has no description to rebuild from. Refusing says so;
+        // guessing would silently replace a scribble with a rectangle.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let points = [
+            BurnPoint { x: 100.0, y: 100.0 },
+            BurnPoint { x: 200.0, y: 180.0 },
+            BurnPoint { x: 300.0, y: 120.0 },
+        ];
+        let strokes = [BurnStroke {
+            page_index: 0,
+            point_offset: 0,
+            point_count: 3,
+            width_px: 3.0,
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, strokes.as_ptr(), 1, points.as_ptr(), 3),
+            STATUS_OK_PDFIUM
+        );
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, 1000, 50.0, 50.0, 500.0, 500.0, &mut new_index),
+            STATUS_UNSUPPORTED
+        );
+
+        // And the stroke is untouched.
+        assert_eq!(read_annotations(handle, 0).len(), 1);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn resize_rejects_bad_input() {
+        let handle = open_fixture();
+        let mut idx = -1;
+        assert_eq!(
+            resize_shape_annotation(0, 0, 0, 1000, 0.0, 0.0, 10.0, 10.0, &mut idx),
+            STATUS_INVALID_INPUT
+        );
+        assert_eq!(
+            resize_shape_annotation(handle, -1, 0, 1000, 0.0, 0.0, 10.0, 10.0, &mut idx),
+            STATUS_INVALID_INPUT
+        );
+        // An inverted or empty box would produce a shape with no extent.
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, 1000, 10.0, 10.0, 10.0, 50.0, &mut idx),
+            STATUS_INVALID_INPUT
+        );
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, 1000, 90.0, 10.0, 10.0, 50.0, &mut idx),
+            STATUS_INVALID_INPUT
+        );
+        close_document(handle);
     }
 
     #[test]
