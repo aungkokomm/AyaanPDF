@@ -50,12 +50,18 @@ public enum ToolOptions
 /// </summary>
 /// <param name="Glyph">Segoe MDL2 Assets code point.</param>
 /// <param name="Shortcut">Single key that selects this tool, uppercase.</param>
+/// <param name="PathData">
+/// Optional SVG path, in a 32x32 box, drawn instead of <paramref name="Glyph"/>.
+/// For the few tools where no icon-font glyph reads right; the rail falls back
+/// to the glyph when this is null.
+/// </param>
 public sealed record ToolDefinition(
     ToolMode Mode,
     string Name,
     string Glyph,
     char Shortcut,
-    ToolOptions Options)
+    ToolOptions Options,
+    string? PathData = null)
 {
     /// <summary>Tooltip text, with the shortcut appended so it is discoverable.</summary>
     public string Tooltip => $"{Name} ({Shortcut})";
@@ -79,8 +85,18 @@ public static class ToolCatalog
         new(ToolMode.Draw, "Draw", "", 'D', ToolOptions.Color | ToolOptions.Width),
         new(ToolMode.Shape, "Shape", "", 'R', ToolOptions.Color | ToolOptions.Width | ToolOptions.Shape),
         new(ToolMode.Note, "Note", "", 'N', ToolOptions.None),
-        new(ToolMode.Stamp, "Stamp", "", 'S', ToolOptions.Stamp),
+        new(ToolMode.Stamp, "Stamp", "", 'S', ToolOptions.Stamp, StampIcon),
     ];
+
+    /// <summary>
+    /// The stamp icon, as an SVG path in a 32x32 box. A drawn rubber stamp,
+    /// because the nearest Segoe MDL2 glyph reads as a faint imprint device
+    /// rather than a stamp. Kept beside the tool it belongs to.
+    /// </summary>
+    private const string StampIcon =
+        "M26,16h-6v-4c0-1.1,0.9-2,2-2s2-0.9,2-2V6c0-1.1-0.9-2-2-2H10C8.9,4,8,4.9,8,6v2c0,1.1,0.9,2,2,2" +
+        "s2,0.9,2,2v4H6c-1.1,0-2,0.9-2,2v10h2h20h2V18C28,16.9,27.1,16,26,16z M10,8V6h12v2c-2.206,0-4,1.794-4,4v4h-4v-4" +
+        "C14,9.794,12.206,8,10,8z M6,26v-4h20v4H6z M6,20v-2h20v2H6z";
 
     public static ToolDefinition For(ToolMode mode) =>
         All.FirstOrDefault(t => t.Mode == mode) ?? All[0];

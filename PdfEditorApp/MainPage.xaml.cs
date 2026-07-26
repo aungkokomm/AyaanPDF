@@ -262,6 +262,50 @@ public sealed partial class MainPage : Page
         return new SolidColorBrush(Color.FromArgb(a, r, g, b));
     }
 
+    /// <summary>
+    /// The rail icon for a tool: a <see cref="FontIcon"/> for the glyph tools,
+    /// or a scaled <see cref="PathIcon"/> for the few that carry an SVG path.
+    ///
+    /// Both are IconElements, so either inherits the rail's foreground and
+    /// follows the theme without extra work. The Path is wrapped in a Viewbox
+    /// because its 32x32 authoring box has to come down to the 16px the glyphs
+    /// occupy.
+    /// </summary>
+    public static UIElement ToolIcon(ToolDefinition tool)
+    {
+        if (!string.IsNullOrEmpty(tool.PathData))
+        {
+            return new Viewbox { Width = 16, Height = 16, Child = BuildPath(tool.PathData) };
+        }
+
+        return new FontIcon { Glyph = tool.Glyph, FontSize = 16 };
+    }
+
+    /// <summary>
+    /// A filled <see cref="Microsoft.UI.Xaml.Shapes.Path"/> from SVG path
+    /// mini-language.
+    ///
+    /// There is no public parser in WinUI, so this loads a whole Path element
+    /// through XamlReader, whose Data property carries the type converter that
+    /// understands the mini-language. The parsed Path is returned AS THE
+    /// ELEMENT, not just its Data: handing that Data to a separate PathIcon
+    /// threw "value does not fall within the expected range", because a
+    /// geometry cannot belong to two elements.
+    ///
+    /// A Path does not inherit foreground the way an IconElement does, so the
+    /// fill is set from the theme brush. It does not track a later theme toggle,
+    /// which for a 16px rail icon is not worth a live binding.
+    /// </summary>
+    private static Microsoft.UI.Xaml.Shapes.Path BuildPath(string data)
+    {
+        const string ns = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+        var path = (Microsoft.UI.Xaml.Shapes.Path)Microsoft.UI.Xaml.Markup.XamlReader.Load(
+            $"<Path xmlns=\"{ns}\" Data=\"{data}\" />");
+        path.Fill = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+        path.Stretch = Stretch.Uniform;
+        return path;
+    }
+
     // ---------------- ScrollView-driven zoom ----------------
 
     /// <summary>

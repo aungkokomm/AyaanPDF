@@ -463,9 +463,19 @@
                     </ListView.ItemContainerStyle>
                     <ListView.ItemTemplate>
                         <DataTemplate x:DataType="viewport:ToolDefinition">
-                            <FontIcon Glyph="{x:Bind Glyph}" FontSize="16"
-                                      ToolTipService.ToolTip="{x:Bind Tooltip}"
-                                      AutomationProperties.Name="{x:Bind Name}" />
+                            <!--
+                                One ContentControl whose content is chosen per
+                                tool: a FontIcon for the glyph tools, a scaled
+                                Path for the ones that carry PathData. Deciding
+                                in code keeps the rail data-driven, since a tool
+                                still declares its own icon in its record.
+                            -->
+                            <ContentControl Content="{x:Bind local:MainPage.ToolIcon((viewport:ToolDefinition))}"
+                                            IsTabStop="False"
+                                            HorizontalContentAlignment="Center"
+                                            VerticalContentAlignment="Center"
+                                            ToolTipService.ToolTip="{x:Bind Tooltip}"
+                                            AutomationProperties.Name="{x:Bind Name}" />
                         </DataTemplate>
                     </ListView.ItemTemplate>
                 </ListView>
@@ -708,10 +718,21 @@
                         </ListViewItem>
                         <ListViewItem Tag="Arrow" ToolTipService.ToolTip="Arrow"
                                       AutomationProperties.Name="Arrow">
-                            <!-- Shaft and both barbs, matching what the tool draws. -->
-                            <Polyline Points="0,14 20,0 12,1 20,0 19,8"
+                            <!--
+                                Built the same way the tool draws: a shaft that
+                                STOPS at the head, plus a solid triangle. The
+                                first version was a hand-drawn polyline whose
+                                barbs came out as a stray tick, which is what an
+                                icon made by eye instead of from the geometry
+                                gets you.
+                            -->
+                            <Grid Width="20" Height="14">
+                                <Line X1="1" Y1="13" X2="13.2" Y2="4.9"
                                       Stroke="{ThemeResource TextFillColorPrimaryBrush}"
-                                      StrokeThickness="1.5" />
+                                      StrokeThickness="1.6" StrokeStartLineCap="Round" />
+                                <Polygon Points="19,1 14.8,7.3 11.6,2.5"
+                                         Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                            </Grid>
                         </ListViewItem>
                     </ListView>
                 </StackPanel>
