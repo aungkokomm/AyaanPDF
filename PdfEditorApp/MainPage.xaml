@@ -417,7 +417,7 @@
                                             <Grid Width="64" Height="64" Padding="4"
                                                   ToolTipService.ToolTip="{x:Bind Name}">
                                                 <Image Stretch="Uniform"
-                                                       Source="{x:Bind Path}" />
+                                                       Source="{x:Bind local:MainPage.StampThumbnail(Path)}" />
                                             </Grid>
                                         </DataTemplate>
                                     </GridView.ItemTemplate>

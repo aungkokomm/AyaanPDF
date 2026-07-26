@@ -61,12 +61,32 @@ public sealed partial class MainPage : Page
         // PDFEDITOR_AUTOZOOM to a factor to zoom there once it has settled.
         // Deep zoom is where the interesting render behaviour lives, and
         // without this it can only be reached by hand.
-        Loaded += (_, _) =>
+        Loaded += async (_, _) =>
         {
             string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
             if (probe.Length > 0 && System.IO.File.Exists(probe))
             {
                 ViewModel.OpenDocument(probe);
+            }
+
+            // Places a stamp straight after opening, so the decode-and-place
+            // path can be checked without a mouse. Done inline rather than on
+            // a timer: a previous harness here scheduled one that never fired,
+            // and its silence was mistaken for the app crashing.
+            string stamp = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOSTAMP") ?? "";
+            if (stamp.Length > 0 && System.IO.File.Exists(stamp))
+            {
+                var pixels = await StampLibrary.DecodeAsync(stamp);
+                Diag.Log(pixels is null
+                    ? $"autostamp: could not decode {stamp}"
+                    : $"autostamp: decoded {pixels.Width}x{pixels.Height}, {pixels.Bgra.Length} bytes");
+
+                if (pixels is not null)
+                {
+                    bool placed = ViewModel.PlaceStamp(0, ViewModel.OverlayScale / 2,
+                                                       ViewModel.OverlayScale / 2, pixels);
+                    Diag.Log($"autostamp: placed={placed}");
+                }
             }
 
             string zooms = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOZOOM") ?? "";
@@ -419,6 +439,38 @@ public sealed partial class MainPage : Page
 
     /// <summary>The stamp a click will place, or null when none is chosen.</summary>
     private StampEntry? _selectedStamp;
+
+    /// <summary>
+    /// A thumbnail for the stamp picker.
+    ///
+    /// Explicit rather than binding the path string straight to Image.Source:
+    /// x:Bind is strongly typed and will not reliably convert a string to an
+    /// ImageSource, which shows as a picker full of blank squares with no
+    /// error anywhere. Decoded to a small size because these are 64px tiles
+    /// and a full-resolution signature scan would otherwise be held in memory
+    /// once per thumbnail.
+    /// </summary>
+    public static Microsoft.UI.Xaml.Media.Imaging.BitmapImage StampThumbnail(string path)
+    {
+        var image = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage
+        {
+            DecodePixelWidth = 128,
+            DecodePixelType = Microsoft.UI.Xaml.Media.Imaging.DecodePixelType.Logical,
+        };
+
+        try
+        {
+            image.UriSource = new Uri(path);
+        }
+        catch (Exception ex)
+        {
+            // A stamp that cannot be shown must not take the picker down with
+            // it; it simply appears blank and the rest still work.
+            Diag.Log($"stamp thumbnail failed for {path}: {ex.Message}");
+        }
+
+        return image;
+    }
 
     private void StampFlyout_Opening(object? sender, object e)
     {

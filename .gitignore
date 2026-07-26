@@ -17,3 +17,7 @@ diag.log
 # Disposable installs used to verify the real installer payload, never the
 # live installed copy.
 testrun/
+
+# The user's own stamp images, created beside the exe at runtime. Data, not
+# source, and never part of the installer payload either.
+Stamps/

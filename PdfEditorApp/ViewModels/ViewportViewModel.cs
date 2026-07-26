@@ -2189,17 +2189,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         // Normalized, top-left origin, both axes over the page WIDTH, which is
-        // the convention render_core reads and writes in.
-        double cx = Norm(x);
-        double cy = Norm(y);
-
-        double w = Math.Clamp(widthFraction, 0.02, 1.0);
-        double h = w * pixels.Height / pixels.Width;
-
-        // Centred on the click, then nudged so it cannot hang off the left or
-        // top edge, where its handle would be unreachable.
-        double left = Math.Max(0, cx - w / 2);
-        double top = Math.Max(0, cy - h / 2);
+        // the convention render_core reads and writes in. The geometry itself
+        // lives in StampPlacement so it can be tested; keeping it here is how
+        // the last two geometry bugs reached the user.
+        var (left, top, right, bottom) = StampPlacement.Compute(
+            Norm(x), Norm(y), pixels.Width, pixels.Height, widthFraction);
 
         // BEFORE the edit. PushHistory captures the state to restore TO, so
         // pushing afterwards would record the document WITH the stamp and undo
@@ -2211,11 +2205,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         int status = RenderCoreNative.add_stamp_annotation(
             _documentHandle, pageIndex, CaptureWidth,
             (float)(left * CaptureWidth), (float)(top * CaptureWidth),
-            (float)((left + w) * CaptureWidth), (float)((top + h) * CaptureWidth),
+            (float)(right * CaptureWidth), (float)(bottom * CaptureWidth),
             pixels.Bgra, (nuint)pixels.Bgra.Length, pixels.Width, pixels.Height);
 
-        Diag.Log($"place stamp p{pageIndex} at ({left:F3},{top:F3}) " +
-                 $"{w:F3}x{h:F3} from {pixels.Width}x{pixels.Height}px -> {status}");
+        Diag.Log($"place stamp p{pageIndex} at ({left:F3},{top:F3})-({right:F3},{bottom:F3}) " +
+                 $"from {pixels.Width}x{pixels.Height}px -> {status}");
 
         if (status != RenderStatus.OkPdfium)
         {

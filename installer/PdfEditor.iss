@@ -69,11 +69,19 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; The entire self-contained publish output (exe + WinUI runtime + render_core.dll +
 ; pdfium.dll + sample.pdf).
 ;
-; diag.log is excluded because it is WRITTEN INTO this folder whenever the app
-; runs there with PDFEDITOR_DIAG=1, which is exactly how the publish output gets
-; verified. Without this it ships inside the installer, and every user's first
-; launch appends to a trace of someone else's session.
-Source: "{#SrcDir}\*"; DestDir: "{app}"; Excludes: "diag.log"; \
+; EXCLUDES, both of which matter:
+;
+; diag.log is WRITTEN INTO this folder whenever the app runs there with
+; PDFEDITOR_DIAG=1, which is exactly how the publish output gets verified.
+; Without this it ships inside the installer and every user's first launch
+; appends to a trace of someone else's session.
+;
+; Stamps is the user's own PNG library, which the app creates beside the exe
+; and which is written to from inside the app. It must never appear in the
+; payload: shipping it would push test images onto users, and worse, an
+; upgrade would write into a folder holding files they put there by hand.
+; The installer's job is the program; that folder is data.
+Source: "{#SrcDir}\*"; DestDir: "{app}"; Excludes: "diag.log,Stamps,Stamps\*"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -84,7 +92,15 @@ Name: "{autodesktop}\{#AppName}";     Filename: "{app}\{#ExeName}"; WorkingDir: 
 [Run]
 Filename: "{app}\{#ExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
-; NOTE: deliberately no [UninstallDelete] entry — the app has no persistent
-; per-user state yet (annotations are in-memory only; nothing is written to
-; LocalAppData). Revisit once annotations/settings gain real persistence.
+; NO [UninstallDelete], and this is now a deliberate protection rather than
+; merely nothing to clean up.
+;
+; The app keeps a Stamps folder beside the exe holding the user's own PNG
+; images, put there by them. Inno removes only the files it installed, and
+; Stamps is excluded from the payload above, so an uninstall leaves it alone.
+; Adding an UninstallDelete for {app} would wipe it, which means deleting
+; someone's signature and seal images because they uninstalled a PDF viewer.
+;
+; If a future version adds settings, they get the same treatment: the
+; uninstaller removes the program, never the user's own files.
 
