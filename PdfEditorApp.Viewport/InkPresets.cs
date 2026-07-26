@@ -26,11 +26,15 @@ public static class InkPresets
     /// </summary>
     public static IReadOnlyList<InkColor> Colors { get; } =
     [
+        new("Black", "#FF1A1A1A"),
         new("Red", "#FFE00000"),
         new("Orange", "#FFFF7A00"),
-        new("Lime", "#FF7CB800"),
+        new("Yellow", "#FFF5B800"),
+        new("Green", "#FF2E9E3B"),
+        new("Blue", "#FF1565C0"),
+        new("Purple", "#FF7B1FA2"),
         new("Pink", "#FFE0308A"),
-        new("Black", "#FF1A1A1A"),
+        new("Gray", "#FF8A8A8A"),
     ];
 
     public static IReadOnlyList<InkWidth> Widths { get; } =
@@ -44,10 +48,14 @@ public static class InkPresets
     /// <summary>Highlighter colours carry alpha, so text stays readable underneath.</summary>
     public static IReadOnlyList<InkColor> HighlightColors { get; } =
     [
-        new("Lime", "#88CCFF00"),
+        new("Yellow", "#88FFE000"),
+        new("Green", "#8869E86A"),
+        new("Cyan", "#8840D0E0"),
         new("Orange", "#88FF9500"),
         new("Pink", "#88FF4FA3"),
+        new("Purple", "#88B388FF"),
         new("Red", "#88FF2D2D"),
+        new("Blue", "#886FA8FF"),
     ];
 
     /// <summary>

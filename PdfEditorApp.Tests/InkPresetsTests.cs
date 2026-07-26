@@ -85,16 +85,20 @@ public class InkPresetsTests
     [Fact]
     public void matching_pen_and_highlighter_names_pair_up()
     {
-        var lime = InkPresets.Colors.Single(c => c.Name == "Lime");
-        Assert.Equal("Lime", InkPresets.HighlightFor(lime).Name);
+        var green = InkPresets.Colors.Single(c => c.Name == "Green");
+        Assert.Equal("Green", InkPresets.HighlightFor(green).Name);
     }
 
     [Fact]
-    public void the_four_highlighter_colours_are_the_requested_set()
+    public void the_highlighter_offers_a_spread_of_common_colours()
     {
-        Assert.Equal(
-            new[] { "Lime", "Orange", "Pink", "Red" },
-            InkPresets.HighlightColors.Select(c => c.Name).ToArray());
+        // Not a fixed list any more: the point is a usable range, all named,
+        // all distinct. Pinning the exact set only made the test a second copy
+        // of the palette that had to be edited in lockstep.
+        var names = InkPresets.HighlightColors.Select(c => c.Name).ToArray();
+        Assert.True(names.Length >= 6, "too few highlighter colours to be useful");
+        Assert.Equal(names.Length, names.Distinct().Count());
+        Assert.Contains("Yellow", names);
     }
 
     [Fact]

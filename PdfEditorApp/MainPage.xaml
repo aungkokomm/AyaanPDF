@@ -613,6 +613,47 @@
                             </DataTemplate>
                         </ListView.ItemTemplate>
                     </ListView>
+
+                    <!--
+                        Custom colour. The swatch always shows the tool's CURRENT
+                        colour, so it doubles as the "you are here" indicator when
+                        the chosen colour is not one of the presets. Clicking it
+                        opens a full picker, so the presets are the common path and
+                        any colour is one click further.
+                    -->
+                    <Button x:Name="CustomColorButton" Width="30" Height="30" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            AutomationProperties.Name="Custom colour"
+                            ToolTipService.ToolTip="Custom colour">
+                        <Grid Width="22" Height="22">
+                            <Ellipse Stroke="#66000000" StrokeThickness="1">
+                                <Ellipse.Fill>
+                                    <!-- A hue ring, so the button reads as "pick any colour". -->
+                                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                        <GradientStop Color="#FFE00000" Offset="0.0" />
+                                        <GradientStop Color="#FFF5B800" Offset="0.25" />
+                                        <GradientStop Color="#FF2E9E3B" Offset="0.5" />
+                                        <GradientStop Color="#FF1565C0" Offset="0.75" />
+                                        <GradientStop Color="#FF7B1FA2" Offset="1.0" />
+                                    </LinearGradientBrush>
+                                </Ellipse.Fill>
+                            </Ellipse>
+                            <!-- The inner dot is the current colour. -->
+                            <Ellipse x:Name="CustomColorSwatch" Width="11" Height="11"
+                                     Stroke="#88FFFFFF" StrokeThickness="1" />
+                        </Grid>
+                        <Button.Flyout>
+                            <Flyout x:Name="CustomColorFlyout" Placement="Bottom"
+                                    Opening="CustomColorFlyout_Opening">
+                                <ColorPicker x:Name="CustomColorPicker"
+                                             IsAlphaEnabled="False"
+                                             IsMoreButtonVisible="True"
+                                             ColorSpectrumShape="Box"
+                                             Width="280"
+                                             ColorChanged="CustomColor_Changed" />
+                            </Flyout>
+                        </Button.Flyout>
+                    </Button>
                 </StackPanel>
 
                 <!-- Width -->

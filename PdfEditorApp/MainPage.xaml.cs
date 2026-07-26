@@ -922,7 +922,13 @@ public sealed partial class MainPage : Page
         // finding the colour the moment opacity was touched and silently fell
         // back to the first swatch, changing the user's colour behind their
         // back.
-        int index = 0;
+        //
+        // A custom colour matches NOTHING, and that must leave the tool's
+        // colour alone: the old code defaulted the index to 0 and then applied
+        // it, which is what snapped a hand-picked colour back to the first
+        // swatch. Now no match means no preset is highlighted and nothing is
+        // overwritten; the custom swatch is what shows the colour instead.
+        int index = -1;
         for (int i = 0; i < palette.Count; i++)
         {
             if (SameColor(palette[i].Hex, wanted))
@@ -934,10 +940,60 @@ public sealed partial class MainPage : Page
         ColorChoices.SelectedIndex = index;
         _suppressColorChange = false;
 
-        ApplyColor(palette[index], highlighting);
+        if (index >= 0)
+        {
+            ApplyColor(palette[index], highlighting);
+        }
+
+        UpdateCustomSwatch();
     }
 
     private bool _suppressColorChange;
+
+    /// <summary>The colour the armed tool draws in, pen or highlighter.</summary>
+    private string CurrentToolColorHex =>
+        ViewModel.ActiveTool == ToolMode.Highlight
+            ? ViewModel.HighlightColorHex
+            : ViewModel.InkColorHex;
+
+    /// <summary>The custom-colour swatch always shows the tool's live colour.</summary>
+    private void UpdateCustomSwatch() =>
+        CustomColorSwatch.Fill = HexBrush(CurrentToolColorHex);
+
+    private bool _suppressCustomColor;
+
+    /// <summary>Opens the picker on whatever colour the tool is currently using.</summary>
+    private void CustomColorFlyout_Opening(object? sender, object e)
+    {
+        // Setting Color raises ColorChanged, which would otherwise read as the
+        // user having picked the colour it already was.
+        _suppressCustomColor = true;
+        CustomColorPicker.Color = ColorFromHex(CurrentToolColorHex);
+        _suppressCustomColor = false;
+    }
+
+    private void CustomColor_Changed(ColorPicker sender, ColorChangedEventArgs args)
+    {
+        if (_suppressCustomColor)
+        {
+            return;
+        }
+
+        var c = args.NewColor;
+        string hex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
+        bool highlighting = ViewModel.ActiveTool == ToolMode.Highlight;
+
+        // Through ApplyColor so the tool's OPACITY is preserved: the picker sets
+        // hue only, and the separate opacity slider owns alpha.
+        ApplyColor(new InkColor("Custom", hex), highlighting);
+
+        // A custom colour is no preset, so nothing in the list is selected.
+        _suppressColorChange = true;
+        ColorChoices.SelectedIndex = -1;
+        _suppressColorChange = false;
+
+        UpdateCustomSwatch();
+    }
 
     /// <summary>
     /// Applies a chosen colour to the tool it belongs to.
@@ -1033,6 +1089,7 @@ public sealed partial class MainPage : Page
         if (!_suppressColorChange && ColorChoices.SelectedItem is InkColor c)
         {
             ApplyColor(c, ViewModel.ActiveTool == ToolMode.Highlight);
+            UpdateCustomSwatch();
             ReturnFocusAfterPointerUse();
         }
     }
