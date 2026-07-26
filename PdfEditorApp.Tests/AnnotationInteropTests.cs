@@ -521,6 +521,59 @@ public class AnnotationInteropTests
     }
 
     [Fact]
+    public void undoing_a_move_by_restoring_bounds_puts_it_back_exactly()
+    {
+        // The cheap undo step is "put the rectangle back", so the test that
+        // matters is whether replaying the old rectangle lands the annotation
+        // exactly where it started. If it drifts, undo quietly moves things.
+        ulong handle = OpenFixture();
+        try
+        {
+            var quads = new[] { new HighlightQuad { Left = 300, Top = 300, Right = 700, Bottom = 380 } };
+            var specs = new[]
+            {
+                new HighlightSpec { PageIndex = 0, QuadOffset = 0, QuadCount = 1, R = 255, G = 235, B = 59, A = 200 },
+            };
+            Assert.Equal(OkPdfium, add_highlight_annotations(handle, 1000, specs, 1, quads, 1));
+
+            var before = get_annotations(handle, 0);
+            var original = Marshal.PtrToStructure<AnnotationInfo>(before.Items);
+            free_annotation_array(before);
+
+            // Move it somewhere else.
+            Assert.Equal(OkPdfium, resize_annotation(
+                handle, 0, original.Index, 1000, 500, 500, 900, 580, out int movedIndex));
+
+            // Undo: replay the ORIGINAL rectangle, which is all the history
+            // entry holds.
+            Assert.Equal(OkPdfium, resize_annotation(
+                handle, 0, movedIndex, 1000,
+                original.Left * 1000, original.Top * 1000,
+                original.Right * 1000, original.Bottom * 1000, out int restoredIndex));
+
+            var after = get_annotations(handle, 0);
+            try
+            {
+                Assert.Equal(1u, (uint)after.Len);
+                var back = Marshal.PtrToStructure<AnnotationInfo>(after.Items);
+                Assert.Equal(restoredIndex, back.Index);
+                Assert.Equal(original.Left, back.Left, 3);
+                Assert.Equal(original.Top, back.Top, 3);
+                Assert.Equal(original.Right, back.Right, 3);
+                Assert.Equal(original.Bottom, back.Bottom, 3);
+            }
+            finally
+            {
+                free_annotation_array(after);
+            }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
     public void reading_every_page_of_a_document_does_not_leak_or_fault()
     {
         // The app sweeps up to 25 pages on open. Twenty allocate-and-free

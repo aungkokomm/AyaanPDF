@@ -1665,6 +1665,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // The inverse of a move or resize is four numbers: put the rectangle
+        // back. Recorded BEFORE the write, and at annotation granularity
+        // rather than as a document snapshot, because dragging a stamp around
+        // a page is the most repeated edit there is and each snapshot is the
+        // whole PDF.
+        PushHistory(HistoryScope.AnnotationBounds,
+                    resizing ? "Resize annotation" : "Move annotation",
+                    new AnnotationBoundsState(start.PageIndex, start.Index,
+                                              start.Left, start.Top, start.Right, start.Bottom));
+
         // resize_annotation, not set_annotation_bounds: it does the same thing
         // for a move or a quad-point resize, and rebuilds the annotation when
         // PDFium will not scale it, which is the only way a stamp can grow.
@@ -1731,6 +1741,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             return false;
         }
+
+        // A document snapshot, unlike move and resize. Undoing a delete means
+        // bringing the annotation's whole content back, and nothing smaller
+        // than the document holds it: the entry would have to carry the image,
+        // the quad points, the colours and the appearance stream. This is the
+        // one annotation edit worth the cost.
+        PushHistory(HistoryScope.Document, "Delete annotation");
 
         int status = RenderCoreNative.delete_annotation(_documentHandle, sel.PageIndex, sel.Index);
         Diag.Log($"delete loaded annotation p{sel.PageIndex}#{sel.Index} -> {status}");
@@ -2441,8 +2458,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// the three overlay lists; document scope serializes the whole PDF, which
     /// is the only way to reverse a page delete or rotation.
     /// </summary>
-    private HistoryEntry Capture(HistoryScope scope, string label)
+    private HistoryEntry Capture(HistoryEntry target) => Capture(target.Scope, target.Label, target.Bounds);
+
+    private HistoryEntry Capture(HistoryScope scope, string label,
+                                 AnnotationBoundsState? boundsTarget = null)
     {
+        // For a per-annotation step the inverse is that SAME annotation's
+        // rectangle as it stands right now, so redo puts it back where undo
+        // took it from. Read live rather than remembered, since a rebuild on
+        // resize can have changed its index.
+        AnnotationBoundsState? bounds = null;
+        if (scope == HistoryScope.AnnotationBounds && boundsTarget is not null)
+        {
+            foreach (var a in LoadedFor(boundsTarget.PageIndex))
+            {
+                if (a.Index == boundsTarget.Index)
+                {
+                    bounds = new AnnotationBoundsState(
+                        boundsTarget.PageIndex, a.Index, a.Left, a.Top, a.Right, a.Bottom);
+                    break;
+                }
+            }
+
+            // The annotation is gone, so there is nothing to restore to. Fall
+            // back to the remembered rectangle rather than dropping the step.
+            bounds ??= boundsTarget;
+        }
+
         byte[]? bytes = null;
         if (scope == HistoryScope.Document && _documentHandle != 0)
         {
@@ -2462,6 +2504,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             WasDirty = IsDirty,
             PageIndex = CurrentPageIndex,
             DocumentBytes = bytes,
+            Bounds = bounds,
             // Highlights and ink are immutable records, so copying the list is
             // a real snapshot. Notes are mutable (their text is edited after
             // creation), so their VALUES are captured instead.
@@ -2472,9 +2515,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Records the pre-edit state. Call immediately BEFORE mutating.</summary>
-    private void PushHistory(HistoryScope scope, string label)
+    private void PushHistory(HistoryScope scope, string label,
+                             AnnotationBoundsState? bounds = null)
     {
-        _history.Push(Capture(scope, label));
+        // A bounds step records the rectangle as it is RIGHT NOW, which is
+        // where undo has to put it back to. Passed through Capture rather than
+        // patched on afterwards, since HistoryEntry is deliberately immutable.
+        _history.Push(Capture(scope, label, bounds));
         NotifyHistoryChanged();
     }
 
@@ -2501,6 +2548,37 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void ApplyHistoryEntry(HistoryEntry entry)
     {
+        // A per-annotation step restores one rectangle and leaves everything
+        // else alone. It must NOT fall through to the overlay restore below:
+        // this annotation lives in the document, not in those lists, and
+        // rewriting them would wipe marks made since.
+        if (entry.Scope == HistoryScope.AnnotationBounds && entry.Bounds is { } b)
+        {
+            const int CaptureWidth = 1000;
+            int status = RenderCoreNative.resize_annotation(
+                _documentHandle, b.PageIndex, b.Index, CaptureWidth,
+                (float)(b.Left * CaptureWidth), (float)(b.Top * CaptureWidth),
+                (float)(b.Right * CaptureWidth), (float)(b.Bottom * CaptureWidth),
+                out int newIndex);
+
+            Diag.Log($"undo bounds p{b.PageIndex}#{b.Index} -> {status}, index now {newIndex}");
+
+            if (status == RenderStatus.OkPdfium)
+            {
+                IsDirty = entry.WasDirty;
+                _selectedLoaded = new LoadedSelection(
+                    b.PageIndex, newIndex, b.Left, b.Top, b.Right, b.Bottom);
+                _loadedGrip = LoadedAnnotationPicker.Grip.None;
+                _loadedDrag = null;
+                InvalidateLoadedPage(b.PageIndex);
+                RefreshSelectionOutline();
+                OnPropertyChanged(nameof(HasSelectedAnnotation));
+            }
+
+            NotifyHistoryChanged();
+            return;
+        }
+
         if (entry.Scope == HistoryScope.Document && entry.DocumentBytes is { Length: > 0 })
         {
             ulong restored = RenderCoreNative.open_document_from_bytes(

@@ -65,14 +65,15 @@ public sealed class DocumentHistory
     /// there is nothing to undo (in which case nothing is captured and the
     /// stacks are untouched).
     ///
-    /// <paramref name="captureCurrent"/> is invoked with the TARGET entry's
-    /// scope and label, and its result becomes the redo entry. The history
-    /// supplies the scope rather than the caller because the inverse must be
-    /// captured at the same granularity as the step being reversed: capturing
-    /// only annotations while undoing a page delete would leave redo with no
-    /// document to restore.
+    /// <paramref name="captureCurrent"/> is invoked with the TARGET ENTRY, and
+    /// its result becomes the redo entry. The history supplies that rather than
+    /// letting the caller choose, because the inverse must be captured at the
+    /// same granularity as the step being reversed: capturing only annotations
+    /// while undoing a page delete would leave redo with no document to
+    /// restore. The whole entry is passed, not just its scope, because a
+    /// per-annotation step also needs to know WHICH annotation to read back.
     /// </summary>
-    public HistoryEntry? Undo(Func<HistoryScope, string, HistoryEntry> captureCurrent)
+    public HistoryEntry? Undo(Func<HistoryEntry, HistoryEntry> captureCurrent)
     {
         if (_undo.Count == 0)
         {
@@ -81,7 +82,7 @@ public sealed class DocumentHistory
 
         HistoryEntry target = _undo[^1];
         _undo.RemoveAt(_undo.Count - 1);
-        _redo.Add(captureCurrent(target.Scope, target.Label));
+        _redo.Add(captureCurrent(target));
         return target;
     }
 
@@ -89,7 +90,7 @@ public sealed class DocumentHistory
     /// The mirror of <see cref="Undo"/>. Pushes onto the undo stack directly,
     /// bypassing <see cref="Push"/> so the redo stack survives.
     /// </summary>
-    public HistoryEntry? Redo(Func<HistoryScope, string, HistoryEntry> captureCurrent)
+    public HistoryEntry? Redo(Func<HistoryEntry, HistoryEntry> captureCurrent)
     {
         if (_redo.Count == 0)
         {
@@ -98,7 +99,7 @@ public sealed class DocumentHistory
 
         HistoryEntry target = _redo[^1];
         _redo.RemoveAt(_redo.Count - 1);
-        _undo.Add(captureCurrent(target.Scope, target.Label));
+        _undo.Add(captureCurrent(target));
         return target;
     }
 

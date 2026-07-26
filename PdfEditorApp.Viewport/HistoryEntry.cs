@@ -14,7 +14,27 @@ public enum HistoryScope
 {
     Annotations,
     Document,
+
+    /// <summary>
+    /// One annotation object in the file was moved or resized.
+    ///
+    /// Its own scope because the inverse is exactly four numbers: put the
+    /// rectangle back. Recording a whole-document snapshot for a nudge would
+    /// cost megabytes per drag, and dragging a stamp across a page is the most
+    /// repeated edit there is.
+    ///
+    /// Only for edits with a cheap exact inverse. DELETING an annotation does
+    /// not qualify, because undoing it means recreating content this entry
+    /// does not hold, so that stays a <see cref="Document"/> snapshot.
+    /// </summary>
+    AnnotationBounds,
 }
+
+/// <summary>
+/// The rectangle to restore one annotation to, in normalized page coordinates.
+/// </summary>
+public sealed record AnnotationBoundsState(
+    int PageIndex, int Index, double Left, double Top, double Right, double Bottom);
 
 /// <summary>
 /// A note's restorable state. Notes are the only mutable annotation (their
@@ -51,6 +71,12 @@ public sealed class HistoryEntry
     /// <summary>Set only for <see cref="HistoryScope.Document"/> entries.</summary>
     public byte[]? DocumentBytes { get; init; }
 
+    /// <summary>
+    /// Set only for <see cref="HistoryScope.AnnotationBounds"/> entries: the
+    /// rectangle to put one annotation back to.
+    /// </summary>
+    public AnnotationBoundsState? Bounds { get; init; }
+
     /// <summary>The page in view when this state was captured.</summary>
     public int PageIndex { get; init; }
 
@@ -61,5 +87,7 @@ public sealed class HistoryEntry
     /// </summary>
     public long Cost =>
         DocumentBytes?.LongLength
-        ?? ((Highlights.Count + InkStrokes.Count + Notes.Count) * 128L + 256L);
+        ?? (Bounds is not null
+                ? 64L
+                : (Highlights.Count + InkStrokes.Count + Notes.Count) * 128L + 256L);
 }

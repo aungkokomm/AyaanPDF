@@ -13,10 +13,12 @@ public class DocumentHistoryTests
         public List<string> Marks { get; } = new();
         public bool Dirty { get; set; }
 
-        public HistoryEntry Capture(HistoryScope scope, string label) => new()
+        // Takes the entry being reversed, not just its scope and label, since
+        // a per-annotation step also needs to know which annotation.
+        public HistoryEntry Capture(HistoryEntry target) => new()
         {
-            Scope = scope,
-            Label = label,
+            Scope = target.Scope,
+            Label = target.Label,
             WasDirty = Dirty,
             // Reuse the Notes list as a generic string carrier for the test.
             Notes = Marks.ConvertAll(m => new NoteState(0, 0, 0, m)),
@@ -34,7 +36,7 @@ public class DocumentHistoryTests
 
         public void Edit(DocumentHistory h, string mark)
         {
-            h.Push(Capture(HistoryScope.Annotations, mark));
+            h.Push(Capture(new HistoryEntry { Scope = HistoryScope.Annotations, Label = mark }));
             Marks.Add(mark);
             Dirty = true;
         }
@@ -170,5 +172,86 @@ public class DocumentHistoryTests
 
         Assert.True(h.CanUndo);
         Assert.Equal(1, h.UndoDepth);
+    }
+}
+
+/// <summary>
+/// The cheap per-annotation undo step, whose whole point is not being a
+/// document snapshot.
+/// </summary>
+public class AnnotationBoundsHistoryTests
+{
+    private static HistoryEntry BoundsEntry(int index, double left, double top) => new()
+    {
+        Scope = HistoryScope.AnnotationBounds,
+        Label = "Move annotation",
+        Bounds = new AnnotationBoundsState(0, index, left, top, left + 0.2, top + 0.1),
+    };
+
+    [Fact]
+    public void a_bounds_step_costs_a_fraction_of_a_document_snapshot()
+    {
+        // The reason this scope exists. A 5MB PDF snapshotted for every nudge
+        // fills the 256MB budget in about fifty drags; a rectangle is 64 bytes.
+        var bounds = BoundsEntry(0, 0.2, 0.2);
+        var snapshot = new HistoryEntry
+        {
+            Scope = HistoryScope.Document,
+            DocumentBytes = new byte[5 * 1024 * 1024],
+        };
+
+        Assert.True(bounds.Cost < 1024, $"a bounds step costs {bounds.Cost} bytes");
+        Assert.True(snapshot.Cost > bounds.Cost * 10_000,
+                    "the comparison this scope exists to avoid should be enormous");
+    }
+
+    [Fact]
+    public void many_drags_do_not_exhaust_the_history_budget()
+    {
+        // Dragging a stamp around is the most repeated edit there is, and each
+        // drag used to record nothing at all; now it must record something
+        // that a thousand repetitions still fit inside.
+        var history = new DocumentHistory();
+        for (int i = 0; i < 1000; i++)
+        {
+            history.Push(BoundsEntry(0, i / 1000.0, 0.3));
+        }
+
+        Assert.True(history.TotalCost < 1024 * 1024,
+                    $"a thousand drags cost {history.TotalCost} bytes");
+    }
+
+    [Fact]
+    public void undoing_a_bounds_step_hands_back_the_rectangle_to_restore()
+    {
+        var history = new DocumentHistory();
+        history.Push(BoundsEntry(3, 0.20, 0.20));
+
+        // Capture the inverse from the entry being reversed, which is what
+        // makes redo possible without a snapshot.
+        var target = history.Undo(t => new HistoryEntry
+        {
+            Scope = t.Scope,
+            Label = t.Label,
+            Bounds = new AnnotationBoundsState(0, t.Bounds!.Index, 0.50, 0.50, 0.70, 0.60),
+        });
+
+        Assert.NotNull(target);
+        Assert.Equal(HistoryScope.AnnotationBounds, target!.Scope);
+        Assert.Equal(3, target.Bounds!.Index);
+        Assert.Equal(0.20, target.Bounds.Left, 6);
+
+        // And redo goes back to where undo took it from.
+        Assert.True(history.CanRedo);
+        var back = history.Redo(t => t);
+        Assert.Equal(0.50, back!.Bounds!.Left, 6);
+    }
+
+    [Fact]
+    public void a_bounds_step_carries_no_document_bytes()
+    {
+        // If one ever did, the scope would have quietly become a snapshot
+        // again and the saving would be gone.
+        Assert.Null(BoundsEntry(0, 0.1, 0.1).DocumentBytes);
     }
 }
