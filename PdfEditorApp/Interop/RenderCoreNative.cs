@@ -424,6 +424,31 @@ internal static partial class RenderCoreNative
     /// ink stroke, which PDFium cannot do: delete and re-add at the new size
     /// instead.
     /// </summary>
+    /// <summary>
+    /// Resizes an annotation, rebuilding it when PDFium will not scale it in
+    /// place. Rebuilding reads the image back out of the annotation, so it
+    /// works for a stamp the app never placed, including one from a saved file
+    /// or made in another editor.
+    ///
+    /// A rebuilt annotation moves to the END of its page's list, so
+    /// <paramref name="newIndex"/> reports where it ended up. For anything
+    /// scaled in place it comes back unchanged.
+    ///
+    /// Returns <see cref="RenderStatus.Unsupported"/> for ink, whose shape is
+    /// a path rather than an image and cannot be rebuilt this way.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int resize_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int set_annotation_bounds(
         ulong docHandle,

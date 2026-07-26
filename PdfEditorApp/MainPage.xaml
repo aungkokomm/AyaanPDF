@@ -258,6 +258,36 @@
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
+
+                                        <!--
+                                            Corner grips for resizing.
+
+                                            Drawn as a separate collection from
+                                            the marquee because they are four
+                                            squares rather than one rectangle,
+                                            and IsHitTestVisible stays False:
+                                            the pointer handler works out which
+                                            corner was grabbed from the
+                                            coordinates, so these are purely
+                                            something to aim at. Letting them
+                                            take the pointer would steal the
+                                            press from the canvas that decides
+                                            what the drag means.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind SelectionGrips}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Fill="{ThemeResource AccentFillColorDefaultBrush}"
+                                                               Stroke="White" StrokeThickness="1"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
                                     </Grid>
 
                                     <!--

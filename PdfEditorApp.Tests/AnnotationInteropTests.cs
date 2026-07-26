@@ -91,6 +91,17 @@ public class AnnotationInteropTests
         ulong docHandle, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int resize_annotation(
+        ulong docHandle, int pageIndex, int index, int captureWidth,
+        float left, float top, float right, float bottom, out int newIndex);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int add_stamp_annotation(
+        ulong docHandle, int pageIndex, int captureWidth,
+        float left, float top, float right, float bottom,
+        [In] byte[] bgra, nuint byteLen, int pixelWidth, int pixelHeight);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern int set_annotation_bounds(
         ulong docHandle, int pageIndex, int index, int captureWidth,
         float left, float top, float right, float bottom);
@@ -462,6 +473,49 @@ public class AnnotationInteropTests
         {
             stop.Cancel();
             System.Threading.Tasks.Task.WaitAll([.. renderers]);
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void resizing_a_stamp_across_the_boundary_reports_its_new_index()
+    {
+        // resize_annotation has an OUT parameter, which is a new shape at this
+        // boundary. A rebuilt annotation moves to the end of its page's list,
+        // so an index that came back wrong would leave the app editing a
+        // different annotation than the one the user selected.
+        ulong handle = OpenFixture();
+        try
+        {
+            // 8x8 opaque BGRA.
+            var px = new byte[8 * 8 * 4];
+            for (int i = 0; i < px.Length; i += 4)
+            {
+                px[i] = 32; px[i + 1] = 64; px[i + 2] = 200; px[i + 3] = 255;
+            }
+
+            Assert.Equal(OkPdfium, add_stamp_annotation(
+                handle, 0, 1000, 100, 100, 200, 200, px, (nuint)px.Length, 8, 8));
+
+            Assert.Equal(OkPdfium, resize_annotation(
+                handle, 0, 0, 1000, 100, 100, 400, 400, out int newIndex));
+
+            var array = get_annotations(handle, 0);
+            try
+            {
+                Assert.Equal(1u, (uint)array.Len);
+                var info = Marshal.PtrToStructure<AnnotationInfo>(array.Items);
+                Assert.Equal(info.Index, newIndex);
+                Assert.Equal(4, info.Subtype);           // still a stamp
+                Assert.Equal(0.40, info.Right, 3);       // and actually resized
+            }
+            finally
+            {
+                free_annotation_array(array);
+            }
+        }
+        finally
+        {
             close_document(handle);
         }
     }

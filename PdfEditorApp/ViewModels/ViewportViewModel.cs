@@ -1329,6 +1329,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             _selectedLoaded = null;
             _loadedDrag = null;
+            _loadedGrip = LoadedAnnotationPicker.Grip.None;
             RefreshSelectionOutline();
             OnPropertyChanged(nameof(HasSelectedAnnotation));
             return true;
@@ -1338,6 +1339,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // this session sit in the overlay ABOVE the page, so they win a tie.
         _selectedLoaded = null;
         _loadedDrag = null;
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
         if (SelectLoadedAt(pageIndex, normX, normY))
         {
             return true;
@@ -1358,6 +1360,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectedAnnotationId = null;
         _selectedLoaded = null;
         _loadedDrag = null;
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _moveOrigin = null;
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
@@ -1477,16 +1480,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         foreach (var slot in PageSlots)
         {
             slot.SelectionOutline.Clear();
+            slot.SelectionGrips.Clear();
         }
 
         if (_selectedLoaded is LoadedSelection sel)
         {
-            SlotFor(sel.PageIndex)?.SelectionOutline.Add(new ScaledRect(
+            var slot = SlotFor(sel.PageIndex);
+            slot?.SelectionOutline.Add(new ScaledRect(
                 sel.Left * SlotLayoutWidth,
                 sel.Top * SlotLayoutWidth,
                 (sel.Right - sel.Left) * SlotLayoutWidth,
                 (sel.Bottom - sel.Top) * SlotLayoutWidth,
                 string.Empty));
+
+            // Grips only for what can actually be resized. Offering them on a
+            // drawing, which PDFium refuses to scale, would be an invitation
+            // to an error message.
+            if (slot is not null && CanResize(sel))
+            {
+                AddGrips(slot, sel);
+            }
+
             InkStrokeChanged?.Invoke();
             return;
         }
@@ -1530,6 +1544,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Where a drag of a loaded annotation began, and its rect then.</summary>
     private (double X, double Y, LoadedSelection Start)? _loadedDrag;
 
+    /// <summary>Which corner the drag has hold of; None means it is a move.</summary>
+    private LoadedAnnotationPicker.Grip _loadedGrip = LoadedAnnotationPicker.Grip.None;
+
     /// <summary>Per-page cache of what the file already carries.</summary>
     private readonly Dictionary<int, List<Interop.ExistingAnnotation>> _loadedByPage = new();
 
@@ -1566,6 +1583,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectedLoaded = new LoadedSelection(
             pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
         _loadedDrag = (normX, normY, _selectedLoaded.Value);
+        _loadedGrip = LoadedAnnotationPicker.GripAt(hit, normX, normY);
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         return true;
@@ -1584,9 +1602,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var moved = LoadedAnnotationPicker.Dragged(
-            new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom),
-            ox, oy, normX, normY);
+        var box = new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom);
+
+        // A grip resizes, anything else moves. Both are computed from where
+        // the drag STARTED, so neither can creep across a long gesture.
+        var moved = _loadedGrip == LoadedAnnotationPicker.Grip.None
+            ? LoadedAnnotationPicker.Dragged(box, ox, oy, normX, normY)
+            : LoadedAnnotationPicker.Resized(box, _loadedGrip, normX, normY);
 
         _selectedLoaded = start with
         {
@@ -1605,7 +1627,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _loadedDrag = null;
 
-        // Nothing actually moved, so do not dirty the document or reflow.
+        // The grip belongs to the gesture that just ended, so it is read once
+        // and cleared here rather than on each of the returns below. Leaving
+        // it set would make the next plain drag resize from a corner nobody is
+        // holding, and clearing it per exit path is how one gets missed.
+        bool resizing = _loadedGrip != LoadedAnnotationPicker.Grip.None;
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
+
+        // Nothing actually changed, so do not dirty the document or reflow.
         if (!LoadedAnnotationPicker.IsRealMove(
                 new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom),
                 new AnnotationBox(now.Index, now.Left, now.Top, now.Right, now.Bottom)))
@@ -1613,13 +1642,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // resize_annotation, not set_annotation_bounds: it does the same thing
+        // for a move or a quad-point resize, and rebuilds the annotation when
+        // PDFium will not scale it, which is the only way a stamp can grow.
+        // Rebuilding moves it to the end of the page's list, so the index it
+        // reports back is the one to keep.
         const int CaptureWidth = 1000;
-        int status = RenderCoreNative.set_annotation_bounds(
+        int status = RenderCoreNative.resize_annotation(
             _documentHandle, now.PageIndex, now.Index, CaptureWidth,
             (float)(now.Left * CaptureWidth), (float)(now.Top * CaptureWidth),
-            (float)(now.Right * CaptureWidth), (float)(now.Bottom * CaptureWidth));
+            (float)(now.Right * CaptureWidth), (float)(now.Bottom * CaptureWidth),
+            out int newIndex);
 
-        Diag.Log($"move loaded annotation p{now.PageIndex}#{now.Index} -> {status}");
+        Diag.Log($"{(resizing ? "resize" : "move")} loaded annotation " +
+                 $"p{now.PageIndex}#{now.Index} -> {status}, index now {newIndex}");
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -1628,14 +1664,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedLoaded = start;
             RefreshSelectionOutline();
             Status = status == RenderStatus.Unsupported
-                ? "That annotation cannot be moved."
-                : "Could not move that annotation.";
+                ? (resizing ? "A drawing cannot be resized yet." : "That annotation cannot be moved.")
+                : $"Could not {(resizing ? "resize" : "move")} that annotation.";
             return;
         }
 
         IsDirty = true;
         InvalidateLoadedPage(now.PageIndex);
-        _selectedLoaded = now;
+        _selectedLoaded = now with { Index = newIndex };
         RefreshSelectionOutline();
     }
 
@@ -1658,6 +1694,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _selectedLoaded = null;
         _loadedDrag = null;
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
         IsDirty = true;
         InvalidateLoadedPage(sel.PageIndex);
         RefreshSelectionOutline();
@@ -1683,6 +1720,42 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.ReleaseBitmap();
             RenderBaseTier(slot);
             ScheduleSharpenPass();
+        }
+    }
+
+    /// <summary>Half a grip's on-screen size, in slot DIPs.</summary>
+    private const double GripHalf = 5.0;
+
+    /// <summary>
+    /// Whether this annotation can be resized at all.
+    ///
+    /// Ink cannot: its shape is a path, and PDFium will neither scale it nor
+    /// let it be rebuilt from the outside. Everything else either scales in
+    /// place or can be rebuilt from its own image.
+    /// </summary>
+    private bool CanResize(LoadedSelection sel)
+    {
+        foreach (var a in LoadedFor(sel.PageIndex))
+        {
+            if (a.Index == sel.Index)
+            {
+                return a.Subtype != Interop.AnnotSubtype.Ink;
+            }
+        }
+        return true;
+    }
+
+    private static void AddGrips(PageSlot slot, LoadedSelection sel)
+    {
+        double l = sel.Left * SlotLayoutWidth;
+        double t = sel.Top * SlotLayoutWidth;
+        double r = sel.Right * SlotLayoutWidth;
+        double b = sel.Bottom * SlotLayoutWidth;
+
+        foreach (var (cx, cy) in new[] { (l, t), (r, t), (l, b), (r, b) })
+        {
+            slot.SelectionGrips.Add(new ScaledRect(
+                cx - GripHalf, cy - GripHalf, GripHalf * 2, GripHalf * 2, string.Empty));
         }
     }
 

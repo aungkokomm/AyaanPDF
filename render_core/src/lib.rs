@@ -1153,6 +1153,223 @@ fn set_annotation_bounds_inner(
     STATUS_OK_PDFIUM
 }
 
+/// Normalizes a PDFium bitmap to the tightly packed BGRA everything else here
+/// speaks, or None if the buffer does not match its stated size.
+///
+/// PDFium hands back whatever the stored image actually uses, which is not
+/// always four bytes per pixel: an opaque image comes back as BGR, three bytes
+/// wide, and a black-and-white one as a single grey byte. Assuming BGRA is how
+/// an 8x8 image arrives as 192 bytes when 256 were expected.
+fn to_bgra(
+    width: i32,
+    height: i32,
+    format: pdfium_render::prelude::PdfBitmapFormat,
+    bytes: &[u8],
+) -> Option<(i32, i32, Vec<u8>)> {
+    use pdfium_render::prelude::PdfBitmapFormat;
+
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    let stride = match format {
+        PdfBitmapFormat::Gray => 1,
+        PdfBitmapFormat::BGR => 3,
+        _ => 4,   // BGRA and BGRx
+    };
+
+    if bytes.len() < pixels.checked_mul(stride)? {
+        return None;
+    }
+
+    // Already what we want, so hand it straight over.
+    if matches!(format, PdfBitmapFormat::BGRA) {
+        return Some((width, height, bytes[..pixels * 4].to_vec()));
+    }
+
+    let mut out = Vec::with_capacity(pixels * 4);
+    for i in 0..pixels {
+        let p = i * stride;
+        match stride {
+            1 => {
+                let v = bytes[p];
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
+            3 => out.extend_from_slice(&[bytes[p], bytes[p + 1], bytes[p + 2], 255]),
+            // BGRx: the fourth byte is padding, not alpha, so it is replaced
+            // rather than carried through as a transparency of whatever
+            // happened to be in it.
+            _ => out.extend_from_slice(&[bytes[p], bytes[p + 1], bytes[p + 2], 255]),
+        }
+    }
+
+    Some((width, height, out))
+}
+
+/// Resizes an annotation to a new rectangle, rebuilding it when PDFium will
+/// not scale it in place.
+///
+/// `set_annotation_bounds` handles a MOVE for everything and a resize for the
+/// kinds whose shape is their quad points, but it refuses to scale a stamp:
+/// the picture lives in an image object that cannot be transformed from
+/// outside, so growing the rectangle alone would leave the image at its old
+/// size inside a bigger box.
+///
+/// The fix is to rebuild the annotation, and doing it HERE rather than in the
+/// app is what makes it work at all. Rebuilding needs the original pixels, and
+/// the app only has those for a stamp it placed this session; one loaded from
+/// a saved file, or made in Acrobat, it has never seen. Down here the image is
+/// simply part of the annotation and can be read straight back out, so a stamp
+/// resizes the same way whoever created it.
+///
+/// The rebuilt annotation goes to the END of the page's list, so its index
+/// changes. That is why the new index is returned rather than assumed.
+#[unsafe(no_mangle)]
+pub extern "C" fn resize_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if !(right > left) || !(bottom > top) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        resize_annotation_inner(doc_handle, page_index, index, capture_width,
+                                left, top, right, bottom, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resize_annotation_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    // The straightforward path first. It succeeds for a move of anything, and
+    // for a resize of the quad-point kinds, and only reports UNSUPPORTED for
+    // the cases that genuinely need rebuilding.
+    let direct = set_annotation_bounds(doc_handle, page_index, index, capture_width,
+                                       left, top, right, bottom);
+    if direct != STATUS_UNSUPPORTED {
+        if direct == STATUS_OK_PDFIUM && !out_new_index.is_null() {
+            unsafe { *out_new_index = index };
+        }
+        return direct;
+    }
+
+    // Rebuild. Pull the pixels out of the existing annotation before removing
+    // it, since removing it takes the image with it.
+    let extracted = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else {
+            return STATUS_INVALID_INPUT;
+        };
+        let doc_guard = lock(&doc);
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let Ok(mut annotation) = page.annotations_mut().get(index as usize) else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        let PdfPageAnnotation::Stamp(stamp) = &mut annotation else {
+            // Ink is the other object-owning kind. Its shape is a path rather
+            // than an image, so rebuilding it would mean reading path segments
+            // back out and re-emitting them, which is a different job. Say so
+            // instead of pretending.
+            return STATUS_UNSUPPORTED;
+        };
+
+        let objects = stamp.objects_mut();
+        let mut found = None;
+        for i in 0..objects.len() {
+            let Ok(object) = objects.get(i) else {
+                continue;
+            };
+            // By reference: PdfPageObject implements Drop, so destructuring it
+            // by value would try to move out of a type that cannot be moved.
+            if let PdfPageObject::Image(image) = &object {
+                // PROCESSED, not raw. The raw bitmap is the image alone, with
+                // its transparency living separately in a soft mask, so
+                // rebuilding from it would turn every transparent signature
+                // into an opaque white block. The processed one has the mask
+                // applied.
+                let bitmap = image
+                    .get_processed_bitmap(&doc_guard)
+                    .or_else(|_| image.get_raw_bitmap());
+
+                if let Ok(bitmap) = bitmap {
+                    let format = bitmap.format().unwrap_or(PdfBitmapFormat::BGRA);
+                    found = to_bgra(bitmap.width(), bitmap.height(), format, &bitmap.as_raw_bytes());
+                }
+                break;
+            }
+        }
+        found
+    };
+
+    let Some((px_width, px_height, pixels)) = extracted else {
+        return STATUS_UNSUPPORTED;
+    };
+
+    // to_bgra has already checked the source against its own format and
+    // produced exactly four bytes per pixel, but this is the buffer that goes
+    // back into PDFium, so it is checked again at the point of use.
+    let expected = (px_width as usize)
+        .saturating_mul(px_height as usize)
+        .saturating_mul(4);
+    if pixels.len() != expected || px_width <= 0 || px_height <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // Remove, then re-place at the new size. Order matters: adding first would
+    // briefly leave two copies, and a failure between the two would leave the
+    // duplicate behind.
+    let removed = delete_annotation(doc_handle, page_index, index);
+    if removed != STATUS_OK_PDFIUM {
+        return removed;
+    }
+
+    let added = add_stamp_annotation(
+        doc_handle, page_index, capture_width,
+        left, top, right, bottom,
+        pixels.as_ptr(), pixels.len(), px_width, px_height);
+    if added != STATUS_OK_PDFIUM {
+        return added;
+    }
+
+    // The rebuilt annotation is now last on the page.
+    if !out_new_index.is_null() {
+        let array = get_annotations(doc_handle, page_index);
+        let count = array.len;
+        free_annotation_array(array);
+        unsafe { *out_new_index = count.saturating_sub(1) as i32 };
+    }
+
+    STATUS_OK_PDFIUM
+}
+
 /// Places an image as a real PDF `/Stamp` annotation object.
 ///
 /// Pixels arrive already decoded, as tightly packed BGRA, rather than as PNG
@@ -4001,6 +4218,222 @@ mod tests {
             new_after, (32, 64, 200),
             "nothing was drawn at the new position"
         );
+    }
+
+    #[test]
+    fn resizing_a_transparent_stamp_keeps_it_transparent() {
+        // The case that matters for a real signature or seal, which is a
+        // shape on a transparent background.
+        //
+        // Rebuilding reads the image back out of the annotation, and the RAW
+        // image does not carry transparency: alpha lives separately in a soft
+        // mask, so rebuilding from the raw bitmap would turn every signature
+        // into an opaque rectangle covering the text underneath. The processed
+        // bitmap has the mask applied, which is why it is used.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        const W: i32 = 400;
+
+        let sample = |r: &RenderResult, x: usize, y: usize| -> (u8, u8, u8) {
+            let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+            let i = (y * r.width as usize + x) * 4;
+            (bytes[i], bytes[i + 1], bytes[i + 2])
+        };
+
+        // Left half transparent, right half solid.
+        let px = test_stamp_pixels(16, 16);
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 200.0, 200.0, 600.0, 600.0,
+                                 px.as_ptr(), px.len(), 16, 16),
+            STATUS_OK_PDFIUM
+        );
+
+        let clean = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        let clear_before = sample(&clean, 120, 160);   // in the transparent half
+        free_render_result(clean);
+
+        // Grow it. Normalized 0.2..0.6 becomes 0.2..0.7, so the transparent
+        // half still covers x around 0.3, i.e. pixel 120.
+        let mut new_index = -1;
+        assert_eq!(
+            resize_annotation(handle, 0, 0, 1000, 200.0, 200.0, 700.0, 700.0, &mut new_index),
+            STATUS_OK_PDFIUM
+        );
+
+        let after = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        let clear_after = sample(&after, 120, 160);
+        // Resized to normalized 0.2..0.7, which on a 400px render is pixels
+        // 80..280: the transparent half covers 80..180 and the solid half
+        // 180..280. Sampling at 300 would land OUTSIDE the stamp entirely,
+        // which is a wrong probe rather than a wrong result.
+        let solid_after = sample(&after, 230, 160);
+        free_render_result(after);
+
+        println!("TRANSPARENCY: clear {clear_before:?} -> {clear_after:?}, solid {solid_after:?}");
+        close_document(handle);
+
+        assert_eq!(
+            clear_after, clear_before,
+            "the transparent half became opaque when resized, so the mask was lost"
+        );
+        assert_eq!(solid_after, (32, 64, 200), "the solid half lost its colour when resized");
+    }
+    #[test]
+    fn resizing_a_stamp_grows_the_picture_not_just_the_box() {
+        // The whole point. set_annotation_bounds refuses to scale a stamp
+        // because the image cannot be transformed from outside, and the
+        // failure mode it was protecting against is a bigger rectangle with
+        // the same small picture inside it. So this checks PIXELS at a point
+        // that is OUTSIDE the original stamp and INSIDE the resized one.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        const W: i32 = 400;
+
+        let sample = |r: &RenderResult, x: usize, y: usize| -> (u8, u8, u8) {
+            let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+            let i = (y * r.width as usize + x) * 4;
+            (bytes[i], bytes[i + 1], bytes[i + 2])
+        };
+
+        // Opaque, so every sampled pixel inside it is the stamp.
+        let px: Vec<u8> = std::iter::repeat([32u8, 64, 200, 255]).take(64).flatten().collect();
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 100.0, 100.0, 200.0, 200.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_OK_PDFIUM
+        );
+
+        // Normalized 0.1..0.2, so pixel 120 (0.3) is well outside it.
+        let probe = (120, 120);
+        let small = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        let before = sample(&small, probe.0, probe.1);
+        free_render_result(small);
+        assert_ne!(before, (32, 64, 200), "the probe should start outside the stamp");
+
+        // Grow to 0.1..0.4, which now covers the probe.
+        let mut new_index = -1;
+        let status = resize_annotation(handle, 0, 0, 1000, 100.0, 100.0, 400.0, 400.0,
+                                       &mut new_index);
+        assert_eq!(status, STATUS_OK_PDFIUM, "resize failed");
+        assert!(new_index >= 0, "resize did not report the rebuilt annotation's index");
+
+        let big = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, W);
+        let after = sample(&big, probe.0, probe.1);
+        free_render_result(big);
+
+        println!("RESIZE: probe {before:?} -> {after:?}, new index {new_index}");
+        assert_eq!(after, (32, 64, 200), "the picture did not grow with its rectangle");
+
+        // Still exactly one annotation: rebuilding must replace, not duplicate.
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1, "resize left a duplicate behind: {found:?}");
+        assert_eq!(found[0].0, new_index, "the reported index is not where it ended up");
+        assert_eq!(found[0].1, ANNOT_STAMP, "the rebuilt annotation is not a stamp");
+
+        // And its rectangle is the one asked for.
+        assert!((found[0].2 - 0.1).abs() < 0.001, "left is {}", found[0].2);
+        assert!((found[0].4 - 0.4).abs() < 0.001, "right is {}", found[0].4);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn resizing_a_highlight_uses_the_direct_path_and_keeps_its_index() {
+        // A highlight's shape is its quad points, which CAN be transformed in
+        // place, so it must not be rebuilt: rebuilding would move it to the
+        // end of the page's list and invalidate an index the caller still
+        // holds, for no reason.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1,
+            r: 255, g: 235, b: 59, a: 200,
+        }];
+        assert_eq!(
+            add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_annotation(handle, 0, 0, 1000, 300.0, 300.0, 900.0, 460.0, &mut new_index),
+            STATUS_OK_PDFIUM
+        );
+        assert_eq!(new_index, 0, "a highlight should keep its index");
+
+        let found = read_annotations(handle, 0);
+        assert_eq!(found.len(), 1);
+        assert!((found[0].4 - 0.9).abs() < 0.001, "right is {}", found[0].4);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn resizing_ink_reports_that_it_cannot_rather_than_mangling_it() {
+        // Ink also owns page objects, but its shape is a path rather than an
+        // image, so rebuilding would mean reading path segments back out and
+        // re-emitting them. Refusing is honest; silently leaving the stroke at
+        // its old size inside a bigger box is not.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let pts = [BurnPoint { x: 300.0, y: 300.0 }, BurnPoint { x: 500.0, y: 400.0 }];
+        let strokes = [BurnStroke {
+            page_index: 0, point_offset: 0, point_count: 2,
+            width_px: 6.0, r: 200, g: 0, b: 0, a: 255,
+        }];
+        assert_eq!(
+            add_ink_annotations(handle, 1000, strokes.as_ptr(), 1, pts.as_ptr(), 2),
+            STATUS_OK_PDFIUM
+        );
+
+        let before = read_annotations(handle, 0);
+        let mut new_index = -1;
+        assert_eq!(
+            resize_annotation(handle, 0, 0, 1000, 300.0, 300.0, 900.0, 700.0, &mut new_index),
+            STATUS_UNSUPPORTED
+        );
+
+        // A refusal must leave the stroke exactly as it was.
+        let after = read_annotations(handle, 0);
+        assert_eq!(after.len(), 1, "the refused resize removed the stroke");
+        assert_eq!(before[0], after[0], "the refused resize changed the stroke anyway");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_stamp_can_be_resized_after_being_saved_and_reopened() {
+        // The case the app cannot do for itself: a stamp in a file it never
+        // placed, so it has no source pixels. Resizing has to read them back
+        // out of the annotation, which is the whole reason this lives in the
+        // core rather than in the app.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let px: Vec<u8> = std::iter::repeat([32u8, 64, 200, 255]).take(64).flatten().collect();
+        assert_eq!(
+            add_stamp_annotation(handle, 0, 1000, 100.0, 100.0, 200.0, 200.0,
+                                 px.as_ptr(), px.len(), 8, 8),
+            STATUS_OK_PDFIUM
+        );
+        free_render_result(render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 400));
+
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        close_document(handle);
+        free_byte_buffer(saved);
+        assert_ne!(reopened, 0);
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_annotation(reopened, 0, 0, 1000, 100.0, 100.0, 500.0, 500.0, &mut new_index),
+            STATUS_OK_PDFIUM,
+            "a reopened stamp should still be resizable"
+        );
+
+        let found = read_annotations(reopened, 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, ANNOT_STAMP);
+        assert!((found[0].4 - 0.5).abs() < 0.001, "right is {}", found[0].4);
+
+        close_document(reopened);
     }
 
     #[test]

@@ -81,5 +81,102 @@ public static class LoadedAnnotationPicker
     /// edit, and certainly should not mark the file dirty.
     /// </summary>
     public static bool IsRealMove(AnnotationBox start, AnnotationBox now, double epsilon = 1e-6) =>
-        Math.Abs(now.Left - start.Left) > epsilon || Math.Abs(now.Top - start.Top) > epsilon;
+        Math.Abs(now.Left - start.Left) > epsilon || Math.Abs(now.Top - start.Top) > epsilon
+        || Math.Abs(now.Width - start.Width) > epsilon
+        || Math.Abs(now.Height - start.Height) > epsilon;
+
+    /// <summary>Which corner of a selected annotation a drag has hold of.</summary>
+    public enum Grip
+    {
+        None,
+        TopLeft,
+        TopRight,
+        BottomLeft,
+        BottomRight,
+    }
+
+    /// <summary>
+    /// Half the width of a corner grip, in normalized units. Generous on
+    /// purpose: a grip drawn 8 DIP across is a small target, and missing it
+    /// starts a MOVE instead of a resize, which is a surprising thing to have
+    /// happen to a carefully placed signature.
+    /// </summary>
+    public const double GripReach = 0.012;
+
+    /// <summary>
+    /// The corner under a point, or None.
+    ///
+    /// Corners are tested BEFORE the body, because they overlap it: a click in
+    /// the corner region is a resize, and only a click elsewhere inside the
+    /// box is a move.
+    /// </summary>
+    public static Grip GripAt(AnnotationBox box, double x, double y, double reach = GripReach)
+    {
+        // A tiny annotation would have grips covering the whole of it, leaving
+        // no way to move the thing. Shrink the reach so the middle stays
+        // grabbable.
+        double limit = Math.Min(reach, Math.Min(box.Width, box.Height) / 3);
+
+        bool left = Math.Abs(x - box.Left) <= limit;
+        bool right = Math.Abs(x - box.Right) <= limit;
+        bool top = Math.Abs(y - box.Top) <= limit;
+        bool bottom = Math.Abs(y - box.Bottom) <= limit;
+
+        if (top && left) return Grip.TopLeft;
+        if (top && right) return Grip.TopRight;
+        if (bottom && left) return Grip.BottomLeft;
+        if (bottom && right) return Grip.BottomRight;
+        return Grip.None;
+    }
+
+    /// <summary>Smallest an annotation may be dragged to, normalized.</summary>
+    public const double MinSize = 0.01;
+
+    /// <summary>
+    /// The box that results from dragging a corner to a point.
+    ///
+    /// The OPPOSITE corner stays put, which is what makes a resize feel like
+    /// one: dragging the bottom-right moves only the bottom-right edge. The
+    /// dragged corner is then stopped from crossing over, since a box turned
+    /// inside out is rejected by both native calls and would look like the
+    /// annotation vanished.
+    /// </summary>
+    public static AnnotationBox Resized(AnnotationBox start, Grip grip, double x, double y)
+    {
+        if (grip == Grip.None)
+        {
+            return start;
+        }
+
+        double left = start.Left;
+        double top = start.Top;
+        double right = start.Right;
+        double bottom = start.Bottom;
+
+        switch (grip)
+        {
+            case Grip.TopLeft:
+                left = Math.Min(x, right - MinSize);
+                top = Math.Min(y, bottom - MinSize);
+                break;
+            case Grip.TopRight:
+                right = Math.Max(x, left + MinSize);
+                top = Math.Min(y, bottom - MinSize);
+                break;
+            case Grip.BottomLeft:
+                left = Math.Min(x, right - MinSize);
+                bottom = Math.Max(y, top + MinSize);
+                break;
+            case Grip.BottomRight:
+                right = Math.Max(x, left + MinSize);
+                bottom = Math.Max(y, top + MinSize);
+                break;
+        }
+
+        // Never off the top or left, where the grips would be unreachable.
+        left = Math.Max(0, left);
+        top = Math.Max(0, top);
+
+        return start with { Left = left, Top = top, Right = right, Bottom = bottom };
+    }
 }

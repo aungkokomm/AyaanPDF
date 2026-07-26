@@ -105,6 +105,69 @@ internal static class StampLibrary
     }
 
     /// <summary>
+    /// Remembers which stamp was last used, so it is still chosen next time.
+    ///
+    /// People keep one or two stamps, a signature and maybe a seal, and reach
+    /// for the same one constantly. Making them re-pick it on every launch is
+    /// a small tax charged on the most common action there is.
+    ///
+    /// Stored as a plain text file next to the stamps, for the same reason
+    /// they are: it is inspectable, portable, and losing it costs one click.
+    /// </summary>
+    private static string LastUsedPath => Path.Combine(FolderPath, ".last-used");
+
+    public static void RememberLastUsed(StampEntry entry)
+    {
+        try
+        {
+            // The NAME, not the full path, so the library still works after
+            // the folder is moved or the app is installed somewhere else.
+            File.WriteAllText(LastUsedPath, Path.GetFileName(entry.Path));
+        }
+        catch (Exception ex)
+        {
+            // Never worth interrupting anyone over.
+            Diag.Log($"could not remember the last stamp: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// The stamp to preselect: the last one used if it is still there,
+    /// otherwise the first, otherwise none.
+    /// </summary>
+    public static StampEntry? LastUsed(IReadOnlyList<StampEntry> stamps)
+    {
+        if (stamps.Count == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (File.Exists(LastUsedPath))
+            {
+                string name = File.ReadAllText(LastUsedPath).Trim();
+                foreach (var s in stamps)
+                {
+                    if (string.Equals(Path.GetFileName(s.Path), name,
+                                      StringComparison.OrdinalIgnoreCase))
+                    {
+                        return s;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"could not read the last stamp: {ex.Message}");
+        }
+
+        // The remembered one was deleted or renamed, so fall back rather than
+        // leaving nothing selected.
+        return stamps[0];
+    }
+
+    /// <summary>
     /// Decodes a stamp to the tightly packed BGRA render_core expects.
     ///
     /// Decoding happens here rather than in the native core so that the image

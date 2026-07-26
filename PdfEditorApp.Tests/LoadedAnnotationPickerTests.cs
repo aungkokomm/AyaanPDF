@@ -109,3 +109,114 @@ public class LoadedAnnotationPickerTests
         Assert.True(LoadedAnnotationPicker.IsRealMove(Highlight, actuallyMoved));
     }
 }
+
+/// <summary>Corner grips and the resize they drive.</summary>
+public class AnnotationResizeTests
+{
+    private static readonly AnnotationBox Box = new(0, 0.20, 0.20, 0.60, 0.50);
+
+    [Fact]
+    public void each_corner_is_grabbable()
+    {
+        Assert.Equal(LoadedAnnotationPicker.Grip.TopLeft,
+                     LoadedAnnotationPicker.GripAt(Box, 0.20, 0.20));
+        Assert.Equal(LoadedAnnotationPicker.Grip.TopRight,
+                     LoadedAnnotationPicker.GripAt(Box, 0.60, 0.20));
+        Assert.Equal(LoadedAnnotationPicker.Grip.BottomLeft,
+                     LoadedAnnotationPicker.GripAt(Box, 0.20, 0.50));
+        Assert.Equal(LoadedAnnotationPicker.Grip.BottomRight,
+                     LoadedAnnotationPicker.GripAt(Box, 0.60, 0.50));
+    }
+
+    [Fact]
+    public void the_middle_is_not_a_grip_so_it_can_still_be_dragged()
+    {
+        Assert.Equal(LoadedAnnotationPicker.Grip.None,
+                     LoadedAnnotationPicker.GripAt(Box, 0.40, 0.35));
+    }
+
+    [Fact]
+    public void a_tiny_annotation_keeps_a_grabbable_middle()
+    {
+        // With a fixed reach the four grips would cover a small mark
+        // completely, leaving no way to MOVE it, only to resize it.
+        var tiny = new AnnotationBox(0, 0.5, 0.5, 0.52, 0.52);
+        Assert.Equal(LoadedAnnotationPicker.Grip.None,
+                     LoadedAnnotationPicker.GripAt(tiny, 0.51, 0.51));
+
+        // The corners still work.
+        Assert.Equal(LoadedAnnotationPicker.Grip.TopLeft,
+                     LoadedAnnotationPicker.GripAt(tiny, 0.5, 0.5));
+    }
+
+    [Fact]
+    public void dragging_a_corner_leaves_the_opposite_one_alone()
+    {
+        var r = LoadedAnnotationPicker.Resized(
+            Box, LoadedAnnotationPicker.Grip.BottomRight, 0.8, 0.7);
+
+        Assert.Equal(0.20, r.Left, 6);    // untouched
+        Assert.Equal(0.20, r.Top, 6);     // untouched
+        Assert.Equal(0.80, r.Right, 6);
+        Assert.Equal(0.70, r.Bottom, 6);
+    }
+
+    [Fact]
+    public void dragging_the_top_left_moves_only_that_corner()
+    {
+        var r = LoadedAnnotationPicker.Resized(
+            Box, LoadedAnnotationPicker.Grip.TopLeft, 0.10, 0.05);
+
+        Assert.Equal(0.10, r.Left, 6);
+        Assert.Equal(0.05, r.Top, 6);
+        Assert.Equal(0.60, r.Right, 6);   // untouched
+        Assert.Equal(0.50, r.Bottom, 6);  // untouched
+    }
+
+    [Fact]
+    public void a_corner_cannot_be_dragged_through_the_opposite_edge()
+    {
+        // Turning the box inside out would produce an inverted rectangle,
+        // which both native calls reject, so the annotation would look like it
+        // had vanished.
+        var r = LoadedAnnotationPicker.Resized(
+            Box, LoadedAnnotationPicker.Grip.BottomRight, 0.05, 0.05);
+
+        Assert.True(r.Right > r.Left, $"right {r.Right} crossed left {r.Left}");
+        Assert.True(r.Bottom > r.Top, $"bottom {r.Bottom} crossed top {r.Top}");
+        Assert.True(r.Width >= LoadedAnnotationPicker.MinSize);
+        Assert.True(r.Height >= LoadedAnnotationPicker.MinSize);
+    }
+
+    [Fact]
+    public void a_resize_never_pushes_the_annotation_off_the_top_or_left()
+    {
+        var r = LoadedAnnotationPicker.Resized(
+            Box, LoadedAnnotationPicker.Grip.TopLeft, -0.5, -0.5);
+
+        Assert.Equal(0.0, r.Left, 6);
+        Assert.Equal(0.0, r.Top, 6);
+    }
+
+    [Fact]
+    public void a_resize_counts_as_a_real_edit_even_when_the_corner_stays_put()
+    {
+        // IsRealMove decides whether to write to the document. It originally
+        // compared only the top-left, so dragging the BOTTOM-RIGHT changed the
+        // size while the test for "did anything happen" said no.
+        var grown = LoadedAnnotationPicker.Resized(
+            Box, LoadedAnnotationPicker.Grip.BottomRight, 0.9, 0.8);
+
+        Assert.Equal(Box.Left, grown.Left, 9);
+        Assert.Equal(Box.Top, grown.Top, 9);
+        Assert.True(LoadedAnnotationPicker.IsRealMove(Box, grown),
+                    "growing from the bottom-right must count as an edit");
+    }
+
+    [Fact]
+    public void no_grip_means_no_change()
+    {
+        Assert.Equal(Box, LoadedAnnotationPicker.Resized(
+            Box, LoadedAnnotationPicker.Grip.None, 0.9, 0.9));
+    }
+}

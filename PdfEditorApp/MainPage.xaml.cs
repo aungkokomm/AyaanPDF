@@ -478,11 +478,16 @@ public sealed partial class MainPage : Page
         StampChoices.ItemsSource = stamps;
         StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
-        // Keep the previous choice selected across openings, so placing several
-        // copies of one stamp does not mean re-picking it every time.
-        if (_selectedStamp is not null)
+        // Preselect: this session's choice if there is one, otherwise the one
+        // remembered from last time. Someone who keeps a single signature
+        // should never have to pick it twice.
+        var wanted = _selectedStamp is not null
+            ? stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path)
+            : StampLibrary.LastUsed(stamps);
+
+        if (wanted is not null)
         {
-            StampChoices.SelectedItem = stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path);
+            StampChoices.SelectedItem = wanted;
         }
     }
 
@@ -491,6 +496,7 @@ public sealed partial class MainPage : Page
         if (StampChoices.SelectedItem is StampEntry entry)
         {
             _selectedStamp = entry;
+            StampLibrary.RememberLastUsed(entry);
             // Choosing a stamp arms the tool: picking one and then having to
             // find the tool button as well would be a pointless second step.
             SetActiveTool(ToolMode.Stamp);

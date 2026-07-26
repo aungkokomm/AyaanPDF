@@ -60,6 +60,15 @@ public partial class PageSlot : ObservableObject
     /// </summary>
     public ObservableCollection<ScaledRect> SelectionOutline { get; } = new();
 
+    /// <summary>
+    /// The four corner grips of the selected annotation, pre-scaled.
+    ///
+    /// Separate from SelectionOutline because they are four small squares
+    /// rather than one rectangle, and because a selection that cannot be
+    /// resized shows the marquee with no grips.
+    /// </summary>
+    public ObservableCollection<ScaledRect> SelectionGrips { get; } = new();
+
     /// <summary>Rebuilds the flattened highlight rectangles from the annotations.</summary>
     public void RebuildHighlightRects()
     {
