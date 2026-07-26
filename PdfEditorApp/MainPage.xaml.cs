@@ -691,8 +691,13 @@ public sealed partial class MainPage : Page
 
     private TextBox? _textEditor;
     private int _textEditorPage;
-    private double _textEditorX;
-    private double _textEditorY;
+
+    // The box being edited, NORMALIZED. Carried so the commit writes the same
+    // rectangle that was dragged, and the core wraps the text to its width.
+    private double _boxLeft;
+    private double _boxTop;
+    private double _boxRight;
+    private double _boxBottom;
 
     /// <summary>
     /// When set, the editor is re-editing an existing text box rather than
@@ -701,15 +706,16 @@ public sealed partial class MainPage : Page
     private ViewportViewModel.TextBoxEditTarget? _editingTarget;
 
     /// <summary>
-    /// Opens a live editor where the text will land, so what is typed is seen
-    /// in place rather than in a dialog. Committed on Escape, on Enter without
-    /// Shift, or when focus leaves it.
+    /// Opens a live editor filling the dragged box, so what is typed wraps
+    /// exactly where it will land. Committed on Escape, on Enter without Shift,
+    /// or when focus leaves it.
+    ///
+    /// Coordinates are NORMALIZED, and the editor is positioned by the same
+    /// <c>normalized * OverlayScale</c> the ink canvas uses for everything else,
+    /// so it sits on the page where a committed mark at the same point would.
     /// </summary>
-    /// <param name="slotX">Box left, in slot DIPs.</param>
-    /// <param name="slotY">Box top, in slot DIPs.</param>
-    /// <param name="initialText">Existing words, when re-editing.</param>
-    /// <param name="editing">The box being re-edited, or null to place a new one.</param>
-    private void BeginTextEdit(int page, double slotX, double slotY,
+    private void BeginTextEdit(int page, double normLeft, double normTop,
+                              double normRight, double normBottom,
                               string? initialText = null,
                               ViewportViewModel.TextBoxEditTarget? editing = null)
     {
@@ -717,29 +723,35 @@ public sealed partial class MainPage : Page
 
         double scale = ViewModel.OverlayScale;
         double pageTop = ViewModel.SlotTopOf(page);
+        double widthDip = (normRight - normLeft) * scale;
 
         _textEditor = new TextBox
         {
             AcceptsReturn = true,
-            TextWrapping = TextWrapping.NoWrap,
-            MinWidth = 40,
+            // Wrap to the dragged width, matching how the box renders. A fixed
+            // Width plus wrap is what makes the editor a true preview.
+            TextWrapping = TextWrapping.Wrap,
+            Width = System.Math.Max(40, widthDip),
             Padding = new Thickness(2),
             BorderThickness = new Thickness(1),
             Background = new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF)),
             Foreground = HexBrush(ViewModel.InkColorHex),
-            // The editor's text is sized to match what will be placed, so the
-            // box is a true preview: font-size fraction times the slot width.
+            // Arial is metrically close to the PDF's Helvetica, so the editor
+            // wraps in almost the same places the rendered text will.
+            FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Arial"),
             FontSize = System.Math.Max(8, ViewModel.TextFontSize * scale),
             Text = initialText ?? string.Empty,
         };
 
-        Canvas.SetLeft(_textEditor, slotX * scale);
-        Canvas.SetTop(_textEditor, (slotY * scale) + pageTop);
+        Canvas.SetLeft(_textEditor, normLeft * scale);
+        Canvas.SetTop(_textEditor, (normTop * scale) + pageTop);
         InkCanvas.Children.Add(_textEditor);
 
         _textEditorPage = page;
-        _textEditorX = slotX;
-        _textEditorY = slotY;
+        _boxLeft = normLeft;
+        _boxTop = normTop;
+        _boxRight = normRight;
+        _boxBottom = normBottom;
 
         // Set AFTER the initial CommitTextEdit above, so closing any prior
         // editor does not adopt this edit's target.
@@ -800,7 +812,7 @@ public sealed partial class MainPage : Page
         // want, so this path runs even when the text is blank.
         if (target is ViewportViewModel.TextBoxEditTarget t)
         {
-            if (ViewModel.ReplaceTextBox(t.PageIndex, t.Index, t.Left, t.Top,
+            if (ViewModel.ReplaceTextBox(t.PageIndex, t.Index, t.Left, t.Top, t.Right, t.Bottom,
                                          text, ViewModel.InkColorHex, ViewModel.TextFontSize)
                 && !string.IsNullOrWhiteSpace(text))
             {
@@ -816,7 +828,7 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        if (ViewModel.PlaceTextBox(_textEditorPage, _textEditorX, _textEditorY,
+        if (ViewModel.PlaceTextBox(_textEditorPage, _boxLeft, _boxTop, _boxRight, _boxBottom,
                                    text, ViewModel.InkColorHex, ViewModel.TextFontSize))
         {
             SetActiveTool(ToolMode.Select);
@@ -1104,8 +1116,17 @@ public sealed partial class MainPage : Page
             ViewModel.EndShape();
         }
 
+        // A half-drawn text box is abandoned, not opened: the preview goes and
+        // the drag state clears, so switching tools mid-drag leaves nothing.
+        if (_textBoxPreview is not null)
+        {
+            InkCanvas.Children.Remove(_textBoxPreview);
+            _textBoxPreview = null;
+        }
+
         _isPanning = false;
         _isDrawingShape = false;
+        _isSizingText = false;
         _isMovingAnnotation = false;
         _isMarqueeing = false;
         _isSelectingText = false;
@@ -2108,7 +2129,7 @@ public sealed partial class MainPage : Page
         ViewModel.TextFontSize = target.FontSizeNorm;
         UpdateToolRail();
 
-        BeginTextEdit(target.PageIndex, ViewModel.ToSlot(target.Left), ViewModel.ToSlot(target.Top),
+        BeginTextEdit(target.PageIndex, target.Left, target.Top, target.Right, target.Bottom,
                       initialText: target.Text, editing: target);
         e.Handled = true;
     }
@@ -2222,7 +2243,15 @@ public sealed partial class MainPage : Page
                 break;
 
             case ToolMode.Text:
-                BeginTextEdit(content.Page, content.X, content.Y);
+                // Drag out the box; the editor opens at the size on release. A
+                // plain click (no drag) still works, via a default width below.
+                _isSizingText = true;
+                _dragPointerId = current.PointerId;
+                _textDragPage = content.Page;
+                _textDragStartX = nx;
+                _textDragStartY = ny;
+                BeginTextBoxPreview(content.Page, nx, ny);
+                ViewportHost.CapturePointer(e.Pointer);
                 e.Handled = true;
                 break;
 
@@ -2312,6 +2341,11 @@ public sealed partial class MainPage : Page
             ViewModel.ExtendShape(content.X, content.Y);
             e.Handled = true;
         }
+        else if (_isSizingText)
+        {
+            UpdateTextBoxPreview(content.X / ViewModel.OverlayScale, content.Y / ViewModel.OverlayScale);
+            e.Handled = true;
+        }
     }
 
     private void ViewportHost_PointerReleased(object sender, PointerRoutedEventArgs e)
@@ -2362,6 +2396,92 @@ public sealed partial class MainPage : Page
             ViewModel.EndShape();
             e.Handled = true;
         }
+        else if (_isSizingText)
+        {
+            _isSizingText = false;
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            var end = ContentPoint(e);
+            EndTextBoxSizing(end.X / ViewModel.OverlayScale, end.Y / ViewModel.OverlayScale);
+            e.Handled = true;
+        }
+    }
+
+    // ---------------- Text box sizing (drag to set width) ----------------
+
+    private bool _isSizingText;
+    private int _textDragPage;
+    private double _textDragStartX;   // normalized
+    private double _textDragStartY;   // normalized
+    private Rectangle? _textBoxPreview;
+
+    /// <summary>A drag shorter than this is treated as a click: a default box.</summary>
+    private const double MinTextDrag = 0.02;
+
+    /// <summary>Default box width, as a fraction of page width, for a plain click.</summary>
+    private const double DefaultTextWidth = 0.42;
+
+    private void BeginTextBoxPreview(int page, double nx, double ny)
+    {
+        var accent = (Brush)Application.Current.Resources["AccentFillColorDefaultBrush"];
+        _textBoxPreview = new Rectangle
+        {
+            Stroke = accent,
+            StrokeThickness = 1,
+            StrokeDashArray = new DoubleCollection { 4, 3 },
+            Fill = new SolidColorBrush(Color.FromArgb(0x14, 0x00, 0x78, 0xD4)),
+            IsHitTestVisible = false,
+        };
+
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(page);
+        Canvas.SetLeft(_textBoxPreview, nx * scale);
+        Canvas.SetTop(_textBoxPreview, (ny * scale) + pageTop);
+        InkCanvas.Children.Add(_textBoxPreview);
+    }
+
+    private void UpdateTextBoxPreview(double nx, double ny)
+    {
+        if (_textBoxPreview is null)
+        {
+            return;
+        }
+
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(_textDragPage);
+
+        double left = System.Math.Min(_textDragStartX, nx);
+        double top = System.Math.Min(_textDragStartY, ny);
+        Canvas.SetLeft(_textBoxPreview, left * scale);
+        Canvas.SetTop(_textBoxPreview, (top * scale) + pageTop);
+        _textBoxPreview.Width = System.Math.Abs(nx - _textDragStartX) * scale;
+        _textBoxPreview.Height = System.Math.Abs(ny - _textDragStartY) * scale;
+    }
+
+    private void EndTextBoxSizing(double nx, double ny)
+    {
+        if (_textBoxPreview is not null)
+        {
+            InkCanvas.Children.Remove(_textBoxPreview);
+            _textBoxPreview = null;
+        }
+
+        double left = System.Math.Min(_textDragStartX, nx);
+        double top = System.Math.Min(_textDragStartY, ny);
+        double right = System.Math.Max(_textDragStartX, nx);
+        double bottom = System.Math.Max(_textDragStartY, ny);
+
+        // A click, or a drag too small to be a deliberate box, opens a
+        // default-width box anchored where the pointer went down. The height is
+        // only a minimum; the box grows to fit what is typed.
+        if (right - left < MinTextDrag)
+        {
+            left = _textDragStartX;
+            top = _textDragStartY;
+            right = System.Math.Min(1.0, left + DefaultTextWidth);
+            bottom = top + (ViewModel.TextFontSize * TextBoxPlacement.LineHeight) + (2 * ViewModel.TextFontSize * TextBoxPlacement.Padding);
+        }
+
+        BeginTextEdit(_textDragPage, left, top, right, bottom);
     }
 
     // ---------------- Thumbnail sidebar ----------------

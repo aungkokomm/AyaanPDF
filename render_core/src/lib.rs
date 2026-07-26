@@ -1569,6 +1569,7 @@ fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
 
 /// The size, colour and text recorded on a text box, or None if the annotation
 /// is not one of ours.
+#[allow(dead_code)] // mirrors the C# TextBoxTagReader; used in tests
 fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
     let rest = contents.strip_prefix(TEXTBOX_TAG)?;
     let mut parts = rest.splitn(3, ':');
@@ -1607,6 +1608,7 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+#[allow(dead_code)] // used only by parse_textbox_tag, above
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -1634,6 +1636,69 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Width of a string in Helvetica at a given size, measured by PDFium, in
+/// points. `f32::MAX` if it cannot be measured, so a failure forces a wrap
+/// rather than silently disabling it.
+fn measure_text_width<'a>(
+    doc: &pdfium_render::prelude::PdfDocument<'a>,
+    font: pdfium_render::prelude::PdfFontToken,
+    s: &str,
+    size_pts: f32,
+) -> f32 {
+    use pdfium_render::prelude::*;
+    if s.is_empty() {
+        return 0.0;
+    }
+    match PdfPageTextObject::new(doc, s, font, PdfPoints::new(size_pts)) {
+        Ok(obj) => obj.bounds().map(|b| b.width().value).unwrap_or(f32::MAX),
+        Err(_) => f32::MAX,
+    }
+}
+
+/// Greedily wraps text to a maximum width, keeping the user's own line breaks.
+///
+/// Measured against real Helvetica metrics rather than an average character
+/// width, so the wrap matches what actually renders. A single word wider than
+/// the box is left to overflow rather than split mid-word, which is what a
+/// person expects of a long URL or token.
+fn wrap_to_width<'a>(
+    doc: &pdfium_render::prelude::PdfDocument<'a>,
+    font: pdfium_render::prelude::PdfFontToken,
+    text: &str,
+    max_width: f32,
+    size_pts: f32,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        // A blank line the user typed is preserved, so paragraph spacing
+        // survives the wrap.
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let mut line = String::new();
+        for word in para.split(' ') {
+            let candidate = if line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{line} {word}")
+            };
+
+            // The first word on a line always goes on, even if it overflows,
+            // since there is nowhere else to put it.
+            if line.is_empty() || measure_text_width(doc, font, &candidate, size_pts) <= max_width {
+                line = candidate;
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+        }
+        out.push(line);
+    }
+    out
 }
 
 /// Places text as a real, editable text box: vector text inside a stamp
@@ -1787,6 +1852,21 @@ fn add_text_box_inner(
 
     let color = PdfColor::new(r, g, b, a);
 
+    // Wrap to the BOX WIDTH, measured with real Helvetica metrics, so the text
+    // fills the width the user dragged rather than running off the right edge.
+    // The usable width is the box minus its two insets.
+    let avail_width = ((x1 - x0) - 2.0 * pad).max(0.0);
+    let lines = wrap_to_width(&doc_guard, font, text, avail_width, size_pts);
+
+    // The box grows DOWN to fit the wrapped lines, but never shrinks below the
+    // height that was dragged: a tall box the user drew stays tall, a short one
+    // still can't clip its own text.
+    let n = lines.len().max(1) as f32;
+    let content_height = 2.0 * pad + n * line_h;
+    let dragged_height = y_top - y_bottom;
+    let box_height = content_height.max(dragged_height);
+    let y_bottom = y_top - box_height;
+
     let bounds = PdfRect::new(
         PdfPoints::new(y_bottom),
         PdfPoints::new(x0),
@@ -1804,21 +1884,19 @@ fn add_text_box_inner(
         return STATUS_INVALID_INPUT;
     }
 
-    // One text object per line. Positioned BEFORE being added, because an object
-    // fetched back from an annotation is detached and a transform on it never
-    // reaches the stored copy; see the stamp resize path.
+    // One text object per WRAPPED line. Positioned BEFORE being added, because an
+    // object fetched back from an annotation is detached and a transform on it
+    // never reaches the stored copy; see the stamp resize path.
     //
     // A text object's origin is its baseline, so the first line sits one full
-    // size below the top inset, and each line below is a line-height lower.
-    for (i, line) in text.split('\n').enumerate() {
+    // size below the top inset, and each line below is a line-height lower. An
+    // empty line (a blank line the user typed) still advances the baseline.
+    for (i, line) in lines.iter().enumerate() {
         if line.is_empty() {
             continue;
         }
 
         let baseline = y_top - pad - size_pts - (i as f32) * line_h;
-        if baseline < y_bottom {
-            break; // Ran out of box; a scroll/clip would need a real text layer.
-        }
 
         let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, line, font, PdfPoints::new(size_pts))
         else {
@@ -1833,6 +1911,8 @@ fn add_text_box_inner(
         }
     }
 
+    // The ORIGINAL text is stored, not the wrapped lines: re-editing gets clean
+    // paragraphs, and reopening re-wraps to the box's current width.
     let _ = annotation.set_contents(&textbox_tag(text, font_size_px, r, g, b, a));
 
     drop(annotation);
@@ -5000,13 +5080,14 @@ mod tests {
     #[ignore]
     fn dump_text_box_for_inspection() {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
-        let text = "Ayaan PDF text box
-Second line here
-Third, with punctuation: 10:30!";
+        // A long paragraph that MUST wrap to the box width, plus a deliberate
+        // blank line and a hard break, so the render shows wrapping, paragraph
+        // spacing and honoured line breaks together.
+        let text = "This is a long paragraph of text that should wrap onto several lines inside the box the user dragged, rather than running off the right edge of the page.\n\nA second paragraph, after a blank line.\nAnd a hard break here.";
         let b = text.as_bytes();
         assert_eq!(
-            add_text_box_annotation(handle, 0, 1000, 60.0, 80.0, 720.0, 340.0,
-                b.as_ptr(), b.len(), 26.0, 200, 0, 0, 255),
+            add_text_box_annotation(handle, 0, 1000, 60.0, 80.0, 480.0, 300.0,
+                b.as_ptr(), b.len(), 22.0, 20, 20, 20, 255),
             STATUS_OK_PDFIUM);
         let r = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 900);
         let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
@@ -5098,6 +5179,61 @@ Third, with punctuation: 10:30!";
         close_document(reopened);
         close_document(handle);
         free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn long_text_wraps_and_grows_the_box_taller() {
+        // The point of wrapping: a long paragraph in a fixed-width box occupies
+        // several lines and the box grows to fit, rather than the text running
+        // off the right edge on one line.
+        let short_h = {
+            let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let t = "Short.".as_bytes();
+            assert_eq!(
+                add_text_box_annotation(h, 0, 1000, 100.0, 100.0, 500.0, 140.0,
+                    t.as_ptr(), t.len(), 20.0, 0, 0, 0, 255),
+                STATUS_OK_PDFIUM);
+            let a = read_annotations(h, 0);
+            let height = a[0].5 - a[0].3; // bottom - top, normalized
+            close_document(h);
+            height
+        };
+
+        let long_h = {
+            let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let t = "This is a much longer paragraph that cannot possibly fit on a single line inside such a narrow box and therefore has to wrap across several lines.".as_bytes();
+            assert_eq!(
+                add_text_box_annotation(h, 0, 1000, 100.0, 100.0, 500.0, 140.0,
+                    t.as_ptr(), t.len(), 20.0, 0, 0, 0, 255),
+                STATUS_OK_PDFIUM);
+            let a = read_annotations(h, 0);
+            let height = a[0].5 - a[0].3;
+            close_document(h);
+            height
+        };
+
+        assert!(
+            long_h > short_h * 2.0,
+            "the long paragraph box ({long_h}) is not much taller than the short one ({short_h}); wrapping did not happen"
+        );
+    }
+
+    #[test]
+    fn a_box_never_shrinks_below_the_height_it_was_dragged() {
+        // A tall box the user drew with little text stays tall, so drag-to-size
+        // is honoured rather than always snapping to content height.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let t = "Hi".as_bytes();
+        // Dragged from y=100 to y=500: a deliberately tall box.
+        assert_eq!(
+            add_text_box_annotation(h, 0, 1000, 100.0, 100.0, 500.0, 500.0,
+                t.as_ptr(), t.len(), 20.0, 0, 0, 0, 255),
+            STATUS_OK_PDFIUM);
+        let a = read_annotations(h, 0);
+        let height = a[0].5 - a[0].3;
+        // The drag was 400px of a 1000px capture width = 0.4 normalized.
+        assert!(height > 0.35, "the tall drag collapsed to {height}");
+        close_document(h);
     }
 
     #[test]

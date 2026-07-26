@@ -2585,26 +2585,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// uses, instead of a second copy of all of it.
     /// </summary>
     /// <returns>True if it was written; the caller then selects the newest.</returns>
-    public bool PlaceTextBox(int pageIndex, double x, double y, string text,
-                             string colorHex, double fontSizeNorm)
+    public bool PlaceTextBox(int pageIndex, double normLeft, double normTop,
+                             double normRight, double normBottom,
+                             string text, string colorHex, double fontSizeNorm)
     {
         if (_documentHandle == 0 || string.IsNullOrEmpty(text))
         {
             return false;
         }
 
-        // x, y are SLOT DIPs from the pointer; the add path works in normalized
-        // coordinates, so convert here at the one place that receives them.
         PushHistory(HistoryScope.Document, "Add text");
-        return AddTextBoxNormalized(pageIndex, Norm(x), Norm(y), text, colorHex, fontSizeNorm);
+        return AddTextBoxNormalized(pageIndex, normLeft, normTop, normRight, normBottom,
+                                    text, colorHex, fontSizeNorm);
     }
 
     /// <summary>
-    /// The details needed to re-open the editor on an existing text box.
-    /// Coordinates are the box's top-left, NORMALIZED.
+    /// The details needed to re-open the editor on an existing text box. The
+    /// rectangle is the box's bounds, NORMALIZED, so re-editing keeps its width
+    /// and the text re-wraps to it.
     /// </summary>
     public readonly record struct TextBoxEditTarget(
-        int PageIndex, int Index, double Left, double Top,
+        int PageIndex, int Index, double Left, double Top, double Right, double Bottom,
         string Text, string ColorHex, double FontSizeNorm);
 
     /// <summary>
@@ -2640,11 +2641,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         return new TextBoxEditTarget(
-            pageIndex, hit.Index, hit.Left, hit.Top, tag.Text, tag.ColorHex, tag.FontSizeNorm);
+            pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom,
+            tag.Text, tag.ColorHex, tag.FontSizeNorm);
     }
 
     /// <summary>Replaces a text box with a freshly typed one, as one undo step.</summary>
-    public bool ReplaceTextBox(int pageIndex, int oldIndex, double normLeft, double normTop,
+    public bool ReplaceTextBox(int pageIndex, int oldIndex,
+                               double normLeft, double normTop, double normRight, double normBottom,
                                string text, string colorHex, double fontSizeNorm)
     {
         if (_documentHandle == 0)
@@ -2679,7 +2682,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return true;
         }
 
-        return AddTextBoxNormalized(pageIndex, normLeft, normTop, text, colorHex, fontSizeNorm);
+        return AddTextBoxNormalized(pageIndex, normLeft, normTop, normRight, normBottom,
+                                    text, colorHex, fontSizeNorm);
     }
 
     /// <summary>Reads an annotation's /Contents, or null on any failure.</summary>
@@ -2708,7 +2712,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// history push, so both the plain place and the replace go through exactly
     /// the same write.
     /// </summary>
-    private bool AddTextBoxNormalized(int pageIndex, double normLeft, double normTop,
+    private bool AddTextBoxNormalized(int pageIndex, double left, double top, double right, double bottom,
                                       string text, string colorHex, double fontSizeNorm)
     {
         if (string.IsNullOrEmpty(text))
@@ -2716,12 +2720,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        // The click is the TOP-LEFT of the box, given a default extent so PDFium
-        // has a rectangle to build the appearance in. The box only needs to hold
-        // the text; the exact size is not load-bearing, since the text is what
-        // is measured on reopen.
-        var (left, top, right, bottom) = TextBoxPlacement.Compute(normLeft, normTop, text, fontSizeNorm);
-
+        // The box the user dragged is passed straight through: the core wraps
+        // the text to this WIDTH and grows the height to fit, so the box owns
+        // its own layout and the exact bottom here is only a minimum.
         const int CaptureWidth = 1000;
         var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
         byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
