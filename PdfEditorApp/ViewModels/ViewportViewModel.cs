@@ -752,6 +752,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return (0xFF, 0xFF, 0x00, defaultAlpha);
     }
 
+    /// <summary>
+    /// Packs an "#AARRGGBB" colour into 0xRRGGBBAA for the styled text-box FFI.
+    /// An empty string is 0, which the core reads as "no fill / no outline".
+    /// </summary>
+    private static uint PackRgba(string hex)
+    {
+        if (string.IsNullOrEmpty(hex))
+        {
+            return 0;
+        }
+
+        var (r, g, b, a) = ParseHex(hex, defaultAlpha: 0xFF);
+        return ((uint)r << 24) | ((uint)g << 16) | ((uint)b << 8) | a;
+    }
+
     // ---------------- AcroForm ----------------
 
     public int FormFieldCount =>
@@ -2574,6 +2589,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial double TextFontSize { get; set; } = TextBoxPresets.DefaultSize.Value;
 
+    /// <summary>How new text boxes align their lines.</summary>
+    [ObservableProperty]
+    public partial TextAlign TextAlign { get; set; } = TextAlign.Left;
+
+    /// <summary>Background fill for new text boxes, "#AARRGGBB", or "" for none.</summary>
+    [ObservableProperty]
+    public partial string TextFillHex { get; set; } = "";
+
+    /// <summary>Border colour for new text boxes, "#AARRGGBB", or "" for none.</summary>
+    [ObservableProperty]
+    public partial string TextOutlineHex { get; set; } = "";
+
+    /// <summary>Border thickness for new text boxes, as a fraction of page width.</summary>
+    [ObservableProperty]
+    public partial double TextOutlineWidthNorm { get; set; } = 2.0 / 1000.0;
+
     /// <summary>
     /// Writes a text box to the document as real vector text, then hands it back
     /// as an ordinary loaded annotation.
@@ -2606,7 +2637,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public readonly record struct TextBoxEditTarget(
         int PageIndex, int Index, double Left, double Top, double Right, double Bottom,
-        string Text, string ColorHex, double FontSizeNorm);
+        string Text, string ColorHex, double FontSizeNorm,
+        TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm);
 
     /// <summary>
     /// If a loaded text box is under the point, returns what is needed to edit
@@ -2642,7 +2674,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         return new TextBoxEditTarget(
             pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom,
-            tag.Text, tag.ColorHex, tag.FontSizeNorm);
+            tag.Text, tag.ColorHex, tag.FontSizeNorm,
+            tag.Align, tag.FillHex, tag.OutlineHex, tag.OutlineWidthNorm);
     }
 
     /// <summary>
@@ -2741,14 +2774,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
         byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
 
-        int status = RenderCoreNative.add_text_box_annotation(
+        int status = RenderCoreNative.add_text_box_annotation_styled(
             _documentHandle, pageIndex, CaptureWidth,
             (float)(left * CaptureWidth), (float)(top * CaptureWidth),
             (float)(right * CaptureWidth), (float)(bottom * CaptureWidth),
             utf8, (nuint)utf8.Length,
-            (float)(fontSizeNorm * CaptureWidth), r, g, b, a);
+            (float)(fontSizeNorm * CaptureWidth), r, g, b, a,
+            (int)TextAlign, PackRgba(TextFillHex), PackRgba(TextOutlineHex),
+            (float)(TextOutlineWidthNorm * CaptureWidth));
 
-        Diag.Log($"text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" -> {status}");
+        Diag.Log($"text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" align={TextAlign} -> {status}");
 
         if (status != RenderStatus.OkPdfium)
         {

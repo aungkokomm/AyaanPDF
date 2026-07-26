@@ -2161,6 +2161,14 @@ public sealed partial class MainPage : Page
         // what is being edited and the rewritten box keeps them unless changed.
         ViewModel.InkColorHex = target.ColorHex;
         ViewModel.TextFontSize = target.FontSizeNorm;
+        ViewModel.TextAlign = target.Align;
+        ViewModel.TextFillHex = target.FillHex;
+        ViewModel.TextOutlineHex = target.OutlineHex;
+        if (target.OutlineWidthNorm > 0)
+        {
+            ViewModel.TextOutlineWidthNorm = target.OutlineWidthNorm;
+        }
+
         UpdateToolRail();
 
         // Remove the box from the page FIRST, so the editor is the only layer.

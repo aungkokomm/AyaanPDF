@@ -2,11 +2,26 @@ using System;
 
 namespace PdfEditorApp.Viewport;
 
+/// <summary>How a text box's lines sit. Mirrors ALIGN_* in render_core.</summary>
+public enum TextAlign
+{
+    Left = 0,
+    Center = 1,
+    Right = 2,
+    Justify = 3,
+}
+
 /// <summary>
 /// What a text box records in its <c>/Contents</c>, decoded: the words, the
-/// font size and the colour needed to re-open the editor on it.
+/// font size, the colour, and the styling needed to re-open the editor on it
+/// looking the same.
+///
+/// <paramref name="FillHex"/> and <paramref name="OutlineHex"/> are empty when
+/// the box has no fill or no outline. Colours are "#AARRGGBB".
 /// </summary>
-public readonly record struct TextBoxTag(string Text, double FontSizeNorm, string ColorHex);
+public readonly record struct TextBoxTag(
+    string Text, double FontSizeNorm, string ColorHex,
+    TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm);
 
 /// <summary>
 /// Reads the tag a text box stores, the C# side of <c>parse_textbox_tag</c> in
@@ -21,6 +36,7 @@ public readonly record struct TextBoxTag(string Text, double FontSizeNorm, strin
 public static class TextBoxTagReader
 {
     private const string Prefix = "AyaanText:";
+    private const string StyledPrefix = "AyaanTextB:";
 
     /// <summary>
     /// The capture width the size is stored in, matching the writer. The size in
@@ -33,59 +49,140 @@ public static class TextBoxTagReader
     {
         tag = default;
 
-        if (contents is null || !contents.StartsWith(Prefix, StringComparison.Ordinal))
+        if (contents is null)
         {
             return false;
         }
 
-        string rest = contents.Substring(Prefix.Length);
+        return contents.StartsWith(StyledPrefix, StringComparison.Ordinal)
+            ? TryParseStyled(contents.Substring(StyledPrefix.Length), out tag)
+            : contents.StartsWith(Prefix, StringComparison.Ordinal)
+                && TryParsePlain(contents.Substring(Prefix.Length), out tag);
+    }
 
-        // Exactly the writer's split: size, colour, then the rest is the base64
-        // text, which may itself contain no colons because it is encoded.
+    // size:textRGBA:base64  — the original boxes, left-aligned, no fill/outline.
+    private static bool TryParsePlain(string rest, out TextBoxTag tag)
+    {
+        tag = default;
+
         int firstColon = rest.IndexOf(':');
-        if (firstColon < 0)
-        {
-            return false;
-        }
-
-        int secondColon = rest.IndexOf(':', firstColon + 1);
+        int secondColon = firstColon < 0 ? -1 : rest.IndexOf(':', firstColon + 1);
         if (secondColon < 0)
         {
             return false;
         }
 
-        string sizePart = rest.Substring(0, firstColon);
-        string rgbaPart = rest.Substring(firstColon + 1, secondColon - firstColon - 1);
-        string textPart = rest.Substring(secondColon + 1);
-
-        if (!double.TryParse(sizePart, System.Globalization.NumberStyles.Float,
-                             System.Globalization.CultureInfo.InvariantCulture, out double sizePx)
-            || !double.IsFinite(sizePx) || sizePx <= 0)
+        if (!TrySize(rest.Substring(0, firstColon), out double sizeNorm)
+            || !TryColor(rest.Substring(firstColon + 1, secondColon - firstColon - 1), out string colorHex)
+            || !TryText(rest.Substring(secondColon + 1), out string text))
         {
             return false;
         }
 
-        if (rgbaPart.Length != 8 || !IsHex(rgbaPart))
+        tag = new TextBoxTag(text, sizeNorm, colorHex, TextAlign.Left, "", "", 0);
+        return true;
+    }
+
+    // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:base64
+    private static bool TryParseStyled(string rest, out TextBoxTag tag)
+    {
+        tag = default;
+
+        // Six fixed fields then the base64 text, which itself has no colons.
+        string[] parts = rest.Split(':', 7);
+        if (parts.Length != 7)
         {
             return false;
         }
 
-        string text;
+        if (!TrySize(parts[0], out double sizeNorm) || !TryColor(parts[1], out string colorHex))
+        {
+            return false;
+        }
+
+        if (!int.TryParse(parts[2], out int alignRaw))
+        {
+            return false;
+        }
+
+        TextAlign align = alignRaw is >= 0 and <= 3 ? (TextAlign)alignRaw : TextAlign.Left;
+        string fill = OptionalColor(parts[3]);
+        string outline = OptionalColor(parts[4]);
+
+        if (!double.TryParse(parts[5], System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture, out double outlineWpx))
+        {
+            outlineWpx = 0;
+        }
+
+        if (!TryText(parts[6], out string text))
+        {
+            return false;
+        }
+
+        tag = new TextBoxTag(text, sizeNorm, colorHex, align, fill, outline, outlineWpx / CaptureWidth);
+        return true;
+    }
+
+    private static bool TrySize(string s, out double sizeNorm)
+    {
+        sizeNorm = 0;
+        if (!double.TryParse(s, System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture, out double px)
+            || !double.IsFinite(px) || px <= 0)
+        {
+            return false;
+        }
+
+        sizeNorm = px / CaptureWidth;
+        return true;
+    }
+
+    // Text colour is forced opaque, the pen palette it feeds back into being
+    // opaque too.
+    private static bool TryColor(string rgba, out string colorHex)
+    {
+        colorHex = "";
+        if (rgba.Length != 8 || !IsHex(rgba))
+        {
+            return false;
+        }
+
+        colorHex = $"#FF{rgba.Substring(0, 6)}";
+        return true;
+    }
+
+    // A fill or outline: RRGGBBAA, with alpha 0 (or a malformed value) meaning
+    // "none", returned as an empty string.
+    private static string OptionalColor(string rgba)
+    {
+        if (rgba.Length != 8 || !IsHex(rgba))
+        {
+            return "";
+        }
+
+        string aa = rgba.Substring(6, 2);
+        if (string.Equals(aa, "00", StringComparison.OrdinalIgnoreCase))
+        {
+            return "";
+        }
+
+        // Stored RRGGBBAA; the app uses #AARRGGBB.
+        return $"#{aa}{rgba.Substring(0, 6)}";
+    }
+
+    private static bool TryText(string base64, out string text)
+    {
+        text = "";
         try
         {
-            text = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(textPart));
+            text = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(base64));
+            return true;
         }
         catch (FormatException)
         {
             return false;
         }
-
-        // Alpha forced opaque: text colour carries no transparency, and the pen
-        // palette this feeds back into is opaque too.
-        string colorHex = $"#FF{rgbaPart.Substring(0, 6)}";
-
-        tag = new TextBoxTag(text, sizePx / CaptureWidth, colorHex);
-        return true;
     }
 
     private static bool IsHex(string s)

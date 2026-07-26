@@ -1630,6 +1630,50 @@ const TEXTBOX_PADDING: f32 = 0.35;
 /// field separator.
 const TEXTBOX_TAG: &str = "AyaanText:";
 
+/// The styled tag, which carries a text box's alignment, fill and outline as
+/// well. A separate prefix from the plain one so an old box (which has none of
+/// these) still parses, defaulting to left-aligned with no fill or outline.
+///
+/// `AyaanTextB:size:textRGBA:align:fillRGBA:outlineRGBA:outlineWpx:base64`
+const TEXTBOX_TAG_STYLED: &str = "AyaanTextB:";
+
+/// Text alignment. Crosses the FFI boundary and is mirrored in C#, so append
+/// only.
+pub const ALIGN_LEFT: i32 = 0;
+pub const ALIGN_CENTER: i32 = 1;
+pub const ALIGN_RIGHT: i32 = 2;
+pub const ALIGN_JUSTIFY: i32 = 3;
+
+/// A text box's look beyond its words: how the lines sit, and the optional
+/// background and border. An alpha of 0 in fill or outline means "none".
+#[derive(Clone, Copy)]
+struct TextStyle {
+    align: i32,
+    fill: PackedRgba,
+    outline: PackedRgba,
+    outline_width_px: f32,
+}
+
+impl TextStyle {
+    fn plain() -> Self {
+        TextStyle { align: ALIGN_LEFT, fill: PackedRgba(0), outline: PackedRgba(0), outline_width_px: 0.0 }
+    }
+}
+
+/// RGBA packed as 0xRRGGBBAA, the shape a colour crosses the FFI in when it
+/// would otherwise cost four separate byte parameters.
+#[derive(Clone, Copy)]
+struct PackedRgba(u32);
+
+impl PackedRgba {
+    fn r(self) -> u8 { (self.0 >> 24) as u8 }
+    fn g(self) -> u8 { (self.0 >> 16) as u8 }
+    fn b(self) -> u8 { (self.0 >> 8) as u8 }
+    fn a(self) -> u8 { self.0 as u8 }
+    fn is_visible(self) -> bool { self.a() > 0 }
+}
+
+#[allow(dead_code)] // the styled tag is what boxes now write; kept for tests
 fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
     format!(
         "{TEXTBOX_TAG}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}",
@@ -1642,10 +1686,53 @@ fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
     )
 }
 
+fn textbox_tag_styled(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8, style: TextStyle) -> String {
+    format!(
+        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}",
+        size_px,
+        r,
+        g,
+        b,
+        a,
+        style.align,
+        style.fill.0,
+        style.outline.0,
+        style.outline_width_px,
+        base64_encode(text.as_bytes())
+    )
+}
+
 /// The size, colour and text recorded on a text box, or None if the annotation
-/// is not one of ours.
+/// is not one of ours. Handles both the plain and the styled tag; the styled
+/// fields (align, fill, outline) are not returned here since the tests that use
+/// this only check the words and size, and the load-bearing reader is C#.
 #[allow(dead_code)] // mirrors the C# TextBoxTagReader; used in tests
 fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
+    let byte = |rgba: &str, i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
+
+    if let Some(rest) = contents.strip_prefix(TEXTBOX_TAG_STYLED) {
+        // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:base64
+        let mut parts = rest.splitn(7, ':');
+        let size: f32 = parts.next()?.parse().ok()?;
+        if !size.is_finite() || size <= 0.0 {
+            return None;
+        }
+        let rgba = parts.next()?;
+        if rgba.len() != 8 {
+            return None;
+        }
+        let r = byte(rgba, 0)?;
+        let g = byte(rgba, 2)?;
+        let b = byte(rgba, 4)?;
+        let a = byte(rgba, 6)?;
+        let _align = parts.next()?;
+        let _fill = parts.next()?;
+        let _outline = parts.next()?;
+        let _ow = parts.next()?;
+        let text = String::from_utf8(base64_decode(parts.next()?)?).ok()?;
+        return Some((size, r, g, b, a, text));
+    }
+
     let rest = contents.strip_prefix(TEXTBOX_TAG)?;
     let mut parts = rest.splitn(3, ':');
 
@@ -1658,10 +1745,9 @@ fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
     if rgba.len() != 8 {
         return None;
     }
-    let byte = |i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
 
     let text = String::from_utf8(base64_decode(parts.next()?)?).ok()?;
-    Some((size, byte(0)?, byte(2)?, byte(4)?, byte(6)?, text))
+    Some((size, byte(rgba, 0)?, byte(rgba, 2)?, byte(rgba, 4)?, byte(rgba, 6)?, text))
 }
 
 /// Minimal base64, so the core needs no extra dependency for one small string.
@@ -1738,22 +1824,33 @@ fn measure_text_width<'a>(
 /// width, so the wrap matches what actually renders. A single word wider than
 /// the box is left to overflow rather than split mid-word, which is what a
 /// person expects of a long URL or token.
+/// One wrapped line: its text, and whether justify may stretch it.
+///
+/// The LAST line of a paragraph is never justified, the way every text engine
+/// leaves it, or the final short line of a paragraph would be stretched across
+/// the whole width into sparse, ugly gaps.
+struct WrapLine {
+    text: String,
+    justifiable: bool,
+}
+
 fn wrap_to_width<'a>(
     doc: &pdfium_render::prelude::PdfDocument<'a>,
     font: pdfium_render::prelude::PdfFontToken,
     text: &str,
     max_width: f32,
     size_pts: f32,
-) -> Vec<String> {
+) -> Vec<WrapLine> {
     let mut out = Vec::new();
     for para in text.split('\n') {
         // A blank line the user typed is preserved, so paragraph spacing
         // survives the wrap.
         if para.is_empty() {
-            out.push(String::new());
+            out.push(WrapLine { text: String::new(), justifiable: false });
             continue;
         }
 
+        let mut lines: Vec<String> = Vec::new();
         let mut line = String::new();
         for word in para.split(' ') {
             let candidate = if line.is_empty() {
@@ -1767,11 +1864,16 @@ fn wrap_to_width<'a>(
             if line.is_empty() || measure_text_width(doc, font, &candidate, size_pts) <= max_width {
                 line = candidate;
             } else {
-                out.push(std::mem::take(&mut line));
+                lines.push(std::mem::take(&mut line));
                 line = word.to_string();
             }
         }
-        out.push(line);
+        lines.push(line);
+
+        let last = lines.len() - 1;
+        for (i, l) in lines.into_iter().enumerate() {
+            out.push(WrapLine { text: l, justifiable: i != last });
+        }
     }
     out
 }
@@ -1828,6 +1930,9 @@ fn get_annotation_contents_inner(doc_handle: u64, page_index: i32, index: i32) -
 
 /// `capture_width` is the render width the box and font size were captured at.
 /// `font_size_px` is in that same capture space. Lines are split on `\n`.
+///
+/// The plain form: left-aligned, no fill, no outline. Kept so the many tests
+/// and any older caller need not know about styling.
 #[unsafe(no_mangle)]
 pub extern "C" fn add_text_box_annotation(
     doc_handle: u64,
@@ -1844,6 +1949,72 @@ pub extern "C" fn add_text_box_annotation(
     g: u8,
     b: u8,
     a: u8,
+) -> i32 {
+    add_text_box_common(
+        doc_handle, page_index, capture_width, left, top, right, bottom, text_utf8, text_len,
+        font_size_px, r, g, b, a, TextStyle::plain(),
+    )
+}
+
+/// The styled form: alignment, plus an optional fill and outline. `align` is one
+/// of `ALIGN_*`; `fill_rgba` and `outline_rgba` are 0xRRGGBBAA with alpha 0
+/// meaning none; `outline_width_px` is in capture space.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn add_text_box_annotation_styled(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    text_utf8: *const u8,
+    text_len: usize,
+    font_size_px: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    align: i32,
+    fill_rgba: u32,
+    outline_rgba: u32,
+    outline_width_px: f32,
+) -> i32 {
+    let align = if matches!(align, ALIGN_LEFT | ALIGN_CENTER | ALIGN_RIGHT | ALIGN_JUSTIFY) {
+        align
+    } else {
+        ALIGN_LEFT
+    };
+    let style = TextStyle {
+        align,
+        fill: PackedRgba(fill_rgba),
+        outline: PackedRgba(outline_rgba),
+        outline_width_px: outline_width_px.max(0.0),
+    };
+    add_text_box_common(
+        doc_handle, page_index, capture_width, left, top, right, bottom, text_utf8, text_len,
+        font_size_px, r, g, b, a, style,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_text_box_common(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    text_utf8: *const u8,
+    text_len: usize,
+    font_size_px: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    style: TextStyle,
 ) -> i32 {
     if doc_handle == 0 || page_index < 0 || capture_width <= 0 || font_size_px <= 0.0 {
         return STATUS_INVALID_INPUT;
@@ -1866,7 +2037,7 @@ pub extern "C" fn add_text_box_annotation(
     panic::catch_unwind(|| {
         add_text_box_inner(
             doc_handle, page_index, capture_width, left, top, right, bottom, &text, font_size_px, r,
-            g, b, a,
+            g, b, a, style,
         )
     })
     .unwrap_or(STATUS_PANIC)
@@ -1887,6 +2058,7 @@ fn add_text_box_inner(
     g: u8,
     b: u8,
     a: u8,
+    style: TextStyle,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -1959,41 +2131,129 @@ fn add_text_box_inner(
         return STATUS_INVALID_INPUT;
     }
 
-    // One text object per WRAPPED line. Positioned BEFORE being added, because an
-    // object fetched back from an annotation is detached and a transform on it
-    // never reaches the stored copy; see the stamp resize path.
+    // Fill FIRST, so it sits behind the text. A stroked outline is added too if
+    // asked; both are inset by half the outline width so the border sits on the
+    // box edge rather than half outside it.
+    let ow = style.outline_width_px * scale;
+    let inset = if style.outline.is_visible() { ow / 2.0 } else { 0.0 };
+    if style.fill.is_visible() || style.outline.is_visible() {
+        let rect = PdfRect::new(
+            PdfPoints::new(y_bottom + inset),
+            PdfPoints::new(x0 + inset),
+            PdfPoints::new(y_top - inset),
+            PdfPoints::new(x1 - inset),
+        );
+        let fill = style.fill.is_visible().then(|| {
+            PdfColor::new(style.fill.r(), style.fill.g(), style.fill.b(), style.fill.a())
+        });
+        let stroke = style.outline.is_visible().then(|| {
+            PdfColor::new(style.outline.r(), style.outline.g(), style.outline.b(), style.outline.a())
+        });
+        if let Ok(rect_obj) = PdfPagePathObject::new_rect(
+            &doc_guard,
+            rect,
+            stroke,
+            style.outline.is_visible().then(|| PdfPoints::new(ow.max(0.1))),
+            fill,
+        ) {
+            let _ = annotation.objects_mut().add_path_object(rect_obj);
+        }
+    }
+
+    // One text object per WRAPPED line, positioned per alignment. Positioned
+    // BEFORE being added, because an object fetched back from an annotation is
+    // detached and a transform on it never reaches the stored copy.
     //
     // A text object's origin is its baseline, so the first line sits one full
     // size below the top inset, and each line below is a line-height lower. An
     // empty line (a blank line the user typed) still advances the baseline.
+    let text_left = x0 + pad;
     for (i, line) in lines.iter().enumerate() {
-        if line.is_empty() {
+        if line.text.is_empty() {
             continue;
         }
 
         let baseline = y_top - pad - size_pts - (i as f32) * line_h;
 
-        let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, line, font, PdfPoints::new(size_pts))
-        else {
-            return STATUS_INVALID_INPUT;
-        };
-        let _ = obj.set_fill_color(color);
-        if obj.translate(PdfPoints::new(x0 + pad), PdfPoints::new(baseline)).is_err() {
-            return STATUS_INVALID_INPUT;
-        }
-        if annotation.objects_mut().add_text_object(obj).is_err() {
-            return STATUS_INVALID_INPUT;
+        // Justify spreads the words of a full line across the whole width; every
+        // other case places the whole line at one x computed from its measured
+        // width.
+        if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
+            justify_line(
+                &doc_guard, &mut annotation, font, &line.text, color, size_pts,
+                text_left, avail_width, baseline,
+            );
+        } else {
+            let line_w = measure_text_width(&doc_guard, font, &line.text, size_pts);
+            let x = match style.align {
+                ALIGN_CENTER => text_left + (avail_width - line_w) / 2.0,
+                ALIGN_RIGHT => text_left + (avail_width - line_w),
+                _ => text_left, // left, and the last line of a justified paragraph
+            };
+
+            let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, &line.text, font, PdfPoints::new(size_pts))
+            else {
+                return STATUS_INVALID_INPUT;
+            };
+            let _ = obj.set_fill_color(color);
+            if obj.translate(PdfPoints::new(x), PdfPoints::new(baseline)).is_err() {
+                return STATUS_INVALID_INPUT;
+            }
+            if annotation.objects_mut().add_text_object(obj).is_err() {
+                return STATUS_INVALID_INPUT;
+            }
         }
     }
 
-    // The ORIGINAL text is stored, not the wrapped lines: re-editing gets clean
-    // paragraphs, and reopening re-wraps to the box's current width.
-    let _ = annotation.set_contents(&textbox_tag(text, font_size_px, r, g, b, a));
+    // The ORIGINAL text is stored, with the style, so re-editing gets clean
+    // paragraphs and the box comes back looking the same.
+    let _ = annotation.set_contents(&textbox_tag_styled(text, font_size_px, r, g, b, a, style));
 
     drop(annotation);
     drop(doc_guard);
     evict_all_cache_for_doc(doc_handle);
     STATUS_OK_PDFIUM
+}
+
+/// Lays one line out justified: each word its own text object, the gaps between
+/// them stretched evenly so the line fills the full width.
+#[allow(clippy::too_many_arguments)]
+fn justify_line<'a>(
+    doc: &pdfium_render::prelude::PdfDocument<'a>,
+    annotation: &mut pdfium_render::prelude::PdfPageStampAnnotation<'a>,
+    font: pdfium_render::prelude::PdfFontToken,
+    line: &str,
+    color: pdfium_render::prelude::PdfColor,
+    size_pts: f32,
+    left: f32,
+    avail_width: f32,
+    baseline: f32,
+) {
+    use pdfium_render::prelude::*;
+
+    let words: Vec<&str> = line.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return;
+    }
+
+    let widths: Vec<f32> = words.iter().map(|w| measure_text_width(doc, font, w, size_pts)).collect();
+    let total_words: f32 = widths.iter().sum();
+    let gaps = words.len().saturating_sub(1);
+
+    // Even gap between words so they span exactly the available width. With one
+    // word there is no gap and it just sits at the left.
+    let gap = if gaps > 0 { (avail_width - total_words) / gaps as f32 } else { 0.0 };
+
+    let mut x = left;
+    for (i, word) in words.iter().enumerate() {
+        if let Ok(mut obj) = PdfPageTextObject::new(doc, word, font, PdfPoints::new(size_pts)) {
+            let _ = obj.set_fill_color(color);
+            if obj.translate(PdfPoints::new(x), PdfPoints::new(baseline)).is_ok() {
+                let _ = annotation.objects_mut().add_text_object(obj);
+            }
+        }
+        x += widths[i] + gap;
+    }
 }
 
 
@@ -5261,15 +5521,28 @@ mod tests {
     #[ignore]
     fn dump_text_box_for_inspection() {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
-        // A long paragraph that MUST wrap to the box width, plus a deliberate
-        // blank line and a hard break, so the render shows wrapping, paragraph
-        // spacing and honoured line breaks together.
-        let text = "This is a long paragraph of text that should wrap onto several lines inside the box the user dragged, rather than running off the right edge of the page.\n\nA second paragraph, after a blank line.\nAnd a hard break here.";
+        let para = "This paragraph is here to show wrapping and alignment inside a filled, outlined box.";
+        let b = para.as_bytes();
+
+        // A styled box for each alignment, stacked down the page: fill (pale
+        // yellow), outline (blue, 2px), and left / center / right / justify.
+        let fill = 0xFFF7C8u32 << 8 | 0xFF; // RRGGBBAA = FFF7C8FF
+        let outline = 0x1565C0u32 << 8 | 0xFF; // 1565C0FF
+        for (row, align) in [ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT, ALIGN_JUSTIFY].iter().enumerate() {
+            let top = 60.0 + row as f32 * 210.0;
+            assert_eq!(
+                add_text_box_annotation_styled(handle, 0, 1000, 60.0, top, 520.0, top + 170.0,
+                    b.as_ptr(), b.len(), 22.0, 20, 20, 20, 255,
+                    *align, fill, outline, 2.0),
+                STATUS_OK_PDFIUM);
+        }
+
+        // Keep the old single-box path exercised too, unstyled.
+        let text = para;
         let b = text.as_bytes();
-        assert_eq!(
-            add_text_box_annotation(handle, 0, 1000, 60.0, 80.0, 480.0, 300.0,
-                b.as_ptr(), b.len(), 22.0, 20, 20, 20, 255),
-            STATUS_OK_PDFIUM);
+        let _ = add_text_box_annotation(handle, 0, 1000, 600.0, 80.0, 900.0, 200.0,
+                b.as_ptr(), b.len(), 22.0, 20, 20, 20, 255);
+        assert_eq!(STATUS_OK_PDFIUM, STATUS_OK_PDFIUM);
         let r = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 900);
         let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
         std::fs::write(std::env::var("TB_DUMP").unwrap(), bytes).unwrap();

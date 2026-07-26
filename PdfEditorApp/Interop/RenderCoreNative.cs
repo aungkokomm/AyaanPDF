@@ -459,6 +459,33 @@ internal static partial class RenderCoreNative
         byte b,
         byte a);
 
+    /// <summary>
+    /// The styled text box: <paramref name="align"/> is one of ALIGN_* (0..3),
+    /// <paramref name="fillRgba"/> and <paramref name="outlineRgba"/> are packed
+    /// 0xRRGGBBAA with alpha 0 meaning none, and <paramref name="outlineWidthPx"/>
+    /// is in capture space.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_text_box_annotation_styled(
+        ulong docHandle,
+        int pageIndex,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        [In] byte[] textUtf8,
+        nuint textLen,
+        float fontSizePx,
+        byte r,
+        byte g,
+        byte b,
+        byte a,
+        int align,
+        uint fillRgba,
+        uint outlineRgba,
+        float outlineWidthPx);
+
     /// <summary>Adds freehand strokes as real /Ink annotations, one per stroke.</summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int add_ink_annotations(
