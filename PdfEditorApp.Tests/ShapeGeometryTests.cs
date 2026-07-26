@@ -32,7 +32,8 @@ public class ShapeGeometryTests
         // The reason a shape carries its drag rather than a normalized box. If
         // this were normalized on the way in, every arrow would point the same
         // way regardless of how it was drawn.
-        var (left, right) = ShapeGeometry.ArrowHead(1.0, 0.0, 0.0, 0.0, 0.01);
+        var a = ShapeGeometry.Arrow(1.0, 0.0, 0.0, 0.0, 0.01);
+        var (left, right) = (a.Left, a.Right);
         Assert.True(left.X > 0.0 && right.X > 0.0, $"barbs at {left.X} and {right.X} ignored the drag direction");
     }
 
@@ -41,7 +42,8 @@ public class ShapeGeometryTests
     [Fact]
     public void arrow_barbs_sweep_back_from_the_tip_and_straddle_the_shaft()
     {
-        var (left, right) = ShapeGeometry.ArrowHead(0.0, 0.0, 1.0, 0.0, 0.01);
+        var a = ShapeGeometry.Arrow(0.0, 0.0, 1.0, 0.0, 0.01);
+        var (left, right) = (a.Left, a.Right);
 
         Assert.True(left.X < 1.0 && right.X < 1.0, "a barb is ahead of the tip, which draws a bowtie");
         Assert.True(left.Y * right.Y < 0, "both barbs are on the same side of the shaft");
@@ -53,7 +55,8 @@ public class ShapeGeometryTests
     {
         // A click with no drag. Dividing by a zero-length shaft would put NaN
         // into the preview and into the file.
-        var (left, right) = ShapeGeometry.ArrowHead(0.5, 0.5, 0.5, 0.5, 0.01);
+        var a = ShapeGeometry.Arrow(0.5, 0.5, 0.5, 0.5, 0.01);
+        var (left, right) = (a.Left, a.Right);
         foreach (double v in new[] { left.X, left.Y, right.X, right.Y })
         {
             Assert.True(double.IsFinite(v), $"non-finite arrow coordinate {v}");
@@ -65,7 +68,7 @@ public class ShapeGeometryTests
     {
         // Barb length scales with stroke width, so without a floor the finest
         // pen draws a head too small to read as one.
-        var (left, _) = ShapeGeometry.ArrowHead(0.0, 0.0, 1.0, 0.0, 0.0);
+        var left = ShapeGeometry.Arrow(0.0, 0.0, 1.0, 0.0, 0.0).Left;
         double reach = Math.Sqrt(Math.Pow(1.0 - left.X, 2) + Math.Pow(left.Y, 2));
         Assert.True(reach >= ShapeGeometry.ArrowHeadMin - 1e-9, $"head reached only {reach}");
     }
@@ -73,8 +76,8 @@ public class ShapeGeometryTests
     [Fact]
     public void a_thick_arrow_gets_a_head_in_proportion()
     {
-        var thin = ShapeGeometry.ArrowHead(0.0, 0.0, 1.0, 0.0, 0.002).Left;
-        var thick = ShapeGeometry.ArrowHead(0.0, 0.0, 1.0, 0.0, 0.02).Left;
+        var thin = ShapeGeometry.Arrow(0.0, 0.0, 1.0, 0.0, 0.002).Left;
+        var thick = ShapeGeometry.Arrow(0.0, 0.0, 1.0, 0.0, 0.02).Left;
         Assert.True(thick.X < thin.X, "a thicker arrow should have a longer head, not the same one");
     }
 
@@ -83,7 +86,8 @@ public class ShapeGeometryTests
     {
         // The rotation is the part most likely to be wrong, and on a horizontal
         // shaft a sign error can still look plausible.
-        var (left, right) = ShapeGeometry.ArrowHead(0.0, 0.0, 1.0, 1.0, 0.01);
+        var a = ShapeGeometry.Arrow(0.0, 0.0, 1.0, 1.0, 0.01);
+        var (left, right) = (a.Left, a.Right);
 
         double tipToLeft = Math.Sqrt(Math.Pow(1.0 - left.X, 2) + Math.Pow(1.0 - left.Y, 2));
         double tipToRight = Math.Sqrt(Math.Pow(1.0 - right.X, 2) + Math.Pow(1.0 - right.Y, 2));
@@ -150,33 +154,57 @@ public class ShapeGeometryTests
     }
 
     [Fact]
-    public void an_arrow_outline_returns_to_the_tip_between_barbs()
+    public void an_arrow_shaft_stops_at_the_head_rather_than_running_through_it()
     {
-        // The preview is one polyline, so without returning to the tip the two
-        // barbs would be joined to each other and the head would draw as a
-        // triangle with a bar across it.
+        // A stroked line continuing under a filled triangle pokes out past the
+        // point and blunts it, which is what the first version looked like.
         var s = Draft(ShapeKind.Arrow, 0.1, 0.5, 0.9, 0.5);
-        var points = ShapeGeometry.Outline(s, 0.003);
+        var shaft = ShapeGeometry.Outline(s, 0.006);
 
-        Assert.Equal(5, points.Count);
-        Assert.Equal((s.X2, s.Y2), points[1]);
-        Assert.Equal((s.X2, s.Y2), points[3]);
+        Assert.Equal(2, shaft.Count);
+        Assert.Equal((s.X1, s.Y1), shaft[0]);
+        Assert.True(shaft[1].X < s.X2, $"the shaft runs to {shaft[1].X}, past the head base");
     }
 
     [Fact]
-    public void an_arrow_preview_matches_the_arrowhead_it_will_be_written_with()
+    public void an_arrow_head_is_a_solid_triangle_at_the_tip()
     {
-        // The preview and the file are computed from the same function on
-        // purpose. If they ever diverge, releasing the mouse would visibly
-        // change the shape that was just drawn.
-        var s = Draft(ShapeKind.Arrow, 0.2, 0.3, 0.7, 0.6);
-        var points = ShapeGeometry.Outline(s, 0.005);
-        var (left, right) = ShapeGeometry.ArrowHead(s.X1, s.Y1, s.X2, s.Y2, 0.005);
+        var s = Draft(ShapeKind.Arrow, 0.1, 0.5, 0.9, 0.5);
+        var head = ShapeGeometry.ArrowHeadTriangle(s, 0.006);
 
-        Assert.Equal(left.X, points[2].X, 9);
-        Assert.Equal(left.Y, points[2].Y, 9);
-        Assert.Equal(right.X, points[4].X, 9);
-        Assert.Equal(right.Y, points[4].Y, 9);
+        Assert.Equal(3, head.Count);
+        Assert.Equal((s.X2, s.Y2), head[0]);
+
+        // The two base corners straddle the shaft, behind the tip.
+        Assert.True(head[1].X < s.X2 && head[2].X < s.X2);
+        Assert.True((head[1].Y - 0.5) * (head[2].Y - 0.5) < 0, "the base corners are on the same side");
+    }
+
+    [Fact]
+    public void an_arrow_head_has_the_proportions_of_an_arrow()
+    {
+        // Roughly 5:2, length to full width. A head as wide as it is long reads
+        // as a diamond; a very narrow one reads as a tick.
+        var s = Draft(ShapeKind.Arrow, 0.0, 0.5, 1.0, 0.5);
+        var head = ShapeGeometry.ArrowHeadTriangle(s, 0.01);
+
+        double length = head[0].X - head[1].X;
+        double width = Math.Abs(head[1].Y - head[2].Y);
+        double ratio = length / width;
+
+        Assert.InRange(ratio, 1.0, 1.5);
+    }
+
+    [Fact]
+    public void a_short_drag_does_not_get_a_head_longer_than_the_arrow()
+    {
+        // Unclamped, a thick pen on a short drag puts the head base BEHIND the
+        // tail, which draws a triangle pointing the wrong way.
+        var s = Draft(ShapeKind.Arrow, 0.5, 0.5, 0.53, 0.5);
+        var a = ShapeGeometry.Arrow(s.X1, s.Y1, s.X2, s.Y2, 0.02);
+
+        Assert.True(a.ShaftEnd.X > s.X1, "the head swallowed the whole shaft");
+        Assert.True(a.ShaftEnd.X <= s.X2);
     }
 
     [Fact]

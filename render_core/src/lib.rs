@@ -1545,9 +1545,6 @@ pub const SHAPE_ELLIPSE: i32 = 1;
 pub const SHAPE_LINE: i32 = 2;
 pub const SHAPE_ARROW: i32 = 3;
 
-/// How far an arrow's barbs spread from the shaft, in radians (about 26°).
-const ARROW_HEAD_ANGLE: f32 = 0.45;
-
 /// Barb length as a multiple of the stroke width, with a floor so a hairline
 /// arrow still has a visible head rather than a dot.
 const ARROW_HEAD_SCALE: f32 = 6.0;
@@ -1631,15 +1628,25 @@ pub struct ShapeSpec {
     pub width_px: f32,
 }
 
-/// The two barb endpoints of an arrowhead at (`tip_x`, `tip_y`), for a shaft
-/// coming from (`tail_x`, `tail_y`).
+/// Half-width of an arrowhead as a fraction of its length, giving the roughly
+/// 5:2 taper a drawn arrow is expected to have. Mirrors ArrowHeadTaper in the
+/// C# viewport library.
+const ARROW_HEAD_TAPER: f32 = 0.42;
+
+/// An arrow, split into the parts drawn differently: a stroked shaft and a
+/// FILLED triangular head.
 ///
-/// Split out and tested on its own because it is the only part of a shape that
-/// is not simply its bounding box, and because the app draws the same head in
-/// its live preview: two implementations of one piece of geometry is two things
-/// that can disagree on screen.
-fn arrow_head(tail_x: f32, tail_y: f32, tip_x: f32, tip_y: f32, width: f32)
-    -> ((f32, f32), (f32, f32))
+/// The head was two thin barbs drawn as part of the shaft's own polyline, and
+/// at any real stroke width that reads as a tick mark rather than an arrow.
+/// Every drawing tool fills the head.
+///
+/// The shaft stops at the BASE of the head rather than running on to the tip: a
+/// stroked line continuing under a filled triangle pokes out past the point and
+/// blunts it.
+///
+/// Returns (shaft_end, tip, left, right).
+fn arrow_parts(tail_x: f32, tail_y: f32, tip_x: f32, tip_y: f32, width: f32)
+    -> ((f32, f32), (f32, f32), (f32, f32), (f32, f32))
 {
     let dx = tip_x - tail_x;
     let dy = tip_y - tail_y;
@@ -1649,16 +1656,21 @@ fn arrow_head(tail_x: f32, tail_y: f32, tip_x: f32, tip_y: f32, width: f32)
     // dividing by zero and writing NaN coordinates into the file.
     let (ux, uy) = if len < 1e-6 { (1.0, 0.0) } else { (dx / len, dy / len) };
 
-    let barb = (width * ARROW_HEAD_SCALE).max(ARROW_HEAD_MIN);
-    let (sin, cos) = ARROW_HEAD_ANGLE.sin_cos();
+    let mut head = (width * ARROW_HEAD_SCALE).max(ARROW_HEAD_MIN);
 
-    // Rotate the REVERSED shaft direction by plus and minus the head angle, so
-    // the barbs sweep back from the tip.
-    let (bx, by) = (-ux * barb, -uy * barb);
-    (
-        (tip_x + bx * cos - by * sin, tip_y + bx * sin + by * cos),
-        (tip_x + bx * cos + by * sin, tip_y - bx * sin + by * cos),
-    )
+    // Never let the head eat the whole arrow. On a short drag an unclamped head
+    // is longer than the shaft, and the result is a floating triangle pointing
+    // backwards.
+    head = head.min(len * 0.6);
+
+    let half = head * ARROW_HEAD_TAPER;
+
+    let bx = tip_x - ux * head;
+    let by = tip_y - uy * head;
+    let px = -uy * half;
+    let py = ux * half;
+
+    ((bx, by), (tip_x, tip_y), (bx + px, by + py), (bx - px, by - py))
 }
 
 /// Adds rectangles, ellipses, lines and arrows as real PDF annotation objects.
@@ -1768,39 +1780,65 @@ fn add_shape_annotations_inner(
                 build(&doc_guard, rect, Some(color), Some(PdfPoints::new(width_pts)), None)
             }
             _ => {
-                let mut p = PdfPagePathObject::new_line(
+                // For an arrow the shaft stops at the head's BASE; the head is
+                // a separate filled triangle, built below.
+                let (sx, sy) = if spec.kind == SHAPE_ARROW {
+                    arrow_parts(x1, y1, x2, y2, width_pts).0
+                } else {
+                    (x2, y2)
+                };
+
+                PdfPagePathObject::new_line(
                     &doc_guard,
                     PdfPoints::new(x1),
                     PdfPoints::new(y1),
-                    PdfPoints::new(x2),
-                    PdfPoints::new(y2),
+                    PdfPoints::new(sx),
+                    PdfPoints::new(sy),
                     color,
                     PdfPoints::new(width_pts),
-                );
-
-                if spec.kind == SHAPE_ARROW {
-                    if let Ok(path) = p.as_mut() {
-                        let (left, right) = arrow_head(x1, y1, x2, y2, width_pts);
-                        extent.push(left);
-                        extent.push(right);
-
-                        // One continuous polyline: tip, barb, back to the tip,
-                        // other barb. Retracing the tip costs nothing on a
-                        // stroked path and avoids needing a second subpath.
-                        let ok = path.line_to(PdfPoints::new(left.0), PdfPoints::new(left.1)).is_ok()
-                            && path.line_to(PdfPoints::new(x2), PdfPoints::new(y2)).is_ok()
-                            && path.line_to(PdfPoints::new(right.0), PdfPoints::new(right.1)).is_ok();
-                        if !ok {
-                            continue;
-                        }
-                    }
-                }
-                p
+                )
             }
         };
 
         let Ok(path) = path else {
             continue;
+        };
+
+        // The arrowhead, as a SOLID triangle. Built before the bounds are
+        // measured so its points are inside them: PDFium clips an appearance to
+        // its box, and a head outside would be cut off silently, leaving what
+        // looks like a plain line.
+        let head = if spec.kind == SHAPE_ARROW {
+            let (_, tip, left, right) = arrow_parts(x1, y1, x2, y2, width_pts);
+            extent.push(tip);
+            extent.push(left);
+            extent.push(right);
+
+            let built = PdfPagePathObject::new_line(
+                &doc_guard,
+                PdfPoints::new(tip.0),
+                PdfPoints::new(tip.1),
+                PdfPoints::new(left.0),
+                PdfPoints::new(left.1),
+                color,
+                PdfPoints::new(width_pts),
+            )
+            .and_then(|mut t| {
+                t.line_to(PdfPoints::new(right.0), PdfPoints::new(right.1))?;
+                t.close_path()?;
+                t.set_fill_color(color)?;
+                // Filled AND stroked, so the taper does not come out ragged at
+                // small sizes.
+                t.set_fill_and_stroke_mode(PdfPathFillMode::Winding, true)?;
+                Ok(t)
+            });
+
+            match built {
+                Ok(t) => Some(t),
+                Err(_) => continue,
+            }
+        } else {
+            None
         };
 
         let pad = width_pts / 2.0 + 1.0;
@@ -1835,6 +1873,12 @@ fn add_shape_annotations_inner(
 
         if annotation.objects_mut().add_path_object(path).is_err() {
             return STATUS_INVALID_INPUT;
+        }
+
+        if let Some(head) = head {
+            if annotation.objects_mut().add_path_object(head).is_err() {
+                return STATUS_INVALID_INPUT;
+            }
         }
     }
 
@@ -4599,7 +4643,7 @@ mod tests {
         // Pointing right: both barbs must sit BEHIND the tip and straddle the
         // shaft. Getting the rotation sign wrong puts them ahead of the tip,
         // which draws a bowtie rather than an arrow.
-        let ((lx, ly), (rx, ry)) = arrow_head(0.0, 0.0, 100.0, 0.0, 2.0);
+        let (_, _, (lx, ly), (rx, ry)) = arrow_parts(0.0, 0.0, 100.0, 0.0, 2.0);
 
         assert!(lx < 100.0 && rx < 100.0, "barbs at x={lx} and x={rx} are not behind the tip");
         assert!(
@@ -4614,7 +4658,7 @@ mod tests {
         // Dragged right to left, the head belongs on the LEFT end. Normalizing
         // the drag to a rectangle first would have lost this, which is why the
         // spec carries the drag's start and end rather than a box.
-        let ((lx, _), (rx, _)) = arrow_head(100.0, 0.0, 0.0, 0.0, 2.0);
+        let (_, _, (lx, _), (rx, _)) = arrow_parts(100.0, 0.0, 0.0, 0.0, 2.0);
         assert!(lx > 0.0 && rx > 0.0, "barbs at x={lx} and x={rx} did not follow the reversed drag");
     }
 
@@ -4622,7 +4666,7 @@ mod tests {
     fn a_zero_length_arrow_does_not_produce_nan_coordinates() {
         // A click without a drag. Dividing by a zero-length shaft would write
         // NaN into the file, which corrupts the page rather than failing.
-        let ((lx, ly), (rx, ry)) = arrow_head(50.0, 50.0, 50.0, 50.0, 2.0);
+        let (_, _, (lx, ly), (rx, ry)) = arrow_parts(50.0, 50.0, 50.0, 50.0, 2.0);
         for v in [lx, ly, rx, ry] {
             assert!(v.is_finite(), "arrow head produced a non-finite coordinate: {v}");
         }
@@ -4632,7 +4676,7 @@ mod tests {
     fn a_hairline_arrow_still_gets_a_visible_head() {
         // Barb length scales with stroke width, so without a floor the finest
         // pen would produce a head a fraction of a point across: invisible.
-        let ((lx, ly), _) = arrow_head(0.0, 0.0, 100.0, 0.0, 0.01);
+        let (_, _, (lx, ly), _) = arrow_parts(0.0, 0.0, 100.0, 0.0, 0.01);
         let reach = ((100.0f32 - lx).powi(2) + ly.powi(2)).sqrt();
         assert!(reach >= ARROW_HEAD_MIN - 0.001, "hairline arrow head reached only {reach}");
     }
@@ -4830,6 +4874,39 @@ mod tests {
             resize_shape_annotation(handle, 0, 0, 1000, 90.0, 10.0, 10.0, 50.0, &mut idx),
             STATUS_INVALID_INPUT
         );
+        close_document(handle);
+    }
+
+    /// Dumps a rendered page so the shapes can be LOOKED at. Ignored by
+    /// default; run with `cargo test --release -- --ignored dump_shapes`.
+    #[test]
+    #[ignore]
+    fn dump_shapes_for_inspection() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let specs = [
+            ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 100.0, x2: 700.0, y2: 100.0,
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0 },
+            ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 200.0, x2: 700.0, y2: 320.0,
+                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0 },
+            ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 700.0, y1: 420.0, x2: 80.0, y2: 420.0,
+                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5 },
+            ShapeSpec { page_index: 0, kind: SHAPE_RECTANGLE, x1: 80.0, y1: 500.0, x2: 350.0, y2: 640.0,
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0 },
+            ShapeSpec { page_index: 0, kind: SHAPE_ELLIPSE, x1: 420.0, y1: 500.0, x2: 700.0, y2: 640.0,
+                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0 },
+        ];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()), STATUS_OK_PDFIUM);
+
+        let r = render_region(handle, 0, 0.0, 0.0, 1.0, 1.0, 900);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+
+        let out = std::env::var("SHAPE_DUMP").unwrap_or_else(|_| "shapes.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {} {}x{}", out, r.width, r.height);
+
+        free_render_result(r);
         close_document(handle);
     }
 

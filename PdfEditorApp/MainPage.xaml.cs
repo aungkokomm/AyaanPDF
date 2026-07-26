@@ -1373,6 +1373,11 @@ public sealed partial class MainPage : Page
         {
             InkCanvas.Children.Add(BuildStrokePolyline(
                 new InkStrokeAnnotation(shape.PageIndex, shape.Outline, shape.ColorHex, shape.StrokeWidth)));
+
+            if (shape.Head.Count == 3)
+            {
+                InkCanvas.Children.Add(BuildFilledHead(shape.Head, shape.PageIndex, shape.ColorHex));
+            }
         }
     }
 
@@ -1400,6 +1405,29 @@ public sealed partial class MainPage : Page
         return polyline;
     }
 
+    /// <summary>
+    /// An arrow's head, as a filled triangle. A stroked outline is not the same
+    /// shape and would not match what goes into the file.
+    /// </summary>
+    private Polygon BuildFilledHead(
+        IReadOnlyList<(double X, double Y)> points, int pageIndex, string colorHex)
+    {
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(pageIndex);
+
+        var brush = new SolidColorBrush(ColorFromHex(colorHex));
+        var polygon = new Polygon { Fill = brush, Stroke = brush, StrokeThickness = 0.5 };
+
+        foreach (var (x, y) in points)
+        {
+            polygon.Points.Add(new Point(x * scale, (y * scale) + pageTop));
+        }
+
+        return polygon;
+    }
+
+    private Polygon? _livePreviewHead;
+
     private void OnInkStrokeChanged()
     {
         // A shape being dragged previews through the same path as ink, built
@@ -1408,6 +1436,12 @@ public sealed partial class MainPage : Page
         var points = ViewModel.ShapeInProgress is { } draft
             ? ShapeGeometry.Outline(draft, ViewModel.InkWidth)
             : ViewModel.CurrentStrokeInProgress;
+
+        if (_livePreviewHead is not null)
+        {
+            InkCanvas.Children.Remove(_livePreviewHead);
+            _livePreviewHead = null;
+        }
 
         if (points is null)
         {
@@ -1420,14 +1454,30 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // The head is rebuilt each move rather than reshaped, because its three
+        // points all move as the drag turns.
+        if (ViewModel.ShapeInProgress is { Kind: ShapeKind.Arrow } arrow)
+        {
+            var head = ShapeGeometry.ArrowHeadTriangle(arrow, ViewModel.InkWidth);
+            _livePreviewHead = BuildFilledHead(head, ViewModel.ActiveShapePage, ViewModel.InkColorHex);
+            InkCanvas.Children.Add(_livePreviewHead);
+        }
+
         double scale = ViewModel.OverlayScale;
 
         if (_livePreviewStroke is null)
         {
+            // A shape previews in ITS OWN colour and width, so what is on
+            // screen during the drag is what lands on the page. Freehand ink
+            // keeps the thin red guide, which reads clearly against a stroke
+            // being laid down continuously.
+            bool shaping = ViewModel.ShapeInProgress is not null;
             _livePreviewStroke = new Polyline
             {
-                Stroke = new SolidColorBrush(Colors.Red),
-                StrokeThickness = 2,
+                Stroke = shaping
+                    ? new SolidColorBrush(ColorFromHex(ViewModel.InkColorHex))
+                    : new SolidColorBrush(Colors.Red),
+                StrokeThickness = shaping ? ViewModel.InkWidth * ViewModel.OverlayScale : 2,
             };
             InkCanvas.Children.Add(_livePreviewStroke);
         }

@@ -54,19 +54,85 @@ public sealed record ShapeAnnotation(
     public IReadOnlyList<(double X, double Y)> Outline =>
         ShapeGeometry.Outline(Draft, StrokeWidth);
 
-    /// <summary>
-    /// Hit-testing and bounds both defer to an ink stroke over this shape's own
-    /// outline, rather than reimplementing segment distance. An ellipse or an
-    /// arrow fills very little of its bounding box, so a box test would grab
-    /// clicks in empty space, and the segment maths is already tested.
-    /// </summary>
+    /// <summary>The filled head, for an arrow; empty for everything else.</summary>
+    public IReadOnlyList<(double X, double Y)> Head =>
+        Draft.Kind == ShapeKind.Arrow
+            ? ShapeGeometry.ArrowHeadTriangle(Draft, StrokeWidth)
+            : [];
+
     private InkStrokeAnnotation AsStroke =>
         new(PageIndex, Outline, ColorHex, StrokeWidth);
 
-    public TextRect Bounds => AsStroke.Bounds;
+    /// <summary>
+    /// Covers the head as well as the shaft. The outline is only the shaft now
+    /// an arrow's head is a separate filled triangle, and bounds that stopped
+    /// there would clip the point off in the saved file and make the tip
+    /// unselectable on screen.
+    /// </summary>
+    public TextRect Bounds
+    {
+        get
+        {
+            var b = AsStroke.Bounds;
+            foreach (var (x, y) in Head)
+            {
+                b = new TextRect(
+                    Math.Min(b.Left, x), Math.Min(b.Top, y),
+                    Math.Max(b.Right, x), Math.Max(b.Bottom, y));
+            }
 
-    public bool HitTest(double x, double y, double tolerance) =>
-        AsStroke.HitTest(x, y, tolerance);
+            return b;
+        }
+    }
+
+    /// <summary>
+    /// A shape is an OBJECT, so anywhere on or inside it picks it up.
+    ///
+    /// This began as distance-to-the-outline, the same test ink uses, and that
+    /// is wrong here: a rectangle drawn round a paragraph is mostly empty, so
+    /// selecting it meant hitting a two-pixel line exactly. A drawn shape is a
+    /// thing you grab, not a curve you must trace, and every drawing app treats
+    /// it that way.
+    ///
+    /// Lines and arrows keep the distance test, generously padded, because they
+    /// enclose nothing: a box test on a long diagonal arrow would swallow half
+    /// the page.
+    /// </summary>
+    public bool HitTest(double x, double y, double tolerance)
+    {
+        double reach = Math.Max(tolerance, Math.Max(StrokeWidth, MinimumGrab));
+
+        if (Draft.Kind is ShapeKind.Line or ShapeKind.Arrow)
+        {
+            if (AsStroke.HitTest(x, y, reach))
+            {
+                return true;
+            }
+
+            // The head is a solid triangle, and it is the fattest, most
+            // obvious part of an arrow: clicking the point has to work.
+            var head = Head;
+            if (head.Count == 3)
+            {
+                var t = new InkStrokeAnnotation(
+                    PageIndex, [head[0], head[1], head[2], head[0]], ColorHex, StrokeWidth);
+                return t.HitTest(x, y, reach);
+            }
+
+            return false;
+        }
+
+        var b = Bounds;
+        return x >= b.Left - reach && x <= b.Right + reach
+            && y >= b.Top - reach && y <= b.Bottom + reach;
+    }
+
+    /// <summary>
+    /// How close counts as a hit, at minimum, in normalized page units: about
+    /// five slot pixels. A hairline shape is still a target the pointer can be
+    /// expected to find without precision aiming.
+    /// </summary>
+    public const double MinimumGrab = 0.006;
 
     public IAnnotation Translate(double dx, double dy) => this with
     {
@@ -94,8 +160,16 @@ public static class ShapeGeometry
     /// <summary>Spread of an arrow's barbs from its shaft, in radians (about 26°).</summary>
     public const double ArrowHeadAngle = 0.45;
 
-    /// <summary>Barb length as a multiple of stroke width.</summary>
+    /// <summary>Head length as a multiple of stroke width.</summary>
     public const double ArrowHeadScale = 6.0;
+
+    /// <summary>
+    /// Half-width of the head as a fraction of its length, giving the roughly
+    /// 5:2 taper a drawn arrow is expected to have. Two thin barbs at an angle
+    /// read as a tick or a bird, not as an arrow; a solid triangle is what
+    /// every drawing tool draws and what this now produces.
+    /// </summary>
+    public const double ArrowHeadTaper = 0.42;
 
     /// <summary>
     /// Shortest barb, in normalized units, so the finest pen still draws a head
@@ -125,15 +199,24 @@ public static class ShapeGeometry
     }
 
     /// <summary>
-    /// The two barb endpoints of an arrowhead at (<paramref name="tipX"/>,
-    /// <paramref name="tipY"/>), for a shaft coming from
-    /// (<paramref name="tailX"/>, <paramref name="tailY"/>).
+    /// An arrow, split into the parts that are drawn differently: a stroked
+    /// shaft and a FILLED triangular head.
     ///
-    /// Deliberately mirrors <c>arrow_head</c> in render_core: the preview the
-    /// user drags and the arrow written to the file have to be the same shape,
-    /// or committing a stroke visibly changes it.
+    /// The head used to be two thin barbs drawn as part of the shaft's own
+    /// polyline. That is not what an arrow looks like: at any real stroke width
+    /// it reads as a tick mark. Every drawing tool fills the head, so this
+    /// returns a triangle to fill.
+    ///
+    /// The shaft also STOPS at the base of the head rather than running to the
+    /// tip. A stroked line continuing under a filled triangle pokes out past
+    /// the point at anything but a hairline width, and blunts it.
     /// </summary>
-    public static ((double X, double Y) Left, (double X, double Y) Right) ArrowHead(
+    public static (
+        (double X, double Y) ShaftStart,
+        (double X, double Y) ShaftEnd,
+        (double X, double Y) Tip,
+        (double X, double Y) Left,
+        (double X, double Y) Right) Arrow(
         double tailX, double tailY, double tipX, double tipY, double width)
     {
         double dx = tipX - tailX;
@@ -145,18 +228,34 @@ public static class ShapeGeometry
         double ux = len < 1e-9 ? 1.0 : dx / len;
         double uy = len < 1e-9 ? 0.0 : dy / len;
 
-        double barb = Math.Max(width * ArrowHeadScale, ArrowHeadMin);
-        double sin = Math.Sin(ArrowHeadAngle);
-        double cos = Math.Cos(ArrowHeadAngle);
+        double head = Math.Max(width * ArrowHeadScale, ArrowHeadMin);
 
-        // Rotate the REVERSED shaft direction by plus and minus the head angle,
-        // so the barbs sweep back from the tip.
-        double bx = -ux * barb;
-        double by = -uy * barb;
+        // Never let the head eat the whole arrow. On a short drag an unclamped
+        // head is longer than the shaft, and the result is a floating triangle
+        // pointing backwards.
+        head = Math.Min(head, len * 0.6);
+
+        double half = head * ArrowHeadTaper;
+
+        // Base of the head, and the perpendicular the barbs sit on.
+        double bx = tipX - (ux * head);
+        double by = tipY - (uy * head);
+        double px = -uy * half;
+        double py = ux * half;
 
         return (
-            (tipX + (bx * cos) - (by * sin), tipY + (bx * sin) + (by * cos)),
-            (tipX + (bx * cos) + (by * sin), tipY - (bx * sin) + (by * cos)));
+            (tailX, tailY),
+            (bx, by),
+            (tipX, tipY),
+            (bx + px, by + py),
+            (bx - px, by - py));
+    }
+
+    /// <summary>The three points of an arrow's filled head.</summary>
+    public static IReadOnlyList<(double X, double Y)> ArrowHeadTriangle(ShapeDraft s, double width)
+    {
+        var a = Arrow(s.X1, s.Y1, s.X2, s.Y2, width);
+        return [a.Tip, a.Left, a.Right];
     }
 
     /// <summary>
@@ -204,18 +303,11 @@ public static class ShapeGeometry
 
             case ShapeKind.Arrow:
             {
-                var (left, right) = ArrowHead(s.X1, s.Y1, s.X2, s.Y2, width);
-
-                // Same single polyline the file gets: tip, barb, back to the
-                // tip, other barb. Retracing costs nothing on a stroke.
-                return
-                [
-                    (s.X1, s.Y1),
-                    (s.X2, s.Y2),
-                    (left.X, left.Y),
-                    (s.X2, s.Y2),
-                    (right.X, right.Y),
-                ];
+                // The SHAFT only. The head is a filled triangle and is fetched
+                // separately, by ArrowHeadTriangle, because a stroked polyline
+                // cannot express a solid one.
+                var a = Arrow(s.X1, s.Y1, s.X2, s.Y2, width);
+                return [a.ShaftStart, a.ShaftEnd];
             }
 
             default:
