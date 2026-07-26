@@ -26,21 +26,80 @@ public sealed record StampPixels(byte[] Bgra, int Width, int Height);
 /// </summary>
 internal static class StampLibrary
 {
+    /// <summary>A Stamps folder beside the exe, which turns on portable mode.</summary>
+    private static string PortableFolder => Path.Combine(AppContext.BaseDirectory, "Stamps");
+
     /// <summary>
-    /// Where the stamps live: a Stamps folder beside the executable.
+    /// Where the stamps live.
     ///
-    /// THIS IS USER DATA. It is created if missing and otherwise left entirely
-    /// alone: never cleared, never overwritten, and it must never be swept up
-    /// by an installer or a deploy step. Losing it means losing files the user
-    /// put there by hand.
+    /// Per-user by default, NOT beside the executable. A stamp is universal:
+    /// the same signature is wanted in every document and every version of the
+    /// app, so it has to outlive the install folder. Keeping it next to the
+    /// exe tied it to one installation, and reinstalling or installing to a
+    /// different folder left it behind, which is exactly what happened.
+    ///
+    /// A Stamps folder beside the exe still wins if one exists, so a copy on a
+    /// USB stick stays self-contained. Nothing creates that folder
+    /// automatically; it is opt-in by putting it there.
+    ///
+    /// THIS IS USER DATA either way. Created if missing, otherwise left
+    /// entirely alone, and never part of an installer payload.
     /// </summary>
-    public static string FolderPath => Path.Combine(AppContext.BaseDirectory, "Stamps");
+    public static string FolderPath =>
+        Directory.Exists(PortableFolder)
+            ? PortableFolder
+            : Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                AppInfo.Name,
+                "Stamps");
 
     public static string EnsureFolder()
     {
         string path = FolderPath;
         Directory.CreateDirectory(path);   // no-op when it already exists
+        MigrateFromBesideExe(path);
         return path;
+    }
+
+    /// <summary>
+    /// Brings stamps across from an older install that kept them beside the
+    /// exe, once.
+    ///
+    /// Earlier versions stored them there, so anyone upgrading has stamps in a
+    /// folder the app no longer reads. Leaving them behind would look exactly
+    /// like the app had thrown them away, which is the complaint this whole
+    /// change exists to answer.
+    ///
+    /// COPIES rather than moves, and never overwrites: the old folder is left
+    /// untouched, so a failure here costs nothing and the originals are always
+    /// still where they were.
+    /// </summary>
+    private static void MigrateFromBesideExe(string destination)
+    {
+        try
+        {
+            // In portable mode the two are the same folder, so there is
+            // nothing to move.
+            if (string.Equals(destination, PortableFolder, StringComparison.OrdinalIgnoreCase)
+                || !Directory.Exists(PortableFolder))
+            {
+                return;
+            }
+
+            foreach (string source in Directory.EnumerateFiles(PortableFolder, "*.png"))
+            {
+                string target = Path.Combine(destination, Path.GetFileName(source));
+                if (!File.Exists(target))
+                {
+                    File.Copy(source, target);
+                    Diag.Log($"stamp migrated from the install folder: {Path.GetFileName(source)}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"stamp migration skipped: {ex.Message}");
+        }
     }
 
     /// <summary>

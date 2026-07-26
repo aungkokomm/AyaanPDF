@@ -291,3 +291,56 @@ public class AspectPreservingResizeTests
         Assert.Equal(Aspect, r.Height / r.Width, 6);
     }
 }
+
+/// <summary>
+/// Handles must be grabbable from OUTSIDE the shape, because that is where
+/// half of each one is drawn.
+/// </summary>
+public class GripReachTests
+{
+    private static readonly AnnotationBox Box = new(0, 0.20, 0.20, 0.60, 0.50);
+
+    [Theory]
+    [InlineData(-1, -1, LoadedAnnotationPicker.Grip.TopLeft)]
+    [InlineData(+1, -1, LoadedAnnotationPicker.Grip.TopRight)]
+    [InlineData(-1, +1, LoadedAnnotationPicker.Grip.BottomLeft)]
+    [InlineData(+1, +1, LoadedAnnotationPicker.Grip.BottomRight)]
+    public void every_corner_is_grabbable_from_just_outside_the_box(
+        int dx, int dy, LoadedAnnotationPicker.Grip expected)
+    {
+        // Half a grip beyond the corner, on both axes: exactly where a user
+        // aiming at the visible handle often lands. All four must answer, not
+        // just the one that happens to be clicked inward.
+        const double Out = LoadedAnnotationPicker.GripReach / 2;
+
+        double x = (dx < 0 ? Box.Left : Box.Right) + dx * Out;
+        double y = (dy < 0 ? Box.Top : Box.Bottom) + dy * Out;
+
+        Assert.Equal(expected, LoadedAnnotationPicker.GripAt(Box, x, y));
+    }
+
+    [Theory]
+    [InlineData(-1, -1, LoadedAnnotationPicker.Grip.TopLeft)]
+    [InlineData(+1, -1, LoadedAnnotationPicker.Grip.TopRight)]
+    [InlineData(-1, +1, LoadedAnnotationPicker.Grip.BottomLeft)]
+    [InlineData(+1, +1, LoadedAnnotationPicker.Grip.BottomRight)]
+    public void every_corner_is_grabbable_from_just_inside_the_box(
+        int dx, int dy, LoadedAnnotationPicker.Grip expected)
+    {
+        const double In = LoadedAnnotationPicker.GripReach / 2;
+
+        double x = (dx < 0 ? Box.Left : Box.Right) - dx * In;
+        double y = (dy < 0 ? Box.Top : Box.Bottom) - dy * In;
+
+        Assert.Equal(expected, LoadedAnnotationPicker.GripAt(Box, x, y));
+    }
+
+    [Fact]
+    public void a_point_well_outside_grabs_nothing()
+    {
+        Assert.Equal(LoadedAnnotationPicker.Grip.None,
+                     LoadedAnnotationPicker.GripAt(Box, 0.9, 0.9));
+        Assert.Equal(LoadedAnnotationPicker.Grip.None,
+                     LoadedAnnotationPicker.GripAt(Box, 0.0, 0.0));
+    }
+}

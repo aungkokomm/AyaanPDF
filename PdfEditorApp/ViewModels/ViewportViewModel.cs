@@ -1335,6 +1335,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return true;
         }
 
+        // A handle of what is ALREADY selected wins, before anything else is
+        // considered, and it is grabbable slightly OUTSIDE the annotation.
+        //
+        // Half of every handle is drawn outside the shape it belongs to, and
+        // the pick below requires the point to be INSIDE, so grabbing a
+        // handle's outer edge used to deselect instead of resizing. That is
+        // why only the top-left corner appeared to work: it is the one people
+        // naturally click slightly inward on.
+        if (_selectedLoaded is LoadedSelection current && current.PageIndex == pageIndex)
+        {
+            var box = new AnnotationBox(
+                current.Index, current.Left, current.Top, current.Right, current.Bottom);
+            var grip = LoadedAnnotationPicker.GripAt(box, normX, normY);
+
+            if (grip != LoadedAnnotationPicker.Grip.None && CanResize(current))
+            {
+                _loadedDrag = (normX, normY, current);
+                _loadedGrip = grip;
+                return true;
+            }
+        }
+
         // Nothing of ours here, so try what the file already had. Marks made
         // this session sit in the overlay ABOVE the page, so they win a tie.
         _selectedLoaded = null;
