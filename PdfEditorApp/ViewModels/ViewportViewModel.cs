@@ -25,22 +25,8 @@ namespace PdfEditorApp.ViewModels;
 /// (PdfEditorApp.Viewport project) so it's unit-testable without a UI
 /// thread; this class is the thin, WinUI-aware glue.
 /// </summary>
-/// <summary>What plain left-drag/click currently does in the viewport.</summary>
-public enum ToolMode
-{
-    /// <summary>Drag selects text (leaves a transient selection for copy).</summary>
-    Select,
-    /// <summary>Drag selects text and immediately commits it as a permanent highlight.</summary>
-    Highlight,
-    /// <summary>Click places a sticky note.</summary>
-    Note,
-    /// <summary>Drag draws a freehand ink stroke.</summary>
-    Draw,
-    /// <summary>Plain left-drag pans, same as holding Space with any other tool active.</summary>
-    Hand,
-    /// <summary>Click places the chosen stamp image.</summary>
-    Stamp,
-}
+// ToolMode moved to PdfEditorApp.Viewport.ToolCatalog, so the tool rail and
+// its shortcuts can be defined in one testable place.
 
 public partial class ViewportViewModel : ObservableObject, IDisposable
 {

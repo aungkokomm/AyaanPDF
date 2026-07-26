@@ -93,6 +93,27 @@ public static class InkPresets
     public static InkColor DefaultHighlightColor => HighlightColors[0];
 
     /// <summary>
+    /// The same colour at a different opacity, as "#AARRGGBB".
+    ///
+    /// Opacity is stored in the colour rather than alongside it because that is
+    /// how it reaches the file: highlight and ink annotations carry an alpha
+    /// component all the way down to the Rust side, so a separate opacity value
+    /// would be a second source of truth that has to be recombined at every
+    /// call site, and forgetting once means an edit that looks right on the
+    /// overlay and comes out wrong in the saved PDF.
+    /// </summary>
+    /// <param name="opacity">0 to 1; clamped.</param>
+    public static string WithOpacity(string hex, double opacity)
+    {
+        var (_, r, g, b) = ParseHex(hex);
+        byte a = (byte)Math.Round(Math.Clamp(opacity, 0, 1) * 255);
+        return $"#{a:X2}{r:X2}{g:X2}{b:X2}";
+    }
+
+    /// <summary>The opacity a colour already carries, 0 to 1.</summary>
+    public static double OpacityOf(string hex) => ParseHex(hex).A / 255.0;
+
+    /// <summary>
     /// Parses "#AARRGGBB" or "#RRGGBB" into components, falling back to the
     /// supplied alpha when none is given.
     /// </summary>

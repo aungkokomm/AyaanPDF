@@ -427,117 +427,48 @@
                                VerticalAlignment="Center" HorizontalAlignment="Center"
                                Fill="{ThemeResource TextFillColorTertiaryBrush}" />
                 </Border>
-                <Button x:Name="HandToolButton" Click="HandTool_Click" ToolTipService.ToolTip="Hand (hold Space)"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE7C9;" FontSize="16" />
-                </Button>
-                <Button x:Name="SelectToolButton" Click="SelectTool_Click" ToolTipService.ToolTip="Select text"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE8B0;" FontSize="16" />
-                </Button>
-                <Button x:Name="HighlightToolButton" Click="HighlightTool_Click" ToolTipService.ToolTip="Highlight"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE7E6;" FontSize="16" />
-                </Button>
-                <Button x:Name="DrawToolButton" Click="DrawTool_Click" ToolTipService.ToolTip="Draw"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE70F;" FontSize="16" />
-                </Button>
-                <Button x:Name="NoteToolButton" Click="NoteTool_Click" ToolTipService.ToolTip="Note"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE70B;" FontSize="16" />
-                </Button>
-
                 <!--
-                    Stamp. The flyout both arms the tool and chooses which
-                    image it places, because a stamp tool with no stamp
-                    selected has nothing to do.
+                    The tools themselves come from ToolCatalog, one row each.
+
+                    They used to be six hand-written buttons plus a method that
+                    assigned six backgrounds by name, so adding a tool meant
+                    editing three places and forgetting any one of them left a
+                    tool that could not be reached or never looked armed. A
+                    single-selection list also means the ARMED tool is drawn by
+                    the framework's own selection visual rather than by
+                    assigning brushes, which is what made the previous rail look
+                    hand-made.
                 -->
-                <Button x:Name="StampToolButton" ToolTipService.ToolTip="Stamp"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE7B8;" FontSize="16" />
-                    <Button.Flyout>
-                        <Flyout Placement="Right" Opening="StampFlyout_Opening">
-                            <StackPanel Spacing="10" Width="248">
-                                <TextBlock Text="Stamps" Style="{StaticResource CaptionTextBlockStyle}" />
-
-                                <TextBlock x:Name="StampEmptyHint"
-                                           Text="No stamps yet. Add a PNG to get started."
-                                           TextWrapping="Wrap"
-                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                           Style="{StaticResource CaptionTextBlockStyle}" />
-
-                                <GridView x:Name="StampChoices" SelectionMode="Single"
-                                          MaxHeight="240"
-                                          SelectionChanged="StampChoice_SelectionChanged">
-                                    <GridView.ItemTemplate>
-                                        <DataTemplate x:DataType="local:StampEntry">
-                                            <Grid Width="64" Height="64" Padding="4"
-                                                  ToolTipService.ToolTip="{x:Bind Name}">
-                                                <Image Stretch="Uniform"
-                                                       Source="{x:Bind local:MainPage.StampThumbnail(Path)}" />
-                                            </Grid>
-                                        </DataTemplate>
-                                    </GridView.ItemTemplate>
-                                </GridView>
-
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Button Content="Add PNG..." Click="AddStamp_Click" />
-                                    <Button Content="Open folder" Click="OpenStampFolder_Click" />
-                                </StackPanel>
-                            </StackPanel>
-                        </Flyout>
-                    </Button.Flyout>
-                </Button>
-
-                <!--
-                    Pen options, shown only while a drawing tool is armed, so
-                    the rail stays minimal when they are irrelevant.
-                -->
-                <Button x:Name="PenOptionsButton" Visibility="Collapsed"
-                        ToolTipService.ToolTip="Colour and width"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <Border x:Name="PenSwatch" Width="16" Height="16" CornerRadius="8"
-                            BorderBrush="#66FFFFFF" BorderThickness="1" />
-                    <Button.Flyout>
-                        <Flyout Placement="Right">
-                            <StackPanel Spacing="10" Width="188">
-                                <TextBlock Text="Colour" Style="{StaticResource CaptionTextBlockStyle}" />
-                                <GridView x:Name="ColorChoices" SelectionMode="Single"
-                                          SelectionChanged="InkColor_SelectionChanged">
-                                    <GridView.ItemTemplate>
-                                        <DataTemplate x:DataType="viewport:InkColor">
-                                            <Border Width="30" Height="30" CornerRadius="15" Margin="2"
-                                                    ToolTipService.ToolTip="{x:Bind Name}"
-                                                    Background="{x:Bind local:MainPage.HexBrush(Hex)}"
-                                                    BorderBrush="#66000000" BorderThickness="1" />
-                                        </DataTemplate>
-                                    </GridView.ItemTemplate>
-                                </GridView>
-
-                                <TextBlock Text="Width" Style="{StaticResource CaptionTextBlockStyle}" />
-                                <ListView x:Name="WidthChoices" SelectionMode="Single"
-                                          SelectionChanged="InkWidth_SelectionChanged">
-                                    <ListView.ItemTemplate>
-                                        <DataTemplate x:DataType="viewport:InkWidth">
-                                            <Grid Height="30" ColumnSpacing="10">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="52" />
-                                                    <ColumnDefinition Width="*" />
-                                                </Grid.ColumnDefinitions>
-                                                <TextBlock Text="{x:Bind Name}" VerticalAlignment="Center"
-                                                           Style="{StaticResource CaptionTextBlockStyle}" />
-                                                <Rectangle Grid.Column="1" VerticalAlignment="Center" RadiusX="4" RadiusY="4"
-                                                           Height="{x:Bind local:MainPage.WidthPreview(Value)}"
-                                                           Fill="{ThemeResource TextFillColorPrimaryBrush}" />
-                                            </Grid>
-                                        </DataTemplate>
-                                    </ListView.ItemTemplate>
-                                </ListView>
-                            </StackPanel>
-                        </Flyout>
-                    </Button.Flyout>
-                </Button>
+                <ListView x:Name="ToolRailList"
+                          ItemsSource="{x:Bind viewport:ToolCatalog.All}"
+                          SelectionMode="Single"
+                          SelectionChanged="ToolRail_SelectionChanged"
+                          ScrollViewer.VerticalScrollMode="Disabled"
+                          ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                          ScrollViewer.HorizontalScrollMode="Disabled"
+                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                          Padding="0" BorderThickness="0" Background="Transparent">
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="MinWidth" Value="0" />
+                            <Setter Property="MinHeight" Value="0" />
+                            <Setter Property="Width" Value="36" />
+                            <Setter Property="Height" Value="36" />
+                            <Setter Property="Padding" Value="0" />
+                            <Setter Property="Margin" Value="0,1" />
+                            <Setter Property="CornerRadius" Value="6" />
+                            <Setter Property="HorizontalContentAlignment" Value="Center" />
+                            <Setter Property="VerticalContentAlignment" Value="Center" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="viewport:ToolDefinition">
+                            <FontIcon Glyph="{x:Bind Glyph}" FontSize="16"
+                                      ToolTipService.ToolTip="{x:Bind Tooltip}"
+                                      AutomationProperties.Name="{x:Bind Name}" />
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
 
                 <Rectangle Height="1" Margin="6,4" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
 
@@ -590,6 +521,228 @@
                     </Button.Flyout>
                 </Button>
             </StackPanel>
+        </Border>
+
+        <!--
+            Property bar: the options belonging to the ARMED tool, and nothing
+            else.
+
+            These controls used to live behind a second button in the rail, in
+            a flyout, which is two clicks to change a colour and no way to see
+            the current one without opening it. Sitting them above the canvas
+            makes the state of the tool readable at a glance and each change one
+            click, the way an options bar works in a drawing app.
+
+            Which sections appear is decided by the tool's ToolOptions, so a
+            tool declares what it offers in one record rather than here.
+            Collapsed entirely for tools that offer nothing, so the canvas is
+            uncluttered whenever the bar has nothing to say.
+        -->
+        <Border x:Name="PropertyBar" Grid.Column="2" Visibility="Collapsed"
+                HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12,12,12,0"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="18" Padding="10,4"
+                AutomationProperties.Name="Tool options">
+            <!--
+                Scrollable, so the bar CANNOT clip. A horizontal StackPanel does
+                not compress: the drawing tool's sections come to roughly 500
+                DIP, which fits any normal window and silently loses its last
+                control on a narrow one. The ScrollViewer caps the bar at the
+                column width and lets what does not fit be reached instead of
+                cut off, and it costs nothing at the sizes that do fit.
+            -->
+            <ScrollViewer HorizontalScrollMode="Auto" HorizontalScrollBarVisibility="Auto"
+                          VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled">
+            <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+
+                <TextBlock x:Name="PropertyBarToolName" VerticalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+
+                <!-- Colour -->
+                <StackPanel x:Name="ColorSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <ListView x:Name="ColorChoices" SelectionMode="Single"
+                              SelectionChanged="InkColor_SelectionChanged"
+                              Padding="0" BorderThickness="0" Background="Transparent"
+                              AutomationProperties.Name="Colour"
+                              ScrollViewer.HorizontalScrollMode="Disabled"
+                              ScrollViewer.VerticalScrollMode="Disabled"
+                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                              ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                        <ListView.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ListView.ItemsPanel>
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinWidth" Value="0" />
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Width" Value="30" />
+                                <Setter Property="Height" Value="30" />
+                                <Setter Property="Padding" Value="0" />
+                                <Setter Property="Margin" Value="1,0" />
+                                <Setter Property="CornerRadius" Value="15" />
+                                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                                <Setter Property="VerticalContentAlignment" Value="Center" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:InkColor">
+                                <!-- Inset from the 30px container so the
+                                     selection ring around it stays visible. -->
+                                <Border Width="20" Height="20" CornerRadius="10"
+                                        ToolTipService.ToolTip="{x:Bind Name}"
+                                        AutomationProperties.Name="{x:Bind Name}"
+                                        Background="{x:Bind local:MainPage.HexBrush(Hex)}"
+                                        BorderBrush="#66000000" BorderThickness="1" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+
+                <!-- Width -->
+                <StackPanel x:Name="WidthSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <ListView x:Name="WidthChoices" SelectionMode="Single"
+                              SelectionChanged="InkWidth_SelectionChanged"
+                              Padding="0" BorderThickness="0" Background="Transparent"
+                              AutomationProperties.Name="Stroke width"
+                              ScrollViewer.HorizontalScrollMode="Disabled"
+                              ScrollViewer.VerticalScrollMode="Disabled"
+                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                              ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                        <ListView.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ListView.ItemsPanel>
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinWidth" Value="0" />
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Width" Value="34" />
+                                <Setter Property="Height" Value="30" />
+                                <Setter Property="Padding" Value="0" />
+                                <Setter Property="Margin" Value="1,0" />
+                                <Setter Property="CornerRadius" Value="6" />
+                                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                                <Setter Property="VerticalContentAlignment" Value="Center" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:InkWidth">
+                                <!-- The width itself is the label: a row of
+                                     names would say less and take more room. -->
+                                <Rectangle Width="20" RadiusX="4" RadiusY="4"
+                                           VerticalAlignment="Center"
+                                           ToolTipService.ToolTip="{x:Bind Name}"
+                                           AutomationProperties.Name="{x:Bind Name}"
+                                           Height="{x:Bind local:MainPage.WidthPreview(Value)}"
+                                           Fill="{ThemeResource TextFillColorPrimaryBrush}" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+
+                <!-- Opacity -->
+                <StackPanel x:Name="OpacitySection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <FontIcon Glyph="&#xE890;" FontSize="13" VerticalAlignment="Center"
+                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                              ToolTipService.ToolTip="Opacity" />
+                    <!--
+                        Maximum BEFORE Minimum, and that is not cosmetic: XAML
+                        assigns attributes in written order, and a Minimum above
+                        the Maximum in force at that moment is rejected outright.
+                        Written the other way round this threw a XamlParseException
+                        from InitializeComponent and the app died at startup with
+                        nothing but a hex code on screen.
+
+                        ValueChanged is attached LAST for the same reason: setting
+                        Minimum coerces Value up to it, and a handler already
+                        wired would take that for the user choosing 10% and
+                        rewrite the tool's colour before the app had even loaded.
+                    -->
+                    <Slider x:Name="OpacitySlider" Width="88" Maximum="100" Minimum="10"
+                            StepFrequency="5" TickFrequency="10"
+                            VerticalAlignment="Center"
+                            AutomationProperties.Name="Opacity"
+                            ValueChanged="Opacity_ValueChanged" />
+                    <TextBlock x:Name="OpacityReadout" VerticalAlignment="Center" MinWidth="34"
+                               TextAlignment="Right"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                </StackPanel>
+
+                <!-- Stamps -->
+                <StackPanel x:Name="StampSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <TextBlock x:Name="StampEmptyHint" Text="No stamps yet"
+                               VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <ListView x:Name="StampChoices" SelectionMode="Single"
+                              SelectionChanged="StampChoice_SelectionChanged"
+                              MaxWidth="320" Padding="0" BorderThickness="0" Background="Transparent"
+                              AutomationProperties.Name="Stamp"
+                              ScrollViewer.VerticalScrollMode="Disabled"
+                              ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                              ScrollViewer.HorizontalScrollMode="Enabled"
+                              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                        <ListView.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ListView.ItemsPanel>
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinWidth" Value="0" />
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Width" Value="40" />
+                                <Setter Property="Height" Value="34" />
+                                <Setter Property="Padding" Value="0" />
+                                <Setter Property="Margin" Value="1,0" />
+                                <Setter Property="CornerRadius" Value="6" />
+                                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                                <Setter Property="VerticalContentAlignment" Value="Center" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="local:StampEntry">
+                                <Image Width="30" Height="26" Stretch="Uniform"
+                                       ToolTipService.ToolTip="{x:Bind Name}"
+                                       AutomationProperties.Name="{x:Bind Name}"
+                                       Source="{x:Bind local:MainPage.StampThumbnail(Path)}" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                    <Button Click="AddStamp_Click" Width="30" Height="30" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            AutomationProperties.Name="Add a stamp"
+                            ToolTipService.ToolTip="Add a PNG stamp">
+                        <FontIcon Glyph="&#xE710;" FontSize="13" />
+                    </Button>
+                    <Button Click="OpenStampFolder_Click" Width="30" Height="30" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            AutomationProperties.Name="Open the stamp folder"
+                            ToolTipService.ToolTip="Open the stamp folder">
+                        <FontIcon Glyph="&#xE838;" FontSize="13" />
+                    </Button>
+                </StackPanel>
+
+            </StackPanel>
+            </ScrollViewer>
         </Border>
 
         <!--

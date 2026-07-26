@@ -42,6 +42,7 @@ public partial class App : Application
     public App()
     {
         InitializeComponent();
+        UnhandledException += (_, e) => Crash.Record("unhandled", e.Exception);
     }
 
     /// <summary>
@@ -50,8 +51,20 @@ public partial class App : Application
     /// <param name="args">Details about the launch request and process.</param>
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
-        Window = new MainWindow();
-        DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
-        Window.Activate();
+        // Startup is caught separately, because a failure here happens BEFORE
+        // there is a window to show anything in. Every startup crash so far has
+        // been visible only as a Windows error dialog with a hex code in it,
+        // which says nothing about which line failed.
+        try
+        {
+            Window = new MainWindow();
+            DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+            Window.Activate();
+        }
+        catch (System.Exception ex)
+        {
+            Crash.Record("startup", ex);
+            throw;
+        }
     }
 }

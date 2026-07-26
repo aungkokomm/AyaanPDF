@@ -7,6 +7,7 @@ using Microsoft.UI;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
@@ -429,11 +430,48 @@ public sealed partial class MainPage : Page
 
     // ---------------- Annotation tool switcher ----------------
 
-    private void HandTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Hand);
-    private void SelectTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Select);
-    private void HighlightTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Highlight);
-    private void NoteTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Note);
-    private void DrawTool_Click(object sender, RoutedEventArgs e) => SetActiveTool(ToolMode.Draw);
+    /// <summary>
+    /// The rail's selection IS the armed tool, so picking one arms it.
+    ///
+    /// Suppressed while the rail is being brought into line with a tool change
+    /// that came from somewhere else (a shortcut key, or placing a stamp handing
+    /// over to Select), which would otherwise re-enter and reset the pointer
+    /// interaction a second time.
+    /// </summary>
+    private void ToolRail_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressToolSelection)
+        {
+            return;
+        }
+
+        if (ToolRailList.SelectedItem is ToolDefinition tool)
+        {
+            SetActiveTool(tool.Mode);
+            ReturnFocusAfterPointerUse();
+        }
+    }
+
+    private bool _suppressToolSelection;
+
+    /// <summary>
+    /// Hands the keyboard back to the canvas after a control was used with the
+    /// POINTER, and only then.
+    ///
+    /// Clicking anything in a list leaves focus inside it, and a list eats the
+    /// arrow keys: after clicking a tool, Down stepped to the next tool instead
+    /// of scrolling the document. Returning focus unconditionally would break
+    /// the other direction, since a keyboard user arrowing through the rail
+    /// would be thrown out on the first press. The focus STATE distinguishes
+    /// them: Pointer means a click put it there.
+    /// </summary>
+    private void ReturnFocusAfterPointerUse()
+    {
+        if (FocusManager.GetFocusedElement(XamlRoot) is Control { FocusState: FocusState.Pointer })
+        {
+            RootGrid.Focus(FocusState.Programmatic);
+        }
+    }
 
     // ---------------- Stamps ----------------
 
@@ -472,10 +510,22 @@ public sealed partial class MainPage : Page
         return image;
     }
 
-    private void StampFlyout_Opening(object? sender, object e)
+    /// <summary>
+    /// Reloads the stamp strip from disk and preselects one.
+    ///
+    /// Read every time the stamp tool is armed rather than cached, because the
+    /// folder is deliberately an ordinary folder the user can drop files into,
+    /// and a cached list would show a stamp that is gone or miss one just added.
+    /// </summary>
+    private void RefreshStamps()
     {
         var stamps = StampLibrary.List();
+
+        _suppressStampSelection = true;
         StampChoices.ItemsSource = stamps;
+        _suppressStampSelection = false;
+
+        StampChoices.Visibility = stamps.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
         StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
         // Preselect: this session's choice if there is one, otherwise the one
@@ -488,11 +538,19 @@ public sealed partial class MainPage : Page
         if (wanted is not null)
         {
             StampChoices.SelectedItem = wanted;
+            _selectedStamp = wanted;
         }
     }
 
+    private bool _suppressStampSelection;
+
     private void StampChoice_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_suppressStampSelection)
+        {
+            return;
+        }
+
         if (StampChoices.SelectedItem is StampEntry entry)
         {
             _selectedStamp = entry;
@@ -500,6 +558,7 @@ public sealed partial class MainPage : Page
             // Choosing a stamp arms the tool: picking one and then having to
             // find the tool button as well would be a pointless second step.
             SetActiveTool(ToolMode.Stamp);
+            ReturnFocusAfterPointerUse();
         }
     }
 
@@ -523,10 +582,10 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        var stamps = StampLibrary.List();
-        StampChoices.ItemsSource = stamps;
-        StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        StampChoices.SelectedItem = stamps.FirstOrDefault(s => s.Path == added.Path);
+        // Select the new one rather than whatever was selected before: adding a
+        // stamp is only ever a prelude to using it.
+        _selectedStamp = added;
+        RefreshStamps();
     }
 
     /// <summary>
@@ -619,6 +678,68 @@ public sealed partial class MainPage : Page
         WidthChoices.ItemsSource = InkPresets.Widths;
         WidthChoices.SelectedIndex = 1;
         ShowPaletteFor(ViewModel.ActiveTool);
+
+        // Only now is the opacity slider allowed to speak. Anything it raised
+        // before this point came from the framework settling the control, not
+        // from the user, and acting on it would rewrite the tool's colour at
+        // startup.
+        _suppressOpacityChange = false;
+    }
+
+    /// <summary>
+    /// Applies the opacity slider to whichever colour the armed tool uses.
+    ///
+    /// Opacity lives in the colour's alpha rather than in a property of its
+    /// own, because alpha is what actually reaches the saved file; see
+    /// <see cref="InkPresets.WithOpacity"/>.
+    /// </summary>
+    private void Opacity_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (_suppressOpacityChange)
+        {
+            return;
+        }
+
+        bool highlighting = ViewModel.ActiveTool == ToolMode.Highlight;
+        string current = highlighting ? ViewModel.HighlightColorHex : ViewModel.InkColorHex;
+        string updated = InkPresets.WithOpacity(current, e.NewValue / 100.0);
+
+        if (highlighting)
+        {
+            ViewModel.HighlightColorHex = updated;
+        }
+        else
+        {
+            ViewModel.InkColorHex = updated;
+        }
+
+        ShowOpacity();
+    }
+
+    /// <summary>
+    /// Starts SET, so nothing the slider raises while the page is still being
+    /// built is mistaken for a deliberate change. Cleared once the pickers are
+    /// initialized.
+    /// </summary>
+    private bool _suppressOpacityChange = true;
+
+    /// <summary>Brings the slider and its readout into line with the armed tool's colour.</summary>
+    private void ShowOpacity()
+    {
+        string hex = ViewModel.ActiveTool == ToolMode.Highlight
+            ? ViewModel.HighlightColorHex
+            : ViewModel.InkColorHex;
+
+        int percent = (int)Math.Round(InkPresets.OpacityOf(hex) * 100);
+
+        // Saved and restored rather than cleared, so writing the slider during
+        // startup does not switch it on early.
+        bool prior = _suppressOpacityChange;
+        _suppressOpacityChange = true;
+        OpacitySlider.Value = Math.Clamp(percent, OpacitySlider.Minimum, OpacitySlider.Maximum);
+        _suppressOpacityChange = prior;
+
+        OpacityReadout.Text = $"{percent}%";
     }
 
     /// <summary>
@@ -641,10 +762,15 @@ public sealed partial class MainPage : Page
         _suppressColorChange = true;
         ColorChoices.ItemsSource = palette;
 
+        // Matched on RGB, NOT on the whole hex string. The opacity slider
+        // rewrites the alpha component, so an exact string match stopped
+        // finding the colour the moment opacity was touched and silently fell
+        // back to the first swatch, changing the user's colour behind their
+        // back.
         int index = 0;
         for (int i = 0; i < palette.Count; i++)
         {
-            if (string.Equals(palette[i].Hex, wanted, StringComparison.OrdinalIgnoreCase))
+            if (SameColor(palette[i].Hex, wanted))
             {
                 index = i;
                 break;
@@ -667,16 +793,34 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void ApplyColor(InkColor c, bool highlighting)
     {
+        // Opacity is a property of the TOOL, not of the swatch, so changing
+        // colour keeps whatever transparency was set. Otherwise every colour
+        // change silently snapped opacity back to the preset's own alpha, and
+        // choosing a different highlighter colour would undo the setting the
+        // user had just made.
+        string current = highlighting ? ViewModel.HighlightColorHex : ViewModel.InkColorHex;
+        string hex = SameColor(c.Hex, current)
+            ? current
+            : InkPresets.WithOpacity(c.Hex, InkPresets.OpacityOf(current));
+
         if (highlighting)
         {
-            ViewModel.HighlightColorHex = c.Hex;
+            ViewModel.HighlightColorHex = hex;
         }
         else
         {
-            ViewModel.InkColorHex = c.Hex;
+            ViewModel.InkColorHex = hex;
         }
 
-        UpdatePenSwatch();
+        ShowOpacity();
+    }
+
+    /// <summary>Compares two colours by RGB, ignoring their opacity.</summary>
+    private static bool SameColor(string a, string b)
+    {
+        var x = InkPresets.ParseHex(a);
+        var y = InkPresets.ParseHex(b);
+        return x.R == y.R && x.G == y.G && x.B == y.B;
     }
 
     /// <summary>
@@ -729,6 +873,7 @@ public sealed partial class MainPage : Page
         if (!_suppressColorChange && ColorChoices.SelectedItem is InkColor c)
         {
             ApplyColor(c, ViewModel.ActiveTool == ToolMode.Highlight);
+            ReturnFocusAfterPointerUse();
         }
     }
 
@@ -737,37 +882,59 @@ public sealed partial class MainPage : Page
         if (WidthChoices.SelectedItem is InkWidth w)
         {
             ViewModel.InkWidth = w.Value;
+            ReturnFocusAfterPointerUse();
         }
     }
 
-    /// <summary>Shows the colour of whichever tool is armed, not always the pen's.</summary>
-    private void UpdatePenSwatch() =>
-        PenSwatch.Background = HexBrush(
-            ViewModel.ActiveTool == ToolMode.Highlight
-                ? ViewModel.HighlightColorHex
-                : ViewModel.InkColorHex);
-
+    /// <summary>
+    /// Brings the rail and the property bar into line with the armed tool.
+    ///
+    /// Which sections of the property bar appear is read from the tool's
+    /// declared <see cref="ToolOptions"/> rather than from a list of tool names
+    /// here, so a new tool decides what it offers in the one record that
+    /// defines it.
+    /// </summary>
     private void UpdateToolRail()
     {
-        // Pen options are only meaningful for tools that lay down colour.
-        bool inks = ViewModel.ActiveTool is ToolMode.Draw or ToolMode.Highlight;
-        PenOptionsButton.Visibility = inks ? Visibility.Visible : Visibility.Collapsed;
+        var tool = ToolCatalog.For(ViewModel.ActiveTool);
 
-        if (inks)
+        // Setting the selection re-enters SelectionChanged, which would arm the
+        // tool again and reset the pointer interaction a second time.
+        _suppressToolSelection = true;
+        ToolRailList.SelectedItem = tool;
+        _suppressToolSelection = false;
+
+        PropertyBarToolName.Text = tool.Name;
+
+        bool color = tool.Offers(ToolOptions.Color);
+        ColorSection.Visibility = Show(color);
+        WidthSection.Visibility = Show(tool.Offers(ToolOptions.Width));
+
+        // Opacity rides on the colour, so it is only meaningful where there is
+        // a colour to apply it to.
+        OpacitySection.Visibility = Show(color);
+
+        bool stamps = tool.Offers(ToolOptions.Stamp);
+        StampSection.Visibility = Show(stamps);
+
+        // A bar with every section collapsed is an empty pill floating over the
+        // page, so the whole thing goes when the tool offers nothing.
+        PropertyBar.Visibility = Show(tool.Options != ToolOptions.None);
+
+        if (color)
         {
             ShowPaletteFor(ViewModel.ActiveTool);
+            ShowOpacity();
         }
 
-        var active = (SolidColorBrush)Application.Current.Resources["AccentFillColorDefaultBrush"];
-        var idle = new SolidColorBrush(Colors.Transparent);
-
-        HandToolButton.Background = ViewModel.ActiveTool == ToolMode.Hand ? active : idle;
-        SelectToolButton.Background = ViewModel.ActiveTool == ToolMode.Select ? active : idle;
-        HighlightToolButton.Background = ViewModel.ActiveTool == ToolMode.Highlight ? active : idle;
-        DrawToolButton.Background = ViewModel.ActiveTool == ToolMode.Draw ? active : idle;
-        NoteToolButton.Background = ViewModel.ActiveTool == ToolMode.Note ? active : idle;
-        StampToolButton.Background = ViewModel.ActiveTool == ToolMode.Stamp ? active : idle;
+        if (stamps)
+        {
+            RefreshStamps();
+        }
     }
+
+    private static Visibility Show(bool visible) =>
+        visible ? Visibility.Visible : Visibility.Collapsed;
 
     // ---------------- File menu ----------------
 
@@ -1323,29 +1490,10 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
-            // Single-key tool switching, Photoshop-style. Guarded by the
-            // text-focus check above, so typing "h" in the search box does not
-            // switch tools.
-            case VirtualKey.H when !_isCtrlDown:
-                SetActiveTool(ToolMode.Hand);
-                e.Handled = true;
-                break;
-            case VirtualKey.V when !_isCtrlDown:
-                SetActiveTool(ToolMode.Select);
-                e.Handled = true;
-                break;
-            case VirtualKey.B when !_isCtrlDown:
-                SetActiveTool(ToolMode.Draw);
-                e.Handled = true;
-                break;
-            case VirtualKey.U when !_isCtrlDown:
-                SetActiveTool(ToolMode.Highlight);
-                e.Handled = true;
-                break;
-            case VirtualKey.N when !_isCtrlDown:
-                SetActiveTool(ToolMode.Note);
-                e.Handled = true;
-                break;
+            // Single-key tool switching is handled below, from the catalog,
+            // rather than as cases here. A switch listing them meant the key
+            // and the tool were declared apart from each other, and the Stamp
+            // tool was simply forgotten when it was added.
 
             // Acrobat's zoom keys: Ctrl+0 fit page, Ctrl+1 actual size,
             // Ctrl+2 fit width. Matching them means zoom muscle memory from
@@ -1408,6 +1556,17 @@ public sealed partial class MainPage : Page
                 ViewModel.ClearAnnotationSelection();
                 e.Handled = true;
                 break;
+        }
+
+        // Single-key tool switching, Photoshop-style, straight from the
+        // catalog, so a tool's key is declared next to the tool itself. Last,
+        // and only for keys nothing above claimed, so a shortcut can never
+        // shadow a real command.
+        if (!e.Handled && !_isCtrlDown
+            && ToolCatalog.ForShortcut((char)e.Key) is { } picked)
+        {
+            SetActiveTool(picked.Mode);
+            e.Handled = true;
         }
     }
 

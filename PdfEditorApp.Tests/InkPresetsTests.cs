@@ -142,4 +142,64 @@ public class InkPresetsTests
         Assert.All(InkPresets.Widths, w => Assert.False(string.IsNullOrWhiteSpace(w.Name)));
         Assert.All(InkPresets.HighlightColors, c => Assert.False(string.IsNullOrWhiteSpace(c.Name)));
     }
+
+    // ---- Opacity, as carried by the colour's alpha ----
+
+    [Fact]
+    public void opacity_changes_only_the_alpha()
+    {
+        // The RGB must survive untouched, or the opacity slider would also be
+        // a colour picker.
+        string half = InkPresets.WithOpacity("#FFE00000", 0.5);
+        var (a, r, g, b) = InkPresets.ParseHex(half);
+
+        Assert.Equal(0xE0, r);
+        Assert.Equal(0x00, g);
+        Assert.Equal(0x00, b);
+        Assert.InRange(a, 127, 128);
+    }
+
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(0.25)]
+    [InlineData(0.53)]
+    [InlineData(1.0)]
+    public void opacity_survives_a_round_trip(double opacity)
+    {
+        // The slider reads the value back out of the colour every time the tool
+        // changes, so a lossy round trip would make it drift on each switch.
+        string hex = InkPresets.WithOpacity("#FF7CB800", opacity);
+        Assert.Equal(opacity, InkPresets.OpacityOf(hex), 2);
+    }
+
+    [Theory]
+    [InlineData(-3.0, 0.0)]
+    [InlineData(7.5, 1.0)]
+    public void opacity_outside_the_range_is_clamped(double given, double expected)
+    {
+        // Out of range must clamp rather than wrap: a byte cast of 7.5*255
+        // would come out near-transparent, i.e. the exact opposite of asked.
+        string hex = InkPresets.WithOpacity("#FF1A1A1A", given);
+        Assert.Equal(expected, InkPresets.OpacityOf(hex), 2);
+    }
+
+    [Fact]
+    public void a_preset_reports_the_opacity_it_was_authored_with()
+    {
+        Assert.Equal(1.0, InkPresets.OpacityOf(InkPresets.DefaultColor.Hex), 2);
+        Assert.True(InkPresets.OpacityOf(InkPresets.DefaultHighlightColor.Hex) < 1.0);
+    }
+
+    [Fact]
+    public void the_result_is_always_a_full_eight_digit_colour()
+    {
+        // The overlay and the annotation writer both parse these back, and a
+        // six-digit result would silently be read as fully opaque.
+        foreach (var c in InkPresets.Colors)
+        {
+            string hex = InkPresets.WithOpacity(c.Hex, 0.4);
+            Assert.Equal(9, hex.Length);
+            Assert.StartsWith("#", hex);
+        }
+    }
 }
