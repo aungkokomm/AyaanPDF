@@ -1608,7 +1608,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // the drag STARTED, so neither can creep across a long gesture.
         var moved = _loadedGrip == LoadedAnnotationPicker.Grip.None
             ? LoadedAnnotationPicker.Dragged(box, ox, oy, normX, normY)
-            : LoadedAnnotationPicker.Resized(box, _loadedGrip, normX, normY);
+            : LoadedAnnotationPicker.Resized(box, _loadedGrip, normX, normY,
+                                             AspectToPreserve(start));
 
         _selectedLoaded = start with
         {
@@ -1675,6 +1676,32 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
     }
 
+    /// <summary>
+    /// Selects the annotation most recently added to a page.
+    ///
+    /// New annotations go to the END of the page's list, so the last one is
+    /// the one just placed. Used to hand a freshly stamped image straight to
+    /// the Select tool, already picked up and ready to nudge.
+    /// </summary>
+    public void SelectNewestAnnotation(int pageIndex)
+    {
+        var all = LoadedFor(pageIndex);
+        if (all.Count == 0)
+        {
+            return;
+        }
+
+        var newest = all[^1];
+        _selectedLoaded = new LoadedSelection(
+            pageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom);
+        _loadedDrag = null;
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
+        _selectedAnnotationId = null;
+
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+    }
+
     /// <summary>Deletes the selected annotation from the file itself.</summary>
     private bool DeleteSelectedLoaded()
     {
@@ -1724,7 +1751,64 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Half a grip's on-screen size, in slot DIPs.</summary>
-    private const double GripHalf = 5.0;
+    private const double GripHalf = 4.5;
+
+    /// <summary>
+    /// Which corner grip of the current selection lies under a point, for
+    /// cursor feedback.
+    ///
+    /// Without this the handles are decoration: the pointer keeps the tool's
+    /// own cursor over them, so nothing says they can be dragged and nobody
+    /// tries. A resize handle that does not announce itself is not a handle.
+    /// </summary>
+    public LoadedAnnotationPicker.Grip GripUnder(int pageIndex, double normX, double normY)
+    {
+        if (_selectedLoaded is not LoadedSelection sel || sel.PageIndex != pageIndex)
+        {
+            return LoadedAnnotationPicker.Grip.None;
+        }
+
+        if (!CanResize(sel))
+        {
+            return LoadedAnnotationPicker.Grip.None;
+        }
+
+        return LoadedAnnotationPicker.GripAt(
+            new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom),
+            normX, normY);
+    }
+
+    /// <summary>Whether a point is inside the current selection, so it can be dragged.</summary>
+    public bool IsOverSelection(int pageIndex, double normX, double normY)
+    {
+        if (_selectedLoaded is not LoadedSelection sel || sel.PageIndex != pageIndex)
+        {
+            return false;
+        }
+
+        return normX >= sel.Left && normX <= sel.Right
+            && normY >= sel.Top && normY <= sel.Bottom;
+    }
+
+    /// <summary>
+    /// The aspect a resize must preserve, or 0 for a free resize.
+    ///
+    /// A stamp is a picture: dragging a corner freely stretches a signature
+    /// into something that no longer looks like the person's handwriting.
+    /// Text markup has no such shape to protect.
+    /// </summary>
+    private double AspectToPreserve(LoadedSelection sel)
+    {
+        foreach (var a in LoadedFor(sel.PageIndex))
+        {
+            if (a.Index == sel.Index && a.Subtype == Interop.AnnotSubtype.Stamp)
+            {
+                double w = sel.Right - sel.Left;
+                return w > 0 ? (sel.Bottom - sel.Top) / w : 0;
+            }
+        }
+        return 0;
+    }
 
     /// <summary>
     /// Whether this annotation can be resized at all.

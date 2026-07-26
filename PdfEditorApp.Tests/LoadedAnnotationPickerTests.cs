@@ -220,3 +220,74 @@ public class AnnotationResizeTests
             Box, LoadedAnnotationPicker.Grip.None, 0.9, 0.9));
     }
 }
+
+/// <summary>Aspect-preserving resize, which is what a picture needs.</summary>
+public class AspectPreservingResizeTests
+{
+    // A 2:1 signature: twice as wide as it is tall.
+    private static readonly AnnotationBox Signature = new(0, 0.20, 0.20, 0.60, 0.40);
+    private const double Aspect = 0.5;   // height / width
+
+    [Fact]
+    public void dragging_a_corner_keeps_a_signature_from_being_stretched()
+    {
+        // Dragged far past where a free resize would put the bottom edge. The
+        // height must follow the width, not the pointer, or the handwriting
+        // comes out distorted.
+        var r = LoadedAnnotationPicker.Resized(
+            Signature, LoadedAnnotationPicker.Grip.BottomRight, 0.80, 0.95, Aspect);
+
+        Assert.Equal(0.60, r.Width, 6);
+        Assert.Equal(0.30, r.Height, 6);
+        Assert.Equal(Aspect, r.Height / r.Width, 6);
+    }
+
+    [Fact]
+    public void the_anchored_corner_stays_put_while_the_aspect_holds()
+    {
+        // Dragging the TOP-left must grow upward from the fixed bottom edge,
+        // not downward from the top.
+        var r = LoadedAnnotationPicker.Resized(
+            Signature, LoadedAnnotationPicker.Grip.TopLeft, 0.10, 0.10, Aspect);
+
+        Assert.Equal(0.60, r.Right, 6);    // fixed
+        Assert.Equal(0.40, r.Bottom, 6);   // fixed
+        Assert.Equal(Aspect, r.Height / r.Width, 6);
+    }
+
+    [Fact]
+    public void a_free_resize_still_ignores_aspect_when_none_is_given()
+    {
+        // Text markup has no shape to protect, so passing 0 must behave
+        // exactly as before.
+        var r = LoadedAnnotationPicker.Resized(
+            Signature, LoadedAnnotationPicker.Grip.BottomRight, 0.90, 0.90, 0);
+
+        Assert.Equal(0.90, r.Right, 6);
+        Assert.Equal(0.90, r.Bottom, 6);
+    }
+
+    [Fact]
+    public void an_aspect_resize_pushed_off_the_page_shifts_rather_than_distorts()
+    {
+        // Clamping an edge to zero would silently change the aspect that was
+        // just enforced, so the box moves instead.
+        var r = LoadedAnnotationPicker.Resized(
+            Signature, LoadedAnnotationPicker.Grip.TopLeft, -0.4, -0.4, Aspect);
+
+        Assert.True(r.Left >= 0, $"left {r.Left} is off the page");
+        Assert.True(r.Top >= 0, $"top {r.Top} is off the page");
+        Assert.Equal(Aspect, r.Height / r.Width, 6);
+    }
+
+    [Fact]
+    public void aspect_is_held_even_at_the_minimum_size()
+    {
+        var r = LoadedAnnotationPicker.Resized(
+            Signature, LoadedAnnotationPicker.Grip.BottomRight, 0.0, 0.0, Aspect);
+
+        Assert.True(r.Width >= LoadedAnnotationPicker.MinSize);
+        Assert.True(r.Height > 0, "a collapsed height would make the stamp invisible");
+        Assert.Equal(Aspect, r.Height / r.Width, 6);
+    }
+}

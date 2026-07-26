@@ -243,7 +243,18 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
-                                        <!-- Marquee around the selected annotation. -->
+                                        <!--
+                                            Marquee around the selected annotation.
+
+                                            A hairline solid border, not a thick
+                                            dashed one. The mark being selected
+                                            is the thing worth looking at; the
+                                            selection should point at it, not
+                                            compete with it. Every serious
+                                            editor draws this the same way, and
+                                            a heavy dashed rectangle reads as a
+                                            debug overlay rather than a tool.
+                                        -->
                                         <ItemsControl ItemsSource="{x:Bind SelectionOutline}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
@@ -251,7 +262,7 @@
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate x:DataType="viewport:ScaledRect">
                                                     <Rectangle Stroke="{ThemeResource AccentFillColorDefaultBrush}"
-                                                               StrokeThickness="2" StrokeDashArray="3,2" Fill="Transparent"
+                                                               StrokeThickness="1" Fill="Transparent"
                                                                Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
@@ -280,11 +291,28 @@
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate x:DataType="viewport:ScaledRect">
-                                                    <Rectangle Fill="{ThemeResource AccentFillColorDefaultBrush}"
-                                                               Stroke="White" StrokeThickness="1"
+                                                    <!--
+                                                        WHITE fill with an accent
+                                                        border, the convention in
+                                                        every design tool. A solid
+                                                        accent square reads as a
+                                                        blob sitting on the page;
+                                                        a white one reads as a
+                                                        control, and stays visible
+                                                        over dark artwork as well
+                                                        as light paper.
+                                                    -->
+                                                    <Rectangle Fill="White"
+                                                               Stroke="{ThemeResource AccentFillColorDefaultBrush}"
+                                                               StrokeThickness="1.5"
+                                                               RadiusX="1" RadiusY="1"
                                                                Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top">
+                                                        <Rectangle.Shadow>
+                                                            <ThemeShadow />
+                                                        </Rectangle.Shadow>
+                                                    </Rectangle>
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>

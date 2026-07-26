@@ -141,7 +141,14 @@ public static class LoadedAnnotationPicker
     /// inside out is rejected by both native calls and would look like the
     /// annotation vanished.
     /// </summary>
-    public static AnnotationBox Resized(AnnotationBox start, Grip grip, double x, double y)
+    /// <param name="aspect">
+    /// Height divided by width to hold constant, or 0 for a free resize. A
+    /// picture keeps its aspect: dragging a corner freely turns a signature
+    /// into a stretched version of someone's handwriting, which is not a thing
+    /// they can put their name to.
+    /// </param>
+    public static AnnotationBox Resized(
+        AnnotationBox start, Grip grip, double x, double y, double aspect = 0)
     {
         if (grip == Grip.None)
         {
@@ -173,9 +180,51 @@ public static class LoadedAnnotationPicker
                 break;
         }
 
+        // Hold the aspect by deriving the height from the width, anchored to
+        // whichever corner is NOT being dragged, so the fixed corner stays put.
+        if (aspect > 0)
+        {
+            // The minimum has to be applied to the WIDTH alone, chosen so the
+            // resulting height also clears it. Flooring each dimension
+            // separately quietly breaks the aspect at small sizes: a 2:1 stamp
+            // squeezed to the minimum came out 1:1, because the height was
+            // raised to the floor after the width had already set it.
+            double minWidth = Math.Max(MinSize, MinSize / aspect);
+            double width = Math.Max(minWidth, right - left);
+            double height = width * aspect;
+
+            if (grip is Grip.TopLeft or Grip.BottomLeft)
+            {
+                left = right - width;
+            }
+            else
+            {
+                right = left + width;
+            }
+
+            if (grip is Grip.TopLeft or Grip.TopRight)
+            {
+                top = bottom - height;
+            }
+            else
+            {
+                bottom = top + height;
+            }
+        }
+
         // Never off the top or left, where the grips would be unreachable.
-        left = Math.Max(0, left);
-        top = Math.Max(0, top);
+        // Shifted rather than clipped, so the aspect just fixed above is not
+        // undone by the clamp.
+        if (left < 0)
+        {
+            right -= left;
+            left = 0;
+        }
+        if (top < 0)
+        {
+            bottom -= top;
+            top = 0;
+        }
 
         return start with { Left = left, Top = top, Right = right, Bottom = bottom };
     }

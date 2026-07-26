@@ -563,7 +563,19 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        ViewModel.PlaceStamp(pageIndex, x, y, pixels);
+        if (!ViewModel.PlaceStamp(pageIndex, x, y, pixels))
+        {
+            return;
+        }
+
+        // Hand over to Select and pick up what was just placed.
+        //
+        // Staying on the stamp tool meant the next click dropped ANOTHER copy,
+        // when what anyone wants immediately after placing something is to
+        // nudge and size it. Placing a second copy is the rarer intent and is
+        // still one click on the stamp button away.
+        SetActiveTool(ToolMode.Select);
+        ViewModel.SelectNewestAnnotation(pageIndex);
     }
 
     private void SetActiveTool(ToolMode tool)
@@ -1435,8 +1447,46 @@ public sealed partial class MainPage : Page
     /// tool leaves the pointer lying about the mode it is in, which is the
     /// main feedback a canvas app has between clicks.
     /// </summary>
-    private void UpdateCursor()
+    /// <summary>
+    /// Cursor for what lies under the pointer, or null to use the tool's own.
+    ///
+    /// Resize handles need this: without it the pointer keeps the tool's
+    /// cursor over them, nothing suggests they can be dragged, and the whole
+    /// feature reads as broken even though it works.
+    /// </summary>
+    private InputSystemCursorShape? HoverCursor(PointerRoutedEventArgs e)
     {
+        if (ViewModel.ActiveTool != ToolMode.Select || _isSpaceHandActive)
+        {
+            return null;
+        }
+
+        var content = ContentPoint(e);
+        double nx = content.X / ViewModel.OverlayScale;
+        double ny = content.Y / ViewModel.OverlayScale;
+
+        return ViewModel.GripUnder(content.Page, nx, ny) switch
+        {
+            // Diagonals matching the corner, as every editor does, so the
+            // cursor says which way the drag will go.
+            LoadedAnnotationPicker.Grip.TopLeft or LoadedAnnotationPicker.Grip.BottomRight
+                => InputSystemCursorShape.SizeNorthwestSoutheast,
+            LoadedAnnotationPicker.Grip.TopRight or LoadedAnnotationPicker.Grip.BottomLeft
+                => InputSystemCursorShape.SizeNortheastSouthwest,
+            _ => ViewModel.IsOverSelection(content.Page, nx, ny)
+                ? InputSystemCursorShape.SizeAll
+                : null,
+        };
+    }
+
+    private void UpdateCursor(PointerRoutedEventArgs? e = null)
+    {
+        if (e is not null && HoverCursor(e) is InputSystemCursorShape hover)
+        {
+            ViewportHost.SetCursorShape(hover);
+            return;
+        }
+
         var shape = (_isSpaceHandActive, ViewModel.ActiveTool) switch
         {
             (true, _) => InputSystemCursorShape.SizeAll,
@@ -1445,6 +1495,7 @@ public sealed partial class MainPage : Page
             (_, ToolMode.Highlight) => InputSystemCursorShape.IBeam,
             (_, ToolMode.Draw) => InputSystemCursorShape.Cross,
             (_, ToolMode.Note) => InputSystemCursorShape.Cross,
+            (_, ToolMode.Stamp) => InputSystemCursorShape.Cross,
             _ => InputSystemCursorShape.Arrow,
         };
         ViewportHost.SetCursorShape(shape);
@@ -1600,6 +1651,16 @@ public sealed partial class MainPage : Page
 
     private void ViewportHost_PointerMoved(object sender, PointerRoutedEventArgs e)
     {
+        // Cursor first, and BEFORE the drag guard below. That guard only lets
+        // through the pointer that is mid-drag, and a hovering pointer has no
+        // drag id, so putting the cursor update after it meant the resize
+        // handles never changed the cursor at all.
+        if (!_isPanning && !_isMovingAnnotation && !_isMarqueeing
+            && !_isSelectingText && !_isDrawing)
+        {
+            UpdateCursor(e);
+        }
+
         if (e.Pointer.PointerId != _dragPointerId)
         {
             return;
