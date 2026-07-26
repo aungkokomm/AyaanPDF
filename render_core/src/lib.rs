@@ -1647,6 +1647,45 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 /// the box round-trips as an editable object because the words are stored in
 /// its `/Contents` tag.
 ///
+/// Reads an annotation's `/Contents` string, as UTF-8 bytes.
+///
+/// The one field this app stores machine data in: a shape's kind and a text
+/// box's words both live here. Reading it back is what makes a text box
+/// re-editable, since the words themselves are the thing that has to be
+/// recovered. Returns an empty successful buffer when the annotation has no
+/// contents. Free with `free_byte_buffer`.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_annotation_contents(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_annotation_contents_inner(doc_handle, page_index, index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_annotation_contents_inner(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let text = annotation.contents().unwrap_or_default();
+    let mut boxed = text.into_bytes().into_boxed_slice();
+    let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
+    std::mem::forget(boxed);
+    buffer
+}
+
 /// `capture_width` is the render width the box and font size were captured at.
 /// `font_size_px` is in that same capture space. Lines are split on `\n`.
 #[unsafe(no_mangle)]
@@ -5059,6 +5098,39 @@ Third, with punctuation: 10:30!";
         close_document(reopened);
         close_document(handle);
         free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn get_annotation_contents_reads_a_text_box_back_across_the_boundary() {
+        // The app reads this to re-open the editor on an existing box. It has
+        // to return the exact tag bytes, or the words come back wrong.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_box(handle, "edit me\nplease", 20.0), STATUS_OK_PDFIUM);
+
+        let buf = get_annotation_contents(handle, 0, 0);
+        assert_eq!(buf.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
+        let contents = std::str::from_utf8(bytes).unwrap().to_string();
+        free_byte_buffer(buf);
+
+        let parsed = parse_textbox_tag(&contents).expect("tag did not parse");
+        assert_eq!(parsed.5, "edit me\nplease");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn get_annotation_contents_is_empty_for_a_mark_with_none_and_rejects_bad_input() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // An out-of-range index is refused, not a crash.
+        let bad = get_annotation_contents(handle, 0, 5);
+        assert_eq!(bad.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(bad);
+
+        assert_eq!(get_annotation_contents(0, 0, 0).status, STATUS_INVALID_INPUT);
+
+        close_document(handle);
     }
 
     #[test]

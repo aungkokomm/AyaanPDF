@@ -2593,14 +2593,134 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        // The click is the TOP-LEFT of the box, and it is given a default
-        // extent so PDFium has a rectangle to build the appearance in. The box
-        // only needs to be big enough to hold the text; the exact size is not
-        // load-bearing, since the text is what is measured on reopen.
-        var (left, top, right, bottom) = TextBoxPlacement.Compute(
-            Norm(x), Norm(y), text, fontSizeNorm);
-
+        // x, y are SLOT DIPs from the pointer; the add path works in normalized
+        // coordinates, so convert here at the one place that receives them.
         PushHistory(HistoryScope.Document, "Add text");
+        return AddTextBoxNormalized(pageIndex, Norm(x), Norm(y), text, colorHex, fontSizeNorm);
+    }
+
+    /// <summary>
+    /// The details needed to re-open the editor on an existing text box.
+    /// Coordinates are the box's top-left, NORMALIZED.
+    /// </summary>
+    public readonly record struct TextBoxEditTarget(
+        int PageIndex, int Index, double Left, double Top,
+        string Text, string ColorHex, double FontSizeNorm);
+
+    /// <summary>
+    /// If a loaded text box is under the point, returns what is needed to edit
+    /// it; otherwise null.
+    ///
+    /// This is how a placed text box becomes modifiable: the words are read
+    /// back out of the annotation's tag, which is the only place they survive
+    /// once the box is committed. Anything that is not one of our text boxes,
+    /// a shape, a highlight, someone else's annotation, returns null and is
+    /// left to the ordinary select-and-move path.
+    /// </summary>
+    public TextBoxEditTarget? HitLoadedTextBox(int pageIndex, double normX, double normY)
+    {
+        if (_documentHandle == 0)
+        {
+            return null;
+        }
+
+        var boxes = LoadedFor(pageIndex)
+            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom))
+            .ToList();
+
+        if (LoadedAnnotationPicker.PickTopmost(boxes, normX, normY) is not AnnotationBox hit)
+        {
+            return null;
+        }
+
+        string? contents = ReadAnnotationContents(pageIndex, hit.Index);
+        if (!TextBoxTagReader.TryParse(contents, out var tag))
+        {
+            return null;
+        }
+
+        return new TextBoxEditTarget(
+            pageIndex, hit.Index, hit.Left, hit.Top, tag.Text, tag.ColorHex, tag.FontSizeNorm);
+    }
+
+    /// <summary>Replaces a text box with a freshly typed one, as one undo step.</summary>
+    public bool ReplaceTextBox(int pageIndex, int oldIndex, double normLeft, double normTop,
+                               string text, string colorHex, double fontSizeNorm)
+    {
+        if (_documentHandle == 0)
+        {
+            return false;
+        }
+
+        // One snapshot for the whole edit, so undo restores the original text in
+        // a single step rather than leaving the box deleted.
+        PushHistory(HistoryScope.Document, "Edit text");
+
+        int del = RenderCoreNative.delete_annotation(_documentHandle, pageIndex, oldIndex);
+        if (del != RenderStatus.OkPdfium)
+        {
+            Status = "Could not edit that text.";
+            return false;
+        }
+
+        // The selection pointed at the annotation just removed; clear it before
+        // the indices shift underneath it.
+        _selectedLoaded = null;
+        _loadedDrag = null;
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+
+        // Empty text is a deletion: the box is gone and nothing replaces it.
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            IsDirty = true;
+            InvalidateLoadedPage(pageIndex);
+            RefreshSelectionOutline();
+            return true;
+        }
+
+        return AddTextBoxNormalized(pageIndex, normLeft, normTop, text, colorHex, fontSizeNorm);
+    }
+
+    /// <summary>Reads an annotation's /Contents, or null on any failure.</summary>
+    private string? ReadAnnotationContents(int pageIndex, int index)
+    {
+        var buffer = RenderCoreNative.get_annotation_contents(_documentHandle, pageIndex, index);
+        try
+        {
+            if (buffer.Status != RenderStatus.OkPdfium || buffer.Data == IntPtr.Zero || buffer.Len == 0)
+            {
+                return buffer.Status == RenderStatus.OkPdfium ? string.Empty : null;
+            }
+
+            byte[] bytes = new byte[(int)buffer.Len];
+            System.Runtime.InteropServices.Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buffer);
+        }
+    }
+
+    /// <summary>
+    /// The shared add path. Coordinates are NORMALIZED and the caller owns the
+    /// history push, so both the plain place and the replace go through exactly
+    /// the same write.
+    /// </summary>
+    private bool AddTextBoxNormalized(int pageIndex, double normLeft, double normTop,
+                                      string text, string colorHex, double fontSizeNorm)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return false;
+        }
+
+        // The click is the TOP-LEFT of the box, given a default extent so PDFium
+        // has a rectangle to build the appearance in. The box only needs to hold
+        // the text; the exact size is not load-bearing, since the text is what
+        // is measured on reopen.
+        var (left, top, right, bottom) = TextBoxPlacement.Compute(normLeft, normTop, text, fontSizeNorm);
 
         const int CaptureWidth = 1000;
         var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
@@ -2613,7 +2733,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             utf8, (nuint)utf8.Length,
             (float)(fontSizeNorm * CaptureWidth), r, g, b, a);
 
-        Diag.Log($"place text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" -> {status}");
+        Diag.Log($"text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" -> {status}");
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -2625,6 +2745,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         InvalidateLoadedPage(pageIndex);
         return true;
     }
+
+    /// <summary>Normalized page coordinate to slot-space DIPs, for positioning overlays.</summary>
+    public double ToSlot(double normalized) => normalized * SlotLayoutWidth;
 
     // ---------------- Undo / redo ----------------
 

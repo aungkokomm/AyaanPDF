@@ -103,7 +103,9 @@
                 PointerMoved="ViewportHost_PointerMoved"
                 PointerReleased="ViewportHost_PointerReleased"
                 PointerCanceled="ViewportHost_PointerReleased"
-                PointerCaptureLost="ViewportHost_PointerCaptureLost">
+                PointerCaptureLost="ViewportHost_PointerCaptureLost"
+                DoubleTapped="ViewportHost_DoubleTapped"
+                IsDoubleTapEnabled="True">
 
                 <!--
                     Continuous page stack.

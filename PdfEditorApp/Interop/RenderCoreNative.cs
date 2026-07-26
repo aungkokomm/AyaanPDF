@@ -344,6 +344,14 @@ internal static partial class RenderCoreNative
     public static extern void free_byte_buffer(ByteBuffer buffer);
 
     /// <summary>
+    /// Reads an annotation's /Contents string as UTF-8. Used to recover a text
+    /// box's words so it can be re-edited. Free the result with
+    /// <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_annotation_contents(ulong docHandle, int pageIndex, int index);
+
+    /// <summary>
     /// Reopens a snapshot. The bytes are copied natively, so the same managed
     /// array can be restored repeatedly (undo, redo, undo again).
     /// </summary>

@@ -695,11 +695,23 @@ public sealed partial class MainPage : Page
     private double _textEditorY;
 
     /// <summary>
+    /// When set, the editor is re-editing an existing text box rather than
+    /// placing a new one, and committing REPLACES that box.
+    /// </summary>
+    private ViewportViewModel.TextBoxEditTarget? _editingTarget;
+
+    /// <summary>
     /// Opens a live editor where the text will land, so what is typed is seen
     /// in place rather than in a dialog. Committed on Escape, on Enter without
     /// Shift, or when focus leaves it.
     /// </summary>
-    private void BeginTextEdit(int page, double normX, double normY)
+    /// <param name="slotX">Box left, in slot DIPs.</param>
+    /// <param name="slotY">Box top, in slot DIPs.</param>
+    /// <param name="initialText">Existing words, when re-editing.</param>
+    /// <param name="editing">The box being re-edited, or null to place a new one.</param>
+    private void BeginTextEdit(int page, double slotX, double slotY,
+                              string? initialText = null,
+                              ViewportViewModel.TextBoxEditTarget? editing = null)
     {
         CommitTextEdit();
 
@@ -718,19 +730,27 @@ public sealed partial class MainPage : Page
             // The editor's text is sized to match what will be placed, so the
             // box is a true preview: font-size fraction times the slot width.
             FontSize = System.Math.Max(8, ViewModel.TextFontSize * scale),
+            Text = initialText ?? string.Empty,
         };
 
-        Canvas.SetLeft(_textEditor, normX * scale);
-        Canvas.SetTop(_textEditor, (normY * scale) + pageTop);
+        Canvas.SetLeft(_textEditor, slotX * scale);
+        Canvas.SetTop(_textEditor, (slotY * scale) + pageTop);
         InkCanvas.Children.Add(_textEditor);
 
         _textEditorPage = page;
-        _textEditorX = normX;
-        _textEditorY = normY;
+        _textEditorX = slotX;
+        _textEditorY = slotY;
+
+        // Set AFTER the initial CommitTextEdit above, so closing any prior
+        // editor does not adopt this edit's target.
+        _editingTarget = editing;
 
         _textEditor.KeyDown += TextEditor_KeyDown;
         _textEditor.LostFocus += (_, _) => CommitTextEdit();
         _textEditor.Focus(FocusState.Programmatic);
+
+        // Caret at the end, so re-editing appends rather than overwriting.
+        _textEditor.SelectionStart = _textEditor.Text.Length;
     }
 
     private void TextEditor_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -767,11 +787,29 @@ public sealed partial class MainPage : Page
         }
 
         var editor = _textEditor;
+        var target = _editingTarget;
         _textEditor = null; // First, so the LostFocus this triggers is a no-op.
+        _editingTarget = null;
         editor.KeyDown -= TextEditor_KeyDown;
 
         string text = editor.Text.TrimEnd('\r', '\n');
         InkCanvas.Children.Remove(editor);
+
+        // Re-editing an existing box: replace it, in one undo step. Empty text
+        // deletes it, which is the natural way to clear a box you no longer
+        // want, so this path runs even when the text is blank.
+        if (target is ViewportViewModel.TextBoxEditTarget t)
+        {
+            if (ViewModel.ReplaceTextBox(t.PageIndex, t.Index, t.Left, t.Top,
+                                         text, ViewModel.InkColorHex, ViewModel.TextFontSize)
+                && !string.IsNullOrWhiteSpace(text))
+            {
+                SetActiveTool(ToolMode.Select);
+                ViewModel.SelectNewestAnnotation(t.PageIndex);
+            }
+
+            return;
+        }
 
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -2022,15 +2060,57 @@ public sealed partial class MainPage : Page
     /// </summary>
     private readonly record struct PagePoint(int Page, double X, double Y);
 
-    private PagePoint ContentPoint(PointerRoutedEventArgs e)
+    private PagePoint ContentPoint(PointerRoutedEventArgs e) =>
+        ContentPointAt(e.GetCurrentPoint(ViewportHost).Position);
+
+    private PagePoint ContentPointAt(Point p)
     {
-        var p = e.GetCurrentPoint(ViewportHost).Position;
         double slotX = p.X - ViewportHost.Padding.Left;
         double slotY = p.Y - ViewportHost.Padding.Top;
 
         return ViewModel.HitTestSlotSpace(slotX, slotY, out int pageIndex, out double localX, out double localY)
             ? new PagePoint(pageIndex, localX, localY)
             : new PagePoint(ViewModel.CurrentPageIndex, slotX, slotY);
+    }
+
+    /// <summary>
+    /// Double-click a text box to edit its words again.
+    ///
+    /// The one gesture that makes placed text modifiable rather than frozen.
+    /// Only a loaded TEXT box responds; a shape or highlight under the pointer
+    /// returns null and the double-click does nothing, leaving select-and-move
+    /// as the way to handle those.
+    /// </summary>
+    private void ViewportHost_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+    {
+        if (ViewModel.ActiveTool is not (ToolMode.Select or ToolMode.Text))
+        {
+            return;
+        }
+
+        var content = ContentPointAt(e.GetPosition(ViewportHost));
+        double nx = content.X / ViewModel.OverlayScale;
+        double ny = content.Y / ViewModel.OverlayScale;
+
+        if (ViewModel.HitLoadedTextBox(content.Page, nx, ny) is not ViewportViewModel.TextBoxEditTarget target)
+        {
+            return;
+        }
+
+        // The preceding clicks may have started a select-and-move; abandon it,
+        // and drop the marquee, so the box is edited rather than dragged.
+        ResetPointerInteraction();
+        ViewModel.ClearAnnotationSelection();
+
+        // The tool takes on the box's colour and size, so the property bar shows
+        // what is being edited and the rewritten box keeps them unless changed.
+        ViewModel.InkColorHex = target.ColorHex;
+        ViewModel.TextFontSize = target.FontSizeNorm;
+        UpdateToolRail();
+
+        BeginTextEdit(target.PageIndex, ViewModel.ToSlot(target.Left), ViewModel.ToSlot(target.Top),
+                      initialText: target.Text, editing: target);
+        e.Handled = true;
     }
 
     private bool ToolWantsPointer =>
