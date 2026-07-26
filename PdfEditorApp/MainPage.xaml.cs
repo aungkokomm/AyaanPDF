@@ -571,24 +571,38 @@ public sealed partial class MainPage : Page
     {
         var stamps = StampLibrary.List();
 
+        // The guard is held across the SELECTION too, not just the rebind.
+        //
+        // This is the stack overflow ("a new guard page for the stack cannot be
+        // created"). Arming the stamp tool calls UpdateToolRail, which calls
+        // RefreshStamps; setting SelectedItem here fires StampChoice_SelectionChanged,
+        // which arms the stamp tool again, and round it goes until the stack is
+        // gone. Nothing in this method is a user action, so none of it may
+        // re-enter the selection handler.
         _suppressStampSelection = true;
-        StampChoices.ItemsSource = stamps;
-        _suppressStampSelection = false;
-
-        StampChoices.Visibility = stamps.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
-        StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-
-        // Preselect: this session's choice if there is one, otherwise the one
-        // remembered from last time. Someone who keeps a single signature
-        // should never have to pick it twice.
-        var wanted = _selectedStamp is not null
-            ? stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path)
-            : StampLibrary.LastUsed(stamps);
-
-        if (wanted is not null)
+        try
         {
-            StampChoices.SelectedItem = wanted;
-            _selectedStamp = wanted;
+            StampChoices.ItemsSource = stamps;
+
+            StampChoices.Visibility = stamps.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+            StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            // Preselect: this session's choice if there is one, otherwise the
+            // one remembered from last time. Someone who keeps a single
+            // signature should never have to pick it twice.
+            var wanted = _selectedStamp is not null
+                ? stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path)
+                : StampLibrary.LastUsed(stamps);
+
+            if (wanted is not null)
+            {
+                StampChoices.SelectedItem = wanted;
+                _selectedStamp = wanted;
+            }
+        }
+        finally
+        {
+            _suppressStampSelection = false;
         }
     }
 
