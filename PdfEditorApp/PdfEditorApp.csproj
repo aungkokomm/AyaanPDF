@@ -4,6 +4,18 @@
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>PdfEditorApp</RootNamespace>
+
+    <!--
+      The exe is what the user sees: in the Start menu, in Task Manager, in the
+      "open with" list and in the install folder. It carries the product's name,
+      not the project's.
+
+      RootNamespace deliberately stays PdfEditorApp. Renaming that would rewrite
+      every namespace in the app and every using in the tests for a string
+      nobody outside the source ever reads.
+    -->
+    <AssemblyName>Ayaan PDF</AssemblyName>
+    <Product>Ayaan PDF</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <Platforms>x86;x64;ARM64</Platforms>
@@ -39,7 +51,7 @@
       still at the SDK default of 1.0.0 while the installer said 1.15.0, and
       the About dialog dutifully reported the wrong one.
     -->
-    <Version>1.30.0</Version>
+    <Version>1.31.0</Version>
 
     <!--
       The SDK otherwise appends "+<git sha>" to the informational version, which

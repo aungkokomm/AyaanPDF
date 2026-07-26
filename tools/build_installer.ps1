@@ -49,8 +49,9 @@ if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
     "/p:PublishDir=$publishDir\" /v:minimal /nologo
 if ($LASTEXITCODE -ne 0) { throw "Publish failed (exit $LASTEXITCODE)." }
 
-$exe = Join-Path $publishDir 'PdfEditorApp.exe'
-if (-not (Test-Path $exe)) { throw "PdfEditorApp.exe missing from publish output." }
+# Must match ExeName in installer\PdfEditor.iss, which reads the version off it.
+$exe = Join-Path $publishDir 'Ayaan PDF.exe'
+if (-not (Test-Path $exe)) { throw "'Ayaan PDF.exe' missing from publish output." }
 foreach ($native in 'render_core.dll', 'pdfium.dll', 'sample.pdf') {
     if (-not (Test-Path (Join-Path $publishDir $native))) { throw "$native missing from publish output." }
 }
@@ -59,6 +60,11 @@ Write-Host "==> Compiling installer with Inno Setup..." -ForegroundColor Cyan
 & $iscc (Join-Path $root 'installer\PdfEditor.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed (exit $LASTEXITCODE)." }
 
-$setup = Get-ChildItem (Join-Path $root 'dist') -Filter 'PdfEditor-Setup-*.exe' |
+# Must match OutputBaseFilename in the .iss. This globbed the old
+# "PdfEditor-Setup-*" name long after the installer was renamed, so every run
+# ended by proudly reporting a stale build from months earlier: the script said
+# 1.14.0 while it had just compiled 1.31.0.
+$setup = Get-ChildItem (Join-Path $root 'dist') -Filter 'AyaanPDF-Setup-*.exe' |
     Sort-Object LastWriteTime | Select-Object -Last 1
+if (-not $setup) { throw "No AyaanPDF-Setup-*.exe in dist after a successful compile." }
 Write-Host ("==> Done: {0} ({1} MB)" -f $setup.FullName, [math]::Round($setup.Length / 1MB, 1)) -ForegroundColor Green

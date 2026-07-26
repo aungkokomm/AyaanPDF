@@ -9,7 +9,7 @@
 
 #define AppName    "Ayaan PDF"
 #define Publisher  "Aung Ko Ko"
-#define ExeName    "PdfEditorApp.exe"
+#define ExeName    "Ayaan PDF.exe"
 #define SrcDir     "..\PdfEditorApp\publish"
 #define AppIcon    "..\PdfEditorApp\Assets\AppIcon.ico"
 
@@ -53,7 +53,15 @@ VersionInfoVersion={#AppVersion}
 ; consistent and never prompts. The destination page still allows a portable
 ; install to any writable folder.
 PrivilegesRequired=lowest
-UsePreviousAppDir=yes
+; Deliberately NO, for now. Every directory recorded by an earlier install was
+; written under the app's old name, so honouring it proposed
+; "...\Programs\PdfEditor" no matter what DefaultDirName says, and the wrong
+; name would have propagated through every future upgrade. The destination page
+; is still shown, so a portable install to a chosen folder is unaffected, and an
+; upgrade of a default install lands on the same default path.
+;
+; Worth turning back on once no machine has a PdfEditor-era directory left.
+UsePreviousAppDir=no
 DisableDirPage=no
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
