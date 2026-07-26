@@ -1537,6 +1537,252 @@ fn add_stamp_annotation_inner(
     STATUS_OK_PDFIUM
 }
 
+/// Shape kinds. These numbers cross the FFI boundary and are mirrored by
+/// `ShapeKind` in the C# viewport library, so they may be appended to but never
+/// reordered.
+pub const SHAPE_RECTANGLE: i32 = 0;
+pub const SHAPE_ELLIPSE: i32 = 1;
+pub const SHAPE_LINE: i32 = 2;
+pub const SHAPE_ARROW: i32 = 3;
+
+/// How far an arrow's barbs spread from the shaft, in radians (about 26°).
+const ARROW_HEAD_ANGLE: f32 = 0.45;
+
+/// Barb length as a multiple of the stroke width, with a floor so a hairline
+/// arrow still has a visible head rather than a dot.
+const ARROW_HEAD_SCALE: f32 = 6.0;
+const ARROW_HEAD_MIN: f32 = 6.0;
+
+/// One shape to add, in render-pixel space.
+///
+/// Carries the drag's START and END rather than a normalized rectangle, because
+/// a line and an arrow have DIRECTION: an arrow drawn right-to-left points
+/// left, and a rectangle built from min/max would have thrown that away. The
+/// rectangle and ellipse kinds normalize the two corners themselves.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeSpec {
+    pub page_index: i32,
+    pub kind: i32,
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+    pub width_px: f32,
+}
+
+/// The two barb endpoints of an arrowhead at (`tip_x`, `tip_y`), for a shaft
+/// coming from (`tail_x`, `tail_y`).
+///
+/// Split out and tested on its own because it is the only part of a shape that
+/// is not simply its bounding box, and because the app draws the same head in
+/// its live preview: two implementations of one piece of geometry is two things
+/// that can disagree on screen.
+fn arrow_head(tail_x: f32, tail_y: f32, tip_x: f32, tip_y: f32, width: f32)
+    -> ((f32, f32), (f32, f32))
+{
+    let dx = tip_x - tail_x;
+    let dy = tip_y - tail_y;
+    let len = (dx * dx + dy * dy).sqrt();
+
+    // A zero-length shaft has no direction to point in. Pick one rather than
+    // dividing by zero and writing NaN coordinates into the file.
+    let (ux, uy) = if len < 1e-6 { (1.0, 0.0) } else { (dx / len, dy / len) };
+
+    let barb = (width * ARROW_HEAD_SCALE).max(ARROW_HEAD_MIN);
+    let (sin, cos) = ARROW_HEAD_ANGLE.sin_cos();
+
+    // Rotate the REVERSED shaft direction by plus and minus the head angle, so
+    // the barbs sweep back from the tip.
+    let (bx, by) = (-ux * barb, -uy * barb);
+    (
+        (tip_x + bx * cos - by * sin, tip_y + bx * sin + by * cos),
+        (tip_x + bx * cos + by * sin, tip_y - bx * sin + by * cos),
+    )
+}
+
+/// Adds rectangles, ellipses, lines and arrows as real PDF annotation objects.
+///
+/// All four are `/Ink` annotations carrying one path object. `/Square` would be
+/// the better label for a rectangle, and was tried first, but this binding
+/// exposes `objects_mut` on ink and stamp annotations ONLY, so a square
+/// annotation cannot be given a path to draw. A square with no path relies on
+/// the viewer synthesizing an appearance from `/C` and `/BS`, which is exactly
+/// the kind of assumption that made created highlights render nothing at all.
+/// Ink is the path this app has already proven draws, in this app and after a
+/// round trip.
+///
+/// The cost is that a shape carries no record of its KIND in the file, so
+/// reopening gives back a mark that can be moved and deleted but not resized as
+/// a shape. Storing the kind needs a custom annotation key, which this binding
+/// does not reach.
+///
+/// `capture_width` is the render width, in pixels, the coordinates were
+/// captured at, matching every other annotation path.
+#[unsafe(no_mangle)]
+pub extern "C" fn add_shape_annotations(
+    doc_handle: u64,
+    capture_width: i32,
+    specs: *const ShapeSpec,
+    spec_count: usize,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if specs.is_null() || spec_count == 0 {
+        return STATUS_OK_PDFIUM;
+    }
+
+    panic::catch_unwind(|| add_shape_annotations_inner(doc_handle, capture_width, specs, spec_count))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn add_shape_annotations_inner(
+    doc_handle: u64,
+    capture_width: i32,
+    specs: *const ShapeSpec,
+    spec_count: usize,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let specs: &[ShapeSpec] = unsafe { std::slice::from_raw_parts(specs, spec_count) };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    for spec in specs {
+        if !matches!(spec.kind, SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_LINE | SHAPE_ARROW) {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let Ok(mut page) = doc_guard.pages().get(spec.page_index as u16) else {
+            continue;
+        };
+
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            continue;
+        }
+
+        let media = page.boundaries().media().map(|b| b.bounds);
+        let (origin_x, origin_top) = match media {
+            Ok(b) => (b.left().value, b.top().value),
+            Err(_) => (0.0, page.height().value),
+        };
+        let scale = page_w / capture_width as f32;
+
+        let to_pdf_x = |x: f32| origin_x + x * scale;
+        let to_pdf_y = |y: f32| origin_top - y * scale;
+
+        let color = PdfColor::new(spec.r, spec.g, spec.b, spec.a);
+        let width_pts = (spec.width_px * scale).max(0.1);
+
+        let (x1, y1) = (to_pdf_x(spec.x1), to_pdf_y(spec.y1));
+        let (x2, y2) = (to_pdf_x(spec.x2), to_pdf_y(spec.y2));
+
+        // Every point the shape actually touches, so the bounds can contain it.
+        // PDFium CLIPS an annotation's appearance to its box, so a box that
+        // merely spans the drag would shave off the outer half of the stroke,
+        // and for an arrow it would cut the barbs clean off.
+        let mut extent: Vec<(f32, f32)> = vec![(x1, y1), (x2, y2)];
+
+        let path = match spec.kind {
+            SHAPE_RECTANGLE | SHAPE_ELLIPSE => {
+                let rect = PdfRect::new(
+                    PdfPoints::new(y1.min(y2)),
+                    PdfPoints::new(x1.min(x2)),
+                    PdfPoints::new(y1.max(y2)),
+                    PdfPoints::new(x1.max(x2)),
+                );
+                let build = if spec.kind == SHAPE_RECTANGLE {
+                    PdfPagePathObject::new_rect
+                } else {
+                    PdfPagePathObject::new_ellipse
+                };
+                // Stroke only, no fill: a filled shape hides the page under it,
+                // and an outline is what marking up a document calls for.
+                build(&doc_guard, rect, Some(color), Some(PdfPoints::new(width_pts)), None)
+            }
+            _ => {
+                let mut p = PdfPagePathObject::new_line(
+                    &doc_guard,
+                    PdfPoints::new(x1),
+                    PdfPoints::new(y1),
+                    PdfPoints::new(x2),
+                    PdfPoints::new(y2),
+                    color,
+                    PdfPoints::new(width_pts),
+                );
+
+                if spec.kind == SHAPE_ARROW {
+                    if let Ok(path) = p.as_mut() {
+                        let (left, right) = arrow_head(x1, y1, x2, y2, width_pts);
+                        extent.push(left);
+                        extent.push(right);
+
+                        // One continuous polyline: tip, barb, back to the tip,
+                        // other barb. Retracing the tip costs nothing on a
+                        // stroked path and avoids needing a second subpath.
+                        let ok = path.line_to(PdfPoints::new(left.0), PdfPoints::new(left.1)).is_ok()
+                            && path.line_to(PdfPoints::new(x2), PdfPoints::new(y2)).is_ok()
+                            && path.line_to(PdfPoints::new(right.0), PdfPoints::new(right.1)).is_ok();
+                        if !ok {
+                            continue;
+                        }
+                    }
+                }
+                p
+            }
+        };
+
+        let Ok(path) = path else {
+            continue;
+        };
+
+        let pad = width_pts / 2.0 + 1.0;
+        let min_x = extent.iter().map(|p| p.0).fold(f32::MAX, f32::min) - pad;
+        let max_x = extent.iter().map(|p| p.0).fold(f32::MIN, f32::max) + pad;
+        let min_y = extent.iter().map(|p| p.1).fold(f32::MAX, f32::min) - pad;
+        let max_y = extent.iter().map(|p| p.1).fold(f32::MIN, f32::max) + pad;
+
+        let bounds = PdfRect::new(
+            PdfPoints::new(min_y),
+            PdfPoints::new(min_x),
+            PdfPoints::new(max_y),
+            PdfPoints::new(max_x),
+        );
+
+        let Ok(mut annotation) = page.annotations_mut().create_ink_annotation() else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        // Bounds BEFORE objects: PDFium builds the appearance form from the
+        // rect, and appending to an annotation with no rect yet crashes inside
+        // the library rather than failing.
+        if annotation.set_bounds(bounds).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let _ = annotation.set_stroke_color(color);
+
+        if annotation.objects_mut().add_path_object(path).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Adds freehand strokes as real PDF `/Ink` annotation objects.
 ///
 /// One annotation per stroke, each holding a single path object, so a stroke
@@ -3922,6 +4168,205 @@ mod tests {
         free_byte_buffer(saved);
     }
 
+    // ---- Shapes: rectangles, ellipses, lines and arrows ----
+
+    /// Counts pixels that are neither white nor near-white in a rendered page.
+    ///
+    /// The measurement that matters for a shape. Creating the annotation and
+    /// reading it back only proves an object exists; a highlight once passed
+    /// exactly that bar while drawing ZERO pixels, because its quad points
+    /// wound the wrong way. Only counting ink on the page proves it draws.
+    fn marked_pixels(handle: u64, page: i32) -> usize {
+        let r = render_region(handle, page, 0.0, 0.0, 1.0, 1.0, 400);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let count = bytes
+            .chunks_exact(4)
+            .filter(|p| p[0] < 200 || p[1] < 200 || p[2] < 200)
+            .count();
+        free_render_result(r);
+        count
+    }
+
+    fn shape(kind: i32, x1: f32, y1: f32, x2: f32, y2: f32) -> ShapeSpec {
+        ShapeSpec {
+            page_index: 0,
+            kind,
+            x1,
+            y1,
+            x2,
+            y2,
+            r: 220,
+            g: 0,
+            b: 0,
+            a: 255,
+            width_px: 3.0,
+        }
+    }
+
+    #[test]
+    fn every_shape_kind_actually_draws_on_the_page() {
+        for kind in [SHAPE_RECTANGLE, SHAPE_ELLIPSE, SHAPE_LINE, SHAPE_ARROW] {
+            let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let before = marked_pixels(handle, 0);
+
+            let specs = [shape(kind, 200.0, 200.0, 700.0, 500.0)];
+            assert_eq!(
+                add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()),
+                STATUS_OK_PDFIUM,
+                "kind {kind} was rejected"
+            );
+
+            let after = marked_pixels(handle, 0);
+            assert!(
+                after > before,
+                "kind {kind} added an annotation that drew nothing: {before} marked pixels before, {after} after"
+            );
+
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn a_shape_survives_save_and_reopen_as_an_editable_object() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 600.0, 400.0)];
+        assert_eq!(
+            add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let before = read_annotations(handle, 0);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, ANNOT_INK);
+
+        // Render before saving: this is what makes PDFium generate the
+        // appearance stream, and without one a reopened file draws nothing.
+        // The highlight path learned this the hard way.
+        let drawn = marked_pixels(handle, 0);
+
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0);
+
+        let after = read_annotations(reopened, 0);
+        assert_eq!(after.len(), 1, "the shape should still be an annotation after reopening");
+        assert_eq!(after[0].1, ANNOT_INK, "and still a mark");
+
+        for (b, a) in [
+            (before[0].2, after[0].2),
+            (before[0].3, after[0].3),
+            (before[0].4, after[0].4),
+            (before[0].5, after[0].5),
+        ] {
+            assert!((b - a).abs() < 0.001, "geometry drifted across the round trip: {b} vs {a}");
+        }
+
+        // And it still DRAWS after the round trip, not merely exists.
+        let redrawn = marked_pixels(reopened, 0);
+        assert!(
+            redrawn as f64 > drawn as f64 * 0.5,
+            "the reopened shape drew {redrawn} marked pixels against {drawn} before saving"
+        );
+
+        close_document(reopened);
+        close_document(handle);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn an_arrow_covers_more_than_its_bare_line() {
+        // The head has to be inside the annotation's bounds. PDFium clips an
+        // appearance to its box, so barbs outside it are silently cut off and
+        // the arrow renders as a plain line: the failure looks like nothing
+        // went wrong.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let base = marked_pixels(handle, 0);
+
+        let line = [shape(SHAPE_LINE, 200.0, 300.0, 700.0, 300.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, line.as_ptr(), 1), STATUS_OK_PDFIUM);
+        let line_px = marked_pixels(handle, 0) - base;
+        close_document(handle);
+
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let arrow = [shape(SHAPE_ARROW, 200.0, 300.0, 700.0, 300.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, arrow.as_ptr(), 1), STATUS_OK_PDFIUM);
+        let arrow_px = marked_pixels(handle, 0) - base;
+        close_document(handle);
+
+        assert!(
+            arrow_px > line_px,
+            "the arrow drew {arrow_px} pixels and the plain line {line_px}, so the head is missing or clipped"
+        );
+    }
+
+    #[test]
+    fn an_arrow_head_sweeps_back_from_the_tip() {
+        // Pointing right: both barbs must sit BEHIND the tip and straddle the
+        // shaft. Getting the rotation sign wrong puts them ahead of the tip,
+        // which draws a bowtie rather than an arrow.
+        let ((lx, ly), (rx, ry)) = arrow_head(0.0, 0.0, 100.0, 0.0, 2.0);
+
+        assert!(lx < 100.0 && rx < 100.0, "barbs at x={lx} and x={rx} are not behind the tip");
+        assert!(
+            (ly > 0.0 && ry < 0.0) || (ly < 0.0 && ry > 0.0),
+            "barbs at y={ly} and y={ry} are on the same side of the shaft"
+        );
+        assert!((ly + ry).abs() < 1e-3, "barbs are not symmetric about the shaft: {ly} vs {ry}");
+    }
+
+    #[test]
+    fn an_arrow_head_follows_the_direction_it_was_drawn() {
+        // Dragged right to left, the head belongs on the LEFT end. Normalizing
+        // the drag to a rectangle first would have lost this, which is why the
+        // spec carries the drag's start and end rather than a box.
+        let ((lx, _), (rx, _)) = arrow_head(100.0, 0.0, 0.0, 0.0, 2.0);
+        assert!(lx > 0.0 && rx > 0.0, "barbs at x={lx} and x={rx} did not follow the reversed drag");
+    }
+
+    #[test]
+    fn a_zero_length_arrow_does_not_produce_nan_coordinates() {
+        // A click without a drag. Dividing by a zero-length shaft would write
+        // NaN into the file, which corrupts the page rather than failing.
+        let ((lx, ly), (rx, ry)) = arrow_head(50.0, 50.0, 50.0, 50.0, 2.0);
+        for v in [lx, ly, rx, ry] {
+            assert!(v.is_finite(), "arrow head produced a non-finite coordinate: {v}");
+        }
+    }
+
+    #[test]
+    fn a_hairline_arrow_still_gets_a_visible_head() {
+        // Barb length scales with stroke width, so without a floor the finest
+        // pen would produce a head a fraction of a point across: invisible.
+        let ((lx, ly), _) = arrow_head(0.0, 0.0, 100.0, 0.0, 0.01);
+        let reach = ((100.0f32 - lx).powi(2) + ly.powi(2)).sqrt();
+        assert!(reach >= ARROW_HEAD_MIN - 0.001, "hairline arrow head reached only {reach}");
+    }
+
+    #[test]
+    fn an_unknown_shape_kind_is_rejected_rather_than_guessed() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(99, 10.0, 10.0, 100.0, 100.0)];
+        assert_eq!(
+            add_shape_annotations(handle, 1000, specs.as_ptr(), 1),
+            STATUS_INVALID_INPUT
+        );
+        close_document(handle);
+    }
+
+    #[test]
+    fn shapes_reject_a_bad_handle_and_accept_an_empty_batch() {
+        let specs = [shape(SHAPE_RECTANGLE, 0.0, 0.0, 10.0, 10.0)];
+        assert_eq!(add_shape_annotations(0, 1000, specs.as_ptr(), 1), STATUS_INVALID_INPUT);
+
+        let handle = open_fixture();
+        assert_eq!(add_shape_annotations(handle, 0, specs.as_ptr(), 1), STATUS_INVALID_INPUT);
+        assert_eq!(add_shape_annotations(handle, 1000, std::ptr::null(), 0), STATUS_OK_PDFIUM);
+        close_document(handle);
+    }
+
+    #[test]
     #[test]
     fn an_ink_stroke_survives_save_and_reopen_as_an_editable_object() {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");

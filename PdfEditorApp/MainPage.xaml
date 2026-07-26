@@ -651,6 +651,71 @@
                     </ListView>
                 </StackPanel>
 
+                <!--
+                    Shape kind. Drawn as real geometry rather than icon-font
+                    glyphs: the picker then shows exactly what each tool draws,
+                    including the arrowhead, and cannot drift from it the way a
+                    stand-in glyph would.
+                -->
+                <StackPanel x:Name="ShapeSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <ListView x:Name="ShapeChoices" SelectionMode="Single"
+                              SelectionChanged="ShapeKind_SelectionChanged"
+                              Padding="0" BorderThickness="0" Background="Transparent"
+                              AutomationProperties.Name="Shape"
+                              ScrollViewer.HorizontalScrollMode="Disabled"
+                              ScrollViewer.VerticalScrollMode="Disabled"
+                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                              ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                        <ListView.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ListView.ItemsPanel>
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinWidth" Value="0" />
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Width" Value="34" />
+                                <Setter Property="Height" Value="30" />
+                                <Setter Property="Padding" Value="0" />
+                                <Setter Property="Margin" Value="1,0" />
+                                <Setter Property="CornerRadius" Value="6" />
+                                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                                <Setter Property="VerticalContentAlignment" Value="Center" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+
+                        <ListViewItem Tag="Rectangle" ToolTipService.ToolTip="Rectangle"
+                                      AutomationProperties.Name="Rectangle">
+                            <Rectangle Width="20" Height="14" RadiusX="1" RadiusY="1"
+                                       Stroke="{ThemeResource TextFillColorPrimaryBrush}"
+                                       StrokeThickness="1.5" />
+                        </ListViewItem>
+                        <ListViewItem Tag="Ellipse" ToolTipService.ToolTip="Ellipse"
+                                      AutomationProperties.Name="Ellipse">
+                            <Ellipse Width="20" Height="14"
+                                     Stroke="{ThemeResource TextFillColorPrimaryBrush}"
+                                     StrokeThickness="1.5" />
+                        </ListViewItem>
+                        <ListViewItem Tag="Line" ToolTipService.ToolTip="Line"
+                                      AutomationProperties.Name="Line">
+                            <Line X1="0" Y1="14" X2="20" Y2="0"
+                                  Stroke="{ThemeResource TextFillColorPrimaryBrush}"
+                                  StrokeThickness="1.5" />
+                        </ListViewItem>
+                        <ListViewItem Tag="Arrow" ToolTipService.ToolTip="Arrow"
+                                      AutomationProperties.Name="Arrow">
+                            <!-- Shaft and both barbs, matching what the tool draws. -->
+                            <Polyline Points="0,14 20,0 12,1 20,0 19,8"
+                                      Stroke="{ThemeResource TextFillColorPrimaryBrush}"
+                                      StrokeThickness="1.5" />
+                        </ListViewItem>
+                    </ListView>
+                </StackPanel>
+
                 <!-- Opacity -->
                 <StackPanel x:Name="OpacitySection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">

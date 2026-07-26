@@ -154,6 +154,29 @@ internal struct BurnStroke
 }
 
 /// <summary>
+/// Mirrors render_core::ShapeSpec (src/lib.rs).
+///
+/// Carries the drag's start and end, not a normalized rectangle, because a line
+/// and an arrow have direction: an arrow drawn right to left points left, and a
+/// box built from min/max would lose that.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeShapeSpec
+{
+    public int PageIndex;
+    public int Kind;
+    public float X1;
+    public float Y1;
+    public float X2;
+    public float Y2;
+    public byte R;
+    public byte G;
+    public byte B;
+    public byte A;
+    public float WidthPx;
+}
+
+/// <summary>
 /// Mirrors render_core::ByteBuffer (src/lib.rs). Must be released with
 /// <see cref="RenderCoreNative.free_byte_buffer"/>.
 /// </summary>
@@ -384,6 +407,19 @@ internal static partial class RenderCoreNative
         nuint specCount,
         [In] HighlightQuad[]? quads,
         nuint quadCount);
+
+    /// <summary>
+    /// Adds rectangles, ellipses, lines and arrows as real annotations.
+    ///
+    /// The kind numbers are <see cref="ShapeKind"/> and must match
+    /// render_core's SHAPE_* constants.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_shape_annotations(
+        ulong docHandle,
+        int captureWidth,
+        [In] NativeShapeSpec[]? specs,
+        nuint specCount);
 
     /// <summary>Adds freehand strokes as real /Ink annotations, one per stroke.</summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]

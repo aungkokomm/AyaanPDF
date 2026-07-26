@@ -41,6 +41,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private readonly List<HighlightAnnotation> _allHighlights = new();
     private readonly List<NoteAnnotation> _allNotes = new();
     private readonly List<InkStrokeAnnotation> _allInkStrokes = new();
+    private readonly List<ShapeAnnotation> _allShapes = new();
     private List<(double X, double Y)>? _currentStroke;
 
     [ObservableProperty]
@@ -75,6 +76,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public ObservableCollection<NoteAnnotation> Notes { get; } = new();
     public ObservableCollection<InkStrokeAnnotation> InkStrokes { get; } = new();
 
+    public ObservableCollection<ShapeAnnotation> Shapes { get; } = new();
+
     /// <summary>The stroke currently being drawn (Draw tool, drag in progress), or null between strokes.</summary>
     public IReadOnlyList<(double X, double Y)>? CurrentStrokeInProgress => _currentStroke;
 
@@ -85,6 +88,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// neighbouring page vanish the moment scrolling changed the current page.
     /// </summary>
     public IReadOnlyList<InkStrokeAnnotation> AllInkStrokes => _allInkStrokes;
+
+    public IReadOnlyList<ShapeAnnotation> AllShapes => _allShapes;
+
+    /// <summary>
+    /// The shape being dragged out, or null. Redrawn on every pointer move, so
+    /// the preview is the same polyline the finished shape will be and the two
+    /// cannot disagree.
+    /// </summary>
+    public ShapeDraft? ShapeInProgress => _shapeDraft;
+
+    /// <summary>
+    /// The page the shape being dragged belongs to. The preview has to be
+    /// anchored to it rather than to the current page: in continuous view a
+    /// shape can be started on a visible page that is not the current one, and
+    /// the preview must land where the shape will.
+    /// </summary>
+    public int ActiveShapePage => _shapePageIndex;
 
     /// <summary>The page the in-progress stroke belongs to, for the live preview.</summary>
     public int ActiveInkPage => _inkPageIndex;
@@ -158,10 +178,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _allHighlights.Clear();
             _allNotes.Clear();
             _allInkStrokes.Clear();
+            _allShapes.Clear();
         }
         Highlights.Clear();
         Notes.Clear();
         InkStrokes.Clear();
+        Shapes.Clear();
 
         // Layers are keyed by page index, so carrying them across a document
         // switch would hand the new document the old one's text.
@@ -473,7 +495,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         bool addedNotes = AddNoteAnnotations();
 
-        if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0)
+        if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0 && _allShapes.Count == 0)
         {
             return addedNotes;
         }
@@ -536,7 +558,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
         }
 
-        if (specs.Count == 0 && strokes.Count == 0)
+        // Shapes cross as the drag's start and end, in capture-space pixels.
+        // The core builds the outline and any arrowhead from those, so what
+        // lands in the file comes from the same description the user drew
+        // rather than from a flattened list of points.
+        var shapes = new List<NativeShapeSpec>();
+        foreach (var sh in _allShapes)
+        {
+            var (r, g, b, a) = ParseHex(sh.ColorHex, defaultAlpha: 0xFF);
+            shapes.Add(new NativeShapeSpec
+            {
+                PageIndex = sh.PageIndex,
+                Kind = (int)sh.Draft.Kind,
+                X1 = (float)(sh.Draft.X1 * CaptureWidth),
+                Y1 = (float)(sh.Draft.Y1 * CaptureWidth),
+                X2 = (float)(sh.Draft.X2 * CaptureWidth),
+                Y2 = (float)(sh.Draft.Y2 * CaptureWidth),
+                R = r, G = g, B = b, A = a,
+                WidthPx = (float)(sh.StrokeWidth * CaptureWidth),
+            });
+        }
+
+        if (specs.Count == 0 && strokes.Count == 0 && shapes.Count == 0)
         {
             return addedNotes;
         }
@@ -551,6 +594,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 quads.ToArray(), (nuint)quads.Count);
             ok &= status == RenderStatus.OkPdfium;
             Diag.Log($"save: {specs.Count} highlight annotations ({quads.Count} quads) -> {status}");
+        }
+
+        if (shapes.Count > 0)
+        {
+            int status = RenderCoreNative.add_shape_annotations(
+                _documentHandle, CaptureWidth, shapes.ToArray(), (nuint)shapes.Count);
+            ok &= status == RenderStatus.OkPdfium;
+            Diag.Log($"save: {shapes.Count} shape annotations -> {status}");
         }
 
         if (strokes.Count > 0)
@@ -580,7 +631,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // survives. See AddNoteAnnotations.
         bool addedNotes = AddNoteAnnotations();
 
-        if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0)
+        if (_allHighlights.Count == 0 && _allInkStrokes.Count == 0 && _allShapes.Count == 0)
         {
             return addedNotes;
         }
@@ -627,6 +678,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 R = r, G = g, B = b, A = a,
             });
             foreach (var (x, y) in s.Points)
+            {
+                points.Add(new BurnPoint { X = (float)(x * CaptureWidth), Y = (float)(y * CaptureWidth) });
+            }
+        }
+
+        // Shapes burn as their own outlines, through the same stroke path as
+        // ink. Without this, flattening a document silently DROPPED every
+        // rectangle, ellipse, line and arrow on it, and the loss would only
+        // show up in the saved copy.
+        foreach (var sh in _allShapes)
+        {
+            var outline = sh.Outline;
+            if (outline.Count < 2)
+            {
+                continue;
+            }
+
+            var (r, g, b, a) = ParseHex(sh.ColorHex, defaultAlpha: 0xFF);
+            strokes.Add(new BurnStroke
+            {
+                PageIndex = sh.PageIndex,
+                PointOffset = (uint)points.Count,
+                PointCount = (uint)outline.Count,
+                WidthPx = (float)(sh.StrokeWidth * CaptureWidth),
+                R = r, G = g, B = b, A = a,
+            });
+            foreach (var (x, y) in outline)
             {
                 points.Add(new BurnPoint { X = (float)(x * CaptureWidth), Y = (float)(y * CaptureWidth) });
             }
@@ -1193,6 +1271,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             slot.Highlights.Clear();
             slot.InkStrokes.Clear();
+            slot.Shapes.Clear();
             slot.Notes.Clear();
             slot.SelectionRects.Clear();
             slot.SearchMatchRects.Clear();
@@ -1209,6 +1288,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         foreach (var slot in PageSlots)
         {
             slot.RebuildHighlightRects();
+        }
+
+        foreach (var sh in _allShapes)
+        {
+            if (sh.PageIndex >= 0 && sh.PageIndex < PageSlots.Count)
+            {
+                PageSlots[sh.PageIndex].Shapes.Add(sh);
+            }
         }
 
         foreach (var s in _allInkStrokes)
@@ -1293,9 +1380,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
     {
-        var all = new List<IAnnotation>(_allHighlights.Count + _allInkStrokes.Count);
+        var all = new List<IAnnotation>(_allHighlights.Count + _allInkStrokes.Count + _allShapes.Count);
         all.AddRange(_allHighlights);
         all.AddRange(_allInkStrokes);
+        all.AddRange(_allShapes);
         return all;
     }
 
@@ -1440,7 +1528,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        int removed = _allHighlights.RemoveAll(h => h.Id == id) + _allInkStrokes.RemoveAll(s => s.Id == id);
+        int removed = _allHighlights.RemoveAll(h => h.Id == id)
+            + _allInkStrokes.RemoveAll(s => s.Id == id)
+            + _allShapes.RemoveAll(sh => sh.Id == id);
         if (removed == 0)
         {
             return;
@@ -1465,6 +1555,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 _allHighlights[i] = (HighlightAnnotation)edit(_allHighlights[i]);
                 return;
+            }
+        }
+
+        for (int i = 0; i < _allShapes.Count; i++)
+        {
+            if (_allShapes[i].Id == id)
+            {
+                _allShapes[i] = (ShapeAnnotation)edit(_allShapes[i]);
             }
         }
 
@@ -2267,6 +2365,52 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private int _inkPageIndex;
 
+    // ---- Shapes ----
+
+    private ShapeDraft? _shapeDraft;
+    private int _shapePageIndex;
+
+    /// <summary>Which shape the tool draws. Chosen in the property bar.</summary>
+    [ObservableProperty]
+    public partial ShapeKind ActiveShapeKind { get; set; } = ShapeKind.Rectangle;
+
+    public void BeginShape(int pageIndex, double x, double y)
+    {
+        // The page is fixed for the whole gesture, like ink: a shape dragged
+        // past a page edge belongs to the page it started on rather than
+        // jumping to whichever page the pointer ended over.
+        _shapePageIndex = pageIndex;
+        _shapeDraft = new ShapeDraft(ActiveShapeKind, Norm(x), Norm(y), Norm(x), Norm(y));
+        InkStrokeChanged?.Invoke();
+    }
+
+    public void ExtendShape(double x, double y)
+    {
+        if (_shapeDraft is not { } d)
+        {
+            return;
+        }
+
+        _shapeDraft = d with { X2 = Norm(x), Y2 = Norm(y) };
+        InkStrokeChanged?.Invoke();
+    }
+
+    public void EndShape()
+    {
+        if (_shapeDraft is { } d && ShapeGeometry.IsWorthDrawing(d))
+        {
+            PushHistory(HistoryScope.Annotations, d.Kind.ToString());
+            var shape = new ShapeAnnotation(_shapePageIndex, d, InkColorHex, InkWidth);
+            _allShapes.Add(shape);
+            Shapes.Add(shape);
+            SlotFor(shape.PageIndex)?.Shapes.Add(shape);
+            IsDirty = true;
+        }
+
+        _shapeDraft = null;
+        InkStrokeChanged?.Invoke();
+    }
+
     public void BeginInkStroke(int pageIndex, double x, double y)
     {
         _inkPageIndex = pageIndex;
@@ -2496,6 +2640,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // creation), so their VALUES are captured instead.
             Highlights = _allHighlights.ToList(),
             InkStrokes = _allInkStrokes.ToList(),
+            Shapes = _allShapes.ToList(),
             Notes = _allNotes.Select(n => new NoteState(n.PageIndex, n.X, n.Y, n.Text)).ToList(),
         };
     }
@@ -2593,6 +2738,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _allHighlights.AddRange(entry.Highlights);
         _allInkStrokes.Clear();
         _allInkStrokes.AddRange(entry.InkStrokes);
+        _allShapes.Clear();
+        _allShapes.AddRange(entry.Shapes);
         _allNotes.Clear();
         _allNotes.AddRange(entry.Notes.Select(
             n => new NoteAnnotation(n.PageIndex, n.X, n.Y, n.Text) { Scale = SlotLayoutWidth }));
@@ -2621,6 +2768,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         foreach (var n in _allNotes.Where(n => n.PageIndex == CurrentPageIndex))
         {
             Notes.Add(n);
+        }
+
+        Shapes.Clear();
+        foreach (var sh in _allShapes.Where(sh => sh.PageIndex == CurrentPageIndex))
+        {
+            Shapes.Add(sh);
         }
 
         InkStrokes.Clear();

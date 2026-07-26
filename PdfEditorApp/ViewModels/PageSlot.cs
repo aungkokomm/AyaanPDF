@@ -40,6 +40,8 @@ public partial class PageSlot : ObservableObject
 
     public ObservableCollection<InkStrokeAnnotation> InkStrokes { get; } = new();
 
+    public ObservableCollection<ShapeAnnotation> Shapes { get; } = new();
+
     public ObservableCollection<NoteAnnotation> Notes { get; } = new();
 
     // Every collection below is in SLOT-SPACE DIPs, already multiplied by the

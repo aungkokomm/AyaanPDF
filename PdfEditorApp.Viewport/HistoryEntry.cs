@@ -66,6 +66,7 @@ public sealed class HistoryEntry
 
     public IReadOnlyList<HighlightAnnotation> Highlights { get; init; } = [];
     public IReadOnlyList<InkStrokeAnnotation> InkStrokes { get; init; } = [];
+    public IReadOnlyList<ShapeAnnotation> Shapes { get; init; } = [];
     public IReadOnlyList<NoteState> Notes { get; init; } = [];
 
     /// <summary>Set only for <see cref="HistoryScope.Document"/> entries.</summary>
@@ -89,5 +90,5 @@ public sealed class HistoryEntry
         DocumentBytes?.LongLength
         ?? (Bounds is not null
                 ? 64L
-                : (Highlights.Count + InkStrokes.Count + Notes.Count) * 128L + 256L);
+                : (Highlights.Count + InkStrokes.Count + Shapes.Count + Notes.Count) * 128L + 256L);
 }

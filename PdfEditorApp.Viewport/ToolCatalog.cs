@@ -19,6 +19,8 @@ public enum ToolMode
     Hand,
     /// <summary>Click places the chosen stamp image.</summary>
     Stamp,
+    /// <summary>Drag draws a rectangle, ellipse, line or arrow.</summary>
+    Shape,
 }
 
 /// <summary>Which extra controls a tool needs in the property bar.</summary>
@@ -32,6 +34,8 @@ public enum ToolOptions
     Width = 2,
     /// <summary>Offers the stamp picker.</summary>
     Stamp = 4,
+    /// <summary>Offers the shape kind picker: rectangle, ellipse, line, arrow.</summary>
+    Shape = 8,
 }
 
 /// <summary>
@@ -73,6 +77,7 @@ public static class ToolCatalog
         new(ToolMode.Select, "Select", "", 'V', ToolOptions.None),
         new(ToolMode.Highlight, "Highlight", "", 'U', ToolOptions.Color),
         new(ToolMode.Draw, "Draw", "", 'D', ToolOptions.Color | ToolOptions.Width),
+        new(ToolMode.Shape, "Shape", "", 'R', ToolOptions.Color | ToolOptions.Width | ToolOptions.Shape),
         new(ToolMode.Note, "Note", "", 'N', ToolOptions.None),
         new(ToolMode.Stamp, "Stamp", "", 'S', ToolOptions.Stamp),
     ];

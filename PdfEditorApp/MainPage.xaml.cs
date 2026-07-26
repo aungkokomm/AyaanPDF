@@ -34,6 +34,7 @@ public sealed partial class MainPage : Page
     private bool _isCtrlDown;
     private bool _isSelectingText;
     private bool _isDrawing;
+    private bool _isDrawingShape;
     private bool _isMovingAnnotation;
     private bool _isMarqueeing;
     private bool _isPanning;
@@ -850,8 +851,13 @@ public sealed partial class MainPage : Page
         {
             ViewModel.EndInkStroke();
         }
+        if (_isDrawingShape)
+        {
+            ViewModel.EndShape();
+        }
 
         _isPanning = false;
+        _isDrawingShape = false;
         _isMovingAnnotation = false;
         _isMarqueeing = false;
         _isSelectingText = false;
@@ -887,6 +893,21 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
+    /// The kind is carried on each item's Tag and parsed back to the enum,
+    /// rather than the list being bound to the enum's values. The items are
+    /// hand-drawn geometry, one per kind, so there is nothing to template over.
+    /// </summary>
+    private void ShapeKind_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ShapeChoices.SelectedItem is FrameworkElement { Tag: string tag }
+            && Enum.TryParse(tag, out ShapeKind kind))
+        {
+            ViewModel.ActiveShapeKind = kind;
+            ReturnFocusAfterPointerUse();
+        }
+    }
+
+    /// <summary>
     /// Brings the rail and the property bar into line with the armed tool.
     ///
     /// Which sections of the property bar appear is read from the tool's
@@ -916,6 +937,13 @@ public sealed partial class MainPage : Page
 
         bool stamps = tool.Offers(ToolOptions.Stamp);
         StampSection.Visibility = Show(stamps);
+
+        bool shapes = tool.Offers(ToolOptions.Shape);
+        ShapeSection.Visibility = Show(shapes);
+        if (shapes)
+        {
+            ShapeChoices.SelectedIndex = (int)ViewModel.ActiveShapeKind;
+        }
 
         // A bar with every section collapsed is an empty pill floating over the
         // page, so the whole thing goes when the tool offers nothing.
@@ -1331,6 +1359,16 @@ public sealed partial class MainPage : Page
         {
             InkCanvas.Children.Add(BuildStrokePolyline(stroke));
         }
+
+        // Shapes draw on the same canvas, from the same polyline builder: a
+        // rectangle, ellipse, line and arrow are all outlines, and giving them
+        // their own element type would mean a second way for the same mark to
+        // be positioned wrongly.
+        foreach (var shape in ViewModel.AllShapes)
+        {
+            InkCanvas.Children.Add(BuildStrokePolyline(
+                new InkStrokeAnnotation(shape.PageIndex, shape.Outline, shape.ColorHex, shape.StrokeWidth)));
+        }
     }
 
     /// <summary>
@@ -1359,7 +1397,12 @@ public sealed partial class MainPage : Page
 
     private void OnInkStrokeChanged()
     {
-        var points = ViewModel.CurrentStrokeInProgress;
+        // A shape being dragged previews through the same path as ink, built
+        // from ShapeGeometry: the preview and the committed shape come from one
+        // function, so releasing the pointer cannot change what was drawn.
+        var points = ViewModel.ShapeInProgress is { } draft
+            ? ShapeGeometry.Outline(draft, ViewModel.InkWidth)
+            : ViewModel.CurrentStrokeInProgress;
 
         if (points is null)
         {
@@ -1390,7 +1433,8 @@ public sealed partial class MainPage : Page
         // Anchored to the page the stroke STARTED on, not the current page:
         // in continuous view you can start drawing on a visible page that is
         // not the current one, and the preview must land where the ink will.
-        double pageTop = ViewModel.SlotTopOf(ViewModel.ActiveInkPage);
+        double pageTop = ViewModel.SlotTopOf(
+            ViewModel.ShapeInProgress is not null ? ViewModel.ActiveShapePage : ViewModel.ActiveInkPage);
 
         _livePreviewStroke.Points.Clear();
         foreach (var (x, y) in points)
@@ -1653,6 +1697,7 @@ public sealed partial class MainPage : Page
             (_, ToolMode.Select) => InputSystemCursorShape.IBeam,
             (_, ToolMode.Highlight) => InputSystemCursorShape.IBeam,
             (_, ToolMode.Draw) => InputSystemCursorShape.Cross,
+            (_, ToolMode.Shape) => InputSystemCursorShape.Cross,
             (_, ToolMode.Note) => InputSystemCursorShape.Cross,
             (_, ToolMode.Stamp) => InputSystemCursorShape.Cross,
             _ => InputSystemCursorShape.Arrow,
@@ -1793,6 +1838,14 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
+            case ToolMode.Shape:
+                _isDrawingShape = true;
+                _dragPointerId = current.PointerId;
+                ViewportHost.CapturePointer(e.Pointer);
+                ViewModel.BeginShape(content.Page, content.X, content.Y);
+                e.Handled = true;
+                break;
+
             case ToolMode.Note:
                 ViewModel.AddNoteAt(content.Page, content.X, content.Y);
                 e.Handled = true;
@@ -1874,6 +1927,11 @@ public sealed partial class MainPage : Page
             ViewModel.ExtendInkStroke(content.X, content.Y);
             e.Handled = true;
         }
+        else if (_isDrawingShape)
+        {
+            ViewModel.ExtendShape(content.X, content.Y);
+            e.Handled = true;
+        }
     }
 
     private void ViewportHost_PointerReleased(object sender, PointerRoutedEventArgs e)
@@ -1915,6 +1973,13 @@ public sealed partial class MainPage : Page
             _isDrawing = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);
             ViewModel.EndInkStroke();
+            e.Handled = true;
+        }
+        else if (_isDrawingShape)
+        {
+            _isDrawingShape = false;
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            ViewModel.EndShape();
             e.Handled = true;
         }
     }
