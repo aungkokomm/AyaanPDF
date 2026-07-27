@@ -430,6 +430,62 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Rotates a set of pages by the same amount, in one undo step, then
+    /// re-lays out and re-renders once. The workhorse behind the Rotate Pages
+    /// dialog; the single-page <see cref="RotatePage"/> is the quick path.
+    /// </summary>
+    public bool RotatePages(IReadOnlyList<int> indices, int degrees)
+    {
+        if (_documentHandle == 0 || indices.Count == 0)
+        {
+            return false;
+        }
+
+        PushHistory(HistoryScope.Document, "Rotate pages");
+
+        foreach (int i in indices)
+        {
+            if (i >= 0 && i < PageCount)
+            {
+                RenderCoreNative.rotate_page(_documentHandle, i, degrees);
+            }
+        }
+
+        IsDirty = true;
+
+        // Rotating swaps a page's aspect, so the whole slot stack is laid out
+        // again; then only the thumbnails that had already rendered are redrawn,
+        // and the rest render fresh when the sidebar realizes them.
+        RebuildContinuousLayout();
+        foreach (int i in indices)
+        {
+            if (i >= 0 && i < Thumbnails.Count && Thumbnails[i].Bitmap is not null)
+            {
+                Thumbnails[i].Bitmap = PageRenderer.RenderLowRes(_documentHandle, i, ThumbnailWidth).Bitmap;
+            }
+        }
+
+        RenderCurrentPage();
+        return true;
+    }
+
+    /// <summary>
+    /// Each page's displayed orientation: true where it is wider than it is
+    /// tall. Read from the laid-out slots, so a page already rotated reads by
+    /// how it currently looks, which is what the orientation filter means.
+    /// </summary>
+    public IReadOnlyList<bool> PageIsLandscape()
+    {
+        var flags = new List<bool>(PageSlots.Count);
+        foreach (var slot in PageSlots)
+        {
+            flags.Add(slot.SlotWidth > slot.SlotHeight);
+        }
+
+        return flags;
+    }
+
+    /// <summary>
     /// Remaps every overlay collection's page indices to the new order, in
     /// place. A mark whose page was dropped is removed; where a page appears
     /// more than once, its marks follow the first copy.

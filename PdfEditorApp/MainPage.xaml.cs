@@ -2805,4 +2805,72 @@ public sealed partial class MainPage : Page
             ViewModel.DeletePage(p);
         }
     }
+
+    // ---------------- Rotate Pages dialog ----------------
+
+    /// <summary>The page "Current page" means, set by whichever entry opened the dialog.</summary>
+    private int _rotateDialogPage;
+
+    /// <summary>Opened from a page's context menu: defaults to rotating that page.</summary>
+    private async void PageRotateDialog_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        await ShowRotatePagesDialog(p >= 0 ? p : ViewModel.CurrentPageIndex, defaultCurrentPage: true);
+    }
+
+    /// <summary>Opened from the menu: defaults to rotating the whole document.</summary>
+    private async void RotatePagesMenu_Click(object sender, RoutedEventArgs e) =>
+        await ShowRotatePagesDialog(ViewModel.CurrentPageIndex, defaultCurrentPage: false);
+
+    private async System.Threading.Tasks.Task ShowRotatePagesDialog(int page, bool defaultCurrentPage)
+    {
+        if (ViewModel.PageCount == 0)
+        {
+            return;
+        }
+
+        _rotateDialogPage = page;
+
+        RotateDirectionCombo.SelectedIndex = 0;             // clockwise 90
+        RotateParityCombo.SelectedIndex = 0;
+        RotateOrientationCombo.SelectedIndex = 0;
+        RotateFrom.Text = "1";
+        RotateTo.Text = ViewModel.PageCount.ToString();
+
+        if (defaultCurrentPage)
+        {
+            RotateRangeCurrent.IsChecked = true;
+        }
+        else
+        {
+            RotateRangeAll.IsChecked = true;
+        }
+
+        RotatePagesDialog.XamlRoot = XamlRoot;
+        if (await RotatePagesDialog.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        int degrees = int.Parse((string)((ComboBoxItem)RotateDirectionCombo.SelectedItem).Tag);
+
+        RotateRange range =
+            RotateRangeCurrent.IsChecked == true ? RotateRange.CurrentPage :
+            RotateRangePages.IsChecked == true ? RotateRange.PageRange :
+            RotateRange.All;
+
+        int.TryParse(RotateFrom.Text, out int from);
+        int.TryParse(RotateTo.Text, out int to);
+
+        var pages = RotationPlan.SelectPages(
+            ViewModel.PageCount, range, _rotateDialogPage, from, to,
+            (RotateParity)RotateParityCombo.SelectedIndex,
+            (RotateOrientation)RotateOrientationCombo.SelectedIndex,
+            ViewModel.PageIsLandscape());
+
+        if (pages.Count > 0)
+        {
+            ViewModel.RotatePages(pages, degrees);
+        }
+    }
 }

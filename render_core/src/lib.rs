@@ -366,17 +366,21 @@ fn rotate_page_inner(doc_handle: u64, page_index: i32, degrees: i32) -> i32 {
         return STATUS_INVALID_INPUT;
     };
 
-    let normalized = ((degrees % 360) + 360) % 360;
+    let doc_guard = lock(&doc);
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // ADDITIVE: rotate BY `degrees` from the page's current rotation, so
+    // "rotate 90" applied twice ends at 180, the way every rotate control
+    // behaves. Setting an absolute value made a second rotate a no-op.
+    let current = page.rotation().map(|r| r.as_degrees() as i32).unwrap_or(0);
+    let normalized = (((current + degrees) % 360) + 360) % 360;
     let rotation = match normalized {
         0..=44 | 316..=359 => PdfPageRenderRotation::None,
         45..=134 => PdfPageRenderRotation::Degrees90,
         135..=224 => PdfPageRenderRotation::Degrees180,
         _ => PdfPageRenderRotation::Degrees270,
-    };
-
-    let doc_guard = lock(&doc);
-    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
-        return STATUS_INVALID_INPUT;
     };
     page.set_rotation(rotation);
     drop(page);
@@ -4373,14 +4377,23 @@ mod tests {
         use pdfium_render::prelude::PdfPageRenderRotation;
 
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
-        assert_eq!(rotate_page(handle, 0, 90), STATUS_OK_PDFIUM);
+        let read = |h: u64| {
+            let doc = lock(&core().documents).get(&h).cloned().unwrap();
+            let r = lock(&doc).pages().get(0).unwrap().rotation().unwrap();
+            r
+        };
 
-        // White-box check: read the rotation straight back off the
-        // in-memory document (there's no FFI getter — the app doesn't need
-        // one, only render_core's own tests do).
-        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
-        let rotation = lock(&doc).pages().get(0).unwrap().rotation().unwrap();
-        assert_eq!(rotation, PdfPageRenderRotation::Degrees90);
+        assert_eq!(rotate_page(handle, 0, 90), STATUS_OK_PDFIUM);
+        assert_eq!(read(handle), PdfPageRenderRotation::Degrees90);
+
+        // ADDITIVE: a second 90 lands at 180, not stuck at 90. This is the
+        // behaviour a rotate control needs and the old absolute-set lacked.
+        assert_eq!(rotate_page(handle, 0, 90), STATUS_OK_PDFIUM);
+        assert_eq!(read(handle), PdfPageRenderRotation::Degrees180);
+
+        // Counter-clockwise (-90) from 180 lands at 90.
+        assert_eq!(rotate_page(handle, 0, -90), STATUS_OK_PDFIUM);
+        assert_eq!(read(handle), PdfPageRenderRotation::Degrees90);
 
         close_document(handle);
     }

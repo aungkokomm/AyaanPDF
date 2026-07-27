@@ -525,6 +525,7 @@
                             </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
+                            <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
                             <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
@@ -1046,6 +1047,7 @@
                                             <FontIcon Glyph="&#xE7AD;" />
                                         </MenuFlyoutItem.Icon>
                                     </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Rotate pages..." Click="PageRotateDialog_Click" />
                                     <MenuFlyoutItem Text="Duplicate" Click="PageDuplicate_Click">
                                         <MenuFlyoutItem.Icon>
                                             <FontIcon Glyph="&#xE8C8;" />
@@ -1075,6 +1077,59 @@
                 </ListView.ItemTemplate>
             </ListView>
         </Border>
+
+        <!--
+            Rotate Pages dialog. The quick right-click "Rotate 90" is one page,
+            one click; this is for rotating many at once, by a chosen amount,
+            filtered by range, odd/even and orientation. Laid out here but only
+            shown via ShowAsync, so it costs nothing until opened.
+        -->
+        <ContentDialog x:Name="RotatePagesDialog" Title="Rotate pages"
+                       PrimaryButtonText="Rotate" CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <StackPanel Spacing="16" Width="300">
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Direction" Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <ComboBox x:Name="RotateDirectionCombo" HorizontalAlignment="Stretch" SelectedIndex="0">
+                        <ComboBoxItem Content="Clockwise 90&#176;" Tag="90" />
+                        <ComboBoxItem Content="Counterclockwise 90&#176;" Tag="-90" />
+                        <ComboBoxItem Content="180&#176;" Tag="180" />
+                    </ComboBox>
+                </StackPanel>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Pages" Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <RadioButton x:Name="RotateRangeAll" Content="All" GroupName="rotateRange" IsChecked="True" />
+                    <RadioButton x:Name="RotateRangeCurrent" Content="Current page" GroupName="rotateRange" />
+                    <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                        <RadioButton x:Name="RotateRangePages" Content="Pages" GroupName="rotateRange"
+                                     VerticalAlignment="Center" MinWidth="64" />
+                        <TextBox x:Name="RotateFrom" Width="52" InputScope="Number"
+                                 VerticalAlignment="Center" />
+                        <TextBlock Text="to" VerticalAlignment="Center" />
+                        <TextBox x:Name="RotateTo" Width="52" InputScope="Number"
+                                 VerticalAlignment="Center" />
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel Spacing="6">
+                    <TextBlock Text="Apply to" Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <ComboBox x:Name="RotateParityCombo" HorizontalAlignment="Stretch" SelectedIndex="0">
+                        <ComboBoxItem Content="Even and odd pages" />
+                        <ComboBoxItem Content="Odd pages only" />
+                        <ComboBoxItem Content="Even pages only" />
+                    </ComboBox>
+                    <ComboBox x:Name="RotateOrientationCombo" HorizontalAlignment="Stretch" SelectedIndex="0">
+                        <ComboBoxItem Content="Pages of any orientation" />
+                        <ComboBoxItem Content="Portrait pages only" />
+                        <ComboBoxItem Content="Landscape pages only" />
+                    </ComboBox>
+                </StackPanel>
+            </StackPanel>
+        </ContentDialog>
 
         <!--
             Status pill: page position, zoom, fit and find. Floats bottom
