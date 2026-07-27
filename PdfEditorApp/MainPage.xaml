@@ -524,6 +524,12 @@
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
+                            <MenuFlyoutSubItem Text="Insert pages">
+                                <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
+                                <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
+                            </MenuFlyoutSubItem>
+                            <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
+                            <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
                             <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
                             <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
@@ -1016,14 +1022,36 @@
             takes width away from the canvas. Hidden until asked for.
         -->
         <Border x:Name="ThumbnailPanel" Visibility="Collapsed"
-                Grid.Column="1" Margin="0,12,12,12" Width="182"
+                Grid.Column="1" Margin="0,12,12,12" Width="196"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="10">
-            <ListView
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Header: what the panel is, and how many pages, with a hint
+                     that they can be dragged. -->
+                <Grid Padding="14,10,10,8" ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Pages" VerticalAlignment="Center"
+                               Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <TextBlock Grid.Column="2" VerticalAlignment="Center"
+                               Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                </Grid>
+
+                <ListView
+                Grid.Row="1"
                 x:Name="ThumbnailList"
-                Grid.Column="0"
-                Padding="8"
+                Padding="8,0,8,8"
                 ItemsSource="{x:Bind ViewModel.Thumbnails}"
                 SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
                 IsItemClickEnabled="True"
@@ -1053,6 +1081,8 @@
                                             <FontIcon Glyph="&#xE8C8;" />
                                         </MenuFlyoutItem.Icon>
                                     </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Insert blank page after" Click="PageInsertBlankAfter_Click" />
+                                    <MenuFlyoutItem Text="Extract page..." Click="PageExtract_Click" />
                                     <MenuFlyoutSeparator />
                                     <MenuFlyoutItem Text="Move up" Click="PageMoveUp_Click" />
                                     <MenuFlyoutItem Text="Move down" Click="PageMoveDown_Click" />
@@ -1064,18 +1094,35 @@
                                     </MenuFlyoutItem>
                                 </MenuFlyout>
                             </StackPanel.ContextFlyout>
-                            <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
-                                <Image
-                                    Source="{x:Bind Bitmap, Mode=OneWay}"
-                                    Stretch="Uniform"
-                                    Width="126"
-                                    Height="163" />
-                            </Border>
-                            <TextBlock Text="{x:Bind DisplayNumber}" HorizontalAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+                            <!-- The page sits on a rounded, shadowed card so it
+                                 reads as a sheet, with its number as a small
+                                 badge in the corner rather than a line of text
+                                 below, which is tidier and saves height. -->
+                            <Grid>
+                                <Border CornerRadius="4" BorderThickness="1"
+                                        BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                                        Background="White">
+                                    <Border.Shadow>
+                                        <ThemeShadow />
+                                    </Border.Shadow>
+                                    <Image
+                                        Source="{x:Bind Bitmap, Mode=OneWay}"
+                                        Stretch="Uniform"
+                                        Width="126"
+                                        Height="163" />
+                                </Border>
+                                <Border HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                                        Margin="0,0,4,4" CornerRadius="8" Padding="6,1"
+                                        Background="#B0000000">
+                                    <TextBlock Text="{x:Bind DisplayNumber}"
+                                               Foreground="White" FontSize="11" />
+                                </Border>
+                            </Grid>
                         </StackPanel>
                     </DataTemplate>
                 </ListView.ItemTemplate>
-            </ListView>
+                </ListView>
+            </Grid>
         </Border>
 
         <!--
@@ -1128,6 +1175,25 @@
                         <ComboBoxItem Content="Landscape pages only" />
                     </ComboBox>
                 </StackPanel>
+            </StackPanel>
+        </ContentDialog>
+
+        <!-- Extract Pages dialog: a range out to a new file, optionally one
+             file per page, optionally removing them from this document. -->
+        <ContentDialog x:Name="ExtractPagesDialog" Title="Extract pages"
+                       PrimaryButtonText="Extract" CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <StackPanel Spacing="16" Width="300">
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="From" VerticalAlignment="Center" />
+                    <TextBox x:Name="ExtractFrom" Width="52" VerticalAlignment="Center" />
+                    <TextBlock Text="to" VerticalAlignment="Center" />
+                    <TextBox x:Name="ExtractTo" Width="52" VerticalAlignment="Center" />
+                    <TextBlock x:Name="ExtractOfLabel" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+                <CheckBox x:Name="ExtractDeleteAfter" Content="Delete pages after extracting" />
+                <CheckBox x:Name="ExtractSeparate" Content="Extract pages as separate files" />
             </StackPanel>
         </ContentDialog>
 

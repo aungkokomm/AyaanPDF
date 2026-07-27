@@ -499,6 +499,154 @@ fn rebuild_page_order_inner(doc_handle: u64, indices: *const i32, count: usize) 
     STATUS_OK_PDFIUM
 }
 
+/// Inserts all pages of another PDF (given as bytes) into this document at
+/// `at_index`. Returns the NUMBER of pages inserted, so the app can shift its
+/// page-indexed overlay marks, or a NEGATIVE value on error (-1 invalid, -2
+/// panic). Imported pages keep their annotations, like every other page copy.
+#[unsafe(no_mangle)]
+pub extern "C" fn insert_pages_from_bytes(
+    doc_handle: u64,
+    data: *const u8,
+    len: usize,
+    at_index: i32,
+) -> i32 {
+    if doc_handle == 0 || data.is_null() || len == 0 || at_index < 0 {
+        return -1;
+    }
+    panic::catch_unwind(|| insert_pages_from_bytes_inner(doc_handle, data, len, at_index)).unwrap_or(-2)
+}
+
+fn insert_pages_from_bytes_inner(doc_handle: u64, data: *const u8, len: usize, at_index: i32) -> i32 {
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return -1;
+    };
+    let Some(pdfium) = pdfium() else {
+        return -1;
+    };
+
+    // The source document owns its bytes, so it can be dropped safely at the
+    // end of this call once its pages have been copied out.
+    let Ok(source) = pdfium.load_pdf_from_byte_vec(bytes, None) else {
+        return -1;
+    };
+    let source_count = source.pages().len() as i32;
+    if source_count == 0 {
+        return 0;
+    }
+
+    let mut doc_guard = lock(&doc);
+    let dest_count = doc_guard.pages().len() as i32;
+    let at = at_index.min(dest_count).max(0) as u16;
+
+    let range = format!("1-{source_count}");
+    if doc_guard.pages_mut().copy_pages_from_document(&source, &range, at).is_err() {
+        return -1;
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
+    source_count
+}
+
+/// Inserts one blank page at `at_index`, sized in points. Used for "insert a
+/// blank page"; the app passes the current page's size so it matches.
+#[unsafe(no_mangle)]
+pub extern "C" fn insert_blank_page(
+    doc_handle: u64,
+    at_index: i32,
+    width_pts: f32,
+    height_pts: f32,
+) -> i32 {
+    if doc_handle == 0 || at_index < 0 || width_pts <= 0.0 || height_pts <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        use pdfium_render::prelude::*;
+
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else {
+            return STATUS_INVALID_INPUT;
+        };
+
+        let mut doc_guard = lock(&doc);
+        let dest_count = doc_guard.pages().len() as i32;
+        let at = at_index.min(dest_count).max(0) as u16;
+
+        let size = PdfPagePaperSize::Custom(PdfPoints::new(width_pts), PdfPoints::new(height_pts));
+        if doc_guard.pages_mut().create_page_at_index(size, at).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+
+        drop(doc_guard);
+        evict_all_cache_for_doc(doc_handle);
+        lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
+        STATUS_OK_PDFIUM
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Saves the given pages, in the given order, to a NEW PDF file at `path`,
+/// leaving this document unchanged. The core half of "extract pages": the app
+/// decides the range and whether to also delete them afterwards.
+#[unsafe(no_mangle)]
+pub extern "C" fn extract_pages_to_file(
+    doc_handle: u64,
+    indices: *const i32,
+    count: usize,
+    path: *const c_char,
+) -> i32 {
+    if doc_handle == 0 || indices.is_null() || count == 0 || path.is_null() {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| extract_pages_to_file_inner(doc_handle, indices, count, path)).unwrap_or(STATUS_PANIC)
+}
+
+fn extract_pages_to_file_inner(doc_handle: u64, indices: *const i32, count: usize, path: *const c_char) -> i32 {
+    let order: &[i32] = unsafe { std::slice::from_raw_parts(indices, count) };
+    let Ok(path_str) = (unsafe { CStr::from_ptr(path) }).to_str() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let page_count = doc_guard.pages().len() as i32;
+    if order.iter().any(|&i| i < 0 || i >= page_count) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let Some(pdfium) = pdfium() else {
+        return STATUS_INVALID_INPUT;
+    };
+    let Ok(mut new_doc) = pdfium.create_new_pdf() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let range = order.iter().map(|&i| (i + 1).to_string()).collect::<Vec<_>>().join(",");
+    if new_doc.pages_mut().copy_pages_from_document(&doc_guard, &range, 0).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let Ok(bytes) = new_doc.save_to_bytes() else {
+        return STATUS_INVALID_INPUT;
+    };
+    if std::fs::write(path_str, bytes).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    STATUS_OK_PDFIUM
+}
+
 /// Saves the document (including any rotate/delete/form-fill changes) to a
 /// new file path.
 #[unsafe(no_mangle)]
@@ -4525,6 +4673,114 @@ mod tests {
         // The document is untouched after a rejected rebuild.
         assert_eq!(get_page_count(h), 20);
 
+        close_document(h);
+    }
+
+    // ---- Insert and extract ----
+
+    /// Builds a small source PDF (its first `n` pages) as bytes, for insert tests.
+    fn small_pdf_bytes(n: usize) -> Vec<u8> {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let order: Vec<i32> = (0..n as i32).collect();
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+        let saved = snapshot_document(h);
+        let bytes = unsafe { std::slice::from_raw_parts(saved.data, saved.len) }.to_vec();
+        free_byte_buffer(saved);
+        close_document(h);
+        bytes
+    }
+
+    #[test]
+    fn insert_pages_from_bytes_puts_them_at_the_right_spot() {
+        let src = small_pdf_bytes(2); // "Page 1 of 20", "Page 2 of 20"
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // Insert the two-page source at index 5.
+        assert_eq!(insert_pages_from_bytes(h, src.as_ptr(), src.len(), 5), 2);
+        assert_eq!(get_page_count(h), 22);
+
+        // Pages 5 and 6 are the inserted ones; page 7 is what used to be page 5.
+        assert_eq!(page_text(h, 5), "Page 1 of 20");
+        assert_eq!(page_text(h, 6), "Page 2 of 20");
+        assert_eq!(page_text(h, 7), "Page 6 of 20");
+        // Before the insert point is untouched.
+        assert_eq!(page_text(h, 4), "Page 5 of 20");
+
+        close_document(h);
+    }
+
+    #[test]
+    fn inserting_past_the_end_appends() {
+        let src = small_pdf_bytes(1);
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(insert_pages_from_bytes(h, src.as_ptr(), src.len(), 9999), 1);
+        assert_eq!(get_page_count(h), 21);
+        assert_eq!(page_text(h, 20), "Page 1 of 20"); // appended last
+        close_document(h);
+    }
+
+    #[test]
+    fn insert_rejects_bad_input() {
+        let src = small_pdf_bytes(1);
+        assert_eq!(insert_pages_from_bytes(0, src.as_ptr(), src.len(), 0), -1);
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(insert_pages_from_bytes(h, std::ptr::null(), 0, 0), -1);
+        // Not a PDF at all: rejected, document untouched.
+        let junk = b"not a pdf".to_vec();
+        assert_eq!(insert_pages_from_bytes(h, junk.as_ptr(), junk.len(), 0), -1);
+        assert_eq!(get_page_count(h), 20);
+        close_document(h);
+    }
+
+    #[test]
+    fn a_blank_page_is_inserted_and_is_actually_blank() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(insert_blank_page(h, 3, 612.0, 792.0), STATUS_OK_PDFIUM);
+        assert_eq!(get_page_count(h), 21);
+
+        // The new page 3 draws (almost) nothing; the old page 3 shifted to 4.
+        assert!(marked_pixels(h, 3) < 50, "the inserted page is not blank");
+        assert_eq!(page_text(h, 4), "Page 4 of 20");
+
+        close_document(h);
+    }
+
+    #[test]
+    fn extract_pages_writes_a_new_file_and_leaves_the_original_alone() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let mut out = std::env::temp_dir();
+        out.push(format!("render_core_extract_{}_{}.pdf", std::process::id(), line!()));
+        let out_str = out.to_str().unwrap().to_owned();
+        let c_path = std::ffi::CString::new(out_str.clone()).unwrap();
+
+        // Extract pages 2 and 3 ("Page 3", "Page 4").
+        let indices = [2i32, 3];
+        assert_eq!(
+            extract_pages_to_file(h, indices.as_ptr(), indices.len(), c_path.as_ptr()),
+            STATUS_OK_PDFIUM);
+
+        // The original is unchanged.
+        assert_eq!(get_page_count(h), 20);
+        close_document(h);
+
+        // The extracted file has exactly those two pages, in order.
+        let extracted = open_fixture_named(&out_str);
+        assert_eq!(get_page_count(extracted), 2);
+        assert_eq!(page_text(extracted, 0), "Page 3 of 20");
+        assert_eq!(page_text(extracted, 1), "Page 4 of 20");
+        close_document(extracted);
+
+        let _ = std::fs::remove_file(&out_str);
+    }
+
+    #[test]
+    fn extract_rejects_a_bad_index() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let c_path = std::ffi::CString::new(std::env::temp_dir().join("nope.pdf").to_str().unwrap()).unwrap();
+        let bad = [0i32, 99];
+        assert_eq!(extract_pages_to_file(h, bad.as_ptr(), 2, c_path.as_ptr()), STATUS_INVALID_INPUT);
+        assert_eq!(get_page_count(h), 20);
         close_document(h);
     }
 

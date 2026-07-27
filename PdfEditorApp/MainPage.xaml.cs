@@ -109,8 +109,9 @@ public sealed partial class MainPage : Page
                 bool duped = ViewModel.DuplicatePage(0);
                 int afterDup = ViewModel.PageCount;
                 bool deleted = ViewModel.DeletePage(1);
+                bool blank = ViewModel.InsertBlankPage(2);
                 Diag.Log($"autoreorder: start={start} moved={moved} duped={duped} afterDup={afterDup} " +
-                         $"deleted={deleted} end={ViewModel.PageCount}");
+                         $"deleted={deleted} blank={blank} end={ViewModel.PageCount}");
             }
 
             string zooms = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOZOOM") ?? "";
@@ -2872,5 +2873,137 @@ public sealed partial class MainPage : Page
         {
             ViewModel.RotatePages(pages, degrees);
         }
+    }
+
+    // ---------------- Insert / extract pages ----------------
+
+    private async void InsertFromFile_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.PageCount == 0)
+        {
+            return;
+        }
+
+        var picker = new Windows.Storage.Pickers.FileOpenPicker();
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
+        picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
+        picker.FileTypeFilter.Add(".pdf");
+
+        var file = await picker.PickSingleFileAsync();
+        if (file is not null)
+        {
+            // After the current page, so the inserted content follows what is
+            // on screen.
+            ViewModel.InsertPagesFromFile(file.Path, ViewModel.CurrentPageIndex + 1);
+        }
+    }
+
+    private void InsertBlankPage_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.PageCount > 0)
+        {
+            ViewModel.InsertBlankPage(ViewModel.CurrentPageIndex + 1);
+        }
+    }
+
+    private async void ExtractPagesMenu_Click(object sender, RoutedEventArgs e) =>
+        await ShowExtractDialog(null);
+
+    private async void PageExtract_Click(object sender, RoutedEventArgs e) =>
+        await ShowExtractDialog(PageOf(sender));
+
+    private void PageInsertBlankAfter_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        if (p >= 0)
+        {
+            ViewModel.InsertBlankPage(p + 1);
+        }
+    }
+
+    private async System.Threading.Tasks.Task ShowExtractDialog(int? contextPage)
+    {
+        int count = ViewModel.PageCount;
+        if (count == 0)
+        {
+            return;
+        }
+
+        int def = ((contextPage >= 0 ? contextPage : null) ?? ViewModel.CurrentPageIndex) + 1;
+        ExtractFrom.Text = def.ToString();
+        ExtractTo.Text = (contextPage >= 0 ? def : count).ToString();
+        ExtractOfLabel.Text = $"of {count}";
+        ExtractDeleteAfter.IsChecked = false;
+        ExtractSeparate.IsChecked = false;
+
+        ExtractPagesDialog.XamlRoot = XamlRoot;
+        if (await ExtractPagesDialog.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        int.TryParse(ExtractFrom.Text, out int from);
+        int.TryParse(ExtractTo.Text, out int to);
+        int lo = System.Math.Clamp(System.Math.Min(from, to), 1, count);
+        int hi = System.Math.Clamp(System.Math.Max(from, to), 1, count);
+
+        var indices = new System.Collections.Generic.List<int>();
+        for (int i = lo; i <= hi; i++)
+        {
+            indices.Add(i - 1);
+        }
+
+        if (indices.Count == 0)
+        {
+            return;
+        }
+
+        bool separate = ExtractSeparate.IsChecked == true;
+        bool ok;
+
+        if (separate)
+        {
+            // One PDF per page, into a chosen folder.
+            var folderPicker = new Windows.Storage.Pickers.FolderPicker();
+            WinRT.Interop.InitializeWithWindow.Initialize(folderPicker, App.WindowHandle);
+            folderPicker.FileTypeFilter.Add("*");
+
+            var folder = await folderPicker.PickSingleFolderAsync();
+            if (folder is null)
+            {
+                return;
+            }
+
+            ok = true;
+            foreach (int i in indices)
+            {
+                string p = System.IO.Path.Combine(folder.Path, $"page {i + 1}.pdf");
+                ok &= ViewModel.ExtractPagesToFile(new[] { i }, p);
+            }
+        }
+        else
+        {
+            var savePicker = new Windows.Storage.Pickers.FileSavePicker();
+            WinRT.Interop.InitializeWithWindow.Initialize(savePicker, App.WindowHandle);
+            savePicker.SuggestedFileName = $"pages {lo}-{hi}";
+            savePicker.FileTypeChoices.Add("PDF", new System.Collections.Generic.List<string> { ".pdf" });
+
+            var file = await savePicker.PickSaveFileAsync();
+            if (file is null)
+            {
+                return;
+            }
+
+            ok = ViewModel.ExtractPagesToFile(indices, file.Path);
+        }
+
+        // Delete-after only runs once the extract succeeded, so a failed write
+        // never loses the pages.
+        if (ok && ExtractDeleteAfter.IsChecked == true)
+        {
+            ViewModel.DeletePages(indices);
+        }
+
+        ViewModel.Status = ok ? "Pages extracted." : "Could not extract the pages.";
     }
 }

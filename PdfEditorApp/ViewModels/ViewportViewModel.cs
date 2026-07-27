@@ -382,7 +382,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        RemapOverlayPages(order);
+        MapOverlayPages(p => PageReorder.NewIndexOf(order, p));
         ReloadAfterPageStructureChange();
         IsDirty = true;
         return true;
@@ -391,6 +391,122 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Moves the page at <paramref name="from"/> to sit at <paramref name="to"/>.</summary>
     public bool MovePage(int from, int to) =>
         from != to && RebuildPages(PageReorder.Move(PageCount, from, to));
+
+    /// <summary>
+    /// Inserts every page of another PDF file at <paramref name="atIndex"/>. The
+    /// overlay marks on pages at or after the insertion point shift down by the
+    /// number of pages inserted.
+    /// </summary>
+    public bool InsertPagesFromFile(string path, int atIndex)
+    {
+        if (_documentHandle == 0)
+        {
+            return false;
+        }
+
+        byte[] bytes;
+        try
+        {
+            bytes = System.IO.File.ReadAllBytes(path);
+        }
+        catch
+        {
+            Status = "Could not read that file.";
+            return false;
+        }
+
+        PushHistory(HistoryScope.Document, "Insert pages");
+        int inserted = RenderCoreNative.insert_pages_from_bytes(
+            _documentHandle, bytes, (nuint)bytes.Length, atIndex);
+        if (inserted <= 0)
+        {
+            Status = "Could not insert those pages.";
+            return false;
+        }
+
+        MapOverlayPages(p => p < atIndex ? p : p + inserted);
+        ReloadAfterPageStructureChange();
+        IsDirty = true;
+        GoToPage(Math.Clamp(atIndex, 0, PageCount - 1));
+        return true;
+    }
+
+    /// <summary>Inserts a blank page, sized to match the current page, at <paramref name="atIndex"/>.</summary>
+    public bool InsertBlankPage(int atIndex)
+    {
+        if (_documentHandle == 0)
+        {
+            return false;
+        }
+
+        var (w, h) = CurrentPageSizePoints();
+
+        PushHistory(HistoryScope.Document, "Insert blank page");
+        if (RenderCoreNative.insert_blank_page(_documentHandle, atIndex, (float)w, (float)h) != RenderStatus.OkPdfium)
+        {
+            Status = "Could not insert a blank page.";
+            return false;
+        }
+
+        MapOverlayPages(p => p < atIndex ? p : p + 1);
+        ReloadAfterPageStructureChange();
+        IsDirty = true;
+        GoToPage(Math.Clamp(atIndex, 0, PageCount - 1));
+        return true;
+    }
+
+    /// <summary>Writes the given pages, in order, to a new PDF file. The document is unchanged.</summary>
+    public bool ExtractPagesToFile(IReadOnlyList<int> indices, string path)
+    {
+        if (_documentHandle == 0 || indices.Count == 0)
+        {
+            return false;
+        }
+
+        return RenderCoreNative.extract_pages_to_file(
+            _documentHandle, indices.ToArray(), (nuint)indices.Count, path) == RenderStatus.OkPdfium;
+    }
+
+    /// <summary>Deletes a set of pages at once, never emptying the document.</summary>
+    public bool DeletePages(IReadOnlyList<int> indices)
+    {
+        var drop = new HashSet<int>(indices);
+        var order = new List<int>();
+        for (int i = 0; i < PageCount; i++)
+        {
+            if (!drop.Contains(i))
+            {
+                order.Add(i);
+            }
+        }
+
+        return order.Count > 0 && order.Count < PageCount && RebuildPages(order);
+    }
+
+    /// <summary>The current page's size in points, or US Letter if it cannot be read.</summary>
+    private (double W, double H) CurrentPageSizePoints()
+    {
+        var array = RenderCoreNative.get_page_sizes(_documentHandle);
+        try
+        {
+            if (array.Status == RenderStatus.OkPdfium && array.Sizes != IntPtr.Zero
+                && CurrentPageIndex >= 0 && CurrentPageIndex < (int)array.Len)
+            {
+                int stride = Marshal.SizeOf<NativePageSize>();
+                var native = Marshal.PtrToStructure<NativePageSize>(array.Sizes + (CurrentPageIndex * stride));
+                if (native.Width > 0 && native.Height > 0)
+                {
+                    return (native.Width, native.Height);
+                }
+            }
+        }
+        finally
+        {
+            RenderCoreNative.free_page_size_array(array);
+        }
+
+        return (612, 792); // US Letter
+    }
 
     /// <summary>Inserts a copy of a page right after it.</summary>
     public bool DuplicatePage(int index) => RebuildPages(PageReorder.Duplicate(PageCount, index));
@@ -486,22 +602,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Remaps every overlay collection's page indices to the new order, in
-    /// place. A mark whose page was dropped is removed; where a page appears
-    /// more than once, its marks follow the first copy.
+    /// Remaps every overlay collection's page index through <paramref name="mapPage"/>,
+    /// in place: it returns where a page moved to, or -1 to drop its marks. A
+    /// reorder maps through the new order; an insert shifts pages after the
+    /// insertion point.
     /// </summary>
-    private void RemapOverlayPages(IReadOnlyList<int> order)
+    private void MapOverlayPages(Func<int, int> mapPage)
     {
-        RemapRecords(_allHighlights, order, (h, p) => h with { PageIndex = p });
-        RemapRecords(_allInkStrokes, order, (s, p) => s with { PageIndex = p });
-        RemapRecords(_allShapes, order, (sh, p) => sh with { PageIndex = p });
+        MapRecords(_allHighlights, mapPage, (h, p) => h with { PageIndex = p });
+        MapRecords(_allInkStrokes, mapPage, (s, p) => s with { PageIndex = p });
+        MapRecords(_allShapes, mapPage, (sh, p) => sh with { PageIndex = p });
 
         // Notes are a class, not a record, so they are rebuilt rather than
         // `with`-copied; Scale is carried across.
         var notes = new List<NoteAnnotation>(_allNotes.Count);
         foreach (var n in _allNotes)
         {
-            int np = PageReorder.NewIndexOf(order, n.PageIndex);
+            int np = mapPage(n.PageIndex);
             if (np >= 0)
             {
                 notes.Add(new NoteAnnotation(np, n.X, n.Y, n.Text) { Scale = n.Scale });
@@ -512,13 +629,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _allNotes.AddRange(notes);
     }
 
-    private static void RemapRecords<T>(List<T> list, IReadOnlyList<int> order, Func<T, int, T> withPage)
+    private static void MapRecords<T>(List<T> list, Func<int, int> mapPage, Func<T, int, T> withPage)
         where T : IAnnotation
     {
         var rebuilt = new List<T>(list.Count);
         foreach (var a in list)
         {
-            int np = PageReorder.NewIndexOf(order, a.PageIndex);
+            int np = mapPage(a.PageIndex);
             if (np >= 0)
             {
                 rebuilt.Add(withPage(a, np));

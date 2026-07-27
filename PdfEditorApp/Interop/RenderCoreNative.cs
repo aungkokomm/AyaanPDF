@@ -360,6 +360,26 @@ internal static partial class RenderCoreNative
     public static extern int rebuild_page_order(ulong docHandle, [In] int[] indices, nuint count);
 
     /// <summary>
+    /// Inserts every page of another PDF (its bytes) at a position. Returns the
+    /// NUMBER of pages inserted, or a NEGATIVE value on error.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int insert_pages_from_bytes(ulong docHandle, [In] byte[] data, nuint len, int atIndex);
+
+    /// <summary>Inserts one blank page, sized in points, at a position.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int insert_blank_page(ulong docHandle, int atIndex, float widthPts, float heightPts);
+
+    /// <summary>
+    /// Saves the given pages, in order, to a new PDF at <paramref name="path"/>,
+    /// leaving this document unchanged.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int extract_pages_to_file(
+        ulong docHandle, [In] int[] indices, nuint count,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>
     /// Reopens a snapshot. The bytes are copied natively, so the same managed
     /// array can be restored repeatedly (undo, redo, undo again).
     /// </summary>
