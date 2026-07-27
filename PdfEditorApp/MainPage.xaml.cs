@@ -828,11 +828,17 @@ public sealed partial class MainPage : Page
         double padX = (field.Right - field.Left) * 0.03;
         double padY = height * 0.12;
 
+        // BeginTextEdit commits any prior editor first, so set the field this
+        // edit fills AFTER it, or the prior field's name would be cleared.
         BeginTextEdit(page,
             field.Left + padX, field.Top + padY,
             field.Right - padX, field.Bottom - padY,
             initialText: string.IsNullOrEmpty(field.Value) ? null : field.Value);
+        _fillingFieldName = field.Name;
     }
+
+    /// <summary>The form field the open editor is filling, or null for an ordinary text box.</summary>
+    private string? _fillingFieldName;
 
     /// <summary>
     /// Brings an OPEN editor into line with the tool's current colour, size,
@@ -1006,8 +1012,10 @@ public sealed partial class MainPage : Page
 
         var editor = _textEditor;
         var target = _editingTarget;
+        var fillingField = _fillingFieldName;
         _textEditor = null; // First, so the LostFocus this triggers is a no-op.
         _editingTarget = null;
+        _fillingFieldName = null;
         editor.KeyDown -= TextEditor_KeyDown;
 
         string text = editor.Text.TrimEnd('\r', '\n');
@@ -1033,6 +1041,16 @@ public sealed partial class MainPage : Page
 
         if (string.IsNullOrWhiteSpace(text))
         {
+            return;
+        }
+
+        // A form-field fill removes the field's widget (so its box stops drawing
+        // over the text) and places the value; it does not leave the box selected
+        // for resizing, since the point is to move on to the next field.
+        if (fillingField is not null)
+        {
+            ViewModel.FillFormField(fillingField, _textEditorPage, _boxLeft, _boxTop, _boxRight, _boxBottom,
+                                    text, ViewModel.InkColorHex, ViewModel.TextFontSize);
             return;
         }
 

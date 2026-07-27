@@ -305,6 +305,15 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_form_fields(ulong docHandle);
 
     /// <summary>
+    /// Deletes the widget(s) for a named form field, so PDFium's form layer
+    /// stops painting the field box on top of the text the app draws to fill it.
+    /// A no-op (still Ok) when no field matches.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int delete_form_field_widget(
+        ulong docHandle, [MarshalAs(UnmanagedType.LPUTF8Str)] string fieldName);
+
+    /// <summary>
     /// Every page's size in one locked pass. The continuous viewport needs all
     /// sizes before it renders anything, so slot heights are known up front.
     /// </summary>

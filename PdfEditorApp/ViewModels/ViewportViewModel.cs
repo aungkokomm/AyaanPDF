@@ -301,6 +301,37 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Fills a form field with typed text: removes the field's widget (so its box
+    /// stops drawing over the text — see PDFium rule 10) and places the text as a
+    /// normal text-box annotation, all in one undo step. The field then drops out
+    /// of the fillable set, so its outline disappears. Returns false on failure.
+    /// </summary>
+    public bool FillFormField(string fieldName, int page, double normLeft, double normTop,
+                              double normRight, double normBottom,
+                              string text, string colorHex, double fontSizeNorm)
+    {
+        if (_documentHandle == 0 || string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        // One document snapshot covers both the widget removal and the text add,
+        // so a single undo restores the empty interactive field.
+        PushHistory(HistoryScope.Document, "Fill field");
+
+        RenderCoreNative.delete_form_field_widget(_documentHandle, fieldName);
+
+        bool placed = AddTextBoxNormalized(page, normLeft, normTop, normRight, normBottom,
+                                           text, colorHex, fontSizeNorm);
+
+        // The field is consumed: re-read so it no longer counts as fillable and
+        // its outline is dropped.
+        LoadFormFields();
+        DistributeFormOutlines();
+        return placed;
+    }
+
+    /// <summary>
     /// The shape being dragged out, or null. Redrawn on every pointer move, so
     /// the preview is the same polyline the finished shape will be and the two
     /// cannot disagree.

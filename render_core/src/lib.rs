@@ -3783,6 +3783,74 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
 // get_form_fields reports (a text box for a text field, a check glyph for a
 // checkbox) — the proven pipeline that renders, saves, flattens and re-edits.
 // get_form_fields stays: reading a field's kind/rect/current state is reliable.
+//
+// One catch the drawing approach hits: PDFium's form layer (FPDF_FFLDraw) paints
+// the widget appearance ON TOP of the page content and regular annotations, so a
+// text box drawn "in" a field is hidden behind the field's own box. Setting the
+// widget's Hidden flag does NOT help — FFLDraw ignores annotation flags and
+// draws the field anyway (measured). The reliable fix is delete_form_field_widget
+// below: remove the widget so the form layer has nothing to paint there, then the
+// app's text shows. It is per-field (other fields keep their boxes and stay
+// clickable via the rects get_form_fields captured) and touches no other
+// annotation, so highlights/ink/text are untouched — unlike a whole-page flatten.
+
+/// Deletes every widget annotation whose form field is named `field_name`. Used
+/// when the app fills a field by drawing text over it: without the widget the
+/// form layer no longer paints the field box on top of that text. Returns
+/// STATUS_OK_PDFIUM (deleting an absent field is a successful no-op),
+/// STATUS_INVALID_INPUT, or STATUS_PANIC.
+#[unsafe(no_mangle)]
+pub extern "C" fn delete_form_field_widget(doc_handle: u64, field_name: *const c_char) -> i32 {
+    if doc_handle == 0 || field_name.is_null() {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| delete_form_field_widget_inner(doc_handle, field_name))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn delete_form_field_widget_inner(doc_handle: u64, field_name: *const c_char) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let Ok(name_str) = (unsafe { CStr::from_ptr(field_name) }).to_str() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let doc_guard = lock(&doc);
+    let _ = doc_guard.form();
+
+    for mut page in doc_guard.pages().iter() {
+        // Collect matching indices first, then delete from the back so earlier
+        // indices stay valid as the list shrinks.
+        let mut to_delete: Vec<usize> = Vec::new();
+        {
+            let annotations = page.annotations();
+            for i in 0..annotations.len() {
+                if let Ok(a) = annotations.get(i) {
+                    if a.as_form_field().and_then(|f| f.name()).as_deref() == Some(name_str) {
+                        to_delete.push(i as usize);
+                    }
+                }
+            }
+        }
+
+        let annotations = page.annotations_mut();
+        for &i in to_delete.iter().rev() {
+            if let Ok(a) = annotations.get(i) {
+                let _ = annotations.delete_annotation(a);
+            }
+        }
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
 
 // ---------------------------------------------------------------------
 // Text layer: per-character Unicode codepoint + bounding box, in the same
@@ -8375,6 +8443,64 @@ mod tests {
 
         let choice = fields.iter().find(|f| f.name == "Country").unwrap();
         assert_eq!(choice.kind, FIELD_COMBO);
+
+        close_document(handle);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_form_deleted_widget_with_text_for_inspection() {
+        // Deletes the FullName widget, then draws a text box where it was, and
+        // renders — to confirm that removing the widget stops the form layer
+        // painting the field box, so the app's text shows instead of hiding
+        // behind it. Run: cargo test --release dump_form_deleted -- --ignored --nocapture
+        let handle = open_fixture_named("tests/fixtures/sample_form_rich.pdf");
+
+        let name = std::ffi::CString::new("FullName").unwrap();
+        assert_eq!(delete_form_field_widget(handle, name.as_ptr()), STATUS_OK_PDFIUM);
+
+        // FullName rect normalized (0.278, 0.098, 0.637, 0.131); text-box coords
+        // are capture-space pixels, so multiply by the capture width.
+        let cap = 900.0f32;
+        let text = "Aung Ko Ko";
+        assert_eq!(
+            add_text_box_annotation(
+                handle, 0, cap as i32,
+                0.288 * cap, 0.103 * cap, 0.627 * cap, 0.126 * cap,
+                text.as_ptr(), text.len(), 0.020 * cap,
+                0, 0, 0, 255,
+            ),
+            STATUS_OK_PDFIUM
+        );
+
+        let r = render_low_res(handle, 0, 900);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let out = std::env::var("DELW_DUMP").unwrap_or_else(|_| "delw.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {out} {}x{}", r.width, r.height);
+        free_render_result(r);
+        close_document(handle);
+    }
+
+    #[test]
+    fn delete_form_field_widget_removes_it_from_enumeration_and_tolerates_a_missing_field() {
+        let handle = open_fixture_named("tests/fixtures/sample_form_rich.pdf");
+
+        let name = std::ffi::CString::new("FullName").unwrap();
+        assert_eq!(delete_form_field_widget(handle, name.as_ptr()), STATUS_OK_PDFIUM);
+
+        // FullName is gone; the other fields remain.
+        let buf = get_form_fields(handle);
+        let fields = parse_form_fields(&buf);
+        free_byte_buffer(buf);
+        assert!(!fields.iter().any(|f| f.name == "FullName"), "FullName widget removed");
+        assert!(fields.iter().any(|f| f.name == "Subscribe"), "other fields untouched");
+
+        // Deleting an absent field is a successful no-op; bad input is rejected.
+        let missing = std::ffi::CString::new("Nope").unwrap();
+        assert_eq!(delete_form_field_widget(handle, missing.as_ptr()), STATUS_OK_PDFIUM);
+        assert_eq!(delete_form_field_widget(0, std::ptr::null()), STATUS_INVALID_INPUT);
 
         close_document(handle);
     }
