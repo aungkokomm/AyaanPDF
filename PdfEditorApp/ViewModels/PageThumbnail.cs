@@ -19,6 +19,17 @@ public partial class PageThumbnail : ObservableObject
     [ObservableProperty]
     public partial WriteableBitmap? Bitmap { get; set; }
 
+    /// <summary>
+    /// The card's on-screen width, in DIPs, so all thumbnails resize together
+    /// when the panel is zoomed or dragged. Height follows at US-Letter aspect.
+    /// </summary>
+    [ObservableProperty]
+    public partial double CardWidth { get; set; } = 126.0;
+
+    public double CardHeight => CardWidth * (11.0 / 8.5);
+
+    partial void OnCardWidthChanged(double value) => OnPropertyChanged(nameof(CardHeight));
+
     private bool _isRendering;
 
     public PageThumbnail(int pageIndex)

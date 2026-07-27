@@ -1704,6 +1704,11 @@ public sealed partial class MainPage : Page
         Grid.SetColumn(ThumbnailPanel, right ? 3 : 1);
         ThumbnailPanel.Margin = right ? new Thickness(12, 12, 0, 12) : new Thickness(0, 12, 12, 12);
 
+        // Keep the resize grip on the edge that faces the document, and flip the
+        // drag direction to match, so dragging inward always widens.
+        _thumbDockedRight = right;
+        ThumbnailResizeGrip.HorizontalAlignment = right ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+
         if (_autoFit)
         {
             DispatcherQueue.TryEnqueue(() => FitToWidth(animate: true));
@@ -2734,6 +2739,85 @@ public sealed partial class MainPage : Page
         {
             ViewModel.GoToPage(thumbnail.PageIndex);
         }
+    }
+
+    private static bool IsCtrlDown() =>
+        Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Control)
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+
+    /// <summary>
+    /// Ctrl+wheel over the thumbnail list zooms the cards instead of scrolling,
+    /// like an image viewer. Without Ctrl the wheel scrolls the list normally.
+    /// </summary>
+    private void ThumbnailList_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (!IsCtrlDown())
+        {
+            return;
+        }
+
+        int delta = e.GetCurrentPoint(ThumbnailList).Properties.MouseWheelDelta;
+        ViewModel.AdjustThumbnailSize(delta > 0 ? 16 : -16);
+        e.Handled = true;
+    }
+
+    // ---------------- Thumbnail pane resize grip ----------------
+
+    private bool _thumbResizing;
+    private bool _thumbDockedRight;
+    private double _thumbResizeStartX;
+    private double _thumbResizeStartWidth;
+
+    /// <summary>
+    /// The panel's inner edge is a thin grip; dragging it toward the document
+    /// widens the thumbnails, away from it narrows them.
+    /// </summary>
+    private void ThumbnailResize_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement grip)
+        {
+            return;
+        }
+
+        _thumbResizing = true;
+        _thumbResizeStartX = e.GetCurrentPoint(null).Position.X;
+        _thumbResizeStartWidth = ViewModel.ThumbnailDisplayWidth;
+        grip.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void ThumbnailResize_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_thumbResizing)
+        {
+            return;
+        }
+
+        double x = e.GetCurrentPoint(null).Position.X;
+        // Dragging toward the document widens. That is rightward while docked
+        // left (grip on the right edge) and leftward while docked right, so the
+        // sign flips with the dock side.
+        double delta = _thumbDockedRight
+            ? _thumbResizeStartX - x
+            : x - _thumbResizeStartX;
+        ViewModel.ThumbnailDisplayWidth = Math.Clamp(
+            _thumbResizeStartWidth + delta,
+            ViewportViewModel.MinThumbnailWidth,
+            ViewportViewModel.MaxThumbnailWidth);
+        e.Handled = true;
+    }
+
+    private void ThumbnailResize_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_thumbResizing)
+        {
+            return;
+        }
+
+        _thumbResizing = false;
+        (sender as FrameworkElement)?.ReleasePointerCapture(e.Pointer);
+        e.Handled = true;
     }
 
     // ---------------- Page organising ----------------

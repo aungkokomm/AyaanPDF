@@ -1022,7 +1022,8 @@
             takes width away from the canvas. Hidden until asked for.
         -->
         <Border x:Name="ThumbnailPanel" Visibility="Collapsed"
-                Grid.Column="1" Margin="0,12,12,12" Width="196"
+                Grid.Column="1" Margin="0,12,12,12"
+                Width="{x:Bind ViewModel.ThumbnailPaneWidth, Mode=OneWay}"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="10">
@@ -1031,6 +1032,21 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
+
+                <!--
+                    Resize grip on the panel's INNER edge (the one facing the
+                    document): the right edge while docked left, flipped to the
+                    left edge when the panel is moved to the right. Dragging it
+                    toward the document widens the thumbnails, away narrows them.
+                    A thin transparent strip, so the whole edge is grabbable.
+                -->
+                <Border x:Name="ThumbnailResizeGrip" Width="8" HorizontalAlignment="Right"
+                        Grid.RowSpan="2" Background="Transparent" Canvas.ZIndex="2"
+                        ToolTipService.ToolTip="Drag to resize, or Ctrl+scroll"
+                        PointerPressed="ThumbnailResize_PointerPressed"
+                        PointerMoved="ThumbnailResize_PointerMoved"
+                        PointerReleased="ThumbnailResize_PointerReleased"
+                        PointerCaptureLost="ThumbnailResize_PointerReleased" />
 
                 <!-- Header: what the panel is, and how many pages, with a hint
                      that they can be dragged. -->
@@ -1051,6 +1067,7 @@
                 <ListView
                 Grid.Row="1"
                 x:Name="ThumbnailList"
+                PointerWheelChanged="ThumbnailList_PointerWheelChanged"
                 Padding="8,0,8,8"
                 ItemsSource="{x:Bind ViewModel.Thumbnails}"
                 SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
@@ -1062,7 +1079,7 @@
                 ContainerContentChanging="ThumbnailList_ContainerContentChanging">
                 <ListView.ItemTemplate>
                     <DataTemplate x:DataType="viewmodels:PageThumbnail">
-                        <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
+                        <StackPanel Spacing="4" Margin="0,0,0,12" Width="{x:Bind CardWidth, Mode=OneWay}">
                             <!--
                                 Right-click a page for the actions drag cannot do:
                                 rotate, duplicate, delete, and a keyboard-free
@@ -1108,8 +1125,8 @@
                                     <Image
                                         Source="{x:Bind Bitmap, Mode=OneWay}"
                                         Stretch="Uniform"
-                                        Width="126"
-                                        Height="163" />
+                                        Width="{x:Bind CardWidth, Mode=OneWay}"
+                                        Height="{x:Bind CardHeight, Mode=OneWay}" />
                                 </Border>
                                 <Border HorizontalAlignment="Right" VerticalAlignment="Bottom"
                                         Margin="0,0,4,4" CornerRadius="8" Padding="6,1"

@@ -31,8 +31,95 @@ namespace PdfEditorApp.ViewModels;
 public partial class ViewportViewModel : ObservableObject, IDisposable
 {
     private const int LowResWidth = 200;
-    private const int ThumbnailWidth = 120;
     private const int MinRenderWidth = 100;
+
+    /// <summary>
+    /// The thumbnail's on-screen width, in DIPs. Adjustable (Ctrl+scroll, or
+    /// dragging the panel edge) between these bounds; the pane and the images
+    /// size from it.
+    /// </summary>
+    [ObservableProperty]
+    public partial double ThumbnailDisplayWidth { get; set; } = 126.0;
+
+    public const double MinThumbnailWidth = 90.0;
+    public const double MaxThumbnailWidth = 320.0;
+
+    /// <summary>Display height, at US-Letter aspect so the card reads as a page.</summary>
+    public double ThumbnailDisplayHeight => ThumbnailDisplayWidth * (11.0 / 8.5);
+
+    /// <summary>The panel's width: the thumbnail plus room for its margins and the scrollbar.</summary>
+    public double ThumbnailPaneWidth => ThumbnailDisplayWidth + 52;
+
+    /// <summary>
+    /// The pixel width thumbnails are RASTERIZED at: the display size times the
+    /// monitor's scale, so a page is drawn at the resolution it is shown at
+    /// rather than upscaled from a fixed small bitmap. This is what makes them
+    /// crisp. Clamped so an extreme DPI or size cannot ask for a huge render.
+    /// </summary>
+    private int ThumbnailPixelWidth =>
+        Math.Clamp((int)Math.Round(ThumbnailDisplayWidth * Math.Max(1.0, RasterizationScale)), 90, 900);
+
+    /// <summary>
+    /// Nudges the thumbnail size by a delta in DIPs, clamped. Ctrl+scroll and
+    /// the panel's resize grip both go through here.
+    /// </summary>
+    public void AdjustThumbnailSize(double deltaDip) =>
+        ThumbnailDisplayWidth = Math.Clamp(ThumbnailDisplayWidth + deltaDip, MinThumbnailWidth, MaxThumbnailWidth);
+
+    private DispatcherQueueTimer? _thumbResharpenTimer;
+
+    partial void OnThumbnailDisplayWidthChanged(double value)
+    {
+        OnPropertyChanged(nameof(ThumbnailDisplayHeight));
+        OnPropertyChanged(nameof(ThumbnailPaneWidth));
+
+        // Resize the cards right now so the panel tracks the drag/scroll
+        // smoothly — the existing bitmap just scales to fit, which is cheap.
+        foreach (var t in Thumbnails)
+        {
+            t.CardWidth = value;
+        }
+
+        // Re-rasterizing at the new resolution is the expensive part, so debounce
+        // it: a drag or a burst of Ctrl+scroll ticks only triggers one sharpening
+        // pass ~180ms after it settles, instead of one per pixel.
+        _thumbResharpenTimer ??= CreateResharpenTimer();
+        _thumbResharpenTimer.Stop();
+        _thumbResharpenTimer.Start();
+    }
+
+    private DispatcherQueueTimer CreateResharpenTimer()
+    {
+        var timer = _dispatcherQueue.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(180);
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) => ResharpenVisibleThumbnails();
+        return timer;
+    }
+
+    /// <summary>
+    /// Drops the bitmaps of the thumbnails currently showing and re-renders them
+    /// at the current <see cref="ThumbnailPixelWidth"/>, so a resize sharpens
+    /// them rather than leaving the old lower-resolution bitmap scaled up. Ones
+    /// not yet realized render fresh when scrolled to.
+    /// </summary>
+    private void ResharpenVisibleThumbnails()
+    {
+        var visible = new List<int>();
+        foreach (var t in Thumbnails)
+        {
+            if (t.Bitmap is not null)
+            {
+                visible.Add(t.PageIndex);
+                t.Bitmap = null;
+            }
+        }
+
+        foreach (int i in visible)
+        {
+            EnsureThumbnailRendered(i);
+        }
+    }
     private readonly DispatcherQueue _dispatcherQueue;
 
     private ulong _documentHandle;
@@ -207,7 +294,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
         for (int i = 0; i < PageCount; i++)
         {
-            Thumbnails.Add(new PageThumbnail(i));
+            Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
         }
 
         CurrentPageIndex = 0;
@@ -310,7 +397,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         IsDirty = true;
 
-        var thumb = PageRenderer.RenderLowRes(_documentHandle, CurrentPageIndex, ThumbnailWidth);
+        var thumb = PageRenderer.RenderLowRes(_documentHandle, CurrentPageIndex, ThumbnailPixelWidth);
         Thumbnails[CurrentPageIndex].Bitmap = thumb.Bitmap;
         RenderCurrentPage();
     }
@@ -344,7 +431,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Thumbnails.Clear();
         for (int i = 0; i < PageCount; i++)
         {
-            Thumbnails.Add(new PageThumbnail(i));
+            Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
         }
 
         if (CurrentPageIndex >= PageCount)
@@ -536,7 +623,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // out again, not just re-rendered in place.
         RebuildContinuousLayout();
 
-        var thumb = PageRenderer.RenderLowRes(_documentHandle, index, ThumbnailWidth);
+        var thumb = PageRenderer.RenderLowRes(_documentHandle, index, ThumbnailPixelWidth);
         if (index < Thumbnails.Count)
         {
             Thumbnails[index].Bitmap = thumb.Bitmap;
@@ -577,7 +664,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (i >= 0 && i < Thumbnails.Count && Thumbnails[i].Bitmap is not null)
             {
-                Thumbnails[i].Bitmap = PageRenderer.RenderLowRes(_documentHandle, i, ThumbnailWidth).Bitmap;
+                Thumbnails[i].Bitmap = PageRenderer.RenderLowRes(_documentHandle, i, ThumbnailPixelWidth).Bitmap;
             }
         }
 
@@ -672,7 +759,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Thumbnails.Clear();
             for (int i = 0; i < PageCount; i++)
             {
-                Thumbnails.Add(new PageThumbnail(i));
+                Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
             }
         }
         finally
@@ -2378,7 +2465,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // PDFium rasterization is tens of ms per page and sidebar scrolling
         // realizes containers in bursts, so this must not run inline.
-        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, ThumbnailWidth));
+        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, ThumbnailPixelWidth));
 
         if (handle != _documentHandle)
         {
@@ -3314,7 +3401,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 Thumbnails.Clear();
                 for (int i = 0; i < PageCount; i++)
                 {
-                    Thumbnails.Add(new PageThumbnail(i));
+                    Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
                 }
             }
         }
