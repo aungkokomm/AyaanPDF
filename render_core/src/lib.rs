@@ -3597,6 +3597,194 @@ fn fill_text_field_inner(doc_handle: u64, field_name: *const c_char, value: *con
 }
 
 // ---------------------------------------------------------------------
+// Enumerating AcroForm fields for an interactive fill UI.
+//
+// get_form_field_count above answers "does this document have a form", but a
+// UI that lets the user fill it needs, per WIDGET: which page it is on, what
+// kind of control to draw, where to put it, its name (to write back by), and
+// its current value/state. That is variable-length data (names, values), so it
+// travels as a self-describing ByteBuffer rather than a fixed struct array.
+//
+// Layout (all little-endian):
+//   u32  count
+//   repeated `count` times:
+//     i32  page_index
+//     i32  kind          (FIELD_* below)
+//     i32  flags         (bit0 = read-only, bit1 = checked)
+//     i32  group_index   (a radio/checkbox widget's unique index within its
+//                         control group; 0 for everything else — this is how a
+//                         specific radio button is addressed, since the export
+//                         value is unreachable, see note below)
+//     f32  left, top, right, bottom   (top-left origin, both axes / page WIDTH,
+//                                       exactly like AnnotationInfo)
+//     u32  name_len,  name_bytes  (UTF-8)
+//     u32  value_len, value_bytes (UTF-8; for radio/checkbox this is the GROUP's
+//                                  currently-selected value, shared by the group)
+//
+// A radio widget's own export value ("Basic"/"Pro") would be the natural key,
+// but FPDFAnnot_GetFormFieldExportValue needs the raw FPDF_ANNOTATION handle,
+// which pdfium-render keeps pub(crate) (same wall as FPDF_MovePages). So each
+// widget is addressed by its group_index instead, which IS reachable.
+// ---------------------------------------------------------------------
+
+pub const FIELD_OTHER: i32 = 0;
+pub const FIELD_TEXT: i32 = 1;
+pub const FIELD_CHECKBOX: i32 = 2;
+pub const FIELD_RADIO: i32 = 3;
+pub const FIELD_COMBO: i32 = 4;
+pub const FIELD_LISTBOX: i32 = 5;
+pub const FIELD_PUSHBUTTON: i32 = 6;
+pub const FIELD_SIGNATURE: i32 = 7;
+
+const FIELD_FLAG_READONLY: i32 = 1;
+const FIELD_FLAG_CHECKED: i32 = 2;
+
+/// Every form-field widget in the document, serialized as described above.
+/// A document with no AcroForm is a successful EMPTY result (count 0), not an
+/// error. Invalid handle -> STATUS_INVALID_INPUT; panic -> STATUS_PANIC.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_form_fields(doc_handle: u64) -> ByteBuffer {
+    if doc_handle == 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_form_fields_inner(doc_handle))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+    let _ = doc_guard.form(); // bind the form-fill environment before reading fields
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&0u32.to_le_bytes()); // count placeholder, backfilled below
+    let mut count: u32 = 0;
+
+    for (page_index, page) in doc_guard.pages().iter().enumerate() {
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            continue;
+        }
+        let page_top = page
+            .boundaries()
+            .media()
+            .map(|b| b.bounds.top().value)
+            .unwrap_or(page.height().value);
+        let page_left = page
+            .boundaries()
+            .media()
+            .map(|b| b.bounds.left().value)
+            .unwrap_or(0.0);
+
+        let annotations = page.annotations();
+        for i in 0..annotations.len() {
+            let Ok(annotation) = annotations.get(i) else {
+                continue;
+            };
+            let Some(field) = annotation.as_form_field() else {
+                continue;
+            };
+
+            // Determine control kind, current value string, checked state, and
+            // (for grouped controls) the widget's unique index within its group.
+            let (kind, value, checked, group_index) = if let Some(t) = field.as_text_field() {
+                (FIELD_TEXT, t.value().unwrap_or_default(), false, 0i32)
+            } else if let Some(c) = field.as_checkbox_field() {
+                (
+                    FIELD_CHECKBOX,
+                    c.group_value().unwrap_or_default(),
+                    c.is_checked().unwrap_or(false),
+                    c.index_in_group() as i32,
+                )
+            } else if let Some(r) = field.as_radio_button_field() {
+                (
+                    FIELD_RADIO,
+                    r.group_value().unwrap_or_default(),
+                    r.is_checked().unwrap_or(false),
+                    r.index_in_group() as i32,
+                )
+            } else if let Some(cb) = field.as_combo_box_field() {
+                (FIELD_COMBO, cb.value().unwrap_or_default(), false, 0)
+            } else if let Some(lb) = field.as_list_box_field() {
+                (FIELD_LISTBOX, lb.value().unwrap_or_default(), false, 0)
+            } else if field.as_signature_field().is_some() {
+                (FIELD_SIGNATURE, String::new(), false, 0)
+            } else if field.as_push_button_field().is_some() {
+                (FIELD_PUSHBUTTON, String::new(), false, 0)
+            } else {
+                (FIELD_OTHER, String::new(), false, 0)
+            };
+
+            let Ok(bounds) = annotation.bounds() else {
+                continue;
+            };
+            let left = (bounds.left().value - page_left) / page_w;
+            let right = (bounds.right().value - page_left) / page_w;
+            let top = (page_top - bounds.top().value) / page_w;
+            let bottom = (page_top - bounds.bottom().value) / page_w;
+
+            let mut flags = 0i32;
+            if field.is_read_only() {
+                flags |= FIELD_FLAG_READONLY;
+            }
+            if checked {
+                flags |= FIELD_FLAG_CHECKED;
+            }
+
+            let name = field.name().unwrap_or_default();
+
+            out.extend_from_slice(&(page_index as i32).to_le_bytes());
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&flags.to_le_bytes());
+            out.extend_from_slice(&group_index.to_le_bytes());
+            out.extend_from_slice(&left.to_le_bytes());
+            out.extend_from_slice(&top.to_le_bytes());
+            out.extend_from_slice(&right.to_le_bytes());
+            out.extend_from_slice(&bottom.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+
+            count += 1;
+        }
+    }
+
+    out[0..4].copy_from_slice(&count.to_le_bytes());
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+// No set_checkbox_field / set_radio_field: pdfium-render's form-module WRITES
+// are both non-rendering and unreliable. Setting /V via FPDFAnnot_SetStringValue
+// never regenerates the widget /AP, so the value is invisible on render AND on
+// flatten (proven: a filled text field, checked box and flipped radio all
+// rendered unchanged, only the reader-baked /AP showed). Worse, radio
+// set_checked() silently no-ops once another document's form environment has
+// been initialized in the same process — PDFium keeps global form state, and
+// the crate even ships stray debug println!s on that path. FPDFAnnot_SetAP and
+// NeedAppearances would fix it but need the pub(crate) raw handle (rule 6/9).
+//
+// So the app fills forms by DRAWING its own annotations at the rects that
+// get_form_fields reports (a text box for a text field, a check glyph for a
+// checkbox) — the proven pipeline that renders, saves, flattens and re-edits.
+// get_form_fields stays: reading a field's kind/rect/current state is reliable.
+
+// ---------------------------------------------------------------------
 // Text layer: per-character Unicode codepoint + bounding box, in the same
 // render-pixel space as a bitmap rendered at `target_width` (top-left
 // origin, Y down) — everything a caller needs to build text selection and
@@ -6369,7 +6557,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn an_ink_stroke_survives_save_and_reopen_as_an_editable_object() {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
 
@@ -8077,6 +8264,131 @@ mod tests {
 
         drop(doc_guard);
         drop(doc);
+        close_document(handle);
+    }
+
+    // ---- Form field enumeration + checkbox/radio setters -------------
+
+    /// One field parsed out of the get_form_fields ByteBuffer, so the tests can
+    /// assert on structured data rather than raw bytes.
+    struct ParsedField {
+        page_index: i32,
+        kind: i32,
+        flags: i32,
+        group_index: i32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        name: String,
+        value: String,
+    }
+
+    fn parse_form_fields(buf: &ByteBuffer) -> Vec<ParsedField> {
+        assert_eq!(buf.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
+        let mut p = 0usize;
+        let rd_u32 = |b: &[u8], p: &mut usize| {
+            let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let rd_i32 = |b: &[u8], p: &mut usize| {
+            let v = i32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let rd_f32 = |b: &[u8], p: &mut usize| {
+            let v = f32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let count = rd_u32(bytes, &mut p);
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let page_index = rd_i32(bytes, &mut p);
+            let kind = rd_i32(bytes, &mut p);
+            let flags = rd_i32(bytes, &mut p);
+            let group_index = rd_i32(bytes, &mut p);
+            let left = rd_f32(bytes, &mut p);
+            let top = rd_f32(bytes, &mut p);
+            let right = rd_f32(bytes, &mut p);
+            let bottom = rd_f32(bytes, &mut p);
+            let nlen = rd_u32(bytes, &mut p) as usize;
+            let name = String::from_utf8(bytes[p..p + nlen].to_vec()).unwrap();
+            p += nlen;
+            let vlen = rd_u32(bytes, &mut p) as usize;
+            let value = String::from_utf8(bytes[p..p + vlen].to_vec()).unwrap();
+            p += vlen;
+            out.push(ParsedField {
+                page_index,
+                kind,
+                flags,
+                group_index,
+                left,
+                top,
+                right,
+                bottom,
+                name,
+                value,
+            });
+        }
+        assert_eq!(p, buf.len, "parser consumed exactly the whole buffer");
+        out
+    }
+
+    #[test]
+    fn get_form_fields_enumerates_every_kind_with_name_rect_and_value() {
+        let handle = open_fixture_named("tests/fixtures/sample_form_rich.pdf");
+        let buf = get_form_fields(handle);
+        let fields = parse_form_fields(&buf);
+        free_byte_buffer(buf);
+
+        // Text, checkbox, two radio widgets, one choice = five widgets.
+        assert_eq!(fields.len(), 5, "expected one widget per control (radio has two)");
+
+        let text = fields.iter().find(|f| f.name == "FullName").unwrap();
+        assert_eq!(text.kind, FIELD_TEXT);
+        assert_eq!(text.page_index, 0);
+        // Rect is normalized top-left / page width, so within [0, ~1.3] and
+        // ordered left<right, top<bottom.
+        assert!(text.left > 0.0 && text.left < 1.0, "left {}", text.left);
+        assert!(text.right > text.left);
+        assert!(text.bottom > text.top);
+
+        let checkbox = fields.iter().find(|f| f.name == "Subscribe").unwrap();
+        assert_eq!(checkbox.kind, FIELD_CHECKBOX);
+        assert_eq!(checkbox.flags & FIELD_FLAG_CHECKED, 0, "starts unchecked");
+
+        let radios: Vec<_> = fields.iter().filter(|f| f.name == "Plan").collect();
+        assert_eq!(radios.len(), 2, "two radio widgets share the group name");
+        assert!(radios.iter().all(|r| r.kind == FIELD_RADIO));
+        // Each widget carries a distinct group index, and the group's selected
+        // value ("Pro") is reported on every widget.
+        let mut indices: Vec<i32> = radios.iter().map(|r| r.group_index).collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1], "widgets have unique group indices");
+        assert!(radios.iter().all(|r| r.value == "Pro"), "group's selected value");
+        // Exactly one widget is checked (the one PDFium considers selected).
+        let checked = radios.iter().filter(|r| r.flags & FIELD_FLAG_CHECKED != 0).count();
+        assert_eq!(checked, 1, "exactly one radio in the group is on");
+
+        let choice = fields.iter().find(|f| f.name == "Country").unwrap();
+        assert_eq!(choice.kind, FIELD_COMBO);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn get_form_fields_rejects_bad_input_and_is_empty_for_a_formless_document() {
+        assert_eq!(get_form_fields(0).status, STATUS_INVALID_INPUT);
+
+        // A document with no form: enumeration succeeds and is empty.
+        let handle = open_fixture_named("tests/fixtures/sample.pdf");
+        let buf = get_form_fields(handle);
+        let fields = parse_form_fields(&buf);
+        free_byte_buffer(buf);
+        assert_eq!(fields.len(), 0);
         close_document(handle);
     }
 }

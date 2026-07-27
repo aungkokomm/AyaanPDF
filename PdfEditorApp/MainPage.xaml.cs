@@ -803,6 +803,38 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
+    /// Fill mode: a click on a fillable field opens the text editor sized to
+    /// that field, so what the user types is placed as a text box that sits
+    /// inside the field's printed box. This reuses the ordinary text-box
+    /// pipeline, so the value renders, saves, flattens, and can be adjusted
+    /// later with the Select tool like any other text box.
+    /// </summary>
+    private void BeginFormFieldEdit(int page, PdfEditorApp.Viewport.FormField field)
+    {
+        double height = field.Bottom - field.Top;
+
+        // Size the text to the field: a fraction of its height, clamped so a
+        // very short or very tall field still gets a sensible size. TextFontSize
+        // is normalized against the page WIDTH, the space the rect uses too.
+        ViewModel.TextFontSize = System.Math.Clamp(height * 0.62, 0.012, 0.05);
+
+        // A form value is plain text inside the field's own box, so give it no
+        // fill or outline of ours, left-aligned like a typed entry.
+        ViewModel.TextAlign = PdfEditorApp.Viewport.TextAlign.Left;
+        ViewModel.TextFillHex = string.Empty;
+        ViewModel.TextOutlineHex = string.Empty;
+
+        // Inset a hair so the text does not sit against the field border.
+        double padX = (field.Right - field.Left) * 0.03;
+        double padY = height * 0.12;
+
+        BeginTextEdit(page,
+            field.Left + padX, field.Top + padY,
+            field.Right - padX, field.Bottom - padY,
+            initialText: string.IsNullOrEmpty(field.Value) ? null : field.Value);
+    }
+
+    /// <summary>
     /// Brings an OPEN editor into line with the tool's current colour, size,
     /// alignment, fill and outline, so changing any of them in the property bar
     /// mid-edit is reflected at once rather than only after committing.
@@ -2351,6 +2383,23 @@ public sealed partial class MainPage : Page
         if (!current.Properties.IsLeftButtonPressed)
         {
             return;
+        }
+
+        // Form fill mode intercepts a click on a fillable field and opens the
+        // text editor on it, whatever tool is active. A click that misses every
+        // field falls through to the normal handling below (pan/select), so the
+        // user can still move around the page.
+        if (ViewModel.FormFillMode)
+        {
+            var fc = ContentPoint(e);
+            double fnx = fc.X / ViewModel.OverlayScale;
+            double fny = fc.Y / ViewModel.OverlayScale;
+            if (ViewModel.FillableFieldAt(fc.Page, fnx, fny) is { } field)
+            {
+                BeginFormFieldEdit(fc.Page, field);
+                e.Handled = true;
+                return;
+            }
         }
 
         // Hand tool and Space-hand pan by dragging.

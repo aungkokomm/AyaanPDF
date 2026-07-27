@@ -52,6 +52,12 @@ public partial class PageSlot : ObservableObject
 
     public ObservableCollection<ScaledRect> SearchMatchRects { get; } = new();
 
+    /// <summary>
+    /// Outlines of the fillable form fields on this page, shown only while form
+    /// fill mode is on so the user can see where to click. Slot-space DIPs.
+    /// </summary>
+    public ObservableCollection<ScaledRect> FormFieldOutlines { get; } = new();
+
     /// <summary>Every highlight's rectangles, flattened and pre-scaled.</summary>
     public ObservableCollection<ScaledRect> HighlightRects { get; } = new();
 

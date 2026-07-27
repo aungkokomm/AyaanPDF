@@ -178,6 +178,128 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public IReadOnlyList<ShapeAnnotation> AllShapes => _allShapes;
 
+    // ---------------- AcroForm filling ----------------
+    //
+    // The document's form-field widgets, read once on open. The app cannot make
+    // PDFium render a field value written to /V (that path never regenerates the
+    // widget appearance, proven in render_core), so "filling" a form here means
+    // placing the app's OWN text-box annotations at the field rects the way the
+    // user would place any text — which renders, saves and flattens. This first
+    // slice fills TEXT fields; checkbox/radio/choice/signature are enumerated
+    // (so the pane can report them) but not yet clickable.
+
+    private readonly List<FormField> _formFields = new();
+
+    /// <summary>Every form-field widget the open document carries.</summary>
+    public IReadOnlyList<FormField> FormFields => _formFields;
+
+    /// <summary>True when the document has any fillable (text) field.</summary>
+    [ObservableProperty]
+    public partial bool HasFillableForm { get; set; }
+
+    /// <summary>The Fill Form toggle only exists when there is something to fill.</summary>
+    public Visibility FillFormButtonVisibility =>
+        HasFillableForm ? Visibility.Visible : Visibility.Collapsed;
+
+    partial void OnHasFillableFormChanged(bool value) =>
+        OnPropertyChanged(nameof(FillFormButtonVisibility));
+
+    /// <summary>When on, fillable fields are outlined and a click opens the text editor on one.</summary>
+    [ObservableProperty]
+    public partial bool FormFillMode { get; set; }
+
+    /// <summary>Reads the document's form fields. Cheap; called on open and after page-structure changes.</summary>
+    private void LoadFormFields()
+    {
+        _formFields.Clear();
+        HasFillableForm = false;
+        if (_documentHandle == 0)
+        {
+            return;
+        }
+
+        var buf = RenderCoreNative.get_form_fields(_documentHandle);
+        try
+        {
+            if (buf.Status == (int)RenderStatus.OkPdfium && buf.Data != IntPtr.Zero && buf.Len > 0)
+            {
+                byte[] bytes = new byte[(int)buf.Len];
+                Marshal.Copy(buf.Data, bytes, 0, bytes.Length);
+                _formFields.AddRange(FormFieldReader.Parse(bytes));
+            }
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buf);
+        }
+
+        HasFillableForm = _formFields.Any(f => f.IsFillable);
+        if (!HasFillableForm)
+        {
+            FormFillMode = false;
+        }
+    }
+
+    partial void OnFormFillModeChanged(bool value)
+    {
+        DistributeFormOutlines();
+        if (value)
+        {
+            int n = _formFields.Count(f => f.IsFillable);
+            Status = n == 1
+                ? "Form fill: click the highlighted field to type."
+                : $"Form fill: click any of the {n} highlighted fields to type.";
+        }
+    }
+
+    /// <summary>Puts each fillable field's outline on its page slot, or clears them when fill mode is off.</summary>
+    private void DistributeFormOutlines()
+    {
+        foreach (var slot in PageSlots)
+        {
+            slot.FormFieldOutlines.Clear();
+        }
+
+        if (!FormFillMode)
+        {
+            return;
+        }
+
+        foreach (var f in _formFields)
+        {
+            if (!f.IsFillable || f.PageIndex < 0 || f.PageIndex >= PageSlots.Count)
+            {
+                continue;
+            }
+
+            var slot = PageSlots[f.PageIndex];
+            var rect = new TextRect(f.Left, f.Top, f.Right, f.Bottom);
+            var scaled = ScaledRect.From(rect, slot.OverlayScale);
+            if (scaled.IsVisible)
+            {
+                slot.FormFieldOutlines.Add(scaled);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The fillable text field under a normalized page-local point, or null. The
+    /// click in fill mode opens the text editor on whatever this returns.
+    /// </summary>
+    public FormField? FillableFieldAt(int page, double normX, double normY)
+    {
+        foreach (var f in _formFields)
+        {
+            if (f.PageIndex == page && f.IsFillable
+                && normX >= f.Left && normX <= f.Right
+                && normY >= f.Top && normY <= f.Bottom)
+            {
+                return f;
+            }
+        }
+        return null;
+    }
+
     /// <summary>
     /// The shape being dragged out, or null. Redrawn on every pointer move, so
     /// the preview is the same polyline the finished shape will be and the two
@@ -301,6 +423,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RebuildContinuousLayout();
         RenderCurrentPage();
         ReportExistingAnnotations();
+        LoadFormFields();
     }
 
     /// <summary>
@@ -774,6 +897,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RenderCurrentPage();
         RefreshSelectionOutline();
         InkStrokeChanged?.Invoke();
+
+        // Field rects are keyed by page index; a reorder/insert/delete moves
+        // them, so re-read from the (rebuilt) document rather than remap.
+        LoadFormFields();
+        DistributeFormOutlines();
     }
 
     /// <summary>
@@ -1749,6 +1877,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 PageSlots[n.PageIndex].Notes.Add(n);
             }
         }
+
+        DistributeFormOutlines();
     }
 
     /// <summary>

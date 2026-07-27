@@ -48,6 +48,11 @@
       <Link>sample_20pages.pdf</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="..\render_core\tests\fixtures\sample_form_rich.pdf"
+             Condition="Exists('..\render_core\tests\fixtures\sample_form_rich.pdf')">
+      <Link>sample_form_rich.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
 </Project>

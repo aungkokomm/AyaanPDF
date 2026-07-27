@@ -217,6 +217,29 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
+                                        <!--
+                                            Fillable form fields, shown only in fill mode. A tinted fill
+                                            plus a dashed accent border so they read as "click here to
+                                            type" without hiding the field's own printed box. Display
+                                            only: the click is caught by the viewport host, which hit-tests
+                                            the field and opens the text editor on it.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind FormFieldOutlines}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Fill="#332563EB"
+                                                               Stroke="#CC2563EB" StrokeThickness="1.5"
+                                                               StrokeDashArray="3,2" RadiusX="1" RadiusY="1"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <ItemsControl ItemsSource="{x:Bind SelectionRects}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
@@ -488,6 +511,16 @@
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE8A9;" FontSize="16" />
                 </Button>
+
+                <!-- Only shown when the open document actually has fillable fields. -->
+                <ToggleButton x:Name="FillFormButton"
+                              ToolTipService.ToolTip="Fill form fields"
+                              Visibility="{x:Bind ViewModel.FillFormButtonVisibility, Mode=OneWay}"
+                              IsChecked="{x:Bind ViewModel.FormFillMode, Mode=TwoWay}"
+                              Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE762;" FontSize="16" />
+                </ToggleButton>
+
                 <Button ToolTipService.ToolTip="Menu"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE712;" FontSize="16" />

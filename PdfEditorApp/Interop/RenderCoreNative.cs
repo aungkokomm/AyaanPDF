@@ -296,6 +296,15 @@ internal static partial class RenderCoreNative
     public static extern int get_form_field_count(ulong docHandle);
 
     /// <summary>
+    /// Every AcroForm field widget in the document, as a self-describing byte
+    /// buffer (page index, kind, flags, group index, rect, name, value per
+    /// field). Parsed by <see cref="Viewport.FormFieldReader"/>. Free the result
+    /// with <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_form_fields(ulong docHandle);
+
+    /// <summary>
     /// Every page's size in one locked pass. The continuous viewport needs all
     /// sizes before it renders anything, so slot heights are known up front.
     /// </summary>
