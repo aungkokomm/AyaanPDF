@@ -1027,10 +1027,41 @@
                 SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
                 IsItemClickEnabled="True"
                 ItemClick="ThumbnailList_ItemClick"
+                CanReorderItems="True"
+                CanDragItems="True"
+                AllowDrop="True"
                 ContainerContentChanging="ThumbnailList_ContainerContentChanging">
                 <ListView.ItemTemplate>
                     <DataTemplate x:DataType="viewmodels:PageThumbnail">
                         <StackPanel Spacing="4" Margin="0,0,0,12" Width="128">
+                            <!--
+                                Right-click a page for the actions drag cannot do:
+                                rotate, duplicate, delete, and a keyboard-free
+                                nudge up or down.
+                            -->
+                            <StackPanel.ContextFlyout>
+                                <MenuFlyout>
+                                    <MenuFlyoutItem Text="Rotate 90&#176;" Click="PageRotate_Click">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE7AD;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutItem Text="Duplicate" Click="PageDuplicate_Click">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE8C8;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                    <MenuFlyoutSeparator />
+                                    <MenuFlyoutItem Text="Move up" Click="PageMoveUp_Click" />
+                                    <MenuFlyoutItem Text="Move down" Click="PageMoveDown_Click" />
+                                    <MenuFlyoutSeparator />
+                                    <MenuFlyoutItem Text="Delete page" Click="PageDelete_Click">
+                                        <MenuFlyoutItem.Icon>
+                                            <FontIcon Glyph="&#xE74D;" />
+                                        </MenuFlyoutItem.Icon>
+                                    </MenuFlyoutItem>
+                                </MenuFlyout>
+                            </StackPanel.ContextFlyout>
                             <Border BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
                                 <Image
                                     Source="{x:Bind Bitmap, Mode=OneWay}"

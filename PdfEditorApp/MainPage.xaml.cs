@@ -54,6 +54,9 @@ public sealed partial class MainPage : Page
         ViewModel.Shapes.CollectionChanged += OnInkStrokesCollectionChanged;
         ViewModel.LayoutRebuilt += OnLayoutRebuilt;
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
+        // Drag-reorder in the thumbnail list moves an item in this collection;
+        // that is the signal to rebuild the document in the new order.
+        ViewModel.Thumbnails.CollectionChanged += Thumbnails_CollectionChanged;
         Loaded += (_, _) =>
         {
             RootGrid.Focus(FocusState.Programmatic);
@@ -93,6 +96,21 @@ public sealed partial class MainPage : Page
                                                        ViewModel.OverlayScale / 2, pixels);
                     Diag.Log($"autostamp: placed={placed}");
                 }
+            }
+
+            // Exercises the page-organising reload path without a mouse: a
+            // reorder, a duplicate and a delete, logging page counts so a crash
+            // or a wrong count shows up headlessly.
+            if ((Environment.GetEnvironmentVariable("PDFEDITOR_AUTOREORDER") ?? "").Length > 0
+                && ViewModel.PageCount >= 3)
+            {
+                int start = ViewModel.PageCount;
+                bool moved = ViewModel.MovePage(0, 2);
+                bool duped = ViewModel.DuplicatePage(0);
+                int afterDup = ViewModel.PageCount;
+                bool deleted = ViewModel.DeletePage(1);
+                Diag.Log($"autoreorder: start={start} moved={moved} duped={duped} afterDup={afterDup} " +
+                         $"deleted={deleted} end={ViewModel.PageCount}");
             }
 
             string zooms = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOZOOM") ?? "";
@@ -2714,6 +2732,77 @@ public sealed partial class MainPage : Page
         if (e.ClickedItem is PageThumbnail thumbnail)
         {
             ViewModel.GoToPage(thumbnail.PageIndex);
+        }
+    }
+
+    // ---------------- Page organising ----------------
+
+    /// <summary>
+    /// A drag-reorder in the thumbnail list moved an item, so rebuild the
+    /// document to match the new sequence.
+    ///
+    /// Only a user MOVE is acted on; the app's own Clear/Add while rebuilding
+    /// the thumbnails raises Reset/Add, and would otherwise loop. The rebuild is
+    /// deferred to after this event, because clearing the collection the list is
+    /// mid-reorder on, from inside its own change notification, is not safe.
+    /// </summary>
+    private void Thumbnails_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.Action != NotifyCollectionChangedAction.Move || ViewModel.IsRebuildingPages)
+        {
+            return;
+        }
+
+        var order = ViewModel.Thumbnails.Select(t => t.PageIndex).ToList();
+        DispatcherQueue.TryEnqueue(() => ViewModel.RebuildPages(order));
+    }
+
+    /// <summary>The page a thumbnail context-menu item belongs to.</summary>
+    private static int PageOf(object sender) =>
+        (sender as FrameworkElement)?.DataContext is PageThumbnail t ? t.PageIndex : -1;
+
+    private void PageRotate_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        if (p >= 0)
+        {
+            ViewModel.RotatePage(p, 90);
+        }
+    }
+
+    private void PageDuplicate_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        if (p >= 0)
+        {
+            ViewModel.DuplicatePage(p);
+        }
+    }
+
+    private void PageMoveUp_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        if (p > 0)
+        {
+            ViewModel.MovePage(p, p - 1);
+        }
+    }
+
+    private void PageMoveDown_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        if (p >= 0 && p < ViewModel.PageCount - 1)
+        {
+            ViewModel.MovePage(p, p + 1);
+        }
+    }
+
+    private void PageDelete_Click(object sender, RoutedEventArgs e)
+    {
+        int p = PageOf(sender);
+        if (p >= 0)
+        {
+            ViewModel.DeletePage(p);
         }
     }
 }

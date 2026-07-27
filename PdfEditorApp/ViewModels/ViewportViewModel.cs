@@ -355,6 +355,167 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RenderCurrentPage();
     }
 
+    // ---------------- Page organising ----------------
+
+    /// <summary>
+    /// Rebuilds the document to a new sequence of its own pages: reorder,
+    /// duplicate or delete, from a list of source page indices.
+    ///
+    /// The document is rebuilt in the core (pages keep their saved annotations),
+    /// and the in-progress overlay marks, which are keyed by page index, are
+    /// remapped so each stays on its page and a mark on a removed page is
+    /// dropped. One undo step covers the whole thing.
+    /// </summary>
+    public bool RebuildPages(IReadOnlyList<int> order)
+    {
+        if (_documentHandle == 0 || order.Count == 0)
+        {
+            return false;
+        }
+
+        PushHistory(HistoryScope.Document, "Reorganize pages");
+
+        int[] arr = order.ToArray();
+        if (RenderCoreNative.rebuild_page_order(_documentHandle, arr, (nuint)arr.Length) != RenderStatus.OkPdfium)
+        {
+            Status = "Could not reorganize the pages.";
+            return false;
+        }
+
+        RemapOverlayPages(order);
+        ReloadAfterPageStructureChange();
+        IsDirty = true;
+        return true;
+    }
+
+    /// <summary>Moves the page at <paramref name="from"/> to sit at <paramref name="to"/>.</summary>
+    public bool MovePage(int from, int to) =>
+        from != to && RebuildPages(PageReorder.Move(PageCount, from, to));
+
+    /// <summary>Inserts a copy of a page right after it.</summary>
+    public bool DuplicatePage(int index) => RebuildPages(PageReorder.Duplicate(PageCount, index));
+
+    /// <summary>Deletes a page by index. Refuses to remove the last remaining page.</summary>
+    public bool DeletePage(int index) =>
+        PageCount > 1 && RebuildPages(PageReorder.Delete(PageCount, index));
+
+    /// <summary>Rotates one page by degrees, updating its thumbnail and the view if it is current.</summary>
+    public void RotatePage(int index, int degrees)
+    {
+        if (_documentHandle == 0 || index < 0 || index >= PageCount)
+        {
+            return;
+        }
+
+        PushHistory(HistoryScope.Document, "Rotate page");
+
+        if (RenderCoreNative.rotate_page(_documentHandle, index, degrees) != RenderStatus.OkPdfium)
+        {
+            return;
+        }
+
+        IsDirty = true;
+
+        // A rotate changes the page's aspect, so the slot stack has to be laid
+        // out again, not just re-rendered in place.
+        RebuildContinuousLayout();
+
+        var thumb = PageRenderer.RenderLowRes(_documentHandle, index, ThumbnailWidth);
+        if (index < Thumbnails.Count)
+        {
+            Thumbnails[index].Bitmap = thumb.Bitmap;
+        }
+
+        RenderCurrentPage();
+    }
+
+    /// <summary>
+    /// Remaps every overlay collection's page indices to the new order, in
+    /// place. A mark whose page was dropped is removed; where a page appears
+    /// more than once, its marks follow the first copy.
+    /// </summary>
+    private void RemapOverlayPages(IReadOnlyList<int> order)
+    {
+        RemapRecords(_allHighlights, order, (h, p) => h with { PageIndex = p });
+        RemapRecords(_allInkStrokes, order, (s, p) => s with { PageIndex = p });
+        RemapRecords(_allShapes, order, (sh, p) => sh with { PageIndex = p });
+
+        // Notes are a class, not a record, so they are rebuilt rather than
+        // `with`-copied; Scale is carried across.
+        var notes = new List<NoteAnnotation>(_allNotes.Count);
+        foreach (var n in _allNotes)
+        {
+            int np = PageReorder.NewIndexOf(order, n.PageIndex);
+            if (np >= 0)
+            {
+                notes.Add(new NoteAnnotation(np, n.X, n.Y, n.Text) { Scale = n.Scale });
+            }
+        }
+
+        _allNotes.Clear();
+        _allNotes.AddRange(notes);
+    }
+
+    private static void RemapRecords<T>(List<T> list, IReadOnlyList<int> order, Func<T, int, T> withPage)
+        where T : IAnnotation
+    {
+        var rebuilt = new List<T>(list.Count);
+        foreach (var a in list)
+        {
+            int np = PageReorder.NewIndexOf(order, a.PageIndex);
+            if (np >= 0)
+            {
+                rebuilt.Add(withPage(a, np));
+            }
+        }
+
+        list.Clear();
+        list.AddRange(rebuilt);
+    }
+
+    /// <summary>
+    /// The full reload after the page count or order changed: fresh thumbnails,
+    /// a rebuilt slot stack, redistributed overlay, and a re-render.
+    /// </summary>
+    /// <summary>
+    /// True while the thumbnail list is being rebuilt by a page operation, so
+    /// the view's drag-reorder handler can tell the app's own Clear/Add of the
+    /// Thumbnails collection apart from a user drag and not loop.
+    /// </summary>
+    public bool IsRebuildingPages { get; private set; }
+
+    private void ReloadAfterPageStructureChange()
+    {
+        _textLayers.Clear();
+        ClearLoadedAnnotations();
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+
+        PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
+
+        IsRebuildingPages = true;
+        try
+        {
+            Thumbnails.Clear();
+            for (int i = 0; i < PageCount; i++)
+            {
+                Thumbnails.Add(new PageThumbnail(i));
+            }
+        }
+        finally
+        {
+            IsRebuildingPages = false;
+        }
+
+        CurrentPageIndex = Math.Clamp(CurrentPageIndex, 0, Math.Max(0, PageCount - 1));
+
+        RebuildContinuousLayout();
+        RefreshAnnotationsForCurrentPage();
+        RenderCurrentPage();
+        RefreshSelectionOutline();
+        InkStrokeChanged?.Invoke();
+    }
+
     /// <summary>
     /// Path the current document was opened from, so it can be reloaded after
     /// a save that burned annotations into it.
