@@ -402,6 +402,29 @@
                 -->
                 <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
 
+                <!--
+                    Isolated text-editing layer, ABOVE the ink canvas.
+
+                    Separate from InkCanvas because that one is hit-test
+                    invisible (so ink never eats a page gesture), but the text
+                    editor MUST receive pointer input: clicking to place the
+                    caret and dragging to select are what make editing feel
+                    like a real text box rather than a field you can only type
+                    into blind. A dim scrim over the rest of the page isolates
+                    the box being edited, the way Word greys out everything
+                    else; clicking the scrim (anywhere off the box) commits.
+
+                    EditCanvas has NO background, so its empty area is
+                    transparent to hit-testing and a click there falls through
+                    to the scrim; only the editor child is interactive.
+                    Collapsed until an edit begins.
+                -->
+                <Grid x:Name="EditOverlay" Visibility="Collapsed">
+                    <Rectangle x:Name="EditScrim" Fill="#30000000"
+                               PointerPressed="EditScrim_PointerPressed" />
+                    <Canvas x:Name="EditCanvas" />
+                </Grid>
+
             </controls:CursorGrid>
         </ScrollView>
 

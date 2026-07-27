@@ -765,9 +765,15 @@ public sealed partial class MainPage : Page
             // Width plus wrap is what makes the editor a true preview.
             TextWrapping = TextWrapping.Wrap,
             Width = System.Math.Max(40, widthDip),
-            Padding = new Thickness(2),
-            BorderThickness = new Thickness(1),
-            Background = new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF)),
+            MinHeight = System.Math.Max(24, ViewModel.TextFontSize * scale * 1.6),
+            Padding = new Thickness(3),
+            // A clear accent frame plus rounded corners reads as "this is a box
+            // you are editing", the way Word frames a text box. When the box has
+            // its own outline, UpdateOpenEditorStyle overrides this with it.
+            BorderThickness = new Thickness(1.5),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2B, 0x6C, 0xB0)),
+            CornerRadius = new CornerRadius(3),
+            Background = new SolidColorBrush(Colors.White),
             Foreground = HexBrush(ViewModel.InkColorHex),
             // Arial is metrically close to the PDF's Helvetica, so the editor
             // wraps in almost the same places the rendered text will.
@@ -776,9 +782,13 @@ public sealed partial class MainPage : Page
             Text = initialText ?? string.Empty,
         };
 
+        // Host on the hit-testable editing layer, NOT the ink canvas: there the
+        // editor receives pointer input, so clicking to place the caret and
+        // dragging to select text work. The scrim dims the rest of the page.
         Canvas.SetLeft(_textEditor, normLeft * scale);
         Canvas.SetTop(_textEditor, (normTop * scale) + pageTop);
-        InkCanvas.Children.Add(_textEditor);
+        EditCanvas.Children.Add(_textEditor);
+        EditOverlay.Visibility = Visibility.Visible;
 
         _textEditorPage = page;
         _boxLeft = normLeft;
@@ -862,17 +872,18 @@ public sealed partial class MainPage : Page
             _ => TextAlignment.Left,
         };
 
-        // Fill: the box's own background, or a faint white so the text stays
-        // readable over the page while typing when there is no fill.
+        // Fill: the box's own background, or an opaque white so the box reads as
+        // a clean editing surface lifted off the dimmed page when it has no fill.
         _textEditor.Background = string.IsNullOrEmpty(ViewModel.TextFillHex)
-            ? new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF))
+            ? new SolidColorBrush(Colors.White)
             : HexBrush(ViewModel.TextFillHex);
 
-        // Outline: the box's border, or none.
+        // Outline: the box's own border when set; otherwise the accent editing
+        // frame, so there is always a clear boundary while typing.
         if (string.IsNullOrEmpty(ViewModel.TextOutlineHex))
         {
-            _textEditor.BorderThickness = new Thickness(1);
-            _textEditor.BorderBrush = new SolidColorBrush(Color.FromArgb(0x40, 0x00, 0x00, 0x00));
+            _textEditor.BorderThickness = new Thickness(1.5);
+            _textEditor.BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2B, 0x6C, 0xB0));
         }
         else
         {
@@ -977,6 +988,13 @@ public sealed partial class MainPage : Page
         OutlineNoneSlash.Visibility = hasOutline ? Visibility.Collapsed : Visibility.Visible;
     }
 
+    /// <summary>Clicking the dimmed area outside the box finishes the edit, keeping what was typed.</summary>
+    private void EditScrim_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        CommitTextEdit();
+        e.Handled = true;
+    }
+
     private void TextEditor_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         // Escape commits and keeps what was typed; Shift+Enter adds a line.
@@ -1019,7 +1037,12 @@ public sealed partial class MainPage : Page
         editor.KeyDown -= TextEditor_KeyDown;
 
         string text = editor.Text.TrimEnd('\r', '\n');
-        InkCanvas.Children.Remove(editor);
+        EditCanvas.Children.Remove(editor);
+        // Lower the isolation layer once nothing is being edited.
+        if (EditCanvas.Children.Count == 0)
+        {
+            EditOverlay.Visibility = Visibility.Collapsed;
+        }
 
         // Re-editing an existing box: replace it, in one undo step. Empty text
         // deletes it, which is the natural way to clear a box you no longer
