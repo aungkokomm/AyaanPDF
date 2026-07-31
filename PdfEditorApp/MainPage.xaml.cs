@@ -903,6 +903,9 @@ public sealed partial class MainPage : Page
         _textEditor.FontStyle = ViewModel.TextItalic
             ? Windows.UI.Text.FontStyle.Italic
             : Windows.UI.Text.FontStyle.Normal;
+        // Underline/strikethrough are not previewed: a TextBox has no
+        // TextDecorations (only TextBlock does). They still render on the
+        // committed box, which is what the PDF keeps.
     }
 
     // ---------------- Text alignment, fill, outline ----------------
@@ -937,6 +940,20 @@ public sealed partial class MainPage : Page
     private void Italic_Click(object sender, RoutedEventArgs e)
     {
         ViewModel.TextItalic = ItalicBtn.IsChecked == true;
+        UpdateOpenEditorStyle();
+        ReturnFocusAfterPointerUse();
+    }
+
+    private void Underline_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.TextUnderline = UnderlineBtn.IsChecked == true;
+        UpdateOpenEditorStyle();
+        ReturnFocusAfterPointerUse();
+    }
+
+    private void Strikethrough_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.TextStrikethrough = StrikethroughBtn.IsChecked == true;
         UpdateOpenEditorStyle();
         ReturnFocusAfterPointerUse();
     }
@@ -1014,6 +1031,8 @@ public sealed partial class MainPage : Page
 
         BoldBtn.IsChecked = ViewModel.TextBold;
         ItalicBtn.IsChecked = ViewModel.TextItalic;
+        UnderlineBtn.IsChecked = ViewModel.TextUnderline;
+        StrikethroughBtn.IsChecked = ViewModel.TextStrikethrough;
 
         bool hasFill = !string.IsNullOrEmpty(ViewModel.TextFillHex);
         FillSwatch.Background = hasFill ? HexBrush(ViewModel.TextFillHex) : new SolidColorBrush(Colors.Transparent);
@@ -1540,6 +1559,14 @@ public sealed partial class MainPage : Page
             ShowFontSize();
             SyncTextStyleControls();
         }
+
+        // Row 2 only exists when one of its sections (font, text style, opacity,
+        // stamps) is showing, so a simple tool stays a single row.
+        bool row2 = FontSection.Visibility == Visibility.Visible
+                 || TextStyleSection.Visibility == Visibility.Visible
+                 || OpacitySection.Visibility == Visibility.Visible
+                 || StampSection.Visibility == Visibility.Visible;
+        PropertyBarRow2.Visibility = Show(row2);
 
         // A bar with every section collapsed is an empty pill floating over the
         // page, so the whole thing goes when the tool offers nothing.

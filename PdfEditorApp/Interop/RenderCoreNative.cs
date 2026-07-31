@@ -524,7 +524,9 @@ internal static partial class RenderCoreNative
         uint outlineRgba,
         float outlineWidthPx,
         [In] byte[]? fontPathUtf8,
-        nuint fontPathLen);
+        nuint fontPathLen,
+        int underline,
+        int strikethrough);
 
     /// <summary>Adds freehand strokes as real /Ink annotations, one per stroke.</summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]

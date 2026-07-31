@@ -627,9 +627,17 @@
                 column width and lets what does not fit be reached instead of
                 cut off, and it costs nothing at the sizes that do fit.
             -->
-            <ScrollViewer HorizontalScrollMode="Auto" HorizontalScrollBarVisibility="Auto"
-                          VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled">
-            <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+            <!--
+                Two rows, not one scrolling row: a bar you have to scroll hides
+                controls. Row 1 carries the general sections (colour, width,
+                shape, size); row 2 the rest (font, text style, opacity,
+                stamps). Sections still show or hide per tool, and row 2 is
+                collapsed whenever none of its sections apply, so a simple tool
+                stays a single row.
+            -->
+            <StackPanel Orientation="Vertical" Spacing="4">
+            <StackPanel x:Name="PropertyBarRow1" Orientation="Horizontal" Spacing="8"
+                        VerticalAlignment="Center" HorizontalAlignment="Center">
 
                 <TextBlock x:Name="PropertyBarToolName" VerticalAlignment="Center"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -885,12 +893,15 @@
                     </ListView>
                 </StackPanel>
 
-                <!-- Font family + bold/italic. Unicode: pick any installed font
-                     (including a local-language one) and the core embeds it. -->
+            </StackPanel>
+            <!-- Row 2: font, text style, opacity, stamps. -->
+            <StackPanel x:Name="PropertyBarRow2" Orientation="Horizontal" Spacing="8"
+                        VerticalAlignment="Center" HorizontalAlignment="Center">
+
+                <!-- Font family + bold/italic/underline/strikethrough. Unicode:
+                     pick any installed font (including a local-language one). -->
                 <StackPanel x:Name="FontSection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">
-                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
-                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
                     <ComboBox x:Name="FontFamilyCombo" Width="164" Height="30" Padding="8,0"
                               PlaceholderText="Default font"
                               SelectionChanged="FontFamily_SelectionChanged"
@@ -915,6 +926,18 @@
                                   AutomationProperties.Name="Italic"
                                   ToolTipService.ToolTip="Italic">
                         <TextBlock Text="I" FontStyle="Italic" FontSize="15" FontFamily="Georgia" />
+                    </ToggleButton>
+                    <ToggleButton x:Name="UnderlineBtn" Click="Underline_Click"
+                                  Width="30" Height="30" Padding="0"
+                                  AutomationProperties.Name="Underline"
+                                  ToolTipService.ToolTip="Underline">
+                        <TextBlock Text="U" FontSize="15" TextDecorations="Underline" />
+                    </ToggleButton>
+                    <ToggleButton x:Name="StrikethroughBtn" Click="Strikethrough_Click"
+                                  Width="30" Height="30" Padding="0"
+                                  AutomationProperties.Name="Strikethrough"
+                                  ToolTipService.ToolTip="Strikethrough">
+                        <TextBlock Text="S" FontSize="15" TextDecorations="Strikethrough" />
                     </ToggleButton>
                 </StackPanel>
 
@@ -1103,7 +1126,7 @@
                 </StackPanel>
 
             </StackPanel>
-            </ScrollViewer>
+            </StackPanel>
         </Border>
 
         <!--

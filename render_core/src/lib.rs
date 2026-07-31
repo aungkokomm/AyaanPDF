@@ -1804,11 +1804,20 @@ struct TextStyle {
     fill: PackedRgba,
     outline: PackedRgba,
     outline_width_px: f32,
+    underline: bool,
+    strikethrough: bool,
 }
 
 impl TextStyle {
     fn plain() -> Self {
-        TextStyle { align: ALIGN_LEFT, fill: PackedRgba(0), outline: PackedRgba(0), outline_width_px: 0.0 }
+        TextStyle {
+            align: ALIGN_LEFT,
+            fill: PackedRgba(0),
+            outline: PackedRgba(0),
+            outline_width_px: 0.0,
+            underline: false,
+            strikethrough: false,
+        }
     }
 }
 
@@ -2173,6 +2182,8 @@ pub extern "C" fn add_text_box_annotation_styled(
     outline_width_px: f32,
     font_path_utf8: *const u8,
     font_path_len: usize,
+    underline: i32,
+    strikethrough: i32,
 ) -> i32 {
     let align = if matches!(align, ALIGN_LEFT | ALIGN_CENTER | ALIGN_RIGHT | ALIGN_JUSTIFY) {
         align
@@ -2184,6 +2195,8 @@ pub extern "C" fn add_text_box_annotation_styled(
         fill: PackedRgba(fill_rgba),
         outline: PackedRgba(outline_rgba),
         outline_width_px: outline_width_px.max(0.0),
+        underline: underline != 0,
+        strikethrough: strikethrough != 0,
     };
 
     // The font path is an OS path to a TrueType/OpenType file, empty for the
@@ -2386,11 +2399,15 @@ fn add_text_box_inner(
         // Justify spreads the words of a full line across the whole width; every
         // other case places the whole line at one x computed from its measured
         // width.
-        if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
+        // Place the line's text, and note the x and width its decoration (if
+        // any) should span: the full width for a justified line, the measured
+        // width otherwise.
+        let (deco_x, deco_w) = if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
             justify_line(
                 &doc_guard, &mut annotation, font, &line.text, color, size_pts,
                 text_left, avail_width, baseline,
             );
+            (text_left, avail_width)
         } else {
             let line_w = measure_text_width(&doc_guard, font, &line.text, size_pts);
             let x = match style.align {
@@ -2410,6 +2427,20 @@ fn add_text_box_inner(
             if annotation.objects_mut().add_text_object(obj).is_err() {
                 return STATUS_INVALID_INPUT;
             }
+            (x, line_w)
+        };
+
+        // Underline sits just below the baseline; strikethrough runs through
+        // the middle of the x-height. Both are thin filled rules in the text
+        // colour, drawn per line so they follow wrapping and alignment.
+        let rule_thickness = (size_pts * 0.06).max(0.4);
+        if style.underline {
+            add_text_rule(&doc_guard, &mut annotation, deco_x, baseline - size_pts * 0.13,
+                          deco_w, rule_thickness, color);
+        }
+        if style.strikethrough {
+            add_text_rule(&doc_guard, &mut annotation, deco_x, baseline + size_pts * 0.28,
+                          deco_w, rule_thickness, color);
         }
     }
 
@@ -2421,6 +2452,33 @@ fn add_text_box_inner(
     drop(doc_guard);
     evict_all_cache_for_doc(doc_handle);
     STATUS_OK_PDFIUM
+}
+
+/// Draws a thin horizontal filled rule (underline or strikethrough) centred on
+/// `y_center`, spanning `x..x+width`, in the text colour. A zero or negative
+/// width is a no-op (an empty or unmeasurable line).
+fn add_text_rule<'a>(
+    doc: &pdfium_render::prelude::PdfDocument<'a>,
+    annotation: &mut pdfium_render::prelude::PdfPageStampAnnotation<'a>,
+    x: f32,
+    y_center: f32,
+    width: f32,
+    thickness: f32,
+    color: pdfium_render::prelude::PdfColor,
+) {
+    use pdfium_render::prelude::*;
+    if width <= 0.0 {
+        return;
+    }
+    let rect = PdfRect::new(
+        PdfPoints::new(y_center - thickness / 2.0),
+        PdfPoints::new(x),
+        PdfPoints::new(y_center + thickness / 2.0),
+        PdfPoints::new(x + width),
+    );
+    if let Ok(obj) = PdfPagePathObject::new_rect(doc, rect, None, None, Some(color)) {
+        let _ = annotation.objects_mut().add_path_object(obj);
+    }
 }
 
 /// Lays one line out justified: each word its own text object, the gaps between
@@ -6114,7 +6172,7 @@ mod tests {
             assert_eq!(
                 add_text_box_annotation_styled(handle, 0, 1000, 60.0, top, 520.0, top + 170.0,
                     b.as_ptr(), b.len(), 22.0, 20, 20, 20, 255,
-                    *align, fill, outline, 2.0, std::ptr::null(), 0),
+                    *align, fill, outline, 2.0, std::ptr::null(), 0, 0, 0),
                 STATUS_OK_PDFIUM);
         }
 
@@ -6294,7 +6352,7 @@ mod tests {
             assert_eq!(
                 add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 800.0, 200.0,
                     text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255, align, 0, 0, 0.0,
-                    std::ptr::null(), 0),
+                    std::ptr::null(), 0, 0, 0),
                 STATUS_OK_PDFIUM);
             let (bytes, _) = render_bytes(h, 0, 400);
             close_document(h);
@@ -6314,7 +6372,7 @@ mod tests {
         assert_eq!(
             add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 300.0,
                 text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255,
-                ALIGN_LEFT, 0xFF0000FF, 0, 0.0, std::ptr::null(), 0),
+                ALIGN_LEFT, 0xFF0000FF, 0, 0.0, std::ptr::null(), 0, 0, 0),
             STATUS_OK_PDFIUM);
 
         let (bytes, w) = render_bytes(h, 0, 400);
@@ -6365,7 +6423,7 @@ mod tests {
             add_text_box_annotation_styled(
                 h, 0, 900, 60.0, 60.0, 620.0, 170.0,
                 text.as_ptr(), text.len(), 44.0, 0, 0, 0, 255,
-                ALIGN_LEFT, white_fill, 0, 0.0, font.as_ptr(), font.len()),
+                ALIGN_LEFT, white_fill, 0, 0.0, font.as_ptr(), font.len(), 0, 0),
             STATUS_OK_PDFIUM);
         let ink = dark_pixels_in_band(h, 0.10, 0.11, 0.55, 0.16);
         close_document(h);
@@ -6385,7 +6443,7 @@ mod tests {
             add_text_box_annotation_styled(
                 handle, 0, 900, 60.0, 60.0, 840.0, 200.0,
                 text.as_ptr(), text.len(), 40.0, 0, 0, 0, 255,
-                ALIGN_LEFT, 0, 0, 0.0, font.as_ptr(), font.len()),
+                ALIGN_LEFT, 0, 0, 0.0, font.as_ptr(), font.len(), 0, 0),
             STATUS_OK_PDFIUM);
 
         let r = render_low_res(handle, 0, 900);
@@ -6399,13 +6457,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn dump_underline_strikethrough_for_inspection() {
+        // Run: cargo test --release dump_underline -- --ignored --nocapture
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let t1 = "Underlined text".as_bytes();
+        assert_eq!(
+            add_text_box_annotation_styled(handle, 0, 900, 60.0, 60.0, 700.0, 130.0,
+                t1.as_ptr(), t1.len(), 36.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0xFFFFFFFF, 0, 0.0, std::ptr::null(), 0, 1, 0),
+            STATUS_OK_PDFIUM);
+
+        let t2 = "Struck through".as_bytes();
+        assert_eq!(
+            add_text_box_annotation_styled(handle, 0, 900, 60.0, 150.0, 700.0, 220.0,
+                t2.as_ptr(), t2.len(), 36.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0xFFFFFFFF, 0, 0.0, std::ptr::null(), 0, 0, 1),
+            STATUS_OK_PDFIUM);
+
+        let r = render_low_res(handle, 0, 900);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let out = std::env::var("DECO_DUMP").unwrap_or_else(|_| "deco.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {out} {}x{}", r.width, r.height);
+        free_render_result(r);
+        close_document(handle);
+    }
+
+    #[test]
+    fn underline_draws_a_rule_below_the_text() {
+        // An underlined box has ink in the strip just below where the text sits
+        // that a plain box does not. White fill isolates the box from the page.
+        let text = "Test".as_bytes();
+        let make = |underline: i32| {
+            let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            add_text_box_annotation_styled(h, 0, 900, 60.0, 60.0, 400.0, 150.0,
+                text.as_ptr(), text.len(), 44.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0xFFFFFFFF, 0, 0.0, std::ptr::null(), 0, underline, 0);
+            // The underline rule sits just below the baseline, inside the box
+            // (box bottom is norm ~0.167 here). Sample that strip.
+            let n = dark_pixels_in_band(h, 0.09, 0.135, 0.42, 0.16);
+            close_document(h);
+            n
+        };
+        assert!(make(1) > make(0) + 20, "underline should add ink below the text");
+    }
+
+    #[test]
     fn a_styled_box_keeps_its_style_tag_across_a_reopen() {
         let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
         let text = "styled".as_bytes();
         assert_eq!(
             add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 600.0, 260.0,
                 text.as_ptr(), text.len(), 22.0, 20, 20, 20, 255,
-                ALIGN_CENTER, 0xFFF7C8FF, 0x1565C0FF, 2.0, std::ptr::null(), 0),
+                ALIGN_CENTER, 0xFFF7C8FF, 0x1565C0FF, 2.0, std::ptr::null(), 0, 0, 0),
             STATUS_OK_PDFIUM);
 
         free_render_result(render_region(h, 0, 0.0, 0.0, 1.0, 1.0, 200));

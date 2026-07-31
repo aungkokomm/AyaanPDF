@@ -3207,6 +3207,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial bool TextItalic { get; set; }
 
+    [ObservableProperty]
+    public partial bool TextUnderline { get; set; }
+
+    [ObservableProperty]
+    public partial bool TextStrikethrough { get; set; }
+
     /// <summary>Installed font families for the picker, loaded once, lazily.</summary>
     public ObservableCollection<FontFamily> FontFamilies { get; } = new();
 
@@ -3447,7 +3453,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             (float)(fontSizeNorm * CaptureWidth), r, g, b, a,
             (int)TextAlign, PackRgba(TextFillHex), PackRgba(TextOutlineHex),
             (float)(TextOutlineWidthNorm * CaptureWidth),
-            fontUtf8, (nuint)(fontUtf8?.Length ?? 0));
+            fontUtf8, (nuint)(fontUtf8?.Length ?? 0),
+            TextUnderline ? 1 : 0, TextStrikethrough ? 1 : 0);
 
         Diag.Log($"text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" align={TextAlign} -> {status}");
 
