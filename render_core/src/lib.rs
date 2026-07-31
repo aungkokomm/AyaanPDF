@@ -1806,6 +1806,13 @@ struct TextStyle {
     outline_width_px: f32,
     underline: bool,
     strikethrough: bool,
+    /// Clockwise rotation of the whole box about its own centre, in degrees.
+    /// Zero for an upright box. Applied to every object of the box before it is
+    /// added, and recorded in the tag so it round-trips. This is a geometric
+    /// property, not a text look, but it rides with the style because it flows
+    /// through the same place-and-tag path as everything else here, and other
+    /// object kinds will want the same field.
+    rotation_deg: f32,
 }
 
 impl TextStyle {
@@ -1817,6 +1824,7 @@ impl TextStyle {
             outline_width_px: 0.0,
             underline: false,
             strikethrough: false,
+            rotation_deg: 0.0,
         }
     }
 }
@@ -1985,15 +1993,17 @@ fn textbox_tag_styled(
     style: TextStyle,
     font_path: Option<&str>,
 ) -> String {
-    // Two round-trip fields go AFTER the original six so an older box (which has
-    // neither) still parses: a decorations flag (bit0 underline, bit1
-    // strikethrough) and the font FILE the box was drawn in, base64 so a path
-    // with a colon or a space is never read as a separator. The bold/italic cut
-    // is the file itself, so it needs no flag of its own. The words stay LAST,
-    // still colon-free base64.
+    // Round-trip fields go AFTER the original six so an older box (which lacks
+    // them) still parses: a decorations flag (bit0 underline, bit1 strikethrough),
+    // the font FILE the box was drawn in (base64, so a path with a colon or a
+    // space is never read as a separator), and the clockwise rotation in degrees.
+    // The bold/italic cut is the file itself, so it needs no flag of its own.
+    // Each addition slots in just before the words, which stay LAST and remain
+    // colon-free base64, so every reader that keys off "last field = text" and
+    // "gate extras on length" keeps working.
     let flags = (style.underline as u32) | ((style.strikethrough as u32) << 1);
     format!(
-        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}:{}:{}",
+        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}:{}:{:.2}:{}",
         size_px,
         r,
         g,
@@ -2005,6 +2015,7 @@ fn textbox_tag_styled(
         style.outline_width_px,
         flags,
         base64_encode(font_path.unwrap_or("").as_bytes()),
+        style.rotation_deg,
         base64_encode(text.as_bytes())
     )
 }
@@ -2105,7 +2116,8 @@ fn parse_textbox_tag_full(contents: &str) -> Option<ParsedTextBox> {
         let outline_width_px: f32 = parts[5].parse().unwrap_or(0.0);
 
         // The round-trip extras (flags + font) are present only when there are
-        // more than the six fixed fields plus the words.
+        // more than the six fixed fields plus the words. Rotation is a later
+        // addition still, so it is gated on its own longer length.
         let (underline, strikethrough, font_path) = if parts.len() >= 9 {
             let flags: u32 = parts[6].parse().unwrap_or(0);
             let font = base64_decode(parts[7])
@@ -2115,6 +2127,7 @@ fn parse_textbox_tag_full(contents: &str) -> Option<ParsedTextBox> {
         } else {
             (false, false, None)
         };
+        let rotation_deg: f32 = if parts.len() >= 10 { parts[8].parse().unwrap_or(0.0) } else { 0.0 };
 
         let text = String::from_utf8(base64_decode(parts[parts.len() - 1])?).ok()?;
         return Some(ParsedTextBox {
@@ -2131,6 +2144,7 @@ fn parse_textbox_tag_full(contents: &str) -> Option<ParsedTextBox> {
                 outline_width_px,
                 underline,
                 strikethrough,
+                rotation_deg,
             },
             font_path,
         });
@@ -2408,6 +2422,9 @@ pub extern "C" fn add_text_box_annotation_styled(
         outline_width_px: outline_width_px.max(0.0),
         underline: underline != 0,
         strikethrough: strikethrough != 0,
+        // A box is placed upright; rotation is applied afterwards, like resizing,
+        // via rotate_text_box_annotation.
+        rotation_deg: 0.0,
     };
 
     // The font path is an OS path to a TrueType/OpenType file, empty for the
@@ -2470,6 +2487,27 @@ fn add_text_box_common(
         )
     })
     .unwrap_or(STATUS_PANIC)
+}
+
+/// Rotates a freshly-built page object CLOCKWISE by `deg` degrees about the point
+/// (`cx`, `cy`) in page points, applied BEFORE the object is added to its
+/// annotation (a transform on an object already stored never reaches the stored
+/// copy). Zero degrees is a no-op. Every object of a rotated text box gets this,
+/// about the box's own centre, so the whole box turns as one, like a Word text
+/// box. Expands where `pdfium_render::prelude::*` is in scope. `deg`/`cx`/`cy`
+/// are read more than once, so pass plain values, not expressions with effects.
+macro_rules! rotate_object_about {
+    ($obj:expr, $deg:expr, $cx:expr, $cy:expr) => {
+        if $deg != 0.0 {
+            let _ = $obj.translate(PdfPoints::new(-$cx), PdfPoints::new(-$cy));
+            // The stored angle is CLOCKWISE ON SCREEN, matching WinUI's
+            // RotateTransform, so the overlay's frame and the drawn box agree. PDF
+            // space is y-up, so a clockwise-on-screen turn is a counter-clockwise
+            // turn here.
+            let _ = $obj.rotate_counter_clockwise_degrees($deg);
+            let _ = $obj.translate(PdfPoints::new($cx), PdfPoints::new($cy));
+        }
+    };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2552,12 +2590,37 @@ fn add_text_box_inner(
     let box_height = content_height.max(dragged_height);
     let y_bottom = y_top - box_height;
 
-    let bounds = PdfRect::new(
-        PdfPoints::new(y_bottom),
-        PdfPoints::new(x0),
-        PdfPoints::new(y_top),
-        PdfPoints::new(x1),
-    );
+    // The box turns about its own centre. Every object is laid out upright first,
+    // in the box's own frame, then rotated about this point before being added.
+    let rot = style.rotation_deg;
+    let cx = (x0 + x1) / 2.0;
+    let cy = (y_bottom + y_top) / 2.0;
+
+    // The annotation's rect is its appearance's clip, so a rotated box needs a
+    // rect big enough for the TURNED box or PDFium would crop the corners. That
+    // is the axis-aligned bounding box of the rotated rectangle, centred on the
+    // same point. Upright, it is exactly the box.
+    let bounds = if rot == 0.0 {
+        PdfRect::new(
+            PdfPoints::new(y_bottom),
+            PdfPoints::new(x0),
+            PdfPoints::new(y_top),
+            PdfPoints::new(x1),
+        )
+    } else {
+        let (s, c) = rot.to_radians().sin_cos();
+        let (s, c) = (s.abs(), c.abs());
+        let w = x1 - x0;
+        let h = y_top - y_bottom;
+        let half_w = (w * c + h * s) / 2.0;
+        let half_h = (w * s + h * c) / 2.0;
+        PdfRect::new(
+            PdfPoints::new(cy - half_h),
+            PdfPoints::new(cx - half_w),
+            PdfPoints::new(cy + half_h),
+            PdfPoints::new(cx + half_w),
+        )
+    };
 
     let Ok(mut annotation) = page.annotations_mut().create_stamp_annotation() else {
         return STATUS_INVALID_INPUT;
@@ -2587,13 +2650,14 @@ fn add_text_box_inner(
         let stroke = style.outline.is_visible().then(|| {
             PdfColor::new(style.outline.r(), style.outline.g(), style.outline.b(), style.outline.a())
         });
-        if let Ok(rect_obj) = PdfPagePathObject::new_rect(
+        if let Ok(mut rect_obj) = PdfPagePathObject::new_rect(
             &doc_guard,
             rect,
             stroke,
             style.outline.is_visible().then(|| PdfPoints::new(ow.max(0.1))),
             fill,
         ) {
+            rotate_object_about!(rect_obj, rot, cx, cy);
             let _ = annotation.objects_mut().add_path_object(rect_obj);
         }
     }
@@ -2649,6 +2713,7 @@ fn add_text_box_inner(
                         PdfPoints::new(pen_x + g.x_offset),
                         PdfPoints::new(baseline + g.y_offset),
                     );
+                    rotate_object_about!(obj, rot, cx, cy);
                     let _ = annotation.objects_mut().add_text_object(obj);
                 }
                 pen_x += g.x_advance;
@@ -2657,7 +2722,7 @@ fn add_text_box_inner(
         } else if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
             justify_line(
                 &doc_guard, &mut annotation, font, &line.text, color, size_pts,
-                text_left, avail_width, baseline,
+                text_left, avail_width, baseline, rot, cx, cy,
             );
             (text_left, avail_width)
         } else {
@@ -2676,6 +2741,7 @@ fn add_text_box_inner(
             if obj.translate(PdfPoints::new(x), PdfPoints::new(baseline)).is_err() {
                 return STATUS_INVALID_INPUT;
             }
+            rotate_object_about!(obj, rot, cx, cy);
             if annotation.objects_mut().add_text_object(obj).is_err() {
                 return STATUS_INVALID_INPUT;
             }
@@ -2688,11 +2754,11 @@ fn add_text_box_inner(
         let rule_thickness = (size_pts * 0.06).max(0.4);
         if style.underline {
             add_text_rule(&doc_guard, &mut annotation, deco_x, baseline - size_pts * 0.13,
-                          deco_w, rule_thickness, color);
+                          deco_w, rule_thickness, color, rot, cx, cy);
         }
         if style.strikethrough {
             add_text_rule(&doc_guard, &mut annotation, deco_x, baseline + size_pts * 0.28,
-                          deco_w, rule_thickness, color);
+                          deco_w, rule_thickness, color, rot, cx, cy);
         }
     }
 
@@ -2707,8 +2773,10 @@ fn add_text_box_inner(
 }
 
 /// Draws a thin horizontal filled rule (underline or strikethrough) centred on
-/// `y_center`, spanning `x..x+width`, in the text colour. A zero or negative
+/// `y_center`, spanning `x..x+width`, in the text colour, then rotates it with
+/// the rest of the box about (`cx`, `cy`) by `rot` degrees. A zero or negative
 /// width is a no-op (an empty or unmeasurable line).
+#[allow(clippy::too_many_arguments)]
 fn add_text_rule<'a>(
     doc: &pdfium_render::prelude::PdfDocument<'a>,
     annotation: &mut pdfium_render::prelude::PdfPageStampAnnotation<'a>,
@@ -2717,6 +2785,9 @@ fn add_text_rule<'a>(
     width: f32,
     thickness: f32,
     color: pdfium_render::prelude::PdfColor,
+    rot: f32,
+    cx: f32,
+    cy: f32,
 ) {
     use pdfium_render::prelude::*;
     if width <= 0.0 {
@@ -2728,7 +2799,8 @@ fn add_text_rule<'a>(
         PdfPoints::new(y_center + thickness / 2.0),
         PdfPoints::new(x + width),
     );
-    if let Ok(obj) = PdfPagePathObject::new_rect(doc, rect, None, None, Some(color)) {
+    if let Ok(mut obj) = PdfPagePathObject::new_rect(doc, rect, None, None, Some(color)) {
+        rotate_object_about!(obj, rot, cx, cy);
         let _ = annotation.objects_mut().add_path_object(obj);
     }
 }
@@ -2746,6 +2818,9 @@ fn justify_line<'a>(
     left: f32,
     avail_width: f32,
     baseline: f32,
+    rot: f32,
+    cx: f32,
+    cy: f32,
 ) {
     use pdfium_render::prelude::*;
 
@@ -2767,6 +2842,7 @@ fn justify_line<'a>(
         if let Ok(mut obj) = PdfPageTextObject::new(doc, word, font, PdfPoints::new(size_pts)) {
             let _ = obj.set_fill_color(color);
             if obj.translate(PdfPoints::new(x), PdfPoints::new(baseline)).is_ok() {
+                rotate_object_about!(obj, rot, cx, cy);
                 let _ = annotation.objects_mut().add_text_object(obj);
             }
         }
@@ -6940,6 +7016,7 @@ mod tests {
             outline_width_px: 0.0,
             underline: true,
             strikethrough: false,
+            rotation_deg: 0.0,
         };
         let tag = textbox_tag_styled("hi", 20.0, 0, 0, 0, 255, style, Some(r"C:\Fonts\Noto Sans.ttf"));
 
@@ -7027,6 +7104,96 @@ mod tests {
     }
 
     #[test]
+    fn a_rotated_box_enlarges_its_rect_and_records_the_angle() {
+        // A rotated square needs a bigger axis-aligned rect to hold it (its
+        // diagonal), so the annotation the core writes for a turned box is wider
+        // AND taller than the same box upright. That enlargement is what stops
+        // PDFium cropping the turned corners. The angle also round-trips in the tag
+        // so a resize or re-edit keeps it.
+        let place = |deg: f32| {
+            let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+            let mut style = TextStyle::plain();
+            style.rotation_deg = deg;
+            // A near-square box (equal capture width and height) and short text, so
+            // the height stays the dragged size and a 45-degree turn grows both.
+            assert_eq!(
+                add_text_box_inner(handle, 0, 1000, 200.0, 200.0, 400.0, 400.0,
+                    "turn", 24.0, 0, 0, 0, 255, style, None),
+                STATUS_OK_PDFIUM);
+            let a = read_annotations(handle, 0);
+            assert_eq!(a.len(), 1);
+            let dims = (a[0].4 - a[0].2, a[0].5 - a[0].3);
+            close_document(handle);
+            dims
+        };
+
+        let (up_w, up_h) = place(0.0);
+        let (rot_w, rot_h) = place(45.0);
+        assert!(rot_w > up_w * 1.2, "a 45-degree box should be much wider: up={up_w} rot={rot_w}");
+        assert!(rot_h > up_h * 1.2, "a 45-degree box should be much taller: up={up_h} rot={rot_h}");
+
+        // The angle survives in the tag.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let mut style = TextStyle::plain();
+        style.rotation_deg = 45.0;
+        add_text_box_inner(handle, 0, 1000, 200.0, 200.0, 400.0, 400.0,
+            "turn", 24.0, 0, 0, 0, 255, style, None);
+        let contents = contents_of(handle, 0, 0).expect("rotated box has no tag");
+        let parsed = parse_textbox_tag_full(&contents).expect("rotated box tag should parse");
+        assert!((parsed.style.rotation_deg - 45.0).abs() < 0.01,
+            "rotation lost in the tag: {}", parsed.style.rotation_deg);
+        close_document(handle);
+    }
+
+    #[test]
+    fn resizing_a_rotated_box_keeps_its_angle() {
+        // Resizing re-lays-the-box-out from its tag, which carries the angle, so a
+        // box that was turned stays turned after it is resized.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let mut style = TextStyle::plain();
+        style.rotation_deg = 30.0;
+        assert_eq!(
+            add_text_box_inner(handle, 0, 1000, 200.0, 200.0, 500.0, 300.0,
+                "keep my angle", 22.0, 0, 0, 0, 255, style, None),
+            STATUS_OK_PDFIUM);
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_text_box_annotation(handle, 0, 0, 1000, 200.0, 200.0, 360.0, 300.0, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        let contents = contents_of(handle, 0, new_index as usize).expect("resized box has no tag");
+        let parsed = parse_textbox_tag_full(&contents).expect("resized box tag should parse");
+        assert!((parsed.style.rotation_deg - 30.0).abs() < 0.01,
+            "resize dropped the rotation: {}", parsed.style.rotation_deg);
+        close_document(handle);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_rotated_text_box_for_inspection() {
+        // Run: cargo test --release dump_rotated -- --ignored --nocapture
+        // then convert the raw BGRA (WxH printed) to PNG and LOOK: the box, its
+        // border, and the Burmese text should all be turned about the box centre.
+        let font = "C:\\Windows\\Fonts\\mmrtext.ttf";
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let mut style = TextStyle::plain();
+        style.rotation_deg = 30.0;
+        style.fill = PackedRgba(0xFFFFFFFF);
+        style.outline = PackedRgba(0x1565C0FF);
+        style.outline_width_px = 2.0;
+        add_text_box_inner(handle, 0, 900, 250.0, 200.0, 650.0, 340.0,
+            "Rotated မြန်မာ", 40.0, 20, 20, 20, 255, style, Some(font));
+        let r = render_low_res(handle, 0, 900);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let out = std::env::var("ROT_DUMP").unwrap_or_else(|_| "rot.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {out} {}x{}", r.width, r.height);
+        free_render_result(r);
+        close_document(handle);
+    }
+
+    #[test]
     fn the_full_text_box_parser_reads_style_and_rejects_other_marks() {
         // The gate that makes resize_text_box_annotation report UNSUPPORTED for a
         // shape or a plain comment, so the app falls back to the generic resize
@@ -7045,6 +7212,7 @@ mod tests {
                 outline_width_px: 0.0,
                 underline: true,
                 strikethrough: false,
+                rotation_deg: 0.0,
             },
             Some(r"C:\Fonts\Noto.ttf"),
         );
