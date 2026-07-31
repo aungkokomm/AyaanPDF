@@ -891,6 +891,18 @@ public sealed partial class MainPage : Page
             _textEditor.BorderThickness = new Thickness(w);
             _textEditor.BorderBrush = HexBrush(ViewModel.TextOutlineHex);
         }
+
+        // Font family, bold and italic: WinUI resolves an installed font by
+        // name, so the editor previews close to what the core will embed. Arial
+        // stands in for the default (Helvetica) as elsewhere.
+        _textEditor.FontFamily = new Microsoft.UI.Xaml.Media.FontFamily(
+            string.IsNullOrEmpty(ViewModel.TextFontFamily) ? "Arial" : ViewModel.TextFontFamily);
+        _textEditor.FontWeight = ViewModel.TextBold
+            ? Microsoft.UI.Text.FontWeights.Bold
+            : Microsoft.UI.Text.FontWeights.Normal;
+        _textEditor.FontStyle = ViewModel.TextItalic
+            ? Windows.UI.Text.FontStyle.Italic
+            : Windows.UI.Text.FontStyle.Normal;
     }
 
     // ---------------- Text alignment, fill, outline ----------------
@@ -904,6 +916,27 @@ public sealed partial class MainPage : Page
         }
 
         SyncTextStyleControls();
+        UpdateOpenEditorStyle();
+        ReturnFocusAfterPointerUse();
+    }
+
+    private void FontFamily_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        ViewModel.SelectFontFamily(FontFamilyCombo.SelectedItem as PdfEditorApp.Viewport.FontFamily);
+        UpdateOpenEditorStyle();
+        ReturnFocusAfterPointerUse();
+    }
+
+    private void Bold_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.TextBold = BoldBtn.IsChecked == true;
+        UpdateOpenEditorStyle();
+        ReturnFocusAfterPointerUse();
+    }
+
+    private void Italic_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.TextItalic = ItalicBtn.IsChecked == true;
         UpdateOpenEditorStyle();
         ReturnFocusAfterPointerUse();
     }
@@ -978,6 +1011,9 @@ public sealed partial class MainPage : Page
         AlignCenterBtn.IsChecked = ViewModel.TextAlign == TextAlign.Center;
         AlignRightBtn.IsChecked = ViewModel.TextAlign == TextAlign.Right;
         AlignJustifyBtn.IsChecked = ViewModel.TextAlign == TextAlign.Justify;
+
+        BoldBtn.IsChecked = ViewModel.TextBold;
+        ItalicBtn.IsChecked = ViewModel.TextItalic;
 
         bool hasFill = !string.IsNullOrEmpty(ViewModel.TextFillHex);
         FillSwatch.Background = hasFill ? HexBrush(ViewModel.TextFillHex) : new SolidColorBrush(Colors.Transparent);
@@ -1494,11 +1530,13 @@ public sealed partial class MainPage : Page
 
         bool fontSize = tool.Offers(ToolOptions.FontSize);
         FontSizeSection.Visibility = Show(fontSize);
-        // Alignment, fill and outline are text-box properties, so they ride
-        // with the font-size section that marks the text tool.
+        // Font family, alignment, fill and outline are text-box properties, so
+        // they ride with the font-size section that marks the text tool.
+        FontSection.Visibility = Show(fontSize);
         TextStyleSection.Visibility = Show(fontSize);
         if (fontSize)
         {
+            ViewModel.EnsureFontsLoaded();
             ShowFontSize();
             SyncTextStyleControls();
         }

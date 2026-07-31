@@ -885,6 +885,39 @@
                     </ListView>
                 </StackPanel>
 
+                <!-- Font family + bold/italic. Unicode: pick any installed font
+                     (including a local-language one) and the core embeds it. -->
+                <StackPanel x:Name="FontSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <ComboBox x:Name="FontFamilyCombo" Width="164" Height="30" Padding="8,0"
+                              PlaceholderText="Default font"
+                              SelectionChanged="FontFamily_SelectionChanged"
+                              ItemsSource="{x:Bind ViewModel.FontFamilies, Mode=OneWay}"
+                              ToolTipService.ToolTip="Font"
+                              AutomationProperties.Name="Font">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:FontFamily">
+                                <TextBlock Text="{x:Bind Name}"
+                                           FontFamily="{x:Bind Name}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <ToggleButton x:Name="BoldBtn" Click="Bold_Click"
+                                  Width="30" Height="30" Padding="0"
+                                  AutomationProperties.Name="Bold"
+                                  ToolTipService.ToolTip="Bold">
+                        <TextBlock Text="B" FontWeight="Bold" FontSize="15" />
+                    </ToggleButton>
+                    <ToggleButton x:Name="ItalicBtn" Click="Italic_Click"
+                                  Width="30" Height="30" Padding="0"
+                                  AutomationProperties.Name="Italic"
+                                  ToolTipService.ToolTip="Italic">
+                        <TextBlock Text="I" FontStyle="Italic" FontSize="15" FontFamily="Georgia" />
+                    </ToggleButton>
+                </StackPanel>
+
                 <!-- Text alignment, fill and outline -->
                 <StackPanel x:Name="TextStyleSection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">

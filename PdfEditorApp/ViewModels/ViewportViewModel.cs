@@ -3196,6 +3196,76 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial string TextFontPath { get; set; } = "";
 
+    /// <summary>The chosen font family's display name, for the editor preview
+    /// (WinUI resolves an installed font by name); "" means the default.</summary>
+    [ObservableProperty]
+    public partial string TextFontFamily { get; set; } = "";
+
+    [ObservableProperty]
+    public partial bool TextBold { get; set; }
+
+    [ObservableProperty]
+    public partial bool TextItalic { get; set; }
+
+    /// <summary>Installed font families for the picker, loaded once, lazily.</summary>
+    public ObservableCollection<FontFamily> FontFamilies { get; } = new();
+
+    private FontFamily? _selectedFontFamily;
+    private bool _fontsLoading;
+
+    /// <summary>
+    /// Populates <see cref="FontFamilies"/> off the UI thread the first time the
+    /// picker is shown (scanning the font files is too slow to do inline).
+    /// </summary>
+    public void EnsureFontsLoaded()
+    {
+        if (FontFamilies.Count > 0 || _fontsLoading)
+        {
+            return;
+        }
+        _fontsLoading = true;
+
+        Task.Run(() =>
+        {
+            IReadOnlyList<FontFamily> families;
+            try
+            {
+                families = FontCatalog.Enumerate();
+            }
+            catch
+            {
+                families = System.Array.Empty<FontFamily>();
+            }
+
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                foreach (var f in families)
+                {
+                    FontFamilies.Add(f);
+                }
+                _fontsLoading = false;
+            });
+        });
+    }
+
+    /// <summary>Picks a font family, resolving the file for the current bold/italic state.</summary>
+    public void SelectFontFamily(FontFamily? family)
+    {
+        _selectedFontFamily = family;
+        TextFontFamily = family?.Name ?? "";
+        ResolveFontFile();
+    }
+
+    partial void OnTextBoldChanged(bool value) => ResolveFontFile();
+
+    partial void OnTextItalicChanged(bool value) => ResolveFontFile();
+
+    /// <summary>Recomputes <see cref="TextFontPath"/> from the family and B/I flags.</summary>
+    private void ResolveFontFile()
+    {
+        TextFontPath = _selectedFontFamily?.ResolvePath(TextBold, TextItalic) ?? "";
+    }
+
     /// <summary>
     /// Writes a text box to the document as real vector text, then hands it back
     /// as an ordinary loaded annotation.
