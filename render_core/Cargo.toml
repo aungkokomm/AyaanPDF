@@ -10,7 +10,12 @@ crate-type = ["cdylib", "rlib"]
 # No "image" feature: the render path hands PDFium's native BGRA buffer
 # straight through via as_raw_bytes(), so nothing here needs the image crate's
 # decode/encode stack (which also drags in ravif, exr, and friends).
-pdfium-render = { version = "0.8", default-features = false, features = ["pdfium_latest", "thread_safe", "sync"] }
+# Vendored + patched (see vendor/pdfium-render): the upstream crate keeps the
+# raw PDFium document/font/object handles pub(crate), which blocks feeding it
+# HarfBuzz-shaped glyph indices via FPDFText_SetCharcodes. The fork exposes just
+# those accessors so complex scripts (Burmese, Devanagari, Arabic) can render as
+# real, selectable vector text. No other changes from 0.8.37.
+pdfium-render = { path = "../vendor/pdfium-render", default-features = false, features = ["pdfium_latest", "thread_safe", "sync"] }
 lru = "0.12"
 
 [profile.dev]
