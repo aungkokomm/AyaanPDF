@@ -801,6 +801,10 @@ public sealed partial class MainPage : Page
         _editingTarget = editing;
 
         _textEditor.KeyDown += TextEditor_KeyDown;
+        // Keep the editor open when a click lands on the property bar, so its
+        // font/size/style controls can be used mid-edit without committing the
+        // box. Any other focus loss (clicking the page, another box) commits.
+        _textEditor.LosingFocus += Editor_LosingFocus;
         _textEditor.LostFocus += (_, _) => CommitTextEdit();
         _textEditor.Focus(FocusState.Programmatic);
 
@@ -1048,6 +1052,30 @@ public sealed partial class MainPage : Page
     {
         CommitTextEdit();
         e.Handled = true;
+    }
+
+    /// <summary>
+    /// Cancels the editor's focus loss when the click is on the property bar, so
+    /// picking a font or toggling bold does not close the box being edited.
+    /// </summary>
+    private void Editor_LosingFocus(UIElement sender, LosingFocusEventArgs args)
+    {
+        if (args.NewFocusedElement is DependencyObject target && IsWithin(target, PropertyBar))
+        {
+            args.TryCancel();
+        }
+    }
+
+    private static bool IsWithin(DependencyObject node, DependencyObject ancestor)
+    {
+        for (DependencyObject? n = node; n is not null; n = VisualTreeHelper.GetParent(n))
+        {
+            if (ReferenceEquals(n, ancestor))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void TextEditor_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -2460,6 +2488,10 @@ public sealed partial class MainPage : Page
             ViewModel.TextOutlineWidthNorm = target.OutlineWidthNorm;
         }
 
+        // Switch to the Text tool so the property bar shows the font/size/style
+        // controls while the box is being edited. Re-editing used to leave the
+        // previous tool active, so the toolbar had nothing to say and vanished.
+        ViewModel.ActiveTool = ToolMode.Text;
         UpdateToolRail();
 
         // Remove the box from the page FIRST, so the editor is the only layer.

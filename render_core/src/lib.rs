@@ -1889,28 +1889,77 @@ fn needs_shaping(text: &str) -> bool {
     })
 }
 
+/// One shaped glyph: its index in the font, and its advance and drawing offset
+/// in POINTS (already scaled from font units by the requested size). This is
+/// what the shaper decided, so drawing each glyph at these positions reproduces
+/// the shaping (reordering, ligatures, mark placement) exactly.
+struct ShapedGlyph {
+    id: u32,
+    x_advance: f32,
+    x_offset: f32,
+    y_offset: f32,
+}
+
 /// Shapes one run of text in the given font with rustybuzz (a HarfBuzz port),
-/// returning the VISUAL-ORDER glyph indices and the run's advance width in
-/// points. None if the font bytes cannot be parsed as a face. The glyph indices
-/// go to PDFium via FPDFText_SetCharcodes; for the CID (Identity) font this app
-/// embeds, glyph index == the code PDFium wants, so the shaped result draws.
-fn shape_run(font_bytes: &[u8], text: &str, size_pts: f32) -> Option<(Vec<u32>, f32)> {
+/// returning the visual-order glyphs with their per-glyph positions. None if the
+/// font bytes cannot be parsed as a face. The glyph indices go to PDFium via
+/// FPDFText_SetCharcodes; for the CID (Identity) font this app embeds, glyph
+/// index == the code PDFium wants, so the shaped result draws.
+fn shape_run(font_bytes: &[u8], text: &str, size_pts: f32) -> Option<Vec<ShapedGlyph>> {
     let face = rustybuzz::Face::from_slice(font_bytes, 0)?;
     let upem = face.units_per_em() as f32;
     if upem <= 0.0 {
         return None;
     }
+    let scale = size_pts / upem;
+
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     buffer.push_str(text);
     let shaped = rustybuzz::shape(&face, &[], buffer);
 
-    let ids: Vec<u32> = shaped.glyph_infos().iter().map(|g| g.glyph_id).collect();
-    if ids.is_empty() {
+    let infos = shaped.glyph_infos();
+    let positions = shaped.glyph_positions();
+    if infos.is_empty() {
         return None;
     }
-    let advance_units: i64 = shaped.glyph_positions().iter().map(|p| p.x_advance as i64).sum();
-    let width_pts = advance_units as f32 * size_pts / upem;
-    Some((ids, width_pts))
+
+    let glyphs: Vec<ShapedGlyph> = infos
+        .iter()
+        .zip(positions.iter())
+        .map(|(info, pos)| ShapedGlyph {
+            id: info.glyph_id,
+            x_advance: pos.x_advance as f32 * scale,
+            x_offset: pos.x_offset as f32 * scale,
+            y_offset: pos.y_offset as f32 * scale,
+        })
+        .collect();
+    Some(glyphs)
+}
+
+/// The total advance width of a shaped run, in points.
+fn shaped_width(glyphs: &[ShapedGlyph]) -> f32 {
+    glyphs.iter().map(|g| g.x_advance).sum()
+}
+
+/// Width of a line in points, measured the way it will actually be drawn: with
+/// rustybuzz for a complex script (when a real font is loaded), else with
+/// PDFium's own text metrics. Keeps wrapping and alignment in step with the
+/// shaped result, so a committed box wraps where the editor did.
+fn measure_run_width<'a>(
+    doc: &pdfium_render::prelude::PdfDocument<'a>,
+    font: pdfium_render::prelude::PdfFontToken,
+    font_bytes: Option<&[u8]>,
+    text: &str,
+    size_pts: f32,
+) -> f32 {
+    if let Some(fb) = font_bytes {
+        if needs_shaping(text) {
+            if let Some(glyphs) = shape_run(fb, text, size_pts) {
+                return shaped_width(&glyphs);
+            }
+        }
+    }
+    measure_text_width(doc, font, text, size_pts)
 }
 
 #[allow(dead_code)] // the styled tag is what boxes now write; kept for tests
@@ -2077,6 +2126,7 @@ struct WrapLine {
 fn wrap_to_width<'a>(
     doc: &pdfium_render::prelude::PdfDocument<'a>,
     font: pdfium_render::prelude::PdfFontToken,
+    font_bytes: Option<&[u8]>,
     text: &str,
     max_width: f32,
     size_pts: f32,
@@ -2101,7 +2151,7 @@ fn wrap_to_width<'a>(
 
             // The first word on a line always goes on, even if it overflows,
             // since there is nowhere else to put it.
-            if line.is_empty() || measure_text_width(doc, font, &candidate, size_pts) <= max_width {
+            if line.is_empty() || measure_run_width(doc, font, font_bytes, &candidate, size_pts) <= max_width {
                 line = candidate;
             } else {
                 lines.push(std::mem::take(&mut line));
@@ -2338,6 +2388,7 @@ fn add_text_box_inner(
     // Only present when a font was chosen (Helvetica cannot render those scripts
     // anyway, so there is nothing to shape without a real font file).
     let font_bytes = font_path.and_then(font_file_bytes);
+    let font_slice: Option<&[u8]> = font_bytes.as_deref().map(|v| v.as_slice());
 
     let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
         return STATUS_INVALID_INPUT;
@@ -2369,7 +2420,7 @@ fn add_text_box_inner(
     // fills the width the user dragged rather than running off the right edge.
     // The usable width is the box minus its two insets.
     let avail_width = ((x1 - x0) - 2.0 * pad).max(0.0);
-    let lines = wrap_to_width(&doc_guard, font, text, avail_width, size_pts);
+    let lines = wrap_to_width(&doc_guard, font, font_slice, text, avail_width, size_pts);
 
     // The box grows DOWN to fit the wrapped lines, but never shrinks below the
     // height that was dragged: a tall box the user drew stays tall, a short one
@@ -2449,32 +2500,37 @@ fn add_text_box_inner(
         // one text object via the forked SetCharcodes path. This is what makes
         // Burmese/Devanagari/Arabic render correctly rather than as loose,
         // wrongly-ordered base glyphs. Everything else uses the plain path.
-        let shaped = font_bytes
-            .as_deref()
-            .map(|v| v.as_slice())
+        let shaped = font_slice
             .filter(|_| needs_shaping(&line.text))
             .and_then(|fb| shape_run(fb, &line.text, size_pts));
 
         // Place the line's text, and note the x and width its decoration (if
         // any) should span: the full width for a justified line, the measured
         // width otherwise.
-        let (deco_x, deco_w) = if let Some((glyph_ids, width_pts)) = shaped {
+        let (deco_x, deco_w) = if let Some(glyphs) = shaped {
+            // Draw each glyph at its OWN shaped position: one text object per
+            // glyph, placed by the advances and offsets rustybuzz computed. A
+            // single object using PDFium's default advances leaves gaps and
+            // mis-stacks marks; per-glyph placement reproduces the shaping.
+            let width_pts = shaped_width(&glyphs);
             let x = match style.align {
                 ALIGN_CENTER => text_left + (avail_width - width_pts) / 2.0,
                 ALIGN_RIGHT => text_left + (avail_width - width_pts),
                 _ => text_left,
             };
-            if let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, " ", font, PdfPoints::new(size_pts)) {
-                let charcodes: Vec<std::os::raw::c_uint> =
-                    glyph_ids.iter().map(|&g| g as std::os::raw::c_uint).collect();
-                doc_guard.bindings().FPDFText_SetCharcodes(
-                    obj.object_handle(),
-                    charcodes.as_ptr(),
-                    charcodes.len(),
-                );
-                let _ = obj.set_fill_color(color);
-                let _ = obj.translate(PdfPoints::new(x), PdfPoints::new(baseline));
-                let _ = annotation.objects_mut().add_text_object(obj);
+            let mut pen_x = x;
+            for g in &glyphs {
+                if let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, " ", font, PdfPoints::new(size_pts)) {
+                    let charcode = [g.id as std::os::raw::c_uint];
+                    doc_guard.bindings().FPDFText_SetCharcodes(obj.object_handle(), charcode.as_ptr(), 1);
+                    let _ = obj.set_fill_color(color);
+                    let _ = obj.translate(
+                        PdfPoints::new(pen_x + g.x_offset),
+                        PdfPoints::new(baseline + g.y_offset),
+                    );
+                    let _ = annotation.objects_mut().add_text_object(obj);
+                }
+                pen_x += g.x_advance;
             }
             (x, width_pts)
         } else if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
@@ -6565,11 +6621,11 @@ mod tests {
     fn dump_burmese_shaped_for_inspection() {
         // Run: cargo test --release dump_burmese -- --ignored --nocapture
         let font = "C:\\Windows\\Fonts\\mmrtext.ttf";
-        let text = "ကောင်းကင်ပြြပြအောက်".as_bytes();
+        let text = "ကောင်းကင်ပြြပြအောက် ငှက်ကလေးတွေ တေးသီနေကြသည်။".as_bytes();
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
         assert_eq!(
-            add_text_box_annotation_styled(handle, 0, 900, 60.0, 60.0, 840.0, 200.0,
-                text.as_ptr(), text.len(), 44.0, 0, 0, 0, 255,
+            add_text_box_annotation_styled(handle, 0, 900, 40.0, 40.0, 560.0, 340.0,
+                text.as_ptr(), text.len(), 40.0, 0, 0, 0, 255,
                 ALIGN_LEFT, 0xFFFFFFFF, 0, 0.0, font.as_ptr(), font.len(), 0, 0),
             STATUS_OK_PDFIUM);
 
@@ -6600,12 +6656,11 @@ mod tests {
             return; // no Myanmar font on this machine
         }
         let bytes = std::fs::read(font).unwrap();
-        let (glyphs, width) = shape_run(&bytes, "ကောင်း", 44.0).expect("shaping produced nothing");
+        let glyphs = shape_run(&bytes, "ကောင်း", 44.0).expect("shaping produced nothing");
         assert!(!glyphs.is_empty(), "no glyphs");
-        assert!(width > 0.0, "zero advance width");
-        // Shaping reorders/substitutes, so the glyph run is not a trivial 1:1 of
-        // the six input codepoints.
-        assert!(glyphs.iter().all(|&g| g != 0), "a .notdef glyph slipped through");
+        assert!(shaped_width(&glyphs) > 0.0, "zero advance width");
+        // Shaping substitutes real glyphs; none should be .notdef.
+        assert!(glyphs.iter().all(|g| g.id != 0), "a .notdef glyph slipped through");
     }
 
     #[test]
