@@ -927,8 +927,18 @@ public sealed partial class MainPage : Page
         ReturnFocusAfterPointerUse();
     }
 
+    /// <summary>True while the combo is being aligned to the tool in code, so the
+    /// programmatic selection is not treated as a user pick (which would re-resolve
+    /// the file and steal focus back from the editor).</summary>
+    private bool _suppressFontCombo;
+
     private void FontFamily_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_suppressFontCombo)
+        {
+            return;
+        }
+
         ViewModel.SelectFontFamily(FontFamilyCombo.SelectedItem as PdfEditorApp.Viewport.FontFamily);
         UpdateOpenEditorStyle();
         ReturnFocusAfterPointerUse();
@@ -1037,6 +1047,17 @@ public sealed partial class MainPage : Page
         ItalicBtn.IsChecked = ViewModel.TextItalic;
         UnderlineBtn.IsChecked = ViewModel.TextUnderline;
         StrikethroughBtn.IsChecked = ViewModel.TextStrikethrough;
+
+        // Show the tool's font in the combo without treating it as a user pick.
+        // Matches by name so a re-opened box shows its own font; an empty name
+        // (the default) clears the selection. Only when the family is among the
+        // loaded items, otherwise the selection is left as-is.
+        _suppressFontCombo = true;
+        FontFamilyCombo.SelectedItem = string.IsNullOrEmpty(ViewModel.TextFontFamily)
+            ? null
+            : FontFamilyCombo.Items.OfType<PdfEditorApp.Viewport.FontFamily>()
+                .FirstOrDefault(f => string.Equals(f.Name, ViewModel.TextFontFamily, StringComparison.OrdinalIgnoreCase));
+        _suppressFontCombo = false;
 
         bool hasFill = !string.IsNullOrEmpty(ViewModel.TextFillHex);
         FillSwatch.Background = hasFill ? HexBrush(ViewModel.TextFillHex) : new SolidColorBrush(Colors.Transparent);
@@ -2491,6 +2512,15 @@ public sealed partial class MainPage : Page
         {
             ViewModel.TextOutlineWidthNorm = target.OutlineWidthNorm;
         }
+
+        // Restore the font the box was drawn in and its decorations, so
+        // re-committing re-embeds the SAME font (a Burmese/Hindi box would
+        // otherwise fall back to the default and break) and the toolbar shows
+        // what is being edited. Set before UpdateToolRail below, which syncs the
+        // style buttons from these.
+        ViewModel.RestoreTextFont(target.FontPath);
+        ViewModel.TextUnderline = target.Underline;
+        ViewModel.TextStrikethrough = target.Strikethrough;
 
         // Switch to the Text tool so the property bar shows the font/size/style
         // controls while the box is being edited. Re-editing used to leave the

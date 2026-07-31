@@ -100,6 +100,43 @@ public static class FontCatalog
         return byName.Values.OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
     }
 
+    /// <summary>
+    /// Reads a single font file into a one-file family, plus whether it is a bold
+    /// and/or italic cut, for restoring a box whose font is known only by path
+    /// (re-editing before the picker was ever opened). Cheap: it parses one file,
+    /// not the whole font directory. Null if the file cannot be read as a font.
+    /// </summary>
+    public static FontFamily? ReadFamilyFromFile(string path, out bool bold, out bool italic)
+    {
+        bold = false;
+        italic = false;
+        FontFace face;
+        try
+        {
+            using var stream = File.OpenRead(path);
+            if (!TryParseFace(stream, out face))
+            {
+                return null;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        bold = face.Bold;
+        italic = face.Italic;
+        var family = new FontFamily(face.Family);
+        switch (face.Bold, face.Italic)
+        {
+            case (true, true): family.BoldItalicPath = path; break;
+            case (true, false): family.BoldPath = path; break;
+            case (false, true): family.ItalicPath = path; break;
+            default: family.RegularPath = path; break;
+        }
+        return family;
+    }
+
     /// <summary>The .ttf/.otf/.ttc files in the machine and per-user font
     /// directories. Public so the enumeration source can be unit-tested.</summary>
     public static IEnumerable<string> DefaultFontFiles()

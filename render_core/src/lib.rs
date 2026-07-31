@@ -1975,9 +1975,25 @@ fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
     )
 }
 
-fn textbox_tag_styled(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8, style: TextStyle) -> String {
+fn textbox_tag_styled(
+    text: &str,
+    size_px: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    style: TextStyle,
+    font_path: Option<&str>,
+) -> String {
+    // Two round-trip fields go AFTER the original six so an older box (which has
+    // neither) still parses: a decorations flag (bit0 underline, bit1
+    // strikethrough) and the font FILE the box was drawn in, base64 so a path
+    // with a colon or a space is never read as a separator. The bold/italic cut
+    // is the file itself, so it needs no flag of its own. The words stay LAST,
+    // still colon-free base64.
+    let flags = (style.underline as u32) | ((style.strikethrough as u32) << 1);
     format!(
-        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}",
+        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}:{}:{}",
         size_px,
         r,
         g,
@@ -1987,6 +2003,8 @@ fn textbox_tag_styled(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8, styl
         style.fill.0,
         style.outline.0,
         style.outline_width_px,
+        flags,
+        base64_encode(font_path.unwrap_or("").as_bytes()),
         base64_encode(text.as_bytes())
     )
 }
@@ -2000,13 +2018,20 @@ fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
     let byte = |rgba: &str, i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
 
     if let Some(rest) = contents.strip_prefix(TEXTBOX_TAG_STYLED) {
-        // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:base64
-        let mut parts = rest.splitn(7, ':');
-        let size: f32 = parts.next()?.parse().ok()?;
+        // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:[flags:base64(font):]base64(text)
+        // The words are ALWAYS the last field; the optional flags and font sit
+        // between the six fixed fields and the text, so a six-field box written
+        // before the round-trip existed still parses. Every field but the words
+        // is colon-free, so a full split is unambiguous.
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() < 7 {
+            return None;
+        }
+        let size: f32 = parts[0].parse().ok()?;
         if !size.is_finite() || size <= 0.0 {
             return None;
         }
-        let rgba = parts.next()?;
+        let rgba = parts[1];
         if rgba.len() != 8 {
             return None;
         }
@@ -2014,11 +2039,7 @@ fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
         let g = byte(rgba, 2)?;
         let b = byte(rgba, 4)?;
         let a = byte(rgba, 6)?;
-        let _align = parts.next()?;
-        let _fill = parts.next()?;
-        let _outline = parts.next()?;
-        let _ow = parts.next()?;
-        let text = String::from_utf8(base64_decode(parts.next()?)?).ok()?;
+        let text = String::from_utf8(base64_decode(parts[parts.len() - 1])?).ok()?;
         return Some((size, r, g, b, a, text));
     }
 
@@ -2577,7 +2598,7 @@ fn add_text_box_inner(
 
     // The ORIGINAL text is stored, with the style, so re-editing gets clean
     // paragraphs and the box comes back looking the same.
-    let _ = annotation.set_contents(&textbox_tag_styled(text, font_size_px, r, g, b, a, style));
+    let _ = annotation.set_contents(&textbox_tag_styled(text, font_size_px, r, g, b, a, style, font_path));
 
     drop(annotation);
     drop(doc_guard);
@@ -6705,6 +6726,40 @@ mod tests {
         close_document(reopened);
         close_document(h);
         free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn the_styled_tag_records_the_font_and_decorations_for_re_editing() {
+        // Re-opening a box must bring it back in the SAME font with the same
+        // underline/strikethrough, so the tag records the font FILE and a
+        // decorations flag. Without this a Burmese/Hindi box would fall back to
+        // the default font on re-commit and its shaping would break.
+        let style = TextStyle {
+            align: ALIGN_LEFT,
+            fill: PackedRgba(0),
+            outline: PackedRgba(0),
+            outline_width_px: 0.0,
+            underline: true,
+            strikethrough: false,
+        };
+        let tag = textbox_tag_styled("hi", 20.0, 0, 0, 0, 255, style, Some(r"C:\Fonts\Noto Sans.ttf"));
+
+        // The words are still the last field, so they still parse.
+        assert_eq!(parse_textbox_tag(&tag).map(|t| t.5), Some("hi".to_string()));
+
+        // flags = underline(1) | strikethrough<<1(0) = 1, sitting just before the
+        // base64 font path, which itself sits just before the words.
+        let path_b64 = base64_encode(r"C:\Fonts\Noto Sans.ttf".as_bytes());
+        assert!(
+            tag.contains(&format!(":1:{path_b64}:")),
+            "decoration flag / font order wrong: {tag}"
+        );
+
+        // A default-font, undecorated box records an empty font field and flag 0,
+        // and still round-trips its words.
+        let plain = textbox_tag_styled("bye", 20.0, 0, 0, 0, 255, TextStyle::plain(), None);
+        assert!(plain.contains(":0::"), "empty font / zero flags expected: {plain}");
+        assert_eq!(parse_textbox_tag(&plain).map(|t| t.5), Some("bye".to_string()));
     }
 
     #[test]

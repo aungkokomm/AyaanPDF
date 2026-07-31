@@ -138,4 +138,58 @@ public class TextBoxTagTests
         Assert.True(TextBoxTagReader.TryParse(tagStr, out var tag));
         Assert.Equal("10:30 meeting\nroom: 4B", tag.Text);
     }
+
+    [Fact]
+    public void an_older_styled_box_has_no_font_or_decorations()
+    {
+        // The seven-field form was written before the round-trip existed; it must
+        // still parse, defaulting to the built-in font and no underline/strike.
+        string tagStr = Styled("legacy", 20.0, "000000FF", 0, "00000000", "00000000", 0.0);
+        Assert.True(TextBoxTagReader.TryParse(tagStr, out var tag));
+        Assert.Equal("legacy", tag.Text);
+        Assert.Equal("", tag.FontPath);
+        Assert.False(tag.Underline);
+        Assert.False(tag.Strikethrough);
+    }
+
+    // Builds the round-trip form: the six fixed fields, then a decorations flag
+    // (bit0 underline, bit1 strikethrough) and the base64 font path, then the
+    // base64 words last, matching render_core's textbox_tag_styled.
+    private static string StyledWithFont(string text, string fontPath, bool underline, bool strikethrough)
+    {
+        int flags = (underline ? 1 : 0) | (strikethrough ? 2 : 0);
+        string fontB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(fontPath));
+        string textB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(text));
+        var ci = System.Globalization.CultureInfo.InvariantCulture;
+        return $"AyaanTextB:{20.0.ToString("0.0000", ci)}:000000FF:0:00000000:00000000:{0.0.ToString("0.00", ci)}:{flags}:{fontB64}:{textB64}";
+    }
+
+    [Fact]
+    public void a_re_editable_box_reads_back_its_font_and_decorations()
+    {
+        // What lets a re-opened Burmese/Hindi box re-embed the same font instead
+        // of falling back to the default. A path with a space and a colon (a
+        // Windows drive) must survive, which is why it is base64.
+        string path = @"C:\Users\me\AppData\Local\Microsoft\Windows\Fonts\Noto Sans Myanmar.ttf";
+        string tagStr = StyledWithFont("မြန်မာ", path, underline: true, strikethrough: false);
+        Assert.True(TextBoxTagReader.TryParse(tagStr, out var tag));
+
+        Assert.Equal("မြန်မာ", tag.Text);
+        Assert.Equal(path, tag.FontPath);
+        Assert.True(tag.Underline);
+        Assert.False(tag.Strikethrough);
+    }
+
+    [Fact]
+    public void a_default_font_re_editable_box_reads_back_empty()
+    {
+        // A box typed in the built-in font records an empty font field; it must
+        // come back as "no chosen font", not as some accidental path.
+        string tagStr = StyledWithFont("plain", "", underline: false, strikethrough: true);
+        Assert.True(TextBoxTagReader.TryParse(tagStr, out var tag));
+        Assert.Equal("plain", tag.Text);
+        Assert.Equal("", tag.FontPath);
+        Assert.False(tag.Underline);
+        Assert.True(tag.Strikethrough);
+    }
 }

@@ -18,10 +18,17 @@ public enum TextAlign
 ///
 /// <paramref name="FillHex"/> and <paramref name="OutlineHex"/> are empty when
 /// the box has no fill or no outline. Colours are "#AARRGGBB".
+///
+/// <paramref name="FontPath"/> is the OS path to the font FILE the box was drawn
+/// in (empty for the default), so re-opening it re-embeds the same font instead
+/// of falling back to the default and breaking a complex script. It is empty on
+/// a box written before the round-trip existed. <paramref name="Underline"/> and
+/// <paramref name="Strikethrough"/> are that box's text decorations.
 /// </summary>
 public readonly record struct TextBoxTag(
     string Text, double FontSizeNorm, string ColorHex,
-    TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm);
+    TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm,
+    string FontPath, bool Underline, bool Strikethrough);
 
 /// <summary>
 /// Reads the tag a text box stores, the C# side of <c>parse_textbox_tag</c> in
@@ -79,18 +86,22 @@ public static class TextBoxTagReader
             return false;
         }
 
-        tag = new TextBoxTag(text, sizeNorm, colorHex, TextAlign.Left, "", "", 0);
+        tag = new TextBoxTag(text, sizeNorm, colorHex, TextAlign.Left, "", "", 0, "", false, false);
         return true;
     }
 
-    // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:base64
+    // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:[flags:base64(font):]base64(text)
     private static bool TryParseStyled(string rest, out TextBoxTag tag)
     {
         tag = default;
 
-        // Six fixed fields then the base64 text, which itself has no colons.
-        string[] parts = rest.Split(':', 7);
-        if (parts.Length != 7)
+        // The words are ALWAYS the last field (colon-free base64). The six fixed
+        // fields come first; an optional flags + base64 font pair sits between
+        // them and the text, present only on boxes written since the round-trip
+        // was added. Every field but the words is colon-free, so a full split is
+        // unambiguous, and a six-field box from before still parses.
+        string[] parts = rest.Split(':');
+        if (parts.Length < 7)
         {
             return false;
         }
@@ -115,12 +126,27 @@ public static class TextBoxTagReader
             outlineWpx = 0;
         }
 
-        if (!TryText(parts[6], out string text))
+        // The round-trip extras, present when there are more than the six fixed
+        // fields plus the words: a decorations flag and the base64 font path.
+        string fontPath = "";
+        bool underline = false, strikethrough = false;
+        if (parts.Length >= 9)
+        {
+            if (int.TryParse(parts[6], out int flags))
+            {
+                underline = (flags & 1) != 0;
+                strikethrough = (flags & 2) != 0;
+            }
+            TryText(parts[7], out fontPath); // sets "" on a malformed value
+        }
+
+        if (!TryText(parts[^1], out string text))
         {
             return false;
         }
 
-        tag = new TextBoxTag(text, sizeNorm, colorHex, align, fill, outline, outlineWpx / CaptureWidth);
+        tag = new TextBoxTag(text, sizeNorm, colorHex, align, fill, outline,
+                             outlineWpx / CaptureWidth, fontPath, underline, strikethrough);
         return true;
     }
 

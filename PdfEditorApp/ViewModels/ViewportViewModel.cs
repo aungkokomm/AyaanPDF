@@ -3282,6 +3282,45 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     partial void OnTextItalicChanged(bool value) => ResolveFontFile();
 
+    /// <summary>
+    /// Restores the font a re-opened box was drawn in, from its stored file path,
+    /// so committing the edit re-embeds the SAME font. Without this a Burmese or
+    /// Hindi box would silently fall back to the default on re-commit and its
+    /// shaping would break. Also reflects the family name and bold/italic into
+    /// the toolbar so it shows what is being edited. An empty path means the box
+    /// was in the default font, which is restored as "no chosen font".
+    /// </summary>
+    public void RestoreTextFont(string fontPath)
+    {
+        if (string.IsNullOrEmpty(fontPath))
+        {
+            _selectedFontFamily = null;
+            TextFontFamily = "";
+            TextBold = false;
+            TextItalic = false;
+            TextFontPath = "";
+            return;
+        }
+
+        // Read the one file for its family name and bold/italic cut. Prefer the
+        // fully-enumerated family when the picker has already loaded it, so
+        // toggling bold/italic mid-edit still finds the other cuts; otherwise the
+        // one-file family is enough to re-embed exactly this file.
+        FontFamily? single = FontCatalog.ReadFamilyFromFile(fontPath, out bool bold, out bool italic);
+        FontFamily? full = single is null
+            ? null
+            : FontFamilies.FirstOrDefault(
+                f => string.Equals(f.Name, single.Name, StringComparison.OrdinalIgnoreCase));
+
+        _selectedFontFamily = full ?? single;
+        TextFontFamily = _selectedFontFamily?.Name ?? "";
+        TextBold = bold;
+        TextItalic = italic;
+        // Land on the EXACT file the box used, regardless of what ResolvePath
+        // picked when TextBold/TextItalic changed above.
+        TextFontPath = fontPath;
+    }
+
     /// <summary>Recomputes <see cref="TextFontPath"/> from the family and B/I flags.</summary>
     private void ResolveFontFile()
     {
@@ -3321,7 +3360,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public readonly record struct TextBoxEditTarget(
         int PageIndex, int Index, double Left, double Top, double Right, double Bottom,
         string Text, string ColorHex, double FontSizeNorm,
-        TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm);
+        TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm,
+        string FontPath, bool Underline, bool Strikethrough);
 
     /// <summary>
     /// If a loaded text box is under the point, returns what is needed to edit
@@ -3358,7 +3398,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return new TextBoxEditTarget(
             pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom,
             tag.Text, tag.ColorHex, tag.FontSizeNorm,
-            tag.Align, tag.FillHex, tag.OutlineHex, tag.OutlineWidthNorm);
+            tag.Align, tag.FillHex, tag.OutlineHex, tag.OutlineWidthNorm,
+            tag.FontPath, tag.Underline, tag.Strikethrough);
     }
 
     /// <summary>

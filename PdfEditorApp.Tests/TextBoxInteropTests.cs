@@ -61,6 +61,16 @@ public class TextBoxInteropTests
         float fontSizePx, byte r, byte g, byte b, byte a);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int add_text_box_annotation_styled(
+        ulong docHandle, int pageIndex, int captureWidth,
+        float left, float top, float right, float bottom,
+        [In] byte[] text, nuint textLen,
+        float fontSizePx, byte r, byte g, byte b, byte a,
+        int align, uint fillRgba, uint outlineRgba, float outlineWidthPx,
+        [In] byte[]? fontPath, nuint fontPathLen,
+        int underline, int strikethrough);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern int delete_annotation(ulong docHandle, int pageIndex, int index);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -168,6 +178,41 @@ public class TextBoxInteropTests
 
             Assert.True(TextBoxTagReader.TryParse(ReadContents(handle, 0), out var tag));
             Assert.Equal("after", tag.Text);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void a_styled_box_carries_its_font_and_decorations_across_the_boundary()
+    {
+        // The whole point of the round-trip: double-clicking a box must recover
+        // the FONT it was drawn in (so a re-committed Burmese box keeps its font)
+        // and its underline/strikethrough. This drives the real writer and reads
+        // it back through the app's own parser. The path need not exist on disk;
+        // the tag records the string it was given, and its spaces and colon prove
+        // the base64 survives the field split.
+        const string fontPath = @"C:\Program Files\Fonts\Noto Sans Myanmar.ttf";
+        ulong handle = OpenFixture();
+        try
+        {
+            byte[] text = Encoding.UTF8.GetBytes("မြန်မာ");
+            byte[] font = Encoding.UTF8.GetBytes(fontPath);
+            int status = add_text_box_annotation_styled(
+                handle, 0, 1000, 100, 100, 500, 200, text, (nuint)text.Length,
+                24f, 0, 0, 0, 0xFF,
+                0, 0u, 0u, 0f,
+                font, (nuint)font.Length,
+                underline: 1, strikethrough: 0);
+            Assert.Equal(OkPdfium, status);
+
+            Assert.True(TextBoxTagReader.TryParse(ReadContents(handle, 0), out var tag));
+            Assert.Equal("မြန်မာ", tag.Text);
+            Assert.Equal(fontPath, tag.FontPath);
+            Assert.True(tag.Underline);
+            Assert.False(tag.Strikethrough);
         }
         finally
         {
