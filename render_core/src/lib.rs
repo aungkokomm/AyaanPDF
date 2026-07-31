@@ -1767,7 +1767,12 @@ fn add_stamp_annotation_inner(
 /// Line spacing as a multiple of the font size, and the inset of the text from
 /// the box edge in multiples of it. Kept here so the app's overlay can lay text
 /// out the same way and the two cannot disagree about where a line sits.
+///
+/// Complex scripts get MORE: Burmese, Devanagari and the like stack marks above
+/// and hang them below the base line, so at the Latin spacing consecutive lines
+/// collide. The taller spacing is used whenever a box needs shaping.
 const TEXTBOX_LINE_HEIGHT: f32 = 1.3;
+const TEXTBOX_LINE_HEIGHT_COMPLEX: f32 = 1.75;
 const TEXTBOX_PADDING: f32 = 0.35;
 
 /// Marks a stamp annotation as one of our text boxes, and records what it takes
@@ -1983,6 +1988,7 @@ fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn textbox_tag_styled(
     text: &str,
     size_px: f32,
@@ -1992,18 +1998,23 @@ fn textbox_tag_styled(
     a: u8,
     style: TextStyle,
     font_path: Option<&str>,
+    box_rect: [f32; 4],
 ) -> String {
     // Round-trip fields go AFTER the original six so an older box (which lacks
     // them) still parses: a decorations flag (bit0 underline, bit1 strikethrough),
     // the font FILE the box was drawn in (base64, so a path with a colon or a
-    // space is never read as a separator), and the clockwise rotation in degrees.
+    // space is never read as a separator), the clockwise rotation in degrees, and
+    // the box's OWN normalized rect (left, top, right, bottom). The rect is the
+    // UPRIGHT box; a rotated box's annotation rect is the enlarged bounding box,
+    // so the overlay needs this to draw the tight frame and to spin the exact box.
     // The bold/italic cut is the file itself, so it needs no flag of its own.
     // Each addition slots in just before the words, which stay LAST and remain
     // colon-free base64, so every reader that keys off "last field = text" and
     // "gate extras on length" keeps working.
     let flags = (style.underline as u32) | ((style.strikethrough as u32) << 1);
+    let [bl, bt, br, bb] = box_rect;
     format!(
-        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}:{}:{:.2}:{}",
+        "{TEXTBOX_TAG_STYLED}{:.4}:{:02X}{:02X}{:02X}{:02X}:{}:{:08X}:{:08X}:{:.2}:{}:{}:{:.2}:{:.5}:{:.5}:{:.5}:{:.5}:{}",
         size_px,
         r,
         g,
@@ -2016,6 +2027,10 @@ fn textbox_tag_styled(
         flags,
         base64_encode(font_path.unwrap_or("").as_bytes()),
         style.rotation_deg,
+        bl,
+        bt,
+        br,
+        bb,
         base64_encode(text.as_bytes())
     )
 }
@@ -2570,7 +2585,14 @@ fn add_text_box_inner(
     let y_bottom = origin_top - bottom * scale;
 
     let size_pts = font_size_px * scale;
-    let line_h = size_pts * TEXTBOX_LINE_HEIGHT;
+    // A box that needs shaping (Burmese, Hindi, ...) gets the taller spacing so
+    // its stacked marks do not run into the line below.
+    let line_height_mult = if needs_shaping(text) {
+        TEXTBOX_LINE_HEIGHT_COMPLEX
+    } else {
+        TEXTBOX_LINE_HEIGHT
+    };
+    let line_h = size_pts * line_height_mult;
     let pad = size_pts * TEXTBOX_PADDING;
 
     let color = PdfColor::new(r, g, b, a);
@@ -2762,9 +2784,18 @@ fn add_text_box_inner(
         }
     }
 
-    // The ORIGINAL text is stored, with the style, so re-editing gets clean
-    // paragraphs and the box comes back looking the same.
-    let _ = annotation.set_contents(&textbox_tag_styled(text, font_size_px, r, g, b, a, style, font_path));
+    // The ORIGINAL text is stored, with the style and the box's own upright rect
+    // (normalized the same way get_annotations reports bounds), so re-editing gets
+    // clean paragraphs and the overlay can recover the tight box even after it is
+    // rotated and its annotation rect has grown to the bounding box.
+    let box_rect = [
+        (x0 - origin_x) / page_w,
+        (origin_top - y_top) / page_w,
+        (x1 - origin_x) / page_w,
+        (origin_top - y_bottom) / page_w,
+    ];
+    let _ = annotation.set_contents(&textbox_tag_styled(
+        text, font_size_px, r, g, b, a, style, font_path, box_rect));
 
     drop(annotation);
     drop(doc_guard);
@@ -3366,14 +3397,20 @@ pub extern "C" fn resize_text_box_annotation(
     }
 
     panic::catch_unwind(|| {
-        resize_text_box_annotation_inner(
-            doc_handle, page_index, index, capture_width, left, top, right, bottom, out_new_index)
+        relayout_text_box_inner(
+            doc_handle, page_index, index, capture_width, left, top, right, bottom, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Rotates one of OUR text boxes to a NEW absolute angle (clockwise degrees on
+/// screen) about its centre, re-laying-it-out at its own upright bounds so the
+/// turned box comes out clean. The caller passes the box's UPRIGHT rect (the one
+/// stored in its tag), not the enlarged bounding box a rotated box reports.
+/// Reports UNSUPPORTED for anything that is not one of our text boxes.
+#[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-fn resize_text_box_annotation_inner(
+pub extern "C" fn rotate_text_box_annotation(
     doc_handle: u64,
     page_index: i32,
     index: i32,
@@ -3382,13 +3419,42 @@ fn resize_text_box_annotation_inner(
     top: f32,
     right: f32,
     bottom: f32,
+    degrees: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if right <= left || bottom <= top {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        relayout_text_box_inner(
+            doc_handle, page_index, index, capture_width, left, top, right, bottom,
+            Some(degrees), out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relayout_text_box_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    rotation_override: Option<f32>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
     // Read and parse the tag BEFORE anything is removed, so a mark that is not
     // one of our text boxes leaves the page untouched.
-    let parsed = {
+    let mut parsed = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
@@ -3407,13 +3473,20 @@ fn resize_text_box_annotation_inner(
         }
     };
 
+    // A rotate sets a NEW absolute angle; a resize keeps whatever the tag carried,
+    // so a rotated box stays turned when it is resized.
+    if let Some(deg) = rotation_override {
+        parsed.style.rotation_deg = deg;
+    }
+
     if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
         return STATUS_INVALID_INPUT;
     }
 
     // Re-lay-out at the new bounds. add_text_box_inner re-wraps to the width and
     // grows the height to fit, embedding the same font, so the box returns in the
-    // same style, just re-flowed. It writes its own AyaanTextB tag again.
+    // same style, just re-flowed (and turned to the new angle). It writes its own
+    // AyaanTextB tag again.
     let status = add_text_box_inner(
         doc_handle, page_index, capture_width, left, top, right, bottom,
         &parsed.text, parsed.size_px, parsed.r, parsed.g, parsed.b, parsed.a,
@@ -7018,7 +7091,8 @@ mod tests {
             strikethrough: false,
             rotation_deg: 0.0,
         };
-        let tag = textbox_tag_styled("hi", 20.0, 0, 0, 0, 255, style, Some(r"C:\Fonts\Noto Sans.ttf"));
+        let tag = textbox_tag_styled("hi", 20.0, 0, 0, 0, 255, style, Some(r"C:\Fonts\Noto Sans.ttf"),
+            [0.1, 0.1, 0.5, 0.2]);
 
         // The words are still the last field, so they still parse.
         assert_eq!(parse_textbox_tag(&tag).map(|t| t.5), Some("hi".to_string()));
@@ -7033,7 +7107,8 @@ mod tests {
 
         // A default-font, undecorated box records an empty font field and flag 0,
         // and still round-trips its words.
-        let plain = textbox_tag_styled("bye", 20.0, 0, 0, 0, 255, TextStyle::plain(), None);
+        let plain = textbox_tag_styled("bye", 20.0, 0, 0, 0, 255, TextStyle::plain(), None,
+            [0.0, 0.0, 0.4, 0.1]);
         assert!(plain.contains(":0::"), "empty font / zero flags expected: {plain}");
         assert_eq!(parse_textbox_tag(&plain).map(|t| t.5), Some("bye".to_string()));
     }
@@ -7170,6 +7245,30 @@ mod tests {
     }
 
     #[test]
+    fn rotate_text_box_annotation_sets_a_new_angle() {
+        // What the overlay's rotate handle calls: re-lay-the-box-out at its own
+        // upright bounds with a NEW absolute angle. The box turns (its rect grows)
+        // and the tag records the angle, while the words are kept.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_box(handle, "spin me", 22.0), STATUS_OK_PDFIUM);
+
+        let mut new_index = -1;
+        assert_eq!(
+            rotate_text_box_annotation(handle, 0, 0, 1000, 100.0, 100.0, 500.0, 200.0, 25.0, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        let contents = contents_of(handle, 0, new_index as usize).expect("rotated box has no tag");
+        let parsed = parse_textbox_tag_full(&contents).expect("rotated box tag should parse");
+        assert!((parsed.style.rotation_deg - 25.0).abs() < 0.01,
+            "rotate did not set the angle: {}", parsed.style.rotation_deg);
+        assert_eq!(parsed.text, "spin me", "rotate must keep the words");
+
+        // A non-text mark is refused so the app does not turn it into text.
+        assert!(parse_textbox_tag_full("AyaanShape:0:FF0000FF:2.0:0.1:0.2").is_none());
+        close_document(handle);
+    }
+
+    #[test]
     #[ignore]
     fn dump_rotated_text_box_for_inspection() {
         // Run: cargo test --release dump_rotated -- --ignored --nocapture
@@ -7215,6 +7314,7 @@ mod tests {
                 rotation_deg: 0.0,
             },
             Some(r"C:\Fonts\Noto.ttf"),
+            [0.05, 0.05, 0.55, 0.25],
         );
         let p = parse_textbox_tag_full(&styled).expect("our styled tag should parse");
         assert_eq!(p.text, "hi");
