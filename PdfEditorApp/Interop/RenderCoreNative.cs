@@ -592,6 +592,28 @@ internal static partial class RenderCoreNative
     /// Returns <see cref="RenderStatus.Unsupported"/> for ink, whose shape is
     /// a path rather than an image and cannot be rebuilt this way.
     /// </summary>
+    /// <summary>
+    /// Resizes one of our TEXT BOXES by re-laying-out its text at the new bounds:
+    /// the words re-wrap to the new width and the box grows to fit, the way a Word
+    /// text box behaves, instead of stretching the rendered glyphs. Like a shape,
+    /// the rebuilt box moves to the END of the page's list, so
+    /// <paramref name="newIndex"/> reports where it landed.
+    ///
+    /// Returns <see cref="RenderStatus.Unsupported"/> for anything that is not one
+    /// of our text boxes, so the caller can fall back to the generic resize.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int resize_text_box_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int resize_annotation(
         ulong docHandle,

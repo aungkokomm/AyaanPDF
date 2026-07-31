@@ -71,6 +71,11 @@ public class TextBoxInteropTests
         int underline, int strikethrough);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int resize_text_box_annotation(
+        ulong docHandle, int pageIndex, int index, int captureWidth,
+        float left, float top, float right, float bottom, out int newIndex);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern int delete_annotation(ulong docHandle, int pageIndex, int index);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -131,6 +136,22 @@ public class TextBoxInteropTests
         try
         {
             return (int)array.Len;
+        }
+        finally
+        {
+            free_annotation_array(array);
+        }
+    }
+
+    /// <summary>The height (bottom - top, normalized) of the first annotation.</summary>
+    private static float FirstHeight(ulong handle)
+    {
+        var array = get_annotations(handle, 0);
+        try
+        {
+            Assert.True(array.Len > 0, "expected at least one annotation");
+            var info = Marshal.PtrToStructure<AnnotationInfo>(array.Items);
+            return info.Bottom - info.Top;
         }
         finally
         {
@@ -213,6 +234,37 @@ public class TextBoxInteropTests
             Assert.Equal(fontPath, tag.FontPath);
             Assert.True(tag.Underline);
             Assert.False(tag.Strikethrough);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void resizing_a_text_box_narrower_re_wraps_it_taller_across_the_boundary()
+    {
+        // The Word-style resize, driven through the real P/Invoke: narrowing a box
+        // re-flows its words onto more lines and grows it DOWN. A stretched picture
+        // would keep its height. This also proves the interop signature marshals.
+        ulong handle = OpenFixture();
+        try
+        {
+            byte[] text = Encoding.UTF8.GetBytes("the quick brown fox jumps over the lazy dog again and again and again");
+            Assert.Equal(OkPdfium, add_text_box_annotation(
+                handle, 0, 1000, 50, 50, 900, 80, text, (nuint)text.Length, 18f, 0, 0, 0, 0xFF));
+            float wide = FirstHeight(handle);
+
+            Assert.Equal(OkPdfium, resize_text_box_annotation(
+                handle, 0, 0, 1000, 50, 50, 200, 80, out int newIndex));
+            Assert.Equal(1, Count(handle));
+            float narrow = FirstHeight(handle);
+
+            Assert.True(narrow > wide + 0.02f, $"narrowing should grow taller: wide={wide} narrow={narrow}");
+
+            // Still one of our text boxes with the same words.
+            Assert.True(TextBoxTagReader.TryParse(ReadContents(handle, newIndex), out var tag));
+            Assert.Equal(Encoding.UTF8.GetString(text), tag.Text);
         }
         finally
         {

@@ -120,7 +120,14 @@ public static class LoadedAnnotationPicker
     /// the corner region is a resize, and only a click elsewhere inside the
     /// box is a move.
     /// </summary>
-    public static Grip GripAt(AnnotationBox box, double x, double y, double reach = GripReach)
+    /// <param name="edges">
+    /// Whether the four edge midpoints are grabbable. True for a free-resize box
+    /// (a text box), so it gets the full eight handles; false for an aspect-locked
+    /// picture, which shows only its four corners, so a point near an edge must
+    /// NOT be read as a one-axis grip that would break the aspect the corners
+    /// protect. This mirrors which handles are actually drawn.
+    /// </param>
+    public static Grip GripAt(AnnotationBox box, double x, double y, bool edges = true, double reach = GripReach)
     {
         // A tiny annotation would have grips covering the whole of it, leaving
         // no way to move the thing. Shrink the reach so the middle stays
@@ -138,6 +145,11 @@ public static class LoadedAnnotationPicker
         if (top && right) return Grip.TopRight;
         if (bottom && left) return Grip.BottomLeft;
         if (bottom && right) return Grip.BottomRight;
+
+        if (!edges)
+        {
+            return Grip.None;
+        }
 
         // Edge midpoints: near the edge line AND near the centre of that edge,
         // so the handle sits where it is drawn rather than the whole border

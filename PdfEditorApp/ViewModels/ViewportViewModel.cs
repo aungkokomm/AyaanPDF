@@ -2018,7 +2018,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             var box = new AnnotationBox(
                 current.Index, current.Left, current.Top, current.Right, current.Bottom);
-            var grip = LoadedAnnotationPicker.GripAt(box, normX, normY);
+            var grip = LoadedAnnotationPicker.GripAt(box, normX, normY, edges: _selectedIsTextBox);
 
             if (grip != LoadedAnnotationPicker.Grip.None && CanResize(current))
             {
@@ -2052,6 +2052,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _selectedAnnotationId = null;
         _selectedLoaded = null;
+        _selectedIsTextBox = false;
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _moveOrigin = null;
@@ -2253,6 +2254,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Which corner the drag has hold of; None means it is a move.</summary>
     private LoadedAnnotationPicker.Grip _loadedGrip = LoadedAnnotationPicker.Grip.None;
 
+    /// <summary>
+    /// Whether the current selection is one of our text boxes. Read ONCE when the
+    /// selection changes (an FFI + parse), then used by the per-sample drag path,
+    /// which cannot afford to read the tag on every pointer move. A text box
+    /// resizes freely (eight handles) and re-wraps its text; an image stamp keeps
+    /// its aspect and scales.
+    /// </summary>
+    private bool _selectedIsTextBox;
+
     /// <summary>Per-page cache of what the file already carries.</summary>
     private readonly Dictionary<int, List<Interop.ExistingAnnotation>> _loadedByPage = new();
 
@@ -2288,12 +2298,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _selectedLoaded = new LoadedSelection(
             pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
+        _selectedIsTextBox = IsLoadedTextBox(pageIndex, hit.Index);
         _loadedDrag = (normX, normY, _selectedLoaded.Value);
-        _loadedGrip = LoadedAnnotationPicker.GripAt(hit, normX, normY);
+        _loadedGrip = LoadedAnnotationPicker.GripAt(hit, normX, normY, edges: _selectedIsTextBox);
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         return true;
     }
+
+    /// <summary>
+    /// Whether the annotation at this index is one of our text boxes, decided by
+    /// reading its tag once. Kept off the drag path (see
+    /// <see cref="_selectedIsTextBox"/>).
+    /// </summary>
+    private bool IsLoadedTextBox(int pageIndex, int index) =>
+        TextBoxTagReader.TryParse(ReadAnnotationContents(pageIndex, index), out _);
 
     /// <summary>
     /// Drags the marquee only. The document is not touched until the gesture
@@ -2383,8 +2402,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (resizing)
         {
-            status = RenderCoreNative.resize_shape_annotation(
-                _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
+            // A text box RE-WRAPS at the new size (Word-style), so it goes through
+            // its own path and can come back a different HEIGHT than was dragged.
+            // A shape redraws from its tag. Anything else reports Unsupported and
+            // falls through to the generic scale/rebuild.
+            if (_selectedIsTextBox)
+            {
+                status = RenderCoreNative.resize_text_box_annotation(
+                    _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
+            }
+
+            if (status != RenderStatus.OkPdfium)
+            {
+                status = RenderCoreNative.resize_shape_annotation(
+                    _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
+            }
         }
 
         if (status != RenderStatus.OkPdfium)
@@ -2410,7 +2442,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         IsDirty = true;
         InvalidateLoadedPage(now.PageIndex);
-        _selectedLoaded = now with { Index = newIndex };
+
+        // A re-wrapped text box can be a different HEIGHT than was dragged, so the
+        // marquee has to follow the bounds the core actually produced, not the
+        // dragged rectangle. For everything else the two are the same.
+        if (_selectedIsTextBox)
+        {
+            var actual = LoadedFor(now.PageIndex)
+                .Where(x => x.Index == newIndex)
+                .Select(x => (Interop.ExistingAnnotation?)x)
+                .FirstOrDefault();
+            _selectedLoaded = actual is Interop.ExistingAnnotation a
+                ? new LoadedSelection(now.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom)
+                : now with { Index = newIndex };
+        }
+        else
+        {
+            _selectedLoaded = now with { Index = newIndex };
+        }
+
         RefreshSelectionOutline();
     }
 
@@ -2432,6 +2482,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var newest = all[^1];
         _selectedLoaded = new LoadedSelection(
             pageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom);
+        _selectedIsTextBox = IsLoadedTextBox(pageIndex, newest.Index);
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _selectedAnnotationId = null;
@@ -2520,7 +2571,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         return LoadedAnnotationPicker.GripAt(
             new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom),
-            normX, normY);
+            normX, normY, edges: _selectedIsTextBox);
     }
 
     /// <summary>Whether a point is inside the current selection, so it can be dragged.</summary>
@@ -2544,6 +2595,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private double AspectToPreserve(LoadedSelection sel)
     {
+        // A text box is a stamp underneath, but it is NOT a picture: it resizes
+        // freely and re-wraps its text, so it keeps no aspect and gets the full
+        // eight handles. Only a real image stamp (a signature, a pasted picture)
+        // holds its aspect.
+        if (_selectedIsTextBox)
+        {
+            return 0;
+        }
+
         foreach (var a in LoadedFor(sel.PageIndex))
         {
             if (a.Index == sel.Index && a.Subtype == Interop.AnnotSubtype.Stamp)

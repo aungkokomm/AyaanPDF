@@ -2060,6 +2060,106 @@ fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
     Some((size, byte(rgba, 0)?, byte(rgba, 2)?, byte(rgba, 4)?, byte(rgba, 6)?, text))
 }
 
+/// Everything a text box needs to be redrawn: its words, size, colour, full
+/// style, and font file. This is what lets a box be RE-LAID-OUT at a new size
+/// (so a resize re-wraps the text rather than stretching the rendered pixels),
+/// the same way a shape is redrawn from its own tag. `None` if the tag is not a
+/// text box of ours.
+struct ParsedTextBox {
+    text: String,
+    size_px: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    style: TextStyle,
+    font_path: Option<String>,
+}
+
+fn parse_textbox_tag_full(contents: &str) -> Option<ParsedTextBox> {
+    let byte = |rgba: &str, i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
+    let rgba4 = |s: &str| -> Option<(u8, u8, u8, u8)> {
+        if s.len() != 8 {
+            return None;
+        }
+        Some((byte(s, 0)?, byte(s, 2)?, byte(s, 4)?, byte(s, 6)?))
+    };
+
+    if let Some(rest) = contents.strip_prefix(TEXTBOX_TAG_STYLED) {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() < 7 {
+            return None;
+        }
+        let size_px: f32 = parts[0].parse().ok()?;
+        if !size_px.is_finite() || size_px <= 0.0 {
+            return None;
+        }
+        let (r, g, b, a) = rgba4(parts[1])?;
+        let align = parts[2]
+            .parse::<i32>()
+            .ok()
+            .filter(|n| matches!(*n, ALIGN_LEFT | ALIGN_CENTER | ALIGN_RIGHT | ALIGN_JUSTIFY))
+            .unwrap_or(ALIGN_LEFT);
+        let fill = PackedRgba(u32::from_str_radix(parts[3], 16).unwrap_or(0));
+        let outline = PackedRgba(u32::from_str_radix(parts[4], 16).unwrap_or(0));
+        let outline_width_px: f32 = parts[5].parse().unwrap_or(0.0);
+
+        // The round-trip extras (flags + font) are present only when there are
+        // more than the six fixed fields plus the words.
+        let (underline, strikethrough, font_path) = if parts.len() >= 9 {
+            let flags: u32 = parts[6].parse().unwrap_or(0);
+            let font = base64_decode(parts[7])
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|s| !s.is_empty());
+            ((flags & 1) != 0, (flags & 2) != 0, font)
+        } else {
+            (false, false, None)
+        };
+
+        let text = String::from_utf8(base64_decode(parts[parts.len() - 1])?).ok()?;
+        return Some(ParsedTextBox {
+            text,
+            size_px,
+            r,
+            g,
+            b,
+            a,
+            style: TextStyle {
+                align,
+                fill,
+                outline,
+                outline_width_px,
+                underline,
+                strikethrough,
+            },
+            font_path,
+        });
+    }
+
+    // The plain tag: left-aligned, no fill/outline/decoration, default font.
+    let rest = contents.strip_prefix(TEXTBOX_TAG)?;
+    let parts: Vec<&str> = rest.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let size_px: f32 = parts[0].parse().ok()?;
+    if !size_px.is_finite() || size_px <= 0.0 {
+        return None;
+    }
+    let (r, g, b, a) = rgba4(parts[1])?;
+    let text = String::from_utf8(base64_decode(parts[2])?).ok()?;
+    Some(ParsedTextBox {
+        text,
+        size_px,
+        r,
+        g,
+        b,
+        a,
+        style: TextStyle::plain(),
+        font_path: None,
+    })
+}
+
 /// Minimal base64, so the core needs no extra dependency for one small string.
 fn base64_encode(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -3148,6 +3248,105 @@ fn resize_shape_annotation_inner(
     }
 
     // The rebuild is appended, so it is the last annotation on the page.
+    if !out_new_index.is_null() {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        if let Some(doc) = doc {
+            let doc_guard = lock(&doc);
+            if let Ok(page) = doc_guard.pages().get(page_index as u16) {
+                let count = page.annotations().len() as i32;
+                unsafe { *out_new_index = count - 1 };
+            }
+        }
+    }
+
+    STATUS_OK_PDFIUM
+}
+
+/// Resizes one of OUR text boxes by RE-LAYING-OUT its text at the new bounds,
+/// so the words re-wrap to the new width and the box grows to fit, exactly as
+/// when it was first placed. This is what makes a text box resize like a Word
+/// text box (drag any handle, text re-flows) instead of stretching its rendered
+/// glyphs the way scaling a stamp would. Reports UNSUPPORTED for anything that
+/// is not one of our text boxes, so the caller falls back to the generic resize.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn resize_text_box_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if right <= left || bottom <= top {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        resize_text_box_annotation_inner(
+            doc_handle, page_index, index, capture_width, left, top, right, bottom, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resize_text_box_annotation_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    // Read and parse the tag BEFORE anything is removed, so a mark that is not
+    // one of our text boxes leaves the page untouched.
+    let parsed = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else {
+            return STATUS_INVALID_INPUT;
+        };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+            return STATUS_INVALID_INPUT;
+        };
+        match annotation.contents().as_deref().and_then(parse_textbox_tag_full) {
+            Some(p) => p,
+            None => return STATUS_UNSUPPORTED,
+        }
+    };
+
+    if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // Re-lay-out at the new bounds. add_text_box_inner re-wraps to the width and
+    // grows the height to fit, embedding the same font, so the box returns in the
+    // same style, just re-flowed. It writes its own AyaanTextB tag again.
+    let status = add_text_box_inner(
+        doc_handle, page_index, capture_width, left, top, right, bottom,
+        &parsed.text, parsed.size_px, parsed.r, parsed.g, parsed.b, parsed.a,
+        parsed.style, parsed.font_path.as_deref());
+    if status != STATUS_OK_PDFIUM {
+        return status;
+    }
+
+    // The rebuilt box is appended, so it is the last annotation on the page.
     if !out_new_index.is_null() {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -6779,6 +6978,86 @@ mod tests {
         assert_eq!(parsed.5, "edit me\nplease");
 
         close_document(handle);
+    }
+
+    #[test]
+    fn resizing_a_text_box_re_wraps_it_taller_rather_than_scaling() {
+        // Word behaviour: making a text box NARROWER re-flows its words onto more
+        // lines and grows the box DOWN, rather than squashing the same glyphs into
+        // a thinner space. Scaling a rendered box into the new rect would keep its
+        // height; only RE-LAYING-OUT makes a narrowed box taller. That is the whole
+        // difference between a text box and a stretched picture.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let text = b"the quick brown fox jumps over the lazy dog again and again and again";
+
+        // A very wide, short box: its height is content-driven, so it reflects the
+        // number of wrapped lines (one, here).
+        assert_eq!(
+            add_text_box_annotation(handle, 0, 1000, 50.0, 50.0, 900.0, 80.0,
+                text.as_ptr(), text.len(), 18.0, 0, 0, 0, 255),
+            STATUS_OK_PDFIUM);
+        let wide = read_annotations(handle, 0);
+        assert_eq!(wide.len(), 1);
+        let wide_h = wide[0].5 - wide[0].3;
+
+        // Narrow it hard, same top and dragged height.
+        let mut new_index = -1;
+        assert_eq!(
+            resize_text_box_annotation(handle, 0, 0, 1000, 50.0, 50.0, 200.0, 80.0, &mut new_index),
+            STATUS_OK_PDFIUM);
+        let narrow = read_annotations(handle, 0);
+        assert_eq!(narrow.len(), 1, "resize must leave exactly one box, not a duplicate");
+        let narrow_h = narrow[0].5 - narrow[0].3;
+
+        assert!(
+            narrow_h > wide_h + 0.02,
+            "narrowing should re-wrap TALLER (re-flow), not scale: wide_h={wide_h} narrow_h={narrow_h}"
+        );
+
+        // Still one of our text boxes, with the same words: re-laid-out, not
+        // rasterized into pixels.
+        let contents = contents_of(handle, 0, new_index as usize).expect("resized box lost its tag");
+        assert!(contents.starts_with("AyaanTextB:"), "resized box is no longer a text box: {contents}");
+        assert_eq!(
+            parse_textbox_tag(&contents).map(|t| t.5),
+            Some(String::from_utf8_lossy(text).to_string())
+        );
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_full_text_box_parser_reads_style_and_rejects_other_marks() {
+        // The gate that makes resize_text_box_annotation report UNSUPPORTED for a
+        // shape or a plain comment, so the app falls back to the generic resize
+        // rather than turning that mark into text.
+        let styled = textbox_tag_styled(
+            "hi",
+            18.0,
+            10,
+            20,
+            30,
+            255,
+            TextStyle {
+                align: ALIGN_CENTER,
+                fill: PackedRgba(0xFFFFFFFF),
+                outline: PackedRgba(0),
+                outline_width_px: 0.0,
+                underline: true,
+                strikethrough: false,
+            },
+            Some(r"C:\Fonts\Noto.ttf"),
+        );
+        let p = parse_textbox_tag_full(&styled).expect("our styled tag should parse");
+        assert_eq!(p.text, "hi");
+        assert_eq!(p.style.align, ALIGN_CENTER);
+        assert!(p.style.underline && !p.style.strikethrough);
+        assert_eq!(p.font_path.as_deref(), Some(r"C:\Fonts\Noto.ttf"));
+
+        // Not ours.
+        assert!(parse_textbox_tag_full("AyaanShape:0:FF0000FF:2.0:0.1:0.2").is_none());
+        assert!(parse_textbox_tag_full("Please review this").is_none());
+        assert!(parse_textbox_tag_full("").is_none());
     }
 
     #[test]

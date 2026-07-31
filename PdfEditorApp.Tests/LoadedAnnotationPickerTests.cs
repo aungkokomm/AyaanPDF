@@ -361,6 +361,22 @@ public class GripReachTests
     }
 
     [Fact]
+    public void an_aspect_locked_stamp_has_no_edge_grips_only_corners()
+    {
+        // A picture keeps its aspect, so it shows only four corners. A point on an
+        // edge midpoint must therefore NOT be a one-axis grip (which would stretch
+        // it and break the aspect), while the corners still grab.
+        Assert.Equal(LoadedAnnotationPicker.Grip.None,
+                     LoadedAnnotationPicker.GripAt(Wide, 0.50, 0.20, edges: false));
+        Assert.Equal(LoadedAnnotationPicker.Grip.None,
+                     LoadedAnnotationPicker.GripAt(Wide, 0.80, 0.40, edges: false));
+        Assert.Equal(LoadedAnnotationPicker.Grip.TopLeft,
+                     LoadedAnnotationPicker.GripAt(Wide, 0.20, 0.20, edges: false));
+        Assert.Equal(LoadedAnnotationPicker.Grip.BottomRight,
+                     LoadedAnnotationPicker.GripAt(Wide, 0.80, 0.60, edges: false));
+    }
+
+    [Fact]
     public void an_edge_grip_moves_one_edge_only()
     {
         var top = LoadedAnnotationPicker.Resized(Wide, LoadedAnnotationPicker.Grip.Top, 0.5, 0.10);
