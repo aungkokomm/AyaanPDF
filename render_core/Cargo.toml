@@ -17,6 +17,10 @@ crate-type = ["cdylib", "rlib"]
 # real, selectable vector text. No other changes from 0.8.37.
 pdfium-render = { path = "../vendor/pdfium-render", default-features = false, features = ["pdfium_latest", "thread_safe", "sync"] }
 lru = "0.12"
+# Pure-Rust HarfBuzz port (MIT). Shapes complex scripts (Burmese, Devanagari,
+# Arabic) into glyph indices, which are then drawn as real PDF text via the
+# forked FPDFText_SetCharcodes path. No C dependency.
+rustybuzz = "0.20"
 
 [profile.dev]
 panic = "unwind"

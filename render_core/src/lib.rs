@@ -1873,6 +1873,46 @@ fn resolve_text_font(
     doc.fonts_mut().helvetica()
 }
 
+/// True when the text contains a script PDFium's plain text path cannot lay out
+/// correctly on its own: one that needs shaping (reordering, ligatures,
+/// contextual and stacked forms). Covers the major complex scripts.
+fn needs_shaping(text: &str) -> bool {
+    text.chars().any(|c| {
+        let u = c as u32;
+        (0x0600..=0x06FF).contains(&u)      // Arabic
+            || (0x0700..=0x074F).contains(&u) // Syriac
+            || (0x0750..=0x077F).contains(&u) // Arabic Supplement
+            || (0x0900..=0x0DFF).contains(&u) // Devanagari .. Malayalam .. Sinhala (Indic)
+            || (0x0E00..=0x0FFF).contains(&u) // Thai, Lao, Tibetan
+            || (0x1000..=0x109F).contains(&u) // Myanmar
+            || (0x1780..=0x17FF).contains(&u) // Khmer
+    })
+}
+
+/// Shapes one run of text in the given font with rustybuzz (a HarfBuzz port),
+/// returning the VISUAL-ORDER glyph indices and the run's advance width in
+/// points. None if the font bytes cannot be parsed as a face. The glyph indices
+/// go to PDFium via FPDFText_SetCharcodes; for the CID (Identity) font this app
+/// embeds, glyph index == the code PDFium wants, so the shaped result draws.
+fn shape_run(font_bytes: &[u8], text: &str, size_pts: f32) -> Option<(Vec<u32>, f32)> {
+    let face = rustybuzz::Face::from_slice(font_bytes, 0)?;
+    let upem = face.units_per_em() as f32;
+    if upem <= 0.0 {
+        return None;
+    }
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    let shaped = rustybuzz::shape(&face, &[], buffer);
+
+    let ids: Vec<u32> = shaped.glyph_infos().iter().map(|g| g.glyph_id).collect();
+    if ids.is_empty() {
+        return None;
+    }
+    let advance_units: i64 = shaped.glyph_positions().iter().map(|p| p.x_advance as i64).sum();
+    let width_pts = advance_units as f32 * size_pts / upem;
+    Some((ids, width_pts))
+}
+
 #[allow(dead_code)] // the styled tag is what boxes now write; kept for tests
 fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
     format!(
@@ -2294,6 +2334,11 @@ fn add_text_box_inner(
     // will not load, falls back to Helvetica.
     let font = resolve_text_font(&mut doc_guard, font_path);
 
+    // The font's raw bytes, kept for shaping complex-script lines with rustybuzz.
+    // Only present when a font was chosen (Helvetica cannot render those scripts
+    // anyway, so there is nothing to shape without a real font file).
+    let font_bytes = font_path.and_then(font_file_bytes);
+
     let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
         return STATUS_INVALID_INPUT;
     };
@@ -2399,10 +2444,40 @@ fn add_text_box_inner(
         // Justify spreads the words of a full line across the whole width; every
         // other case places the whole line at one x computed from its measured
         // width.
+        // A complex-script line (with a real font loaded) is SHAPED: rustybuzz
+        // turns the codepoints into ordered glyph indices, which go to PDFium as
+        // one text object via the forked SetCharcodes path. This is what makes
+        // Burmese/Devanagari/Arabic render correctly rather than as loose,
+        // wrongly-ordered base glyphs. Everything else uses the plain path.
+        let shaped = font_bytes
+            .as_deref()
+            .map(|v| v.as_slice())
+            .filter(|_| needs_shaping(&line.text))
+            .and_then(|fb| shape_run(fb, &line.text, size_pts));
+
         // Place the line's text, and note the x and width its decoration (if
         // any) should span: the full width for a justified line, the measured
         // width otherwise.
-        let (deco_x, deco_w) = if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
+        let (deco_x, deco_w) = if let Some((glyph_ids, width_pts)) = shaped {
+            let x = match style.align {
+                ALIGN_CENTER => text_left + (avail_width - width_pts) / 2.0,
+                ALIGN_RIGHT => text_left + (avail_width - width_pts),
+                _ => text_left,
+            };
+            if let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, " ", font, PdfPoints::new(size_pts)) {
+                let charcodes: Vec<std::os::raw::c_uint> =
+                    glyph_ids.iter().map(|&g| g as std::os::raw::c_uint).collect();
+                doc_guard.bindings().FPDFText_SetCharcodes(
+                    obj.object_handle(),
+                    charcodes.as_ptr(),
+                    charcodes.len(),
+                );
+                let _ = obj.set_fill_color(color);
+                let _ = obj.translate(PdfPoints::new(x), PdfPoints::new(baseline));
+                let _ = annotation.objects_mut().add_text_object(obj);
+            }
+            (x, width_pts)
+        } else if style.align == ALIGN_JUSTIFY && line.justifiable && line.text.contains(' ') {
             justify_line(
                 &doc_guard, &mut annotation, font, &line.text, color, size_pts,
                 text_left, avail_width, baseline,
@@ -6483,6 +6558,54 @@ mod tests {
         println!("DUMP {out} {}x{}", r.width, r.height);
         free_render_result(r);
         close_document(handle);
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_burmese_shaped_for_inspection() {
+        // Run: cargo test --release dump_burmese -- --ignored --nocapture
+        let font = "C:\\Windows\\Fonts\\mmrtext.ttf";
+        let text = "ကောင်းကင်ပြြပြအောက်".as_bytes();
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(handle, 0, 900, 60.0, 60.0, 840.0, 200.0,
+                text.as_ptr(), text.len(), 44.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0xFFFFFFFF, 0, 0.0, font.as_ptr(), font.len(), 0, 0),
+            STATUS_OK_PDFIUM);
+
+        let r = render_low_res(handle, 0, 900);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let out = std::env::var("MM_DUMP").unwrap_or_else(|_| "mm.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {out} {}x{}", r.width, r.height);
+        free_render_result(r);
+        close_document(handle);
+    }
+
+    #[test]
+    fn needs_shaping_flags_only_complex_scripts() {
+        assert!(!needs_shaping("Hello, world 123"));
+        assert!(!needs_shaping("Привет мир"));   // Cyrillic maps 1:1, no shaping
+        assert!(!needs_shaping("日本語"));         // CJK maps 1:1
+        assert!(needs_shaping("ကောင်း"));          // Myanmar
+        assert!(needs_shaping("नमस्ते"));           // Devanagari
+        assert!(needs_shaping("مرحبا"));           // Arabic
+        assert!(needs_shaping("Mixed नमस्ते text")); // any complex char triggers it
+    }
+
+    #[test]
+    fn shape_run_turns_burmese_into_glyphs() {
+        let font = "C:\\Windows\\Fonts\\mmrtext.ttf";
+        if !std::path::Path::new(font).exists() {
+            return; // no Myanmar font on this machine
+        }
+        let bytes = std::fs::read(font).unwrap();
+        let (glyphs, width) = shape_run(&bytes, "ကောင်း", 44.0).expect("shaping produced nothing");
+        assert!(!glyphs.is_empty(), "no glyphs");
+        assert!(width > 0.0, "zero advance width");
+        // Shaping reorders/substitutes, so the glyph run is not a trivial 1:1 of
+        // the six input codepoints.
+        assert!(glyphs.iter().all(|&g| g != 0), "a .notdef glyph slipped through");
     }
 
     #[test]
