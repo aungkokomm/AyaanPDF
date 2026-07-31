@@ -1825,6 +1825,45 @@ impl PackedRgba {
     fn is_visible(self) -> bool { self.a() > 0 }
 }
 
+/// Font files read from disk, cached by absolute path so a given font is read
+/// once per process. The bytes are re-embedded per text box (a `PdfFontToken`
+/// cannot be cached: it wraps a raw handle and its constructor is pub(crate)),
+/// but at least the disk read is not repeated for every box in the same font.
+static FONT_BYTES: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+
+fn font_file_bytes(path: &str) -> Option<Arc<Vec<u8>>> {
+    let cache = FONT_BYTES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = lock(cache);
+    if let Some(bytes) = map.get(path) {
+        return Some(bytes.clone());
+    }
+    let data = std::fs::read(path).ok()?;
+    let arc = Arc::new(data);
+    map.insert(path.to_string(), arc.clone());
+    Some(arc)
+}
+
+/// Resolves the font a text box should draw in: the embedded TrueType font at
+/// `font_path` loaded as a Unicode (CID) font, or Helvetica when no path is
+/// given or the file cannot be loaded. Loading as CID is what gives >256 glyphs,
+/// i.e. any Unicode a text field needs. Complex scripts (Devanagari, Myanmar,
+/// Arabic) still need shaping (a later phase); this covers the rest.
+fn resolve_text_font(
+    doc: &mut pdfium_render::prelude::PdfDocument<'_>,
+    font_path: Option<&str>,
+) -> pdfium_render::prelude::PdfFontToken {
+    if let Some(path) = font_path {
+        if !path.is_empty() {
+            if let Some(bytes) = font_file_bytes(path) {
+                if let Ok(token) = doc.fonts_mut().load_true_type_from_bytes(&bytes, true) {
+                    return token;
+                }
+            }
+        }
+    }
+    doc.fonts_mut().helvetica()
+}
+
 #[allow(dead_code)] // the styled tag is what boxes now write; kept for tests
 fn textbox_tag(text: &str, size_px: f32, r: u8, g: u8, b: u8, a: u8) -> String {
     format!(
@@ -2104,7 +2143,7 @@ pub extern "C" fn add_text_box_annotation(
 ) -> i32 {
     add_text_box_common(
         doc_handle, page_index, capture_width, left, top, right, bottom, text_utf8, text_len,
-        font_size_px, r, g, b, a, TextStyle::plain(),
+        font_size_px, r, g, b, a, TextStyle::plain(), None,
     )
 }
 
@@ -2132,6 +2171,8 @@ pub extern "C" fn add_text_box_annotation_styled(
     fill_rgba: u32,
     outline_rgba: u32,
     outline_width_px: f32,
+    font_path_utf8: *const u8,
+    font_path_len: usize,
 ) -> i32 {
     let align = if matches!(align, ALIGN_LEFT | ALIGN_CENTER | ALIGN_RIGHT | ALIGN_JUSTIFY) {
         align
@@ -2144,9 +2185,20 @@ pub extern "C" fn add_text_box_annotation_styled(
         outline: PackedRgba(outline_rgba),
         outline_width_px: outline_width_px.max(0.0),
     };
+
+    // The font path is an OS path to a TrueType/OpenType file, empty for the
+    // default. Kept owned for the whole call so the borrow threaded below stays
+    // valid; a bad UTF-8 path is treated as "no font" rather than an error.
+    let font_path: Option<String> = if font_path_utf8.is_null() || font_path_len == 0 {
+        None
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(font_path_utf8, font_path_len) };
+        std::str::from_utf8(slice).ok().map(|s| s.to_string())
+    };
+
     add_text_box_common(
         doc_handle, page_index, capture_width, left, top, right, bottom, text_utf8, text_len,
-        font_size_px, r, g, b, a, style,
+        font_size_px, r, g, b, a, style, font_path.as_deref(),
     )
 }
 
@@ -2167,6 +2219,7 @@ fn add_text_box_common(
     b: u8,
     a: u8,
     style: TextStyle,
+    font_path: Option<&str>,
 ) -> i32 {
     if doc_handle == 0 || page_index < 0 || capture_width <= 0 || font_size_px <= 0.0 {
         return STATUS_INVALID_INPUT;
@@ -2189,7 +2242,7 @@ fn add_text_box_common(
     panic::catch_unwind(|| {
         add_text_box_inner(
             doc_handle, page_index, capture_width, left, top, right, bottom, &text, font_size_px, r,
-            g, b, a, style,
+            g, b, a, style, font_path,
         )
     })
     .unwrap_or(STATUS_PANIC)
@@ -2211,6 +2264,7 @@ fn add_text_box_inner(
     b: u8,
     a: u8,
     style: TextStyle,
+    font_path: Option<&str>,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -2222,8 +2276,10 @@ fn add_text_box_inner(
     let mut doc_guard = lock(&doc);
 
     // The font token is a plain handle, so taking it here (a brief mutable
-    // borrow) releases the document before the page borrows it below.
-    let font = doc_guard.fonts_mut().helvetica();
+    // borrow) releases the document before the page borrows it below. A given
+    // font path is embedded as a Unicode (CID) font; no path, or a font that
+    // will not load, falls back to Helvetica.
+    let font = resolve_text_font(&mut doc_guard, font_path);
 
     let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
         return STATUS_INVALID_INPUT;
@@ -6058,7 +6114,7 @@ mod tests {
             assert_eq!(
                 add_text_box_annotation_styled(handle, 0, 1000, 60.0, top, 520.0, top + 170.0,
                     b.as_ptr(), b.len(), 22.0, 20, 20, 20, 255,
-                    *align, fill, outline, 2.0),
+                    *align, fill, outline, 2.0, std::ptr::null(), 0),
                 STATUS_OK_PDFIUM);
         }
 
@@ -6237,7 +6293,8 @@ mod tests {
             let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
             assert_eq!(
                 add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 800.0, 200.0,
-                    text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255, align, 0, 0, 0.0),
+                    text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255, align, 0, 0, 0.0,
+                    std::ptr::null(), 0),
                 STATUS_OK_PDFIUM);
             let (bytes, _) = render_bytes(h, 0, 400);
             close_document(h);
@@ -6257,7 +6314,7 @@ mod tests {
         assert_eq!(
             add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 300.0,
                 text.as_ptr(), text.len(), 20.0, 0, 0, 0, 255,
-                ALIGN_LEFT, 0xFF0000FF, 0, 0.0),
+                ALIGN_LEFT, 0xFF0000FF, 0, 0.0, std::ptr::null(), 0),
             STATUS_OK_PDFIUM);
 
         let (bytes, w) = render_bytes(h, 0, 400);
@@ -6270,6 +6327,77 @@ mod tests {
         assert!(r > 180 && g < 90 && b < 90, "fill sampled B={b} G={g} R={r}, not red");
     }
 
+    /// Counts near-black pixels in a normalized band of a 400px-wide render of
+    /// page 0, so a test can tell "glyphs were drawn here" from "nothing was".
+    fn dark_pixels_in_band(handle: u64, x0: f32, y0: f32, x1: f32, y1: f32) -> usize {
+        let (bytes, w) = render_bytes(handle, 0, 400);
+        let h = bytes.len() / (w * 4);
+        let mut dark = 0;
+        for y in (y0 * 400.0) as usize..(y1 * 400.0) as usize {
+            for x in (x0 * 400.0) as usize..(x1 * 400.0) as usize {
+                if y >= h || x >= w {
+                    continue;
+                }
+                let px = (y * w + x) * 4;
+                if bytes[px] < 110 && bytes[px + 1] < 110 && bytes[px + 2] < 110 {
+                    dark += 1;
+                }
+            }
+        }
+        dark
+    }
+
+    #[test]
+    fn a_text_box_in_a_real_font_renders_cyrillic_glyphs() {
+        // With a real embedded font, non-Latin text actually puts ink on the
+        // page (visually confirmed to be correct Cyrillic in the ignored
+        // dump_unicode_text test). An opaque white fill isolates the box from
+        // the page content beneath, so the dark pixels counted are the glyphs.
+        let font = "C:\\Windows\\Fonts\\arial.ttf";
+        if !std::path::Path::new(font).exists() {
+            return; // a machine without Arial: nothing to prove here
+        }
+        let text = "Привет мир".as_bytes();
+        let white_fill = 0xFFFFFFFFu32;
+
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(
+                h, 0, 900, 60.0, 60.0, 620.0, 170.0,
+                text.as_ptr(), text.len(), 44.0, 0, 0, 0, 255,
+                ALIGN_LEFT, white_fill, 0, 0.0, font.as_ptr(), font.len()),
+            STATUS_OK_PDFIUM);
+        let ink = dark_pixels_in_band(h, 0.10, 0.11, 0.55, 0.16);
+        close_document(h);
+
+        assert!(ink > 150, "expected Cyrillic glyphs drawn on the box, found {ink} dark px");
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_unicode_text_for_inspection() {
+        // Renders mixed non-Latin text in a real font, to LOOK at the glyphs.
+        // Run: cargo test --release dump_unicode_text -- --ignored --nocapture
+        let font = "C:\\Windows\\Fonts\\arial.ttf";
+        let text = "Привет мир  Γειά σου  Ünïcödé  1234".as_bytes();
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(
+                handle, 0, 900, 60.0, 60.0, 840.0, 200.0,
+                text.as_ptr(), text.len(), 40.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0, 0, 0.0, font.as_ptr(), font.len()),
+            STATUS_OK_PDFIUM);
+
+        let r = render_low_res(handle, 0, 900);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let out = std::env::var("UNI_DUMP").unwrap_or_else(|_| "uni.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {out} {}x{}", r.width, r.height);
+        free_render_result(r);
+        close_document(handle);
+    }
+
     #[test]
     fn a_styled_box_keeps_its_style_tag_across_a_reopen() {
         let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
@@ -6277,7 +6405,7 @@ mod tests {
         assert_eq!(
             add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 600.0, 260.0,
                 text.as_ptr(), text.len(), 22.0, 20, 20, 20, 255,
-                ALIGN_CENTER, 0xFFF7C8FF, 0x1565C0FF, 2.0),
+                ALIGN_CENTER, 0xFFF7C8FF, 0x1565C0FF, 2.0, std::ptr::null(), 0),
             STATUS_OK_PDFIUM);
 
         free_render_result(render_region(h, 0, 0.0, 0.0, 1.0, 1.0, 200));

@@ -3188,6 +3188,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public partial double TextOutlineWidthNorm { get; set; } = 2.0 / 1000.0;
 
     /// <summary>
+    /// OS path to the TrueType/OpenType font new text boxes are drawn in, or ""
+    /// for the built-in Helvetica. Set by the font picker; the core embeds the
+    /// file as a Unicode font so non-Latin scripts render. See
+    /// project-ayaanpdf-text-fonts-foundation.
+    /// </summary>
+    [ObservableProperty]
+    public partial string TextFontPath { get; set; } = "";
+
+    /// <summary>
     /// Writes a text box to the document as real vector text, then hands it back
     /// as an ordinary loaded annotation.
     ///
@@ -3356,6 +3365,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
         byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
 
+        byte[]? fontUtf8 = string.IsNullOrEmpty(TextFontPath)
+            ? null
+            : System.Text.Encoding.UTF8.GetBytes(TextFontPath);
+
         int status = RenderCoreNative.add_text_box_annotation_styled(
             _documentHandle, pageIndex, CaptureWidth,
             (float)(left * CaptureWidth), (float)(top * CaptureWidth),
@@ -3363,7 +3376,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             utf8, (nuint)utf8.Length,
             (float)(fontSizeNorm * CaptureWidth), r, g, b, a,
             (int)TextAlign, PackRgba(TextFillHex), PackRgba(TextOutlineHex),
-            (float)(TextOutlineWidthNorm * CaptureWidth));
+            (float)(TextOutlineWidthNorm * CaptureWidth),
+            fontUtf8, (nuint)(fontUtf8?.Length ?? 0));
 
         Diag.Log($"text box p{pageIndex} \"{text.Replace("\n", "\\n")}\" align={TextAlign} -> {status}");
 
