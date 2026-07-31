@@ -2201,7 +2201,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // to an error message.
             if (slot is not null && CanResize(sel))
             {
-                AddGrips(slot, sel);
+                // Edge (one-axis) handles only for a free resize; an aspect-locked
+                // picture keeps just its four corners, since stretching one edge
+                // would break the aspect the corners protect.
+                AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0);
             }
 
             InkStrokeChanged?.Invoke();
@@ -2571,14 +2574,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    private static void AddGrips(PageSlot slot, LoadedSelection sel)
+    private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges)
     {
         double l = sel.Left * SlotLayoutWidth;
         double t = sel.Top * SlotLayoutWidth;
         double r = sel.Right * SlotLayoutWidth;
         double b = sel.Bottom * SlotLayoutWidth;
+        double mx = (l + r) / 2;
+        double my = (t + b) / 2;
 
-        foreach (var (cx, cy) in new[] { (l, t), (r, t), (l, b), (r, b) })
+        // Four corners always; the four edge midpoints when the object resizes
+        // freely, for a Word-style eight-handle frame.
+        var points = new List<(double, double)> { (l, t), (r, t), (l, b), (r, b) };
+        if (edges)
+        {
+            points.Add((mx, t));
+            points.Add((mx, b));
+            points.Add((l, my));
+            points.Add((r, my));
+        }
+
+        foreach (var (cx, cy) in points)
         {
             slot.SelectionGrips.Add(new ScaledRect(
                 cx - GripHalf, cy - GripHalf, GripHalf * 2, GripHalf * 2, string.Empty));

@@ -343,4 +343,46 @@ public class GripReachTests
         Assert.Equal(LoadedAnnotationPicker.Grip.None,
                      LoadedAnnotationPicker.GripAt(Box, 0.0, 0.0));
     }
+
+    // A wide box with a clear centre, for the eight-handle (Word-style) frame.
+    private static readonly AnnotationBox Wide = new(0, 0.20, 0.20, 0.80, 0.60);
+
+    [Fact]
+    public void the_four_edge_midpoints_are_grips_too()
+    {
+        Assert.Equal(LoadedAnnotationPicker.Grip.Top, LoadedAnnotationPicker.GripAt(Wide, 0.50, 0.20));
+        Assert.Equal(LoadedAnnotationPicker.Grip.Bottom, LoadedAnnotationPicker.GripAt(Wide, 0.50, 0.60));
+        Assert.Equal(LoadedAnnotationPicker.Grip.Left, LoadedAnnotationPicker.GripAt(Wide, 0.20, 0.40));
+        Assert.Equal(LoadedAnnotationPicker.Grip.Right, LoadedAnnotationPicker.GripAt(Wide, 0.80, 0.40));
+        // A point on the top edge but away from its midpoint is not a handle.
+        Assert.Equal(LoadedAnnotationPicker.Grip.None, LoadedAnnotationPicker.GripAt(Wide, 0.32, 0.20));
+        // Corners still win where they overlap the edges.
+        Assert.Equal(LoadedAnnotationPicker.Grip.TopLeft, LoadedAnnotationPicker.GripAt(Wide, 0.20, 0.20));
+    }
+
+    [Fact]
+    public void an_edge_grip_moves_one_edge_only()
+    {
+        var top = LoadedAnnotationPicker.Resized(Wide, LoadedAnnotationPicker.Grip.Top, 0.5, 0.10);
+        Assert.Equal(0.10, top.Top, 6);
+        Assert.Equal(0.20, top.Left, 6);
+        Assert.Equal(0.80, top.Right, 6);
+        Assert.Equal(0.60, top.Bottom, 6);
+
+        var right = LoadedAnnotationPicker.Resized(Wide, LoadedAnnotationPicker.Grip.Right, 0.90, 0.4);
+        Assert.Equal(0.90, right.Right, 6);
+        Assert.Equal(0.20, right.Top, 6);
+        Assert.Equal(0.60, right.Bottom, 6);
+    }
+
+    [Fact]
+    public void an_edge_grip_stretches_freely_even_with_an_aspect_lock()
+    {
+        // Aspect is honoured only for corners; an edge is a deliberate stretch.
+        var r = LoadedAnnotationPicker.Resized(Wide, LoadedAnnotationPicker.Grip.Bottom, 0.5, 0.90, aspect: 2.0);
+        Assert.Equal(0.90, r.Bottom, 6);
+        Assert.Equal(0.20, r.Top, 6);
+        Assert.Equal(0.20, r.Left, 6);
+        Assert.Equal(0.80, r.Right, 6);
+    }
 }

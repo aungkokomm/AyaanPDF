@@ -327,17 +327,16 @@
                                                         over dark artwork as well
                                                         as light paper.
                                                     -->
-                                                    <Rectangle Fill="White"
-                                                               Stroke="{ThemeResource AccentFillColorDefaultBrush}"
-                                                               StrokeThickness="1.5"
-                                                               RadiusX="1" RadiusY="1"
-                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
-                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
-                                                               HorizontalAlignment="Left" VerticalAlignment="Top">
-                                                        <Rectangle.Shadow>
+                                                    <Ellipse Fill="White"
+                                                             Stroke="{ThemeResource AccentFillColorDefaultBrush}"
+                                                             StrokeThickness="1.5"
+                                                             Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                             Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                             HorizontalAlignment="Left" VerticalAlignment="Top">
+                                                        <Ellipse.Shadow>
                                                             <ThemeShadow />
-                                                        </Rectangle.Shadow>
-                                                    </Rectangle>
+                                                        </Ellipse.Shadow>
+                                                    </Ellipse>
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>

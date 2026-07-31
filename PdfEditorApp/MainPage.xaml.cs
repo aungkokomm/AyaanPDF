@@ -2382,6 +2382,10 @@ public sealed partial class MainPage : Page
                 => InputSystemCursorShape.SizeNorthwestSoutheast,
             LoadedAnnotationPicker.Grip.TopRight or LoadedAnnotationPicker.Grip.BottomLeft
                 => InputSystemCursorShape.SizeNortheastSouthwest,
+            LoadedAnnotationPicker.Grip.Top or LoadedAnnotationPicker.Grip.Bottom
+                => InputSystemCursorShape.SizeNorthSouth,
+            LoadedAnnotationPicker.Grip.Left or LoadedAnnotationPicker.Grip.Right
+                => InputSystemCursorShape.SizeWestEast,
             _ => ViewModel.IsOverSelection(content.Page, nx, ny)
                 ? InputSystemCursorShape.SizeAll
                 : null,

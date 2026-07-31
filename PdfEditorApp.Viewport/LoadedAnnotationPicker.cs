@@ -85,7 +85,9 @@ public static class LoadedAnnotationPicker
         || Math.Abs(now.Width - start.Width) > epsilon
         || Math.Abs(now.Height - start.Height) > epsilon;
 
-    /// <summary>Which corner of a selected annotation a drag has hold of.</summary>
+    /// <summary>Which handle of a selected annotation a drag has hold of: the
+    /// four corners (two-axis resize) and the four edge midpoints (one-axis),
+    /// like a Word text box.</summary>
     public enum Grip
     {
         None,
@@ -93,7 +95,15 @@ public static class LoadedAnnotationPicker
         TopRight,
         BottomLeft,
         BottomRight,
+        Top,
+        Bottom,
+        Left,
+        Right,
     }
+
+    /// <summary>True for the four corner grips (two-axis resize).</summary>
+    public static bool IsCorner(Grip g) =>
+        g is Grip.TopLeft or Grip.TopRight or Grip.BottomLeft or Grip.BottomRight;
 
     /// <summary>
     /// Half the width of a corner grip, in normalized units. Generous on
@@ -122,10 +132,22 @@ public static class LoadedAnnotationPicker
         bool top = Math.Abs(y - box.Top) <= limit;
         bool bottom = Math.Abs(y - box.Bottom) <= limit;
 
+        // Corners first: they overlap the edges, and a corner is a two-axis
+        // resize where an edge is one-axis.
         if (top && left) return Grip.TopLeft;
         if (top && right) return Grip.TopRight;
         if (bottom && left) return Grip.BottomLeft;
         if (bottom && right) return Grip.BottomRight;
+
+        // Edge midpoints: near the edge line AND near the centre of that edge,
+        // so the handle sits where it is drawn rather than the whole border
+        // resizing (which would fight the body-drag move).
+        double cx = (box.Left + box.Right) / 2;
+        double cy = (box.Top + box.Bottom) / 2;
+        if (top && Math.Abs(x - cx) <= limit) return Grip.Top;
+        if (bottom && Math.Abs(x - cx) <= limit) return Grip.Bottom;
+        if (left && Math.Abs(y - cy) <= limit) return Grip.Left;
+        if (right && Math.Abs(y - cy) <= limit) return Grip.Right;
         return Grip.None;
     }
 
@@ -178,11 +200,26 @@ public static class LoadedAnnotationPicker
                 right = Math.Max(x, left + MinSize);
                 bottom = Math.Max(y, top + MinSize);
                 break;
+
+            // Edge midpoints move one edge only.
+            case Grip.Top:
+                top = Math.Min(y, bottom - MinSize);
+                break;
+            case Grip.Bottom:
+                bottom = Math.Max(y, top + MinSize);
+                break;
+            case Grip.Left:
+                left = Math.Min(x, right - MinSize);
+                break;
+            case Grip.Right:
+                right = Math.Max(x, left + MinSize);
+                break;
         }
 
         // Hold the aspect by deriving the height from the width, anchored to
         // whichever corner is NOT being dragged, so the fixed corner stays put.
-        if (aspect > 0)
+        // Only corners preserve aspect; an edge is a deliberate one-axis stretch.
+        if (aspect > 0 && IsCorner(grip))
         {
             // The minimum has to be applied to the WIDTH alone, chosen so the
             // resulting height also clears it. Flooring each dimension
