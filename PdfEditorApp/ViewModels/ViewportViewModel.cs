@@ -904,6 +904,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         ClearLoadedAnnotations();
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
 
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
 
@@ -1974,6 +1975,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public bool HasSelectedAnnotation => _selectedAnnotationId is not null || _selectedLoaded is not null;
 
+    /// <summary>True when the current loaded selection is one of our text boxes.
+    /// The toolbar uses this to show the text style controls (font, fill, outline,
+    /// thickness) whenever a text box is selected, no matter which tool is armed,
+    /// so a Select-tool click on a text box still exposes its properties.</summary>
+    public bool HasSelectedTextBox => _selectedLoaded is not null && _selectedIsTextBox;
+
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
     {
@@ -2003,6 +2010,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _loadedGrip = LoadedAnnotationPicker.Grip.None;
             RefreshSelectionOutline();
             OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
             return true;
         }
 
@@ -2041,6 +2049,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
         return false;
     }
 
@@ -2059,6 +2068,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _moveOrigin = null;
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
     }
 
     /// <summary>
@@ -2144,6 +2154,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshAnnotationsForCurrentPage();
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
     }
 
     private void ReplaceAnnotation(Guid id, Func<IAnnotation, IAnnotation> edit)
@@ -2321,6 +2332,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _loadedGrip = GripForPoint(sel, normX, normY);
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
         return true;
     }
 
@@ -2367,11 +2379,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         TextUnderline = tag.Underline;
         TextStrikethrough = tag.Strikethrough;
         RestoreTextFont(tag.FontPath);
-
-        // The toolbar's text sections show only for the Text tool. Switching now
-        // means clicking on a text box opens its properties in the toolbar, the
-        // way selecting one in Word does.
-        ActiveTool = ToolMode.Text;
     }
 
     /// <summary>
@@ -2751,6 +2758,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
     }
 
     /// <summary>Deletes the selected annotation from the file itself.</summary>
@@ -2784,6 +2792,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         InvalidateLoadedPage(sel.PageIndex);
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
         return true;
     }
 
@@ -3779,6 +3788,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
         RefreshSelectionOutline();
 
         IsDirty = true;
@@ -4033,6 +4043,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 InvalidateLoadedPage(b.PageIndex);
                 RefreshSelectionOutline();
                 OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
             }
 
             NotifyHistoryChanged();

@@ -57,6 +57,18 @@ public sealed partial class MainPage : Page
         // Drag-reorder in the thumbnail list moves an item in this collection;
         // that is the signal to rebuild the document in the new order.
         ViewModel.Thumbnails.CollectionChanged += Thumbnails_CollectionChanged;
+
+        // When the loaded selection changes to (or from) one of our text boxes,
+        // the toolbar's font/fill/outline sections need to show up (or hide) even
+        // though the active tool has not changed. Any tool + a selected text box
+        // exposes its style, the way Word does.
+        ViewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(ViewModel.HasSelectedTextBox))
+            {
+                UpdateToolRail();
+            }
+        };
         Loaded += (_, _) =>
         {
             RootGrid.Focus(FocusState.Programmatic);
@@ -1654,13 +1666,14 @@ public sealed partial class MainPage : Page
             ShapeChoices.SelectedIndex = (int)ViewModel.ActiveShapeKind;
         }
 
-        bool fontSize = tool.Offers(ToolOptions.FontSize);
-        FontSizeSection.Visibility = Show(fontSize);
-        // Font family, alignment, fill and outline are text-box properties, so
-        // they ride with the font-size section that marks the text tool.
-        FontSection.Visibility = Show(fontSize);
-        TextStyleSection.Visibility = Show(fontSize);
-        if (fontSize)
+        // The text sections show for the Text tool AND whenever a text box is
+        // selected under any tool: without that second half, clicking a text box
+        // in Select mode gave no way to modify its style. Word behaves the same.
+        bool textSections = tool.Offers(ToolOptions.FontSize) || ViewModel.HasSelectedTextBox;
+        FontSizeSection.Visibility = Show(textSections);
+        FontSection.Visibility = Show(textSections);
+        TextStyleSection.Visibility = Show(textSections);
+        if (textSections)
         {
             ViewModel.EnsureFontsLoaded();
             ShowFontSize();
