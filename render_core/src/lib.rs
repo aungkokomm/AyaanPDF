@@ -6746,6 +6746,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_rotated_shape_records_its_angle_and_can_be_rotated_again() {
+        // A shape is added at 0 deg, rotated to 45 via the FFI, and its tag is
+        // re-read. The tag's rotation field must come back at 45, and a second
+        // rotate to 90 must overwrite (not compound) the angle. This is the
+        // whole round-trip the app relies on for a shape's rotate handle.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 200.0)];
+        assert_eq!(
+            add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        // First rotate to 45.
+        let mut new_index = -1;
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, 0, 1000, 45.0, &mut new_index),
+            STATUS_OK_PDFIUM
+        );
+        let contents = contents_of(handle, 0, new_index as usize)
+            .expect("rotated shape has no tag");
+        let parsed = parse_shape_tag(&contents).expect("rotated shape tag should parse");
+        assert!((parsed.8 - 45.0).abs() < 0.01,
+            "rotate did not record 45 in the tag: {}", parsed.8);
+
+        // Rotate again to 90; should REPLACE not accumulate.
+        let mut newer = -1;
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, new_index, 1000, 90.0, &mut newer),
+            STATUS_OK_PDFIUM
+        );
+        let contents2 = contents_of(handle, 0, newer as usize)
+            .expect("re-rotated shape has no tag");
+        let parsed2 = parse_shape_tag(&contents2).expect("re-rotated shape tag should parse");
+        assert!((parsed2.8 - 90.0).abs() < 0.01,
+            "rotate did not overwrite the angle: {}", parsed2.8);
+
+        close_document(handle);
+    }
+
     /// Why shapes are not `/Square` and `/Circle` annotations.
     ///
     /// A rectangle SHOULD be a `/Square`: it would resize by changing four

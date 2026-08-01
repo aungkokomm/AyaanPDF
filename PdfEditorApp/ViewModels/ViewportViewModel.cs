@@ -3026,6 +3026,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private bool CanResize(LoadedSelection sel)
     {
+        // Our shapes are stored as ink annotations underneath (create_ink_annotation
+        // in the core) but they CAN be resized and rotated through their tag, so
+        // the plain "ink is unresizable" rule does not apply to them. This was
+        // why a selected shape got no grips at all - not the eight resize handles
+        // AND not the rotate handle - even though the rotation stack is wired.
+        if (_selectedIsShape) { return true; }
+
         foreach (var a in LoadedFor(sel.PageIndex))
         {
             if (a.Index == sel.Index)
