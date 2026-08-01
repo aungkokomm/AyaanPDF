@@ -2407,6 +2407,9 @@ public sealed partial class MainPage : Page
                 => InputSystemCursorShape.SizeNorthSouth,
             LoadedAnnotationPicker.Grip.Left or LoadedAnnotationPicker.Grip.Right
                 => InputSystemCursorShape.SizeWestEast,
+            // No dedicated rotate cursor in the platform set; the hand reads as
+            // "grab this to turn it".
+            LoadedAnnotationPicker.Grip.Rotate => InputSystemCursorShape.Hand,
             _ => ViewModel.IsOverSelection(content.Page, nx, ny)
                 ? InputSystemCursorShape.SizeAll
                 : null,

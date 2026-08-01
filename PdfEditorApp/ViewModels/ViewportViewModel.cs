@@ -2380,6 +2380,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return (cx + dx * cos + dy * sin, cy - dx * sin + dy * cos);
     }
 
+    /// <summary>Whether Shift is held right now, for snapping the rotate drag.</summary>
+    private static bool IsShiftDown()
+    {
+        var state = Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift);
+        return (state & Windows.UI.Core.CoreVirtualKeyStates.Down) == Windows.UI.Core.CoreVirtualKeyStates.Down;
+    }
+
     /// <summary>
     /// Drags the marquee only. The document is not touched until the gesture
     /// ends: committing on every pointer sample would mean a PDFium write and
@@ -2402,6 +2410,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             double cx = (start.Left + start.Right) / 2, cy = (start.Top + start.Bottom) / 2;
             double ang = Math.Atan2(normY - cy, normX - cx) * 180.0 / Math.PI + 90.0;
+
+            // Hold Shift to snap to 15-degree steps.
+            if (IsShiftDown())
+            {
+                ang = Math.Round(ang / 15.0) * 15.0;
+            }
+            if (ang < 0) { ang += 360; }
+            if (ang >= 360) { ang -= 360; }
+
             _selectedRotationDeg = ang;
             _selectedLoaded = start;
             RefreshSelectionOutline();
@@ -2588,7 +2605,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         IsDirty = true;
         InvalidateLoadedPage(start.PageIndex);
-        _selectedLoaded = start with { Index = newIndex };
+
+        // Take the box's OWN rect and angle from the tag the core just wrote, so
+        // the frame is drawn around EXACTLY what was rendered rather than the
+        // pre-commit guess. This is what keeps the frame and the text aligned.
+        if (TextBoxTagReader.TryParse(ReadAnnotationContents(start.PageIndex, newIndex), out var tag)
+            && tag.HasBoxRect)
+        {
+            _selectedRotationDeg = tag.RotationDeg;
+            _selectedLoaded = new LoadedSelection(
+                start.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom);
+        }
+        else
+        {
+            _selectedLoaded = start with { Index = newIndex };
+        }
+
         RefreshSelectionOutline();
     }
 
@@ -2780,11 +2812,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             points.Add((r, my));
         }
 
-        // The rotate handle floats above the top edge; the whole frame is turned
-        // about the centre, so it drawn upright here follows the box round.
+        // The rotate handle floats above the top edge on a thin stem; the whole
+        // frame is turned about the centre, so laid out upright here it follows
+        // the box round. The stem is added first so the handle draws on top of it.
         if (rotate)
         {
-            points.Add((mx, t - LoadedAnnotationPicker.RotateHandleGap * SlotLayoutWidth));
+            double gapPx = LoadedAnnotationPicker.RotateHandleGap * SlotLayoutWidth;
+            slot.SelectionGrips.Add(new ScaledRect(mx - 1, t - gapPx, 2, gapPx, string.Empty));
+            points.Add((mx, t - gapPx));
         }
 
         foreach (var (cx, cy) in points)
