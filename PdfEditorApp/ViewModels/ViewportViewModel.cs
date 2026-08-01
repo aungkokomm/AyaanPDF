@@ -3510,28 +3510,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 {
                     FontFamilies.Add(f);
                 }
-
-                // Bring the fonts the user has already picked this session (before
-                // the full list finished loading) back to the top, in order.
-                for (int i = _recentFontNames.Count - 1; i >= 0; i--)
-                {
-                    string name = _recentFontNames[i];
-                    int at = -1;
-                    for (int j = 0; j < FontFamilies.Count; j++)
-                    {
-                        if (string.Equals(FontFamilies[j].Name, name, StringComparison.OrdinalIgnoreCase))
-                        {
-                            at = j;
-                            break;
-                        }
-                    }
-                    if (at > 0)
-                    {
-                        var family = FontFamilies[at];
-                        FontFamilies.RemoveAt(at);
-                        FontFamilies.Insert(0, family);
-                    }
-                }
                 _fontsLoading = false;
             });
         });
@@ -3545,40 +3523,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         ResolveFontFile();
         if (family is not null)
         {
-            PromoteRecentFont(family);
+            _recentFontNames.RemoveAll(n => string.Equals(n, family.Name, StringComparison.OrdinalIgnoreCase));
+            _recentFontNames.Insert(0, family.Name);
+            if (_recentFontNames.Count > RecentFontLimit)
+            {
+                _recentFontNames.RemoveRange(RecentFontLimit, _recentFontNames.Count - RecentFontLimit);
+            }
         }
     }
 
     /// <summary>How many recently-used fonts float above the rest of the picker.</summary>
     private const int RecentFontLimit = 6;
 
-    /// <summary>The names of the recently used fonts in most-recent-first order.
-    /// They also occupy the first slots of <see cref="FontFamilies"/>, so the
-    /// picker shows them at the top without needing a second collection.</summary>
+    /// <summary>The names of the recently used fonts, most-recent-first. Kept for
+    /// a future reordering pass; the picker's own ItemsSource is NOT edited from
+    /// inside its SelectionChanged handler, which crashed the app: modifying a
+    /// ComboBox's items while it is dispatching a selection tears its state.</summary>
     private readonly List<string> _recentFontNames = new();
-
-    /// <summary>Moves a family to the top of the picker so recent picks stay in
-    /// reach. Kept to a small cap so the "everything else" section still shows.</summary>
-    private void PromoteRecentFont(FontFamily family)
-    {
-        _recentFontNames.RemoveAll(n => string.Equals(n, family.Name, StringComparison.OrdinalIgnoreCase));
-        _recentFontNames.Insert(0, family.Name);
-        if (_recentFontNames.Count > RecentFontLimit)
-        {
-            _recentFontNames.RemoveRange(RecentFontLimit, _recentFontNames.Count - RecentFontLimit);
-        }
-
-        int existing = FontFamilies.IndexOf(family);
-        if (existing < 0)
-        {
-            return;
-        }
-        if (existing != 0)
-        {
-            FontFamilies.RemoveAt(existing);
-            FontFamilies.Insert(0, family);
-        }
-    }
 
     partial void OnTextBoldChanged(bool value) => ResolveFontFile();
 
