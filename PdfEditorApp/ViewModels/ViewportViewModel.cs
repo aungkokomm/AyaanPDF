@@ -2918,18 +2918,46 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedLoaded = now with { Index = newIndex };
         }
 
-        // Move-all commit: write each extra's NEW position to the document. The
-        // anchor's re-add above shifts indices on its page (rebuilt annotation
-        // moves to the end), so read the CURRENT extras (already at their new
-        // in-memory positions) and match them back by their old index against
-        // the fresh cache. Only body drags (grip None) trigger this; a resize
-        // or rotate is anchor-only.
+        // Move-all commit: write each extra's NEW position. Two corrections
+        // stack on top of v1.77 to make the second and later group moves land
+        // consistently (v1.77 was intermittent, "moves now and next it does
+        // not"). Both come from the same root cause: a delete+re-add shifts
+        // indices on the same page.
+        //
+        // (1) The anchor's write above already ran. If any extra on the same
+        //     page had an original index HIGHER than the anchor's original
+        //     index, PDFium's compaction has slid it down by one. Adjust the
+        //     cached extra index before using it.
+        // (2) Then process the extras in DESCENDING original-index order per
+        //     page so each of their delete+re-adds does not disturb the ones
+        //     yet to come.
         if (!resizing && !rotating && _extraDragOrigin.Count > 0)
         {
-            var pagesTouched = new HashSet<int> { now.PageIndex };
+            int anchorOldIndex = now.Index;
+            int anchorPage = now.PageIndex;
+
+            // Adjust extras for the anchor's shift, then sort the (index-in-list,
+            // adjusted-annotation-index) pairs by descending annotation index so
+            // deletes never orphan a later write.
+            var order = new List<(int Slot, LoadedSelection Adjusted)>(_extraSelected.Count);
             for (int i = 0; i < _extraSelected.Count && i < _extraDragOrigin.Count; i++)
             {
-                var target = _extraSelected[i];
+                var e = _extraSelected[i];
+                if (e.PageIndex == anchorPage && e.Index > anchorOldIndex)
+                {
+                    e = e with { Index = e.Index - 1 };
+                }
+                order.Add((i, e));
+            }
+            order.Sort((a, b) =>
+            {
+                int p = b.Adjusted.PageIndex.CompareTo(a.Adjusted.PageIndex);
+                return p != 0 ? p : b.Adjusted.Index.CompareTo(a.Adjusted.Index);
+            });
+
+            var pagesTouched = new HashSet<int> { anchorPage };
+            foreach (var (slot, target) in order)
+            {
                 float exl = (float)(target.Left * CaptureWidth);
                 float ext = (float)(target.Top * CaptureWidth);
                 float exr = (float)(target.Right * CaptureWidth);
@@ -2968,7 +2996,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
                 if (extStatus == RenderStatus.OkPdfium)
                 {
-                    _extraSelected[i] = target with { Index = extNewIndex };
+                    _extraSelected[slot] = target with { Index = extNewIndex };
                     pagesTouched.Add(target.PageIndex);
                 }
                 Diag.Log($"move extra p{target.PageIndex}#{target.Index} -> {extStatus}, now #{extNewIndex}");
@@ -3101,31 +3129,60 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>Writes new bounds for the anchor and each extra to the document
     /// through the same routing the drag-move uses (text-box relayout, shape
-    /// restyle-move, or generic bounds set), then refreshes the overlay.</summary>
+    /// restyle-move, or generic bounds set), then refreshes the overlay.
+    ///
+    /// The writes go in DESCENDING index order per page. Each write does a
+    /// delete + re-add which moves that annotation to the END of the page's
+    /// list, and every annotation with a higher original index shifts down by
+    /// one. Writing higher indices first means every not-yet-processed index is
+    /// unaffected. Ascending order was the reason a second Align (or any second
+    /// multi-write) landed on the wrong annotations - what looked like an
+    /// intermittent bug ("aligns now and next it don't") was actually indices
+    /// pointing at slid-down neighbours.</summary>
     private void CommitAlignedOrDistributed(LoadedSelection oldAnchor,
         LoadedSelection newAnchor, List<LoadedSelection> newExtras)
     {
         const int CaptureWidth = 1000;
         var pagesTouched = new HashSet<int>();
 
-        // Anchor.
-        int anchorNewIndex = WriteMovedAnnotation(oldAnchor, newAnchor, CaptureWidth);
-        if (anchorNewIndex >= 0)
-        {
-            pagesTouched.Add(newAnchor.PageIndex);
-            _selectedLoaded = newAnchor with { Index = anchorNewIndex };
-        }
-
-        // Extras.
+        // Build a joint list of (oldSel, target, slot). The slot is where the
+        // NEW index gets written back after the FFI call: 0 for the anchor and
+        // i+1 for extra[i]. Sorting by descending page index THEN descending
+        // annotation index means the deletes never affect a later write.
+        int n = 1 + _extraSelected.Count;
+        var jobs = new List<(LoadedSelection Old, LoadedSelection Target, int Slot)>(n);
+        jobs.Add((oldAnchor, newAnchor, 0));
         for (int i = 0; i < _extraSelected.Count && i < newExtras.Count; i++)
         {
-            var oldExtra = _extraSelected[i];
-            var target = newExtras[i];
-            int newIdx = WriteMovedAnnotation(oldExtra, target, CaptureWidth);
+            jobs.Add((_extraSelected[i], newExtras[i], i + 1));
+        }
+        jobs.Sort((a, b) =>
+        {
+            int p = b.Old.PageIndex.CompareTo(a.Old.PageIndex);
+            return p != 0 ? p : b.Old.Index.CompareTo(a.Old.Index);
+        });
+
+        var newIndicesBySlot = new Dictionary<int, int>(n);
+        foreach (var (oldSel, target, slot) in jobs)
+        {
+            int newIdx = WriteMovedAnnotation(oldSel, target, CaptureWidth);
             if (newIdx >= 0)
             {
-                _extraSelected[i] = target with { Index = newIdx };
+                newIndicesBySlot[slot] = newIdx;
                 pagesTouched.Add(target.PageIndex);
+            }
+        }
+
+        // Write results back into the anchor and extras in ORIGINAL slot order.
+        if (newIndicesBySlot.TryGetValue(0, out int anchorIdx))
+        {
+            _selectedLoaded = newAnchor with { Index = anchorIdx };
+        }
+        for (int i = 0; i < _extraSelected.Count && i < newExtras.Count; i++)
+        {
+            if (newIndicesBySlot.TryGetValue(i + 1, out int idx))
+            {
+                _extraSelected[i] = newExtras[i] with { Index = idx };
             }
         }
 

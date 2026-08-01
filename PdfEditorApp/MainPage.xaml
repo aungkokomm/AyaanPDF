@@ -1168,17 +1168,34 @@
                     </Button>
                     <Rectangle Width="1" Height="14" VerticalAlignment="Center"
                                Margin="2,0" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <!-- Vertical alignment icons: the same three Fluent align glyphs used above
+                         for horizontal, ROTATED 90 degrees. Same visual language, different axis. -->
                     <Button Width="28" Height="28" Padding="0" Tag="Top" Click="AlignObjects_Click"
                             ToolTipService.ToolTip="Align top edges">
-                        <TextBlock Text="T" FontSize="12" HorizontalAlignment="Center" />
+                        <FontIcon Glyph="&#xE8E4;" FontSize="14"
+                                  RenderTransformOrigin="0.5,0.5">
+                            <FontIcon.RenderTransform>
+                                <RotateTransform Angle="90" />
+                            </FontIcon.RenderTransform>
+                        </FontIcon>
                     </Button>
                     <Button Width="28" Height="28" Padding="0" Tag="MiddleV" Click="AlignObjects_Click"
                             ToolTipService.ToolTip="Align vertical centres">
-                        <TextBlock Text="M" FontSize="12" HorizontalAlignment="Center" />
+                        <FontIcon Glyph="&#xE8E3;" FontSize="14"
+                                  RenderTransformOrigin="0.5,0.5">
+                            <FontIcon.RenderTransform>
+                                <RotateTransform Angle="90" />
+                            </FontIcon.RenderTransform>
+                        </FontIcon>
                     </Button>
                     <Button Width="28" Height="28" Padding="0" Tag="Bottom" Click="AlignObjects_Click"
                             ToolTipService.ToolTip="Align bottom edges">
-                        <TextBlock Text="B" FontSize="12" HorizontalAlignment="Center" />
+                        <FontIcon Glyph="&#xE8E2;" FontSize="14"
+                                  RenderTransformOrigin="0.5,0.5">
+                            <FontIcon.RenderTransform>
+                                <RotateTransform Angle="90" />
+                            </FontIcon.RenderTransform>
+                        </FontIcon>
                     </Button>
                     <Rectangle Width="1" Height="14" VerticalAlignment="Center"
                                Margin="2,0" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
