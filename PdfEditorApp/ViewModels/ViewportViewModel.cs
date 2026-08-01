@@ -3511,14 +3511,44 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void EndShape()
     {
-        if (_shapeDraft is { } d && ShapeGeometry.IsWorthDrawing(d))
+        if (_shapeDraft is { } d && ShapeGeometry.IsWorthDrawing(d) && _documentHandle != 0)
         {
-            PushHistory(HistoryScope.Annotations, d.Kind.ToString());
-            var shape = new ShapeAnnotation(_shapePageIndex, d, InkColorHex, InkWidth);
-            _allShapes.Add(shape);
-            Shapes.Add(shape);
-            SlotFor(shape.PageIndex)?.Shapes.Add(shape);
-            IsDirty = true;
+            // Write the shape STRAIGHT into the document as a real annotation, the
+            // way text boxes are. Before this, shapes lived in an overlay list and
+            // only became real annotations on save, which meant the selection code
+            // that draws rotate/resize handles (keyed off _selectedLoaded and the
+            // shape's tag) never saw them, so a freshly-drawn shape had a marquee
+            // and no handles. Immediate write unifies the two lives of a shape.
+            const int CaptureWidth = 1000;
+            var (r, g, b, a) = ParseHex(InkColorHex, defaultAlpha: 0xFF);
+            var spec = new Interop.NativeShapeSpec
+            {
+                PageIndex = _shapePageIndex,
+                Kind = (int)d.Kind,
+                X1 = (float)(d.X1 * CaptureWidth),
+                Y1 = (float)(d.Y1 * CaptureWidth),
+                X2 = (float)(d.X2 * CaptureWidth),
+                Y2 = (float)(d.Y2 * CaptureWidth),
+                R = r, G = g, B = b, A = a,
+                WidthPx = (float)(InkWidth * CaptureWidth),
+                RotationDeg = 0f,
+            };
+
+            PushHistory(HistoryScope.Document, "Draw shape");
+            int status = RenderCoreNative.add_shape_annotations(
+                _documentHandle, CaptureWidth, new[] { spec }, 1);
+
+            if (status == RenderStatus.OkPdfium)
+            {
+                IsDirty = true;
+                InvalidateLoadedPage(_shapePageIndex);
+                SelectNewestAnnotation(_shapePageIndex);
+            }
+            else
+            {
+                Diag.Log($"EndShape add_shape_annotations -> {status}");
+                Status = "Could not add that shape.";
+            }
         }
 
         _shapeDraft = null;
