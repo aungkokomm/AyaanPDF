@@ -2375,6 +2375,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // Pull the shape's rotation out of its tag. The rest of the shape
             // style stays on the tool and applies through ApplyStyleToSelectedShape.
             _selectedRotationDeg = ParseShapeRotation(contents!);
+
+            // Also mirror the shape's OWN colour into the tool's InkColorHex, so
+            // the opacity slider, colour swatch and the "current colour" indicator
+            // all reflect what THIS shape actually is - not the last colour the
+            // user picked. A subsequent slider drag then re-styles the shape at
+            // the right starting point.
+            string? shapeColor = ParseShapeColor(contents!);
+            if (shapeColor is not null)
+            {
+                InkColorHex = shapeColor;
+            }
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
@@ -2770,6 +2781,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         RefreshSelectionOutline();
+    }
+
+    /// <summary>The shape's colour from its tag, as "#AARRGGBB" including the
+    /// alpha, or null if the tag is malformed. Used to mirror the shape's actual
+    /// colour and opacity into the tool state on selection so the pickers and
+    /// the opacity slider reflect this shape, not the tool's leftover state.</summary>
+    private static string? ParseShapeColor(string contents)
+    {
+        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
+            ? contents.Substring("AyaanShape:".Length)
+            : null;
+        if (rest is null) { return null; }
+        string[] parts = rest.Split(':');
+        if (parts.Length < 2) { return null; }
+        string rgba = parts[1]; // RRGGBBAA
+        if (rgba.Length != 8) { return null; }
+        foreach (char ch in rgba)
+        {
+            if (!Uri.IsHexDigit(ch)) { return null; }
+        }
+        // Tag stores RRGGBBAA; the app uses "#AARRGGBB".
+        return $"#{rgba.Substring(6, 2)}{rgba.Substring(0, 6)}";
     }
 
     /// <summary>The shape tag has fields separated by ':'; the rotation, if

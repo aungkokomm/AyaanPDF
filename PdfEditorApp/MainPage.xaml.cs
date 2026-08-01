@@ -1342,6 +1342,14 @@ public sealed partial class MainPage : Page
             ViewModel.InkColorHex = updated;
         }
 
+        // Universal: if an object is selected, the opacity change writes through
+        // to it, not just to the tool's state for the next mark. The alpha lives
+        // in the object's colour, so setting the tool colour with a new alpha and
+        // re-styling is enough. Both apply methods no-op when nothing of their
+        // kind is selected, so calling both is safe.
+        ViewModel.ApplyStyleToSelectedShape(changeColor: true, changeWidth: false);
+        ViewModel.ApplyStyleToSelectedTextBox();
+
         ShowOpacity();
     }
 
@@ -1352,7 +1360,10 @@ public sealed partial class MainPage : Page
     /// </summary>
     private bool _suppressOpacityChange = true;
 
-    /// <summary>Brings the slider and its readout into line with the armed tool's colour.</summary>
+    /// <summary>Brings the slider and its readout into line with either the
+    /// selected object's colour (if there is one - text box or shape) or, when
+    /// nothing is selected, the armed tool's colour. Selection wins so opening
+    /// the slider on a 40 percent rectangle shows 40, not the tool's default.</summary>
     private void ShowOpacity()
     {
         string hex = ViewModel.ActiveTool == ToolMode.Highlight
@@ -1661,9 +1672,10 @@ public sealed partial class MainPage : Page
         ColorSection.Visibility = Show(color);
         WidthSection.Visibility = Show(tool.Offers(ToolOptions.Width) || ViewModel.HasSelectedShape);
 
-        // Opacity rides on the colour, so it is only meaningful where there is
-        // a colour to apply it to.
-        OpacitySection.Visibility = Show(color);
+        // Opacity is UNIVERSAL: it applies to the primary colour of whichever
+        // object is selected (text of a text box, stroke of a shape, or the
+        // tool's next mark). Shown for any of those.
+        OpacitySection.Visibility = Show(color || ViewModel.HasSelectedTextBox);
 
         bool stamps = tool.Offers(ToolOptions.Stamp);
         StampSection.Visibility = Show(stamps);
