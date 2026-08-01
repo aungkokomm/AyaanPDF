@@ -2708,6 +2708,20 @@ public sealed partial class MainPage : Page
                 // annotations objects rather than paint.
                 if (ViewModel.SelectAnnotationAt(content.Page, nx, ny))
                 {
+                    // Ctrl-drag clones the picked mark IN PLACE; the drag that
+                    // follows moves the clone, so the original stays put. Every
+                    // editor uses this convention (Word, Illustrator, PowerPoint).
+                    // The clone becomes the new anchor via DuplicateSelectedForDrag,
+                    // so the rest of the drag path applies unchanged.
+                    var ctrlState = Microsoft.UI.Input.InputKeyboardSource
+                        .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Control);
+                    bool ctrl = (ctrlState & Windows.UI.Core.CoreVirtualKeyStates.Down)
+                                == Windows.UI.Core.CoreVirtualKeyStates.Down;
+                    if (ctrl)
+                    {
+                        ViewModel.DuplicateSelectedForDrag();
+                    }
+
                     _isMovingAnnotation = true;
                     _dragPointerId = current.PointerId;
                     ViewportHost.CapturePointer(e.Pointer);

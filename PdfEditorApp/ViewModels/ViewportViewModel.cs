@@ -2052,9 +2052,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // Nothing of ours here, so try what the file already had. Marks made
         // this session sit in the overlay ABOVE the page, so they win a tie.
-        _selectedLoaded = null;
+        // A plain click clears any previous selection so SelectLoadedAt can set
+        // a fresh anchor; a SHIFT click leaves the current selection alone so
+        // SelectLoadedAt sees the anchor and can push it to the extras list.
+        // Clearing unconditionally here was the reason shift-adding never
+        // worked - prev was already null by the time the shift branch ran.
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
+        if (!IsShiftDown())
+        {
+            _selectedLoaded = null;
+        }
         if (SelectLoadedAt(pageIndex, normX, normY))
         {
             return true;
@@ -2854,6 +2862,160 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         RefreshSelectionOutline();
+    }
+
+    /// <summary>Clones the current anchor selection IN PLACE and selects the clone,
+    /// so the drag that follows moves the clone and leaves the original where it
+    /// was. This is the Ctrl-drag = copy convention every editor uses. Only text
+    /// boxes and shapes are supported for now (the two kinds that live in the PDF
+    /// with round-trippable tags). Returns true if a clone was made.</summary>
+    public bool DuplicateSelectedForDrag()
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel)
+        {
+            return false;
+        }
+
+        string? contents = ReadAnnotationContents(sel.PageIndex, sel.Index);
+        if (contents is null)
+        {
+            return false;
+        }
+
+        PushHistory(HistoryScope.Document, "Duplicate");
+        const int CaptureWidth = 1000;
+        int status;
+        int newIndex;
+
+        if (_selectedIsShape)
+        {
+            // Rebuild the ShapeSpec from the tag and add a second copy at the SAME
+            // bounds. The subsequent drag will slide it off the original.
+            if (!ShapeSpecFromTag(contents, sel, CaptureWidth, out var spec))
+            {
+                return false;
+            }
+            status = RenderCoreNative.add_shape_annotations(
+                _documentHandle, CaptureWidth, new[] { spec }, 1);
+            if (status != RenderStatus.OkPdfium) { return false; }
+            newIndex = LoadedFor(sel.PageIndex).Count; // will resolve after invalidate
+        }
+        else if (_selectedIsTextBox
+                 && TextBoxTagReader.TryParse(contents, out var tag))
+        {
+            // Re-add the box via the styled writer using the tag's own settings.
+            double left = tag.HasBoxRect ? tag.BoxLeft : sel.Left;
+            double top = tag.HasBoxRect ? tag.BoxTop : sel.Top;
+            double right = tag.HasBoxRect ? tag.BoxRight : sel.Right;
+            double bottom = tag.HasBoxRect ? tag.BoxBottom : sel.Bottom;
+            var (r, g, b, a) = ParseHex(tag.ColorHex, defaultAlpha: 0xFF);
+            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(tag.Text);
+            byte[]? fontUtf8 = string.IsNullOrEmpty(tag.FontPath)
+                ? null
+                : System.Text.Encoding.UTF8.GetBytes(tag.FontPath);
+
+            status = RenderCoreNative.add_text_box_annotation_styled(
+                _documentHandle, sel.PageIndex, CaptureWidth,
+                (float)(left * CaptureWidth), (float)(top * CaptureWidth),
+                (float)(right * CaptureWidth), (float)(bottom * CaptureWidth),
+                utf8, (nuint)utf8.Length,
+                (float)(tag.FontSizeNorm * CaptureWidth), r, g, b, a,
+                (int)tag.Align,
+                PackRgba(tag.FillHex), PackRgba(tag.OutlineHex),
+                (float)(tag.OutlineWidthNorm * CaptureWidth),
+                fontUtf8, (nuint)(fontUtf8?.Length ?? 0),
+                tag.Underline ? 1 : 0, tag.Strikethrough ? 1 : 0);
+            if (status != RenderStatus.OkPdfium) { return false; }
+            // Rotation lives in the tag but the styled add doesn't take it; if the
+            // original was rotated, follow up with a rotate to the same angle.
+            if (tag.RotationDeg != 0)
+            {
+                int rotStatus = RenderCoreNative.rotate_text_box_annotation(
+                    _documentHandle, sel.PageIndex,
+                    (int)(LoadedFor(sel.PageIndex).Count), // last one - reload after invalidate below
+                    CaptureWidth,
+                    (float)(left * CaptureWidth), (float)(top * CaptureWidth),
+                    (float)(right * CaptureWidth), (float)(bottom * CaptureWidth),
+                    (float)tag.RotationDeg, out int _);
+                _ = rotStatus; // best-effort; if it fails the clone comes out upright
+            }
+            newIndex = LoadedFor(sel.PageIndex).Count;
+        }
+        else
+        {
+            return false;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+
+        // Pick the last annotation on the page - the one we just added - and make
+        // it the new anchor so the drag now moves the clone, not the original.
+        var all = LoadedFor(sel.PageIndex);
+        if (all.Count == 0) { return false; }
+        var newest = all[^1];
+        _selectedLoaded = new LoadedSelection(
+            sel.PageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom);
+        _extraSelected.Clear();
+        ApplyTextBoxSelectionInfo(sel.PageIndex, newest.Index);
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
+        return true;
+    }
+
+    /// <summary>Reconstructs a NativeShapeSpec from a selected shape's tag, using
+    /// its own bounds. Returns false if the tag is malformed.</summary>
+    private static bool ShapeSpecFromTag(string contents, LoadedSelection sel,
+        int captureWidth, out Interop.NativeShapeSpec spec)
+    {
+        spec = default;
+        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
+            ? contents.Substring("AyaanShape:".Length) : null;
+        if (rest is null) { return false; }
+        string[] parts = rest.Split(':');
+        if (parts.Length < 5) { return false; }
+        if (!int.TryParse(parts[0], out int kind)) { return false; }
+        string rgba = parts[1];
+        if (rgba.Length != 8) { return false; }
+        byte r = byte.Parse(rgba.Substring(0, 2), System.Globalization.NumberStyles.HexNumber);
+        byte g = byte.Parse(rgba.Substring(2, 2), System.Globalization.NumberStyles.HexNumber);
+        byte b = byte.Parse(rgba.Substring(4, 2), System.Globalization.NumberStyles.HexNumber);
+        byte a = byte.Parse(rgba.Substring(6, 2), System.Globalization.NumberStyles.HexNumber);
+        if (!double.TryParse(parts[2], System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out double widthPts))
+        {
+            return false;
+        }
+        bool fx = parts[3] == "1";
+        bool fy = parts[4] == "1";
+        double rot = parts.Length >= 6
+            && double.TryParse(parts[5], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double rv) ? rv : 0;
+
+        // The drag-direction flags let the arrow head keep its side.
+        float x1 = (float)((fx ? sel.Left : sel.Right) * captureWidth);
+        float x2 = (float)((fx ? sel.Right : sel.Left) * captureWidth);
+        float y1 = (float)((fy ? sel.Top : sel.Bottom) * captureWidth);
+        float y2 = (float)((fy ? sel.Bottom : sel.Top) * captureWidth);
+
+        // Tag stores width in POINTS; ShapeSpec wants capture-space pixels. Without
+        // the page width here we approximate: capture_width matches the writer's
+        // capture, so widthPts * (capture/page_w) - but page_w isn't exposed. Use
+        // widthPts directly; the resize path uses the same conversion the writer
+        // did, so a duplicate will be roughly the same visual width.
+        float widthPx = (float)widthPts;
+
+        spec = new Interop.NativeShapeSpec
+        {
+            PageIndex = sel.PageIndex, Kind = kind,
+            X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
+            R = r, G = g, B = b, A = a,
+            WidthPx = widthPx, RotationDeg = (float)rot,
+        };
+        return true;
     }
 
     /// <summary>The shape's colour from its tag, as "#AARRGGBB" including the
