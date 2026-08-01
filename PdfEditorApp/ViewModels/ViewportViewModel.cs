@@ -2016,9 +2016,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // naturally click slightly inward on.
         if (_selectedLoaded is LoadedSelection current && current.PageIndex == pageIndex)
         {
-            var box = new AnnotationBox(
-                current.Index, current.Left, current.Top, current.Right, current.Bottom);
-            var grip = LoadedAnnotationPicker.GripAt(box, normX, normY, edges: _selectedIsTextBox);
+            // Turns the pointer into the box's own frame and also finds the rotate
+            // handle above it, so grabbing a handle of an already-selected (possibly
+            // rotated) box works.
+            var grip = GripForPoint(current, normX, normY);
 
             if (grip != LoadedAnnotationPicker.Grip.None && CanResize(current))
             {
@@ -2185,6 +2186,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             slot.SelectionOutline.Clear();
             slot.SelectionGrips.Clear();
+            slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
         }
 
         if (_selectedLoaded is LoadedSelection sel)
@@ -2197,15 +2199,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 (sel.Bottom - sel.Top) * SlotLayoutWidth,
                 string.Empty));
 
+            // The frame and handles are laid out UPRIGHT (from the tight box) and
+            // then turned as one about the box centre, so a rotated text box is
+            // framed at its real angle.
+            if (slot is not null)
+            {
+                slot.SelectionRotation = _selectedIsTextBox ? _selectedRotationDeg : 0;
+                slot.SelectionCenterX = (sel.Left + sel.Right) / 2 * SlotLayoutWidth;
+                slot.SelectionCenterY = (sel.Top + sel.Bottom) / 2 * SlotLayoutWidth;
+            }
+
             // Grips only for what can actually be resized. Offering them on a
             // drawing, which PDFium refuses to scale, would be an invitation
             // to an error message.
             if (slot is not null && CanResize(sel))
             {
                 // Edge (one-axis) handles only for a free resize; an aspect-locked
-                // picture keeps just its four corners, since stretching one edge
-                // would break the aspect the corners protect.
-                AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0);
+                // picture keeps just its four corners. A text box also gets the
+                // rotate handle above its top edge.
+                AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0, rotate: _selectedIsTextBox);
             }
 
             InkStrokeChanged?.Invoke();
@@ -2263,6 +2275,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private bool _selectedIsTextBox;
 
+    /// <summary>The selected text box's clockwise rotation in degrees; 0 otherwise.
+    /// Read once on selection, updated live while the rotate handle is dragged. The
+    /// value the overlay draws with lives on the page slot (per page).</summary>
+    private double _selectedRotationDeg;
+
     /// <summary>Per-page cache of what the file already carries.</summary>
     private readonly Dictionary<int, List<Interop.ExistingAnnotation>> _loadedByPage = new();
 
@@ -2298,21 +2315,70 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _selectedLoaded = new LoadedSelection(
             pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
-        _selectedIsTextBox = IsLoadedTextBox(pageIndex, hit.Index);
-        _loadedDrag = (normX, normY, _selectedLoaded.Value);
-        _loadedGrip = LoadedAnnotationPicker.GripAt(hit, normX, normY, edges: _selectedIsTextBox);
+        ApplyTextBoxSelectionInfo(pageIndex, hit.Index);
+        var sel = _selectedLoaded.Value;
+        _loadedDrag = (normX, normY, sel);
+        _loadedGrip = GripForPoint(sel, normX, normY);
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         return true;
     }
 
     /// <summary>
-    /// Whether the annotation at this index is one of our text boxes, decided by
-    /// reading its tag once. Kept off the drag path (see
-    /// <see cref="_selectedIsTextBox"/>).
+    /// Reads the just-selected annotation's tag ONCE (kept off the per-sample drag
+    /// path): whether it is one of our text boxes, its rotation, and its own TIGHT
+    /// upright rect, which replaces the enlarged bounds a rotated box reports so the
+    /// frame is drawn around the real box.
     /// </summary>
-    private bool IsLoadedTextBox(int pageIndex, int index) =>
-        TextBoxTagReader.TryParse(ReadAnnotationContents(pageIndex, index), out _);
+    private void ApplyTextBoxSelectionInfo(int pageIndex, int index)
+    {
+        _selectedRotationDeg = 0;
+        if (!TextBoxTagReader.TryParse(ReadAnnotationContents(pageIndex, index), out var tag))
+        {
+            _selectedIsTextBox = false;
+            return;
+        }
+
+        _selectedIsTextBox = true;
+        _selectedRotationDeg = tag.RotationDeg;
+        if (tag.HasBoxRect && _selectedLoaded is LoadedSelection s)
+        {
+            _selectedLoaded = s with
+            {
+                Left = tag.BoxLeft, Top = tag.BoxTop, Right = tag.BoxRight, Bottom = tag.BoxBottom,
+            };
+        }
+    }
+
+    /// <summary>The handle under a point, accounting for the box's rotation: the
+    /// pointer is turned back into the box's own upright frame first, then the
+    /// rotate handle (above the top edge) and the resize handles are tested.</summary>
+    private LoadedAnnotationPicker.Grip GripForPoint(LoadedSelection sel, double nx, double ny)
+    {
+        var box = new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom);
+        var (lx, ly) = InverseRotate(nx, ny, box, _selectedRotationDeg);
+        if (_selectedIsTextBox && LoadedAnnotationPicker.IsRotateHandle(box, lx, ly))
+        {
+            return LoadedAnnotationPicker.Grip.Rotate;
+        }
+        return LoadedAnnotationPicker.GripAt(box, lx, ly, edges: _selectedIsTextBox);
+    }
+
+    /// <summary>Turns a screen-space point back into a box's own upright frame,
+    /// the inverse of the WinUI RotateTransform (clockwise-positive) the overlay
+    /// applies to the frame.</summary>
+    private static (double X, double Y) InverseRotate(double x, double y, AnnotationBox box, double deg)
+    {
+        if (deg == 0)
+        {
+            return (x, y);
+        }
+        double cx = (box.Left + box.Right) / 2, cy = (box.Top + box.Bottom) / 2;
+        double rad = deg * Math.PI / 180.0;
+        double cos = Math.Cos(rad), sin = Math.Sin(rad);
+        double dx = x - cx, dy = y - cy;
+        return (cx + dx * cos + dy * sin, cy - dx * sin + dy * cos);
+    }
 
     /// <summary>
     /// Drags the marquee only. The document is not touched until the gesture
@@ -2329,12 +2395,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         var box = new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom);
 
-        // A grip resizes, anything else moves. Both are computed from where
-        // the drag STARTED, so neither can creep across a long gesture.
-        var moved = _loadedGrip == LoadedAnnotationPicker.Grip.None
-            ? LoadedAnnotationPicker.Dragged(box, ox, oy, normX, normY)
-            : LoadedAnnotationPicker.Resized(box, _loadedGrip, normX, normY,
-                                             AspectToPreserve(start));
+        // The rotate handle turns the box: the angle is the direction from the
+        // centre to the pointer, measured from straight up (the handle's home), so
+        // dragging it round spins the frame. Bounds do not change.
+        if (_loadedGrip == LoadedAnnotationPicker.Grip.Rotate)
+        {
+            double cx = (start.Left + start.Right) / 2, cy = (start.Top + start.Bottom) / 2;
+            double ang = Math.Atan2(normY - cy, normX - cx) * 180.0 / Math.PI + 90.0;
+            _selectedRotationDeg = ang;
+            _selectedLoaded = start;
+            RefreshSelectionOutline();
+            return;
+        }
+
+        // A grip resizes, anything else moves. Both are computed from where the
+        // drag STARTED, so neither can creep across a long gesture. A resize on a
+        // rotated box works in the box's own frame, so the pointer is turned back
+        // into it first; a move is a plain screen-space translation either way.
+        AnnotationBox moved;
+        if (_loadedGrip == LoadedAnnotationPicker.Grip.None)
+        {
+            moved = LoadedAnnotationPicker.Dragged(box, ox, oy, normX, normY);
+        }
+        else
+        {
+            var (lnx, lny) = InverseRotate(normX, normY, box, _selectedRotationDeg);
+            moved = LoadedAnnotationPicker.Resized(box, _loadedGrip, lnx, lny, AspectToPreserve(start));
+        }
 
         _selectedLoaded = start with
         {
@@ -2357,8 +2444,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // and cleared here rather than on each of the returns below. Leaving
         // it set would make the next plain drag resize from a corner nobody is
         // holding, and clearing it per exit path is how one gets missed.
-        bool resizing = _loadedGrip != LoadedAnnotationPicker.Grip.None;
+        bool rotating = _loadedGrip == LoadedAnnotationPicker.Grip.Rotate;
+        bool resizing = _loadedGrip != LoadedAnnotationPicker.Grip.None && !rotating;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
+
+        // A rotate changes only the angle, not the bounds, so it takes its own
+        // path BEFORE the "did the rectangle move" check that would otherwise call
+        // it a no-op and drop it.
+        if (rotating)
+        {
+            CommitRotation(start);
+            return;
+        }
 
         // Nothing actually changed, so do not dirty the document or reflow.
         if (!LoadedAnnotationPicker.IsRealMove(
@@ -2464,6 +2561,37 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
     }
 
+    /// <summary>Writes a finished ROTATE through to the document: the box is
+    /// re-laid-out at its own upright bounds, turned to the new angle. Bounds are
+    /// unchanged, so the marquee keeps them and its angle.</summary>
+    private void CommitRotation(LoadedSelection start)
+    {
+        const int CaptureWidth = 1000;
+        float l = (float)(start.Left * CaptureWidth);
+        float t = (float)(start.Top * CaptureWidth);
+        float r = (float)(start.Right * CaptureWidth);
+        float b = (float)(start.Bottom * CaptureWidth);
+
+        PushHistory(HistoryScope.Document, "Rotate text");
+
+        int status = RenderCoreNative.rotate_text_box_annotation(
+            _documentHandle, start.PageIndex, start.Index, CaptureWidth, l, t, r, b,
+            (float)_selectedRotationDeg, out int newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            _selectedLoaded = start;
+            RefreshSelectionOutline();
+            Status = "Could not rotate that text.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(start.PageIndex);
+        _selectedLoaded = start with { Index = newIndex };
+        RefreshSelectionOutline();
+    }
+
     /// <summary>
     /// Selects the annotation most recently added to a page.
     ///
@@ -2482,7 +2610,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var newest = all[^1];
         _selectedLoaded = new LoadedSelection(
             pageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom);
-        _selectedIsTextBox = IsLoadedTextBox(pageIndex, newest.Index);
+        ApplyTextBoxSelectionInfo(pageIndex, newest.Index);
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _selectedAnnotationId = null;
@@ -2569,9 +2697,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return LoadedAnnotationPicker.Grip.None;
         }
 
-        return LoadedAnnotationPicker.GripAt(
-            new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom),
-            normX, normY, edges: _selectedIsTextBox);
+        return GripForPoint(sel, normX, normY);
     }
 
     /// <summary>Whether a point is inside the current selection, so it can be dragged.</summary>
@@ -2634,7 +2760,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges)
+    private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges, bool rotate)
     {
         double l = sel.Left * SlotLayoutWidth;
         double t = sel.Top * SlotLayoutWidth;
@@ -2652,6 +2778,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             points.Add((mx, b));
             points.Add((l, my));
             points.Add((r, my));
+        }
+
+        // The rotate handle floats above the top edge; the whole frame is turned
+        // about the centre, so it drawn upright here follows the box round.
+        if (rotate)
+        {
+            points.Add((mx, t - LoadedAnnotationPicker.RotateHandleGap * SlotLayoutWidth));
         }
 
         foreach (var (cx, cy) in points)

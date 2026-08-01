@@ -614,6 +614,26 @@ internal static partial class RenderCoreNative
         float bottom,
         out int newIndex);
 
+    /// <summary>
+    /// Turns one of our text boxes to a new absolute angle (clockwise degrees on
+    /// screen) about its centre, re-laying-it-out at its own UPRIGHT bounds (the
+    /// rect stored in its tag, not the enlarged bounds a rotated box reports). The
+    /// rebuilt box moves to the END of the page's list, so <paramref name="newIndex"/>
+    /// reports where it landed. Unsupported for anything not one of our text boxes.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int rotate_text_box_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        float degrees,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int resize_annotation(
         ulong docHandle,

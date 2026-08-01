@@ -77,6 +77,19 @@ public partial class PageSlot : ObservableObject
     /// </summary>
     public ObservableCollection<ScaledRect> SelectionGrips { get; } = new();
 
+    /// <summary>Degrees the selection frame and its handles are turned (clockwise),
+    /// so a rotated text box is framed at its real angle. The frame and handles are
+    /// laid out upright and turned as one about the pivot below.</summary>
+    [ObservableProperty]
+    public partial double SelectionRotation { get; set; }
+
+    /// <summary>The pivot the selection frame turns about, in slot-space DIPs.</summary>
+    [ObservableProperty]
+    public partial double SelectionCenterX { get; set; }
+
+    [ObservableProperty]
+    public partial double SelectionCenterY { get; set; }
+
     /// <summary>Rebuilds the flattened highlight rectangles from the annotations.</summary>
     public void RebuildHighlightRects()
     {

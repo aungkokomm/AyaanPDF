@@ -280,6 +280,13 @@
                                             a heavy dashed rectangle reads as a
                                             debug overlay rather than a tool.
                                         -->
+                                        <!-- Frame + handles, turned as ONE about the box centre for a rotated text box. -->
+                                        <Grid>
+                                            <Grid.RenderTransform>
+                                                <RotateTransform Angle="{x:Bind SelectionRotation, Mode=OneWay}"
+                                                                 CenterX="{x:Bind SelectionCenterX, Mode=OneWay}"
+                                                                 CenterY="{x:Bind SelectionCenterY, Mode=OneWay}" />
+                                            </Grid.RenderTransform>
                                         <ItemsControl ItemsSource="{x:Bind SelectionOutline}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
@@ -340,6 +347,7 @@
                                                 </DataTemplate>
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
+                                        </Grid>
                                     </Grid>
 
                                     <!--

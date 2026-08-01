@@ -25,10 +25,20 @@ public enum TextAlign
 /// a box written before the round-trip existed. <paramref name="Underline"/> and
 /// <paramref name="Strikethrough"/> are that box's text decorations.
 /// </summary>
+/// <para>
+/// <paramref name="RotationDeg"/> is the box's clockwise rotation in degrees.
+/// <paramref name="HasBoxRect"/> says whether the box recorded its own upright
+/// rect (<paramref name="BoxLeft"/>..<paramref name="BoxBottom"/>, normalized): a
+/// rotated box's annotation bounds are its enlarged bounding box, so the overlay
+/// needs this to draw the tight frame and spin the exact box. Absent on a box
+/// written before rotation existed, which is always upright anyway.
+/// </para>
 public readonly record struct TextBoxTag(
     string Text, double FontSizeNorm, string ColorHex,
     TextAlign Align, string FillHex, string OutlineHex, double OutlineWidthNorm,
-    string FontPath, bool Underline, bool Strikethrough);
+    string FontPath, bool Underline, bool Strikethrough,
+    double RotationDeg, bool HasBoxRect,
+    double BoxLeft, double BoxTop, double BoxRight, double BoxBottom);
 
 /// <summary>
 /// Reads the tag a text box stores, the C# side of <c>parse_textbox_tag</c> in
@@ -86,7 +96,8 @@ public static class TextBoxTagReader
             return false;
         }
 
-        tag = new TextBoxTag(text, sizeNorm, colorHex, TextAlign.Left, "", "", 0, "", false, false);
+        tag = new TextBoxTag(text, sizeNorm, colorHex, TextAlign.Left, "", "", 0, "", false, false,
+            0, false, 0, 0, 0, 0);
         return true;
     }
 
@@ -127,9 +138,13 @@ public static class TextBoxTagReader
         }
 
         // The round-trip extras, present when there are more than the six fixed
-        // fields plus the words: a decorations flag and the base64 font path.
+        // fields plus the words: a decorations flag and the base64 font path
+        // (>=9 fields), the rotation (>=10), and the box's own rect (>=14).
         string fontPath = "";
         bool underline = false, strikethrough = false;
+        double rotation = 0;
+        bool hasRect = false;
+        double bl = 0, bt = 0, br = 0, bb = 0;
         if (parts.Length >= 9)
         {
             if (int.TryParse(parts[6], out int flags))
@@ -139,6 +154,18 @@ public static class TextBoxTagReader
             }
             TryText(parts[7], out fontPath); // sets "" on a malformed value
         }
+        if (parts.Length >= 10)
+        {
+            rotation = ParseDouble(parts[8]);
+        }
+        if (parts.Length >= 14)
+        {
+            hasRect = true;
+            bl = ParseDouble(parts[9]);
+            bt = ParseDouble(parts[10]);
+            br = ParseDouble(parts[11]);
+            bb = ParseDouble(parts[12]);
+        }
 
         if (!TryText(parts[^1], out string text))
         {
@@ -146,9 +173,15 @@ public static class TextBoxTagReader
         }
 
         tag = new TextBoxTag(text, sizeNorm, colorHex, align, fill, outline,
-                             outlineWpx / CaptureWidth, fontPath, underline, strikethrough);
+                             outlineWpx / CaptureWidth, fontPath, underline, strikethrough,
+                             rotation, hasRect, bl, bt, br, bb);
         return true;
     }
+
+    private static double ParseDouble(string s) =>
+        double.TryParse(s, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out double v) && double.IsFinite(v)
+            ? v : 0;
 
     private static bool TrySize(string s, out double sizeNorm)
     {

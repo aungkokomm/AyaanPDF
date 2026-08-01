@@ -99,6 +99,20 @@ public static class LoadedAnnotationPicker
         Bottom,
         Left,
         Right,
+        Rotate,
+    }
+
+    /// <summary>How far above the top edge the rotate handle floats, normalized to
+    /// page width. Mirrored by the overlay when it draws the handle.</summary>
+    public const double RotateHandleGap = 0.05;
+
+    /// <summary>Whether a point (already turned into the box's own upright frame)
+    /// is on the rotate handle above the top edge.</summary>
+    public static bool IsRotateHandle(AnnotationBox box, double x, double y, double reach = GripReach)
+    {
+        double cx = (box.Left + box.Right) / 2;
+        double hy = box.Top - RotateHandleGap;
+        return Math.Abs(x - cx) <= reach && Math.Abs(y - hy) <= reach;
     }
 
     /// <summary>True for the four corner grips (two-axis resize).</summary>
