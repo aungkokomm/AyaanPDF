@@ -2516,10 +2516,13 @@ macro_rules! rotate_object_about {
         if $deg != 0.0 {
             let _ = $obj.translate(PdfPoints::new(-$cx), PdfPoints::new(-$cy));
             // The stored angle is CLOCKWISE ON SCREEN, matching WinUI's
-            // RotateTransform, so the overlay's frame and the drawn box agree. PDF
-            // space is y-up, so a clockwise-on-screen turn is a counter-clockwise
-            // turn here.
-            let _ = $obj.rotate_counter_clockwise_degrees($deg);
+            // RotateTransform, so the overlay's frame and the drawn text agree.
+            // pdfium-render's rotate_clockwise_degrees turns the object clockwise
+            // in the rendered image too (the y-flip that happens between PDF user
+            // space and the raster does NOT reverse the rotation direction: a
+            // point that was to the right ends up ABOVE the origin either way,
+            // which is what "clockwise" means to a viewer).
+            let _ = $obj.rotate_clockwise_degrees($deg);
             let _ = $obj.translate(PdfPoints::new($cx), PdfPoints::new($cy));
         }
     };
