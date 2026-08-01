@@ -2955,7 +2955,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 return p != 0 ? p : b.Adjusted.Index.CompareTo(a.Adjusted.Index);
             });
 
+            // Track write order per page (anchor's write already happened above;
+            // count it as slot -1 so its stored index also gets corrected). The
+            // newIndex the FFI returns is L-1 at that MOMENT; every later delete
+            // on a lower index slides earlier-added items down. So the returned
+            // value is stale after the very next delete. The last-N slots in
+            // each page's write order hold our items in write order.
+            var writeOrderPerPage = new Dictionary<int, List<int>>();
+            writeOrderPerPage[anchorPage] = new List<int> { -1 };
             var pagesTouched = new HashSet<int> { anchorPage };
+
             foreach (var (slot, target) in order)
             {
                 float exl = (float)(target.Left * CaptureWidth);
@@ -2996,15 +3005,45 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
                 if (extStatus == RenderStatus.OkPdfium)
                 {
+                    // Store the new BOUNDS now; the index gets fixed up below.
                     _extraSelected[slot] = target with { Index = extNewIndex };
                     pagesTouched.Add(target.PageIndex);
+                    if (!writeOrderPerPage.TryGetValue(target.PageIndex, out var list))
+                    {
+                        list = new List<int>();
+                        writeOrderPerPage[target.PageIndex] = list;
+                    }
+                    list.Add(slot);
                 }
                 Diag.Log($"move extra p{target.PageIndex}#{target.Index} -> {extStatus}, now #{extNewIndex}");
             }
             _extraDragOrigin.Clear();
+
+            // Refresh caches, then assign each successful write its TRUE final
+            // index from the last-N run in write order per page.
             foreach (int page in pagesTouched)
             {
                 InvalidateLoadedPage(page);
+            }
+            foreach (var kv in writeOrderPerPage)
+            {
+                int count = LoadedFor(kv.Key).Count;
+                var slots = kv.Value;
+                for (int i = 0; i < slots.Count; i++)
+                {
+                    int idx = count - slots.Count + i;
+                    if (slots[i] == -1)
+                    {
+                        if (_selectedLoaded is LoadedSelection s)
+                        {
+                            _selectedLoaded = s with { Index = idx };
+                        }
+                    }
+                    else
+                    {
+                        _extraSelected[slots[i]] = _extraSelected[slots[i]] with { Index = idx };
+                    }
+                }
             }
         }
 
@@ -3162,14 +3201,48 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return p != 0 ? p : b.Old.Index.CompareTo(a.Old.Index);
         });
 
-        var newIndicesBySlot = new Dictionary<int, int>(n);
+        // Track write order PER PAGE. The newIndex each write returns is L-1 at
+        // THAT moment - but every subsequent delete on a LOWER index shifts
+        // already-added items down. After all writes on a page, the successful
+        // items sit at positions [count - N, count - N + 1, ..., count - 1] in
+        // WRITE ORDER (not sort order, though we're processing sorted). So
+        // recording the returned index per write is wrong (that value gets
+        // stale after the very next delete on the same page). Recompute below
+        // once every write on this page is done. This is what made "align top
+        // then align bottom" behave inconsistently: the second align's cached
+        // indices pointed at slid-down neighbours.
+        var writeOrderPerPage = new Dictionary<int, List<int>>();
         foreach (var (oldSel, target, slot) in jobs)
         {
             int newIdx = WriteMovedAnnotation(oldSel, target, CaptureWidth);
             if (newIdx >= 0)
             {
-                newIndicesBySlot[slot] = newIdx;
                 pagesTouched.Add(target.PageIndex);
+                if (!writeOrderPerPage.TryGetValue(target.PageIndex, out var list))
+                {
+                    list = new List<int>();
+                    writeOrderPerPage[target.PageIndex] = list;
+                }
+                list.Add(slot);
+            }
+        }
+
+        // Invalidate the loaded-annotation cache to get fresh counts, then
+        // assign every successfully-written slot its TRUE final index. On each
+        // page the writes ended up in the last-N run in write order.
+        foreach (int page in pagesTouched)
+        {
+            InvalidateLoadedPage(page);
+        }
+
+        var newIndicesBySlot = new Dictionary<int, int>(n);
+        foreach (var kv in writeOrderPerPage)
+        {
+            int count = LoadedFor(kv.Key).Count;
+            var slots = kv.Value;
+            for (int i = 0; i < slots.Count; i++)
+            {
+                newIndicesBySlot[slots[i]] = count - slots.Count + i;
             }
         }
 
