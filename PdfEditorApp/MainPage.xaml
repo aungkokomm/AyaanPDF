@@ -1006,12 +1006,37 @@
                         </Grid>
                         <Button.Flyout>
                             <Flyout x:Name="FillFlyout" Placement="Bottom" Opening="FillFlyout_Opening">
-                                <StackPanel Spacing="8" Width="288">
-                                    <ColorPicker x:Name="FillPicker" IsAlphaEnabled="False"
-                                                 IsMoreButtonVisible="True" ColorSpectrumShape="Box"
-                                                 Width="280" ColorChanged="FillColor_Changed" />
-                                    <Button Content="No fill" HorizontalAlignment="Stretch"
-                                            Click="NoFill_Click" />
+                                <StackPanel Spacing="6" Width="272">
+                                    <TextBlock Text="Standard colours" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <!-- Row 1: neutrals + warm -->
+                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF000000" Tag="#FF000000" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF404040" Tag="#FF404040" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF808080" Tag="#FF808080" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFC0C0C0" Tag="#FFC0C0C0" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFF7630C" Tag="#FFF7630C" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFFFB900" Tag="#FFFFB900" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                    </StackPanel>
+                                    <!-- Row 2: cool + tints -->
+                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF00B7C3" Tag="#FF00B7C3" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF8764B8" Tag="#FF8764B8" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFE3008C" Tag="#FFE3008C" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF7A4200" Tag="#FF7A4200" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFFFF4CE" Tag="#FFFFF4CE" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFDFF6DD" Tag="#FFDFF6DD" Click="FillPreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                    </StackPanel>
+                                    <Button Content="No fill" HorizontalAlignment="Stretch" Click="NoFill_Click" />
+                                    <Expander Header="Custom colour" HorizontalAlignment="Stretch" IsExpanded="False">
+                                        <ColorPicker x:Name="FillPicker" IsAlphaEnabled="False"
+                                                     IsMoreButtonVisible="True" ColorSpectrumShape="Box"
+                                                     Width="256" ColorChanged="FillColor_Changed" />
+                                    </Expander>
                                 </StackPanel>
                             </Flyout>
                         </Button.Flyout>
@@ -1030,12 +1055,43 @@
                         </Grid>
                         <Button.Flyout>
                             <Flyout x:Name="OutlineFlyout" Placement="Bottom" Opening="OutlineFlyout_Opening">
-                                <StackPanel Spacing="8" Width="288">
-                                    <ColorPicker x:Name="OutlinePicker" IsAlphaEnabled="False"
-                                                 IsMoreButtonVisible="True" ColorSpectrumShape="Box"
-                                                 Width="280" ColorChanged="OutlineColor_Changed" />
-                                    <Button Content="No outline" HorizontalAlignment="Stretch"
-                                            Click="NoOutline_Click" />
+                                <StackPanel Spacing="6" Width="272">
+                                    <TextBlock Text="Standard colours" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF000000" Tag="#FF000000" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF404040" Tag="#FF404040" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF808080" Tag="#FF808080" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFC0C0C0" Tag="#FFC0C0C0" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFF7630C" Tag="#FFF7630C" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFFFB900" Tag="#FFFFB900" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF00B7C3" Tag="#FF00B7C3" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF8764B8" Tag="#FF8764B8" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFE3008C" Tag="#FFE3008C" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FF7A4200" Tag="#FF7A4200" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFFFF4CE" Tag="#FFFFF4CE" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                        <Button Width="28" Height="28" Padding="0" Background="#FFDFF6DD" Tag="#FFDFF6DD" Click="OutlinePreset_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" />
+                                    </StackPanel>
+                                    <TextBlock Text="Thickness" FontSize="12" Margin="0,4,0,0"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <StackPanel x:Name="ThicknessRow" Orientation="Horizontal" Spacing="4">
+                                        <RadioButton x:Name="Thickness1" GroupName="OutlineThickness" Content="1 pt" Tag="1" Click="OutlineThickness_Click" MinWidth="0" Padding="8,2" />
+                                        <RadioButton x:Name="Thickness2" GroupName="OutlineThickness" Content="2 pt" Tag="2" Click="OutlineThickness_Click" MinWidth="0" Padding="8,2" />
+                                        <RadioButton x:Name="Thickness3" GroupName="OutlineThickness" Content="3 pt" Tag="3" Click="OutlineThickness_Click" MinWidth="0" Padding="8,2" />
+                                        <RadioButton x:Name="Thickness5" GroupName="OutlineThickness" Content="5 pt" Tag="5" Click="OutlineThickness_Click" MinWidth="0" Padding="8,2" />
+                                    </StackPanel>
+                                    <Button Content="No outline" HorizontalAlignment="Stretch" Click="NoOutline_Click" />
+                                    <Expander Header="Custom colour" HorizontalAlignment="Stretch" IsExpanded="False">
+                                        <ColorPicker x:Name="OutlinePicker" IsAlphaEnabled="False"
+                                                     IsMoreButtonVisible="True" ColorSpectrumShape="Box"
+                                                     Width="256" ColorChanged="OutlineColor_Changed" />
+                                    </Expander>
                                 </StackPanel>
                             </Flyout>
                         </Button.Flyout>

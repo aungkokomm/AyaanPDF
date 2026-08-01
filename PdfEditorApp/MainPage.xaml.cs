@@ -1035,6 +1035,46 @@ public sealed partial class MainPage : Page
         OutlineFlyout.Hide();
     }
 
+    /// <summary>A fill preset swatch was clicked; its Tag is the "#AARRGGBB" hex.
+    /// The picker closes immediately so the fill is applied in one gesture, the
+    /// way a user of Word or Acrobat expects.</summary>
+    private void FillPreset_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button b && b.Tag is string hex && !string.IsNullOrEmpty(hex))
+        {
+            ViewModel.TextFillHex = hex;
+            SyncTextStyleControls();
+            UpdateOpenEditorStyle();
+            FillFlyout.Hide();
+        }
+    }
+
+    /// <summary>An outline preset swatch was clicked; same shape as fill.</summary>
+    private void OutlinePreset_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button b && b.Tag is string hex && !string.IsNullOrEmpty(hex))
+        {
+            ViewModel.TextOutlineHex = hex;
+            SyncTextStyleControls();
+            UpdateOpenEditorStyle();
+            OutlineFlyout.Hide();
+        }
+    }
+
+    /// <summary>A thickness preset (1/2/3/5 pt) was picked; the outline width is
+    /// stored normalized against a capture width of 1000, i.e. "pt / 1000".</summary>
+    private void OutlineThickness_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is RadioButton rb && rb.Tag is string tag
+            && double.TryParse(tag, System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture, out double pt)
+            && pt > 0)
+        {
+            ViewModel.TextOutlineWidthNorm = pt / 1000.0;
+            UpdateOpenEditorStyle();
+        }
+    }
+
     /// <summary>Brings the alignment buttons and the fill/outline swatches into line with the tool.</summary>
     private void SyncTextStyleControls()
     {
@@ -1066,6 +1106,15 @@ public sealed partial class MainPage : Page
         bool hasOutline = !string.IsNullOrEmpty(ViewModel.TextOutlineHex);
         OutlineSwatch.BorderBrush = hasOutline ? HexBrush(ViewModel.TextOutlineHex) : new SolidColorBrush(Color.FromArgb(0x60, 0, 0, 0));
         OutlineNoneSlash.Visibility = hasOutline ? Visibility.Collapsed : Visibility.Visible;
+
+        // The thickness radios sit inside the outline picker's flyout; they need
+        // to open showing the current thickness ticked. The stored value is
+        // normalized (pt / 1000), so multiplying gets the pt-integer back.
+        int pt = (int)System.Math.Round(ViewModel.TextOutlineWidthNorm * 1000.0);
+        Thickness1.IsChecked = pt == 1;
+        Thickness2.IsChecked = pt == 2;
+        Thickness3.IsChecked = pt == 3;
+        Thickness5.IsChecked = pt == 5;
     }
 
     /// <summary>Clicking the dimmed area outside the box finishes the edit, keeping what was typed.</summary>
