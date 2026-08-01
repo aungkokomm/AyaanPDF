@@ -174,6 +174,12 @@ internal struct NativeShapeSpec
     public byte B;
     public byte A;
     public float WidthPx;
+    /// <summary>
+    /// Clockwise rotation about the shape's centre, in degrees on screen.
+    /// APPENDED after WidthPx so a zero-init struct (from callers that don't
+    /// set this) still renders unrotated; the C ABI stays additive.
+    /// </summary>
+    public float RotationDeg;
 }
 
 /// <summary>
@@ -643,6 +649,19 @@ internal static partial class RenderCoreNative
     /// to keep the thickness, and -1 for the decoration flags to keep those.
     /// The tag's bounds, rotation, font, size, and words are all preserved.
     /// </summary>
+    /// <summary>
+    /// Turns one of our shapes to a new absolute angle (clockwise degrees on
+    /// screen) about its centre, keeping its kind, colour, width and bounds.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int rotate_shape_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float degrees,
+        out int newIndex);
+
     /// <summary>
     /// Applies a new colour and/or stroke width to one of our shapes, keeping
     /// its bounds and kind. An alpha of 0 in <paramref name="colorRgba"/> keeps

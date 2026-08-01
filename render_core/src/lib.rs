@@ -2919,15 +2919,28 @@ const SHAPE_TAG: &str = "AyaanShape:";
 fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
     let fx = u8::from(spec.x2 >= spec.x1);
     let fy = u8::from(spec.y2 >= spec.y1);
-    format!(
-        "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}",
-        spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts
-    )
+    // Rotation is APPENDED so an older reader that stops after fy still gets
+    // kind/colour/width/direction; a new reader also picks up the angle. Only
+    // written when non-zero to keep unrotated tags identical to what they used
+    // to be, so shape files diffed against the old build show no change.
+    if spec.rotation_deg == 0.0 {
+        format!(
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}",
+            spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts
+        )
+    } else {
+        format!(
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}",
+            spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts, spec.rotation_deg
+        )
+    }
 }
 
-/// The kind, colour, width and drag direction recorded on an annotation, or
-/// None if it is not one of our shapes.
-fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool)> {
+/// The kind, colour, width, drag direction, and rotation recorded on one of our
+/// shape annotations, or None if it is not one of ours. Rotation is 0 on older
+/// tags that predate that field; the caller does not need to know which form
+/// the tag was in.
+fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32)> {
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
 
@@ -2951,7 +2964,12 @@ fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bo
     let fx = flag(parts.next());
     let fy = flag(parts.next());
 
-    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy))
+    // Rotation, if present. An unparseable value is treated as 0 so a bad tag
+    // does not turn a valid shape into an unknown mark; the shape just renders
+    // unrotated.
+    let rot: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot))
 }
 
 /// One shape to add, in render-pixel space.
@@ -2974,6 +2992,11 @@ pub struct ShapeSpec {
     pub b: u8,
     pub a: u8,
     pub width_px: f32,
+    /// Clockwise rotation of the shape about its own centre, in degrees on
+    /// screen. Zero for an unrotated shape. APPENDED to the struct: the C ABI
+    /// stays stable for callers that don't set this (they'll pass a zero-init
+    /// struct so rotation is 0), and the render code treats 0 as a no-op.
+    pub rotation_deg: f32,
 }
 
 /// Half-width of an arrowhead as a fraction of its length, giving the roughly
@@ -3148,7 +3171,7 @@ fn add_shape_annotations_inner(
             }
         };
 
-        let Ok(path) = path else {
+        let Ok(mut path) = path else {
             continue;
         };
 
@@ -3195,12 +3218,36 @@ fn add_shape_annotations_inner(
         let min_y = extent.iter().map(|p| p.1).fold(f32::MAX, f32::min) - pad;
         let max_y = extent.iter().map(|p| p.1).fold(f32::MIN, f32::max) + pad;
 
-        let bounds = PdfRect::new(
-            PdfPoints::new(min_y),
-            PdfPoints::new(min_x),
-            PdfPoints::new(max_y),
-            PdfPoints::new(max_x),
-        );
+        // The shape turns about its own centre. Every rendered object gets the
+        // same rotate-about-centre transform BEFORE it is added, and when the
+        // shape is turned the annotation's /Rect grows to the axis-aligned
+        // bounding box of the rotated content, so PDFium does not crop the
+        // turned corners (the same story as text boxes).
+        let rot = spec.rotation_deg;
+        let cx = (min_x + max_x) / 2.0;
+        let cy = (min_y + max_y) / 2.0;
+
+        let bounds = if rot == 0.0 {
+            PdfRect::new(
+                PdfPoints::new(min_y),
+                PdfPoints::new(min_x),
+                PdfPoints::new(max_y),
+                PdfPoints::new(max_x),
+            )
+        } else {
+            let (s, c) = rot.to_radians().sin_cos();
+            let (s, c) = (s.abs(), c.abs());
+            let w = max_x - min_x;
+            let h = max_y - min_y;
+            let hw = (w * c + h * s) / 2.0;
+            let hh = (w * s + h * c) / 2.0;
+            PdfRect::new(
+                PdfPoints::new(cy - hh),
+                PdfPoints::new(cx - hw),
+                PdfPoints::new(cy + hh),
+                PdfPoints::new(cx + hw),
+            )
+        };
 
         let Ok(mut annotation) = page.annotations_mut().create_ink_annotation() else {
             return STATUS_INVALID_INPUT;
@@ -3219,11 +3266,13 @@ fn add_shape_annotations_inner(
         // it a shape is just ink, and can then only be moved or deleted.
         let _ = annotation.set_contents(&shape_tag(spec, width_pts));
 
+        rotate_object_about!(path, rot, cx, cy);
         if annotation.objects_mut().add_path_object(path).is_err() {
             return STATUS_INVALID_INPUT;
         }
 
-        if let Some(head) = head {
+        if let Some(mut head) = head {
+            rotate_object_about!(head, rot, cx, cy);
             if annotation.objects_mut().add_path_object(head).is_err() {
                 return STATUS_INVALID_INPUT;
             }
@@ -3270,6 +3319,31 @@ pub extern "C" fn resize_shape_annotation(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Rotates one of our shapes to a NEW absolute angle (clockwise degrees on
+/// screen) about its centre, keeping its kind, colour, width and bounds. Under
+/// the hood this is a restyle with only the rotation changed.
+#[unsafe(no_mangle)]
+pub extern "C" fn rotate_shape_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    degrees: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        // Passing color_rgba=0 and width_px=-1 keeps the tag's colour and
+        // width; rotation_override supplies the new angle.
+        restyle_shape_annotation_inner_with_rotation(
+            doc_handle, page_index, index, capture_width,
+            0, -1.0, Some(degrees), out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
 /// Applies a new colour and/or width to one of our shapes without moving it.
 /// Reads the tag for kind, corner flags, and current bounds; deletes; re-adds
 /// with the new style. A width_px < 0 keeps the tag's current width; an alpha
@@ -3289,26 +3363,28 @@ pub extern "C" fn restyle_shape_annotation(
         return STATUS_INVALID_INPUT;
     }
     panic::catch_unwind(|| {
-        restyle_shape_annotation_inner(
-            doc_handle, page_index, index, capture_width, color_rgba, width_px, out_new_index)
+        restyle_shape_annotation_inner_with_rotation(
+            doc_handle, page_index, index, capture_width, color_rgba, width_px, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
 
-fn restyle_shape_annotation_inner(
+#[allow(clippy::too_many_arguments)]
+fn restyle_shape_annotation_inner_with_rotation(
     doc_handle: u64,
     page_index: i32,
     index: i32,
     capture_width: i32,
     color_rgba: u32,
     width_px: f32,
+    rotation_override: Option<f32>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
     // Read tag AND the annotation's own bounds BEFORE the delete, so a mark
     // that is not one of our shapes leaves the page untouched.
-    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, page_left, page_top, page_w, bounds) = {
+    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, page_left, page_top, page_w, bounds) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
@@ -3325,7 +3401,7 @@ fn restyle_shape_annotation_inner(
             Ok(b) => (b.left().value, b.top().value),
             Err(_) => (0.0, page.height().value),
         };
-        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, page_left, page_top, pw, bx)
+        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, page_left, page_top, pw, bx)
     };
 
     // Convert the annotation's PDF-point bounds back into capture space.
@@ -3363,6 +3439,7 @@ fn restyle_shape_annotation_inner(
         page_index, kind, x1, y1, x2, y2,
         r: nr, g: ng, b: nb, a: na,
         width_px: new_width_px,
+        rotation_deg: rotation_override.unwrap_or(cur_rot),
     };
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
     if status != STATUS_OK_PDFIUM { return status; }
@@ -3419,7 +3496,7 @@ fn resize_shape_annotation_inner(
         }
     };
 
-    let (kind, r, g, b, a, width_pts, fx, fy) = tag;
+    let (kind, r, g, b, a, width_pts, fx, fy, rot) = tag;
 
     if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
         return STATUS_INVALID_INPUT;
@@ -3461,6 +3538,7 @@ fn resize_shape_annotation_inner(
         b,
         a,
         width_px,
+        rotation_deg: rot,
     };
 
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
@@ -6664,6 +6742,7 @@ mod tests {
             b: 0,
             a: 255,
             width_px: 3.0,
+            rotation_deg: 0.0,
         }
     }
 
@@ -7677,7 +7756,7 @@ mod tests {
         let contents = contents_of(reopened, 0, 0).expect("the reopened shape has no contents");
         let parsed = parse_shape_tag(&contents);
         assert!(parsed.is_some(), "tag did not parse: {contents}");
-        let (kind, r, g, b, a, width, _, _) = parsed.unwrap();
+        let (kind, r, g, b, a, width, _, _, _) = parsed.unwrap();
 
         assert_eq!(kind, SHAPE_ELLIPSE);
         assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x78));
@@ -7848,15 +7927,15 @@ mod tests {
 
         let specs = [
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 100.0, x2: 700.0, y2: 100.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0 },
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0 },
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 200.0, x2: 700.0, y2: 320.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0 },
+                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0 },
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 700.0, y1: 420.0, x2: 80.0, y2: 420.0,
-                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5 },
+                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0 },
             ShapeSpec { page_index: 0, kind: SHAPE_RECTANGLE, x1: 80.0, y1: 500.0, x2: 350.0, y2: 640.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0 },
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0 },
             ShapeSpec { page_index: 0, kind: SHAPE_ELLIPSE, x1: 420.0, y1: 500.0, x2: 700.0, y2: 640.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0 },
+                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0 },
         ];
         assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()), STATUS_OK_PDFIUM);
 

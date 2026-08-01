@@ -2232,7 +2232,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // framed at its real angle.
             if (slot is not null)
             {
-                slot.SelectionRotation = _selectedIsTextBox ? _selectedRotationDeg : 0;
+                slot.SelectionRotation = (_selectedIsTextBox || _selectedIsShape) ? _selectedRotationDeg : 0;
                 slot.SelectionCenterX = (sel.Left + sel.Right) / 2 * SlotLayoutWidth;
                 slot.SelectionCenterY = (sel.Top + sel.Bottom) / 2 * SlotLayoutWidth;
             }
@@ -2245,7 +2245,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // Edge (one-axis) handles only for a free resize; an aspect-locked
                 // picture keeps just its four corners. A text box also gets the
                 // rotate handle above its top edge.
-                AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0, rotate: _selectedIsTextBox);
+                AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0,
+                         rotate: _selectedIsTextBox || _selectedIsShape);
             }
 
             InkStrokeChanged?.Invoke();
@@ -2368,6 +2369,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // cheap prefix test and rules out most other marks.
         string? contents = ReadAnnotationContents(pageIndex, index);
         _selectedIsShape = contents is not null && contents.StartsWith("AyaanShape:", StringComparison.Ordinal);
+
+        if (_selectedIsShape)
+        {
+            // Pull the shape's rotation out of its tag. The rest of the shape
+            // style stays on the tool and applies through ApplyStyleToSelectedShape.
+            _selectedRotationDeg = ParseShapeRotation(contents!);
+        }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
         {
@@ -2520,11 +2528,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         var box = new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom);
         var (lx, ly) = InverseRotate(nx, ny, box, _selectedRotationDeg);
-        if (_selectedIsTextBox && LoadedAnnotationPicker.IsRotateHandle(box, lx, ly))
+        if ((_selectedIsTextBox || _selectedIsShape)
+            && LoadedAnnotationPicker.IsRotateHandle(box, lx, ly))
         {
             return LoadedAnnotationPicker.Grip.Rotate;
         }
-        return LoadedAnnotationPicker.GripAt(box, lx, ly, edges: _selectedIsTextBox);
+        // Shapes are free-resize (edge handles) too; text boxes always are.
+        return LoadedAnnotationPicker.GripAt(box, lx, ly,
+            edges: _selectedIsTextBox || _selectedIsShape);
     }
 
     /// <summary>Turns a screen-space point back into a box's own upright frame,
@@ -2761,12 +2772,58 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
     }
 
-    /// <summary>Writes a finished ROTATE through to the document: the box is
-    /// re-laid-out at its own upright bounds, turned to the new angle. Bounds are
-    /// unchanged, so the marquee keeps them and its angle.</summary>
+    /// <summary>The shape tag has fields separated by ':'; the rotation, if
+    /// present, is the ninth (after kind, RGBA, width, fx, fy). An older tag
+    /// without it comes back as 0.</summary>
+    private static double ParseShapeRotation(string contents)
+    {
+        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
+            ? contents.Substring("AyaanShape:".Length)
+            : null;
+        if (rest is null)
+        {
+            return 0;
+        }
+        string[] parts = rest.Split(':');
+        // Fields: 0=kind, 1=rgba, 2=width, 3=fx, 4=fy, 5=rotation
+        if (parts.Length < 6)
+        {
+            return 0;
+        }
+        return double.TryParse(parts[5], System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture, out double v)
+               && double.IsFinite(v)
+            ? v : 0;
+    }
+
+    /// <summary>Writes a finished ROTATE through to the document: the object is
+    /// re-laid-out at its own upright bounds, turned to the new angle. Bounds
+    /// are unchanged, so the marquee keeps them and its angle. Branches on the
+    /// selected type so shapes go through their own FFI.</summary>
     private void CommitRotation(LoadedSelection start)
     {
         const int CaptureWidth = 1000;
+
+        if (_selectedIsShape)
+        {
+            PushHistory(HistoryScope.Document, "Rotate shape");
+            int shapeStatus = RenderCoreNative.rotate_shape_annotation(
+                _documentHandle, start.PageIndex, start.Index, CaptureWidth,
+                (float)_selectedRotationDeg, out int shapeNewIndex);
+            if (shapeStatus != RenderStatus.OkPdfium)
+            {
+                _selectedLoaded = start;
+                RefreshSelectionOutline();
+                Status = "Could not rotate that shape.";
+                return;
+            }
+            IsDirty = true;
+            InvalidateLoadedPage(start.PageIndex);
+            _selectedLoaded = start with { Index = shapeNewIndex };
+            RefreshSelectionOutline();
+            return;
+        }
+
         float l = (float)(start.Left * CaptureWidth);
         float t = (float)(start.Top * CaptureWidth);
         float r = (float)(start.Right * CaptureWidth);
