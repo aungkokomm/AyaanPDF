@@ -2078,6 +2078,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectedLoaded = null;
         _selectedIsTextBox = false;
         _selectedIsShape = false;
+        _extraSelected.Clear();
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _moveOrigin = null;
@@ -2214,6 +2215,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             slot.SelectionOutline.Clear();
             slot.SelectionGrips.Clear();
+            slot.ExtraSelectionOutlines.Clear();
             slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
         }
 
@@ -2247,6 +2249,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // rotate handle above its top edge.
                 AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0,
                          rotate: _selectedIsTextBox || _selectedIsShape);
+            }
+
+            // Draw a marquee (no handles) for each extra-selected object, on its
+            // own page's slot. Operations live on the anchor; the extras just
+            // participate in Delete for now.
+            foreach (var extra in _extraSelected)
+            {
+                var extraSlot = SlotFor(extra.PageIndex);
+                extraSlot?.ExtraSelectionOutlines.Add(new ScaledRect(
+                    extra.Left * SlotLayoutWidth,
+                    extra.Top * SlotLayoutWidth,
+                    (extra.Right - extra.Left) * SlotLayoutWidth,
+                    (extra.Bottom - extra.Top) * SlotLayoutWidth,
+                    string.Empty));
             }
 
             InkStrokeChanged?.Invoke();
@@ -2295,6 +2311,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Which corner the drag has hold of; None means it is a move.</summary>
     private LoadedAnnotationPicker.Grip _loadedGrip = LoadedAnnotationPicker.Grip.None;
 
+    /// <summary>Objects that are ALSO selected besides <see cref="_selectedLoaded"/>
+    /// (the anchor / most-recently-clicked). Shift-click grows this set; a plain
+    /// click clears it. The anchor keeps the handles and drives style edits; the
+    /// extras get a marquee only so Delete removes them all at once. Follow-ups
+    /// will extend move, rotate, restyle and align to the whole set.</summary>
+    private readonly List<LoadedSelection> _extraSelected = new();
+
     /// <summary>
     /// Whether the current selection is one of our text boxes. Read ONCE when the
     /// selection changes (an FFI + parse), then used by the per-sample drag path,
@@ -2342,12 +2365,62 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // Shift-click grows the selection. If the clicked mark was already in
+        // the multi-selection it is removed (deselected individually); otherwise
+        // the previous anchor moves to the extras list and the clicked mark
+        // becomes the new anchor. A plain click clears the extras.
+        bool shift = IsShiftDown();
+        if (shift)
+        {
+            // Clicked mark is already in the extras: remove it and keep the anchor.
+            int existingExtra = _extraSelected.FindIndex(x =>
+                x.PageIndex == pageIndex && x.Index == hit.Index);
+            if (existingExtra >= 0)
+            {
+                _extraSelected.RemoveAt(existingExtra);
+                RefreshSelectionOutline();
+                return true;
+            }
+            // Clicked mark is already the anchor: demote the FIRST extra to be
+            // the new anchor (or clear the anchor if there are no extras).
+            if (_selectedLoaded is LoadedSelection cur
+                && cur.PageIndex == pageIndex && cur.Index == hit.Index)
+            {
+                if (_extraSelected.Count > 0)
+                {
+                    _selectedLoaded = _extraSelected[0];
+                    _extraSelected.RemoveAt(0);
+                    ApplyTextBoxSelectionInfo(_selectedLoaded.Value.PageIndex, _selectedLoaded.Value.Index);
+                }
+                else
+                {
+                    ClearAnnotationSelection();
+                    return true;
+                }
+                RefreshSelectionOutline();
+                return true;
+            }
+            // New mark to add: push the current anchor to extras, promote clicked.
+            if (_selectedLoaded is LoadedSelection prev)
+            {
+                _extraSelected.Add(prev);
+            }
+        }
+        else
+        {
+            _extraSelected.Clear();
+        }
+
         _selectedLoaded = new LoadedSelection(
             pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
         ApplyTextBoxSelectionInfo(pageIndex, hit.Index);
         var sel = _selectedLoaded.Value;
-        _loadedDrag = (normX, normY, sel);
-        _loadedGrip = GripForPoint(sel, normX, normY);
+        _loadedDrag = shift ? null : (normX, normY, sel);
+        _loadedGrip = LoadedAnnotationPicker.Grip.None;
+        if (!shift)
+        {
+            _loadedGrip = GripForPoint(sel, normX, normY);
+        }
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
@@ -2950,11 +3023,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return true;
         }
 
+        // The multi-selection extras go next. Indices SHIFT after a delete
+        // (annotations are compacted), so delete in DESCENDING order per page:
+        // erasing #7 first leaves #5 and #3 at their original indices, whereas
+        // ascending order would leave stale numbers pointing at the wrong marks.
+        var pagesTouched = new HashSet<int> { sel.PageIndex };
+        foreach (var extra in _extraSelected
+            .OrderByDescending(x => x.PageIndex)
+            .ThenByDescending(x => x.Index))
+        {
+            int extraStatus = RenderCoreNative.delete_annotation(
+                _documentHandle, extra.PageIndex, extra.Index);
+            Diag.Log($"delete extra p{extra.PageIndex}#{extra.Index} -> {extraStatus}");
+            if (extraStatus == RenderStatus.OkPdfium)
+            {
+                pagesTouched.Add(extra.PageIndex);
+            }
+        }
+        _extraSelected.Clear();
+
         _selectedLoaded = null;
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         IsDirty = true;
-        InvalidateLoadedPage(sel.PageIndex);
+        foreach (int page in pagesTouched)
+        {
+            InvalidateLoadedPage(page);
+        }
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));

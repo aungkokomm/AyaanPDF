@@ -77,6 +77,11 @@ public partial class PageSlot : ObservableObject
     /// </summary>
     public ObservableCollection<ScaledRect> SelectionGrips { get; } = new();
 
+    /// <summary>Marquees for the objects that are ALSO in the multi-selection
+    /// besides the anchor. Drawn as thinner accent outlines so the anchor stays
+    /// visually primary; no handles because operations key off the anchor.</summary>
+    public ObservableCollection<ScaledRect> ExtraSelectionOutlines { get; } = new();
+
     /// <summary>Degrees the selection frame and its handles are turned (clockwise),
     /// so a rotated text box is framed at its real angle. The frame and handles are
     /// laid out upright and turned as one about the pivot below.</summary>

@@ -280,6 +280,25 @@
                                             a heavy dashed rectangle reads as a
                                             debug overlay rather than a tool.
                                         -->
+                                        <!-- Marquees for the multi-selection extras: thin accent outlines, no
+                                             handles, OUTSIDE the rotate transform because each extra keeps its
+                                             own upright frame. -->
+                                        <ItemsControl ItemsSource="{x:Bind ExtraSelectionOutlines}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Stroke="{ThemeResource AccentFillColorDefaultBrush}"
+                                                               StrokeThickness="1" StrokeDashArray="3,2"
+                                                               Fill="Transparent"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <!-- Frame + handles, turned as ONE about the box centre for a rotated text box. -->
                                         <Grid>
                                             <Grid.RenderTransform>
