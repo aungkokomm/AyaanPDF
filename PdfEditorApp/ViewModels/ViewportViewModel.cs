@@ -2574,18 +2574,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         IsDirty = true;
         InvalidateLoadedPage(now.PageIndex);
 
-        // A re-wrapped text box can be a different HEIGHT than was dragged, so the
-        // marquee has to follow the bounds the core actually produced, not the
-        // dragged rectangle. For everything else the two are the same.
-        if (_selectedIsTextBox)
+        // A re-wrapped text box can be a different HEIGHT than was dragged, and
+        // its ANNOTATION rect is the enlarged bounding box when rotated (that is
+        // what stops PDFium clipping the turned corners), not the tight upright
+        // box the frame draws. Reading LoadedFor's bounds instead of the tag was
+        // the "each resize makes the frame BIGGER" bug: the enlarged rect became
+        // the starting rect for the next drag, and the next commit inflated it
+        // again. Take the box's OWN tight rect and angle from the tag it just
+        // wrote. Everything else can trust the dragged rectangle.
+        if (_selectedIsTextBox
+            && TextBoxTagReader.TryParse(ReadAnnotationContents(now.PageIndex, newIndex), out var tag)
+            && tag.HasBoxRect)
         {
-            var actual = LoadedFor(now.PageIndex)
-                .Where(x => x.Index == newIndex)
-                .Select(x => (Interop.ExistingAnnotation?)x)
-                .FirstOrDefault();
-            _selectedLoaded = actual is Interop.ExistingAnnotation a
-                ? new LoadedSelection(now.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom)
-                : now with { Index = newIndex };
+            _selectedRotationDeg = tag.RotationDeg;
+            _selectedLoaded = new LoadedSelection(
+                now.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom);
         }
         else
         {
