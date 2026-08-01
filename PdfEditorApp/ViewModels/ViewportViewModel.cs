@@ -2046,6 +2046,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 _loadedDrag = (normX, normY, current);
                 _loadedGrip = grip;
+                // Handle grip - resize/rotate belongs to the anchor only, so the
+                // extras drag-origin can stay empty (move-all does not apply).
+                _extraDragOrigin.Clear();
                 return true;
             }
         }
@@ -2087,6 +2090,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectedIsTextBox = false;
         _selectedIsShape = false;
         _extraSelected.Clear();
+        _extraDragOrigin.Clear();
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _moveOrigin = null;
@@ -2323,8 +2327,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// (the anchor / most-recently-clicked). Shift-click grows this set; a plain
     /// click clears it. The anchor keeps the handles and drives style edits; the
     /// extras get a marquee only so Delete removes them all at once. Follow-ups
-    /// will extend move, rotate, restyle and align to the whole set.</summary>
+    /// will extend rotate, restyle and align to the whole set.</summary>
     private readonly List<LoadedSelection> _extraSelected = new();
+
+    /// <summary>Snapshot of <see cref="_extraSelected"/> taken at drag start, so
+    /// every pointer sample applies the anchor's total delta to the ORIGINALS,
+    /// never accumulates. Without this the extras would drift by delta every
+    /// sample and race off the page.</summary>
+    private readonly List<LoadedSelection> _extraDragOrigin = new();
 
     /// <summary>
     /// Whether the current selection is one of our text boxes. Read ONCE when the
@@ -2428,6 +2438,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (!shift)
         {
             _loadedGrip = GripForPoint(sel, normX, normY);
+        }
+        // Snapshot the extras so the drag can apply the anchor's delta to their
+        // ORIGINAL positions each sample, not to whatever they were on the last
+        // sample. Only meaningful for a body drag (no grip); a resize/rotate is
+        // an anchor-only operation, and the shift-add path returns above without
+        // starting a drag at all.
+        _extraDragOrigin.Clear();
+        if (!shift && _loadedGrip == LoadedAnnotationPicker.Grip.None)
+        {
+            _extraDragOrigin.AddRange(_extraSelected);
         }
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
@@ -2729,6 +2749,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             Left = moved.Left, Top = moved.Top, Right = moved.Right, Bottom = moved.Bottom,
         };
+
+        // Move-all: on a body drag with extras selected, apply the anchor's total
+        // delta to each extra's ORIGINAL position captured at drag start. Resize
+        // and rotate stay anchor-only for now (multi-resize/rotate is a bigger
+        // interaction question).
+        if (_loadedGrip == LoadedAnnotationPicker.Grip.None && _extraDragOrigin.Count > 0)
+        {
+            double dx = moved.Left - box.Left;
+            double dy = moved.Top - box.Top;
+            for (int i = 0; i < _extraDragOrigin.Count && i < _extraSelected.Count; i++)
+            {
+                var o = _extraDragOrigin[i];
+                _extraSelected[i] = o with
+                {
+                    Left = o.Left + dx,
+                    Top = o.Top + dy,
+                    Right = o.Right + dx,
+                    Bottom = o.Bottom + dy,
+                };
+            }
+        }
+
         RefreshSelectionOutline();
     }
 
@@ -2859,6 +2901,68 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         else
         {
             _selectedLoaded = now with { Index = newIndex };
+        }
+
+        // Move-all commit: write each extra's NEW position to the document. The
+        // anchor's re-add above shifts indices on its page (rebuilt annotation
+        // moves to the end), so read the CURRENT extras (already at their new
+        // in-memory positions) and match them back by their old index against
+        // the fresh cache. Only body drags (grip None) trigger this; a resize
+        // or rotate is anchor-only.
+        if (!resizing && !rotating && _extraDragOrigin.Count > 0)
+        {
+            var pagesTouched = new HashSet<int> { now.PageIndex };
+            for (int i = 0; i < _extraSelected.Count && i < _extraDragOrigin.Count; i++)
+            {
+                var target = _extraSelected[i];
+                float exl = (float)(target.Left * CaptureWidth);
+                float ext = (float)(target.Top * CaptureWidth);
+                float exr = (float)(target.Right * CaptureWidth);
+                float exb = (float)(target.Bottom * CaptureWidth);
+
+                // Text box: full re-layout preserves rotation/font/wrapping.
+                // Shape: same via its shape restyle path (no bounds change tool,
+                // so use generic resize which just moves for a matching size).
+                // Anything else: generic resize_annotation (moves the /Rect).
+                int extStatus = RenderStatus.Unsupported;
+                int extNewIndex = target.Index;
+
+                string? extContents = ReadAnnotationContents(target.PageIndex, target.Index);
+                bool extIsText = TextBoxTagReader.TryParse(extContents, out _);
+                bool extIsShape = extContents is not null
+                    && extContents.StartsWith("AyaanShape:", StringComparison.Ordinal);
+
+                if (extIsText)
+                {
+                    extStatus = RenderCoreNative.resize_text_box_annotation(
+                        _documentHandle, target.PageIndex, target.Index, CaptureWidth,
+                        exl, ext, exr, exb, out extNewIndex);
+                }
+                if (extStatus != RenderStatus.OkPdfium && extIsShape)
+                {
+                    extStatus = RenderCoreNative.resize_shape_annotation(
+                        _documentHandle, target.PageIndex, target.Index, CaptureWidth,
+                        exl, ext, exr, exb, out extNewIndex);
+                }
+                if (extStatus != RenderStatus.OkPdfium)
+                {
+                    extStatus = RenderCoreNative.resize_annotation(
+                        _documentHandle, target.PageIndex, target.Index, CaptureWidth,
+                        exl, ext, exr, exb, out extNewIndex);
+                }
+
+                if (extStatus == RenderStatus.OkPdfium)
+                {
+                    _extraSelected[i] = target with { Index = extNewIndex };
+                    pagesTouched.Add(target.PageIndex);
+                }
+                Diag.Log($"move extra p{target.PageIndex}#{target.Index} -> {extStatus}, now #{extNewIndex}");
+            }
+            _extraDragOrigin.Clear();
+            foreach (int page in pagesTouched)
+            {
+                InvalidateLoadedPage(page);
+            }
         }
 
         RefreshSelectionOutline();
