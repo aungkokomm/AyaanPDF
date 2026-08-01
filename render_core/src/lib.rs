@@ -3270,6 +3270,117 @@ pub extern "C" fn resize_shape_annotation(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Applies a new colour and/or width to one of our shapes without moving it.
+/// Reads the tag for kind, corner flags, and current bounds; deletes; re-adds
+/// with the new style. A width_px < 0 keeps the tag's current width; an alpha
+/// of 0 in `color_rgba` keeps the current colour.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn restyle_shape_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    color_rgba: u32,
+    width_px: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        restyle_shape_annotation_inner(
+            doc_handle, page_index, index, capture_width, color_rgba, width_px, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn restyle_shape_annotation_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    color_rgba: u32,
+    width_px: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    // Read tag AND the annotation's own bounds BEFORE the delete, so a mark
+    // that is not one of our shapes leaves the page untouched.
+    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, page_left, page_top, page_w, bounds) = {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else { return STATUS_INVALID_INPUT; };
+        let Some(annotation) = page.annotations().iter().nth(index as usize) else { return STATUS_INVALID_INPUT; };
+        let Some(tag) = annotation.contents().as_deref().and_then(parse_shape_tag) else {
+            return STATUS_UNSUPPORTED;
+        };
+        let Ok(bx) = annotation.bounds() else { return STATUS_INVALID_INPUT; };
+        let pw = page.width().value;
+        if pw <= 0.0 { return STATUS_INVALID_INPUT; }
+        let (page_left, page_top) = match page.boundaries().media().map(|b| b.bounds) {
+            Ok(b) => (b.left().value, b.top().value),
+            Err(_) => (0.0, page.height().value),
+        };
+        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, page_left, page_top, pw, bx)
+    };
+
+    // Convert the annotation's PDF-point bounds back into capture space.
+    let scale_cap_per_pt = capture_width as f32 / page_w;
+    let cap_left = (bounds.left().value - page_left) * scale_cap_per_pt;
+    let cap_right = (bounds.right().value - page_left) * scale_cap_per_pt;
+    let cap_top = (page_top - bounds.top().value) * scale_cap_per_pt;
+    let cap_bottom = (page_top - bounds.bottom().value) * scale_cap_per_pt;
+
+    // Apply the caller's overrides on top of the tag's own values.
+    let (nr, ng, nb, na) = if (color_rgba & 0xFF) != 0 {
+        (((color_rgba >> 24) & 0xFF) as u8,
+         ((color_rgba >> 16) & 0xFF) as u8,
+         ((color_rgba >> 8) & 0xFF) as u8,
+         (color_rgba & 0xFF) as u8)
+    } else {
+        (cur_r, cur_g, cur_b, cur_a)
+    };
+    let new_width_px = if width_px >= 0.0 {
+        width_px
+    } else {
+        // Tag stored width in POINTS; ShapeSpec wants capture pixels.
+        cur_width_pts * scale_cap_per_pt
+    };
+
+    if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // Restore the drag-direction so an arrow keeps its head where it was.
+    let (x1, x2) = if fx { (cap_left, cap_right) } else { (cap_right, cap_left) };
+    let (y1, y2) = if fy { (cap_top, cap_bottom) } else { (cap_bottom, cap_top) };
+
+    let spec = ShapeSpec {
+        page_index, kind, x1, y1, x2, y2,
+        r: nr, g: ng, b: nb, a: na,
+        width_px: new_width_px,
+    };
+    let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
+    if status != STATUS_OK_PDFIUM { return status; }
+
+    if !out_new_index.is_null() {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        if let Some(doc) = doc {
+            let doc_guard = lock(&doc);
+            if let Ok(page) = doc_guard.pages().get(page_index as u16) {
+                let count = page.annotations().len() as i32;
+                unsafe { *out_new_index = count - 1 };
+            }
+        }
+    }
+    STATUS_OK_PDFIUM
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resize_shape_annotation_inner(
     doc_handle: u64,

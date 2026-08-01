@@ -64,7 +64,8 @@ public sealed partial class MainPage : Page
         // exposes its style, the way Word does.
         ViewModel.PropertyChanged += (_, args) =>
         {
-            if (args.PropertyName == nameof(ViewModel.HasSelectedTextBox))
+            if (args.PropertyName == nameof(ViewModel.HasSelectedTextBox)
+                || args.PropertyName == nameof(ViewModel.HasSelectedShape))
             {
                 UpdateToolRail();
             }
@@ -1459,6 +1460,7 @@ public sealed partial class MainPage : Page
         // Through ApplyColor so the tool's OPACITY is preserved: the picker sets
         // hue only, and the separate opacity slider owns alpha.
         ApplyColor(new InkColor("Custom", hex), highlighting);
+        ViewModel.ApplyStyleToSelectedShape(changeColor: true, changeWidth: false);
 
         // A custom colour is no preset, so nothing in the list is selected.
         _suppressColorChange = true;
@@ -1572,6 +1574,9 @@ public sealed partial class MainPage : Page
         if (!_suppressColorChange && ColorChoices.SelectedItem is InkColor c)
         {
             ApplyColor(c, ViewModel.ActiveTool == ToolMode.Highlight);
+            // If the current selection is a shape, apply the new colour to it,
+            // not just to the tool's state for the next mark.
+            ViewModel.ApplyStyleToSelectedShape(changeColor: true, changeWidth: false);
             UpdateCustomSwatch();
             ReturnFocusAfterPointerUse();
         }
@@ -1582,6 +1587,7 @@ public sealed partial class MainPage : Page
         if (WidthChoices.SelectedItem is InkWidth w)
         {
             ViewModel.InkWidth = w.Value;
+            ViewModel.ApplyStyleToSelectedShape(changeColor: false, changeWidth: true);
             ReturnFocusAfterPointerUse();
         }
     }
@@ -1648,9 +1654,12 @@ public sealed partial class MainPage : Page
 
         PropertyBarToolName.Text = tool.Name;
 
-        bool color = tool.Offers(ToolOptions.Color);
+        // Colour and width sections show for tools that offer them AND for a
+        // selected shape under any tool, so clicking a shape in Select mode
+        // still exposes its style, the way Word does for text.
+        bool color = tool.Offers(ToolOptions.Color) || ViewModel.HasSelectedShape;
         ColorSection.Visibility = Show(color);
-        WidthSection.Visibility = Show(tool.Offers(ToolOptions.Width));
+        WidthSection.Visibility = Show(tool.Offers(ToolOptions.Width) || ViewModel.HasSelectedShape);
 
         // Opacity rides on the colour, so it is only meaningful where there is
         // a colour to apply it to.

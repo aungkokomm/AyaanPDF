@@ -905,6 +905,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
 
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
 
@@ -1981,6 +1982,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// so a Select-tool click on a text box still exposes its properties.</summary>
     public bool HasSelectedTextBox => _selectedLoaded is not null && _selectedIsTextBox;
 
+    /// <summary>True when the current loaded selection is one of our SHAPES
+    /// (rectangle, ellipse, line, arrow). The toolbar uses this to show the
+    /// colour and width sections whenever a shape is selected under any tool,
+    /// so a Select-tool pick on a shape exposes its style.</summary>
+    public bool HasSelectedShape => _selectedLoaded is not null && _selectedIsShape;
+
+    /// <summary>Whether the current selection is a shape (rectangle, ellipse,
+    /// line, arrow). Set once on selection so the drag path pays no per-sample
+    /// FFI cost. Cleared alongside the other selection flags.</summary>
+    private bool _selectedIsShape;
+
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
     {
@@ -2011,6 +2023,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RefreshSelectionOutline();
             OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
             return true;
         }
 
@@ -2050,6 +2063,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
         return false;
     }
 
@@ -2063,12 +2077,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _selectedAnnotationId = null;
         _selectedLoaded = null;
         _selectedIsTextBox = false;
+        _selectedIsShape = false;
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         _moveOrigin = null;
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
     }
 
     /// <summary>
@@ -2155,6 +2171,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
     }
 
     private void ReplaceAnnotation(Guid id, Func<IAnnotation, IAnnotation> edit)
@@ -2333,6 +2350,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
         return true;
     }
 
@@ -2345,11 +2363,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void ApplyTextBoxSelectionInfo(int pageIndex, int index)
     {
         _selectedRotationDeg = 0;
-        if (!TextBoxTagReader.TryParse(ReadAnnotationContents(pageIndex, index), out var tag))
+        // Whether the selection is a shape is decided by whether its /Contents
+        // parses as our shape tag; the shape check comes first because it is a
+        // cheap prefix test and rules out most other marks.
+        string? contents = ReadAnnotationContents(pageIndex, index);
+        _selectedIsShape = contents is not null && contents.StartsWith("AyaanShape:", StringComparison.Ordinal);
+
+        if (!TextBoxTagReader.TryParse(contents, out var tag))
         {
             _selectedIsTextBox = false;
             return;
         }
+        _selectedIsShape = false; // a text box, not a shape
 
         _selectedIsTextBox = true;
         _selectedRotationDeg = tag.RotationDeg;
@@ -2379,6 +2404,55 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         TextUnderline = tag.Underline;
         TextStrikethrough = tag.Strikethrough;
         RestoreTextFont(tag.FontPath);
+    }
+
+    /// <summary>
+    /// Re-writes the selected SHAPE (rectangle, ellipse, line, arrow) with the
+    /// current ink colour and/or the current stroke width, keeping its bounds
+    /// and kind. Called by the picker click handlers so a colour or width
+    /// change applies to the selected shape, not just to the next one drawn.
+    /// A width of null keeps the shape's own width.
+    /// </summary>
+    public void ApplyStyleToSelectedShape(bool changeColor = true, bool changeWidth = false)
+    {
+        if (_documentHandle == 0
+            || _selectedLoaded is not LoadedSelection sel
+            || !_selectedIsShape)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+        // 0 alpha in the packed rgba tells the core to keep the tag's current
+        // colour, so we only send the ink colour when the caller is actually
+        // changing it. Same idea for width: negative means keep.
+        uint colorRgba = changeColor ? PackRgba(InkColorHex) : 0u;
+        float widthPx = changeWidth ? (float)InkWidth : -1f;
+
+        PushHistory(HistoryScope.Document, "Restyle shape");
+        int status = RenderCoreNative.restyle_shape_annotation(
+            _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
+            colorRgba, widthPx, out int newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not apply that style.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+
+        // The re-added shape is at the end of the list; follow it and re-read
+        // its bounds so the marquee stays on the mark.
+        var actual = LoadedFor(sel.PageIndex)
+            .Where(x => x.Index == newIndex)
+            .Select(x => (Interop.ExistingAnnotation?)x)
+            .FirstOrDefault();
+        _selectedLoaded = actual is Interop.ExistingAnnotation a
+            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom)
+            : sel with { Index = newIndex };
+        RefreshSelectionOutline();
     }
 
     /// <summary>
@@ -2759,6 +2833,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
     }
 
     /// <summary>Deletes the selected annotation from the file itself.</summary>
@@ -2793,6 +2868,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
         return true;
     }
 
@@ -3789,6 +3865,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
         RefreshSelectionOutline();
 
         IsDirty = true;
@@ -4044,6 +4121,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 RefreshSelectionOutline();
                 OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
             }
 
             NotifyHistoryChanged();

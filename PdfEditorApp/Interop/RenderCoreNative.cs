@@ -643,6 +643,22 @@ internal static partial class RenderCoreNative
     /// to keep the thickness, and -1 for the decoration flags to keep those.
     /// The tag's bounds, rotation, font, size, and words are all preserved.
     /// </summary>
+    /// <summary>
+    /// Applies a new colour and/or stroke width to one of our shapes, keeping
+    /// its bounds and kind. An alpha of 0 in <paramref name="colorRgba"/> keeps
+    /// the current colour; a negative <paramref name="widthPx"/> keeps the
+    /// current width.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int restyle_shape_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        uint colorRgba,
+        float widthPx,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int restyle_text_box_annotation(
         ulong docHandle,
