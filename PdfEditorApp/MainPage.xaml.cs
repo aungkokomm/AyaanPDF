@@ -995,6 +995,7 @@ public sealed partial class MainPage : Page
         ViewModel.TextFillHex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
         SyncTextStyleControls();
         UpdateOpenEditorStyle();
+        ViewModel.ApplyStyleToSelectedTextBox();
     }
 
     private void NoFill_Click(object sender, RoutedEventArgs e)
@@ -1002,6 +1003,7 @@ public sealed partial class MainPage : Page
         ViewModel.TextFillHex = "";
         SyncTextStyleControls();
         UpdateOpenEditorStyle();
+        ViewModel.ApplyStyleToSelectedTextBox();
         FillFlyout.Hide();
     }
 
@@ -1025,6 +1027,7 @@ public sealed partial class MainPage : Page
         ViewModel.TextOutlineHex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
         SyncTextStyleControls();
         UpdateOpenEditorStyle();
+        ViewModel.ApplyStyleToSelectedTextBox();
     }
 
     private void NoOutline_Click(object sender, RoutedEventArgs e)
@@ -1032,12 +1035,15 @@ public sealed partial class MainPage : Page
         ViewModel.TextOutlineHex = "";
         SyncTextStyleControls();
         UpdateOpenEditorStyle();
+        ViewModel.ApplyStyleToSelectedTextBox();
         OutlineFlyout.Hide();
     }
 
     /// <summary>A fill preset swatch was clicked; its Tag is the "#AARRGGBB" hex.
     /// The picker closes immediately so the fill is applied in one gesture, the
-    /// way a user of Word or Acrobat expects.</summary>
+    /// way a user of Word or Acrobat expects. If a text box is selected, the
+    /// fill is applied to IT; otherwise the pick sets the tool's fill for the
+    /// next box.</summary>
     private void FillPreset_Click(object sender, RoutedEventArgs e)
     {
         if (sender is Button b && b.Tag is string hex && !string.IsNullOrEmpty(hex))
@@ -1045,6 +1051,7 @@ public sealed partial class MainPage : Page
             ViewModel.TextFillHex = hex;
             SyncTextStyleControls();
             UpdateOpenEditorStyle();
+            ViewModel.ApplyStyleToSelectedTextBox();
             FillFlyout.Hide();
         }
     }
@@ -1057,6 +1064,7 @@ public sealed partial class MainPage : Page
             ViewModel.TextOutlineHex = hex;
             SyncTextStyleControls();
             UpdateOpenEditorStyle();
+            ViewModel.ApplyStyleToSelectedTextBox();
             OutlineFlyout.Hide();
         }
     }
@@ -1072,6 +1080,7 @@ public sealed partial class MainPage : Page
         {
             ViewModel.TextOutlineWidthNorm = pt / 1000.0;
             UpdateOpenEditorStyle();
+            ViewModel.ApplyStyleToSelectedTextBox();
         }
     }
 

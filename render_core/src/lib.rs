@@ -3400,8 +3400,84 @@ pub extern "C" fn resize_text_box_annotation(
     }
 
     panic::catch_unwind(|| {
-        relayout_text_box_inner(
-            doc_handle, page_index, index, capture_width, left, top, right, bottom, None, out_new_index)
+        relayout_text_box_inner_v2(
+            doc_handle, page_index, index, capture_width,
+            Some(left), Some(top), Some(right), Some(bottom),
+            None, None, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// A partial style patch for a text box: any field left None keeps the value
+/// already in the tag. Used by `restyle_text_box_annotation` to change the fill
+/// or outline while preserving the words, font, rotation, and bounds.
+#[derive(Default)]
+struct StyleOverride {
+    text_color: Option<(u8, u8, u8, u8)>,
+    align: Option<i32>,
+    fill: Option<PackedRgba>,
+    outline: Option<PackedRgba>,
+    outline_width_px: Option<f32>,
+    underline: Option<bool>,
+    strikethrough: Option<bool>,
+}
+
+/// Applies a NEW style (fill, outline, underline, etc.) to one of OUR text boxes
+/// without moving or turning it: the tag's bounds, rotation, font, size, and
+/// words are all preserved, only the style fields the caller wants to change are
+/// updated, then the box is re-laid-out. -1 (or a negative width) leaves that
+/// field alone; a colour with alpha 0 means "no fill / no outline".
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn restyle_text_box_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    text_rgba: u32,
+    align: i32,
+    fill_rgba: u32,
+    outline_rgba: u32,
+    outline_width_px: f32,
+    underline: i32,
+    strikethrough: i32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let text_color = if text_rgba != 0 {
+        Some((
+            ((text_rgba >> 24) & 0xFF) as u8,
+            ((text_rgba >> 16) & 0xFF) as u8,
+            ((text_rgba >> 8) & 0xFF) as u8,
+            (text_rgba & 0xFF) as u8,
+        ))
+    } else { None };
+    let align_opt = if matches!(align, ALIGN_LEFT | ALIGN_CENTER | ALIGN_RIGHT | ALIGN_JUSTIFY) {
+        Some(align)
+    } else { None };
+    let width_opt = if outline_width_px >= 0.0 { Some(outline_width_px) } else { None };
+    let overrides = StyleOverride {
+        text_color,
+        align: align_opt,
+        // A colour is a patch iff the alpha is set; alpha 0 is a legal patch
+        // meaning "clear the fill/outline".
+        fill: Some(PackedRgba(fill_rgba)),
+        outline: Some(PackedRgba(outline_rgba)),
+        outline_width_px: width_opt,
+        underline: if underline < 0 { None } else { Some(underline != 0) },
+        strikethrough: if strikethrough < 0 { None } else { Some(strikethrough != 0) },
+    };
+
+    panic::catch_unwind(|| {
+        // Bounds are the tag's own upright rect; left..bottom of 0 tells the inner
+        // function to take them from the tag.
+        relayout_text_box_inner_v2(
+            doc_handle, page_index, index, capture_width,
+            None, None, None, None,
+            None, Some(overrides), out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -3433,31 +3509,41 @@ pub extern "C" fn rotate_text_box_annotation(
     }
 
     panic::catch_unwind(|| {
-        relayout_text_box_inner(
-            doc_handle, page_index, index, capture_width, left, top, right, bottom,
-            Some(degrees), out_new_index)
+        relayout_text_box_inner_v2(
+            doc_handle, page_index, index, capture_width,
+            Some(left), Some(top), Some(right), Some(bottom),
+            Some(degrees), None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
 
+/// The shared re-layout for a text box: parse its tag, optionally override its
+/// bounds/rotation/style, delete, and re-add. Move/resize passes new bounds;
+/// rotate passes a new angle; restyle passes new style fields; each keeps
+/// everything the caller does not override (font, words, size, and any bit of
+/// style not patched). Bounds default to the tight upright rect in the tag when
+/// the caller passes None for them.
 #[allow(clippy::too_many_arguments)]
-fn relayout_text_box_inner(
+fn relayout_text_box_inner_v2(
     doc_handle: u64,
     page_index: i32,
     index: i32,
     capture_width: i32,
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
+    left: Option<f32>,
+    top: Option<f32>,
+    right: Option<f32>,
+    bottom: Option<f32>,
     rotation_override: Option<f32>,
+    style_override: Option<StyleOverride>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
     // Read and parse the tag BEFORE anything is removed, so a mark that is not
-    // one of our text boxes leaves the page untouched.
-    let mut parsed = {
+    // one of our text boxes leaves the page untouched. Also grab the page's
+    // width in points here, since we may need it to convert the tag's own
+    // normalized rect into capture space for the caller-omitted bounds case.
+    let (mut parsed, page_w_pts) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
@@ -3470,35 +3556,67 @@ fn relayout_text_box_inner(
         let Some(annotation) = page.annotations().iter().nth(index as usize) else {
             return STATUS_INVALID_INPUT;
         };
-        match annotation.contents().as_deref().and_then(parse_textbox_tag_full) {
+        let parsed = match annotation.contents().as_deref().and_then(parse_textbox_tag_full) {
             Some(p) => p,
             None => return STATUS_UNSUPPORTED,
-        }
+        };
+        (parsed, page.width().value)
     };
 
-    // A rotate sets a NEW absolute angle; a resize keeps whatever the tag carried,
-    // so a rotated box stays turned when it is resized.
+    // A rotate sets a NEW absolute angle; a resize keeps whatever the tag carried.
     if let Some(deg) = rotation_override {
         parsed.style.rotation_deg = deg;
     }
+
+    // Restyle patches a subset of the style fields; unset fields keep the tag's
+    // value. The text colour is patched separately because it lives outside the
+    // TextStyle struct.
+    let mut text_r = parsed.r;
+    let mut text_g = parsed.g;
+    let mut text_b = parsed.b;
+    let mut text_a = parsed.a;
+    if let Some(over) = style_override {
+        if let Some((r, g, b, a)) = over.text_color {
+            text_r = r; text_g = g; text_b = b; text_a = a;
+        }
+        if let Some(a) = over.align { parsed.style.align = a; }
+        if let Some(f) = over.fill { parsed.style.fill = f; }
+        if let Some(o) = over.outline { parsed.style.outline = o; }
+        if let Some(w) = over.outline_width_px { parsed.style.outline_width_px = w; }
+        if let Some(u) = over.underline { parsed.style.underline = u; }
+        if let Some(s) = over.strikethrough { parsed.style.strikethrough = s; }
+    }
+
+    // Bounds: caller-provided override the tag; otherwise take the tight upright
+    // rect out of the tag (which was normalized like get_annotations reports,
+    // i.e. offset/page_width). Convert to capture space.
+    let (bl, bt, br, bb) = if let (Some(l), Some(t), Some(r), Some(b)) = (left, top, right, bottom) {
+        (l, t, r, b)
+    } else {
+        // Read the box rect that add_text_box_inner wrote into the tag. We use the
+        // page width already fetched above (in points) with the caller's capture
+        // width to scale from normalized coords back to capture coords.
+        // The rect field in the tag is expressed as offset/page_width for all four
+        // sides, so multiplying by capture_width recovers capture-space pixels.
+        let (nl, nt, nr, nb) = tag_box_rect(index as usize, doc_handle, page_index)
+            .unwrap_or((0.0, 0.0, 1.0, 1.0));
+        (nl * capture_width as f32, nt * capture_width as f32,
+         nr * capture_width as f32, nb * capture_width as f32)
+    };
+    let _ = page_w_pts;
 
     if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
         return STATUS_INVALID_INPUT;
     }
 
-    // Re-lay-out at the new bounds. add_text_box_inner re-wraps to the width and
-    // grows the height to fit, embedding the same font, so the box returns in the
-    // same style, just re-flowed (and turned to the new angle). It writes its own
-    // AyaanTextB tag again.
     let status = add_text_box_inner(
-        doc_handle, page_index, capture_width, left, top, right, bottom,
-        &parsed.text, parsed.size_px, parsed.r, parsed.g, parsed.b, parsed.a,
+        doc_handle, page_index, capture_width, bl, bt, br, bb,
+        &parsed.text, parsed.size_px, text_r, text_g, text_b, text_a,
         parsed.style, parsed.font_path.as_deref());
     if status != STATUS_OK_PDFIUM {
         return status;
     }
 
-    // The rebuilt box is appended, so it is the last annotation on the page.
     if !out_new_index.is_null() {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -3512,6 +3630,30 @@ fn relayout_text_box_inner(
     }
 
     STATUS_OK_PDFIUM
+}
+
+/// Reads the tight upright rect the tag records for one of our text boxes.
+/// Used by restyle so the caller does not have to know the box's bounds. The
+/// rect fields (indices 9..=12) are only present on the >=14-field form; older
+/// boxes return None and the caller falls back to whatever else it has.
+fn tag_box_rect(index: usize, doc_handle: u64, page_index: i32) -> Option<(f32, f32, f32, f32)> {
+    use pdfium_render::prelude::*;
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned()?;
+    let doc_guard = lock(&doc);
+    let page = doc_guard.pages().get(page_index as u16).ok()?;
+    let annotation = page.annotations().iter().nth(index)?;
+    let contents = annotation.contents()?;
+    let parts: Vec<&str> = contents.strip_prefix(TEXTBOX_TAG_STYLED)?.split(':').collect();
+    if parts.len() < 14 {
+        return None;
+    }
+    Some((
+        parts[9].parse().ok()?,
+        parts[10].parse().ok()?,
+        parts[11].parse().ok()?,
+        parts[12].parse().ok()?,
+    ))
 }
 
 /// Adds freehand strokes as real PDF `/Ink` annotation objects.

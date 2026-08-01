@@ -634,6 +634,30 @@ internal static partial class RenderCoreNative
         float degrees,
         out int newIndex);
 
+    /// <summary>
+    /// Applies a new style to one of our text boxes without moving or turning
+    /// it: text colour, alignment, fill, outline, thickness, underline and
+    /// strikethrough. Any field the caller does not want to change is left
+    /// alone: pass 0 for <paramref name="textRgba"/> to keep the text colour,
+    /// -1 for <paramref name="align"/> to keep the alignment, a negative width
+    /// to keep the thickness, and -1 for the decoration flags to keep those.
+    /// The tag's bounds, rotation, font, size, and words are all preserved.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int restyle_text_box_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        uint textRgba,
+        int align,
+        uint fillRgba,
+        uint outlineRgba,
+        float outlineWidthPx,
+        int underline,
+        int strikethrough,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int resize_annotation(
         ulong docHandle,

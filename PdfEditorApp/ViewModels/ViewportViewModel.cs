@@ -2348,6 +2348,88 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 Left = tag.BoxLeft, Top = tag.BoxTop, Right = tag.BoxRight, Bottom = tag.BoxBottom,
             };
         }
+
+        // Populate the tool's style from the box's own tag, so the toolbar shows
+        // this box's colours/font/size/decorations and any change picks up on top
+        // of them, rather than overwriting with whatever leftover state the tool
+        // happened to have. Without this, picking a fill colour after selecting
+        // an existing box did nothing visible because the box was rebuilt with
+        // stale style values from the last new box.
+        TextFontSize = tag.FontSizeNorm;
+        InkColorHex = tag.ColorHex;
+        TextAlign = tag.Align;
+        TextFillHex = tag.FillHex;
+        TextOutlineHex = tag.OutlineHex;
+        if (tag.OutlineWidthNorm > 0)
+        {
+            TextOutlineWidthNorm = tag.OutlineWidthNorm;
+        }
+        TextUnderline = tag.Underline;
+        TextStrikethrough = tag.Strikethrough;
+        RestoreTextFont(tag.FontPath);
+
+        // The toolbar's text sections show only for the Text tool. Switching now
+        // means clicking on a text box opens its properties in the toolbar, the
+        // way selecting one in Word does.
+        ActiveTool = ToolMode.Text;
+    }
+
+    /// <summary>
+    /// Re-writes the selected text box with the tool's current style (fill,
+    /// outline, thickness, colour, alignment, decorations), keeping the box's
+    /// words, font, bounds, and rotation. Used by the picker click handlers so
+    /// a preset colour applies to the box you have selected, not just to the
+    /// next box you type.
+    /// </summary>
+    public void ApplyStyleToSelectedTextBox()
+    {
+        if (_documentHandle == 0
+            || _selectedLoaded is not LoadedSelection sel
+            || !_selectedIsTextBox)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+        var (tr, tg, tb, ta) = ParseHex(InkColorHex, defaultAlpha: 0xFF);
+        uint textRgba = ((uint)tr << 24) | ((uint)tg << 16) | ((uint)tb << 8) | ta;
+
+        PushHistory(HistoryScope.Document, "Restyle text");
+
+        int status = RenderCoreNative.restyle_text_box_annotation(
+            _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
+            textRgba,
+            (int)TextAlign,
+            PackRgba(TextFillHex),
+            PackRgba(TextOutlineHex),
+            (float)(TextOutlineWidthNorm * CaptureWidth),
+            TextUnderline ? 1 : 0,
+            TextStrikethrough ? 1 : 0,
+            out int newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not apply that style.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+
+        // Follow the re-laid-out box's own tight rect and angle, the same way
+        // CommitLoadedMove and CommitRotation do, so the marquee stays on it.
+        if (TextBoxTagReader.TryParse(ReadAnnotationContents(sel.PageIndex, newIndex), out var tag)
+            && tag.HasBoxRect)
+        {
+            _selectedRotationDeg = tag.RotationDeg;
+            _selectedLoaded = new LoadedSelection(
+                sel.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom);
+        }
+        else
+        {
+            _selectedLoaded = sel with { Index = newIndex };
+        }
+        RefreshSelectionOutline();
     }
 
     /// <summary>The handle under a point, accounting for the box's rotation: the
