@@ -3558,6 +3558,96 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private static TextRect MarqueeRect(double ax, double ay, double bx, double by) =>
         new(Math.Min(ax, bx), Math.Min(ay, by), Math.Max(ax, bx), Math.Max(ay, by));
 
+    /// <summary>
+    /// Starts a selection-marquee: drag a rectangle over annotations and every
+    /// one it touches gets added to the multi-selection on release. Does NOT
+    /// clear the current selection - the marquee EXTENDS what is selected the
+    /// same way Shift-click does. The preview uses the same SelectionRects
+    /// overlay slot the highlight-tool marquee uses (nothing on screen shows
+    /// both at once, and this saves a second binding).
+    /// </summary>
+    public void BeginSelectionMarquee(int pageIndex, double x, double y)
+    {
+        _marqueePage = pageIndex;
+        _marqueeAnchor = (Norm(x), Norm(y));
+    }
+
+    /// <summary>Ends a selection marquee: adds every loaded annotation on the
+    /// marquee's page whose bounds INTERSECT the rectangle to the multi-selection.
+    /// A tiny marquee (a click without drag) is ignored. Duplicates are skipped so
+    /// re-marqueeing over the same set is idempotent.</summary>
+    public void EndSelectionMarquee()
+    {
+        if (_marqueeAnchor is not (double _, double _))
+        {
+            return;
+        }
+
+        var slot = SlotFor(_marqueePage);
+        var scaled = slot?.SelectionRects.Count > 0 ? slot.SelectionRects[0] : default;
+        var rect = new TextRect(
+            scaled.Left / SlotLayoutWidth,
+            scaled.Top / SlotLayoutWidth,
+            (scaled.Left + scaled.Width) / SlotLayoutWidth,
+            (scaled.Top + scaled.Height) / SlotLayoutWidth);
+        _marqueeAnchor = null;
+        slot?.SelectionRects.Clear();
+
+        const double MinSize = 0.005;
+        if (rect.Width < MinSize || rect.Height < MinSize)
+        {
+            return;
+        }
+
+        // Hit-test every loaded annotation on this page against the rect.
+        // "Intersects" not "contains", so a shape that is only partly under the
+        // marquee gets picked up - the way Illustrator and PowerPoint work.
+        var loaded = LoadedFor(_marqueePage);
+        var hits = new List<LoadedSelection>();
+        foreach (var a in loaded)
+        {
+            if (a.Right < rect.Left || a.Left > rect.Right) { continue; }
+            if (a.Bottom < rect.Top || a.Top > rect.Bottom) { continue; }
+            hits.Add(new LoadedSelection(_marqueePage, a.Index, a.Left, a.Top, a.Right, a.Bottom));
+        }
+        if (hits.Count == 0)
+        {
+            RefreshSelectionOutline();
+            return;
+        }
+
+        // If nothing is currently selected, the first hit becomes the anchor and
+        // the rest become extras. If an anchor already exists, everything the
+        // marquee touched is added to the extras (skipping duplicates).
+        if (_selectedLoaded is not LoadedSelection currentAnchor)
+        {
+            var first = hits[0];
+            _selectedLoaded = first;
+            ApplyTextBoxSelectionInfo(first.PageIndex, first.Index);
+            for (int i = 1; i < hits.Count; i++)
+            {
+                if (!_extraSelected.Any(e => e.PageIndex == hits[i].PageIndex && e.Index == hits[i].Index))
+                {
+                    _extraSelected.Add(hits[i]);
+                }
+            }
+        }
+        else
+        {
+            foreach (var s in hits)
+            {
+                if (s.PageIndex == currentAnchor.PageIndex && s.Index == currentAnchor.Index) { continue; }
+                if (_extraSelected.Any(e => e.PageIndex == s.PageIndex && e.Index == s.Index)) { continue; }
+                _extraSelected.Add(s);
+            }
+        }
+
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
+    }
+
     public void BeginTextSelection(int pageIndex, double x, double y)
     {
         ClearSelection();

@@ -37,6 +37,11 @@ public sealed partial class MainPage : Page
     private bool _isDrawingShape;
     private bool _isMovingAnnotation;
     private bool _isMarqueeing;
+
+    /// <summary>Distinguishes the SELECT-tool marquee (picks up annotations) from
+    /// the HIGHLIGHT-tool marquee (creates a highlight). Both share the same
+    /// preview drawing and pointer flag; only the release side branches.</summary>
+    private bool _isAnnotationMarquee;
     private bool _isPanning;
     private Point _panLastPoint;
     private Point _panTarget;
@@ -2729,6 +2734,27 @@ public sealed partial class MainPage : Page
                     break;
                 }
 
+                // Empty-area drag with Shift = SELECTION MARQUEE: draw a
+                // rectangle over the annotations, on release every one it
+                // touches is added to the multi-selection (the extras). Plain
+                // drag still starts text selection so people can pick page text
+                // the way they always could. The marquee reuses the same
+                // preview overlay the highlight-tool marquee uses.
+                var shiftState = Microsoft.UI.Input.InputKeyboardSource
+                    .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift);
+                bool shiftDown = (shiftState & Windows.UI.Core.CoreVirtualKeyStates.Down)
+                                 == Windows.UI.Core.CoreVirtualKeyStates.Down;
+                if (shiftDown)
+                {
+                    _isMarqueeing = true;
+                    _isAnnotationMarquee = true;
+                    _dragPointerId = current.PointerId;
+                    ViewportHost.CapturePointer(e.Pointer);
+                    ViewModel.BeginSelectionMarquee(content.Page, content.X, content.Y);
+                    e.Handled = true;
+                    break;
+                }
+
                 _isSelectingText = true;
                 _dragPointerId = current.PointerId;
                 ViewportHost.CapturePointer(e.Pointer);
@@ -2903,9 +2929,18 @@ public sealed partial class MainPage : Page
         }
         else if (_isMarqueeing)
         {
+            bool wasAnnotation = _isAnnotationMarquee;
             _isMarqueeing = false;
+            _isAnnotationMarquee = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);
-            ViewModel.EndMarquee();
+            if (wasAnnotation)
+            {
+                ViewModel.EndSelectionMarquee();
+            }
+            else
+            {
+                ViewModel.EndMarquee();
+            }
             e.Handled = true;
         }
         else if (_isSelectingText)
