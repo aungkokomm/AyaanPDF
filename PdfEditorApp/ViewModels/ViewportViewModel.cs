@@ -906,6 +906,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
 
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
 
@@ -1988,6 +1989,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// so a Select-tool pick on a shape exposes its style.</summary>
     public bool HasSelectedShape => _selectedLoaded is not null && _selectedIsShape;
 
+    /// <summary>How many loaded annotations are in the current multi-selection
+    /// (anchor plus extras). Zero when nothing is selected. The align/distribute
+    /// controls key their visibility off this: alignment needs at least two.</summary>
+    public int SelectionCount => (_selectedLoaded is null ? 0 : 1) + _extraSelected.Count;
+
+    /// <summary>True when at least two annotations are selected together, so
+    /// alignment and grouping become meaningful.</summary>
+    public bool HasMultiSelection => SelectionCount >= 2;
+
     /// <summary>Whether the current selection is a shape (rectangle, ellipse,
     /// line, arrow). Set once on selection so the drag path pays no per-sample
     /// FFI cost. Cleared alongside the other selection flags.</summary>
@@ -2024,6 +2034,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
             return true;
         }
 
@@ -2075,6 +2086,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
         return false;
     }
 
@@ -2098,6 +2110,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
     }
 
     /// <summary>
@@ -2185,6 +2198,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
     }
 
     private void ReplaceAnnotation(Guid id, Func<IAnnotation, IAnnotation> edit)
@@ -2453,6 +2467,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
         return true;
     }
 
@@ -2968,6 +2983,195 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
     }
 
+    /// <summary>What edge of the selection an alignment snaps to.</summary>
+    public enum AlignMode { Left, CenterH, Right, Top, MiddleV, Bottom }
+
+    /// <summary>Aligns every object in the multi-selection to a shared edge or
+    /// centre. Uses the SELECTION's overall bounding box as the reference (the
+    /// "align to selection" convention every editor uses). Each object moves
+    /// only; sizes stay. Written back to the document per object through the
+    /// same routing the drag-move uses (text-box relayout, shape restyle-move,
+    /// or generic bounds set).</summary>
+    public void AlignSelected(AlignMode mode)
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor)
+        {
+            return;
+        }
+        // Alignment on a single object is a no-op; save the caller a UI check.
+        if (_extraSelected.Count == 0) { return; }
+
+        // Selection bounding box.
+        double minL = anchor.Left, minT = anchor.Top;
+        double maxR = anchor.Right, maxB = anchor.Bottom;
+        foreach (var s in _extraSelected)
+        {
+            if (s.Left < minL) { minL = s.Left; }
+            if (s.Top < minT) { minT = s.Top; }
+            if (s.Right > maxR) { maxR = s.Right; }
+            if (s.Bottom > maxB) { maxB = s.Bottom; }
+        }
+
+        PushHistory(HistoryScope.Document, "Align");
+
+        // Compute each object's NEW bounds by shifting to hit the target.
+        // Anchor first, then extras. The write helper takes care of routing per type.
+        LoadedSelection newAnchor = ShiftToAlign(anchor, mode, minL, minT, maxR, maxB);
+        var newExtras = new List<LoadedSelection>(_extraSelected.Count);
+        foreach (var s in _extraSelected)
+        {
+            newExtras.Add(ShiftToAlign(s, mode, minL, minT, maxR, maxB));
+        }
+
+        CommitAlignedOrDistributed(anchor, newAnchor, newExtras);
+    }
+
+    /// <summary>Distributes the multi-selection evenly along one axis: each
+    /// object's centre lands on an even step between the two outermost centres.
+    /// Needs at least three objects (with two, "distribute" is undefined - they
+    /// are just the endpoints). Positions only; sizes stay.</summary>
+    public void DistributeSelected(bool horizontal)
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor)
+        {
+            return;
+        }
+        int total = 1 + _extraSelected.Count;
+        if (total < 3) { return; }
+
+        // Sort all selections by their axis centre. The two outermost keep their
+        // positions; the middle ones get moved to even steps between.
+        var all = new List<LoadedSelection> { anchor };
+        all.AddRange(_extraSelected);
+        double Centre(LoadedSelection s) => horizontal
+            ? (s.Left + s.Right) / 2
+            : (s.Top + s.Bottom) / 2;
+        var sorted = all.OrderBy(Centre).ToList();
+
+        double firstC = Centre(sorted[0]);
+        double lastC = Centre(sorted[^1]);
+        double step = (lastC - firstC) / (total - 1);
+
+        // Build the target centre for each sorted item.
+        var moved = new Dictionary<int, LoadedSelection>(); // keyed by identity via list index
+        for (int i = 0; i < sorted.Count; i++)
+        {
+            double targetC = firstC + step * i;
+            var s = sorted[i];
+            double delta = targetC - Centre(s);
+            var shifted = horizontal
+                ? s with { Left = s.Left + delta, Right = s.Right + delta }
+                : s with { Top = s.Top + delta, Bottom = s.Bottom + delta };
+            moved[i] = shifted;
+        }
+
+        // Map sorted results back onto anchor/extras by identity.
+        LoadedSelection FindMoved(LoadedSelection original)
+        {
+            int idx = sorted.FindIndex(x => x.PageIndex == original.PageIndex && x.Index == original.Index);
+            return idx >= 0 ? moved[idx] : original;
+        }
+
+        PushHistory(HistoryScope.Document, horizontal ? "Distribute horizontally" : "Distribute vertically");
+        var newAnchor = FindMoved(anchor);
+        var newExtras = _extraSelected.Select(FindMoved).ToList();
+        CommitAlignedOrDistributed(anchor, newAnchor, newExtras);
+    }
+
+    /// <summary>Shifts an object so a chosen edge/centre lands on a target value
+    /// taken from the selection bounding box. Size unchanged.</summary>
+    private static LoadedSelection ShiftToAlign(LoadedSelection s, AlignMode mode,
+        double minL, double minT, double maxR, double maxB)
+    {
+        double w = s.Right - s.Left;
+        double h = s.Bottom - s.Top;
+        double centreX = (minL + maxR) / 2;
+        double centreY = (minT + maxB) / 2;
+        return mode switch
+        {
+            AlignMode.Left => s with { Left = minL, Right = minL + w },
+            AlignMode.Right => s with { Left = maxR - w, Right = maxR },
+            AlignMode.CenterH => s with { Left = centreX - w / 2, Right = centreX + w / 2 },
+            AlignMode.Top => s with { Top = minT, Bottom = minT + h },
+            AlignMode.Bottom => s with { Top = maxB - h, Bottom = maxB },
+            AlignMode.MiddleV => s with { Top = centreY - h / 2, Bottom = centreY + h / 2 },
+            _ => s,
+        };
+    }
+
+    /// <summary>Writes new bounds for the anchor and each extra to the document
+    /// through the same routing the drag-move uses (text-box relayout, shape
+    /// restyle-move, or generic bounds set), then refreshes the overlay.</summary>
+    private void CommitAlignedOrDistributed(LoadedSelection oldAnchor,
+        LoadedSelection newAnchor, List<LoadedSelection> newExtras)
+    {
+        const int CaptureWidth = 1000;
+        var pagesTouched = new HashSet<int>();
+
+        // Anchor.
+        int anchorNewIndex = WriteMovedAnnotation(oldAnchor, newAnchor, CaptureWidth);
+        if (anchorNewIndex >= 0)
+        {
+            pagesTouched.Add(newAnchor.PageIndex);
+            _selectedLoaded = newAnchor with { Index = anchorNewIndex };
+        }
+
+        // Extras.
+        for (int i = 0; i < _extraSelected.Count && i < newExtras.Count; i++)
+        {
+            var oldExtra = _extraSelected[i];
+            var target = newExtras[i];
+            int newIdx = WriteMovedAnnotation(oldExtra, target, CaptureWidth);
+            if (newIdx >= 0)
+            {
+                _extraSelected[i] = target with { Index = newIdx };
+                pagesTouched.Add(target.PageIndex);
+            }
+        }
+
+        IsDirty = true;
+        foreach (int page in pagesTouched) { InvalidateLoadedPage(page); }
+        RefreshSelectionOutline();
+    }
+
+    /// <summary>Writes a single annotation's new bounds through the type-aware
+    /// path (text-box, shape, generic). Returns the new index or -1 on failure.</summary>
+    private int WriteMovedAnnotation(LoadedSelection oldSel, LoadedSelection target, int captureWidth)
+    {
+        float l = (float)(target.Left * captureWidth);
+        float t = (float)(target.Top * captureWidth);
+        float r = (float)(target.Right * captureWidth);
+        float b = (float)(target.Bottom * captureWidth);
+
+        string? contents = ReadAnnotationContents(oldSel.PageIndex, oldSel.Index);
+        bool isText = TextBoxTagReader.TryParse(contents, out _);
+        bool isShape = contents is not null
+            && contents.StartsWith("AyaanShape:", StringComparison.Ordinal);
+
+        int status = RenderStatus.Unsupported;
+        int newIndex = oldSel.Index;
+
+        if (isText)
+        {
+            status = RenderCoreNative.resize_text_box_annotation(
+                _documentHandle, oldSel.PageIndex, oldSel.Index, captureWidth,
+                l, t, r, b, out newIndex);
+        }
+        if (status != RenderStatus.OkPdfium && isShape)
+        {
+            status = RenderCoreNative.resize_shape_annotation(
+                _documentHandle, oldSel.PageIndex, oldSel.Index, captureWidth,
+                l, t, r, b, out newIndex);
+        }
+        if (status != RenderStatus.OkPdfium)
+        {
+            status = RenderCoreNative.resize_annotation(
+                _documentHandle, oldSel.PageIndex, oldSel.Index, captureWidth,
+                l, t, r, b, out newIndex);
+        }
+        return status == RenderStatus.OkPdfium ? newIndex : -1;
+    }
+
     /// <summary>Clones the current anchor selection IN PLACE and selects the clone,
     /// so the drag that follows moves the clone and leaves the original where it
     /// was. This is the Ctrl-drag = copy convention every editor uses. Only text
@@ -3067,6 +3271,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
         return true;
     }
 
@@ -3263,6 +3468,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
     }
 
     /// <summary>Deletes the selected annotation from the file itself.</summary>
@@ -3320,6 +3526,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
         return true;
     }
 
@@ -3750,6 +3957,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
     }
 
     public void BeginTextSelection(int pageIndex, double x, double y)
@@ -4444,6 +4652,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
         RefreshSelectionOutline();
 
         IsDirty = true;
@@ -4700,6 +4909,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
         OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
             }
 
             NotifyHistoryChanged();

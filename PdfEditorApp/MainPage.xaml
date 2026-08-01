@@ -1149,6 +1149,49 @@
                                Style="{StaticResource CaptionTextBlockStyle}" />
                 </StackPanel>
 
+                <!-- Align + distribute. Shown only when 2+ annotations are selected. -->
+                <StackPanel x:Name="AlignSection" Orientation="Horizontal" Spacing="3"
+                            VerticalAlignment="Center" Visibility="Collapsed">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <Button Width="28" Height="28" Padding="0" Tag="Left" Click="AlignObjects_Click"
+                            ToolTipService.ToolTip="Align left edges">
+                        <FontIcon Glyph="&#xE8E4;" FontSize="14" />
+                    </Button>
+                    <Button Width="28" Height="28" Padding="0" Tag="CenterH" Click="AlignObjects_Click"
+                            ToolTipService.ToolTip="Align horizontal centres">
+                        <FontIcon Glyph="&#xE8E3;" FontSize="14" />
+                    </Button>
+                    <Button Width="28" Height="28" Padding="0" Tag="Right" Click="AlignObjects_Click"
+                            ToolTipService.ToolTip="Align right edges">
+                        <FontIcon Glyph="&#xE8E2;" FontSize="14" />
+                    </Button>
+                    <Rectangle Width="1" Height="14" VerticalAlignment="Center"
+                               Margin="2,0" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <Button Width="28" Height="28" Padding="0" Tag="Top" Click="AlignObjects_Click"
+                            ToolTipService.ToolTip="Align top edges">
+                        <TextBlock Text="T" FontSize="12" HorizontalAlignment="Center" />
+                    </Button>
+                    <Button Width="28" Height="28" Padding="0" Tag="MiddleV" Click="AlignObjects_Click"
+                            ToolTipService.ToolTip="Align vertical centres">
+                        <TextBlock Text="M" FontSize="12" HorizontalAlignment="Center" />
+                    </Button>
+                    <Button Width="28" Height="28" Padding="0" Tag="Bottom" Click="AlignObjects_Click"
+                            ToolTipService.ToolTip="Align bottom edges">
+                        <TextBlock Text="B" FontSize="12" HorizontalAlignment="Center" />
+                    </Button>
+                    <Rectangle Width="1" Height="14" VerticalAlignment="Center"
+                               Margin="2,0" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <Button Width="28" Height="28" Padding="0" Tag="H" Click="Distribute_Click"
+                            ToolTipService.ToolTip="Distribute horizontally (3+ objects)">
+                        <TextBlock Text="↔" FontSize="14" HorizontalAlignment="Center" />
+                    </Button>
+                    <Button Width="28" Height="28" Padding="0" Tag="V" Click="Distribute_Click"
+                            ToolTipService.ToolTip="Distribute vertically (3+ objects)">
+                        <TextBlock Text="↕" FontSize="14" HorizontalAlignment="Center" />
+                    </Button>
+                </StackPanel>
+
                 <!-- Stamps -->
                 <StackPanel x:Name="StampSection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">

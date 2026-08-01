@@ -70,7 +70,8 @@ public sealed partial class MainPage : Page
         ViewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName == nameof(ViewModel.HasSelectedTextBox)
-                || args.PropertyName == nameof(ViewModel.HasSelectedShape))
+                || args.PropertyName == nameof(ViewModel.HasSelectedShape)
+                || args.PropertyName == nameof(ViewModel.HasMultiSelection))
             {
                 UpdateToolRail();
             }
@@ -1057,6 +1058,29 @@ public sealed partial class MainPage : Page
         OutlineFlyout.Hide();
     }
 
+    /// <summary>Align (multi-selection) button clicked; the Tag names one of the
+    /// AlignMode values. Anchor + extras all shift to hit the picked edge/centre
+    /// of the selection's bounding box, then each writes through to the document.
+    /// Named AlignObjects_Click to avoid clashing with the text-alignment radio
+    /// handler (Align_Click) that already exists for the Text tool.</summary>
+    private void AlignObjects_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag }
+            && Enum.TryParse(tag, out ViewportViewModel.AlignMode mode))
+        {
+            ViewModel.AlignSelected(mode);
+        }
+    }
+
+    /// <summary>Distribute button clicked; Tag is "H" or "V". Needs 3+ objects.</summary>
+    private void Distribute_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag })
+        {
+            ViewModel.DistributeSelected(horizontal: tag == "H");
+        }
+    }
+
     /// <summary>A fill preset swatch was clicked; its Tag is the "#AARRGGBB" hex.
     /// The picker closes immediately so the fill is applied in one gesture, the
     /// way a user of Word or Acrobat expects. If a text box is selected, the
@@ -1685,6 +1709,10 @@ public sealed partial class MainPage : Page
         bool stamps = tool.Offers(ToolOptions.Stamp);
         StampSection.Visibility = Show(stamps);
 
+        // Align + distribute shows only for a real multi-selection; alignment
+        // on one object is a no-op.
+        AlignSection.Visibility = Show(ViewModel.HasMultiSelection);
+
         bool shapes = tool.Offers(ToolOptions.Shape);
         ShapeSection.Visibility = Show(shapes);
         if (shapes)
@@ -1707,16 +1735,19 @@ public sealed partial class MainPage : Page
         }
 
         // Row 2 only exists when one of its sections (font, text style, opacity,
-        // stamps) is showing, so a simple tool stays a single row.
+        // stamps, align) is showing, so a simple tool stays a single row.
         bool row2 = FontSection.Visibility == Visibility.Visible
                  || TextStyleSection.Visibility == Visibility.Visible
                  || OpacitySection.Visibility == Visibility.Visible
-                 || StampSection.Visibility == Visibility.Visible;
+                 || StampSection.Visibility == Visibility.Visible
+                 || AlignSection.Visibility == Visibility.Visible;
         PropertyBarRow2.Visibility = Show(row2);
 
         // A bar with every section collapsed is an empty pill floating over the
-        // page, so the whole thing goes when the tool offers nothing.
-        PropertyBar.Visibility = Show(tool.Options != ToolOptions.None);
+        // page, so the whole thing goes when the tool offers nothing AND no
+        // selection-driven section is showing.
+        PropertyBar.Visibility = Show(tool.Options != ToolOptions.None
+            || ViewModel.HasMultiSelection);
 
         if (color)
         {
