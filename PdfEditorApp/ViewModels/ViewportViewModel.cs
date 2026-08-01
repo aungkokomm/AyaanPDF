@@ -2438,6 +2438,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             var (lnx, lny) = InverseRotate(normX, normY, box, _selectedRotationDeg);
             moved = LoadedAnnotationPicker.Resized(box, _loadedGrip, lnx, lny, AspectToPreserve(start));
+
+            // On a rotated box, the corner (or edge) OPPOSITE the grip must stay
+            // put in SCREEN space, the way Word behaves. The local-frame resize
+            // above shifted the box's centre from C0 to C1, and turning about that
+            // new centre displaces every point of the frame in screen space by
+            // (I - R) * (C1 - C0). Nudging the new bounds by the negative of that
+            // brings anything with unchanged local coordinates (the opposite
+            // corner or edge midpoint) back to its old screen position, and it
+            // also lines the dragged corner up under the pointer.
+            if (_selectedRotationDeg != 0)
+            {
+                double dx = (moved.Left + moved.Right) / 2 - (box.Left + box.Right) / 2;
+                double dy = (moved.Top + moved.Bottom) / 2 - (box.Top + box.Bottom) / 2;
+                double rad = _selectedRotationDeg * Math.PI / 180.0;
+                double cos = Math.Cos(rad), sin = Math.Sin(rad);
+                double shiftX = dx * (cos - 1) - dy * sin;
+                double shiftY = dx * sin + dy * (cos - 1);
+                moved = moved.MovedBy(shiftX, shiftY);
+            }
         }
 
         _selectedLoaded = start with
