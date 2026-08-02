@@ -2890,32 +2890,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // pick a shape drawn a week ago). Null clears the picker to No Fill.
             ShapeFillHex = ParseShapeFill(contents!);
 
-            // The annotation's /Rect that get_annotations returned is the
-            // shape extent PLUS the writer's stroke pad (width/2 + 1 on every
-            // side, so PDFium doesn't clip the stroke). Drawing the marquee on
-            // that padded rect makes it float outside the shape - especially
-            // visible on right/bottom. Shrink the cached bounds back to the
-            // tight extent so the frame hugs the shape and snap-to-guide
-            // targets the actual edges. For rotated shapes this yields the
-            // rotated AABB (still tighter than the padded /Rect, though not
-            // the perfect tight rect - separate follow-up).
-            if (_selectedLoaded is LoadedSelection sel)
-            {
-                double widthPts = ParseShapeStrokeWidthPts(contents!);
-                var (pageWpt, _) = PagePointsFor(pageIndex);
-                if (widthPts > 0 && pageWpt > 0)
-                {
-                    double padPts = widthPts / 2.0 + 1.0;
-                    double padNorm = padPts / pageWpt;
-                    _selectedLoaded = sel with
-                    {
-                        Left   = sel.Left   + padNorm,
-                        Top    = sel.Top    + padNorm,
-                        Right  = sel.Right  - padNorm,
-                        Bottom = sel.Bottom - padNorm,
-                    };
-                }
-            }
+            // NOTE: we deliberately do NOT shrink _selectedLoaded from the
+            // padded /Rect back to the tight extent here. Tried it in v1.95.1
+            // to make the frame hug the shape, but the whole selection+drag+
+            // commit pipeline is threaded on _selectedLoaded matching what
+            // get_annotations returns; shrinking it broke the drag hit-zone
+            // and drag start entirely. The small cosmetic gap on right/bottom
+            // is preferable to a shape that won't move. Proper fix would
+            // decouple "visual frame" from "storage bounds", larger refactor.
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
