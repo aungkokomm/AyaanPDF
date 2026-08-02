@@ -3180,15 +3180,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             ys.Add(c.Top); ys.Add(c.Bottom); ys.Add((c.Top + c.Bottom) / 2);
         }
         // Add guide positions on this page as snap targets. A vertical guide's
-        // NormalizedPos is 0-1 across page width - the same normalization the
-        // selection bounds use - so it goes straight into xs/ys.
+        // NormalizedPos IS width-normalized (same as annotation bounds), goes
+        // straight into xs. A HORIZONTAL guide's NormalizedPos is
+        // HEIGHT-normalized though, and annotation Y is width-normalized, so
+        // it has to be rescaled - same width/height unit mismatch that broke
+        // horizontal-guide hit-test / drag.
         var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
         if (slot is not null)
         {
             foreach (var g in slot.Guides)
             {
-                if (g.Horizontal) { ys.Add(g.NormalizedPos); }
-                else              { xs.Add(g.NormalizedPos); }
+                if (g.Horizontal)
+                {
+                    double gyWidthNorm = slot.SlotWidth > 0
+                        ? g.NormalizedPos * slot.SlotHeight / slot.SlotWidth
+                        : g.NormalizedPos;
+                    ys.Add(gyWidthNorm);
+                }
+                else
+                {
+                    xs.Add(g.NormalizedPos);
+                }
             }
         }
         if (xs.Count == 0 && ys.Count == 0) { return moved; }
