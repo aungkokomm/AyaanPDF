@@ -3073,7 +3073,9 @@ public sealed partial class MainPage : Page
         }
         else if (_isDrawingShape)
         {
-            ViewModel.ExtendShape(content.X, content.Y);
+            // Shift held during a shape draw constrains the endpoint:
+            // rect/ellipse becomes a square/circle, line/arrow snaps to 45°.
+            ViewModel.ExtendShape(content.X, content.Y, constrain: IsShiftDown());
             e.Handled = true;
         }
         else if (_isSizingText)

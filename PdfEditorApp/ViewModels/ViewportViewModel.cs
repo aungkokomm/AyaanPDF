@@ -4447,14 +4447,55 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         InkStrokeChanged?.Invoke();
     }
 
-    public void ExtendShape(double x, double y)
+    public void ExtendShape(double x, double y, bool constrain = false)
     {
         if (_shapeDraft is not { } d)
         {
             return;
         }
 
-        _shapeDraft = d with { X2 = Norm(x), Y2 = Norm(y) };
+        double nx = Norm(x);
+        double ny = Norm(y);
+
+        // Shift-constrain while drawing (Illustrator/Word convention). A rect
+        // or ellipse becomes a square/circle (matching the LARGER of the two
+        // deltas, so the shape follows the pointer as far as it went in the
+        // stronger axis). A line or arrow snaps to the nearest 45° from start,
+        // keeping its length - so a shift-line comes out perfectly horizontal,
+        // vertical, or diagonal.
+        if (constrain)
+        {
+            double dx = nx - d.X1;
+            double dy = ny - d.Y1;
+            switch (d.Kind)
+            {
+                case ShapeKind.Rectangle:
+                case ShapeKind.Ellipse:
+                {
+                    double side = Math.Max(Math.Abs(dx), Math.Abs(dy));
+                    nx = d.X1 + Math.Sign(dx == 0 ? 1 : dx) * side;
+                    ny = d.Y1 + Math.Sign(dy == 0 ? 1 : dy) * side;
+                    break;
+                }
+                case ShapeKind.Line:
+                case ShapeKind.Arrow:
+                {
+                    // Snap the angle to the nearest 45° and keep the length.
+                    double len = Math.Sqrt(dx * dx + dy * dy);
+                    if (len > 0)
+                    {
+                        double angle = Math.Atan2(dy, dx);
+                        double snap = Math.PI / 4; // 45°
+                        double snapped = Math.Round(angle / snap) * snap;
+                        nx = d.X1 + Math.Cos(snapped) * len;
+                        ny = d.Y1 + Math.Sin(snapped) * len;
+                    }
+                    break;
+                }
+            }
+        }
+
+        _shapeDraft = d with { X2 = nx, Y2 = ny };
         InkStrokeChanged?.Invoke();
     }
 
