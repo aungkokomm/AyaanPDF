@@ -2538,10 +2538,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         foreach (var s in PageSlots)
         {
             foreach (var g in s.Guides) { if (g.IsSnapActive) { g.IsSnapActive = false; } }
-            s.SmartGuideX = null;
-            s.SmartGuideY = null;
+            if (s.SmartGuideLines.Count > 0) { s.SmartGuideLines.Clear(); }
         }
-        Diag.Log("cleared drag-time visuals");
     }
 
     public void DeleteSelectedAnnotation()
@@ -3407,30 +3405,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // Smart guides: temporary alignment lines that appear when the
             // moved shape's edge/centre lines up with ANOTHER OBJECT's edge/
             // centre (not with a placed guide, which already flashes yellow
-            // above). Position is the snap coord itself, which is where the
-            // moved shape's snapped edge now sits. Both axes tracked
-            // independently. Null when snap engaged on a placed guide or on
-            // nothing at all.
-            slot.SmartGuideX = (Math.Abs(bestDx) > 0 && snapGuideX is null)
-                ? moved.Left + bestDx  // whichever edge snapped, this X is where the snapped-to line runs
-                : null;
-            slot.SmartGuideY = (Math.Abs(bestDy) > 0 && snapGuideY is null)
-                ? moved.Top + bestDy
-                : null;
-            // Snap chose an offset that shifts the moved box; use the ACTUAL
-            // snapped target position (already in xTargets/yTargets) so a
-            // centre-snap draws the line at the centre, not at the edge.
-            // Simpler and more correct: find the target closest to the moved
-            // edge that produced the offset.
-            if (slot.SmartGuideX is not null)
+            // above). Rebuild the collection each frame so removal is
+            // automatic when snap disengages - ObservableCollection.Clear
+            // pattern is what proved reliable for the user-placed guides.
+            slot.SmartGuideLines.Clear();
+            bool xActive = Math.Abs(bestDx) > 0 && snapGuideX is null;
+            bool yActive = Math.Abs(bestDy) > 0 && snapGuideY is null;
+            if (xActive)
             {
-                double snappedX = FindMatchingSnapPos(xTargets, moved.Left, moved.Right, movedCx, bestDx);
-                slot.SmartGuideX = snappedX;
+                double sx = FindMatchingSnapPos(xTargets, moved.Left, moved.Right, movedCx, bestDx);
+                // Vertical line, 0.5 DIP wide, spans page height.
+                slot.SmartGuideLines.Add(new SmartGuideLine(
+                    Horizontal: false,
+                    PixelLeft: sx * SlotLayoutWidth, PixelTop: 0,
+                    PixelWidth: 0.5, PixelHeight: slot.SlotHeight));
             }
-            if (slot.SmartGuideY is not null)
+            if (yActive)
             {
-                double snappedY = FindMatchingSnapPos(yTargets, moved.Top, moved.Bottom, movedCy, bestDy);
-                slot.SmartGuideY = snappedY;
+                double sy = FindMatchingSnapPos(yTargets, moved.Top, moved.Bottom, movedCy, bestDy);
+                slot.SmartGuideLines.Add(new SmartGuideLine(
+                    Horizontal: true,
+                    PixelLeft: 0, PixelTop: sy * SlotLayoutWidth,
+                    PixelWidth: slot.SlotWidth, PixelHeight: 0.5));
             }
         }
 
@@ -3464,15 +3460,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _loadedDrag = null;
 
-        // Turn off any guide snap-flash: the drag is over, so no guide is
-        // actively snapping anymore. Also clear the smart alignment guides
-        // that appeared while dragging.
-        foreach (var s in PageSlots)
-        {
-            foreach (var g in s.Guides) { if (g.IsSnapActive) { g.IsSnapActive = false; } }
-            if (s.SmartGuideX is not null) { s.SmartGuideX = null; }
-            if (s.SmartGuideY is not null) { s.SmartGuideY = null; }
-        }
+        ClearDragTimeVisuals();
 
         // The grip belongs to the gesture that just ended, so it is read once
         // and cleared here rather than on each of the returns below. Leaving

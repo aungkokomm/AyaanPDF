@@ -99,18 +99,12 @@ public partial class PageSlot : ObservableObject
     /// equality-compared and null-set-to-null (already-null case) doesn't
     /// raise, which we don't want here: the clear at drag-end needs to fire
     /// regardless of prior state to guarantee the overlay collapses.</summary>
-    private double? _smartGuideX;
-    public double? SmartGuideX
-    {
-        get => _smartGuideX;
-        set { _smartGuideX = value; OnPropertyChanged(nameof(SmartGuideX)); }
-    }
-    private double? _smartGuideY;
-    public double? SmartGuideY
-    {
-        get => _smartGuideY;
-        set { _smartGuideY = value; OnPropertyChanged(nameof(SmartGuideY)); }
-    }
+    /// <summary>Smart alignment guide LINES rendered as an ItemsControl. Same
+    /// pattern the user-placed Guides collection uses because it's the one
+    /// that fires visibly reliable notifications when we mutate it - the
+    /// nullable-double property approach was silent enough of the time that
+    /// stale orange lines were sticking around. Cleared at every drag-end.</summary>
+    public ObservableCollection<SmartGuideLine> SmartGuideLines { get; } = new();
 
     /// <summary>Degrees the selection frame and its handles are turned (clockwise),
     /// so a rotated text box is framed at its real angle. The frame and handles are
@@ -334,6 +328,12 @@ public partial class PageSlot : ObservableObject
         ClearTiles();
     }
 }
+
+/// <summary>A transient orange smart-guide line that appears while a shape
+/// is being dragged and its edge/centre lines up with another object's
+/// edge/centre. Horizontal spans the page width; vertical spans the page
+/// height. Pixel-space so the DataTemplate can bind straight.</summary>
+public sealed record SmartGuideLine(bool Horizontal, double PixelLeft, double PixelTop, double PixelWidth, double PixelHeight);
 
 /// <summary>A guide line dragged out from a ruler. Kept in NORMALIZED units
 /// (0-1 across the page's perpendicular dimension) so a guide that survives

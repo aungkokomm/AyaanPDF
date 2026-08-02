@@ -373,22 +373,25 @@
                                         -->
                                         <!-- Smart alignment guides: bright orange lines that flash into
                                              existence while you drag and your edge/centre aligns with
-                                             another object's edge/centre. Full-width for horizontal, full-
-                                             height for vertical. Cleared on drag release. -->
-                                        <Rectangle IsHitTestVisible="False"
-                                                   Fill="{x:Bind local:MainPage.SmartGuideBrush, Mode=OneTime}"
-                                                   Opacity="0.9" UseLayoutRounding="False"
-                                                   HorizontalAlignment="Left" VerticalAlignment="Stretch"
-                                                   Width="0.5"
-                                                   Visibility="{x:Bind local:MainPage.SmartGuideVis(SmartGuideX), Mode=OneWay}"
-                                                   Margin="{x:Bind local:MainPage.SmartGuideMarginX(SmartGuideX), Mode=OneWay}" />
-                                        <Rectangle IsHitTestVisible="False"
-                                                   Fill="{x:Bind local:MainPage.SmartGuideBrush, Mode=OneTime}"
-                                                   Opacity="0.9" UseLayoutRounding="False"
-                                                   HorizontalAlignment="Stretch" VerticalAlignment="Top"
-                                                   Height="0.5"
-                                                   Visibility="{x:Bind local:MainPage.SmartGuideVis(SmartGuideY), Mode=OneWay}"
-                                                   Margin="{x:Bind local:MainPage.SmartGuideMarginY(SmartGuideY), Mode=OneWay}" />
+                                             another object's edge/centre. ItemsControl over an ObservableCollection
+                                             so the .Clear() at drag-end reliably disappears the lines - the
+                                             earlier nullable-property approach's PropertyChanged wasn't always
+                                             re-evaluating the binding. -->
+                                        <ItemsControl ItemsSource="{x:Bind SmartGuideLines}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewmodels:SmartGuideLine">
+                                                    <Rectangle Fill="{x:Bind local:MainPage.SmartGuideBrush, Mode=OneTime}"
+                                                               Opacity="0.9" UseLayoutRounding="False"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top"
+                                                               Width="{x:Bind PixelWidth}"
+                                                               Height="{x:Bind PixelHeight}"
+                                                               Margin="{x:Bind local:MainPage.Offset(PixelLeft, PixelTop)}" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
 
                                         <!-- Ruler guides: horizontal/vertical lines spanning the page,
                                              drawn above the page content but below selection marquees.
