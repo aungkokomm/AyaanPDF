@@ -2889,6 +2889,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // ACTUAL fill (which the tool state does not know about — a user can
             // pick a shape drawn a week ago). Null clears the picker to No Fill.
             ShapeFillHex = ParseShapeFill(contents!);
+
+            // The annotation's /Rect that get_annotations returned is the
+            // shape extent PLUS the writer's stroke pad (width/2 + 1 on every
+            // side, so PDFium doesn't clip the stroke). Drawing the marquee on
+            // that padded rect makes it float outside the shape - especially
+            // visible on right/bottom. Shrink the cached bounds back to the
+            // tight extent so the frame hugs the shape and snap-to-guide
+            // targets the actual edges. For rotated shapes this yields the
+            // rotated AABB (still tighter than the padded /Rect, though not
+            // the perfect tight rect - separate follow-up).
+            if (_selectedLoaded is LoadedSelection sel)
+            {
+                double widthPts = ParseShapeStrokeWidthPts(contents!);
+                var (pageWpt, _) = PagePointsFor(pageIndex);
+                if (widthPts > 0 && pageWpt > 0)
+                {
+                    double padPts = widthPts / 2.0 + 1.0;
+                    double padNorm = padPts / pageWpt;
+                    _selectedLoaded = sel with
+                    {
+                        Left   = sel.Left   + padNorm,
+                        Top    = sel.Top    + padNorm,
+                        Right  = sel.Right  - padNorm,
+                        Bottom = sel.Bottom - padNorm,
+                    };
+                }
+            }
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
@@ -4092,6 +4119,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         // Tag stores RRGGBBAA; the app uses "#AARRGGBB".
         return $"#{rgba.Substring(6, 2)}{rgba.Substring(0, 6)}";
+    }
+
+    /// <summary>The shape tag's stroke width field (position 2: kind, rgba,
+    /// WIDTH). Points. Returns 0 on a malformed tag.</summary>
+    private static double ParseShapeStrokeWidthPts(string contents)
+    {
+        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
+            ? contents.Substring("AyaanShape:".Length)
+            : null;
+        if (rest is null) { return 0; }
+        string[] parts = rest.Split(':');
+        if (parts.Length < 3) { return 0; }
+        return double.TryParse(parts[2], System.Globalization.NumberStyles.Float,
+                               System.Globalization.CultureInfo.InvariantCulture, out double v)
+               && double.IsFinite(v) && v > 0
+            ? v : 0;
     }
 
     /// <summary>The shape tag's optional fill field (position 6: kind, rgba,
