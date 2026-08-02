@@ -339,6 +339,13 @@ public partial class GuideMark : ObservableObject
     [ObservableProperty]
     public partial bool IsSelected { get; set; }
 
+    /// <summary>Briefly true while a shape drag is currently snapping onto
+    /// this guide. Flips the fill to a bright yellow so the snap engagement
+    /// is visible - without this, snap was silent and the user had to feel it
+    /// through the pointer rather than see it.</summary>
+    [ObservableProperty]
+    public partial bool IsSnapActive { get; set; }
+
     public GuideMark(bool horizontal, double normalizedPos, double slotWidth, double slotHeight)
     {
         Horizontal = horizontal;

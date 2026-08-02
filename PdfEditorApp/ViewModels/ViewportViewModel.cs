@@ -3146,6 +3146,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// dragging.</summary>
     private const double SnapThresholdNorm = 0.005;
 
+    /// <summary>Guides get a WIDER snap threshold than object edges: the user
+    /// placed them intentionally as alignment targets, so they should grab
+    /// more eagerly. Matches Illustrator's convention of a bigger guide zone.</summary>
+    private const double GuideSnapThresholdNorm = 0.012;
+
     /// <summary>Returns the moved box shifted so its nearest edge or centre
     /// lines up with a NEARBY OTHER annotation on the same page. Independent
     /// axes: X can snap to one annotation while Y snaps to another. Snapping
@@ -3170,21 +3175,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             if (e.PageIndex == pageIndex) { ignore.Add(e.Index); }
         }
 
-        // Gather X and Y snap targets: left/right/centre from every other mark.
-        var xs = new List<double>(candidates.Count * 3);
-        var ys = new List<double>(candidates.Count * 3);
+        // Two lists of snap targets per axis, one for object edges (tight
+        // threshold) and one for guides (wider threshold, because a placed
+        // guide is an explicit "line up on me" declaration). Each entry
+        // carries an optional GuideMark so a guide-triggered snap can flash
+        // the guide it engaged.
+        var xTargets = new List<(double Pos, GuideMark? Guide)>(candidates.Count * 3);
+        var yTargets = new List<(double Pos, GuideMark? Guide)>(candidates.Count * 3);
         foreach (var c in candidates)
         {
             if (ignore.Contains(c.Index)) { continue; }
-            xs.Add(c.Left); xs.Add(c.Right); xs.Add((c.Left + c.Right) / 2);
-            ys.Add(c.Top); ys.Add(c.Bottom); ys.Add((c.Top + c.Bottom) / 2);
+            xTargets.Add((c.Left, null));
+            xTargets.Add((c.Right, null));
+            xTargets.Add(((c.Left + c.Right) / 2, null));
+            yTargets.Add((c.Top, null));
+            yTargets.Add((c.Bottom, null));
+            yTargets.Add(((c.Top + c.Bottom) / 2, null));
         }
-        // Add guide positions on this page as snap targets. A vertical guide's
-        // NormalizedPos IS width-normalized (same as annotation bounds), goes
-        // straight into xs. A HORIZONTAL guide's NormalizedPos is
-        // HEIGHT-normalized though, and annotation Y is width-normalized, so
-        // it has to be rescaled - same width/height unit mismatch that broke
-        // horizontal-guide hit-test / drag.
+        // Guides: a vertical guide's NormalizedPos is width-normalized already;
+        // a horizontal guide's is HEIGHT-normalized and needs rescaling to
+        // width-units so it's comparable to annotation Y (which uses the same
+        // width normalization as X).
         var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
         if (slot is not null)
         {
@@ -3195,40 +3206,59 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     double gyWidthNorm = slot.SlotWidth > 0
                         ? g.NormalizedPos * slot.SlotHeight / slot.SlotWidth
                         : g.NormalizedPos;
-                    ys.Add(gyWidthNorm);
+                    yTargets.Add((gyWidthNorm, g));
                 }
                 else
                 {
-                    xs.Add(g.NormalizedPos);
+                    xTargets.Add((g.NormalizedPos, g));
                 }
             }
         }
-        if (xs.Count == 0 && ys.Count == 0) { return moved; }
+        if (xTargets.Count == 0 && yTargets.Count == 0) { return moved; }
 
-        // For each of our own edges/centre, find the closest candidate on that
-        // axis. Whichever of the three has the smallest distance wins - if it's
-        // within threshold, we shift by that offset.
         double movedCx = (moved.Left + moved.Right) / 2;
         double movedCy = (moved.Top + moved.Bottom) / 2;
 
-        double bestDx = 0;
-        double bestDistX = SnapThresholdNorm;
-        foreach (double t in xs)
+        // For each axis, pick the smallest signed offset whose absolute
+        // distance is under the applicable threshold (object vs. guide).
+        // GuideSnapped_ record the guide the snap hit (or null if the snap
+        // came from an object edge) so we can flash the right guide below.
+        (double Offset, GuideMark? Guide) BestSnap(List<(double Pos, GuideMark? Guide)> targets,
+                                                    double own1, double own2, double ownC)
         {
-            double d;
-            d = t - moved.Left; if (Math.Abs(d) < bestDistX) { bestDistX = Math.Abs(d); bestDx = d; }
-            d = t - moved.Right; if (Math.Abs(d) < bestDistX) { bestDistX = Math.Abs(d); bestDx = d; }
-            d = t - movedCx; if (Math.Abs(d) < bestDistX) { bestDistX = Math.Abs(d); bestDx = d; }
+            double bestOff = 0;
+            double bestDist = double.MaxValue;
+            GuideMark? bestGuide = null;
+            foreach (var (pos, guide) in targets)
+            {
+                double tol = guide is null ? SnapThresholdNorm : GuideSnapThresholdNorm;
+                double[] ownVals = { own1, own2, ownC };
+                foreach (double v in ownVals)
+                {
+                    double d = pos - v;
+                    if (Math.Abs(d) < tol && Math.Abs(d) < bestDist)
+                    {
+                        bestDist = Math.Abs(d);
+                        bestOff = d;
+                        bestGuide = guide;
+                    }
+                }
+            }
+            return (bestOff, bestGuide);
         }
 
-        double bestDy = 0;
-        double bestDistY = SnapThresholdNorm;
-        foreach (double t in ys)
+        var (bestDx, snapGuideX) = BestSnap(xTargets, moved.Left, moved.Right, movedCx);
+        var (bestDy, snapGuideY) = BestSnap(yTargets, moved.Top, moved.Bottom, movedCy);
+
+        // Flash whichever guide got snapped to (up to one per axis). Every
+        // OTHER guide on this page is turned off, so the flash follows the
+        // pointer as the snap switches guides through the drag.
+        if (slot is not null)
         {
-            double d;
-            d = t - moved.Top; if (Math.Abs(d) < bestDistY) { bestDistY = Math.Abs(d); bestDy = d; }
-            d = t - moved.Bottom; if (Math.Abs(d) < bestDistY) { bestDistY = Math.Abs(d); bestDy = d; }
-            d = t - movedCy; if (Math.Abs(d) < bestDistY) { bestDistY = Math.Abs(d); bestDy = d; }
+            foreach (var g in slot.Guides)
+            {
+                g.IsSnapActive = (g == snapGuideX) || (g == snapGuideY);
+            }
         }
 
         return moved.MovedBy(bestDx, bestDy);
@@ -3243,6 +3273,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         _loadedDrag = null;
+
+        // Turn off any guide snap-flash: the drag is over, so no guide is
+        // actively snapping anymore.
+        foreach (var s in PageSlots)
+        {
+            foreach (var g in s.Guides) { if (g.IsSnapActive) { g.IsSnapActive = false; } }
+        }
 
         // The grip belongs to the gesture that just ended, so it is read once
         // and cleared here rather than on each of the returns below. Leaving

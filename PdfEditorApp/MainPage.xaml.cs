@@ -282,13 +282,19 @@ public sealed partial class MainPage : Page
     public static Thickness Offset(double left, double top) => new(left, top, 0, 0);
 
     /// <summary>Cyan for an unselected guide, accent-red for the selected
-    /// one, so the user can see at a glance which guide Delete will remove.</summary>
+    /// one, bright yellow while a shape is snapping onto it. Snap wins over
+    /// selection - a selected guide getting snapped to is a rare-but-real
+    /// case and the snap indicator is the more useful feedback in that
+    /// instant.</summary>
     private static readonly Microsoft.UI.Xaml.Media.SolidColorBrush GuideBrushDefault =
         new(Windows.UI.Color.FromArgb(0xD8, 0x00, 0xA0, 0xD8));
     private static readonly Microsoft.UI.Xaml.Media.SolidColorBrush GuideBrushSelected =
         new(Windows.UI.Color.FromArgb(0xFF, 0xE8, 0x1B, 0x3B));
-    public static Microsoft.UI.Xaml.Media.Brush GuideFill(bool selected) =>
-        selected ? GuideBrushSelected : GuideBrushDefault;
+    private static readonly Microsoft.UI.Xaml.Media.SolidColorBrush GuideBrushSnapActive =
+        new(Windows.UI.Color.FromArgb(0xFF, 0xFF, 0xC0, 0x00));
+    public static Microsoft.UI.Xaml.Media.Brush GuideFill(bool selected, bool snapActive) =>
+        snapActive ? GuideBrushSnapActive
+            : (selected ? GuideBrushSelected : GuideBrushDefault);
 
     /// <summary>
     /// Positions an element from a NORMALIZED coordinate, multiplying by the
