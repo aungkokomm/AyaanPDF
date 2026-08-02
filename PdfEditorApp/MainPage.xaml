@@ -91,12 +91,26 @@
                 HorizontalAlignment="Stretch" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 Canvas.ZIndex="10"
-                SizeChanged="Rulers_SizeChanged" />
+                RightTapped="Ruler_RightTapped"
+                SizeChanged="Rulers_SizeChanged">
+            <Canvas.ContextFlyout>
+                <MenuFlyout x:Name="RulerFlyout">
+                    <RadioMenuFlyoutItem Text="Inches"       GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Inches" IsChecked="True" />
+                    <RadioMenuFlyoutItem Text="Centimeters"  GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Centimeters" />
+                    <RadioMenuFlyoutItem Text="Millimeters"  GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Millimeters" />
+                    <RadioMenuFlyoutItem Text="Points"       GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Points" />
+                    <RadioMenuFlyoutItem Text="Picas"        GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Picas" />
+                    <MenuFlyoutSeparator />
+                    <MenuFlyoutItem Text="Hide Rulers" Click="RulersHide_Click" />
+                </MenuFlyout>
+            </Canvas.ContextFlyout>
+        </Canvas>
         <Canvas x:Name="LeftRuler" Grid.Column="2"
                 Width="22" Margin="0,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Stretch"
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 Canvas.ZIndex="10"
+                RightTapped="Ruler_RightTapped"
                 SizeChanged="Rulers_SizeChanged" />
 
         <ScrollView
@@ -642,7 +656,28 @@
                             <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
                             <MenuFlyoutSeparator />
                             <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
-                                                  IsChecked="True" Click="RulersToggle_Click" />
+                                                  IsChecked="True" Click="RulersToggle_Click">
+                                <ToggleMenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="R" />
+                                </ToggleMenuFlyoutItem.KeyboardAccelerators>
+                            </ToggleMenuFlyoutItem>
+                            <MenuFlyoutSubItem Text="Ruler units">
+                                <RadioMenuFlyoutItem x:Name="UnitInches" Text="Inches"
+                                                     GroupName="RulerUnit" IsChecked="True"
+                                                     Click="RulerUnit_Click" Tag="Inches" />
+                                <RadioMenuFlyoutItem x:Name="UnitCentimeters" Text="Centimeters"
+                                                     GroupName="RulerUnit"
+                                                     Click="RulerUnit_Click" Tag="Centimeters" />
+                                <RadioMenuFlyoutItem x:Name="UnitMillimeters" Text="Millimeters"
+                                                     GroupName="RulerUnit"
+                                                     Click="RulerUnit_Click" Tag="Millimeters" />
+                                <RadioMenuFlyoutItem x:Name="UnitPoints" Text="Points"
+                                                     GroupName="RulerUnit"
+                                                     Click="RulerUnit_Click" Tag="Points" />
+                                <RadioMenuFlyoutItem x:Name="UnitPicas" Text="Picas"
+                                                     GroupName="RulerUnit"
+                                                     Click="RulerUnit_Click" Tag="Picas" />
+                            </MenuFlyoutSubItem>
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
                             <MenuFlyoutItem Text="Exit" Click="Exit_Click" />

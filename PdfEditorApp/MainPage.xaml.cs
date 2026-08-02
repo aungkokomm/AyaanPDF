@@ -517,23 +517,102 @@ public sealed partial class MainPage : Page
     // page can come later; for now the ruler numbers keep counting through
     // page boundaries, which still gives useful monotonic X and Y.)
 
+    /// <summary>Units the ruler can display. All are converted from PDF points
+    /// (1/72 inch) via a per-unit ratio. Default is Inches - Acrobat's default
+    /// and what most non-typographers reach for on a Letter-size page.</summary>
+    private enum RulerUnit { Points, Picas, Millimeters, Centimeters, Inches }
+    private RulerUnit _rulerUnit = RulerUnit.Inches;
+
     private void RulersToggle_Click(object sender, RoutedEventArgs e)
     {
-        bool on = RulersToggle.IsChecked;
+        SetRulersVisible(RulersToggle.IsChecked);
+    }
+
+    private void RulersHide_Click(object sender, RoutedEventArgs e)
+    {
+        RulersToggle.IsChecked = false;
+        SetRulersVisible(false);
+    }
+
+    private void SetRulersVisible(bool on)
+    {
         var vis = on ? Visibility.Visible : Visibility.Collapsed;
         TopRuler.Visibility = vis;
         LeftRuler.Visibility = vis;
         RulerCorner.Visibility = vis;
-        // Reclaim the reserved 22px when off, or restore it when back on. The
+        // Reclaim the reserved 22px when off, restore it when back on. The
         // ScrollView's other margins never change, so this doesn't fight any
         // other layout hint.
         PageScroller.Margin = on ? new Thickness(22, 22, 0, 0) : new Thickness(0);
+        if (on) { RedrawRulers(); }
+    }
+
+    private void RulerUnit_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag }
+            && Enum.TryParse<RulerUnit>(tag, out var picked))
+        {
+            _rulerUnit = picked;
+            // Keep both the View menu and right-click menu radio groups in sync
+            // - they show the same choice but live in two separate DOM subtrees.
+            SyncRulerUnitRadios(picked);
+            RedrawRulers();
+        }
+    }
+
+    private void SyncRulerUnitRadios(RulerUnit picked)
+    {
+        UnitInches.IsChecked = picked == RulerUnit.Inches;
+        UnitCentimeters.IsChecked = picked == RulerUnit.Centimeters;
+        UnitMillimeters.IsChecked = picked == RulerUnit.Millimeters;
+        UnitPoints.IsChecked = picked == RulerUnit.Points;
+        UnitPicas.IsChecked = picked == RulerUnit.Picas;
+    }
+
+    private void Ruler_RightTapped(object sender, Microsoft.UI.Xaml.Input.RightTappedRoutedEventArgs e)
+    {
+        // Both TopRuler and LeftRuler route here so the same context menu is
+        // reachable from either. TopRuler already has it declared as its own
+        // ContextFlyout for automatic show on right-tap; LeftRuler shows it
+        // manually anchored to the pointer position.
+        if (sender is Canvas c && c == LeftRuler)
+        {
+            RulerFlyout.ShowAt(LeftRuler, new FlyoutShowOptions
+            {
+                Position = e.GetPosition(LeftRuler),
+            });
+            e.Handled = true;
+        }
     }
 
     private void Rulers_SizeChanged(object sender, SizeChangedEventArgs e)
     {
         RedrawRulers();
     }
+
+    /// <summary>Points-per-unit conversion factor (points *per one* selected
+    /// unit). Multiply a point value by 1/factor to get the unit value.</summary>
+    private static double PointsPerUnit(RulerUnit u) => u switch
+    {
+        RulerUnit.Points => 1.0,
+        RulerUnit.Picas => 12.0,                    // 1 pica = 12 pt
+        RulerUnit.Inches => 72.0,                   // 1 in   = 72 pt
+        RulerUnit.Millimeters => 72.0 / 25.4,       // 1 mm   = 72/25.4 pt ≈ 2.835
+        RulerUnit.Centimeters => 72.0 / 2.54,       // 1 cm   = 72/2.54 pt ≈ 28.35
+        _ => 1.0,
+    };
+
+    /// <summary>Candidate major-tick spacings PER UNIT. Chosen so labels land on
+    /// round numbers in the display unit. For inches, that means 1/8, 1/4, 1/2,
+    /// 1, 2, 5, 10, ... rather than an arbitrary "0.375".</summary>
+    private static double[] MajorStepsPerUnit(RulerUnit u) => u switch
+    {
+        RulerUnit.Inches => new[] { 0.125, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0 },
+        RulerUnit.Centimeters => new[] { 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0 },
+        RulerUnit.Millimeters => new[] { 1.0, 2.5, 5.0, 10.0, 20.0, 50.0, 100.0, 250.0, 500.0 },
+        RulerUnit.Picas => new[] { 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0 },
+        _ => new[] { 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0 },
+    };
 
     private void RedrawRulers()
     {
@@ -544,62 +623,80 @@ public sealed partial class MainPage : Page
         var (pageWpt, pageHpt) = ViewModel.CurrentPagePoints();
         if (pageWpt <= 0 || pageHpt <= 0) { return; }
 
-        // Points-per-screen-DIP at the current zoom: the content is laid out at
-        // ViewportHost.ActualWidth DIPs which corresponds to pageWpt points, then
-        // scaled by ScrollView zoom. So 1 point on screen = (layoutW/pageWpt) *
-        // zoom DIPs. Invert to get DIPs->points.
         double layoutW = ViewportHost.ActualWidth > 0 ? ViewportHost.ActualWidth : 800;
         double zoom = PageScroller.ZoomFactor;
         double dipsPerPoint = (layoutW / pageWpt) * zoom;
         if (dipsPerPoint <= 0) { return; }
 
-        // Choose a MAJOR tick spacing (in points) that lands near 80 screen DIPs.
-        // Standard 1-2-5-10 progression so labelled ticks are round numbers.
-        double[] steps = { 1, 2, 5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000 };
+        // Convert to selected unit. Ticks and labels operate in unit-space so
+        // the labelled values are round (e.g. 1.0, 1.25 in inches, not the
+        // arbitrary point values that would produce those inches).
+        double pointsPerUnit = PointsPerUnit(_rulerUnit);
+        double dipsPerUnit = dipsPerPoint * pointsPerUnit;
+
+        // Pick a MAJOR spacing (in the selected unit) landing near 80 DIPs.
+        // If ALL candidate steps are smaller than the target, use the largest
+        // one; if all are larger (zoom out extreme), use the smallest.
+        double[] steps = MajorStepsPerUnit(_rulerUnit);
         double targetDips = 80;
-        double bestStep = 100;
+        double bestStep = steps[^1];
         double bestDelta = double.MaxValue;
         foreach (double s in steps)
         {
-            double d = Math.Abs(s * dipsPerPoint - targetDips);
+            double d = Math.Abs(s * dipsPerUnit - targetDips);
             if (d < bestDelta) { bestDelta = d; bestStep = s; }
         }
+        double majorUnits = bestStep;
+        double minorUnits = majorUnits / 5;                 // 5 minors per major
+        double majorDips = majorUnits * dipsPerUnit;
+        double minorDips = minorUnits * dipsPerUnit;
 
-        double majorPts = bestStep;
-        double minorPts = majorPts / 5; // 5 minor divisions per major
-        double majorDips = majorPts * dipsPerPoint;
-        double minorDips = minorPts * dipsPerPoint;
+        // The FIRST PAGE'S top-left in RulerCanvas space. TransformToVisual
+        // walks all the intermediate transforms (ScrollView zoom, scroll offset,
+        // ViewportHost centering, ViewportHost padding) in one call, so a page
+        // that's centered horizontally or scrolled off vertically lands at the
+        // right screen X/Y without me redoing that math. Uses TopRuler for X
+        // and LeftRuler for Y because each Canvas's coordinate system starts
+        // at its own top-left, and that's where the tick's X or Y is measured
+        // from.
+        double pageOriginX = 0, pageOriginY = 0;
+        try
+        {
+            // ViewportHost's top-left in TopRuler coords gives X. Its top-left
+            // is also the first page's top-left because ViewportHost's own
+            // Padding starts the page content; ViewportHost.Padding.Top adds
+            // the vertical inset which we account for below.
+            var toTop = ViewportHost.TransformToVisual(TopRuler);
+            var pT = toTop.TransformPoint(new Windows.Foundation.Point(0, 0));
+            pageOriginX = pT.X;
 
-        // ScrollView's HorizontalOffset/VerticalOffset are in zoomed content DIPs
-        // relative to the content origin. The ViewportHost is centered inside the
-        // ScrollView so the CONTENT origin is at (layoutW*zoom + slack)/2 from the
-        // viewport left. We approximate page-origin-on-screen as
-        //   pageOriginScreenX = ViewportHost.ContentOffset - HorizontalOffset
-        // For centered layouts that reduces to (viewportW - layoutW*zoom) / 2
-        // when the content is narrower than the viewport, or 0 when scrolled.
+            var toLeft = ViewportHost.TransformToVisual(LeftRuler);
+            var pL = toLeft.TransformPoint(new Windows.Foundation.Point(0, ViewportHost.Padding.Top));
+            pageOriginY = pL.Y;
+        }
+        catch
+        {
+            // TransformToVisual can throw during teardown; skip a redraw rather
+            // than crash - the next ViewChanged will retry.
+            return;
+        }
+
         double viewportW = PageScroller.ViewportWidth;
-        double contentW = layoutW * zoom;
-        double pageOriginScreenX = contentW < viewportW
-            ? (viewportW - contentW) / 2
-            : -PageScroller.HorizontalOffset;
-
         double viewportH = PageScroller.ViewportHeight;
-        // Vertical: the ViewportHost has TOP padding for its own spacing so we
-        // approximate origin as 0 minus scroll offset when scrolled, or the
-        // padding when the whole content fits.
-        double pageOriginScreenY = -PageScroller.VerticalOffset + ViewportHost.Padding.Top;
 
         DrawRulerTicks(TopRuler, horizontal: true,
-            originScreen: pageOriginScreenX, viewportSpan: TopRuler.ActualWidth > 0 ? TopRuler.ActualWidth : viewportW,
-            majorDips: majorDips, minorDips: minorDips, majorPts: majorPts);
+            originScreen: pageOriginX,
+            viewportSpan: TopRuler.ActualWidth > 0 ? TopRuler.ActualWidth : viewportW,
+            majorDips: majorDips, minorDips: minorDips, majorUnits: majorUnits);
         DrawRulerTicks(LeftRuler, horizontal: false,
-            originScreen: pageOriginScreenY, viewportSpan: LeftRuler.ActualHeight > 0 ? LeftRuler.ActualHeight : viewportH,
-            majorDips: majorDips, minorDips: minorDips, majorPts: majorPts);
+            originScreen: pageOriginY,
+            viewportSpan: LeftRuler.ActualHeight > 0 ? LeftRuler.ActualHeight : viewportH,
+            majorDips: majorDips, minorDips: minorDips, majorUnits: majorUnits);
     }
 
     private void DrawRulerTicks(Canvas canvas, bool horizontal,
         double originScreen, double viewportSpan,
-        double majorDips, double minorDips, double majorPts)
+        double majorDips, double minorDips, double majorUnits)
     {
         canvas.Children.Clear();
         if (viewportSpan <= 0 || majorDips <= 0) { return; }
@@ -607,27 +704,21 @@ public sealed partial class MainPage : Page
         var stroke = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
         var text = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
 
-        // Start slightly before the visible left/top so ticks at negative
-        // pointer positions still show (a user scrolled beyond the page origin
-        // wants to see negative coordinates, same as PageMaker).
-        double startScreen = 0;
-        double endScreen = viewportSpan;
-        double startOffsetScreen = startScreen - originScreen;
-        double firstMinorIndex = Math.Floor(startOffsetScreen / minorDips);
-        double firstMinorScreen = originScreen + firstMinorIndex * minorDips;
+        // Walk minor-tick indices covering the visible span with one on each
+        // side for safety. Compute unit value from index rather than accumulating
+        // a double to avoid drift over a long ruler.
+        int firstIdx = (int)Math.Floor((0 - originScreen) / minorDips) - 1;
+        int lastIdx = (int)Math.Ceiling((viewportSpan - originScreen) / minorDips) + 1;
 
         const double barLen = 22;
-        for (double s = firstMinorScreen; s < endScreen + minorDips; s += minorDips)
+        for (int i = firstIdx; i <= lastIdx; i++)
         {
-            if (s < startScreen - minorDips) { continue; }
-            // Is this a major (labelled) tick? Compare to closest major.
-            double pts = (s - originScreen) / (majorDips / majorPts * majorPts) * majorPts;
-            // easier: recover point value directly
-            double pointsAt = (s - originScreen) / minorDips * (majorPts / 5);
-            double majorPtsExpected = Math.Round(pointsAt / majorPts) * majorPts;
-            bool isMajor = Math.Abs(pointsAt - majorPtsExpected) < majorPts / 10;
-
+            double s = originScreen + i * minorDips;
+            double unitValue = i * (majorUnits / 5);
+            // A major tick is one where the minor index is a multiple of 5.
+            bool isMajor = (i % 5) == 0;
             double tickLen = isMajor ? barLen - 4 : barLen - 14;
+
             var line = new Microsoft.UI.Xaml.Shapes.Line
             {
                 Stroke = stroke,
@@ -651,7 +742,7 @@ public sealed partial class MainPage : Page
             {
                 var tb = new TextBlock
                 {
-                    Text = ((int)Math.Round(majorPtsExpected)).ToString(),
+                    Text = FormatRulerLabel(unitValue),
                     FontSize = 9,
                     Foreground = text,
                 };
@@ -662,7 +753,6 @@ public sealed partial class MainPage : Page
                 }
                 else
                 {
-                    // Rotate vertical labels 90° so the numbers read along the ruler.
                     tb.RenderTransform = new Microsoft.UI.Xaml.Media.RotateTransform { Angle = -90 };
                     Canvas.SetLeft(tb, 1);
                     Canvas.SetTop(tb, s + 20);
@@ -670,6 +760,19 @@ public sealed partial class MainPage : Page
                 canvas.Children.Add(tb);
             }
         }
+    }
+
+    /// <summary>Formats a ruler label sensibly for the current unit. Integers
+    /// stay integer; fractional shows enough decimal places for the unit but
+    /// no more (0.5 not 0.500).</summary>
+    private static string FormatRulerLabel(double v)
+    {
+        // Snap tiny FP dust from index math (0.000000001 back to 0).
+        if (Math.Abs(v) < 1e-6) { return "0"; }
+        // Integer? Show without decimal.
+        if (Math.Abs(v - Math.Round(v)) < 1e-4) { return ((int)Math.Round(v)).ToString(); }
+        // Otherwise show up to 3 decimals, trimming trailing zeros.
+        return v.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     /// <summary>Arrow-key scroll distance in DIPs, close to Acrobat's nudge.</summary>
