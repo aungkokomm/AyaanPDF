@@ -3480,6 +3480,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         double rot = parts.Length >= 6
             && double.TryParse(parts[5], System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out double rv) ? rv : 0;
+        // Fill lives at position 6 (kind, rgba, width, fx, fy, rot, FILL) as
+        // 8-char AARRGGBB hex. Older tags without it come back as 0 (stroke
+        // only), which was the historic default. Missing this field is what
+        // made Ctrl+drag drop the fill on the clone.
+        uint fillRgba = parts.Length >= 7
+            && parts[6].Length == 8
+            && uint.TryParse(parts[6], System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out uint fv) ? fv : 0;
 
         // The drag-direction flags let the arrow head keep its side.
         float x1 = (float)((fx ? sel.Left : sel.Right) * captureWidth);
@@ -3500,6 +3508,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
             R = r, G = g, B = b, A = a,
             WidthPx = widthPx, RotationDeg = (float)rot,
+            FillRgba = fillRgba,
         };
         return true;
     }
