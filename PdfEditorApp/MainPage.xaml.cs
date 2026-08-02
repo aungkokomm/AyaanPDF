@@ -1009,6 +1009,148 @@ public sealed partial class MainPage : Page
         ViewModel.AreGuidesLocked = LockGuidesToggle.IsChecked;
     }
 
+    /// <summary>Adds four margin guides (top, bottom, left, right) at a
+    /// specified inset. Sensible defaults for a print layout are 0.5 in on
+    /// every side; the user overrides for anything else. Optionally applies
+    /// to every page so a whole document picks up the margin in one call.</summary>
+    private async void AddMargins_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.PageCount == 0) { return; }
+        string unitAbbr = UnitAbbr(_rulerUnit);
+
+        NumberBox NB(double v) => new()
+        {
+            Minimum = 0, Maximum = 1000, SmallChange = 0.05, LargeChange = 0.5,
+            Value = v,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+        };
+        var top = NB(0.5); var bottom = NB(0.5); var left = NB(0.5); var right = NB(0.5);
+        var allPages = new CheckBox { Content = "Apply to all pages" };
+
+        Grid Row(string label, NumberBox nb)
+        {
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(60) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });
+            var lbl = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(lbl, 0);
+            Grid.SetColumn(nb, 1);
+            var uab = new TextBlock { Text = unitAbbr, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 0, 0) };
+            Grid.SetColumn(uab, 2);
+            grid.Children.Add(lbl); grid.Children.Add(nb); grid.Children.Add(uab);
+            return grid;
+        }
+
+        var stack = new StackPanel { Spacing = 6, Width = 260 };
+        stack.Children.Add(Row("Top",    top));
+        stack.Children.Add(Row("Bottom", bottom));
+        stack.Children.Add(Row("Left",   left));
+        stack.Children.Add(Row("Right",  right));
+        stack.Children.Add(allPages);
+
+        var dlg = new ContentDialog
+        {
+            Title = "Add margin guides",
+            Content = stack,
+            PrimaryButtonText = "Add",
+            SecondaryButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = this.XamlRoot,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) { return; }
+
+        double f = PointsPerUnit(_rulerUnit);
+        ViewModel.AddMarginGuides(ViewModel.CurrentPageIndex,
+            top.Value * f, bottom.Value * f, left.Value * f, right.Value * f,
+            allPages.IsChecked == true);
+    }
+
+    /// <summary>Adds N vertical column guides (2 per column: left + right
+    /// edges), with an optional gutter between columns and side margins that
+    /// bound the content band. Defaults: 3 columns, 0.25 in gutter, no side
+    /// margin - a starting point for a magazine-style layout.</summary>
+    private async void AddColumns_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.PageCount == 0) { return; }
+        string unitAbbr = UnitAbbr(_rulerUnit);
+
+        var cols = new NumberBox
+        {
+            Minimum = 1, Maximum = 24, SmallChange = 1, LargeChange = 1, Value = 3,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+        };
+        var gutter = new NumberBox
+        {
+            Minimum = 0, Maximum = 100, SmallChange = 0.05, LargeChange = 0.25, Value = 0.25,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+        };
+        var leftInset = new NumberBox
+        {
+            Minimum = 0, Maximum = 1000, SmallChange = 0.05, LargeChange = 0.5, Value = 0,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+        };
+        var rightInset = new NumberBox
+        {
+            Minimum = 0, Maximum = 1000, SmallChange = 0.05, LargeChange = 0.5, Value = 0,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+        };
+        var allPages = new CheckBox { Content = "Apply to all pages" };
+
+        Grid Row(string label, FrameworkElement input, string? unit)
+        {
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(90) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });
+            var lbl = new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetColumn(lbl, 0);
+            Grid.SetColumn(input, 1);
+            grid.Children.Add(lbl); grid.Children.Add(input);
+            if (unit is not null)
+            {
+                var uab = new TextBlock { Text = unit, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 0, 0) };
+                Grid.SetColumn(uab, 2);
+                grid.Children.Add(uab);
+            }
+            return grid;
+        }
+
+        var stack = new StackPanel { Spacing = 6, Width = 300 };
+        stack.Children.Add(Row("Columns",       cols,      null));
+        stack.Children.Add(Row("Gutter",        gutter,    unitAbbr));
+        stack.Children.Add(Row("Left inset",    leftInset, unitAbbr));
+        stack.Children.Add(Row("Right inset",   rightInset,unitAbbr));
+        stack.Children.Add(allPages);
+
+        var dlg = new ContentDialog
+        {
+            Title = "Add column guides",
+            Content = stack,
+            PrimaryButtonText = "Add",
+            SecondaryButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = this.XamlRoot,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) { return; }
+
+        double f = PointsPerUnit(_rulerUnit);
+        ViewModel.AddColumnGuides(ViewModel.CurrentPageIndex,
+            (int)Math.Round(cols.Value),
+            gutter.Value * f,
+            leftInset.Value * f, rightInset.Value * f,
+            allPages.IsChecked == true);
+    }
+
+    private static string UnitAbbr(RulerUnit u) => u switch
+    {
+        RulerUnit.Inches => "in",
+        RulerUnit.Centimeters => "cm",
+        RulerUnit.Millimeters => "mm",
+        RulerUnit.Picas => "pc",
+        _ => "pt",
+    };
+
     /// <summary>Numeric guide placement, PageMaker-style. Shows a small
     /// dialog with orientation + position (in the current ruler unit),
     /// and adds the guide to the current page.</summary>

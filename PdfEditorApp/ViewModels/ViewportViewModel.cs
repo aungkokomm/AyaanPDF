@@ -1595,6 +1595,90 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         slot.Guides.Add(new GuideMark(horizontal, normalizedPos, slot.SlotWidth, slot.SlotHeight));
     }
 
+    /// <summary>Adds four MARGIN guides (top, bottom, left, right) at the
+    /// specified inset in POINTS. Called by the "Add margin guides..."
+    /// dialog. If <paramref name="allPages"/>, applies to every page in the
+    /// document; otherwise only the given page.</summary>
+    public void AddMarginGuides(int pageIndex, double topPts, double bottomPts,
+                                double leftPts, double rightPts, bool allPages)
+    {
+        IEnumerable<int> pages = allPages
+            ? Enumerable.Range(0, PageCount)
+            : new[] { pageIndex };
+        foreach (int p in pages)
+        {
+            var slot = PageSlots.FirstOrDefault(s => s.PageIndex == p);
+            if (slot is null) { continue; }
+            // Query the page's own dimensions in points so a mixed-size
+            // document still lands its right/bottom margin on each page's
+            // actual edge, not a shared assumption.
+            var (pageWpt, pageHpt) = PagePointsFor(p);
+            if (pageWpt <= 0 || pageHpt <= 0) { continue; }
+            slot.Guides.Add(new GuideMark(true,  topPts    / pageHpt,               slot.SlotWidth, slot.SlotHeight));
+            slot.Guides.Add(new GuideMark(true,  (pageHpt - bottomPts) / pageHpt,   slot.SlotWidth, slot.SlotHeight));
+            slot.Guides.Add(new GuideMark(false, leftPts   / pageWpt,               slot.SlotWidth, slot.SlotHeight));
+            slot.Guides.Add(new GuideMark(false, (pageWpt - rightPts) / pageWpt,    slot.SlotWidth, slot.SlotHeight));
+        }
+    }
+
+    /// <summary>Adds N COLUMN guides evenly across a content band bounded by
+    /// left/right insets (in points), with a gutter between columns. Each
+    /// column contributes TWO vertical guides (its left edge and right edge),
+    /// so N columns adds 2N guides. First column's left edge sits at
+    /// leftInsetPts; last column's right edge at (pageW - rightInsetPts).</summary>
+    public void AddColumnGuides(int pageIndex, int columns, double gutterPts,
+                                double leftInsetPts, double rightInsetPts, bool allPages)
+    {
+        if (columns < 1) { return; }
+        IEnumerable<int> pages = allPages
+            ? Enumerable.Range(0, PageCount)
+            : new[] { pageIndex };
+        foreach (int p in pages)
+        {
+            var slot = PageSlots.FirstOrDefault(s => s.PageIndex == p);
+            if (slot is null) { continue; }
+            var (pageWpt, _) = PagePointsFor(p);
+            if (pageWpt <= 0) { continue; }
+            double contentW = pageWpt - leftInsetPts - rightInsetPts;
+            if (contentW <= 0) { continue; }
+            // Column width from the standard grid formula: N columns and
+            // (N-1) gutters must fit into the content band.
+            double colW = (contentW - (columns - 1) * gutterPts) / columns;
+            if (colW <= 0) { continue; }
+            double cursor = leftInsetPts;
+            for (int c = 0; c < columns; c++)
+            {
+                slot.Guides.Add(new GuideMark(false, cursor / pageWpt,           slot.SlotWidth, slot.SlotHeight));
+                slot.Guides.Add(new GuideMark(false, (cursor + colW) / pageWpt,  slot.SlotWidth, slot.SlotHeight));
+                cursor += colW + gutterPts;
+            }
+        }
+    }
+
+    /// <summary>Point-space dimensions of the given page. Same source
+    /// <see cref="CurrentPagePoints"/> uses, exposed per-index so the margin
+    /// / column presets can handle mixed-size documents correctly (a legal
+    /// page + a letter page in the same PDF would want different margins).</summary>
+    private (double W, double H) PagePointsFor(int pageIndex)
+    {
+        var array = RenderCoreNative.get_page_sizes(_documentHandle);
+        try
+        {
+            if (array.Status == RenderStatus.OkPdfium && array.Sizes != IntPtr.Zero
+                && pageIndex >= 0 && pageIndex < (int)array.Len)
+            {
+                int stride = Marshal.SizeOf<NativePageSize>();
+                var native = Marshal.PtrToStructure<NativePageSize>(array.Sizes + (pageIndex * stride));
+                if (native.Width > 0 && native.Height > 0) { return (native.Width, native.Height); }
+            }
+        }
+        finally
+        {
+            RenderCoreNative.free_page_size_array(array);
+        }
+        return (0, 0);
+    }
+
     /// <summary>The guide the user has picked (single-select). Delete removes
     /// it, and its appearance flips to accent red. Held as a page/guide pair
     /// because the guide lives on a specific page.</summary>

@@ -140,6 +140,8 @@
                     <RadioMenuFlyoutItem Text="Picas"        GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Picas" />
                     <MenuFlyoutSeparator />
                     <MenuFlyoutItem Text="Add guide at exact position..." Click="AddGuideAt_Click" />
+                    <MenuFlyoutItem Text="Add margin guides..." Click="AddMargins_Click" />
+                    <MenuFlyoutItem Text="Add column guides..." Click="AddColumns_Click" />
                     <ToggleMenuFlyoutItem x:Name="LockGuidesToggle" Text="Lock guides" Click="LockGuidesToggle_Click" />
                     <MenuFlyoutSeparator />
                     <MenuFlyoutItem Text="Clear guides on this page" Click="ClearGuidesPage_Click" />
