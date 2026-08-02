@@ -139,6 +139,8 @@
                     <RadioMenuFlyoutItem Text="Points"       GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Points" />
                     <RadioMenuFlyoutItem Text="Picas"        GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Picas" />
                     <MenuFlyoutSeparator />
+                    <MenuFlyoutItem Text="Add guide at exact position..." Click="AddGuideAt_Click" />
+                    <MenuFlyoutSeparator />
                     <MenuFlyoutItem Text="Clear guides on this page" Click="ClearGuidesPage_Click" />
                     <MenuFlyoutItem Text="Clear all guides" Click="ClearGuidesAll_Click" />
                     <MenuFlyoutSeparator />

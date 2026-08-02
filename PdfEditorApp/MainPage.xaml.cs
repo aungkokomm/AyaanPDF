@@ -998,6 +998,78 @@ public sealed partial class MainPage : Page
         ViewModel.ClearAllGuides();
     }
 
+    /// <summary>Numeric guide placement, PageMaker-style. Shows a small
+    /// dialog with orientation + position (in the current ruler unit),
+    /// and adds the guide to the current page.</summary>
+    private async void AddGuideAt_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.PageCount == 0) { return; }
+
+        string unitAbbr = _rulerUnit switch
+        {
+            RulerUnit.Inches => "in",
+            RulerUnit.Centimeters => "cm",
+            RulerUnit.Millimeters => "mm",
+            RulerUnit.Picas => "pc",
+            _ => "pt",
+        };
+
+        // Compact layout: orientation radio at top, then number + unit label.
+        var horizontal = new RadioButton { Content = "Horizontal (across the page)", GroupName = "GuideOrient", IsChecked = true };
+        var vertical   = new RadioButton { Content = "Vertical (down the page)",     GroupName = "GuideOrient" };
+        var input = new Microsoft.UI.Xaml.Controls.NumberBox
+        {
+            Minimum = 0,
+            Maximum = 10000,
+            SmallChange = 0.1,
+            LargeChange = 1,
+            Value = 1,
+            SpinButtonPlacementMode = Microsoft.UI.Xaml.Controls.NumberBoxSpinButtonPlacementMode.Inline,
+        };
+        var unitLabel = new TextBlock
+        {
+            Text = unitAbbr,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 0, 0),
+        };
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+        row.Children.Add(input);
+        row.Children.Add(unitLabel);
+
+        var stack = new StackPanel { Spacing = 8, Width = 320 };
+        stack.Children.Add(horizontal);
+        stack.Children.Add(vertical);
+        stack.Children.Add(new TextBlock { Text = "Position:" });
+        stack.Children.Add(row);
+
+        var dlg = new ContentDialog
+        {
+            Title = "Add guide",
+            Content = stack,
+            PrimaryButtonText = "Add",
+            SecondaryButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = this.XamlRoot,
+        };
+
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) { return; }
+
+        double valueUnits = input.Value;
+        if (double.IsNaN(valueUnits)) { return; }
+        double valuePts = valueUnits * PointsPerUnit(_rulerUnit);
+
+        // Convert points -> normalized (0-1) on the current page.
+        var (pageWpt, pageHpt) = ViewModel.CurrentPagePoints();
+        if (pageWpt <= 0 || pageHpt <= 0) { return; }
+
+        bool isHorizontal = horizontal.IsChecked == true;
+        double norm = isHorizontal
+            ? Math.Clamp(valuePts / pageHpt, 0, 1)
+            : Math.Clamp(valuePts / pageWpt, 0, 1);
+
+        ViewModel.AddGuide(ViewModel.CurrentPageIndex, isHorizontal, norm);
+    }
+
     /// <summary>Formats a ruler label sensibly for the current unit. Integers
     /// stay integer; fractional shows enough decimal places for the unit but
     /// no more (0.5 not 0.500).</summary>
