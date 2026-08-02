@@ -651,27 +651,31 @@ public sealed partial class MainPage : Page
         double majorDips = majorUnits * dipsPerUnit;
         double minorDips = minorUnits * dipsPerUnit;
 
-        // First page's top-left in RulerCanvas space. TransformToVisual walks
-        // every intermediate transform (ScrollView zoom, scroll offset,
-        // ViewportHost centering) in one call. The point we transform is
-        // (Padding.Left, Padding.Top) - NOT (0,0) - because the ViewportHost
-        // starts its page content INSIDE its padding, the same offset every
-        // pointer-to-page conversion uses (see e.g. slotX = p.X - Padding.Left).
-        // Missing Padding.Left was why "0" landed a bit to the right of the
-        // page's actual left edge: the ticks were positioned at the ViewportHost
-        // origin, not the page origin.
-        double pageOriginX = 0, pageOriginY = 0;
+        // CURRENT page's top-left in RulerCanvas coords. PageMaker/Acrobat
+        // put ruler zero at whichever page the user is looking at, not
+        // permanently at page 1 - scroll to page 5 and the ruler restarts
+        // at 0 for page 5's edges. Do the same by computing from the current
+        // page's slot-top plus Padding.Top and the zoom, then subtracting the
+        // scroll offset. TransformToVisual gave page 0's origin instead which
+        // is why later pages had the ruler running past the page's top edge.
+        //
+        // ScrollView content coords are unzoomed; visual/screen coords are
+        // zoomed. Page top in content-space = SlotTopOf(current) + Padding.Top.
+        // In screen (ruler) space that's (that value) * zoom - VerticalOffset.
+        double pageOriginX, pageOriginY;
         try
         {
+            double slotTop = ViewModel.SlotTopOf(ViewModel.CurrentPageIndex);
+            pageOriginY = (slotTop + ViewportHost.Padding.Top) * zoom - PageScroller.VerticalOffset;
+
+            // Horizontal keeps the visual-tree walk because pages are centered
+            // in ScrollView when content is narrower than viewport, so a plain
+            // formula would have to redo that layout math. TransformToVisual
+            // already knows it.
             var toTop = ViewportHost.TransformToVisual(TopRuler);
             var pT = toTop.TransformPoint(new Windows.Foundation.Point(
                 ViewportHost.Padding.Left, 0));
             pageOriginX = pT.X;
-
-            var toLeft = ViewportHost.TransformToVisual(LeftRuler);
-            var pL = toLeft.TransformPoint(new Windows.Foundation.Point(
-                0, ViewportHost.Padding.Top));
-            pageOriginY = pL.Y;
         }
         catch
         {
