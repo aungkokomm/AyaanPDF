@@ -2772,6 +2772,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return (state & Windows.UI.Core.CoreVirtualKeyStates.Down) == Windows.UI.Core.CoreVirtualKeyStates.Down;
     }
 
+    /// <summary>Alt disables object snapping during a move, so the user can
+    /// place freely when snap keeps grabbing something they don't want.</summary>
+    private static bool IsAltDown()
+    {
+        var state = Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Menu);
+        return (state & Windows.UI.Core.CoreVirtualKeyStates.Down) == Windows.UI.Core.CoreVirtualKeyStates.Down;
+    }
+
     /// <summary>
     /// Drags the marquee only. The document is not touched until the gesture
     /// ends: committing on every pointer sample would mean a PDFium write and
@@ -2817,6 +2826,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_loadedGrip == LoadedAnnotationPicker.Grip.None)
         {
             moved = LoadedAnnotationPicker.Dragged(box, ox, oy, normX, normY);
+
+            // Object snap: nudge the moved box so its edges/centres line up with
+            // other annotations' edges/centres on the same page when close. Alt
+            // held disables snapping so a user can place freely when the snap
+            // wants to grab something unwanted. Snap runs BEFORE the extras
+            // delta below so the whole group inherits the snap - one anchor snap
+            // moves every extra by the same amount, so relative positions hold.
+            if (!IsAltDown())
+            {
+                moved = SnapMovedToNearbyAnnotations(start.PageIndex, moved);
+            }
         }
         else
         {
@@ -2870,6 +2890,77 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         RefreshSelectionOutline();
+    }
+
+    /// <summary>How close (in normalized page-width units) an edge or centre
+    /// has to come to another annotation's edge/centre before snapping. 0.005
+    /// is 5 units on the 1000-wide capture, about 3-4 pixels on screen at fit-
+    /// width - close enough to feel intentional, far enough to not fight normal
+    /// dragging.</summary>
+    private const double SnapThresholdNorm = 0.005;
+
+    /// <summary>Returns the moved box shifted so its nearest edge or centre
+    /// lines up with a NEARBY OTHER annotation on the same page. Independent
+    /// axes: X can snap to one annotation while Y snaps to another. Snapping
+    /// preserves the box's size (a snap on Left shifts Right by the same
+    /// amount). Same-anchor and extras-in-motion are excluded because a shape
+    /// should never snap to itself or to its own moving companions.</summary>
+    private AnnotationBox SnapMovedToNearbyAnnotations(int pageIndex, AnnotationBox moved)
+    {
+        var candidates = LoadedFor(pageIndex);
+        if (candidates.Count == 0) { return moved; }
+
+        // Set of indices to ignore: the anchor being dragged and every extra
+        // being moved with it. Snapping to those is nonsense - they follow the
+        // anchor by the same delta so their positions are correlated.
+        var ignore = new HashSet<int>();
+        if (_selectedLoaded is LoadedSelection a && a.PageIndex == pageIndex)
+        {
+            ignore.Add(a.Index);
+        }
+        foreach (var e in _extraSelected)
+        {
+            if (e.PageIndex == pageIndex) { ignore.Add(e.Index); }
+        }
+
+        // Gather X and Y snap targets: left/right/centre from every other mark.
+        var xs = new List<double>(candidates.Count * 3);
+        var ys = new List<double>(candidates.Count * 3);
+        foreach (var c in candidates)
+        {
+            if (ignore.Contains(c.Index)) { continue; }
+            xs.Add(c.Left); xs.Add(c.Right); xs.Add((c.Left + c.Right) / 2);
+            ys.Add(c.Top); ys.Add(c.Bottom); ys.Add((c.Top + c.Bottom) / 2);
+        }
+        if (xs.Count == 0) { return moved; }
+
+        // For each of our own edges/centre, find the closest candidate on that
+        // axis. Whichever of the three has the smallest distance wins - if it's
+        // within threshold, we shift by that offset.
+        double movedCx = (moved.Left + moved.Right) / 2;
+        double movedCy = (moved.Top + moved.Bottom) / 2;
+
+        double bestDx = 0;
+        double bestDistX = SnapThresholdNorm;
+        foreach (double t in xs)
+        {
+            double d;
+            d = t - moved.Left; if (Math.Abs(d) < bestDistX) { bestDistX = Math.Abs(d); bestDx = d; }
+            d = t - moved.Right; if (Math.Abs(d) < bestDistX) { bestDistX = Math.Abs(d); bestDx = d; }
+            d = t - movedCx; if (Math.Abs(d) < bestDistX) { bestDistX = Math.Abs(d); bestDx = d; }
+        }
+
+        double bestDy = 0;
+        double bestDistY = SnapThresholdNorm;
+        foreach (double t in ys)
+        {
+            double d;
+            d = t - moved.Top; if (Math.Abs(d) < bestDistY) { bestDistY = Math.Abs(d); bestDy = d; }
+            d = t - moved.Bottom; if (Math.Abs(d) < bestDistY) { bestDistY = Math.Abs(d); bestDy = d; }
+            d = t - movedCy; if (Math.Abs(d) < bestDistY) { bestDistY = Math.Abs(d); bestDy = d; }
+        }
+
+        return moved.MovedBy(bestDx, bestDy);
     }
 
     /// <summary>Writes a finished drag through to the document.</summary>
