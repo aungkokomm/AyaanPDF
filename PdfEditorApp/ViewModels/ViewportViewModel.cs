@@ -2447,7 +2447,36 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         else
         {
-            _extraSelected.Clear();
+            // Plain click on any member of the current multi-selection (anchor
+            // OR extras) PRESERVES the group and starts dragging the whole
+            // thing - the convention every editor follows. Only when the click
+            // lands on something OUTSIDE the current selection does the group
+            // collapse to just the clicked mark. Without this, marquee-select
+            // eight lines then click-drag one and only that one moved.
+            bool clickedInSelection =
+                (_selectedLoaded is LoadedSelection cur
+                    && cur.PageIndex == pageIndex && cur.Index == hit.Index)
+                || _extraSelected.Any(x => x.PageIndex == pageIndex && x.Index == hit.Index);
+
+            if (clickedInSelection)
+            {
+                // Keep the extras exactly as they are, and if the clicked mark
+                // was an extra, promote it to anchor so subsequent per-anchor
+                // ops (rotate handle, resize grip) act on the mark under the
+                // pointer. Its previous position in extras is dropped and the
+                // old anchor moves in.
+                int wasExtra = _extraSelected.FindIndex(x =>
+                    x.PageIndex == pageIndex && x.Index == hit.Index);
+                if (wasExtra >= 0 && _selectedLoaded is LoadedSelection oldAnchor)
+                {
+                    _extraSelected.RemoveAt(wasExtra);
+                    _extraSelected.Add(oldAnchor);
+                }
+            }
+            else
+            {
+                _extraSelected.Clear();
+            }
         }
 
         _selectedLoaded = new LoadedSelection(
