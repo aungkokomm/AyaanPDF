@@ -2433,6 +2433,13 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void ResetPointerInteraction()
     {
+        // Drop every drag-time visual (smart alignment lines, snap-flash)
+        // FIRST, so a capture-lost mid-drag never leaves orange guides
+        // stranded on the page. EndAnnotationMove below also calls this via
+        // ClearDragTimeVisuals, but running once here covers the case where
+        // _isMovingAnnotation was already cleared by a prior path.
+        ViewModel.ClearDragTimeVisuals();
+
         // Tell the view model first, so a half-finished stroke or selection is
         // closed off properly rather than left hanging.
         if (_isMovingAnnotation)

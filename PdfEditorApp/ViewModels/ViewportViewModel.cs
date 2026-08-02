@@ -2522,21 +2522,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // A loaded annotation is written through here, at the END of the drag,
         // rather than on every pointer sample.
         CommitLoadedMove();
-        // Clear snap-flash and smart alignment guides regardless of whether
-        // CommitLoadedMove ran its own clear (its guard returns early when
-        // _loadedDrag is already null - which happens on cancelled/tiny
-        // gestures - and would leave orange smart lines on screen). This
-        // path always runs at the end of the gesture, so it's the reliable
-        // spot to drop the visuals.
+        ClearDragTimeVisuals();
+        _isMovingAnnotation = false;
+        _moveOrigin = null;
+    }
+
+    /// <summary>Drops every drag-time visual on every page - guide snap-flash
+    /// (yellow) and smart alignment guides (orange) - unconditionally. Every
+    /// drag-end path calls this so the overlays disappear no matter which
+    /// path runs (PointerReleased, PointerCaptureLost, tool switch, etc.).
+    /// Sets to null unconditionally (skips the "already null" fast-return)
+    /// so the change-notify fires even if internal state got out of sync.</summary>
+    public void ClearDragTimeVisuals()
+    {
         foreach (var s in PageSlots)
         {
             foreach (var g in s.Guides) { if (g.IsSnapActive) { g.IsSnapActive = false; } }
-            if (s.SmartGuideX is not null) { s.SmartGuideX = null; }
-            if (s.SmartGuideY is not null) { s.SmartGuideY = null; }
+            s.SmartGuideX = null;
+            s.SmartGuideY = null;
         }
-
-        _isMovingAnnotation = false;
-        _moveOrigin = null;
+        Diag.Log("cleared drag-time visuals");
     }
 
     public void DeleteSelectedAnnotation()
