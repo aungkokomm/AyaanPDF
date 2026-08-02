@@ -330,6 +330,11 @@ public partial class GuideMark : ObservableObject
     public partial double PixelWidth { get; set; }
     [ObservableProperty]
     public partial double PixelHeight { get; set; }
+    /// <summary>True when the user has clicked to select this guide. Toggles
+    /// the fill from cyan to accent-red so it's visually clear which one the
+    /// Delete key will remove.</summary>
+    [ObservableProperty]
+    public partial bool IsSelected { get; set; }
 
     public GuideMark(bool horizontal, double normalizedPos, double slotWidth, double slotHeight)
     {

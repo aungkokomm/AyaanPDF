@@ -1519,6 +1519,62 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         slot.Guides.Add(new GuideMark(horizontal, normalizedPos, slot.SlotWidth, slot.SlotHeight));
     }
 
+    /// <summary>The guide the user has picked (single-select). Delete removes
+    /// it, and its appearance flips to accent red. Held as a page/guide pair
+    /// because the guide lives on a specific page.</summary>
+    private (int Page, GuideMark Guide)? _selectedGuide;
+
+    /// <summary>Picks the guide under a page-local NORMALIZED pointer (nx, ny)
+    /// on the given page, if any is within the tolerance. Horizontal guides
+    /// match on Y, vertical on X. Tolerance is 0.005 normalized (about 4 DIPs
+    /// on the 800-wide slot) which is Illustrator's rough click zone for a
+    /// hairline object. Returns null when nothing's close enough.</summary>
+    public GuideMark? PickGuideAt(int pageIndex, double nx, double ny)
+    {
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
+        if (slot is null) { return null; }
+        const double Tol = 0.005;
+        foreach (var g in slot.Guides)
+        {
+            double d = g.Horizontal ? Math.Abs(ny - g.NormalizedPos) : Math.Abs(nx - g.NormalizedPos);
+            if (d <= Tol) { return g; }
+        }
+        return null;
+    }
+
+    /// <summary>Selects the given guide (page + guide), highlighting it and
+    /// clearing any prior selection - including annotation selection, so the
+    /// property bar stops showing shape/text controls that don't apply.</summary>
+    public void SelectGuide(int pageIndex, GuideMark guide)
+    {
+        // Clear the annotation selection so the property bar reacts (nothing
+        // shape-like or text-like is picked while a guide is active).
+        ClearAnnotationSelection();
+
+        if (_selectedGuide is (_, GuideMark prev)) { prev.IsSelected = false; }
+        _selectedGuide = (pageIndex, guide);
+        guide.IsSelected = true;
+    }
+
+    public void ClearGuideSelection()
+    {
+        if (_selectedGuide is (_, GuideMark g)) { g.IsSelected = false; }
+        _selectedGuide = null;
+    }
+
+    public bool HasSelectedGuide => _selectedGuide is not null;
+
+    /// <summary>Deletes the currently-selected guide, if any. Bound to the
+    /// Delete/Backspace key path from MainPage, same as annotation delete.</summary>
+    public bool DeleteSelectedGuide()
+    {
+        if (_selectedGuide is not (int page, GuideMark g)) { return false; }
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == page);
+        slot?.Guides.Remove(g);
+        _selectedGuide = null;
+        return true;
+    }
+
     public void ClearGuidesOnPage(int pageIndex)
     {
         var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);

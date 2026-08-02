@@ -281,6 +281,15 @@ public sealed partial class MainPage : Page
     /// </summary>
     public static Thickness Offset(double left, double top) => new(left, top, 0, 0);
 
+    /// <summary>Cyan for an unselected guide, accent-red for the selected
+    /// one, so the user can see at a glance which guide Delete will remove.</summary>
+    private static readonly Microsoft.UI.Xaml.Media.SolidColorBrush GuideBrushDefault =
+        new(Windows.UI.Color.FromArgb(0xD8, 0x00, 0xA0, 0xD8));
+    private static readonly Microsoft.UI.Xaml.Media.SolidColorBrush GuideBrushSelected =
+        new(Windows.UI.Color.FromArgb(0xFF, 0xE8, 0x1B, 0x3B));
+    public static Microsoft.UI.Xaml.Media.Brush GuideFill(bool selected) =>
+        selected ? GuideBrushSelected : GuideBrushDefault;
+
     /// <summary>
     /// Positions an element from a NORMALIZED coordinate, multiplying by the
     /// slot scale. For overlays that must not sit inside the scaled layer,
@@ -3090,7 +3099,12 @@ public sealed partial class MainPage : Page
                 break;
             case VirtualKey.Delete:
             case VirtualKey.Back:
-                ViewModel.DeleteSelectedAnnotation();
+                // Selected guide wins over selected annotation: a user who
+                // just clicked a guide expects Delete to remove THAT.
+                if (!ViewModel.DeleteSelectedGuide())
+                {
+                    ViewModel.DeleteSelectedAnnotation();
+                }
                 e.Handled = true;
                 break;
 
@@ -3378,6 +3392,24 @@ public sealed partial class MainPage : Page
 
         Diag.Log($"press tool={ViewModel.ActiveTool} raw=({e.GetCurrentPoint(ViewportHost).Position.X:F0},{e.GetCurrentPoint(ViewportHost).Position.Y:F0}) " +
                  $"page={content.Page} local=({content.X:F1},{content.Y:F1}) norm=({nx:F3},{ny:F3})");
+
+        // Guide hit-test comes FIRST, regardless of tool, because a guide
+        // sits ON TOP of whatever else is there and Illustrator/PageMaker
+        // both let you grab a guide with any tool active. A hit selects the
+        // guide (highlighted red) and captures the pointer; a miss falls
+        // through so the click reaches the normal tool path. Any other press
+        // clears the guide selection so the highlight doesn't linger.
+        if (ViewModel.PickGuideAt(content.Page, nx, ny) is { } guideHit)
+        {
+            ViewModel.SelectGuide(content.Page, guideHit);
+            ViewportHost.CapturePointer(e.Pointer);
+            e.Handled = true;
+            return;
+        }
+        else
+        {
+            ViewModel.ClearGuideSelection();
+        }
 
         switch (ViewModel.ActiveTool)
         {
