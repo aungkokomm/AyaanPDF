@@ -805,6 +805,26 @@ public sealed partial class MainPage : Page
         UpdateGuidePreview(e);
     }
 
+    private void Ruler_PointerEntered(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        // Signal that this ruler is grab-and-pull. Hand cursor is what
+        // Illustrator/PageMaker both use for the same gesture, and it lands
+        // in the right ballpark of "you can drag out of here" without being
+        // as literal as a custom I-beam-with-arrow.
+        if (sender is Controls.CursorCanvas cc)
+        {
+            cc.SetCursorShape(Microsoft.UI.Input.InputSystemCursorShape.Hand);
+        }
+    }
+
+    private void Ruler_PointerExited(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (sender is Controls.CursorCanvas cc)
+        {
+            cc.ClearCursor();
+        }
+    }
+
     private void Ruler_PointerReleased(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
         if (_guideDrag == GuideDragSource.None) { return; }
@@ -863,6 +883,7 @@ public sealed partial class MainPage : Page
             GuidePreviewLine.VerticalAlignment = VerticalAlignment.Stretch;
         }
         GuidePreviewLine.Visibility = Visibility.Visible;
+        GuideReadout.Visibility = Visibility.Visible;
         UpdateGuidePreview(e);
     }
 
@@ -884,11 +905,78 @@ public sealed partial class MainPage : Page
             // Vertical line: pin X = pointer X, Y unchanged.
             GuidePreviewLine.Margin = new Thickness(pInCorner.X, 0, 0, 0);
         }
+
+        UpdateGuideReadout(e, pInCorner);
+    }
+
+    /// <summary>Refreshes the floating "Y = 1.5 in" chip near the pointer,
+    /// showing the position the guide would land at IF released now. Points
+    /// are converted through the current ruler unit so what the user reads
+    /// matches the tick numbers.</summary>
+    private void UpdateGuideReadout(Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e,
+                                    Windows.Foundation.Point pInCorner)
+    {
+        // Position in ViewportHost content space, mapped to the current page
+        // (whichever page the pointer is over). If the pointer is above the
+        // first page or off any page, show a coordinate anyway so the user
+        // sees the pointer's mapped value throughout the drag.
+        var pInHost = e.GetCurrentPoint(ViewportHost).Position;
+        double slotX = pInHost.X - ViewportHost.Padding.Left;
+        double slotY = pInHost.Y - ViewportHost.Padding.Top;
+
+        int pageIndex = ViewModel.PageAt(slotY);
+        var slot = pageIndex >= 0
+            ? ViewModel.PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex)
+            : null;
+
+        double valuePts;
+        string axisLabel;
+        if (_guideDrag == GuideDragSource.TopRuler)
+        {
+            // Horizontal guide -> Y readout in the current page's coordinate
+            // system. Convert slot DIPs to points using the page's actual size.
+            axisLabel = "Y";
+            if (slot is not null && slot.SlotHeight > 0)
+            {
+                double slotLocalY = slotY - ViewModel.SlotTopOf(pageIndex);
+                var (_, pageHpt) = ViewModel.CurrentPagePoints();
+                valuePts = pageHpt > 0 ? slotLocalY / slot.SlotHeight * pageHpt : 0;
+            }
+            else { valuePts = 0; }
+        }
+        else
+        {
+            axisLabel = "X";
+            if (slot is not null && slot.SlotWidth > 0)
+            {
+                var (pageWpt, _) = ViewModel.CurrentPagePoints();
+                valuePts = pageWpt > 0 ? slotX / slot.SlotWidth * pageWpt : 0;
+            }
+            else { valuePts = 0; }
+        }
+
+        double valueUnits = valuePts / PointsPerUnit(_rulerUnit);
+        string unitAbbr = _rulerUnit switch
+        {
+            RulerUnit.Inches => "in",
+            RulerUnit.Centimeters => "cm",
+            RulerUnit.Millimeters => "mm",
+            RulerUnit.Picas => "pc",
+            _ => "pt",
+        };
+        GuideReadoutText.Text = $"{axisLabel} = {FormatRulerLabel(valueUnits)} {unitAbbr}";
+
+        // Chip trails the pointer by a small offset so it's not right under
+        // the cursor. Kept inside Grid col 2 via Margin.
+        const double dxChip = 14;
+        const double dyChip = 12;
+        GuideReadout.Margin = new Thickness(pInCorner.X + dxChip, pInCorner.Y + dyChip, 0, 0);
     }
 
     private void HideGuidePreview()
     {
         GuidePreviewLine.Visibility = Visibility.Collapsed;
+        GuideReadout.Visibility = Visibility.Collapsed;
     }
 
     private void ClearGuidesPage_Click(object sender, RoutedEventArgs e)

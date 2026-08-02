@@ -100,7 +100,25 @@
                    UseLayoutRounding="False"
                    Canvas.ZIndex="9"
                    Visibility="Collapsed" />
-        <Canvas x:Name="TopRuler" Grid.Column="2"
+
+        <!-- Coordinate readout that follows the pointer during the drag.
+             Small floating chip near the cursor showing the current position
+             in the active ruler unit, so precise placement is a matter of
+             watching the number rather than counting ticks. Collapsed until
+             a ruler drag starts. -->
+        <Border x:Name="GuideReadout" Grid.Column="2"
+                Background="{ThemeResource SystemControlBackgroundBaseLowBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="3"
+                Padding="4,1"
+                HorizontalAlignment="Left" VerticalAlignment="Top"
+                IsHitTestVisible="False"
+                Canvas.ZIndex="11"
+                Visibility="Collapsed">
+            <TextBlock x:Name="GuideReadoutText" FontSize="10"
+                       Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
+        </Border>
+        <controls:CursorCanvas x:Name="TopRuler" Grid.Column="2"
                 Height="22" Margin="22,0,0,0"
                 HorizontalAlignment="Stretch" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -109,6 +127,8 @@
                 PointerMoved="Ruler_PointerMoved"
                 PointerReleased="Ruler_PointerReleased"
                 PointerCaptureLost="Ruler_PointerCaptureLost"
+                PointerEntered="Ruler_PointerEntered"
+                PointerExited="Ruler_PointerExited"
                 RightTapped="Ruler_RightTapped"
                 SizeChanged="Rulers_SizeChanged">
             <Canvas.ContextFlyout>
@@ -125,8 +145,8 @@
                     <MenuFlyoutItem Text="Hide Rulers" Click="RulersHide_Click" />
                 </MenuFlyout>
             </Canvas.ContextFlyout>
-        </Canvas>
-        <Canvas x:Name="LeftRuler" Grid.Column="2"
+        </controls:CursorCanvas>
+        <controls:CursorCanvas x:Name="LeftRuler" Grid.Column="2"
                 Width="22" Margin="0,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Stretch"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -135,6 +155,8 @@
                 PointerMoved="Ruler_PointerMoved"
                 PointerReleased="Ruler_PointerReleased"
                 PointerCaptureLost="Ruler_PointerCaptureLost"
+                PointerEntered="Ruler_PointerEntered"
+                PointerExited="Ruler_PointerExited"
                 RightTapped="Ruler_RightTapped"
                 SizeChanged="Rulers_SizeChanged" />
 
