@@ -94,11 +94,23 @@ public partial class PageSlot : ObservableObject
     /// object's edge/centre on this page. Bright orange, span the full page
     /// dimension perpendicular to the alignment, cleared the moment the
     /// alignment ends. Both axes independent - X can be lit while Y isn't.
-    /// Null = not active on that axis.</summary>
-    [ObservableProperty]
-    public partial double? SmartGuideX { get; set; }
-    [ObservableProperty]
-    public partial double? SmartGuideY { get; set; }
+    /// Null = not active on that axis. Explicit setters with an unconditional
+    /// OnPropertyChanged - [ObservableProperty] on a nullable double gets
+    /// equality-compared and null-set-to-null (already-null case) doesn't
+    /// raise, which we don't want here: the clear at drag-end needs to fire
+    /// regardless of prior state to guarantee the overlay collapses.</summary>
+    private double? _smartGuideX;
+    public double? SmartGuideX
+    {
+        get => _smartGuideX;
+        set { _smartGuideX = value; OnPropertyChanged(nameof(SmartGuideX)); }
+    }
+    private double? _smartGuideY;
+    public double? SmartGuideY
+    {
+        get => _smartGuideY;
+        set { _smartGuideY = value; OnPropertyChanged(nameof(SmartGuideY)); }
+    }
 
     /// <summary>Degrees the selection frame and its handles are turned (clockwise),
     /// so a rotated text box is framed at its real angle. The frame and handles are
