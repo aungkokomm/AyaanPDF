@@ -2919,28 +2919,36 @@ const SHAPE_TAG: &str = "AyaanShape:";
 fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
     let fx = u8::from(spec.x2 >= spec.x1);
     let fy = u8::from(spec.y2 >= spec.y1);
-    // Rotation is APPENDED so an older reader that stops after fy still gets
-    // kind/colour/width/direction; a new reader also picks up the angle. Only
-    // written when non-zero to keep unrotated tags identical to what they used
-    // to be, so shape files diffed against the old build show no change.
-    if spec.rotation_deg == 0.0 {
+    // Rotation and fill are BOTH appended so an older reader that stops after
+    // fy still gets kind/colour/width/direction. Emit progressively longer
+    // tags: bare when neither is set, +rot when only rotated, +rot+fill when
+    // filled (rot forced to 0.00 in that case so parse order stays positional).
+    // Keeps unrotated stroke-only shapes byte-identical to older tags, so a
+    // shape file diffed against the old build shows no change unless the
+    // shape actually uses one of these new features.
+    if spec.rotation_deg == 0.0 && spec.fill_rgba == 0 {
         format!(
             "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}",
             spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts
         )
-    } else {
+    } else if spec.fill_rgba == 0 {
         format!(
             "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}",
             spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts, spec.rotation_deg
         )
+    } else {
+        format!(
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}",
+            spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts, spec.rotation_deg, spec.fill_rgba
+        )
     }
 }
 
-/// The kind, colour, width, drag direction, and rotation recorded on one of our
-/// shape annotations, or None if it is not one of ours. Rotation is 0 on older
-/// tags that predate that field; the caller does not need to know which form
-/// the tag was in.
-fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32)> {
+/// The kind, colour, width, drag direction, rotation, and fill colour recorded
+/// on one of our shape annotations, or None if it is not one of ours. Rotation
+/// is 0 and fill is 0 on older tags that predate those fields; the caller does
+/// not need to know which form the tag was in.
+fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32)> {
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
 
@@ -2969,7 +2977,15 @@ fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bo
     // unrotated.
     let rot: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
 
-    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot))
+    // Fill colour, if present. Same permissive parse: an unparseable value is
+    // treated as 0 (stroke-only), so a corrupt trailing byte never invalidates
+    // an otherwise good shape tag.
+    let fill: u32 = parts
+        .next()
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+
+    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill))
 }
 
 /// One shape to add, in render-pixel space.
@@ -2997,6 +3013,13 @@ pub struct ShapeSpec {
     /// stays stable for callers that don't set this (they'll pass a zero-init
     /// struct so rotation is 0), and the render code treats 0 as a no-op.
     pub rotation_deg: f32,
+    /// Fill colour for rectangles and ellipses as 0xAARRGGBB. Zero means
+    /// STROKE-ONLY (the historic default: shapes were originally outlines so
+    /// they wouldn't hide the page under them). Non-zero fills rectangles and
+    /// ellipses with this colour BEHIND their stroke; lines and arrows ignore
+    /// it. APPENDED to the struct: existing callers that zero-init the whole
+    /// thing get stroke-only shapes, same as before this field was added.
+    pub fill_rgba: u32,
 }
 
 /// Half-width of an arrowhead as a fraction of its length, giving the roughly
@@ -3146,9 +3169,20 @@ fn add_shape_annotations_inner(
                 } else {
                     PdfPagePathObject::new_ellipse
                 };
-                // Stroke only, no fill: a filled shape hides the page under it,
-                // and an outline is what marking up a document calls for.
-                build(&doc_guard, rect, Some(color), Some(PdfPoints::new(width_pts)), None)
+                // Fill is optional. Historically shapes were stroke-only so
+                // they'd never hide the underlying page; a non-zero fill_rgba
+                // opts a rectangle or ellipse into a solid fill (with alpha,
+                // so a light fill still shows the page through it).
+                let fill = if spec.fill_rgba != 0 {
+                    let r = ((spec.fill_rgba >> 16) & 0xFF) as u8;
+                    let g = ((spec.fill_rgba >> 8) & 0xFF) as u8;
+                    let b = (spec.fill_rgba & 0xFF) as u8;
+                    let a = ((spec.fill_rgba >> 24) & 0xFF) as u8;
+                    Some(PdfColor::new(r, g, b, a))
+                } else {
+                    None
+                };
+                build(&doc_guard, rect, Some(color), Some(PdfPoints::new(width_pts)), fill)
             }
             _ => {
                 // For an arrow the shaft stops at the head's BASE; the head is
@@ -3336,10 +3370,11 @@ pub extern "C" fn rotate_shape_annotation(
     }
     panic::catch_unwind(|| {
         // Passing color_rgba=0 and width_px=-1 keeps the tag's colour and
-        // width; rotation_override supplies the new angle.
+        // width; rotation_override supplies the new angle. Fill stays as it was
+        // (None), so a rotate does not clear or change a filled shape.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, Some(degrees), out_new_index)
+            0, -1.0, Some(degrees), None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -3364,7 +3399,34 @@ pub extern "C" fn restyle_shape_annotation(
     }
     panic::catch_unwind(|| {
         restyle_shape_annotation_inner_with_rotation(
-            doc_handle, page_index, index, capture_width, color_rgba, width_px, None, out_new_index)
+            doc_handle, page_index, index, capture_width, color_rgba, width_px, None, None, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Applies a new fill colour to one of our rectangle or ellipse shapes without
+/// moving it. Zero clears the fill (shape becomes stroke-only). Line and arrow
+/// shapes ignore fill: they still write the value into their tag for round-trip
+/// consistency, but the drawn shape doesn't gain a fill (there's nothing to
+/// fill on a line).
+#[unsafe(no_mangle)]
+pub extern "C" fn restyle_shape_fill_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    fill_rgba: u32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        // color_rgba=0, width_px=-1, rotation_override=None: preserve stroke
+        // colour, width and rotation. Only the fill changes.
+        restyle_shape_annotation_inner_with_rotation(
+            doc_handle, page_index, index, capture_width,
+            0, -1.0, None, Some(fill_rgba), out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -3378,13 +3440,14 @@ fn restyle_shape_annotation_inner_with_rotation(
     color_rgba: u32,
     width_px: f32,
     rotation_override: Option<f32>,
+    fill_override: Option<u32>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
     // Read tag AND the annotation's own bounds BEFORE the delete, so a mark
     // that is not one of our shapes leaves the page untouched.
-    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, page_left, page_top, page_w, bounds) = {
+    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, page_left, page_top, page_w, bounds) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
@@ -3401,7 +3464,7 @@ fn restyle_shape_annotation_inner_with_rotation(
             Ok(b) => (b.left().value, b.top().value),
             Err(_) => (0.0, page.height().value),
         };
-        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, page_left, page_top, pw, bx)
+        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, page_left, page_top, pw, bx)
     };
 
     // Convert the annotation's PDF-point bounds back into capture space.
@@ -3440,6 +3503,10 @@ fn restyle_shape_annotation_inner_with_rotation(
         r: nr, g: ng, b: nb, a: na,
         width_px: new_width_px,
         rotation_deg: rotation_override.unwrap_or(cur_rot),
+        // Fill override applies the caller's value; None keeps the tag's fill
+        // (so a restyle of colour or width alone preserves the fill). A caller
+        // that wants to CLEAR the fill passes Some(0), not None.
+        fill_rgba: fill_override.unwrap_or(cur_fill),
     };
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
     if status != STATUS_OK_PDFIUM { return status; }
@@ -3496,7 +3563,7 @@ fn resize_shape_annotation_inner(
         }
     };
 
-    let (kind, r, g, b, a, width_pts, fx, fy, rot) = tag;
+    let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba) = tag;
 
     if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
         return STATUS_INVALID_INPUT;
@@ -3539,6 +3606,7 @@ fn resize_shape_annotation_inner(
         a,
         width_px,
         rotation_deg: rot,
+        fill_rgba,
     };
 
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
@@ -6743,6 +6811,7 @@ mod tests {
             a: 255,
             width_px: 3.0,
             rotation_deg: 0.0,
+            fill_rgba: 0,
         }
     }
 
@@ -7796,7 +7865,7 @@ mod tests {
         let contents = contents_of(reopened, 0, 0).expect("the reopened shape has no contents");
         let parsed = parse_shape_tag(&contents);
         assert!(parsed.is_some(), "tag did not parse: {contents}");
-        let (kind, r, g, b, a, width, _, _, _) = parsed.unwrap();
+        let (kind, r, g, b, a, width, _, _, _, _) = parsed.unwrap();
 
         assert_eq!(kind, SHAPE_ELLIPSE);
         assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x78));
@@ -7967,15 +8036,15 @@ mod tests {
 
         let specs = [
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 100.0, x2: 700.0, y2: 100.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0 },
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 },
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 200.0, x2: 700.0, y2: 320.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0 },
+                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 },
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 700.0, y1: 420.0, x2: 80.0, y2: 420.0,
-                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0 },
+                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 },
             ShapeSpec { page_index: 0, kind: SHAPE_RECTANGLE, x1: 80.0, y1: 500.0, x2: 350.0, y2: 640.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0 },
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 },
             ShapeSpec { page_index: 0, kind: SHAPE_ELLIPSE, x1: 420.0, y1: 500.0, x2: 700.0, y2: 640.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0 },
+                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 },
         ];
         assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()), STATUS_OK_PDFIUM);
 

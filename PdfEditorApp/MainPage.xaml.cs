@@ -997,9 +997,14 @@ public sealed partial class MainPage : Page
     private void FillFlyout_Opening(object? sender, object e)
     {
         _suppressFillChange = true;
-        FillPicker.Color = string.IsNullOrEmpty(ViewModel.TextFillHex)
+        // Show the correct existing fill so the custom picker opens on THIS
+        // object's actual value (shape or text box), not on the tool's leftover.
+        string? current = ViewModel.HasSelectedShape
+            ? ViewModel.ShapeFillHex
+            : ViewModel.TextFillHex;
+        FillPicker.Color = string.IsNullOrEmpty(current)
             ? Microsoft.UI.Colors.White
-            : ColorFromHex(ViewModel.TextFillHex);
+            : ColorFromHex(current);
         _suppressFillChange = false;
     }
 
@@ -1011,18 +1016,35 @@ public sealed partial class MainPage : Page
         }
 
         var c = args.NewColor;
-        ViewModel.TextFillHex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
-        SyncTextStyleControls();
-        UpdateOpenEditorStyle();
-        ViewModel.ApplyStyleToSelectedTextBox();
+        string hex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
+        if (ViewModel.HasSelectedShape)
+        {
+            ViewModel.ShapeFillHex = hex;
+            ViewModel.ApplyFillToSelectedShape();
+        }
+        else
+        {
+            ViewModel.TextFillHex = hex;
+            SyncTextStyleControls();
+            UpdateOpenEditorStyle();
+            ViewModel.ApplyStyleToSelectedTextBox();
+        }
     }
 
     private void NoFill_Click(object sender, RoutedEventArgs e)
     {
-        ViewModel.TextFillHex = "";
-        SyncTextStyleControls();
-        UpdateOpenEditorStyle();
-        ViewModel.ApplyStyleToSelectedTextBox();
+        if (ViewModel.HasSelectedShape)
+        {
+            ViewModel.ShapeFillHex = null;
+            ViewModel.ApplyFillToSelectedShape();
+        }
+        else
+        {
+            ViewModel.TextFillHex = "";
+            SyncTextStyleControls();
+            UpdateOpenEditorStyle();
+            ViewModel.ApplyStyleToSelectedTextBox();
+        }
         FillFlyout.Hide();
     }
 
@@ -1090,10 +1112,22 @@ public sealed partial class MainPage : Page
     {
         if (sender is Button b && b.Tag is string hex && !string.IsNullOrEmpty(hex))
         {
-            ViewModel.TextFillHex = hex;
-            SyncTextStyleControls();
-            UpdateOpenEditorStyle();
-            ViewModel.ApplyStyleToSelectedTextBox();
+            // Shape and text box share the fill picker. Route to whichever kind
+            // is selected; if both are somehow set, prefer the shape (text-box
+            // fill still applies below - both paths no-op unless their kind is
+            // actually the selected annotation).
+            if (ViewModel.HasSelectedShape)
+            {
+                ViewModel.ShapeFillHex = hex;
+                ViewModel.ApplyFillToSelectedShape();
+            }
+            else
+            {
+                ViewModel.TextFillHex = hex;
+                SyncTextStyleControls();
+                UpdateOpenEditorStyle();
+                ViewModel.ApplyStyleToSelectedTextBox();
+            }
             FillFlyout.Hide();
         }
     }
@@ -1726,7 +1760,13 @@ public sealed partial class MainPage : Page
         bool textSections = tool.Offers(ToolOptions.FontSize) || ViewModel.HasSelectedTextBox;
         FontSizeSection.Visibility = Show(textSections);
         FontSection.Visibility = Show(textSections);
-        TextStyleSection.Visibility = Show(textSections);
+        // TextStyleSection also carries the Fill button, which now applies to
+        // shapes too, so it shows for a selected shape as well. The alignment
+        // sub-row and Outline stay hidden for the shape case (a shape has no
+        // text to align and no separate outline distinct from its stroke).
+        TextStyleSection.Visibility = Show(textSections || ViewModel.HasSelectedShape);
+        TextAlignRow.Visibility = Show(textSections);
+        OutlineButton.Visibility = Show(textSections);
         if (textSections)
         {
             ViewModel.EnsureFontsLoaded();

@@ -973,8 +973,10 @@
                     <Rectangle Width="1" Height="18" VerticalAlignment="Center"
                                Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
 
-                    <!-- Alignment: one of four, radio-style. -->
-                    <StackPanel Orientation="Horizontal" Spacing="1">
+                    <!-- Alignment: one of four, radio-style. Text-only; hidden
+                         when TextStyleSection is showing for a shape (which
+                         has no text alignment to speak of). -->
+                    <StackPanel x:Name="TextAlignRow" Orientation="Horizontal" Spacing="1">
                         <ToggleButton x:Name="AlignLeftBtn" Tag="Left" Click="Align_Click"
                                       Width="30" Height="30" Padding="0"
                                       AutomationProperties.Name="Align left"

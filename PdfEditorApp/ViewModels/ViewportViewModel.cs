@@ -2502,6 +2502,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 InkColorHex = shapeColor;
             }
+
+            // Mirror the shape's fill too, so the Fill picker shows this shape's
+            // ACTUAL fill (which the tool state does not know about — a user can
+            // pick a shape drawn a week ago). Null clears the picker to No Fill.
+            ShapeFillHex = ParseShapeFill(contents!);
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
@@ -2580,6 +2585,48 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // The re-added shape is at the end of the list; follow it and re-read
         // its bounds so the marquee stays on the mark.
+        var actual = LoadedFor(sel.PageIndex)
+            .Where(x => x.Index == newIndex)
+            .Select(x => (Interop.ExistingAnnotation?)x)
+            .FirstOrDefault();
+        _selectedLoaded = actual is Interop.ExistingAnnotation a
+            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom)
+            : sel with { Index = newIndex };
+        RefreshSelectionOutline();
+    }
+
+    /// <summary>Applies the current <see cref="ShapeFillHex"/> to the selected
+    /// shape. Null clears the fill (stroke-only). This is a separate path from
+    /// ApplyStyleToSelectedShape because fill has its own picker and it would
+    /// be surprising if picking a fill also re-wrote the stroke colour with
+    /// whatever InkColorHex happens to be.</summary>
+    public void ApplyFillToSelectedShape()
+    {
+        if (_documentHandle == 0
+            || _selectedLoaded is not LoadedSelection sel
+            || !_selectedIsShape)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+        uint fillRgba = PackShapeFillRgba(ShapeFillHex);
+
+        PushHistory(HistoryScope.Document, "Shape fill");
+        int status = RenderCoreNative.restyle_shape_fill_annotation(
+            _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
+            fillRgba, out int newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not apply that fill.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+
+        // Rebuild the marquee on the re-added shape (same as ApplyStyleToSelectedShape).
         var actual = LoadedFor(sel.PageIndex)
             .Where(x => x.Index == newIndex)
             .Select(x => (Interop.ExistingAnnotation?)x)
@@ -3479,6 +3526,45 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return $"#{rgba.Substring(6, 2)}{rgba.Substring(0, 6)}";
     }
 
+    /// <summary>The shape tag's optional fill field (position 6: kind, rgba,
+    /// width, fx, fy, rot, FILL). Returns null when the tag has no fill or is
+    /// stroke-only. Format is 8-char hex AARRGGBB; the app uses "#AARRGGBB".</summary>
+    private static string? ParseShapeFill(string contents)
+    {
+        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
+            ? contents.Substring("AyaanShape:".Length)
+            : null;
+        if (rest is null) { return null; }
+        string[] parts = rest.Split(':');
+        // Fields: 0=kind, 1=rgba, 2=width, 3=fx, 4=fy, 5=rot, 6=fillARGB
+        if (parts.Length < 7) { return null; }
+        string fill = parts[6];
+        if (fill.Length != 8) { return null; }
+        foreach (char ch in fill)
+        {
+            if (!Uri.IsHexDigit(ch)) { return null; }
+        }
+        // Tag already stores fill as AARRGGBB (unlike the stroke rgba above,
+        // which is RRGGBBAA). Zero means "no fill" — treat as null.
+        if (string.Equals(fill, "00000000", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        return "#" + fill;
+    }
+
+    /// <summary>Packs a "#AARRGGBB" fill hex into the 0xAARRGGBB uint the FFI
+    /// wants. Null (no fill) becomes 0.</summary>
+    private static uint PackShapeFillRgba(string? hex)
+    {
+        if (string.IsNullOrEmpty(hex)) { return 0; }
+        string h = hex.StartsWith('#') ? hex.Substring(1) : hex;
+        if (h.Length != 8) { return 0; }
+        return uint.TryParse(h, System.Globalization.NumberStyles.HexNumber,
+                             System.Globalization.CultureInfo.InvariantCulture, out uint v)
+            ? v : 0;
+    }
+
     /// <summary>The shape tag has fields separated by ':'; the rotation, if
     /// present, is the ninth (after kind, RGBA, width, fx, fy). An older tag
     /// without it comes back as 0.</summary>
@@ -4354,6 +4440,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 R = r, G = g, B = b, A = a,
                 WidthPx = (float)(InkWidth * CaptureWidth),
                 RotationDeg = 0f,
+                FillRgba = PackShapeFillRgba(ShapeFillHex),
             };
 
             PushHistory(HistoryScope.Document, "Draw shape");
@@ -4406,6 +4493,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Fill colour for new highlights.</summary>
     [ObservableProperty]
     public partial string HighlightColorHex { get; set; } = InkPresets.DefaultHighlightColor.Hex;
+
+    /// <summary>Fill for rectangle and ellipse shapes as "#AARRGGBB", or null
+    /// for stroke-only (the historic default). Doubles as the tool state for
+    /// newly-drawn shapes AND the reflection of the selected shape's fill; the
+    /// picker writes to it, the selection code reads out of it.</summary>
+    [ObservableProperty]
+    public partial string? ShapeFillHex { get; set; }
 
     public void EndInkStroke()
     {

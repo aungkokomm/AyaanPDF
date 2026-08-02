@@ -180,6 +180,13 @@ internal struct NativeShapeSpec
     /// set this) still renders unrotated; the C ABI stays additive.
     /// </summary>
     public float RotationDeg;
+    /// <summary>
+    /// Fill colour for rectangles and ellipses as 0xAARRGGBB. Zero means
+    /// stroke only, which was the original shape behaviour. Non-zero puts a
+    /// solid fill (with alpha) BEHIND the stroke; lines and arrows ignore it.
+    /// APPENDED after RotationDeg for the same additive-ABI reason.
+    /// </summary>
+    public uint FillRgba;
 }
 
 /// <summary>
@@ -676,6 +683,21 @@ internal static partial class RenderCoreNative
         int captureWidth,
         uint colorRgba,
         float widthPx,
+        out int newIndex);
+
+    /// <summary>
+    /// Sets or clears the fill colour on one of our rectangle/ellipse shapes.
+    /// Zero clears the fill (shape becomes stroke-only); non-zero fills it with
+    /// the given 0xAARRGGBB. Lines and arrows ignore fill visually but round-
+    /// trip the value on their tag.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int restyle_shape_fill_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        uint fillRgba,
         out int newIndex);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
