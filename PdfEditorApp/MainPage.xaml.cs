@@ -651,27 +651,26 @@ public sealed partial class MainPage : Page
         double majorDips = majorUnits * dipsPerUnit;
         double minorDips = minorUnits * dipsPerUnit;
 
-        // The FIRST PAGE'S top-left in RulerCanvas space. TransformToVisual
-        // walks all the intermediate transforms (ScrollView zoom, scroll offset,
-        // ViewportHost centering, ViewportHost padding) in one call, so a page
-        // that's centered horizontally or scrolled off vertically lands at the
-        // right screen X/Y without me redoing that math. Uses TopRuler for X
-        // and LeftRuler for Y because each Canvas's coordinate system starts
-        // at its own top-left, and that's where the tick's X or Y is measured
-        // from.
+        // First page's top-left in RulerCanvas space. TransformToVisual walks
+        // every intermediate transform (ScrollView zoom, scroll offset,
+        // ViewportHost centering) in one call. The point we transform is
+        // (Padding.Left, Padding.Top) - NOT (0,0) - because the ViewportHost
+        // starts its page content INSIDE its padding, the same offset every
+        // pointer-to-page conversion uses (see e.g. slotX = p.X - Padding.Left).
+        // Missing Padding.Left was why "0" landed a bit to the right of the
+        // page's actual left edge: the ticks were positioned at the ViewportHost
+        // origin, not the page origin.
         double pageOriginX = 0, pageOriginY = 0;
         try
         {
-            // ViewportHost's top-left in TopRuler coords gives X. Its top-left
-            // is also the first page's top-left because ViewportHost's own
-            // Padding starts the page content; ViewportHost.Padding.Top adds
-            // the vertical inset which we account for below.
             var toTop = ViewportHost.TransformToVisual(TopRuler);
-            var pT = toTop.TransformPoint(new Windows.Foundation.Point(0, 0));
+            var pT = toTop.TransformPoint(new Windows.Foundation.Point(
+                ViewportHost.Padding.Left, 0));
             pageOriginX = pT.X;
 
             var toLeft = ViewportHost.TransformToVisual(LeftRuler);
-            var pL = toLeft.TransformPoint(new Windows.Foundation.Point(0, ViewportHost.Padding.Top));
+            var pL = toLeft.TransformPoint(new Windows.Foundation.Point(
+                0, ViewportHost.Padding.Top));
             pageOriginY = pL.Y;
         }
         catch
