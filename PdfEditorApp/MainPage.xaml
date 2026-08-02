@@ -1119,14 +1119,19 @@
                     </Button>
                 </StackPanel>
 
-                <!-- Opacity -->
+                <!-- Opacity: stroke on the left, an optional fill slider on
+                     the right (visible only when the selected object HAS a
+                     fill - a filled shape today, potentially a text box's
+                     fill tomorrow). Two sliders means the labels stop being
+                     optional: "Stroke" and "Fill" precede each so a user
+                     doesn't have to guess which they are dragging. -->
                 <StackPanel x:Name="OpacitySection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">
                     <Rectangle Width="1" Height="18" VerticalAlignment="Center"
                                Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
-                    <FontIcon Glyph="&#xE890;" FontSize="13" VerticalAlignment="Center"
-                              Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                              ToolTipService.ToolTip="Opacity" />
+                    <TextBlock Text="Stroke" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
                     <!--
                         Maximum BEFORE Minimum, and that is not cosmetic: XAML
                         assigns attributes in written order, and a Minimum above
@@ -1143,12 +1148,36 @@
                     <Slider x:Name="OpacitySlider" Width="88" Maximum="100" Minimum="10"
                             StepFrequency="5" TickFrequency="10"
                             VerticalAlignment="Center"
-                            AutomationProperties.Name="Opacity"
+                            AutomationProperties.Name="Stroke opacity"
+                            ToolTipService.ToolTip="Stroke opacity"
                             ValueChanged="Opacity_ValueChanged" />
                     <TextBlock x:Name="OpacityReadout" VerticalAlignment="Center" MinWidth="34"
                                TextAlignment="Right"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                Style="{StaticResource CaptionTextBlockStyle}" />
+
+                    <!-- Fill opacity: separate slider so a user can dim just
+                         the fill (keep the outline crisp) or vice versa.
+                         Collapsed until the selection actually has a fill. -->
+                    <StackPanel x:Name="FillOpacitySection" Orientation="Horizontal"
+                                Spacing="6" VerticalAlignment="Center"
+                                Visibility="Collapsed">
+                        <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                                   Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                        <TextBlock Text="Fill" VerticalAlignment="Center"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <Slider x:Name="FillOpacitySlider" Width="88" Maximum="100" Minimum="10"
+                                StepFrequency="5" TickFrequency="10"
+                                VerticalAlignment="Center"
+                                AutomationProperties.Name="Fill opacity"
+                                ToolTipService.ToolTip="Fill opacity"
+                                ValueChanged="FillOpacity_ValueChanged" />
+                        <TextBlock x:Name="FillOpacityReadout" VerticalAlignment="Center" MinWidth="34"
+                                   TextAlignment="Right"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                    </StackPanel>
                 </StackPanel>
 
                 <!-- Align + distribute. Shown only when 2+ annotations are selected. -->

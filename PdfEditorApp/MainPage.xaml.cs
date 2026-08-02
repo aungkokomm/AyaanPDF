@@ -1016,7 +1016,15 @@ public sealed partial class MainPage : Page
         }
 
         var c = args.NewColor;
-        string hex = $"#FF{c.R:X2}{c.G:X2}{c.B:X2}";
+        // Preserve whatever alpha the fill-opacity slider already set, so
+        // dragging opacity down and then picking a new colour keeps the same
+        // opacity rather than jumping back to 100%.
+        string? current = ViewModel.HasSelectedShape
+            ? ViewModel.ShapeFillHex
+            : ViewModel.TextFillHex;
+        double alpha = string.IsNullOrEmpty(current) ? 1.0 : InkPresets.OpacityOf(current);
+        byte alphaByte = (byte)Math.Round(Math.Clamp(alpha, 0.0, 1.0) * 255);
+        string hex = $"#{alphaByte:X2}{c.R:X2}{c.G:X2}{c.B:X2}";
         if (ViewModel.HasSelectedShape)
         {
             ViewModel.ShapeFillHex = hex;
@@ -1029,6 +1037,7 @@ public sealed partial class MainPage : Page
             UpdateOpenEditorStyle();
             ViewModel.ApplyStyleToSelectedTextBox();
         }
+        ShowFillOpacity();
     }
 
     private void NoFill_Click(object sender, RoutedEventArgs e)
@@ -1045,6 +1054,8 @@ public sealed partial class MainPage : Page
             UpdateOpenEditorStyle();
             ViewModel.ApplyStyleToSelectedTextBox();
         }
+        // Clearing the fill means the fill-opacity slider has nothing to act on.
+        ShowFillOpacity();
         FillFlyout.Hide();
     }
 
@@ -1128,6 +1139,9 @@ public sealed partial class MainPage : Page
                 UpdateOpenEditorStyle();
                 ViewModel.ApplyStyleToSelectedTextBox();
             }
+            // Picking a fill can be the first fill the shape has: the fill-
+            // opacity slider was hidden a moment ago and now needs to appear.
+            ShowFillOpacity();
             FillFlyout.Hide();
         }
     }
@@ -1374,8 +1388,9 @@ public sealed partial class MainPage : Page
         // Only now is the opacity slider allowed to speak. Anything it raised
         // before this point came from the framework settling the control, not
         // from the user, and acting on it would rewrite the tool's colour at
-        // startup.
+        // startup. Same story for the fill-opacity slider.
         _suppressOpacityChange = false;
+        _suppressFillOpacityChange = false;
     }
 
     /// <summary>
@@ -1443,6 +1458,67 @@ public sealed partial class MainPage : Page
         _suppressOpacityChange = prior;
 
         OpacityReadout.Text = $"{percent}%";
+
+        ShowFillOpacity();
+    }
+
+    /// <summary>Mirrors <see cref="ShowOpacity"/> for the fill slider: reads
+    /// the selected object's own fill (shape fill today, text-box fill when
+    /// that later gets its own opacity path), reflects the alpha into the
+    /// slider and readout, and hides the whole sub-section when nothing here
+    /// has a fill.</summary>
+    private void ShowFillOpacity()
+    {
+        string? fillHex = ViewModel.HasSelectedShape
+            ? ViewModel.ShapeFillHex
+            : (ViewModel.HasSelectedTextBox ? ViewModel.TextFillHex : null);
+
+        if (string.IsNullOrEmpty(fillHex))
+        {
+            FillOpacitySection.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        FillOpacitySection.Visibility = Visibility.Visible;
+        int percent = (int)Math.Round(InkPresets.OpacityOf(fillHex) * 100);
+        bool prior = _suppressFillOpacityChange;
+        _suppressFillOpacityChange = true;
+        FillOpacitySlider.Value = Math.Clamp(percent, FillOpacitySlider.Minimum, FillOpacitySlider.Maximum);
+        _suppressFillOpacityChange = prior;
+        FillOpacityReadout.Text = $"{percent}%";
+    }
+
+    /// <summary>Starts SET so the value the slider raises while the page is
+    /// still building up isn't mistaken for a deliberate change. Cleared once
+    /// the pickers are initialized (same pattern as <see cref="_suppressOpacityChange"/>).</summary>
+    private bool _suppressFillOpacityChange = true;
+
+    /// <summary>Fill-opacity slider tick. Rebuilds the fill hex with the new
+    /// alpha and re-applies through the type-appropriate path. No-ops when
+    /// nothing with a fill is selected (the section itself is hidden then, so
+    /// this handler mostly doesn't fire, but the guard makes it safe if it
+    /// does).</summary>
+    private void FillOpacity_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (_suppressFillOpacityChange)
+        {
+            return;
+        }
+
+        if (ViewModel.HasSelectedShape && !string.IsNullOrEmpty(ViewModel.ShapeFillHex))
+        {
+            ViewModel.ShapeFillHex = InkPresets.WithOpacity(ViewModel.ShapeFillHex, e.NewValue / 100.0);
+            ViewModel.ApplyFillToSelectedShape();
+        }
+        else if (ViewModel.HasSelectedTextBox && !string.IsNullOrEmpty(ViewModel.TextFillHex))
+        {
+            ViewModel.TextFillHex = InkPresets.WithOpacity(ViewModel.TextFillHex, e.NewValue / 100.0);
+            SyncTextStyleControls();
+            UpdateOpenEditorStyle();
+            ViewModel.ApplyStyleToSelectedTextBox();
+        }
+
+        FillOpacityReadout.Text = $"{(int)Math.Round(e.NewValue)}%";
     }
 
     /// <summary>
