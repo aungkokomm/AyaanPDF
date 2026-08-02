@@ -2511,6 +2511,10 @@ public sealed partial class MainPage : Page
         }
 
         bool saved = ViewModel.SaveDocumentAs(file.Path, flatten);
+        // Ruler guides live in a sidecar next to the PDF; write it whenever
+        // the PDF itself is saved so a reopen from the new location shows the
+        // same guides. Non-fatal if it fails.
+        if (saved) { ViewModel.SaveGuidesToSidecar(); }
         Debug.WriteLine($"[MainPage] Save As \"{file.Path}\" flatten={flatten} -> {(saved ? "ok" : "failed")}");
         return saved;
     }

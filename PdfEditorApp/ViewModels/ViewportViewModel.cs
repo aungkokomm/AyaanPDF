@@ -455,6 +455,82 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RenderCurrentPage();
         ReportExistingAnnotations();
         LoadFormFields();
+        LoadGuidesFromSidecar();
+    }
+
+    // ---------------- Guide persistence (sidecar JSON) ----------------
+    //
+    // Guides live in a small file next to the PDF: <pdf>.ayaanguides.json.
+    // Sidecar over in-PDF because (a) other viewers would render any real
+    // annotation regardless of tag, and (b) the guides are the editor's
+    // state, not the document's - Word doesn't store its ruler settings in
+    // a .docx either.
+    //
+    // Written on Save/SaveAs (and any explicit save-guides call from the
+    // menu). Read on Open. A missing sidecar is not an error.
+
+    private sealed record GuideRecord(int Page, bool Horizontal, double Pos);
+    private sealed record GuideSidecar(int Version, List<GuideRecord> Guides);
+
+    private string? SidecarPath =>
+        _currentDocumentPath is { } p ? p + ".ayaanguides.json" : null;
+
+    /// <summary>Writes every current guide out to the sidecar for the loaded
+    /// PDF. No-op if no document is open. Called from Save/SaveAs so the
+    /// sidecar always lands next to the freshly-saved file.</summary>
+    public void SaveGuidesToSidecar()
+    {
+        if (SidecarPath is not { } path) { return; }
+        try
+        {
+            var records = new List<GuideRecord>();
+            foreach (var slot in PageSlots)
+            {
+                foreach (var g in slot.Guides)
+                {
+                    records.Add(new GuideRecord(slot.PageIndex, g.Horizontal, g.NormalizedPos));
+                }
+            }
+
+            // Skip writing when there are no guides AND no existing sidecar -
+            // no reason to make a file just to say "empty".
+            if (records.Count == 0 && !File.Exists(path)) { return; }
+
+            var payload = new GuideSidecar(1, records);
+            var json = System.Text.Json.JsonSerializer.Serialize(payload,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = false });
+            File.WriteAllText(path, json);
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"guides sidecar write failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Reads the sidecar next to the loaded PDF, if any, and drops
+    /// guides onto their pages. A malformed or missing file is silent - the
+    /// user just sees no guides.</summary>
+    public void LoadGuidesFromSidecar()
+    {
+        if (SidecarPath is not { } path) { return; }
+        if (!File.Exists(path)) { return; }
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var payload = System.Text.Json.JsonSerializer.Deserialize<GuideSidecar>(json);
+            if (payload?.Guides is null) { return; }
+            foreach (var r in payload.Guides)
+            {
+                var slot = PageSlots.FirstOrDefault(s => s.PageIndex == r.Page);
+                if (slot is null) { continue; }
+                slot.Guides.Add(new GuideMark(r.Horizontal, r.Pos, slot.SlotWidth, slot.SlotHeight));
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"guides sidecar read failed: {ex.Message}");
+        }
     }
 
     /// <summary>
