@@ -75,9 +75,34 @@
             DIPs, with the level chosen against that floor, NOT just a bigger
             number here.
         -->
+        <!-- Rulers: PageMaker-style top and left, giving the user a visible
+             coordinate frame while placing shapes. Overlaid on the viewport
+             column with a Margin on the ScrollView reserving room; toggled
+             from View > Rulers. Corner covers the intersection so the two
+             rulers don't butt into each other visually. -->
+        <Border x:Name="RulerCorner" Grid.Column="2"
+                Width="22" Height="22"
+                HorizontalAlignment="Left" VerticalAlignment="Top"
+                Background="{ThemeResource LayerFillColorAltBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="0,0,1,1" Canvas.ZIndex="10" />
+        <Canvas x:Name="TopRuler" Grid.Column="2"
+                Height="22" Margin="22,0,0,0"
+                HorizontalAlignment="Stretch" VerticalAlignment="Top"
+                Background="{ThemeResource LayerFillColorAltBrush}"
+                Canvas.ZIndex="10"
+                SizeChanged="Rulers_SizeChanged" />
+        <Canvas x:Name="LeftRuler" Grid.Column="2"
+                Width="22" Margin="0,22,0,0"
+                HorizontalAlignment="Left" VerticalAlignment="Stretch"
+                Background="{ThemeResource LayerFillColorAltBrush}"
+                Canvas.ZIndex="10"
+                SizeChanged="Rulers_SizeChanged" />
+
         <ScrollView
             x:Name="PageScroller"
             Grid.Column="2"
+            Margin="22,22,0,0"
             ZoomMode="Enabled"
             HorizontalScrollBarVisibility="Auto"
             VerticalScrollBarVisibility="Auto"
@@ -615,6 +640,9 @@
                             <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
                             <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
                             <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
+                            <MenuFlyoutSeparator />
+                            <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
+                                                  IsChecked="True" Click="RulersToggle_Click" />
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
                             <MenuFlyoutItem Text="Exit" Click="Exit_Click" />

@@ -470,6 +470,7 @@ public sealed partial class MainPage : Page
         }
 
         PushVisibleWindow();
+        RedrawRulers();
     }
 
     /// <summary>
@@ -502,6 +503,173 @@ public sealed partial class MainPage : Page
 
         UpdateZoomReadout();
         PushVisibleWindow();
+        RedrawRulers();
+    }
+
+    // ---------------- Rulers ----------------
+    //
+    // Rulers show the current page's coordinates in PDF POINTS (1/72 inch)
+    // along the top and left edges of the viewport, PageMaker style. Ticks
+    // adapt to zoom - the tick pitch is chosen so majors fall roughly every
+    // 60-100 screen DIPs no matter the zoom factor. Origin is the first page's
+    // top-left in the ScrollView content, which is what a user placing a
+    // shape on page 1 will expect. (Multi-page origin per current visible
+    // page can come later; for now the ruler numbers keep counting through
+    // page boundaries, which still gives useful monotonic X and Y.)
+
+    private void RulersToggle_Click(object sender, RoutedEventArgs e)
+    {
+        bool on = RulersToggle.IsChecked;
+        var vis = on ? Visibility.Visible : Visibility.Collapsed;
+        TopRuler.Visibility = vis;
+        LeftRuler.Visibility = vis;
+        RulerCorner.Visibility = vis;
+        // Reclaim the reserved 22px when off, or restore it when back on. The
+        // ScrollView's other margins never change, so this doesn't fight any
+        // other layout hint.
+        PageScroller.Margin = on ? new Thickness(22, 22, 0, 0) : new Thickness(0);
+    }
+
+    private void Rulers_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        RedrawRulers();
+    }
+
+    private void RedrawRulers()
+    {
+        if (TopRuler is null || LeftRuler is null) { return; }
+        if (TopRuler.Visibility != Visibility.Visible) { return; }
+        if (ViewModel.PageCount == 0) { return; }
+
+        var (pageWpt, pageHpt) = ViewModel.CurrentPagePoints();
+        if (pageWpt <= 0 || pageHpt <= 0) { return; }
+
+        // Points-per-screen-DIP at the current zoom: the content is laid out at
+        // ViewportHost.ActualWidth DIPs which corresponds to pageWpt points, then
+        // scaled by ScrollView zoom. So 1 point on screen = (layoutW/pageWpt) *
+        // zoom DIPs. Invert to get DIPs->points.
+        double layoutW = ViewportHost.ActualWidth > 0 ? ViewportHost.ActualWidth : 800;
+        double zoom = PageScroller.ZoomFactor;
+        double dipsPerPoint = (layoutW / pageWpt) * zoom;
+        if (dipsPerPoint <= 0) { return; }
+
+        // Choose a MAJOR tick spacing (in points) that lands near 80 screen DIPs.
+        // Standard 1-2-5-10 progression so labelled ticks are round numbers.
+        double[] steps = { 1, 2, 5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000 };
+        double targetDips = 80;
+        double bestStep = 100;
+        double bestDelta = double.MaxValue;
+        foreach (double s in steps)
+        {
+            double d = Math.Abs(s * dipsPerPoint - targetDips);
+            if (d < bestDelta) { bestDelta = d; bestStep = s; }
+        }
+
+        double majorPts = bestStep;
+        double minorPts = majorPts / 5; // 5 minor divisions per major
+        double majorDips = majorPts * dipsPerPoint;
+        double minorDips = minorPts * dipsPerPoint;
+
+        // ScrollView's HorizontalOffset/VerticalOffset are in zoomed content DIPs
+        // relative to the content origin. The ViewportHost is centered inside the
+        // ScrollView so the CONTENT origin is at (layoutW*zoom + slack)/2 from the
+        // viewport left. We approximate page-origin-on-screen as
+        //   pageOriginScreenX = ViewportHost.ContentOffset - HorizontalOffset
+        // For centered layouts that reduces to (viewportW - layoutW*zoom) / 2
+        // when the content is narrower than the viewport, or 0 when scrolled.
+        double viewportW = PageScroller.ViewportWidth;
+        double contentW = layoutW * zoom;
+        double pageOriginScreenX = contentW < viewportW
+            ? (viewportW - contentW) / 2
+            : -PageScroller.HorizontalOffset;
+
+        double viewportH = PageScroller.ViewportHeight;
+        // Vertical: the ViewportHost has TOP padding for its own spacing so we
+        // approximate origin as 0 minus scroll offset when scrolled, or the
+        // padding when the whole content fits.
+        double pageOriginScreenY = -PageScroller.VerticalOffset + ViewportHost.Padding.Top;
+
+        DrawRulerTicks(TopRuler, horizontal: true,
+            originScreen: pageOriginScreenX, viewportSpan: TopRuler.ActualWidth > 0 ? TopRuler.ActualWidth : viewportW,
+            majorDips: majorDips, minorDips: minorDips, majorPts: majorPts);
+        DrawRulerTicks(LeftRuler, horizontal: false,
+            originScreen: pageOriginScreenY, viewportSpan: LeftRuler.ActualHeight > 0 ? LeftRuler.ActualHeight : viewportH,
+            majorDips: majorDips, minorDips: minorDips, majorPts: majorPts);
+    }
+
+    private void DrawRulerTicks(Canvas canvas, bool horizontal,
+        double originScreen, double viewportSpan,
+        double majorDips, double minorDips, double majorPts)
+    {
+        canvas.Children.Clear();
+        if (viewportSpan <= 0 || majorDips <= 0) { return; }
+
+        var stroke = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+        var text = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+
+        // Start slightly before the visible left/top so ticks at negative
+        // pointer positions still show (a user scrolled beyond the page origin
+        // wants to see negative coordinates, same as PageMaker).
+        double startScreen = 0;
+        double endScreen = viewportSpan;
+        double startOffsetScreen = startScreen - originScreen;
+        double firstMinorIndex = Math.Floor(startOffsetScreen / minorDips);
+        double firstMinorScreen = originScreen + firstMinorIndex * minorDips;
+
+        const double barLen = 22;
+        for (double s = firstMinorScreen; s < endScreen + minorDips; s += minorDips)
+        {
+            if (s < startScreen - minorDips) { continue; }
+            // Is this a major (labelled) tick? Compare to closest major.
+            double pts = (s - originScreen) / (majorDips / majorPts * majorPts) * majorPts;
+            // easier: recover point value directly
+            double pointsAt = (s - originScreen) / minorDips * (majorPts / 5);
+            double majorPtsExpected = Math.Round(pointsAt / majorPts) * majorPts;
+            bool isMajor = Math.Abs(pointsAt - majorPtsExpected) < majorPts / 10;
+
+            double tickLen = isMajor ? barLen - 4 : barLen - 14;
+            var line = new Microsoft.UI.Xaml.Shapes.Line
+            {
+                Stroke = stroke,
+                StrokeThickness = 1,
+            };
+            if (horizontal)
+            {
+                line.X1 = line.X2 = Math.Round(s) + 0.5;
+                line.Y1 = barLen - tickLen;
+                line.Y2 = barLen;
+            }
+            else
+            {
+                line.Y1 = line.Y2 = Math.Round(s) + 0.5;
+                line.X1 = barLen - tickLen;
+                line.X2 = barLen;
+            }
+            canvas.Children.Add(line);
+
+            if (isMajor)
+            {
+                var tb = new TextBlock
+                {
+                    Text = ((int)Math.Round(majorPtsExpected)).ToString(),
+                    FontSize = 9,
+                    Foreground = text,
+                };
+                if (horizontal)
+                {
+                    Canvas.SetLeft(tb, s + 2);
+                    Canvas.SetTop(tb, 1);
+                }
+                else
+                {
+                    // Rotate vertical labels 90° so the numbers read along the ruler.
+                    tb.RenderTransform = new Microsoft.UI.Xaml.Media.RotateTransform { Angle = -90 };
+                    Canvas.SetLeft(tb, 1);
+                    Canvas.SetTop(tb, s + 20);
+                }
+                canvas.Children.Add(tb);
+            }
+        }
     }
 
     /// <summary>Arrow-key scroll distance in DIPs, close to Acrobat's nudge.</summary>

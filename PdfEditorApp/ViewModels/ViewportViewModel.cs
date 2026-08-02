@@ -725,6 +725,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>The current page's size in points, or US Letter if it cannot be read.</summary>
+    /// <summary>Width/height of the currently displayed page in PDF POINTS
+    /// (1/72 inch), for anything outside the view model that needs to place
+    /// coordinates in physical units - notably the on-screen rulers.</summary>
+    public (double WidthPoints, double HeightPoints) CurrentPagePoints()
+    {
+        var (w, h) = CurrentPageSizePoints();
+        return (w, h);
+    }
+
     private (double W, double H) CurrentPageSizePoints()
     {
         var array = RenderCoreNative.get_page_sizes(_documentHandle);
