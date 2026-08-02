@@ -1004,6 +1004,11 @@ public sealed partial class MainPage : Page
         ViewModel.ClearAllGuides();
     }
 
+    private void LockGuidesToggle_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.AreGuidesLocked = LockGuidesToggle.IsChecked;
+    }
+
     /// <summary>Numeric guide placement, PageMaker-style. Shows a small
     /// dialog with orientation + position (in the current ruler unit),
     /// and adds the guide to the current page.</summary>

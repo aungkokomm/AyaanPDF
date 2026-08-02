@@ -1653,6 +1653,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public bool HasSelectedGuide => _selectedGuide is not null;
 
+    /// <summary>When true, guides can't be dragged to move, dragged off to
+    /// delete, or removed via the Delete key. Click-select still works so
+    /// the user can see which guide they're pointing at, and snap still uses
+    /// them. Standard Illustrator/PageMaker "Lock Guides" affordance for
+    /// preventing accidental changes during heavy edit work.</summary>
+    [ObservableProperty]
+    public partial bool AreGuidesLocked { get; set; }
+
     /// <summary>True while a click-and-hold on a selected guide is being
     /// dragged. Set by <see cref="BeginGuideDrag"/>; cleared by the release
     /// path. The MainPage pointer-move handler routes to <see cref="DragGuideTo"/>
@@ -1661,6 +1669,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void BeginGuideDrag()
     {
+        // Locked guides can be selected but not moved.
+        if (AreGuidesLocked) { return; }
         if (_selectedGuide is not null) { IsDraggingGuide = true; }
     }
 
@@ -1716,6 +1726,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public bool DeleteSelectedGuide()
     {
         if (_selectedGuide is not (int page, GuideMark g)) { return false; }
+        // Locked guides can't be deleted. Return true anyway so the Delete
+        // key handler swallows the event - deleting an annotation instead
+        // when the user's intent was clearly the highlighted guide would be
+        // worse.
+        if (AreGuidesLocked) { return true; }
         var slot = PageSlots.FirstOrDefault(s => s.PageIndex == page);
         slot?.Guides.Remove(g);
         _selectedGuide = null;
