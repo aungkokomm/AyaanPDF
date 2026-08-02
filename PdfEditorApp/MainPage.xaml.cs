@@ -3266,6 +3266,14 @@ public sealed partial class MainPage : Page
             case (VirtualKey)0xDD when _isCtrlDown && IsShiftDown():
                 if (ViewModel.BringSelectedToFront()) { e.Handled = true; }
                 break;
+            // Ctrl+G / Ctrl+Shift+G = group / ungroup the current selection.
+            // Illustrator / PowerPoint / Word all use these keys.
+            case VirtualKey.G when _isCtrlDown && !IsShiftDown():
+                if (ViewModel.GroupSelected()) { e.Handled = true; }
+                break;
+            case VirtualKey.G when _isCtrlDown && IsShiftDown():
+                if (ViewModel.UngroupSelected()) { e.Handled = true; }
+                break;
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
                 SearchBox.SelectAll();

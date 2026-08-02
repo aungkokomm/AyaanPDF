@@ -2778,11 +2778,58 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // Grouping: a plain click on any group member selects the WHOLE group.
+        // The clicked mark becomes the anchor and the other members become
+        // extras. Shift-click bypasses group expansion (so a shift-click on a
+        // group member removes just that one from the multi-selection, which
+        // matches Illustrator's ungroup-on-shift behaviour). Membership is
+        // read once here on click and pinned to the selection until the next
+        // click; index shifts inside the drag can't confuse the anchor because
+        // it's cached above.
+        bool shift = IsShiftDown();
+        if (!shift && GroupContaining(pageIndex, hit.Index) is { } group && group.Count > 1)
+        {
+            _extraSelected.Clear();
+            _selectedLoaded = new LoadedSelection(
+                pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
+            // Extras = every other group member. Use their CURRENT bounds via
+            // LoadedFor; a member's index might have been drifted by an earlier
+            // operation, in which case it silently drops from the pick (limit
+            // of session-only grouping without persistence).
+            foreach (var (p, idx) in group)
+            {
+                if (p == pageIndex && idx == hit.Index) { continue; }
+                var page = LoadedFor(p);
+                // ExistingAnnotation is a struct so FirstOrDefault yields
+                // default rather than null; match by explicit lookup and
+                // skip if not found (member's index drifted).
+                int mi = page.FindIndex(a => a.Index == idx);
+                if (mi < 0) { continue; }
+                var found = page[mi];
+                _extraSelected.Add(new LoadedSelection(p, idx, found.Left, found.Top, found.Right, found.Bottom));
+            }
+            ApplyTextBoxSelectionInfo(pageIndex, hit.Index);
+            var gsel = _selectedLoaded.Value;
+            _loadedDrag = (normX, normY, gsel);
+            _loadedGrip = GripForPoint(gsel, normX, normY);
+            _extraDragOrigin.Clear();
+            if (_loadedGrip == LoadedAnnotationPicker.Grip.None)
+            {
+                _extraDragOrigin.AddRange(_extraSelected);
+            }
+            RefreshSelectionOutline();
+            OnPropertyChanged(nameof(HasSelectedAnnotation));
+            OnPropertyChanged(nameof(HasSelectedAnnotationLoaded));
+            OnPropertyChanged(nameof(HasSelectedTextBox));
+            OnPropertyChanged(nameof(HasSelectedShape));
+            OnPropertyChanged(nameof(HasMultiSelection));
+            return true;
+        }
+
         // Shift-click grows the selection. If the clicked mark was already in
         // the multi-selection it is removed (deselected individually); otherwise
         // the previous anchor moves to the extras list and the clicked mark
         // becomes the new anchor. A plain click clears the extras.
-        bool shift = IsShiftDown();
         if (shift)
         {
             // Clicked mark is already in the extras: remove it and keep the anchor.
@@ -4136,6 +4183,88 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    // ---------------- Grouping ----------------
+    //
+    // A group is a set of annotation references (page + index) that always
+    // select together: click any member and the whole set becomes the
+    // multi-selection, so a follow-up move / delete / restyle / paste treats
+    // them as one. Session-only for now; not persisted to the PDF.
+    //
+    // Index-shift caveat: multi-writes (align, move-all, bring-to-front) do
+    // delete + re-add on each member and the indices shift. The recompute
+    // hooks below rewrite group members with their new indices after those
+    // operations. Groups still won't survive OPERATIONS ON OTHER annotations
+    // (an align of some unrelated shape won't touch our group's indices, but
+    // adding a new annotation ABOVE a group member would leave the group's
+    // stored index pointing at the wrong mark). Acceptable MVP limitation.
+
+    private readonly List<List<(int Page, int Index)>> _groups = new();
+
+    public bool HasGrouping => _groups.Count > 0;
+
+    /// <summary>Creates a group from the current multi-selection (anchor +
+    /// extras). Needs 2+ marks. Returns false if there's nothing to group
+    /// or if all the selected marks are already in the same group.</summary>
+    public bool GroupSelected()
+    {
+        if (_selectedLoaded is not LoadedSelection anchor) { return false; }
+        var refs = new List<(int, int)> { (anchor.PageIndex, anchor.Index) };
+        foreach (var e in _extraSelected) { refs.Add((e.PageIndex, e.Index)); }
+        if (refs.Count < 2) { return false; }
+
+        // Remove any existing groups those marks are in - a mark can only be
+        // in ONE group at a time (flat, non-nested). Then add the new one.
+        foreach (var r in refs)
+        {
+            _groups.RemoveAll(g => g.Contains(r));
+        }
+        _groups.Add(refs.Distinct().ToList());
+        return true;
+    }
+
+    /// <summary>Dissolves the group that the current anchor is in. Returns
+    /// false if the anchor isn't in a group.</summary>
+    public bool UngroupSelected()
+    {
+        if (_selectedLoaded is not LoadedSelection anchor) { return false; }
+        var key = (anchor.PageIndex, anchor.Index);
+        int removed = _groups.RemoveAll(g => g.Contains(key));
+        return removed > 0;
+    }
+
+    /// <summary>Returns the group containing the given annotation, or null
+    /// if it isn't grouped. Called by SelectLoadedAt to expand a click into
+    /// a whole-group multi-selection.</summary>
+    private IReadOnlyList<(int Page, int Index)>? GroupContaining(int page, int index)
+    {
+        var key = (page, index);
+        foreach (var g in _groups)
+        {
+            if (g.Contains(key)) { return g; }
+        }
+        return null;
+    }
+
+    /// <summary>After a multi-write that re-emitted annotations at new
+    /// indices, rewrite any group members whose old indices matched with
+    /// their new ones. Called from BringSelectedToFront and the like.
+    /// oldToNew maps (page, oldIndex) to newIndex on the same page.</summary>
+    private void RemapGroupIndices(Dictionary<(int Page, int OldIndex), int> oldToNew)
+    {
+        if (_groups.Count == 0 || oldToNew.Count == 0) { return; }
+        for (int gi = 0; gi < _groups.Count; gi++)
+        {
+            var g = _groups[gi];
+            for (int mi = 0; mi < g.Count; mi++)
+            {
+                if (oldToNew.TryGetValue(g[mi], out int newIdx))
+                {
+                    g[mi] = (g[mi].Page, newIdx);
+                }
+            }
+        }
+    }
+
     /// <summary>Moves the currently selected annotation(s) to the top of the
     /// page's z-order. Works via delete + re-add - a fresh annotation always
     /// lands at the end of the page's list (which renders LAST, i.e. on top).
@@ -4189,17 +4318,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 newIndicesBySlot[slots[i]] = count - slots.Count + i;
             }
         }
+        // Build the (page, oldIndex) -> newIndex map for group remapping.
+        var oldToNew = new Dictionary<(int Page, int OldIndex), int>();
         if (newIndicesBySlot.TryGetValue(0, out int anchorIdx))
         {
+            oldToNew[(anchor.PageIndex, anchor.Index)] = anchorIdx;
             _selectedLoaded = anchor with { Index = anchorIdx };
         }
         for (int i = 0; i < _extraSelected.Count; i++)
         {
             if (newIndicesBySlot.TryGetValue(i + 1, out int idx))
             {
-                _extraSelected[i] = _extraSelected[i] with { Index = idx };
+                var old = _extraSelected[i];
+                oldToNew[(old.PageIndex, old.Index)] = idx;
+                _extraSelected[i] = old with { Index = idx };
             }
         }
+        RemapGroupIndices(oldToNew);
         IsDirty = true;
         RefreshSelectionOutline();
         return true;
@@ -4569,6 +4704,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_selectedLoaded is not LoadedSelection sel)
         {
             return false;
+        }
+
+        // Drop the deleted marks from any groups they were in. A group whose
+        // members are all deleted goes away entirely; a partially-deleted
+        // group shrinks. Session-only groups so this doesn't touch the PDF.
+        var deleted = new HashSet<(int, int)> { (sel.PageIndex, sel.Index) };
+        foreach (var e in _extraSelected) { deleted.Add((e.PageIndex, e.Index)); }
+        for (int gi = _groups.Count - 1; gi >= 0; gi--)
+        {
+            _groups[gi].RemoveAll(m => deleted.Contains(m));
+            if (_groups[gi].Count < 2) { _groups.RemoveAt(gi); }
         }
 
         // A document snapshot, unlike move and resize. Undoing a delete means
