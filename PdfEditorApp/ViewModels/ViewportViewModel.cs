@@ -1977,6 +1977,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public bool HasSelectedAnnotation => _selectedAnnotationId is not null || _selectedLoaded is not null;
 
+    /// <summary>True when the selection is a REAL PDFium annotation (text box,
+    /// shape, stamp, or any loaded mark) - i.e. anything the arrow-key nudge,
+    /// align/distribute, and multi-select machinery can act on. Overlay-only
+    /// entities like fresh ink or highlights (selected via _selectedAnnotationId)
+    /// are excluded because they don't yet participate in that path.</summary>
+    public bool HasSelectedAnnotationLoaded => _selectedLoaded is not null;
+
     /// <summary>True when the current loaded selection is one of our text boxes.
     /// The toolbar uses this to show the text style controls (font, fill, outline,
     /// thickness) whenever a text box is selected, no matter which tool is armed,
@@ -3189,6 +3196,31 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         PushHistory(HistoryScope.Document, horizontal ? "Distribute horizontally" : "Distribute vertically");
         var newAnchor = FindMoved(anchor);
         var newExtras = _extraSelected.Select(FindMoved).ToList();
+        CommitAlignedOrDistributed(anchor, newAnchor, newExtras);
+    }
+
+    /// <summary>Moves every selected object (anchor + extras) by the given delta
+    /// in NORMALIZED page-width units. The arrow-key nudge and the shift-arrow
+    /// bigger nudge both come through here; only the caller decides the step
+    /// size. Reuses <see cref="CommitAlignedOrDistributed"/> for the actual
+    /// write so the last-N index tracking that keeps repeated align/move
+    /// consistent covers nudge automatically.</summary>
+    public void NudgeSelected(double dx, double dy)
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor)
+        {
+            return;
+        }
+        if (dx == 0 && dy == 0) { return; }
+
+        PushHistory(HistoryScope.Document, "Nudge");
+        LoadedSelection Shift(LoadedSelection s) => s with
+        {
+            Left = s.Left + dx, Right = s.Right + dx,
+            Top = s.Top + dy, Bottom = s.Bottom + dy,
+        };
+        var newAnchor = Shift(anchor);
+        var newExtras = _extraSelected.Select(Shift).ToList();
         CommitAlignedOrDistributed(anchor, newAnchor, newExtras);
     }
 

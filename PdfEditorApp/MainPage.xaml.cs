@@ -507,6 +507,15 @@ public sealed partial class MainPage : Page
     /// <summary>Arrow-key scroll distance in DIPs, close to Acrobat's nudge.</summary>
     private const double ArrowScrollStep = 64;
 
+    /// <summary>Small arrow-key nudge on a selected annotation, in normalized
+    /// page-width units. 0.002 = ~1 pt on a Letter-width page - the
+    /// "just move it a bit" tap every editor supports.</summary>
+    private const double SmallNudgeStep = 0.002;
+
+    /// <summary>Shift+arrow bigger nudge, in the same units. 5x the small step
+    /// matches Word / Illustrator's convention for the "coarser step".</summary>
+    private const double BigNudgeStep = 0.01;
+
     private void ScrollBy(double dx, double dy) =>
         PageScroller.ScrollTo(
             PageScroller.HorizontalOffset + dx,
@@ -2528,16 +2537,36 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
-            // Arrow keys nudge the scroll, as in Acrobat. Without these the
-            // keyboard could jump pages but not move within one.
+            // Arrow keys: if an annotation is selected they NUDGE it (Illustrator
+            // / Word style, expected keyboard polish). Only when nothing is
+            // selected do they fall back to the Acrobat-style scroll nudge, so
+            // the keyboard can still move within a page when no object is picked.
+            // Shift-arrow multiplies the step, matching every editor's "bigger
+            // nudge" convention.
             case VirtualKey.Down:
             case VirtualKey.Up:
-                ScrollBy(0, e.Key == VirtualKey.Down ? ArrowScrollStep : -ArrowScrollStep);
+                if (ViewModel.HasSelectedAnnotationLoaded)
+                {
+                    double stepD = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
+                    ViewModel.NudgeSelected(0, e.Key == VirtualKey.Down ? stepD : -stepD);
+                }
+                else
+                {
+                    ScrollBy(0, e.Key == VirtualKey.Down ? ArrowScrollStep : -ArrowScrollStep);
+                }
                 e.Handled = true;
                 break;
             case VirtualKey.Right:
             case VirtualKey.Left:
-                ScrollBy(e.Key == VirtualKey.Right ? ArrowScrollStep : -ArrowScrollStep, 0);
+                if (ViewModel.HasSelectedAnnotationLoaded)
+                {
+                    double stepR = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
+                    ViewModel.NudgeSelected(e.Key == VirtualKey.Right ? stepR : -stepR, 0);
+                }
+                else
+                {
+                    ScrollBy(e.Key == VirtualKey.Right ? ArrowScrollStep : -ArrowScrollStep, 0);
+                }
                 e.Handled = true;
                 break;
 
