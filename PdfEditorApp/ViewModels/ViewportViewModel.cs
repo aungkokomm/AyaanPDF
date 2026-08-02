@@ -1495,6 +1495,41 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Slot-space top of a page, for scroll-to-page.</summary>
     public double SlotTopOf(int pageIndex) => _layout.TopOf(pageIndex);
 
+    /// <summary>Which page contains the given Y in slot-space (ViewportHost's
+    /// content minus Padding.Top), or -1 if the Y is above the first page or
+    /// past the last one. Linear walk over slots is fine - typical documents
+    /// have a few hundred pages at most and this only fires on a ruler drop.</summary>
+    public int PageAt(double slotY)
+    {
+        for (int i = 0; i < PageSlots.Count; i++)
+        {
+            double top = _layout.TopOf(i);
+            double bottom = top + PageSlots[i].SlotHeight;
+            if (slotY >= top && slotY < bottom) { return i; }
+        }
+        return -1;
+    }
+
+    /// <summary>Adds a guide (dragged out from a ruler) to the given page.
+    /// Session-only; the guide isn't written to the PDF yet.</summary>
+    public void AddGuide(int pageIndex, bool horizontal, double normalizedPos)
+    {
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
+        if (slot is null) { return; }
+        slot.Guides.Add(new GuideMark(horizontal, normalizedPos, slot.SlotWidth, slot.SlotHeight));
+    }
+
+    public void ClearGuidesOnPage(int pageIndex)
+    {
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
+        slot?.Guides.Clear();
+    }
+
+    public void ClearAllGuides()
+    {
+        foreach (var s in PageSlots) { s.Guides.Clear(); }
+    }
+
     /// <summary>"7 / 20", or empty when no document is open.</summary>
     public string PagePositionLabel =>
         PageCount > 0 ? $"{CurrentPageIndex + 1} / {PageCount}" : string.Empty;
@@ -2941,7 +2976,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             xs.Add(c.Left); xs.Add(c.Right); xs.Add((c.Left + c.Right) / 2);
             ys.Add(c.Top); ys.Add(c.Bottom); ys.Add((c.Top + c.Bottom) / 2);
         }
-        if (xs.Count == 0) { return moved; }
+        // Add guide positions on this page as snap targets. A vertical guide's
+        // NormalizedPos is 0-1 across page width - the same normalization the
+        // selection bounds use - so it goes straight into xs/ys.
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
+        if (slot is not null)
+        {
+            foreach (var g in slot.Guides)
+            {
+                if (g.Horizontal) { ys.Add(g.NormalizedPos); }
+                else              { xs.Add(g.NormalizedPos); }
+            }
+        }
+        if (xs.Count == 0 && ys.Count == 0) { return moved; }
 
         // For each of our own edges/centre, find the closest candidate on that
         // axis. Whichever of the three has the smallest distance wins - if it's

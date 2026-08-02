@@ -91,6 +91,9 @@
                 HorizontalAlignment="Stretch" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 Canvas.ZIndex="10"
+                PointerPressed="TopRuler_PointerPressed"
+                PointerReleased="Ruler_PointerReleased"
+                PointerCaptureLost="Ruler_PointerCaptureLost"
                 RightTapped="Ruler_RightTapped"
                 SizeChanged="Rulers_SizeChanged">
             <Canvas.ContextFlyout>
@@ -101,6 +104,9 @@
                     <RadioMenuFlyoutItem Text="Points"       GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Points" />
                     <RadioMenuFlyoutItem Text="Picas"        GroupName="RulerUnitFly" Click="RulerUnit_Click" Tag="Picas" />
                     <MenuFlyoutSeparator />
+                    <MenuFlyoutItem Text="Clear guides on this page" Click="ClearGuidesPage_Click" />
+                    <MenuFlyoutItem Text="Clear all guides" Click="ClearGuidesAll_Click" />
+                    <MenuFlyoutSeparator />
                     <MenuFlyoutItem Text="Hide Rulers" Click="RulersHide_Click" />
                 </MenuFlyout>
             </Canvas.ContextFlyout>
@@ -110,6 +116,9 @@
                 HorizontalAlignment="Left" VerticalAlignment="Stretch"
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 Canvas.ZIndex="10"
+                PointerPressed="LeftRuler_PointerPressed"
+                PointerReleased="Ruler_PointerReleased"
+                PointerCaptureLost="Ruler_PointerCaptureLost"
                 RightTapped="Ruler_RightTapped"
                 SizeChanged="Rulers_SizeChanged" />
 
@@ -319,6 +328,26 @@
                                             a heavy dashed rectangle reads as a
                                             debug overlay rather than a tool.
                                         -->
+                                        <!-- Ruler guides: horizontal/vertical lines spanning the page,
+                                             drawn above the page content but below selection marquees.
+                                             1 DIP thick, Acrobat-cyan. IsHitTestVisible=False for now;
+                                             the pointer falls through so drawing tools still work over
+                                             a guide. Move/delete will get their own pass. -->
+                                        <ItemsControl ItemsSource="{x:Bind Guides}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewmodels:GuideMark">
+                                                    <Rectangle Fill="#FF00A0D8" Opacity="0.85"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top"
+                                                               Width="{x:Bind PixelWidth, Mode=OneWay}"
+                                                               Height="{x:Bind PixelHeight, Mode=OneWay}"
+                                                               Margin="{x:Bind local:MainPage.Offset(PixelLeft, PixelTop), Mode=OneWay}" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <!-- Marquees for the multi-selection extras: thin accent outlines, no
                                              handles, OUTSIDE the rotate transform because each extra keeps its
                                              own upright frame. -->

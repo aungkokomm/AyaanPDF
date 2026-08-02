@@ -82,6 +82,13 @@ public partial class PageSlot : ObservableObject
     /// visually primary; no handles because operations key off the anchor.</summary>
     public ObservableCollection<ScaledRect> ExtraSelectionOutlines { get; } = new();
 
+    /// <summary>Guide lines dragged out from the rulers, drawn as thin cyan
+    /// lines that span the page. A guide with Horizontal=true is a horizontal
+    /// line at NormalizedPos (0-1 across page HEIGHT); false is a vertical
+    /// line at NormalizedPos (0-1 across page WIDTH). Session-only for now;
+    /// persistence to the PDF is a follow-up.</summary>
+    public ObservableCollection<GuideMark> Guides { get; } = new();
+
     /// <summary>Degrees the selection frame and its handles are turned (clockwise),
     /// so a rotated text box is framed at its real angle. The frame and handles are
     /// laid out upright and turned as one about the pivot below.</summary>
@@ -302,5 +309,53 @@ public partial class PageSlot : ObservableObject
         BaseWidth = 0;
         IsSharp = false;
         ClearTiles();
+    }
+}
+
+/// <summary>A guide line dragged out from a ruler. Kept in NORMALIZED units
+/// (0-1 across the page's perpendicular dimension) so a guide that survives
+/// a slot resize still lands in the right place; the pixel Left/Top/Width/
+/// Height are cached alongside so the DataTemplate can bind directly without
+/// walking up to find the parent's SlotWidth/SlotHeight (which x:Bind
+/// makes awkward across templates).</summary>
+public partial class GuideMark : ObservableObject
+{
+    public bool Horizontal { get; }
+    public double NormalizedPos { get; }
+    [ObservableProperty]
+    public partial double PixelLeft { get; set; }
+    [ObservableProperty]
+    public partial double PixelTop { get; set; }
+    [ObservableProperty]
+    public partial double PixelWidth { get; set; }
+    [ObservableProperty]
+    public partial double PixelHeight { get; set; }
+
+    public GuideMark(bool horizontal, double normalizedPos, double slotWidth, double slotHeight)
+    {
+        Horizontal = horizontal;
+        NormalizedPos = normalizedPos;
+        Reproject(slotWidth, slotHeight);
+    }
+
+    /// <summary>Recompute the pixel rect for the current slot dimensions.
+    /// Horizontal guide = 1 DIP tall spanning full width at Y = pos * height.
+    /// Vertical guide  = 1 DIP wide spanning full height at X = pos * width.</summary>
+    public void Reproject(double slotWidth, double slotHeight)
+    {
+        if (Horizontal)
+        {
+            PixelLeft = 0;
+            PixelTop = NormalizedPos * slotHeight;
+            PixelWidth = slotWidth;
+            PixelHeight = 1;
+        }
+        else
+        {
+            PixelLeft = NormalizedPos * slotWidth;
+            PixelTop = 0;
+            PixelWidth = 1;
+            PixelHeight = slotHeight;
+        }
     }
 }

@@ -765,6 +765,77 @@ public sealed partial class MainPage : Page
         }
     }
 
+    // ---------------- Guide drag-out from ruler ----------------
+    //
+    // Down on a ruler starts a "creating guide" gesture; capture the pointer
+    // so subsequent Moves/Releases land here even after the pointer leaves
+    // the ruler and crosses into the page. On release, find which page (if
+    // any) is under the pointer and add a guide there at the pointer's cross-
+    // axis position in normalized (0-1) page coords.
+    private enum DraggingGuide { None, Vertical, Horizontal }
+    private DraggingGuide _guideDrag = DraggingGuide.None;
+
+    private void TopRuler_PointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (e.GetCurrentPoint(TopRuler).Properties.IsRightButtonPressed) { return; }
+        _guideDrag = DraggingGuide.Vertical;
+        TopRuler.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void LeftRuler_PointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (e.GetCurrentPoint(LeftRuler).Properties.IsRightButtonPressed) { return; }
+        _guideDrag = DraggingGuide.Horizontal;
+        LeftRuler.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void Ruler_PointerReleased(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (_guideDrag == DraggingGuide.None) { return; }
+        var kind = _guideDrag;
+        _guideDrag = DraggingGuide.None;
+        if (sender is UIElement el) { el.ReleasePointerCapture(e.Pointer); }
+
+        // Translate the release position into ViewportHost content space, then
+        // page-slot coords, and only add a guide when the pointer landed inside
+        // a page. A release on the corner or off any page just cancels.
+        var pInHost = e.GetCurrentPoint(ViewportHost).Position;
+        double slotX = pInHost.X - ViewportHost.Padding.Left;
+        double slotY = pInHost.Y - ViewportHost.Padding.Top;
+        if (slotX < 0 || slotY < 0) { return; }
+
+        int pageIndex = ViewModel.PageAt(slotY);
+        if (pageIndex < 0) { return; }
+
+        var slot = ViewModel.PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
+        if (slot is null) { return; }
+
+        double slotLocalY = slotY - ViewModel.SlotTopOf(pageIndex);
+        double normX = slot.SlotWidth  > 0 ? Math.Clamp(slotX / slot.SlotWidth,  0, 1) : 0.5;
+        double normY = slot.SlotHeight > 0 ? Math.Clamp(slotLocalY / slot.SlotHeight, 0, 1) : 0.5;
+
+        if (kind == DraggingGuide.Vertical) { ViewModel.AddGuide(pageIndex, horizontal: false, normX); }
+        else                                { ViewModel.AddGuide(pageIndex, horizontal: true,  normY); }
+        e.Handled = true;
+    }
+
+    private void Ruler_PointerCaptureLost(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        _guideDrag = DraggingGuide.None;
+    }
+
+    private void ClearGuidesPage_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ClearGuidesOnPage(ViewModel.CurrentPageIndex);
+    }
+
+    private void ClearGuidesAll_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ClearAllGuides();
+    }
+
     /// <summary>Formats a ruler label sensibly for the current unit. Integers
     /// stay integer; fractional shows enough decimal places for the unit but
     /// no more (0.5 not 0.500).</summary>
