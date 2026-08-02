@@ -371,6 +371,25 @@
                                             a heavy dashed rectangle reads as a
                                             debug overlay rather than a tool.
                                         -->
+                                        <!-- Smart alignment guides: bright orange lines that flash into
+                                             existence while you drag and your edge/centre aligns with
+                                             another object's edge/centre. Full-width for horizontal, full-
+                                             height for vertical. Cleared on drag release. -->
+                                        <Rectangle IsHitTestVisible="False"
+                                                   Fill="{x:Bind local:MainPage.SmartGuideBrush, Mode=OneTime}"
+                                                   Opacity="0.9" UseLayoutRounding="False"
+                                                   HorizontalAlignment="Left" VerticalAlignment="Stretch"
+                                                   Width="0.5"
+                                                   Visibility="{x:Bind local:MainPage.SmartGuideVis(SmartGuideX), Mode=OneWay}"
+                                                   Margin="{x:Bind local:MainPage.SmartGuideMarginX(SmartGuideX), Mode=OneWay}" />
+                                        <Rectangle IsHitTestVisible="False"
+                                                   Fill="{x:Bind local:MainPage.SmartGuideBrush, Mode=OneTime}"
+                                                   Opacity="0.9" UseLayoutRounding="False"
+                                                   HorizontalAlignment="Stretch" VerticalAlignment="Top"
+                                                   Height="0.5"
+                                                   Visibility="{x:Bind local:MainPage.SmartGuideVis(SmartGuideY), Mode=OneWay}"
+                                                   Margin="{x:Bind local:MainPage.SmartGuideMarginY(SmartGuideY), Mode=OneWay}" />
+
                                         <!-- Ruler guides: horizontal/vertical lines spanning the page,
                                              drawn above the page content but below selection marquees.
                                              1 DIP thick, Acrobat-cyan. IsHitTestVisible=False for now;

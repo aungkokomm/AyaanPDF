@@ -3386,9 +3386,55 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 g.IsSnapActive = (g == snapGuideX) || (g == snapGuideY);
             }
+
+            // Smart guides: temporary alignment lines that appear when the
+            // moved shape's edge/centre lines up with ANOTHER OBJECT's edge/
+            // centre (not with a placed guide, which already flashes yellow
+            // above). Position is the snap coord itself, which is where the
+            // moved shape's snapped edge now sits. Both axes tracked
+            // independently. Null when snap engaged on a placed guide or on
+            // nothing at all.
+            slot.SmartGuideX = (Math.Abs(bestDx) > 0 && snapGuideX is null)
+                ? moved.Left + bestDx  // whichever edge snapped, this X is where the snapped-to line runs
+                : null;
+            slot.SmartGuideY = (Math.Abs(bestDy) > 0 && snapGuideY is null)
+                ? moved.Top + bestDy
+                : null;
+            // Snap chose an offset that shifts the moved box; use the ACTUAL
+            // snapped target position (already in xTargets/yTargets) so a
+            // centre-snap draws the line at the centre, not at the edge.
+            // Simpler and more correct: find the target closest to the moved
+            // edge that produced the offset.
+            if (slot.SmartGuideX is not null)
+            {
+                double snappedX = FindMatchingSnapPos(xTargets, moved.Left, moved.Right, movedCx, bestDx);
+                slot.SmartGuideX = snappedX;
+            }
+            if (slot.SmartGuideY is not null)
+            {
+                double snappedY = FindMatchingSnapPos(yTargets, moved.Top, moved.Bottom, movedCy, bestDy);
+                slot.SmartGuideY = snappedY;
+            }
         }
 
         return moved.MovedBy(bestDx, bestDy);
+    }
+
+    /// <summary>Given the offset that snap chose and the moved edges, find
+    /// which target position it engaged (there's exactly one within threshold
+    /// per axis - the winning target). Used to draw the smart-guide line at
+    /// the ACTUAL alignment position rather than an edge of the moved box.</summary>
+    private static double FindMatchingSnapPos(List<(double Pos, GuideMark? Guide)> targets,
+                                              double edge1, double edge2, double centre, double bestOff)
+    {
+        const double Eps = 1e-6;
+        foreach (var (pos, _) in targets)
+        {
+            if (Math.Abs((pos - edge1) - bestOff) < Eps) { return pos; }
+            if (Math.Abs((pos - edge2) - bestOff) < Eps) { return pos; }
+            if (Math.Abs((pos - centre) - bestOff) < Eps) { return pos; }
+        }
+        return edge1 + bestOff;  // fallback: the moved edge after snap
     }
 
     /// <summary>Writes a finished drag through to the document.</summary>
@@ -3402,10 +3448,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _loadedDrag = null;
 
         // Turn off any guide snap-flash: the drag is over, so no guide is
-        // actively snapping anymore.
+        // actively snapping anymore. Also clear the smart alignment guides
+        // that appeared while dragging.
         foreach (var s in PageSlots)
         {
             foreach (var g in s.Guides) { if (g.IsSnapActive) { g.IsSnapActive = false; } }
+            if (s.SmartGuideX is not null) { s.SmartGuideX = null; }
+            if (s.SmartGuideY is not null) { s.SmartGuideY = null; }
         }
 
         // The grip belongs to the gesture that just ended, so it is read once

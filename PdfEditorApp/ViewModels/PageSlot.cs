@@ -89,6 +89,17 @@ public partial class PageSlot : ObservableObject
     /// persistence to the PDF is a follow-up.</summary>
     public ObservableCollection<GuideMark> Guides { get; } = new();
 
+    /// <summary>Smart alignment guides that flash into existence WHILE a
+    /// shape is being dragged and its edge/centre lines up with another
+    /// object's edge/centre on this page. Bright orange, span the full page
+    /// dimension perpendicular to the alignment, cleared the moment the
+    /// alignment ends. Both axes independent - X can be lit while Y isn't.
+    /// Null = not active on that axis.</summary>
+    [ObservableProperty]
+    public partial double? SmartGuideX { get; set; }
+    [ObservableProperty]
+    public partial double? SmartGuideY { get; set; }
+
     /// <summary>Degrees the selection frame and its handles are turned (clockwise),
     /// so a rotated text box is framed at its real angle. The frame and handles are
     /// laid out upright and turned as one about the pivot below.</summary>

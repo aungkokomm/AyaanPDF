@@ -296,6 +296,29 @@ public sealed partial class MainPage : Page
         snapActive ? GuideBrushSnapActive
             : (selected ? GuideBrushSelected : GuideBrushDefault);
 
+    /// <summary>Smart alignment guide brush - bright orange, distinct from
+    /// user guides (cyan) and the snap-flash (yellow) so it reads as a
+    /// SUGGESTION, not a placed thing. Only shown mid-drag.</summary>
+    public static readonly Microsoft.UI.Xaml.Media.SolidColorBrush SmartGuideBrush =
+        new(Windows.UI.Color.FromArgb(0xFF, 0xFF, 0x60, 0x00));
+
+    /// <summary>Visibility helpers for the smart-guide overlays: collapse when
+    /// the axis's smart guide is null (no alignment engaged on that axis),
+    /// visible when it has a value.</summary>
+    public static Visibility SmartGuideVis(double? v) =>
+        v.HasValue ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>Pixel-space Margin for a VERTICAL smart-guide overlay: X only.
+    /// x:Bind cannot pass literal booleans as method arguments, so the two
+    /// axes are two separate helpers.</summary>
+    public static Thickness SmartGuideMarginX(double? v) =>
+        !v.HasValue ? new Thickness(0)
+                    : new Thickness(v.Value * SlotLayoutWidth, 0, 0, 0);
+    public static Thickness SmartGuideMarginY(double? v) =>
+        !v.HasValue ? new Thickness(0)
+                    : new Thickness(0, v.Value * SlotLayoutWidth, 0, 0);
+    private const double SlotLayoutWidth = 800;
+
     /// <summary>
     /// Positions an element from a NORMALIZED coordinate, multiplying by the
     /// slot scale. For overlays that must not sit inside the scaled layer,
