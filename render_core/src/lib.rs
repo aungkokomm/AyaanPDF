@@ -3467,12 +3467,22 @@ fn restyle_shape_annotation_inner_with_rotation(
         (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, page_left, page_top, pw, bx)
     };
 
-    // Convert the annotation's PDF-point bounds back into capture space.
+    // Convert the annotation's PDF-point bounds back into capture space AND
+    // subtract the stroke padding that the writer added around the content.
+    // The writer builds shape extent then inflates by `width_pts/2 + 1` on every
+    // side so PDFium doesn't clip the stroke; if a restyle used those inflated
+    // bounds as the NEW extent, the writer would inflate again, and a slider
+    // drag (opacity, colour change) that re-styles many times would grow the
+    // shape a little each tick. Undo the pad here to keep the content extent
+    // stable across restyles. (Rotated shapes need a smarter reversal - the
+    // stored /Rect is the AABB of the rotated content plus pad - but the
+    // opacity-slider case is un-rotated in practice.)
     let scale_cap_per_pt = capture_width as f32 / page_w;
-    let cap_left = (bounds.left().value - page_left) * scale_cap_per_pt;
-    let cap_right = (bounds.right().value - page_left) * scale_cap_per_pt;
-    let cap_top = (page_top - bounds.top().value) * scale_cap_per_pt;
-    let cap_bottom = (page_top - bounds.bottom().value) * scale_cap_per_pt;
+    let pad_pts = cur_width_pts / 2.0 + 1.0;
+    let cap_left = (bounds.left().value + pad_pts - page_left) * scale_cap_per_pt;
+    let cap_right = (bounds.right().value - pad_pts - page_left) * scale_cap_per_pt;
+    let cap_top = (page_top - bounds.top().value + pad_pts) * scale_cap_per_pt;
+    let cap_bottom = (page_top - bounds.bottom().value - pad_pts) * scale_cap_per_pt;
 
     // Apply the caller's overrides on top of the tag's own values.
     let (nr, ng, nb, na) = if (color_rgba & 0xFF) != 0 {
