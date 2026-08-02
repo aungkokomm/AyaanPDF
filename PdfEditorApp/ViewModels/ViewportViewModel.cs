@@ -3941,6 +3941,147 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// was. This is the Ctrl-drag = copy convention every editor uses. Only text
     /// boxes and shapes are supported for now (the two kinds that live in the PDF
     /// with round-trippable tags). Returns true if a clone was made.</summary>
+    /// <summary>A stashed annotation ready to be pasted. Captures the Contents
+    /// tag (which fully describes a shape or text box - kind/style/font/text)
+    /// and its normalized bounds on the source page. Paste re-emits the
+    /// annotation on the target page at an offset from the original bounds.</summary>
+    private sealed record ClipboardEntry(
+        string Contents,
+        double Left, double Top, double Right, double Bottom);
+    private readonly List<ClipboardEntry> _clipboard = new();
+
+    /// <summary>True when Ctrl+V has something to paste.</summary>
+    public bool HasClipboardContent => _clipboard.Count > 0;
+
+    /// <summary>Copies every selected loaded annotation into the in-memory
+    /// clipboard. Returns true if anything was captured. Ink and highlight
+    /// overlays are skipped (they don't yet participate in the loaded-
+    /// annotation model). Same session only for now.</summary>
+    public bool CopySelectedAnnotations()
+    {
+        var toCopy = new List<LoadedSelection>();
+        if (_selectedLoaded is LoadedSelection a) { toCopy.Add(a); }
+        toCopy.AddRange(_extraSelected);
+        if (toCopy.Count == 0) { return false; }
+
+        _clipboard.Clear();
+        foreach (var sel in toCopy)
+        {
+            string? contents = ReadAnnotationContents(sel.PageIndex, sel.Index);
+            if (string.IsNullOrEmpty(contents)) { continue; }
+            _clipboard.Add(new ClipboardEntry(contents, sel.Left, sel.Top, sel.Right, sel.Bottom));
+        }
+        return _clipboard.Count > 0;
+    }
+
+    /// <summary>Copy plus delete, the standard Ctrl+X semantic. Delete uses
+    /// the existing multi-select delete path so an anchor + extras go together.</summary>
+    public bool CutSelectedAnnotations()
+    {
+        if (!CopySelectedAnnotations()) { return false; }
+        DeleteSelectedAnnotation();
+        return true;
+    }
+
+    /// <summary>Pastes everything in the clipboard onto the current page,
+    /// offset by ~12pt right and down from the source bounds so pastes stack
+    /// visibly rather than landing on top of the original. Newly-pasted
+    /// annotations become the new selection so a follow-up move affects
+    /// exactly what was just pasted, the way every editor works.</summary>
+    public bool PasteAnnotations()
+    {
+        if (_documentHandle == 0 || _clipboard.Count == 0) { return false; }
+        int page = CurrentPageIndex;
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == page);
+        if (slot is null) { return false; }
+
+        // Offset in NORMALIZED (width-based) units. ~12pt on Letter -> 0.02.
+        const double Offset = 0.02;
+        const int CaptureWidth = 1000;
+        PushHistory(HistoryScope.Document, _clipboard.Count == 1 ? "Paste" : "Paste " + _clipboard.Count);
+
+        int firstNewIndex = LoadedFor(page).Count;
+        int emitted = 0;
+        foreach (var e in _clipboard)
+        {
+            // Fresh normalized bounds on the current page. Clamp so a paste
+            // near a page edge lands INSIDE the page even if the offset would
+            // push it off.
+            double w = e.Right - e.Left;
+            double h = e.Bottom - e.Top;
+            double left = Math.Clamp(e.Left + Offset, 0, 1 - w);
+            double top  = Math.Clamp(e.Top  + Offset, 0, Math.Max(0, 1.5 - h));  // vertical isn't 0-1 in width-norm units
+            var pasted = new LoadedSelection(page, -1, left, top, left + w, top + h);
+
+            if (e.Contents.StartsWith("AyaanShape:", StringComparison.Ordinal))
+            {
+                if (!ShapeSpecFromTag(e.Contents, pasted, CaptureWidth, out var spec)) { continue; }
+                if (RenderCoreNative.add_shape_annotations(
+                        _documentHandle, CaptureWidth, new[] { spec }, 1)
+                    == RenderStatus.OkPdfium) { emitted++; }
+            }
+            else if (TextBoxTagReader.TryParse(e.Contents, out var tag))
+            {
+                double l2 = pasted.Left, t2 = pasted.Top, r2 = pasted.Right, b2 = pasted.Bottom;
+                var (rr, gg, bb, aa) = ParseHex(tag.ColorHex, defaultAlpha: 0xFF);
+                byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(tag.Text);
+                byte[]? fontUtf8 = string.IsNullOrEmpty(tag.FontPath)
+                    ? null
+                    : System.Text.Encoding.UTF8.GetBytes(tag.FontPath);
+                int status = RenderCoreNative.add_text_box_annotation_styled(
+                    _documentHandle, page, CaptureWidth,
+                    (float)(l2 * CaptureWidth), (float)(t2 * CaptureWidth),
+                    (float)(r2 * CaptureWidth), (float)(b2 * CaptureWidth),
+                    utf8, (nuint)utf8.Length,
+                    (float)(tag.FontSizeNorm * CaptureWidth), rr, gg, bb, aa,
+                    (int)tag.Align,
+                    PackRgba(tag.FillHex), PackRgba(tag.OutlineHex),
+                    (float)(tag.OutlineWidthNorm * CaptureWidth),
+                    fontUtf8, (nuint)(fontUtf8?.Length ?? 0),
+                    tag.Underline ? 1 : 0, tag.Strikethrough ? 1 : 0);
+                if (status != RenderStatus.OkPdfium) { continue; }
+                if (tag.RotationDeg != 0)
+                {
+                    RenderCoreNative.rotate_text_box_annotation(
+                        _documentHandle, page,
+                        (int)(LoadedFor(page).Count),
+                        CaptureWidth,
+                        (float)(l2 * CaptureWidth), (float)(t2 * CaptureWidth),
+                        (float)(r2 * CaptureWidth), (float)(b2 * CaptureWidth),
+                        (float)tag.RotationDeg, out _);
+                }
+                emitted++;
+            }
+        }
+        if (emitted == 0) { return false; }
+
+        IsDirty = true;
+        InvalidateLoadedPage(page);
+
+        // Select what was just pasted: anchor = last one, extras = the rest.
+        var all = LoadedFor(page);
+        _extraSelected.Clear();
+        _selectedLoaded = null;
+        for (int i = firstNewIndex; i < all.Count && i < firstNewIndex + emitted; i++)
+        {
+            var a = all[i];
+            var newSel = new LoadedSelection(page, a.Index, a.Left, a.Top, a.Right, a.Bottom);
+            if (_selectedLoaded is null) { _selectedLoaded = newSel; }
+            else { _extraSelected.Add(newSel); }
+        }
+        if (_selectedLoaded is LoadedSelection anchor)
+        {
+            ApplyTextBoxSelectionInfo(anchor.PageIndex, anchor.Index);
+        }
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedAnnotationLoaded));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
+        return true;
+    }
+
     public bool DuplicateSelectedForDrag()
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel)

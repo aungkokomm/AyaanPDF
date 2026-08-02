@@ -3219,7 +3219,17 @@ public sealed partial class MainPage : Page
                 UpdateCursor();
                 break;
             case VirtualKey.C when _isCtrlDown:
-                CopySelectedText();
+                // Selected annotation wins over selected text: if the user has
+                // a shape or text box picked, they mean copy IT, not whatever
+                // text underneath happens to be highlighted.
+                if (!ViewModel.CopySelectedAnnotations()) { CopySelectedText(); }
+                e.Handled = true;
+                break;
+            case VirtualKey.X when _isCtrlDown:
+                if (ViewModel.CutSelectedAnnotations()) { e.Handled = true; }
+                break;
+            case VirtualKey.V when _isCtrlDown:
+                if (ViewModel.PasteAnnotations()) { e.Handled = true; }
                 break;
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
