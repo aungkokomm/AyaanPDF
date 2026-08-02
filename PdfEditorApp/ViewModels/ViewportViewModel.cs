@@ -1604,15 +1604,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// on the given page, if any is within the tolerance. Horizontal guides
     /// match on Y, vertical on X. Tolerance is 0.005 normalized (about 4 DIPs
     /// on the 800-wide slot) which is Illustrator's rough click zone for a
-    /// hairline object. Returns null when nothing's close enough.</summary>
+    /// hairline object. Returns null when nothing's close enough.
+    ///
+    /// The incoming (nx, ny) are BOTH normalized by page WIDTH (the annotation
+    /// convention: OverlayScale is SlotLayoutWidth). A HORIZONTAL guide's
+    /// NormalizedPos is 0-1 across page HEIGHT though, so we rescale ny into
+    /// height units before comparing - without this, horizontal-guide clicks
+    /// and drags landed at wrong positions or missed the guide entirely.</summary>
     public GuideMark? PickGuideAt(int pageIndex, double nx, double ny)
     {
         var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
         if (slot is null) { return null; }
         const double Tol = 0.005;
+        // ny is (slotLocalY / SlotLayoutWidth); convert to (slotLocalY /
+        // SlotHeight) so it lines up with horizontal-guide NormalizedPos.
+        double nyInHeight = slot.SlotHeight > 0
+            ? ny * SlotLayoutWidth / slot.SlotHeight
+            : ny;
         foreach (var g in slot.Guides)
         {
-            double d = g.Horizontal ? Math.Abs(ny - g.NormalizedPos) : Math.Abs(nx - g.NormalizedPos);
+            double d = g.Horizontal
+                ? Math.Abs(nyInHeight - g.NormalizedPos)
+                : Math.Abs(nx - g.NormalizedPos);
             if (d <= Tol) { return g; }
         }
         return null;
@@ -1652,8 +1665,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Moves the guide currently under drag to the pointer's page-local
-    /// normalized position. Horizontal guide takes ny; vertical takes nx.
-    /// Clamps to [0, 1] so a guide can't slip past a page edge.</summary>
+    /// normalized position. Horizontal guide takes ny (rescaled from width-
+    /// normalized to height-normalized so the units match its NormalizedPos);
+    /// vertical takes nx unchanged. Clamps to [0, 1] so a guide can't slip
+    /// past a page edge.</summary>
     public void DragGuideTo(int pageIndex, double nx, double ny)
     {
         if (!IsDraggingGuide || _selectedGuide is not (int selPage, GuideMark g)) { return; }
@@ -1662,7 +1677,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // shape-drag which also crosses pages.
         var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
         if (slot is null) { return; }
-        double pos = g.Horizontal ? Math.Clamp(ny, 0, 1) : Math.Clamp(nx, 0, 1);
+        // Same width->height rescale as PickGuideAt: ny arrives width-normalized,
+        // but a horizontal guide's NormalizedPos is height-normalized.
+        double pos;
+        if (g.Horizontal)
+        {
+            double nyInHeight = slot.SlotHeight > 0
+                ? ny * SlotLayoutWidth / slot.SlotHeight
+                : ny;
+            pos = Math.Clamp(nyInHeight, 0, 1);
+        }
+        else
+        {
+            pos = Math.Clamp(nx, 0, 1);
+        }
         g.MoveTo(pos, slot.SlotWidth, slot.SlotHeight);
         if (pageIndex != selPage)
         {

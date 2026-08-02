@@ -3247,14 +3247,26 @@ public sealed partial class MainPage : Page
     /// </summary>
     private InputSystemCursorShape? HoverCursor(PointerRoutedEventArgs e)
     {
-        if (ViewModel.ActiveTool != ToolMode.Select || _isSpaceHandActive)
-        {
-            return null;
-        }
+        // Space-hand overrides everything - never override the pan cursor.
+        if (_isSpaceHandActive) { return null; }
 
         var content = ContentPoint(e);
         double nx = content.X / ViewModel.OverlayScale;
         double ny = content.Y / ViewModel.OverlayScale;
+
+        // Guides can be picked and dragged under ANY tool, so the hover
+        // cursor for them ignores the Select-tool gate below. SizeAll is
+        // the standard "move me" cursor - what Illustrator shows over a
+        // guide it can pick up.
+        if (ViewModel.PickGuideAt(content.Page, nx, ny) is not null)
+        {
+            return InputSystemCursorShape.SizeAll;
+        }
+
+        if (ViewModel.ActiveTool != ToolMode.Select)
+        {
+            return null;
+        }
 
         return ViewModel.GripUnder(content.Page, nx, ny) switch
         {
