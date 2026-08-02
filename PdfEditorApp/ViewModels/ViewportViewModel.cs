@@ -4136,6 +4136,75 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    /// <summary>Moves the currently selected annotation(s) to the top of the
+    /// page's z-order. Works via delete + re-add - a fresh annotation always
+    /// lands at the end of the page's list (which renders LAST, i.e. on top).
+    /// Multi-selection processes each in current order so the anchor ends up
+    /// on top of the extras. Non-Ayaan annotations on the page keep their
+    /// existing positions relative to each other, but of course our resused
+    /// ones now sit above them.</summary>
+    public bool BringSelectedToFront()
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor) { return false; }
+        const int CaptureWidth = 1000;
+
+        // Build the joint list (anchor + extras) and sort by DESCENDING index
+        // per page so each delete never disturbs a later item's index. The
+        // last-N run-at-end pattern (proven in v1.79.1 for align/distribute)
+        // gives us the final indices to write back.
+        var jobs = new List<(LoadedSelection Sel, int Slot)>();
+        jobs.Add((anchor, 0));
+        for (int i = 0; i < _extraSelected.Count; i++) { jobs.Add((_extraSelected[i], i + 1)); }
+        jobs.Sort((a, b) =>
+        {
+            int p = b.Sel.PageIndex.CompareTo(a.Sel.PageIndex);
+            return p != 0 ? p : b.Sel.Index.CompareTo(a.Sel.Index);
+        });
+
+        PushHistory(HistoryScope.Document, "Bring to front");
+        var writeOrderPerPage = new Dictionary<int, List<int>>();
+        var pagesTouched = new HashSet<int>();
+        foreach (var (sel, slot) in jobs)
+        {
+            int newIdx = WriteMovedAnnotation(sel, sel, CaptureWidth);
+            if (newIdx < 0) { continue; }
+            pagesTouched.Add(sel.PageIndex);
+            if (!writeOrderPerPage.TryGetValue(sel.PageIndex, out var list))
+            {
+                list = new List<int>();
+                writeOrderPerPage[sel.PageIndex] = list;
+            }
+            list.Add(slot);
+        }
+        if (pagesTouched.Count == 0) { return false; }
+
+        foreach (int p in pagesTouched) { InvalidateLoadedPage(p); }
+        var newIndicesBySlot = new Dictionary<int, int>(jobs.Count);
+        foreach (var kv in writeOrderPerPage)
+        {
+            int count = LoadedFor(kv.Key).Count;
+            var slots = kv.Value;
+            for (int i = 0; i < slots.Count; i++)
+            {
+                newIndicesBySlot[slots[i]] = count - slots.Count + i;
+            }
+        }
+        if (newIndicesBySlot.TryGetValue(0, out int anchorIdx))
+        {
+            _selectedLoaded = anchor with { Index = anchorIdx };
+        }
+        for (int i = 0; i < _extraSelected.Count; i++)
+        {
+            if (newIndicesBySlot.TryGetValue(i + 1, out int idx))
+            {
+                _extraSelected[i] = _extraSelected[i] with { Index = idx };
+            }
+        }
+        IsDirty = true;
+        RefreshSelectionOutline();
+        return true;
+    }
+
     public bool DuplicateSelectedForDrag()
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel)

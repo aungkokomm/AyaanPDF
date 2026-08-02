@@ -3261,6 +3261,11 @@ public sealed partial class MainPage : Page
             case VirtualKey.V when _isCtrlDown:
                 if (ViewModel.PasteAnnotations()) { e.Handled = true; }
                 break;
+            // Ctrl+Shift+] = Bring to Front (Illustrator convention).
+            // VirtualKey for the ] key is Oem6 (\ in some layouts).
+            case (VirtualKey)0xDD when _isCtrlDown && IsShiftDown():
+                if (ViewModel.BringSelectedToFront()) { e.Handled = true; }
+                break;
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
                 SearchBox.SelectAll();
