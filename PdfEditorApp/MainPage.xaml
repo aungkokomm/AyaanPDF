@@ -86,12 +86,27 @@
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="0,0,1,1" Canvas.ZIndex="10" />
+
+        <!-- Live preview line shown while dragging a guide out of a ruler.
+             Positioned in viewport-DIP space via Margin, so it lands under
+             the pointer even as the pointer crosses out of the ruler onto
+             the page. Horizontal preview: full viewport width, 1 DIP tall,
+             top of Margin = pointer Y. Vertical preview: 1 DIP wide, full
+             height, left of Margin = pointer X. Collapsed until pressed. -->
+        <Rectangle x:Name="GuidePreviewLine" Grid.Column="2"
+                   Fill="#FF00A0D8" Opacity="0.85"
+                   HorizontalAlignment="Left" VerticalAlignment="Top"
+                   IsHitTestVisible="False"
+                   UseLayoutRounding="False"
+                   Canvas.ZIndex="9"
+                   Visibility="Collapsed" />
         <Canvas x:Name="TopRuler" Grid.Column="2"
                 Height="22" Margin="22,0,0,0"
                 HorizontalAlignment="Stretch" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 Canvas.ZIndex="10"
                 PointerPressed="TopRuler_PointerPressed"
+                PointerMoved="Ruler_PointerMoved"
                 PointerReleased="Ruler_PointerReleased"
                 PointerCaptureLost="Ruler_PointerCaptureLost"
                 RightTapped="Ruler_RightTapped"
@@ -117,6 +132,7 @@
                 Background="{ThemeResource LayerFillColorAltBrush}"
                 Canvas.ZIndex="10"
                 PointerPressed="LeftRuler_PointerPressed"
+                PointerMoved="Ruler_PointerMoved"
                 PointerReleased="Ruler_PointerReleased"
                 PointerCaptureLost="Ruler_PointerCaptureLost"
                 RightTapped="Ruler_RightTapped"

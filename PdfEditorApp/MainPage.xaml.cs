@@ -786,6 +786,7 @@ public sealed partial class MainPage : Page
         if (e.GetCurrentPoint(TopRuler).Properties.IsRightButtonPressed) { return; }
         _guideDrag = GuideDragSource.TopRuler;
         TopRuler.CapturePointer(e.Pointer);
+        ShowGuidePreview(e);
         e.Handled = true;
     }
 
@@ -794,7 +795,14 @@ public sealed partial class MainPage : Page
         if (e.GetCurrentPoint(LeftRuler).Properties.IsRightButtonPressed) { return; }
         _guideDrag = GuideDragSource.LeftRuler;
         LeftRuler.CapturePointer(e.Pointer);
+        ShowGuidePreview(e);
         e.Handled = true;
+    }
+
+    private void Ruler_PointerMoved(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (_guideDrag == GuideDragSource.None) { return; }
+        UpdateGuidePreview(e);
     }
 
     private void Ruler_PointerReleased(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
@@ -802,6 +810,7 @@ public sealed partial class MainPage : Page
         if (_guideDrag == GuideDragSource.None) { return; }
         var source = _guideDrag;
         _guideDrag = GuideDragSource.None;
+        HideGuidePreview();
         if (sender is UIElement el) { el.ReleasePointerCapture(e.Pointer); }
 
         var pInHost = e.GetCurrentPoint(ViewportHost).Position;
@@ -828,6 +837,58 @@ public sealed partial class MainPage : Page
     private void Ruler_PointerCaptureLost(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
         _guideDrag = GuideDragSource.None;
+        HideGuidePreview();
+    }
+
+    /// <summary>Show the preview line for the FROM-ruler drag currently in
+    /// progress. Called once on press so the line appears at the moment the
+    /// gesture starts, not on the first move.</summary>
+    private void ShowGuidePreview(Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        if (_guideDrag == GuideDragSource.None) { return; }
+        // Full-viewport line, thin in the axis perpendicular to the ruler.
+        // Positioned via Margin below; size stays fixed for the duration.
+        if (_guideDrag == GuideDragSource.TopRuler)
+        {
+            GuidePreviewLine.Width = double.NaN;   // stretch to Grid column width
+            GuidePreviewLine.Height = 0.5;
+            GuidePreviewLine.HorizontalAlignment = HorizontalAlignment.Stretch;
+            GuidePreviewLine.VerticalAlignment = VerticalAlignment.Top;
+        }
+        else
+        {
+            GuidePreviewLine.Width = 0.5;
+            GuidePreviewLine.Height = double.NaN;
+            GuidePreviewLine.HorizontalAlignment = HorizontalAlignment.Left;
+            GuidePreviewLine.VerticalAlignment = VerticalAlignment.Stretch;
+        }
+        GuidePreviewLine.Visibility = Visibility.Visible;
+        UpdateGuidePreview(e);
+    }
+
+    private void UpdateGuidePreview(Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
+    {
+        // Position the preview at the pointer, in the coordinate space of
+        // Grid.Column=2 (where the Rectangle lives). Grid col 2 starts at the
+        // same X as the left ruler. Translating pointer via TransformToVisual
+        // on the RulerCorner (which lives at Grid col 2's top-left) gives us
+        // that space; then just set Margin.
+        var pInCorner = e.GetCurrentPoint(RulerCorner).Position;
+        if (_guideDrag == GuideDragSource.TopRuler)
+        {
+            // Horizontal line: pin Y = pointer Y, X unchanged.
+            GuidePreviewLine.Margin = new Thickness(0, pInCorner.Y, 0, 0);
+        }
+        else
+        {
+            // Vertical line: pin X = pointer X, Y unchanged.
+            GuidePreviewLine.Margin = new Thickness(pInCorner.X, 0, 0, 0);
+        }
+    }
+
+    private void HideGuidePreview()
+    {
+        GuidePreviewLine.Visibility = Visibility.Collapsed;
     }
 
     private void ClearGuidesPage_Click(object sender, RoutedEventArgs e)
