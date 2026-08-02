@@ -341,6 +341,7 @@
                                                 <DataTemplate x:DataType="viewmodels:GuideMark">
                                                     <Rectangle Fill="#FF00A0D8" Opacity="0.85"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top"
+                                                               UseLayoutRounding="False"
                                                                Width="{x:Bind PixelWidth, Mode=OneWay}"
                                                                Height="{x:Bind PixelHeight, Mode=OneWay}"
                                                                Margin="{x:Bind local:MainPage.Offset(PixelLeft, PixelTop), Mode=OneWay}" />

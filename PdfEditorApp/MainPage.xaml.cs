@@ -770,15 +770,21 @@ public sealed partial class MainPage : Page
     // Down on a ruler starts a "creating guide" gesture; capture the pointer
     // so subsequent Moves/Releases land here even after the pointer leaves
     // the ruler and crosses into the page. On release, find which page (if
-    // any) is under the pointer and add a guide there at the pointer's cross-
-    // axis position in normalized (0-1) page coords.
-    private enum DraggingGuide { None, Vertical, Horizontal }
-    private DraggingGuide _guideDrag = DraggingGuide.None;
+    // any) is under the pointer and add a guide there.
+    //
+    // Convention: dragging FROM the TOP ruler creates a HORIZONTAL guide
+    // (horizontal line at the Y where you released), and FROM the LEFT ruler
+    // creates a VERTICAL one. That is what PageMaker and Acrobat do - the
+    // ruler you pull from measures the axis perpendicular to the guide, so
+    // the number you're picking on the top ruler is X, and the LINE you drop
+    // is a horizontal one at whatever Y you land on.
+    private enum GuideDragSource { None, TopRuler, LeftRuler }
+    private GuideDragSource _guideDrag = GuideDragSource.None;
 
     private void TopRuler_PointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
         if (e.GetCurrentPoint(TopRuler).Properties.IsRightButtonPressed) { return; }
-        _guideDrag = DraggingGuide.Vertical;
+        _guideDrag = GuideDragSource.TopRuler;
         TopRuler.CapturePointer(e.Pointer);
         e.Handled = true;
     }
@@ -786,21 +792,18 @@ public sealed partial class MainPage : Page
     private void LeftRuler_PointerPressed(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
         if (e.GetCurrentPoint(LeftRuler).Properties.IsRightButtonPressed) { return; }
-        _guideDrag = DraggingGuide.Horizontal;
+        _guideDrag = GuideDragSource.LeftRuler;
         LeftRuler.CapturePointer(e.Pointer);
         e.Handled = true;
     }
 
     private void Ruler_PointerReleased(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
-        if (_guideDrag == DraggingGuide.None) { return; }
-        var kind = _guideDrag;
-        _guideDrag = DraggingGuide.None;
+        if (_guideDrag == GuideDragSource.None) { return; }
+        var source = _guideDrag;
+        _guideDrag = GuideDragSource.None;
         if (sender is UIElement el) { el.ReleasePointerCapture(e.Pointer); }
 
-        // Translate the release position into ViewportHost content space, then
-        // page-slot coords, and only add a guide when the pointer landed inside
-        // a page. A release on the corner or off any page just cancels.
         var pInHost = e.GetCurrentPoint(ViewportHost).Position;
         double slotX = pInHost.X - ViewportHost.Padding.Left;
         double slotY = pInHost.Y - ViewportHost.Padding.Top;
@@ -816,14 +819,15 @@ public sealed partial class MainPage : Page
         double normX = slot.SlotWidth  > 0 ? Math.Clamp(slotX / slot.SlotWidth,  0, 1) : 0.5;
         double normY = slot.SlotHeight > 0 ? Math.Clamp(slotLocalY / slot.SlotHeight, 0, 1) : 0.5;
 
-        if (kind == DraggingGuide.Vertical) { ViewModel.AddGuide(pageIndex, horizontal: false, normX); }
-        else                                { ViewModel.AddGuide(pageIndex, horizontal: true,  normY); }
+        // Top ruler => horizontal guide at Y; left ruler => vertical guide at X.
+        if (source == GuideDragSource.TopRuler) { ViewModel.AddGuide(pageIndex, horizontal: true,  normY); }
+        else                                    { ViewModel.AddGuide(pageIndex, horizontal: false, normX); }
         e.Handled = true;
     }
 
     private void Ruler_PointerCaptureLost(object sender, Microsoft.UI.Xaml.Input.PointerRoutedEventArgs e)
     {
-        _guideDrag = DraggingGuide.None;
+        _guideDrag = GuideDragSource.None;
     }
 
     private void ClearGuidesPage_Click(object sender, RoutedEventArgs e)

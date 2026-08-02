@@ -339,22 +339,25 @@ public partial class GuideMark : ObservableObject
     }
 
     /// <summary>Recompute the pixel rect for the current slot dimensions.
-    /// Horizontal guide = 1 DIP tall spanning full width at Y = pos * height.
-    /// Vertical guide  = 1 DIP wide spanning full height at X = pos * width.</summary>
+    /// 0.5 DIP thick with UseLayoutRounding=False on the Rectangle so it
+    /// renders as a hairline (a single physical pixel at 100% DPI), matching
+    /// what Acrobat's guides look like - anything thicker starts to compete
+    /// with the page content.</summary>
     public void Reproject(double slotWidth, double slotHeight)
     {
+        const double Thickness = 0.5;
         if (Horizontal)
         {
             PixelLeft = 0;
             PixelTop = NormalizedPos * slotHeight;
             PixelWidth = slotWidth;
-            PixelHeight = 1;
+            PixelHeight = Thickness;
         }
         else
         {
             PixelLeft = NormalizedPos * slotWidth;
             PixelTop = 0;
-            PixelWidth = 1;
+            PixelWidth = Thickness;
             PixelHeight = slotHeight;
         }
     }
