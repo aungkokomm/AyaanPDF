@@ -321,7 +321,10 @@ public partial class PageSlot : ObservableObject
 public partial class GuideMark : ObservableObject
 {
     public bool Horizontal { get; }
-    public double NormalizedPos { get; }
+    /// <summary>Position along the perpendicular axis in normalized (0-1) page
+    /// coordinates. Settable so a drag can move the guide; use MoveTo to keep
+    /// the pixel-space cache in step.</summary>
+    public double NormalizedPos { get; private set; }
     [ObservableProperty]
     public partial double PixelLeft { get; set; }
     [ObservableProperty]
@@ -339,6 +342,15 @@ public partial class GuideMark : ObservableObject
     public GuideMark(bool horizontal, double normalizedPos, double slotWidth, double slotHeight)
     {
         Horizontal = horizontal;
+        NormalizedPos = normalizedPos;
+        Reproject(slotWidth, slotHeight);
+    }
+
+    /// <summary>Repositions the guide to a new normalized position and
+    /// re-derives the pixel-space rect for the current slot dimensions. Used
+    /// by the drag-to-move path.</summary>
+    public void MoveTo(double normalizedPos, double slotWidth, double slotHeight)
+    {
         NormalizedPos = normalizedPos;
         Reproject(slotWidth, slotHeight);
     }

@@ -1564,6 +1564,49 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public bool HasSelectedGuide => _selectedGuide is not null;
 
+    /// <summary>True while a click-and-hold on a selected guide is being
+    /// dragged. Set by <see cref="BeginGuideDrag"/>; cleared by the release
+    /// path. The MainPage pointer-move handler routes to <see cref="DragGuideTo"/>
+    /// while this is set instead of falling through to the tool path.</summary>
+    public bool IsDraggingGuide { get; private set; }
+
+    public void BeginGuideDrag()
+    {
+        if (_selectedGuide is not null) { IsDraggingGuide = true; }
+    }
+
+    /// <summary>Moves the guide currently under drag to the pointer's page-local
+    /// normalized position. Horizontal guide takes ny; vertical takes nx.
+    /// Clamps to [0, 1] so a guide can't slip past a page edge.</summary>
+    public void DragGuideTo(int pageIndex, double nx, double ny)
+    {
+        if (!IsDraggingGuide || _selectedGuide is not (int selPage, GuideMark g)) { return; }
+        // A guide that follows the pointer onto a DIFFERENT page moves to the
+        // NEW page. Rare in practice but keeps the interaction consistent with
+        // shape-drag which also crosses pages.
+        var slot = PageSlots.FirstOrDefault(s => s.PageIndex == pageIndex);
+        if (slot is null) { return; }
+        double pos = g.Horizontal ? Math.Clamp(ny, 0, 1) : Math.Clamp(nx, 0, 1);
+        g.MoveTo(pos, slot.SlotWidth, slot.SlotHeight);
+        if (pageIndex != selPage)
+        {
+            var oldSlot = PageSlots.FirstOrDefault(s => s.PageIndex == selPage);
+            oldSlot?.Guides.Remove(g);
+            slot.Guides.Add(g);
+            _selectedGuide = (pageIndex, g);
+        }
+    }
+
+    /// <summary>Releases the drag. If <paramref name="offPage"/>, the guide is
+    /// deleted (drag-off-to-delete convention). Otherwise it stays wherever
+    /// the last DragGuideTo call put it.</summary>
+    public void EndGuideDrag(bool offPage)
+    {
+        if (!IsDraggingGuide) { return; }
+        IsDraggingGuide = false;
+        if (offPage) { DeleteSelectedGuide(); }
+    }
+
     /// <summary>Deletes the currently-selected guide, if any. Bound to the
     /// Delete/Backspace key path from MainPage, same as annotation delete.</summary>
     public bool DeleteSelectedGuide()

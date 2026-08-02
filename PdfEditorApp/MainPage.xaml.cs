@@ -3396,12 +3396,15 @@ public sealed partial class MainPage : Page
         // Guide hit-test comes FIRST, regardless of tool, because a guide
         // sits ON TOP of whatever else is there and Illustrator/PageMaker
         // both let you grab a guide with any tool active. A hit selects the
-        // guide (highlighted red) and captures the pointer; a miss falls
-        // through so the click reaches the normal tool path. Any other press
-        // clears the guide selection so the highlight doesn't linger.
+        // guide (highlighted red), captures the pointer, and starts a
+        // drag-move; a miss falls through so the click reaches the normal
+        // tool path. Any other press clears the guide selection so the
+        // highlight doesn't linger.
         if (ViewModel.PickGuideAt(content.Page, nx, ny) is { } guideHit)
         {
             ViewModel.SelectGuide(content.Page, guideHit);
+            ViewModel.BeginGuideDrag();
+            _dragPointerId = current.PointerId;
             ViewportHost.CapturePointer(e.Pointer);
             e.Handled = true;
             return;
@@ -3554,6 +3557,20 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
+        // Guide drag: whatever tool is armed, if a guide is being moved,
+        // update its position from the pointer's page-local coords. The
+        // capture keeps events flowing here even after the pointer leaves
+        // the page onto a ruler (that's what makes drag-off-to-delete work
+        // at release).
+        if (ViewModel.IsDraggingGuide)
+        {
+            double gnx = content.X / ViewModel.OverlayScale;
+            double gny = content.Y / ViewModel.OverlayScale;
+            ViewModel.DragGuideTo(content.Page, gnx, gny);
+            e.Handled = true;
+            return;
+        }
+
         if (_isPanning)
         {
             var now = e.GetCurrentPoint(PageScroller).Position;
@@ -3619,6 +3636,22 @@ public sealed partial class MainPage : Page
     {
         if (e.Pointer.PointerId != _dragPointerId)
         {
+            return;
+        }
+
+        // Guide drag release: if the pointer landed OFF the page (on the
+        // ruler bar area, above/beside the page), delete the guide - that's
+        // the drag-off-to-delete convention every editor with guides uses.
+        // Otherwise the position from the last DragGuideTo is kept.
+        if (ViewModel.IsDraggingGuide)
+        {
+            var pInHost = e.GetCurrentPoint(ViewportHost).Position;
+            double slotX = pInHost.X - ViewportHost.Padding.Left;
+            double slotY = pInHost.Y - ViewportHost.Padding.Top;
+            bool offPage = slotX < 0 || slotY < 0 || ViewModel.PageAt(slotY) < 0;
+            ViewModel.EndGuideDrag(offPage);
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
             return;
         }
 
