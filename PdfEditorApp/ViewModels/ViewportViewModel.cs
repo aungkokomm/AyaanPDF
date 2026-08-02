@@ -2356,6 +2356,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// FFI cost. Cleared alongside the other selection flags.</summary>
     private bool _selectedIsShape;
 
+    /// <summary>Slot-space (DIP) inset from _selectedLoaded's /Rect back to
+    /// the shape's outer stroke edge. The writer adds width/2 + 1 on every
+    /// side to keep PDFium from clipping the stroke; the frame and grips
+    /// draw INSIDE the /Rect by this amount so they hug the visible shape.
+    /// Zero for non-shape selections.</summary>
+    private double _selectedShapePadDips;
+
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
     {
@@ -2601,12 +2608,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_selectedLoaded is LoadedSelection sel)
         {
             var slot = SlotFor(sel.PageIndex);
+            // Inset the DRAW rect by the shape's stroke pad so the frame
+            // hugs the shape's outer stroke edge rather than the padded /Rect.
+            // Zero pad for non-shapes; unchanged behaviour there.
+            double p = _selectedIsShape ? _selectedShapePadDips : 0;
+            double fl = sel.Left  * SlotLayoutWidth + p;
+            double ft = sel.Top   * SlotLayoutWidth + p;
+            double fr = sel.Right * SlotLayoutWidth - p;
+            double fb = sel.Bottom* SlotLayoutWidth - p;
             slot?.SelectionOutline.Add(new ScaledRect(
-                sel.Left * SlotLayoutWidth,
-                sel.Top * SlotLayoutWidth,
-                (sel.Right - sel.Left) * SlotLayoutWidth,
-                (sel.Bottom - sel.Top) * SlotLayoutWidth,
-                string.Empty));
+                fl, ft, fr - fl, fb - ft, string.Empty));
 
             // The frame and handles are laid out UPRIGHT (from the tight box) and
             // then turned as one about the box centre, so a rotated text box is
@@ -2625,9 +2636,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 // Edge (one-axis) handles only for a free resize; an aspect-locked
                 // picture keeps just its four corners. A text box also gets the
-                // rotate handle above its top edge.
+                // rotate handle above its top edge. Grips inset by the same
+                // shape-pad amount so they sit ON the frame, not outside it.
                 AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0,
-                         rotate: _selectedIsTextBox || _selectedIsShape);
+                         rotate: _selectedIsTextBox || _selectedIsShape,
+                         insetDips: p);
             }
 
             // Draw a marquee (no handles) for each extra-selected object, on its
@@ -2862,6 +2875,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void ApplyTextBoxSelectionInfo(int pageIndex, int index)
     {
         _selectedRotationDeg = 0;
+        _selectedShapePadDips = 0;
         // Whether the selection is a shape is decided by whether its /Contents
         // parses as our shape tag; the shape check comes first because it is a
         // cheap prefix test and rules out most other marks.
@@ -2890,14 +2904,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // pick a shape drawn a week ago). Null clears the picker to No Fill.
             ShapeFillHex = ParseShapeFill(contents!);
 
-            // NOTE: we deliberately do NOT shrink _selectedLoaded from the
-            // padded /Rect back to the tight extent here. Tried it in v1.95.1
-            // to make the frame hug the shape, but the whole selection+drag+
-            // commit pipeline is threaded on _selectedLoaded matching what
-            // get_annotations returns; shrinking it broke the drag hit-zone
-            // and drag start entirely. The small cosmetic gap on right/bottom
-            // is preferable to a shape that won't move. Proper fix would
-            // decouple "visual frame" from "storage bounds", larger refactor.
+            // Compute the pad the writer added around the stroke (width/2 + 1
+            // on every side, so PDFium doesn't clip). Stored in slot DIPs so
+            // RefreshSelectionOutline / AddGrips can INSET the drawn frame and
+            // grips by it - keeping _selectedLoaded on the /Rect (which the
+            // drag + commit pipeline is threaded on) while the VISUAL frame
+            // hugs the shape's outer stroke edge. This is what makes the
+            // right/bottom gap disappear without breaking drag (v1.95.1's
+            // mistake was shrinking the storage bounds).
+            double widthPts = ParseShapeStrokeWidthPts(contents!);
+            var (pageWpt, _) = PagePointsFor(pageIndex);
+            _selectedShapePadDips = (widthPts > 0 && pageWpt > 0)
+                ? (widthPts / 2.0 + 1.0) * SlotLayoutWidth / pageWpt
+                : 0;
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
@@ -4453,12 +4472,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges, bool rotate)
+    private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges, bool rotate, double insetDips = 0)
     {
-        double l = sel.Left * SlotLayoutWidth;
-        double t = sel.Top * SlotLayoutWidth;
-        double r = sel.Right * SlotLayoutWidth;
-        double b = sel.Bottom * SlotLayoutWidth;
+        // Inset from the /Rect corners by the caller's amount, so the grips
+        // sit on the visible outer stroke edge (matches the frame draw above)
+        // rather than floating outside the shape.
+        double l = sel.Left  * SlotLayoutWidth + insetDips;
+        double t = sel.Top   * SlotLayoutWidth + insetDips;
+        double r = sel.Right * SlotLayoutWidth - insetDips;
+        double b = sel.Bottom* SlotLayoutWidth - insetDips;
         double mx = (l + r) / 2;
         double my = (t + b) / 2;
 
