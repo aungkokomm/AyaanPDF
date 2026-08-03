@@ -561,6 +561,14 @@ public sealed partial class MainPage : Page
     private enum RulerUnit { Points, Picas, Millimeters, Centimeters, Inches }
     private RulerUnit _rulerUnit = RulerUnit.Inches;
 
+    // Group/Ungroup - three separate routes so at least ONE fires no matter
+    // where focus is: MenuFlyoutItem Click (opens menu, clicks item), the
+    // MenuFlyoutItem's KeyboardAccelerator (fires Ctrl+G directly - proven
+    // to work from the Rulers/Ctrl+R precedent), and the RootGrid
+    // KeyboardAccelerator below as a third belt.
+    private void Group_Click(object sender, RoutedEventArgs e) => ViewModel.GroupSelected();
+    private void Ungroup_Click(object sender, RoutedEventArgs e) => ViewModel.UngroupSelected();
+
     private void GroupShortcut_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
     {
         ViewModel.GroupSelected();

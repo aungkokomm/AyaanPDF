@@ -757,6 +757,17 @@
                             </MenuFlyoutSubItem>
                             <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
                             <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Group" Click="Group_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="G" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Ungroup" Click="Ungroup_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="G" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
                             <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
                             <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
