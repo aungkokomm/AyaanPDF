@@ -3653,16 +3653,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // (2) Then process the extras in DESCENDING original-index order per
         //     page so each of their delete+re-adds does not disturb the ones
         //     yet to come.
-        if (!resizing && !rotating && _extraDragOrigin.Count > 0)
+        if (!resizing && !rotating && _extraSelected.Count > 0)
         {
             int anchorOldIndex = now.Index;
             int anchorPage = now.PageIndex;
 
             // Adjust extras for the anchor's shift, then sort the (index-in-list,
             // adjusted-annotation-index) pairs by descending annotation index so
-            // deletes never orphan a later write.
+            // deletes never orphan a later write. Gate is on _extraSelected -
+            // NOT on _extraDragOrigin, which can be legitimately empty for a
+            // group-expanded selection where the drag started via a code path
+            // that didn't snapshot origins. _extraSelected already carries the
+            // target bounds from DragLoadedTo's move-all update, so we don't
+            // need the origins to compute where to write them.
             var order = new List<(int Slot, LoadedSelection Adjusted)>(_extraSelected.Count);
-            for (int i = 0; i < _extraSelected.Count && i < _extraDragOrigin.Count; i++)
+            for (int i = 0; i < _extraSelected.Count; i++)
             {
                 var e = _extraSelected[i];
                 if (e.PageIndex == anchorPage && e.Index > anchorOldIndex)
@@ -4733,6 +4738,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             return false;
         }
+
+        Diag.Log($"DeleteSelectedLoaded: anchor=p{sel.PageIndex}#{sel.Index}, extras={_extraSelected.Count}");
 
         // Drop the deleted marks from any groups they were in. A group whose
         // members are all deleted goes away entirely; a partially-deleted
