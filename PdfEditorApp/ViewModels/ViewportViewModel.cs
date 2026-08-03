@@ -3306,19 +3306,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Left = moved.Left, Top = moved.Top, Right = moved.Right, Bottom = moved.Bottom,
         };
 
-        // Move-all: on a body drag with extras selected, apply the anchor's total
-        // delta to each extra's ORIGINAL position captured at drag start. Resize
-        // and rotate stay anchor-only for now (multi-resize/rotate is a bigger
-        // interaction question).
-        if (_loadedGrip == LoadedAnnotationPicker.Grip.None && _extraSelected.Count > 0
-            && _extraDragOrigin.Count == 0)
+        // Move-all: on a body drag with extras selected, apply the anchor's
+        // total delta to each extra's ORIGINAL position. Auto-snapshot the
+        // origins if the cached list doesn't match the current extras count
+        // - covers group expansion, shift-click, or any other path that
+        // might set up extras without capturing their origins.
+        if (_loadedGrip == LoadedAnnotationPicker.Grip.None && _extraSelected.Count > 0)
         {
-            // Recovery: extras are visibly selected but the drag-origin snapshot
-            // is empty (happens if a code path pushed extras without capturing).
-            // Snapshot NOW so the move-all logic below still runs and the group
-            // moves with the anchor instead of getting stranded.
-            _extraDragOrigin.AddRange(_extraSelected);
-            Diag.Log($"DragLoadedTo: emergency snapshot of {_extraDragOrigin.Count} extras");
+            if (_extraDragOrigin.Count != _extraSelected.Count)
+            {
+                _extraDragOrigin.Clear();
+                _extraDragOrigin.AddRange(_extraSelected);
+                Diag.Log($"DragLoadedTo: auto-snapshotted {_extraDragOrigin.Count} extras");
+            }
         }
         if (_loadedGrip == LoadedAnnotationPicker.Grip.None && _extraDragOrigin.Count > 0)
         {
