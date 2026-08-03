@@ -27,6 +27,16 @@
         region of the window.
     -->
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp">
+        <!-- Editor shortcuts as XAML KeyboardAccelerators. They route through
+             the WinUI accelerator system, which fires regardless of which
+             visual has focus within this Grid - the custom KeyDown switch
+             above was getting occasionally skipped for reasons I couldn't
+             fully pin down (Ctrl+G was silently failing on real machines even
+             though the switch case was correct). Belt-and-suspenders. -->
+        <Grid.KeyboardAccelerators>
+            <KeyboardAccelerator Modifiers="Control" Key="G" Invoked="GroupShortcut_Invoked" />
+            <KeyboardAccelerator Modifiers="Control,Shift" Key="G" Invoked="UngroupShortcut_Invoked" />
+        </Grid.KeyboardAccelerators>
         <!--
             The canvas surface. A fixed neutral grey rather than a theme
             brush: theme surface colours are near-white in light mode, so a

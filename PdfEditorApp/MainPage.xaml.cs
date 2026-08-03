@@ -561,6 +561,18 @@ public sealed partial class MainPage : Page
     private enum RulerUnit { Points, Picas, Millimeters, Centimeters, Inches }
     private RulerUnit _rulerUnit = RulerUnit.Inches;
 
+    private void GroupShortcut_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    {
+        ViewModel.GroupSelected();
+        args.Handled = true;
+    }
+
+    private void UngroupShortcut_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    {
+        ViewModel.UngroupSelected();
+        args.Handled = true;
+    }
+
     private void RulersToggle_Click(object sender, RoutedEventArgs e)
     {
         SetRulersVisible(RulersToggle.IsChecked);
@@ -3266,14 +3278,11 @@ public sealed partial class MainPage : Page
             case (VirtualKey)0xDD when _isCtrlDown && IsShiftDown():
                 if (ViewModel.BringSelectedToFront()) { e.Handled = true; }
                 break;
-            // Ctrl+G / Ctrl+Shift+G = group / ungroup the current selection.
-            // Illustrator / PowerPoint / Word all use these keys.
-            case VirtualKey.G when _isCtrlDown && !IsShiftDown():
-                if (ViewModel.GroupSelected()) { e.Handled = true; }
-                break;
-            case VirtualKey.G when _isCtrlDown && IsShiftDown():
-                if (ViewModel.UngroupSelected()) { e.Handled = true; }
-                break;
+            // Ctrl+G / Ctrl+Shift+G moved to a Grid.KeyboardAccelerator in
+            // MainPage.xaml because this switch was intermittently NOT
+            // matching on real machines (the case was correct, so probably a
+            // focus/routing quirk somewhere - accelerators fire regardless).
+            // See GroupShortcut_Invoked / UngroupShortcut_Invoked below.
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
                 SearchBox.SelectAll();
