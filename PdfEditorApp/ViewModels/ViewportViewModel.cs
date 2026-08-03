@@ -3231,6 +3231,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             return;
         }
+        // Diagnostic: prove counts + first-extra state at each drag frame.
+        // Only log on the first move of a gesture to keep the log tractable.
+        if (_extraSelected.Count > 0 && _extraDragOrigin.Count == 0)
+        {
+            var e0 = _extraSelected[0];
+            Diag.Log($"DragLoadedTo start: extras.Count={_extraSelected.Count} origins.Count=0 extra[0]=p{e0.PageIndex}#{e0.Index} at ({e0.Left:F3},{e0.Top:F3}) anchor=p{start.PageIndex}#{start.Index} at ({start.Left:F3},{start.Top:F3})");
+        }
 
         var box = new AnnotationBox(start.Index, start.Left, start.Top, start.Right, start.Bottom);
 
@@ -3772,6 +3779,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     }
                 }
             }
+
+            // Remap groups: after the delete+re-add churn from move-all,
+            // every member's index moved. Without this, groups' stored
+            // (page, index) tuples would go stale and the next click on a
+            // group member wouldn't find its group - so the extras would
+            // silently collapse to just the clicked shape on the second
+            // move, or come out stacked at wrong positions.
+            var oldToNew = new Dictionary<(int Page, int OldIndex), int>();
+            if (_selectedLoaded is LoadedSelection anchorNow)
+            {
+                oldToNew[(anchorNow.PageIndex, now.Index)] = anchorNow.Index;
+            }
+            for (int i = 0; i < _extraSelected.Count && i < _extraDragOrigin.Count; i++)
+            {
+                var extNow = _extraSelected[i];
+                var extOld = _extraDragOrigin[i];
+                oldToNew[(extOld.PageIndex, extOld.Index)] = extNow.Index;
+            }
+            RemapGroupIndices(oldToNew);
         }
 
         RefreshSelectionOutline();
