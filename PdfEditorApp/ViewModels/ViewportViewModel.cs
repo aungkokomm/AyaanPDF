@@ -2787,8 +2787,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // click; index shifts inside the drag can't confuse the anchor because
         // it's cached above.
         bool shift = IsShiftDown();
+        Diag.Log($"SelectLoadedAt hit p{pageIndex}#{hit.Index} shift={shift} groupsCount={_groups.Count} inGroup={(GroupContaining(pageIndex, hit.Index) is not null)}");
         if (!shift && GroupContaining(pageIndex, hit.Index) is { } group && group.Count > 1)
         {
+            Diag.Log($"  expanding group of {group.Count}: [{string.Join(",", group.Select(m => $"p{m.Page}#{m.Index}"))}]");
             _extraSelected.Clear();
             _selectedLoaded = new LoadedSelection(
                 pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
@@ -3308,6 +3310,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // delta to each extra's ORIGINAL position captured at drag start. Resize
         // and rotate stay anchor-only for now (multi-resize/rotate is a bigger
         // interaction question).
+        if (_loadedGrip == LoadedAnnotationPicker.Grip.None && _extraSelected.Count > 0
+            && _extraDragOrigin.Count == 0)
+        {
+            // Recovery: extras are visibly selected but the drag-origin snapshot
+            // is empty (happens if a code path pushed extras without capturing).
+            // Snapshot NOW so the move-all logic below still runs and the group
+            // moves with the anchor instead of getting stranded.
+            _extraDragOrigin.AddRange(_extraSelected);
+            Diag.Log($"DragLoadedTo: emergency snapshot of {_extraDragOrigin.Count} extras");
+        }
         if (_loadedGrip == LoadedAnnotationPicker.Grip.None && _extraDragOrigin.Count > 0)
         {
             double dx = moved.Left - box.Left;
@@ -4207,6 +4219,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// or if all the selected marks are already in the same group.</summary>
     public bool GroupSelected()
     {
+        Diag.Log($"GroupSelected: anchor={(_selectedLoaded.HasValue ? $"p{_selectedLoaded.Value.PageIndex}#{_selectedLoaded.Value.Index}" : "null")} extras={_extraSelected.Count}");
         if (_selectedLoaded is not LoadedSelection anchor)
         {
             Status = "Nothing selected to group.";
@@ -4227,6 +4240,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _groups.RemoveAll(g => g.Contains(r));
         }
         _groups.Add(refs.Distinct().ToList());
+        Diag.Log($"GroupSelected done: groups={_groups.Count}, members=[{string.Join(",", refs.Select(r => $"p{r.Item1}#{r.Item2}"))}]");
         Status = $"Grouped {refs.Count} marks.";
         return true;
     }
