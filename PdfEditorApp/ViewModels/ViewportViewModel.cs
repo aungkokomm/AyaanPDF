@@ -4207,10 +4207,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// or if all the selected marks are already in the same group.</summary>
     public bool GroupSelected()
     {
-        if (_selectedLoaded is not LoadedSelection anchor) { return false; }
+        if (_selectedLoaded is not LoadedSelection anchor)
+        {
+            Status = "Nothing selected to group.";
+            return false;
+        }
         var refs = new List<(int, int)> { (anchor.PageIndex, anchor.Index) };
         foreach (var e in _extraSelected) { refs.Add((e.PageIndex, e.Index)); }
-        if (refs.Count < 2) { return false; }
+        if (refs.Count < 2)
+        {
+            Status = "Select two or more marks (shift-click) before grouping.";
+            return false;
+        }
 
         // Remove any existing groups those marks are in - a mark can only be
         // in ONE group at a time (flat, non-nested). Then add the new one.
@@ -4219,6 +4227,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _groups.RemoveAll(g => g.Contains(r));
         }
         _groups.Add(refs.Distinct().ToList());
+        Status = $"Grouped {refs.Count} marks.";
         return true;
     }
 
@@ -4226,9 +4235,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// false if the anchor isn't in a group.</summary>
     public bool UngroupSelected()
     {
-        if (_selectedLoaded is not LoadedSelection anchor) { return false; }
+        if (_selectedLoaded is not LoadedSelection anchor)
+        {
+            Status = "Nothing selected to ungroup.";
+            return false;
+        }
         var key = (anchor.PageIndex, anchor.Index);
         int removed = _groups.RemoveAll(g => g.Contains(key));
+        Status = removed > 0 ? "Ungrouped." : "That mark isn't in a group.";
         return removed > 0;
     }
 
