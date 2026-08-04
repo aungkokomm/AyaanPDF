@@ -2042,6 +2042,7 @@ fn textbox_tag_styled(
 #[allow(dead_code)] // mirrors the C# TextBoxTagReader; used in tests
 fn parse_textbox_tag(contents: &str) -> Option<(f32, u8, u8, u8, u8, String)> {
     let byte = |rgba: &str, i: usize| u8::from_str_radix(&rgba[i..i + 2], 16).ok();
+    let contents = strip_id_prefix(contents).1;
 
     if let Some(rest) = contents.strip_prefix(TEXTBOX_TAG_STYLED) {
         // size:textRGBA:align:fillRGBA:outlineRGBA:outlineW:[flags:base64(font):]base64(text)
@@ -2110,6 +2111,7 @@ fn parse_textbox_tag_full(contents: &str) -> Option<ParsedTextBox> {
         }
         Some((byte(s, 0)?, byte(s, 2)?, byte(s, 4)?, byte(s, 6)?))
     };
+    let contents = strip_id_prefix(contents).1;
 
     if let Some(rest) = contents.strip_prefix(TEXTBOX_TAG_STYLED) {
         let parts: Vec<&str> = rest.split(':').collect();
@@ -2329,6 +2331,43 @@ fn wrap_to_width<'a>(
 /// the box round-trips as an editable object because the words are stored in
 /// its `/Contents` tag.
 ///
+/// A machine-readable identity that survives edits.
+///
+/// PDFium cannot edit annotations in place. Every commit deletes and re-adds,
+/// which reshuffles the per-page annotation array. Any C# state that
+/// references annotations by index (groups, drag origin, selection extras)
+/// goes stale after any write. This prefix embeds a stable Guid at the start
+/// of the annotation's /Contents so the C# side can find "the same
+/// annotation" after such a churn. The rest of the /Contents string is the
+/// existing tag body (`AyaanShape:...`, `AyaanText:...`, etc.), unchanged.
+///
+/// Format: `ID:<32 lowercase hex chars>|<existing tag body>`
+///
+/// A `|` is used as the separator because every existing tag field uses `:`,
+/// so it cannot collide. Annotations without this prefix are legacy and get
+/// a fresh Guid assigned in C# on first load; the first save writes it back.
+const ID_PREFIX: &str = "ID:";
+const ID_SEPARATOR: char = '|';
+const ID_HEX_LEN: usize = 32;
+
+/// If `contents` starts with a well-formed ID prefix, returns
+/// `(Some(id_hex), body)`. Otherwise returns `(None, contents)` unchanged.
+/// Every tag parser calls this before matching its own prefix, so a tag with
+/// or without an ID parses identically once the ID is stripped.
+fn strip_id_prefix(contents: &str) -> (Option<&str>, &str) {
+    let Some(rest) = contents.strip_prefix(ID_PREFIX) else {
+        return (None, contents);
+    };
+    let Some(sep_pos) = rest.find(ID_SEPARATOR) else {
+        return (None, contents);
+    };
+    let id = &rest[..sep_pos];
+    if id.len() != ID_HEX_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (None, contents);
+    }
+    (Some(id), &rest[sep_pos + 1..])
+}
+
 /// Reads an annotation's `/Contents` string, as UTF-8 bytes.
 ///
 /// The one field this app stores machine data in: a shape's kind and a text
@@ -2366,6 +2405,101 @@ fn get_annotation_contents_inner(doc_handle: u64, page_index: i32, index: i32) -
     let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
     std::mem::forget(boxed);
     buffer
+}
+
+/// Returns the 32-char lowercase-hex Guid embedded in an annotation's
+/// /Contents, or an empty buffer if the annotation has no such prefix. See
+/// [`ID_PREFIX`] for why the prefix exists and its format.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_annotation_id(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_annotation_id_inner(doc_handle, page_index, index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let contents = annotation.contents().unwrap_or_default();
+    let id_owned: String = strip_id_prefix(&contents).0.map(str::to_owned).unwrap_or_default();
+    let mut boxed = id_owned.into_bytes().into_boxed_slice();
+    let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Stamps `id_hex` (32 lowercase hex chars) onto the annotation's /Contents
+/// as an ID prefix. Any existing ID prefix is replaced. The existing tag body
+/// is preserved unchanged.
+///
+/// C# calls this immediately after every add_*/resize_* to attach a stable
+/// identity that survives the next delete+re-add churn. Returns
+/// STATUS_OK_PDFIUM on success.
+///
+/// # Safety
+/// `id_utf8` must point to `id_len` valid bytes of ASCII hex.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn set_annotation_id(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    id_utf8: *const u8,
+    id_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || id_utf8.is_null() || id_len != ID_HEX_LEN {
+        return STATUS_INVALID_INPUT;
+    }
+    let id_bytes = unsafe { std::slice::from_raw_parts(id_utf8, id_len) };
+    let Ok(id_hex) = std::str::from_utf8(id_bytes) else {
+        return STATUS_INVALID_INPUT;
+    };
+    if !id_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return STATUS_INVALID_INPUT;
+    }
+    let id_owned = id_hex.to_ascii_lowercase();
+    panic::catch_unwind(|| set_annotation_id_inner(doc_handle, page_index, index, &id_owned))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn set_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32, id_hex: &str) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+    let annotations = page.annotations_mut();
+    let Some(mut annotation) = annotations.iter().nth(index as usize) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let existing = annotation.contents().unwrap_or_default();
+    let body = strip_id_prefix(&existing).1;
+    let new_contents = format!("{ID_PREFIX}{id_hex}{ID_SEPARATOR}{body}");
+    if annotation.set_contents(&new_contents).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+    STATUS_OK_PDFIUM
 }
 
 /// `capture_width` is the render width the box and font size were captured at.
@@ -2949,6 +3083,7 @@ fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
 /// is 0 and fill is 0 on older tags that predate those fields; the caller does
 /// not need to know which form the tag was in.
 fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32)> {
+    let contents = strip_id_prefix(contents).1;
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
 
@@ -3911,7 +4046,8 @@ fn tag_box_rect(index: usize, doc_handle: u64, page_index: i32) -> Option<(f32, 
     let page = doc_guard.pages().get(page_index as u16).ok()?;
     let annotation = page.annotations().iter().nth(index)?;
     let contents = annotation.contents()?;
-    let parts: Vec<&str> = contents.strip_prefix(TEXTBOX_TAG_STYLED)?.split(':').collect();
+    let body = strip_id_prefix(&contents).1;
+    let parts: Vec<&str> = body.strip_prefix(TEXTBOX_TAG_STYLED)?.split(':').collect();
     if parts.len() < 14 {
         return None;
     }

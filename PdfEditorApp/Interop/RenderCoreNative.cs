@@ -383,6 +383,25 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_annotation_contents(ulong docHandle, int pageIndex, int index);
 
     /// <summary>
+    /// Returns the 32-char hex Guid embedded in the annotation's /Contents
+    /// ID prefix, or an empty buffer if no prefix is present. The C# side
+    /// stamps identity via <see cref="set_annotation_id"/> so that stable
+    /// references (groups, selection extras) can survive the delete+re-add
+    /// churn of every edit. Free the result with <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_annotation_id(ulong docHandle, int pageIndex, int index);
+
+    /// <summary>
+    /// Stamps a 32-char hex Guid onto the annotation's /Contents. Any existing
+    /// ID prefix is replaced; the tag body (AyaanShape:.., AyaanText:..) is
+    /// preserved. Call this immediately after every add_*_annotation and every
+    /// resize_*_annotation so the identity persists across the churn.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_annotation_id(ulong docHandle, int pageIndex, int index, [In] byte[] idHex, nuint idLen);
+
+    /// <summary>
     /// Rebuilds the document from a list of its own page indices: reorder,
     /// duplicate (repeat an index), delete (omit one) or extract (a subset).
     /// The handle is preserved. Pages keep their annotations.
