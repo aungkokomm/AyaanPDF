@@ -33,16 +33,18 @@
          drawing and stays there. The menu entries still show their shortcuts. -->
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
           KeyboardAcceleratorPlacementMode="Hidden">
-        <!-- Editor shortcuts as XAML KeyboardAccelerators. They route through
-             the WinUI accelerator system, which fires regardless of which
-             visual has focus within this Grid - the custom KeyDown switch
-             above was getting occasionally skipped for reasons I couldn't
-             fully pin down (Ctrl+G was silently failing on real machines even
-             though the switch case was correct). Belt-and-suspenders. -->
-        <Grid.KeyboardAccelerators>
-            <KeyboardAccelerator Modifiers="Control" Key="G" Invoked="GroupShortcut_Invoked" />
-            <KeyboardAccelerator Modifiers="Control,Shift" Key="G" Invoked="UngroupShortcut_Invoked" />
-        </Grid.KeyboardAccelerators>
+        <!-- Ctrl+G and Ctrl+Shift+G used to ALSO be declared here, as a second
+             belt after the custom KeyDown switch proved unreliable. When the
+             MenuFlyoutItem accelerators were added later as the proper fix,
+             this pair was never removed, so two elements in one visual tree
+             claimed the same chord. WinUI resolves that ambiguously and here
+             it resolved to NEITHER: the menu item grouped, the keystroke did
+             nothing, and no handler was entered at all.
+
+             Every accelerator that works in this window (Ctrl+O, Ctrl+S,
+             Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z, Ctrl+R) is declared exactly once, on
+             its MenuFlyoutItem. Group and Ungroup now match them. Keep it that
+             way: one chord, one registration. -->
         <!--
             The canvas surface. A fixed neutral grey rather than a theme
             brush: theme surface colours are near-white in light mode, so a
