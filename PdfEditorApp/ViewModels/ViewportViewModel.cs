@@ -3648,9 +3648,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
         }
 
-        if (status != RenderStatus.OkPdfium && resizing)
+        if (status != RenderStatus.OkPdfium && _selectedIsShape)
         {
-            // A shape redraws from its tag. Only meaningful for a resize.
+            // A shape is redrawn from its tag for a MOVE as well as a resize,
+            // which is what the extras loop below has always done. The anchor
+            // used to reach for this only when resizing and otherwise fell
+            // through to resize_annotation, which REFUSES a shape outright
+            // (proved by moving_a_shape_moves_the_drawing_not_just_the_rectangle:
+            // it answers UNSUPPORTED, while resize_shape_annotation moves the
+            // drawing correctly). Whether the fallthrough appeared to work
+            // depended on whether PDFium had built an appearance stream for
+            // the shape yet, which is why moving a group behaved differently
+            // from one attempt to the next. Anchor and extras now take the
+            // same path for the same operation.
             status = RenderCoreNative.resize_shape_annotation(
                 _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
         }

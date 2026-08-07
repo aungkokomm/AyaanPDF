@@ -10205,6 +10205,194 @@ mod tests {
         );
     }
 
+    /// Count distinct red blobs by scanning for red pixels and flood-filling.
+    /// Enough to answer "did all three shapes end up where they were sent".
+    fn red_blob_boxes(handle: u64, width: i32) -> Vec<(f32, f32, f32, f32)> {
+        let (bytes, w) = render_bytes(handle, 0, width);
+        let h = bytes.len() / (w * 4);
+        let is_red = |x: usize, y: usize| {
+            let px = (y * w + x) * 4;
+            bytes[px + 2] > 140 && bytes[px + 1] < 90 && bytes[px] < 90
+        };
+        let mut seen = vec![false; w * h];
+        let mut out = Vec::new();
+        for y0 in 0..h {
+            for x0 in 0..w {
+                if seen[y0 * w + x0] || !is_red(x0, y0) {
+                    continue;
+                }
+                let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (x0, y0, x0, y0);
+                let mut stack = vec![(x0, y0)];
+                seen[y0 * w + x0] = true;
+                while let Some((x, y)) = stack.pop() {
+                    lo_x = lo_x.min(x);
+                    lo_y = lo_y.min(y);
+                    hi_x = hi_x.max(x);
+                    hi_y = hi_y.max(y);
+                    for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                            continue;
+                        }
+                        let (nx, ny) = (nx as usize, ny as usize);
+                        if !seen[ny * w + nx] && is_red(nx, ny) {
+                            seen[ny * w + nx] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+                let wf = w as f32;
+                out.push((lo_x as f32 / wf, lo_y as f32 / wf, hi_x as f32 / wf, hi_y as f32 / wf));
+            }
+        }
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        out
+    }
+
+    #[test]
+    fn moving_three_shapes_as_a_group_moves_all_three_drawings() {
+        // The whole reported failure, end to end, in the core: three shapes
+        // drawn side by side, then every one of them moved down by the same
+        // delta, exactly as the group-move commit does. The field symptom was
+        // that the frames travelled and one or two of the SHAPES stayed
+        // behind, so this asserts on rendered ink, not on status codes.
+        //
+        // Shapes are moved back-to-front, since each write is a delete and a
+        // re-add and that keeps the not-yet-written ones at stable indices.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        let xs = [0.10f32, 0.40, 0.70];
+        for x in xs {
+            let spec = ShapeSpec {
+                page_index: 0,
+                kind: SHAPE_RECTANGLE,
+                x1: x * CAP as f32,
+                y1: 0.10 * CAP as f32,
+                x2: (x + 0.15) * CAP as f32,
+                y2: 0.25 * CAP as f32,
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+                width_px: 4.0,
+                rotation_deg: 0.0,
+                fill_rgba: 0,
+            };
+            assert_eq!(
+                add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+                STATUS_OK_PDFIUM
+            );
+        }
+        assert_eq!(red_blob_boxes(handle, 600).len(), 3, "three shapes should be on the page");
+
+        const DY: f32 = 0.45;
+        for i in (0..3).rev() {
+            let x = xs[i];
+            let mut new_index = -1;
+            assert_eq!(
+                resize_shape_annotation(
+                    handle, 0, i as i32, CAP,
+                    x * CAP as f32, (0.10 + DY) * CAP as f32,
+                    (x + 0.15) * CAP as f32, (0.25 + DY) * CAP as f32,
+                    &mut new_index as *mut i32,
+                ),
+                STATUS_OK_PDFIUM,
+                "moving shape {i} must succeed"
+            );
+        }
+
+        let after = red_blob_boxes(handle, 600);
+        close_document(handle);
+        println!("GROUP MOVE RESULT: {after:?}");
+
+        assert_eq!(after.len(), 3, "all three shapes must still be on the page");
+        let tol = 0.03;
+        for (i, blob) in after.iter().enumerate() {
+            assert!(
+                (blob.1 - (0.10 + DY)).abs() < tol,
+                "shape {i} should have moved to y {:.3} but its drawing is at y {:.3}",
+                0.10 + DY,
+                blob.1
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_shape_moves_the_drawing_not_just_the_rectangle() {
+        // The move path the app uses for a dragged annotation is
+        // resize_annotation, which tries set_annotation_bounds first. That
+        // sets the annotation's /Rect. If the shape's path objects live in
+        // page coordinates, the rect moves and the DRAWING stays put - and
+        // since the selection frame is positioned from the rect, the frame
+        // moves and the shape does not. That is the field symptom: a group
+        // where the frames travel and the shapes are left behind.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 0.10 * CAP as f32,
+            y1: 0.10 * CAP as f32,
+            x2: 0.30 * CAP as f32,
+            y2: 0.30 * CAP as f32,
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+        let before = red_bbox_norm(handle, 600).expect("shape should be on the page");
+
+        // resize_annotation is what the anchor's move path falls through to,
+        // and it CANNOT move a shape: it reports UNSUPPORTED. A shape has to
+        // be redrawn from its tag, which is what resize_shape_annotation
+        // does. The app only reached for that on a RESIZE, so a shape being
+        // MOVED as the anchor went down a path that cannot move it.
+        let mut dead_index = -1;
+        assert_eq!(
+            resize_annotation(
+                handle, 0, 0, CAP,
+                0.50 * CAP as f32, 0.50 * CAP as f32,
+                0.70 * CAP as f32, 0.70 * CAP as f32,
+                &mut dead_index as *mut i32,
+            ),
+            STATUS_UNSUPPORTED,
+            "resize_annotation is expected to refuse a shape; if it ever starts \
+             succeeding, the anchor move path can be simplified"
+        );
+
+        let mut new_index = -1;
+        let status = resize_shape_annotation(
+            handle, 0, 0, CAP,
+            0.50 * CAP as f32, 0.50 * CAP as f32,
+            0.70 * CAP as f32, 0.70 * CAP as f32,
+            &mut new_index as *mut i32,
+        );
+        assert_eq!(status, STATUS_OK_PDFIUM, "the move itself must succeed");
+
+        let after = red_bbox_norm(handle, 600).expect("shape should still be on the page");
+        close_document(handle);
+
+        println!("SHAPE MOVE: before {before:?} after {after:?} (asked to move to 0.50..0.70)");
+
+        let tol = 0.03;
+        assert!(
+            (after.0 - 0.50).abs() < tol,
+            "asked to move the shape to x 0.50, and the DRAWING is at x {:.3} \
+             (it started at {:.3}). The call reported success, so the /Rect \
+             moved; the painted path did not follow it.",
+            after.0,
+            before.0
+        );
+    }
+
     #[test]
     fn a_shape_lands_where_it_was_asked_for_on_an_uncropped_page() {
         // The control for the cropped case below. On a page whose crop box
