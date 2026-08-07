@@ -3770,6 +3770,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         NormalizeExtras(now.Id, "CommitLoadedMove");
 
+        // DIAGNOSTIC (temporary): the drag delta the anchor actually travelled,
+        // and every extra's origin -> target. If the extras' targets equal
+        // their origins, the delta never reached them; if the targets are right
+        // but nothing moves on screen, the write or the redraw is at fault.
+        Diag.Log($"MOVEDIAG anchor id={now.Id:N} start=({start.Left:F4},{start.Top:F4}) " +
+                 $"now=({now.Left:F4},{now.Top:F4}) delta=({now.Left - start.Left:F4},{now.Top - start.Top:F4})");
+        Diag.Log($"MOVEDIAG extras={_extraSelected.Count} origins={_extraDragOrigin.Count}");
+        for (int di = 0; di < _extraSelected.Count; di++)
+        {
+            var cur = _extraSelected[di];
+            string org = di < _extraDragOrigin.Count
+                ? $"({_extraDragOrigin[di].Left:F4},{_extraDragOrigin[di].Top:F4}) id={_extraDragOrigin[di].Id:N}"
+                : "NO-ORIGIN";
+            Diag.Log($"  MOVEDIAG extra[{di}] origin={org} target=({cur.Left:F4},{cur.Top:F4}) id={cur.Id:N}");
+        }
+
         // The inverse of a move or resize is four numbers: put the rectangle
         // back. Recorded BEFORE the write, and at annotation granularity
         // rather than as a document snapshot, because dragging a stamp around
@@ -3996,8 +4012,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                         exl, ext, exr, exb, out extNewIndex);
                 }
 
+                // DIAGNOSTIC (temporary): the rect this write was handed, and
+                // the rect the document reports for that annotation afterwards.
+                // A mismatch between them is the write ignoring its bounds; a
+                // match with no visible movement is a redraw problem.
                 if (extStatus == RenderStatus.OkPdfium)
                 {
+                    InvalidateLoadedPage(target.PageIndex);
+                    string landed = "NOT-FOUND";
+                    foreach (var la in LoadedFor(target.PageIndex))
+                    {
+                        if (la.Index == extNewIndex)
+                        {
+                            landed = $"({la.Left:F4},{la.Top:F4})";
+                            break;
+                        }
+                    }
+                    Diag.Log($"  MOVEDIAG wrote id={target.Id:N} asked=({target.Left:F4},{target.Top:F4}) landed={landed} idx {target.Index}->{extNewIndex}");
+
                     _extraSelected[slot] = target with { Index = extNewIndex };
                     pagesTouched.Add(target.PageIndex);
 
