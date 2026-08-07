@@ -2744,14 +2744,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// was already in extras). Rather than proving every entry path clean,
     /// we normalize at the multi-write boundary. Cheap; a linear scan of a
     /// selection that in practice holds a handful of items.</summary>
-    private void NormalizeExtras(int anchorPage, int anchorIndex, string callerTag)
+    private void NormalizeExtras(Guid anchorId, string callerTag)
     {
         if (_extraSelected.Count == 0) { return; }
-        var seen = new HashSet<(int, int)> { (anchorPage, anchorIndex) };
-        int removed = _extraSelected.RemoveAll(e => !seen.Add((e.PageIndex, e.Index)));
+
+        // Keyed on the stable Id, NEVER on (page, index).
+        //
+        // v2.1.2 deduped on the index and silently dropped real shapes: two
+        // different group members can carry the SAME stale index between a
+        // write and a cache refresh, so an index-keyed dedup sees a duplicate
+        // that isn't one. The symptom was a group of three where two moved,
+        // the third stayed put, and its frame moved anyway (the frame comes
+        // from _extraSelected, which the drag had already updated).
+        //
+        // Entries whose Id is empty cannot be compared this way, so they are
+        // kept: dropping a shape is far worse than writing one twice.
+        var seen = new HashSet<Guid>();
+        if (anchorId != Guid.Empty) { seen.Add(anchorId); }
+        int removed = _extraSelected.RemoveAll(e => e.Id != Guid.Empty && !seen.Add(e.Id));
         if (removed > 0)
         {
-            Diag.Log($"{callerTag}: dropped {removed} duplicate extras (anchor at p{anchorPage}#{anchorIndex}); extras now {_extraSelected.Count}");
+            Diag.Log($"{callerTag}: dropped {removed} extras that were the same annotation as another; extras now {_extraSelected.Count}");
             if (_extraDragOrigin.Count > _extraSelected.Count)
             {
                 _extraDragOrigin.Clear();
@@ -3580,7 +3593,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        NormalizeExtras(now.PageIndex, now.Index, "CommitLoadedMove");
+        NormalizeExtras(now.Id, "CommitLoadedMove");
 
         // The inverse of a move or resize is four numbers: put the rectangle
         // back. Recorded BEFORE the write, and at annotation granularity
@@ -3676,60 +3689,74 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedLoaded = now with { Index = newIndex };
         }
 
-        // Move-all commit: write each extra's NEW position. Two corrections
-        // stack on top of v1.77 to make the second and later group moves land
-        // consistently (v1.77 was intermittent, "moves now and next it does
-        // not"). Both come from the same root cause: a delete+re-add shifts
-        // indices on the same page.
+        // Stamp the anchor's Id back on BEFORE the extras loop, because that
+        // loop finds each of its targets by scanning for Ids. The write above
+        // rebuilt /Contents from the tag and dropped the prefix, so without
+        // this the anchor is anonymous and an extra carrying a stale Id could
+        // match it instead of its own mark.
+        if (now.Id != Guid.Empty)
+        {
+            Interop.AnnotationLoader.WriteId(_documentHandle, now.PageIndex, newIndex, now.Id);
+            InvalidateLoadedPage(now.PageIndex);
+        }
+
+        // Move-all commit: write each extra's NEW position.
         //
-        // (1) The anchor's write above already ran. If any extra on the same
-        //     page had an original index HIGHER than the anchor's original
-        //     index, PDFium's compaction has slid it down by one. Adjust the
-        //     cached extra index before using it.
-        // (2) Then process the extras in DESCENDING original-index order per
-        //     page so each of their delete+re-adds does not disturb the ones
-        //     yet to come.
+        // Every earlier attempt here tried to PREDICT what the indices would
+        // be after each delete+re-add: adjust for the anchor's shift, sort
+        // descending so deletes don't orphan later writes, then recover the
+        // final indices from the last-N run in write order. Each correction
+        // was right about the case it was written for and wrong about another,
+        // because the prediction depends on which path the anchor took (the
+        // in-place move and the rebuild shift indices differently).
+        //
+        // Nothing is predicted now. Each extra is located by its stable Id
+        // immediately before it is written, and the whole selection is
+        // re-resolved by Id afterwards. Gate is on _extraSelected, not on
+        // _extraDragOrigin, which is legitimately empty for a group-expanded
+        // selection; _extraSelected already carries the target bounds from
+        // DragLoadedTo's move-all update.
         if (!resizing && !rotating && _extraSelected.Count > 0)
         {
-            int anchorOldIndex = now.Index;
-            int anchorPage = now.PageIndex;
-
-            // Adjust extras for the anchor's shift, then sort the (index-in-list,
-            // adjusted-annotation-index) pairs by descending annotation index so
-            // deletes never orphan a later write. Gate is on _extraSelected -
-            // NOT on _extraDragOrigin, which can be legitimately empty for a
-            // group-expanded selection where the drag started via a code path
-            // that didn't snapshot origins. _extraSelected already carries the
-            // target bounds from DragLoadedTo's move-all update, so we don't
-            // need the origins to compute where to write them.
             var order = new List<(int Slot, LoadedSelection Adjusted)>(_extraSelected.Count);
             for (int i = 0; i < _extraSelected.Count; i++)
             {
-                var e = _extraSelected[i];
-                if (e.PageIndex == anchorPage && e.Index > anchorOldIndex)
-                {
-                    e = e with { Index = e.Index - 1 };
-                }
-                order.Add((i, e));
+                order.Add((i, _extraSelected[i]));
             }
-            order.Sort((a, b) =>
-            {
-                int p = b.Adjusted.PageIndex.CompareTo(a.Adjusted.PageIndex);
-                return p != 0 ? p : b.Adjusted.Index.CompareTo(a.Adjusted.Index);
-            });
 
             // Track write order per page (anchor's write already happened above;
             // count it as slot -1 so its stored index also gets corrected). The
-            // newIndex the FFI returns is L-1 at that MOMENT; every later delete
-            // on a lower index slides earlier-added items down. So the returned
-            // value is stale after the very next delete. The last-N slots in
-            // each page's write order hold our items in write order.
-            var writeOrderPerPage = new Dictionary<int, List<int>>();
-            writeOrderPerPage[anchorPage] = new List<int> { -1 };
-            var pagesTouched = new HashSet<int> { anchorPage };
+            var pagesTouched = new HashSet<int> { now.PageIndex };
 
-            foreach (var (slot, target) in order)
+            foreach (var (slot, targetCached) in order)
             {
+                // Resolve the annotation's LIVE index from its stable Id right
+                // before writing it, instead of trusting the index cached at
+                // selection time.
+                //
+                // Each write in this loop is a delete + re-add, so every write
+                // reshuffles the page and invalidates the indices of the ones
+                // still queued. The old code compensated with an
+                // adjust-then-sort-descending scheme that assumed the anchor
+                // had also been rebuilt; when the anchor took the in-place
+                // path instead, the compensation aimed the extras' writes at
+                // the wrong annotations. Asking the document where the
+                // annotation is NOW cannot drift, whatever happened before it.
+                var target = targetCached;
+                if (target.Id != Guid.Empty)
+                {
+                    InvalidateLoadedPage(target.PageIndex);
+                    if (FindLoadedById(target.Id) is (int livePage, int liveIndex))
+                    {
+                        target = target with { PageIndex = livePage, Index = liveIndex };
+                    }
+                    else
+                    {
+                        Diag.Log($"move extra id={target.Id:N}: not found on reload, skipping");
+                        continue;
+                    }
+                }
+
                 float exl = (float)(target.Left * CaptureWidth);
                 float ext = (float)(target.Top * CaptureWidth);
                 float exr = (float)(target.Right * CaptureWidth);
@@ -3768,54 +3795,51 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
                 if (extStatus == RenderStatus.OkPdfium)
                 {
-                    // Store the new BOUNDS now; the index gets fixed up below.
                     _extraSelected[slot] = target with { Index = extNewIndex };
                     pagesTouched.Add(target.PageIndex);
-                    if (!writeOrderPerPage.TryGetValue(target.PageIndex, out var list))
+
+                    // Re-stamp the Id NOW, not after the loop. The resize FFIs
+                    // rebuild /Contents from the shape or text tag and do not
+                    // carry the ID prefix through, so the annotation is
+                    // anonymous the moment this write returns. The very next
+                    // iteration resolves ITS target by scanning for Ids, and
+                    // an anonymous annotation would both be unfindable and let
+                    // a stale Id match the wrong mark.
+                    if (target.Id != Guid.Empty)
                     {
-                        list = new List<int>();
-                        writeOrderPerPage[target.PageIndex] = list;
+                        Interop.AnnotationLoader.WriteId(
+                            _documentHandle, target.PageIndex, extNewIndex, target.Id);
                     }
-                    list.Add(slot);
                 }
-                Diag.Log($"move extra p{target.PageIndex}#{target.Index} -> {extStatus}, now #{extNewIndex}");
+                Diag.Log($"move extra p{target.PageIndex}#{target.Index} id={target.Id:N} -> {extStatus}, now #{extNewIndex}");
             }
             _extraDragOrigin.Clear();
 
-            // Refresh caches, then assign each successful write its TRUE final
-            // index from the last-N run in write order per page.
             foreach (int page in pagesTouched)
             {
                 InvalidateLoadedPage(page);
             }
-            foreach (var kv in writeOrderPerPage)
+
+            // Re-resolve the whole selection from the document by Id. No
+            // arithmetic, no assumptions about write order: whatever the page
+            // looks like now is what the selection points at.
+            if (_selectedLoaded is LoadedSelection anchorSel && anchorSel.Id != Guid.Empty
+                && FindLoadedById(anchorSel.Id) is (int ap, int ai))
             {
-                int count = LoadedFor(kv.Key).Count;
-                var slots = kv.Value;
-                for (int i = 0; i < slots.Count; i++)
+                _selectedLoaded = anchorSel with { PageIndex = ap, Index = ai };
+            }
+            for (int i = 0; i < _extraSelected.Count; i++)
+            {
+                var ex = _extraSelected[i];
+                if (ex.Id != Guid.Empty && FindLoadedById(ex.Id) is (int ep, int ei))
                 {
-                    int idx = count - slots.Count + i;
-                    if (slots[i] == -1)
-                    {
-                        if (_selectedLoaded is LoadedSelection s)
-                        {
-                            _selectedLoaded = s with { Index = idx };
-                        }
-                    }
-                    else
-                    {
-                        _extraSelected[slots[i]] = _extraSelected[slots[i]] with { Index = idx };
-                    }
+                    _extraSelected[i] = ex with { PageIndex = ep, Index = ei };
                 }
             }
-
         }
 
-        // Groups are stored by Id, so no index remap is needed. But the
-        // resize FFIs rebuilt /Contents from the tag and didn't carry the
-        // ID prefix through, so re-stamp every selected annotation's Id at
-        // its current index. Without this, the next click on a group member
-        // would look up an Id that no longer exists in the file.
+        // The anchor's own write also stripped its ID prefix, and a
+        // single-selection move never enters the block above at all.
         StampSelectedIds();
         RefreshSelectionOutline();
     }
@@ -4393,7 +4417,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor) { return false; }
         const int CaptureWidth = 1000;
 
-        NormalizeExtras(anchor.PageIndex, anchor.Index, "BringSelectedToFront");
+        NormalizeExtras(anchor.Id, "BringSelectedToFront");
 
         // Build the joint list (anchor + extras) and sort by DESCENDING index
         // per page so each delete never disturbs a later item's index. The
