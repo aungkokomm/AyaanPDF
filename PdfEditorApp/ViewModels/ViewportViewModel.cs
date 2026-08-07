@@ -6568,6 +6568,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 _textLayers.Clear();
                 ClearSelection();
 
+                // The loaded-annotation cache describes the document we just
+                // replaced. Leaving it in place means hit-testing, the
+                // selection frame and every subsequent write address
+                // annotations that no longer exist, on a handle that no longer
+                // exists either. Nothing else here drops it: ClearSelection
+                // forgets what is selected, not what was read off the page.
+                ClearLoadedAnnotations();
+
                 PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
                 Thumbnails.Clear();
                 for (int i = 0; i < PageCount; i++)
