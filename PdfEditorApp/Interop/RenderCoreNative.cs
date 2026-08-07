@@ -393,6 +393,15 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_annotation_id(ulong docHandle, int pageIndex, int index);
 
     /// <summary>
+    /// Turns an image stamp to an ABSOLUTE angle about its own centre, keeping
+    /// its picture and its upright size. Delete + re-add underneath, so the
+    /// annotation's index changes; the new one is returned.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int rotate_stamp_annotation(
+        ulong docHandle, int pageIndex, int index, int captureWidth, float degrees, out int newIndex);
+
+    /// <summary>
     /// Stamps a 32-char hex Guid onto the annotation's /Contents. Any existing
     /// ID prefix is replaced; the tag body (AyaanShape:.., AyaanText:..) is
     /// preserved. Call this immediately after every add_*_annotation and every

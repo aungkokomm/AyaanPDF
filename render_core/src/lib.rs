@@ -1593,6 +1593,170 @@ fn resize_annotation_inner(
     STATUS_OK_PDFIUM
 }
 
+/// Pulls the BGRA pixels out of a stamp annotation, or None if the annotation
+/// is not a stamp or carries no image.
+///
+/// PROCESSED, not raw, for the same reason the resize path uses it: the raw
+/// bitmap is the image alone with its transparency in a separate soft mask, so
+/// rebuilding from it turns every transparent signature into an opaque white
+/// block.
+fn extract_stamp_pixels(doc_handle: u64, page_index: i32, index: i32) -> Option<(i32, i32, Vec<u8>)> {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned()?;
+    let doc_guard = lock(&doc);
+    let mut page = doc_guard.pages().get(page_index as u16).ok()?;
+    let mut annotations = page.annotations_mut();
+    let annotation = annotations.get(index as usize).ok()?;
+    // By reference: PdfPageAnnotation implements Drop, so matching by value
+    // would try to move out of a type that cannot be moved.
+    let PdfPageAnnotation::Stamp(stamp) = &annotation else {
+        return None;
+    };
+
+    let objects = stamp.objects();
+    for i in 0..objects.len() {
+        let Ok(object) = objects.get(i) else {
+            continue;
+        };
+        if let PdfPageObject::Image(image) = &object {
+            let bitmap = image
+                .get_processed_bitmap(&doc_guard)
+                .or_else(|_| image.get_raw_bitmap());
+            if let Ok(bitmap) = bitmap {
+                let format = bitmap.format().unwrap_or(PdfBitmapFormat::BGRA);
+                return to_bgra(bitmap.width(), bitmap.height(), format, &bitmap.as_raw_bytes());
+            }
+        }
+    }
+    None
+}
+
+/// Turns a stamp to an ABSOLUTE angle about its own centre, keeping its image
+/// and its upright size.
+///
+/// Delete and re-add, not a transform of the object in place. An object taken
+/// from `objects_mut().get()` is DETACHED, so `apply_matrix` on it never
+/// reaches the stored annotation; that was measured, see the note on
+/// `set_annotation_bounds`. Re-placing the image with a rotated matrix is what
+/// actually turns the picture.
+///
+/// The angle is absolute so repeated rotations do not compound rounding, and
+/// the upright rect comes from the tag rather than from the annotation's
+/// current rectangle, which for a turned stamp is the ENLARGED box that
+/// contains it.
+#[unsafe(no_mangle)]
+pub extern "C" fn rotate_stamp_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    degrees: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if !degrees.is_finite() {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        rotate_stamp_annotation_inner(doc_handle, page_index, index, capture_width, degrees, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn rotate_stamp_annotation_inner(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    degrees: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    // The upright box, from the tag. A stamp placed before stamps were tagged
+    // has none, so fall back to its current rectangle and treat it as upright,
+    // which is exactly what it is in that case.
+    let upright = {
+        let _guard = lock(&CALL_LOCK);
+        let Some(doc) = lock(&core().documents).get(&doc_handle).cloned() else {
+            return STATUS_INVALID_INPUT;
+        };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+            return STATUS_INVALID_INPUT;
+        };
+        if !matches!(annotation, PdfPageAnnotation::Stamp(_)) {
+            return STATUS_UNSUPPORTED;
+        }
+
+        match annotation_tag(&annotation).as_deref().and_then(parse_stamp_tag) {
+            Some((_, l, t, r, b)) => (l, t, r, b),
+            None => {
+                let Ok(bounds) = annotation.bounds() else {
+                    return STATUS_INVALID_INPUT;
+                };
+                let page_w = page.width().value;
+                if page_w <= 0.0 {
+                    return STATUS_INVALID_INPUT;
+                }
+                let (origin_x, origin_top) = page_origin(&page);
+                let per_pt = capture_width as f32 / page_w;
+                (
+                    (bounds.left().value - origin_x) * per_pt,
+                    (origin_top - bounds.top().value) * per_pt,
+                    (bounds.right().value - origin_x) * per_pt,
+                    (origin_top - bounds.bottom().value) * per_pt,
+                )
+            }
+        }
+    };
+
+    let Some((px_width, px_height, pixels)) = extract_stamp_pixels(doc_handle, page_index, index)
+    else {
+        return STATUS_UNSUPPORTED;
+    };
+
+    let expected = (px_width as usize)
+        .saturating_mul(px_height as usize)
+        .saturating_mul(4);
+    if pixels.len() != expected || px_width <= 0 || px_height <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // Remove before re-placing, so a failure in between cannot leave two.
+    let removed = delete_annotation(doc_handle, page_index, index);
+    if removed != STATUS_OK_PDFIUM {
+        return removed;
+    }
+
+    let (l, t, r, b) = upright;
+    let added = add_stamp_annotation_inner(
+        doc_handle, page_index, capture_width,
+        l, t, r, b,
+        pixels.as_ptr(), pixels.len(), px_width, px_height,
+        degrees,
+    );
+    if added != STATUS_OK_PDFIUM {
+        return added;
+    }
+
+    if !out_new_index.is_null() {
+        let array = get_annotations(doc_handle, page_index);
+        let count = array.len;
+        free_annotation_array(array);
+        unsafe { *out_new_index = count.saturating_sub(1) as i32 };
+    }
+
+    STATUS_OK_PDFIUM
+}
+
 /// Places an image as a real PDF `/Stamp` annotation object.
 ///
 /// Pixels arrive already decoded, as tightly packed BGRA, rather than as PNG
@@ -1644,6 +1808,7 @@ pub extern "C" fn add_stamp_annotation(
             doc_handle, page_index, capture_width,
             left, top, right, bottom,
             bgra, byte_len, pixel_width, pixel_height,
+            0.0,
         )
     })
     .unwrap_or(STATUS_PANIC)
@@ -1662,6 +1827,7 @@ fn add_stamp_annotation_inner(
     byte_len: usize,
     pixel_width: i32,
     pixel_height: i32,
+    rotation_deg: f32,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -1693,11 +1859,25 @@ fn add_stamp_annotation_inner(
     let y1 = origin_top - top * scale;
     let y0 = origin_top - bottom * scale;
 
+    // The UPRIGHT box the caller asked for. A rotated stamp still records
+    // this, not the turned one, so a later rotation is absolute rather than
+    // compounding on itself.
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (bw, bh) = (x1 - x0, y1 - y0);
+
+    let rad = rotation_deg.to_radians();
+    let (sin, cos) = (rad.sin(), rad.cos());
+
+    // PDFium CLIPS an annotation's appearance to its rectangle, so a turned
+    // stamp needs the axis-aligned box that CONTAINS it or the corners are
+    // shaved off. Same lesson the rotated text boxes taught.
+    let half_w = (cos.abs() * bw + sin.abs() * bh) / 2.0;
+    let half_h = (sin.abs() * bw + cos.abs() * bh) / 2.0;
     let bounds = PdfRect::new(
-        PdfPoints::new(y0),
-        PdfPoints::new(x0),
-        PdfPoints::new(y1),
-        PdfPoints::new(x1),
+        PdfPoints::new(cy - half_h),
+        PdfPoints::new(cx - half_w),
+        PdfPoints::new(cy + half_h),
+        PdfPoints::new(cx + half_w),
     );
 
     let Ok(mut annotation) = page.annotations_mut().create_stamp_annotation() else {
@@ -1709,6 +1889,15 @@ fn add_stamp_annotation_inner(
     if annotation.set_bounds(bounds).is_err() {
         return STATUS_INVALID_INPUT;
     }
+
+    // Record the angle and the UPRIGHT rect so the stamp can be rotated again
+    // later, and so the angle survives a save and reopen. Without this a
+    // reopened stamp looks turned but reports itself upright, and the next
+    // rotation would be measured from the wrong place.
+    let _ = set_annotation_tag(
+        &mut annotation,
+        &stamp_tag(rotation_deg, left, top, right, bottom),
+    );
 
     // PdfBitmap borrows the buffer mutably, so this needs an owned copy rather
     // than the caller's memory, which is only valid for the call.
@@ -1740,7 +1929,21 @@ fn add_stamp_annotation_inner(
     //
     // apply_matrix composes with what is already there, which is the identity
     // on a freshly created object, so this sets exactly this matrix.
-    let matrix = PdfMatrix::new(x1 - x0, 0.0, 0.0, y1 - y0, x0, y0);
+    // An image object draws the UNIT SQUARE, so its matrix supplies position,
+    // size AND rotation. Unrotated this is the plain [w 0 0 h x0 y0] that maps
+    // the square onto the box; with an angle it maps the square onto the box
+    // turned about its own centre:
+    //     (u,v) -> centre + R(angle) * (w*(u-0.5), h*(v-0.5))
+    let (ma, mb) = (cos * bw, sin * bw);
+    let (mc, md) = (-sin * bh, cos * bh);
+    let matrix = PdfMatrix::new(
+        ma,
+        mb,
+        mc,
+        md,
+        cx - (ma + mc) / 2.0,
+        cy - (mb + md) / 2.0,
+    );
     if image.apply_matrix(matrix).is_err() {
         return STATUS_INVALID_INPUT;
     }
@@ -3122,6 +3325,40 @@ const ARROW_HEAD_MIN: f32 = 6.0;
 /// `fx` and `fy` record which corner of the box the drag STARTED at, so a line
 /// or arrow keeps pointing the way it was drawn. A bounding box alone cannot
 /// say that.
+/// A stamp's angle and the UPRIGHT rectangle it was placed in, in capture
+/// space: `AyaanStamp:<deg>:<l>:<t>:<r>:<b>`.
+///
+/// Stamps carried no tag at all before rotation existed, because nothing
+/// needed recovering from one: the image lives in the annotation. Rotation
+/// changes that. The angle has to survive a save so a reopened stamp does not
+/// report itself upright while looking turned, and the upright rect has to be
+/// kept so a second rotation is measured from the original box instead of
+/// compounding on the enlarged one.
+const STAMP_TAG: &str = "AyaanStamp:";
+
+fn stamp_tag(rotation_deg: f32, left: f32, top: f32, right: f32, bottom: f32) -> String {
+    format!("{STAMP_TAG}{rotation_deg:.2}:{left:.4}:{top:.4}:{right:.4}:{bottom:.4}")
+}
+
+/// The angle and upright rect recorded on one of our stamps, or None if the
+/// annotation is not a tagged stamp (including any stamp written before the
+/// tag existed, which is treated as upright).
+fn parse_stamp_tag(contents: &str) -> Option<(f32, f32, f32, f32, f32)> {
+    let contents = strip_id_prefix(contents).1;
+    let rest = contents.strip_prefix(STAMP_TAG)?;
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+        parts[3].parse().ok()?,
+        parts[4].parse().ok()?,
+    ))
+}
+
 const SHAPE_TAG: &str = "AyaanShape:";
 
 fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
@@ -10461,6 +10698,81 @@ mod tests {
         free_byte_buffer(tag);
         close_document(handle);
         assert_eq!(String::from_utf8(bytes).unwrap(), legacy);
+    }
+
+    #[test]
+    fn rotating_a_stamp_turns_the_picture_and_the_angle_survives_a_reopen() {
+        // A WIDE, SHORT red block. Asymmetric on purpose: a square would look
+        // identical at 0 and 90 degrees, so it could not tell a real rotation
+        // from a no-op, which is exactly the bug this guards.
+        const CAP: i32 = 1000;
+        let (pw, ph) = (40i32, 10i32);
+        let mut pixels = Vec::with_capacity((pw * ph * 4) as usize);
+        for _ in 0..(pw * ph) {
+            pixels.extend_from_slice(&[0, 0, 255, 255]); // BGRA red, opaque
+        }
+
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        // Placed in a box with the same 4:1 aspect as the image.
+        let (l, t, r, b) = (0.30 * CAP as f32, 0.45 * CAP as f32, 0.70 * CAP as f32, 0.55 * CAP as f32);
+        assert_eq!(
+            add_stamp_annotation(handle, 0, CAP, l, t, r, b, pixels.as_ptr(), pixels.len(), pw, ph),
+            STATUS_OK_PDFIUM
+        );
+
+        let upright = red_bbox_norm(handle, 600).expect("the stamp should be on the page");
+        let up_w = upright.2 - upright.0;
+        let up_h = upright.3 - upright.1;
+        assert!(up_w > up_h * 2.0, "the stamp should start wide: {upright:?}");
+
+        let mut new_index = -1;
+        assert_eq!(
+            rotate_stamp_annotation(handle, 0, 0, CAP, 90.0, &mut new_index as *mut i32),
+            STATUS_OK_PDFIUM
+        );
+
+        let turned = red_bbox_norm(handle, 600).expect("the stamp should still be on the page");
+        let t_w = turned.2 - turned.0;
+        let t_h = turned.3 - turned.1;
+        println!("STAMP ROTATE: upright {upright:?} -> turned {turned:?}");
+
+        // Turned a quarter, so it must now be TALL, and about as tall as it
+        // used to be wide.
+        assert!(
+            t_h > t_w * 2.0,
+            "after a 90 degree rotation the stamp should be tall, got {turned:?}"
+        );
+        assert!(
+            (t_h - up_w).abs() < 0.04,
+            "the turned height {t_h:.3} should match the upright width {up_w:.3}"
+        );
+
+        // It must stay put: rotation is about the stamp's own centre.
+        let up_cx = (upright.0 + upright.2) / 2.0;
+        let up_cy = (upright.1 + upright.3) / 2.0;
+        let t_cx = (turned.0 + turned.2) / 2.0;
+        let t_cy = (turned.1 + turned.3) / 2.0;
+        assert!(
+            (t_cx - up_cx).abs() < 0.02 && (t_cy - up_cy).abs() < 0.02,
+            "the stamp drifted while rotating: centre {up_cx:.3},{up_cy:.3} -> {t_cx:.3},{t_cy:.3}"
+        );
+
+        // And the angle must survive a save, or a reopened stamp looks turned
+        // while reporting itself upright and the next rotation is measured
+        // from the wrong place.
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        free_byte_buffer(saved);
+        close_document(handle);
+        assert_ne!(reopened, 0);
+
+        let tag = contents_of(reopened, 0, 0).expect("the reopened stamp has no tag");
+        close_document(reopened);
+        let parsed = parse_stamp_tag(&tag).expect("the reopened stamp tag did not parse");
+        assert!(
+            (parsed.0 - 90.0).abs() < 0.01,
+            "the reopened stamp should remember 90 degrees, tag says {tag}"
+        );
     }
 
     #[test]

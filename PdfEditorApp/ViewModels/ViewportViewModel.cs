@@ -2356,6 +2356,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// FFI cost. Cleared alongside the other selection flags.</summary>
     private bool _selectedIsShape;
 
+    /// <summary>True when the selection is a placed IMAGE stamp, as opposed to
+    /// a shape or a text box, which are also /Stamp annotations underneath.
+    /// Distinguished by the tag: an image stamp carries AyaanStamp: (or, for
+    /// one placed before stamps were tagged, no tag at all).</summary>
+    private bool _selectedIsStamp;
+
     /// <summary>Slot-space (DIP) inset from _selectedLoaded's /Rect back to
     /// the shape's outer stroke edge. The writer adds width/2 + 1 on every
     /// side to keep PDFium from clipping the stroke; the frame and grips
@@ -2639,7 +2645,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // framed at its real angle.
             if (slot is not null)
             {
-                slot.SelectionRotation = (_selectedIsTextBox || _selectedIsShape) ? _selectedRotationDeg : 0;
+                slot.SelectionRotation = (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp) ? _selectedRotationDeg : 0;
                 slot.SelectionCenterX = (sel.Left + sel.Right) / 2 * SlotLayoutWidth;
                 slot.SelectionCenterY = (sel.Top + sel.Bottom) / 2 * SlotLayoutWidth;
             }
@@ -2654,7 +2660,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // rotate handle above its top edge. Grips inset by the same
                 // shape-pad amount so they sit ON the frame, not outside it.
                 AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0,
-                         rotate: _selectedIsTextBox || _selectedIsShape,
+                         rotate: _selectedIsTextBox || _selectedIsShape || _selectedIsStamp,
                          insetDips: p);
             }
 
@@ -2997,6 +3003,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         string? contents = ReadAnnotationContents(pageIndex, index);
         _selectedIsShape = contents is not null && contents.StartsWith("AyaanShape:", StringComparison.Ordinal);
 
+        // An image stamp is what is left once shapes and text boxes are
+        // ruled out: all three are /Stamp annotations underneath, so the
+        // TAG is what separates them, not the subtype. A stamp placed
+        // before stamps were tagged has no tag, hence the empty case.
+        _selectedIsStamp = !_selectedIsShape
+            && !TextBoxTagReader.TryParse(contents, out _)
+            && (string.IsNullOrEmpty(contents)
+                || contents!.StartsWith("AyaanStamp:", StringComparison.Ordinal));
+        if (_selectedIsStamp)
+        {
+            _selectedRotationDeg = ParseStampRotation(contents);
+        }
+
         if (_selectedIsShape)
         {
             // Pull the shape's rotation out of its tag. The rest of the shape
@@ -3227,7 +3246,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         var box = new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom);
         var (lx, ly) = InverseRotate(nx, ny, box, _selectedRotationDeg);
-        if ((_selectedIsTextBox || _selectedIsShape)
+        if ((_selectedIsTextBox || _selectedIsShape || _selectedIsStamp)
             && LoadedAnnotationPicker.IsRotateHandle(box, lx, ly))
         {
             return LoadedAnnotationPicker.Grip.Rotate;
@@ -4781,9 +4800,56 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// re-laid-out at its own upright bounds, turned to the new angle. Bounds
     /// are unchanged, so the marquee keeps them and its angle. Branches on the
     /// selected type so shapes go through their own FFI.</summary>
+    /// <summary>The angle recorded on an image stamp's tag, or 0 for one
+    /// placed before stamps were tagged (which is upright by definition).
+    /// Tag shape: AyaanStamp:&lt;deg&gt;:&lt;l&gt;:&lt;t&gt;:&lt;r&gt;:&lt;b&gt;.</summary>
+    private static double ParseStampRotation(string? contents)
+    {
+        if (string.IsNullOrEmpty(contents)) { return 0; }
+        const string Prefix = "AyaanStamp:";
+        if (!contents.StartsWith(Prefix, StringComparison.Ordinal)) { return 0; }
+        string[] parts = contents.Substring(Prefix.Length).Split(':');
+        return parts.Length > 0 && double.TryParse(parts[0],
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out double deg) ? deg : 0;
+    }
+
     private void CommitRotation(LoadedSelection start)
     {
         const int CaptureWidth = 1000;
+
+        if (_selectedIsStamp)
+        {
+            // An image stamp is turned by re-placing its picture with a
+            // rotated matrix; it has no tag geometry to redraw from the way a
+            // shape does, and its bounds are recomputed core-side to the box
+            // that CONTAINS the turned image, so nothing is passed here but
+            // the angle.
+            PushHistory(HistoryScope.Document, "Rotate stamp");
+            int stampStatus = RenderCoreNative.rotate_stamp_annotation(
+                _documentHandle, start.PageIndex, start.Index, CaptureWidth,
+                (float)_selectedRotationDeg, out int stampNewIndex);
+            if (stampStatus != RenderStatus.OkPdfium)
+            {
+                _selectedLoaded = start;
+                RefreshSelectionOutline();
+                Status = "Could not rotate that stamp.";
+                return;
+            }
+            IsDirty = true;
+            InvalidateLoadedPage(start.PageIndex);
+
+            // Re-read the bounds: a turned stamp's rectangle is the ENLARGED
+            // box that contains it, so the dragged rect is not what landed.
+            var placed = LoadedFor(start.PageIndex).Find(a => a.Index == stampNewIndex);
+            _selectedLoaded = placed.Index == stampNewIndex
+                ? new LoadedSelection(start.PageIndex, stampNewIndex,
+                    placed.Left, placed.Top, placed.Right, placed.Bottom, start.Id)
+                : start with { Index = stampNewIndex };
+            StampSelectedIds();
+            RefreshSelectionOutline();
+            return;
+        }
 
         if (_selectedIsShape)
         {
