@@ -54,12 +54,19 @@ internal static class AnnotationLoader
             int count = (int)array.Len;
             int structSize = Marshal.SizeOf<AnnotationInfo>();
 
+            // Counted, not logged per annotation. This used to write one line
+            // per annotation per load, and a page cache is invalidated after
+            // every edit, so a heavily annotated page produced a burst of file
+            // opens on each one. The only thing worth knowing here is whether
+            // any annotation still lacks a persisted id.
+            int unstamped = 0;
+
             for (int i = 0; i < count; i++)
             {
                 var native = Marshal.PtrToStructure<AnnotationInfo>(array.Items + i * structSize);
                 var readId = ReadId(docHandle, pageIndex, native.Index);
                 var id = readId ?? Guid.NewGuid();
-                PdfEditorApp.Diag.Log($"AnnotationLoader.Load p{pageIndex}#{native.Index}: readId={(readId?.ToString("N") ?? "null")} -> id={id:N}");
+                if (readId is null) { unstamped++; }
                 result.Add(new ExistingAnnotation(
                     pageIndex,
                     native.Index,
@@ -73,6 +80,10 @@ internal static class AnnotationLoader
                     id));
             }
 
+            if (unstamped > 0)
+            {
+                PdfEditorApp.Diag.Log($"AnnotationLoader.Load p{pageIndex}: {count} annotations, {unstamped} with no persisted id");
+            }
             return result;
         }
         finally
@@ -123,7 +134,13 @@ internal static class AnnotationLoader
         // 32 ASCII hex chars, no dashes; matches ID_HEX_LEN on the Rust side.
         byte[] hex = Encoding.ASCII.GetBytes(id.ToString("N"));
         int status = RenderCoreNative.set_annotation_id(docHandle, pageIndex, index, hex, (nuint)hex.Length);
-        PdfEditorApp.Diag.Log($"AnnotationLoader.WriteId p{pageIndex}#{index} id={id:N} -> status={status}");
+        // Only failures. This runs on every click and every write in a move,
+        // so logging the successes buried the interesting lines and put a file
+        // open in front of each one.
+        if (status != RenderStatus.OkPdfium)
+        {
+            PdfEditorApp.Diag.Log($"AnnotationLoader.WriteId p{pageIndex}#{index} id={id:N} FAILED -> status={status}");
+        }
     }
 
     private static bool IsHex(string s)
