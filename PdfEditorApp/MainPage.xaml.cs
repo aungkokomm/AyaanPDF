@@ -96,6 +96,19 @@ public sealed partial class MainPage : Page
             {
                 ViewModel.OpenDocument(probe);
             }
+            else
+            {
+                // Otherwise start on a blank page rather than an empty canvas,
+                // so a drawing tool can be used the moment the app is up. It
+                // is a real one-page document, so every tool, the rulers and
+                // the save path all behave exactly as they do for a file the
+                // user opened; File>Open still replaces it.
+                string blank = System.IO.Path.Combine(AppContext.BaseDirectory, "blank.pdf");
+                if (System.IO.File.Exists(blank))
+                {
+                    ViewModel.OpenDocument(blank);
+                }
+            }
 
             // Places a stamp straight after opening, so the decode-and-place
             // path can be checked without a mouse. Done inline rather than on

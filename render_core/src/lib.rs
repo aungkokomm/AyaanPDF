@@ -1294,11 +1294,7 @@ fn set_annotation_bounds_inner(
         return STATUS_INVALID_INPUT;
     }
 
-    let media = page.boundaries().media().map(|b| b.bounds);
-    let (origin_x, origin_top) = match media {
-        Ok(b) => (b.left().value, b.top().value),
-        Err(_) => (0.0, page.height().value),
-    };
+    let (origin_x, origin_top) = page_origin(&page);
     let scale = page_w / capture_width as f32;
 
     let new_x0 = origin_x + left * scale;
@@ -1689,11 +1685,7 @@ fn add_stamp_annotation_inner(
         return STATUS_INVALID_INPUT;
     }
 
-    let media = page.boundaries().media().map(|b| b.bounds);
-    let (origin_x, origin_top) = match media {
-        Ok(b) => (b.left().value, b.top().value),
-        Err(_) => (0.0, page.height().value),
-    };
+    let (origin_x, origin_top) = page_origin(&page);
     let scale = page_w / capture_width as f32;
 
     let x0 = origin_x + left * scale;
@@ -2346,6 +2338,30 @@ fn wrap_to_width<'a>(
 /// A `|` is used as the separator because every existing tag field uses `:`,
 /// so it cannot collide. Annotations without this prefix are legacy and get
 /// a fresh Guid assigned in C# on first load; the first save writes it back.
+/// The origin every annotation coordinate must be measured from: the corner
+/// of the box PDFium actually RENDERS.
+///
+/// Crop box first, media box as the fallback, which is exactly what
+/// `render_region_inner` does when it saves and restores the page's box. The
+/// two agree on most files, so this went unnoticed for a long time; on a file
+/// where they differ (print-ready PDFs, scans, anything with trim marks) every
+/// annotation was written relative to the media corner and then drawn relative
+/// to the crop corner, landing displaced by the difference between them. The
+/// selection frame, positioned from `get_annotations` reading the media corner
+/// again, then sat off the shape the user could see.
+///
+/// Proved by `a_shape_lands_where_it_was_asked_for_on_a_cropped_page`, with
+/// `..._on_an_uncropped_page` as the control.
+fn page_origin(page: &pdfium_render::prelude::PdfPage) -> (f32, f32) {
+    let boxes = page.boundaries();
+    boxes
+        .crop()
+        .map(|b| b.bounds)
+        .or_else(|_| boxes.media().map(|b| b.bounds))
+        .map(|b| (b.left().value, b.top().value))
+        .unwrap_or((0.0, page.height().value))
+}
+
 const ID_PREFIX: &str = "ID:";
 const ID_SEPARATOR: char = '|';
 const ID_HEX_LEN: usize = 32;
@@ -2711,10 +2727,7 @@ fn add_text_box_inner(
     }
     let scale = page_w / capture_width as f32;
 
-    let (origin_x, origin_top) = match page.boundaries().media().map(|bx| bx.bounds) {
-        Ok(bx) => (bx.left().value, bx.top().value),
-        Err(_) => (0.0, page.height().value),
-    };
+    let (origin_x, origin_top) = page_origin(&page);
 
     let x0 = origin_x + left * scale;
     let x1 = origin_x + right * scale;
@@ -3269,11 +3282,7 @@ fn add_shape_annotations_inner(
             continue;
         }
 
-        let media = page.boundaries().media().map(|b| b.bounds);
-        let (origin_x, origin_top) = match media {
-            Ok(b) => (b.left().value, b.top().value),
-            Err(_) => (0.0, page.height().value),
-        };
+        let (origin_x, origin_top) = page_origin(&page);
         let scale = page_w / capture_width as f32;
 
         let to_pdf_x = |x: f32| origin_x + x * scale;
@@ -3595,10 +3604,7 @@ fn restyle_shape_annotation_inner_with_rotation(
         let Ok(bx) = annotation.bounds() else { return STATUS_INVALID_INPUT; };
         let pw = page.width().value;
         if pw <= 0.0 { return STATUS_INVALID_INPUT; }
-        let (page_left, page_top) = match page.boundaries().media().map(|b| b.bounds) {
-            Ok(b) => (b.left().value, b.top().value),
-            Err(_) => (0.0, page.height().value),
-        };
+        let (page_left, page_top) = page_origin(&page);
         (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, page_left, page_top, pw, bx)
     };
 
@@ -4135,11 +4141,7 @@ fn add_ink_annotations_inner(
             continue;
         }
 
-        let media = page.boundaries().media().map(|b| b.bounds);
-        let (origin_x, origin_top) = match media {
-            Ok(b) => (b.left().value, b.top().value),
-            Err(_) => (0.0, page.height().value),
-        };
+        let (origin_x, origin_top) = page_origin(&page);
         let scale = page_w / capture_width as f32;
 
         let to_pdf_x = |x: f32| PdfPoints::new(origin_x + x * scale);
@@ -4292,13 +4294,10 @@ fn add_highlight_annotations_inner(
             continue;
         }
 
-        // Page origin from the media box, not assumed to be zero, so the
-        // geometry matches what get_annotations reads back.
-        let media = page.boundaries().media().map(|b| b.bounds);
-        let (origin_x, origin_top) = match media {
-            Ok(b) => (b.left().value, b.top().value),
-            Err(_) => (0.0, page.height().value),
-        };
+        // Page origin from the RENDERED box (crop, then media), not assumed to
+        // be zero, so the geometry matches both what PDFium draws and what
+        // get_annotations reads back. See page_origin.
+        let (origin_x, origin_top) = page_origin(&page);
         let scale = page_w / capture_width as f32;
 
         // Convert every quad first, so the bounding box is known before the
@@ -5117,8 +5116,7 @@ fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
     };
 
     let page_w = page.width().value;
-    let page_top = page.boundaries().media().map(|b| b.bounds.top().value).unwrap_or(page.height().value);
-    let page_left = page.boundaries().media().map(|b| b.bounds.left().value).unwrap_or(0.0);
+    let (page_left, page_top) = page_origin(&page);
     if page_w <= 0.0 {
         return AnnotationArray::failure(STATUS_INVALID_INPUT);
     }
@@ -10120,5 +10118,207 @@ mod tests {
         free_byte_buffer(buf);
         assert_eq!(fields.len(), 0);
         close_document(handle);
+    }
+
+    /// The bounding box of RED ink in a rendered page, in NORMALIZED units
+    /// matching the app's convention: both axes divided by the render WIDTH,
+    /// top-left origin. Returns None if no red pixels are present.
+    ///
+    /// Red rather than "any dark pixel" so a fixture that already carries
+    /// black page text cannot be mistaken for the shape under test. Buffer is
+    /// BGRA, so index +2 is the red channel.
+    fn red_bbox_norm(handle: u64, width: i32) -> Option<(f32, f32, f32, f32)> {
+        let (bytes, w) = render_bytes(handle, 0, width);
+        let h = bytes.len() / (w * 4);
+        let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        let mut found = false;
+        for y in 0..h {
+            for x in 0..w {
+                let px = (y * w + x) * 4;
+                let (b, g, r) = (bytes[px], bytes[px + 1], bytes[px + 2]);
+                if r > 140 && g < 90 && b < 90 {
+                    found = true;
+                    lo_x = lo_x.min(x);
+                    lo_y = lo_y.min(y);
+                    hi_x = hi_x.max(x);
+                    hi_y = hi_y.max(y);
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        let wf = w as f32;
+        Some((lo_x as f32 / wf, lo_y as f32 / wf, hi_x as f32 / wf, hi_y as f32 / wf))
+    }
+
+    #[test]
+    fn the_bundled_blank_page_opens_renders_and_accepts_a_shape() {
+        // The document the app opens at startup so there is always something
+        // to draw on. Hand-built minimal PDF, so prove PDFium accepts it
+        // rather than discovering at launch that the xref is off by a byte.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+
+        let sizes = get_page_sizes(handle);
+        assert_eq!(sizes.status, STATUS_OK_PDFIUM);
+        assert_eq!(sizes.len, 1, "the blank document should have exactly one page");
+        free_page_size_array(sizes);
+
+        // It must render, and it must render BLANK (no stray ink).
+        assert!(
+            red_bbox_norm(handle, 300).is_none(),
+            "the blank page should have no red ink before anything is drawn"
+        );
+
+        // And it must accept a shape at the position asked for, since that is
+        // the first thing anyone will do with it.
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 0.25 * CAP as f32,
+            y1: 0.25 * CAP as f32,
+            x2: 0.75 * CAP as f32,
+            y2: 0.75 * CAP as f32,
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+        let bbox = red_bbox_norm(handle, 600).expect("the shape should have put red ink on the page");
+        close_document(handle);
+
+        let tol = 0.02;
+        assert!(
+            (bbox.0 - 0.25).abs() < tol && (bbox.2 - 0.75).abs() < tol,
+            "on the blank page a shape asked for at x 0.25..0.75 rendered at \
+             x {:.3}..{:.3}",
+            bbox.0,
+            bbox.2
+        );
+    }
+
+    #[test]
+    fn a_shape_lands_where_it_was_asked_for_on_an_uncropped_page() {
+        // The control for the cropped case below. On a page whose crop box
+        // equals its media box, the two origins agree and the shape lands
+        // exactly where it was asked for. If THIS ever fails the problem is
+        // not crop-vs-media and the other test's diagnosis is wrong.
+        let handle = open_fixture_named("tests/fixtures/sample.pdf");
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 0.25 * CAP as f32,
+            y1: 0.25 * CAP as f32,
+            x2: 0.75 * CAP as f32,
+            y2: 0.75 * CAP as f32,
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+        let bbox = red_bbox_norm(handle, 600).expect("the shape should have put red ink on the page");
+        close_document(handle);
+
+        println!("UNCROPPED-PAGE SHAPE BBOX: {bbox:?} (asked for 0.25..0.75 in x)");
+        let tol = 0.02;
+        assert!(
+            (bbox.0 - 0.25).abs() < tol && (bbox.2 - 0.75).abs() < tol,
+            "on an UNCROPPED page a shape asked for at x 0.25..0.75 rendered \
+             at x {:.3}..{:.3}",
+            bbox.0,
+            bbox.2
+        );
+    }
+
+    #[test]
+    fn a_shape_lands_where_it_was_asked_for_on_a_cropped_page() {
+        // The annotation write path takes its origin from the MEDIA box while
+        // the render path crops to the CROP box. On a page where those differ
+        // (print-ready PDFs, scans, anything with trim marks) a shape asked
+        // for at the middle of the page is written relative to the media
+        // origin and then DRAWN relative to the crop origin, so it lands
+        // displaced by the difference. The selection frame, positioned from
+        // get_annotations (media origin again), then does not sit on the
+        // shape the user can see.
+        //
+        // This test pins the user-visible contract: ask for a rect, render,
+        // and the ink must be there. It fails on a cropped page until the
+        // annotation paths use the same box the renderer does.
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample.pdf");
+
+        // Inset the crop box well inside the media box, asymmetrically so a
+        // sign error cannot cancel out.
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let g = lock(&doc);
+            let mut page = g.pages().get(0).unwrap();
+            let media = page.boundaries().media().map(|b| b.bounds).unwrap();
+            let crop = PdfRect::new(
+                PdfPoints::new(media.bottom().value + 30.0),
+                PdfPoints::new(media.left().value + 60.0),
+                PdfPoints::new(media.top().value - 90.0),
+                PdfPoints::new(media.right().value - 20.0),
+            );
+            page.boundaries_mut().set_crop(crop).unwrap();
+        }
+
+        // Ask for a rectangle in the middle half of the (cropped) page.
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 0.25 * CAP as f32,
+            y1: 0.25 * CAP as f32,
+            x2: 0.75 * CAP as f32,
+            y2: 0.75 * CAP as f32,
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let bbox = red_bbox_norm(handle, 600).expect("the shape should have put red ink on the page");
+        close_document(handle);
+
+        println!("CROPPED-PAGE SHAPE BBOX: {bbox:?} (asked for 0.25..0.75 in x)");
+
+        // Generous tolerance: this is about gross displacement, not sub-pixel
+        // stroke placement. A crop offset of 60pt on a 612pt page is ~0.1
+        // normalized, which is 20x this tolerance.
+        let tol = 0.02;
+        assert!(
+            (bbox.0 - 0.25).abs() < tol && (bbox.2 - 0.75).abs() < tol,
+            "shape asked for x 0.25..0.75 rendered at x {:.3}..{:.3} - \
+             the write path used the media origin but the renderer crops to \
+             the crop box, so the shape is displaced by the difference",
+            bbox.0,
+            bbox.2
+        );
     }
 }

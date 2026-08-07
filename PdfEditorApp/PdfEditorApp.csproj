@@ -51,7 +51,7 @@
       still at the SDK default of 1.0.0 while the installer said 1.15.0, and
       the About dialog dutifully reported the wrong one.
     -->
-    <Version>2.1.2</Version>
+    <Version>2.2.0</Version>
 
     <!--
       The SDK otherwise appends "+<git sha>" to the informational version, which
@@ -118,6 +118,15 @@
     <!-- Same 20-page fixture render_core's own tests use; stands in for real document loading until a file-open flow exists. Multi-page so the phase 2 thumbnail sidebar / page navigation has something to show. -->
     <Content Include="..\render_core\tests\fixtures\sample_20pages.pdf" Condition="Exists('..\render_core\tests\fixtures\sample_20pages.pdf')">
       <Link>sample.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!--
+      One blank US Letter page, opened at startup so there is always a surface
+      to draw on. Without it the app starts on an empty canvas and every test
+      of a drawing tool begins with a File>Open.
+    -->
+    <Content Include="..\render_core\tests\fixtures\blank.pdf" Condition="Exists('..\render_core\tests\fixtures\blank.pdf')">
+      <Link>blank.pdf</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
