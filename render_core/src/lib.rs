@@ -1621,9 +1621,22 @@ fn extract_stamp_pixels(doc_handle: u64, page_index: i32, index: i32) -> Option<
             continue;
         };
         if let PdfPageObject::Image(image) = &object {
+            // RAW, the opposite of what the resize path wants.
+            //
+            // get_processed_bitmap applies the object's transforms, so on an
+            // already-turned stamp it returns pixels with the current angle
+            // BAKED IN. Re-placing those at a new angle adds the two together
+            // and resamples the picture again every time: the stamp turned the
+            // wrong distance and grew visibly more skewed with each rotation.
+            //
+            // The raw buffer is the source image, untransformed, which is
+            // exactly what a rotation to an ABSOLUTE angle needs. It also
+            // ignores a separate image mask, which is safe here because these
+            // stamps are created by set_bitmap from decoded BGRA and carry
+            // their alpha in the buffer itself rather than in a mask.
             let bitmap = image
-                .get_processed_bitmap(&doc_guard)
-                .or_else(|_| image.get_raw_bitmap());
+                .get_raw_bitmap()
+                .or_else(|_| image.get_processed_bitmap(&doc_guard));
             if let Ok(bitmap) = bitmap {
                 let format = bitmap.format().unwrap_or(PdfBitmapFormat::BGRA);
                 return to_bgra(bitmap.width(), bitmap.height(), format, &bitmap.as_raw_bytes());
@@ -1865,7 +1878,11 @@ fn add_stamp_annotation_inner(
     let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let (bw, bh) = (x1 - x0, y1 - y0);
 
-    let rad = rotation_deg.to_radians();
+    // NEGATED. The app's angle is clockwise ON SCREEN, where y runs down;
+    // PDF space has y running up, and the textbook matrix [cos sin -sin cos]
+    // turns counter-clockwise there. Without the negation a stamp turned the
+    // opposite way to its own selection frame.
+    let rad = (-rotation_deg).to_radians();
     let (sin, cos) = (rad.sin(), rad.cos());
 
     // PDFium CLIPS an annotation's appearance to its rectangle, so a turned
@@ -10698,6 +10715,120 @@ mod tests {
         free_byte_buffer(tag);
         close_document(handle);
         assert_eq!(String::from_utf8(bytes).unwrap(), legacy);
+    }
+
+    /// A stamp image that is asymmetric in BOTH axes: a wide white block with
+    /// its LEFT quarter red. The red marker is what says which way round the
+    /// picture ended up, which a symmetric block cannot.
+    fn marker_stamp_pixels(pw: i32, ph: i32) -> Vec<u8> {
+        let mut px = Vec::with_capacity((pw * ph * 4) as usize);
+        for _y in 0..ph {
+            for x in 0..pw {
+                if x < pw / 4 {
+                    px.extend_from_slice(&[0, 0, 255, 255]); // BGRA red
+                } else {
+                    px.extend_from_slice(&[255, 255, 255, 255]); // opaque white
+                }
+            }
+        }
+        px
+    }
+
+    #[test]
+    fn rotating_a_stamp_turns_it_clockwise_on_screen() {
+        // The app's angle is clockwise as the user sees it. PDF space has y
+        // running up, where the textbook rotation matrix turns the other way,
+        // so a missing negation made the stamp turn opposite to its own
+        // selection frame. The red marker starts on the LEFT; a quarter turn
+        // clockwise must put it at the TOP.
+        const CAP: i32 = 1000;
+        let (pw, ph) = (40i32, 10i32);
+        let pixels = marker_stamp_pixels(pw, ph);
+
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let (l, t, r, b) = (0.30 * CAP as f32, 0.45 * CAP as f32, 0.70 * CAP as f32, 0.55 * CAP as f32);
+        assert_eq!(
+            add_stamp_annotation(handle, 0, CAP, l, t, r, b, pixels.as_ptr(), pixels.len(), pw, ph),
+            STATUS_OK_PDFIUM
+        );
+
+        let up = red_bbox_norm(handle, 600).expect("marker missing");
+        let up_cx = (up.0 + up.2) / 2.0;
+
+        let mut idx = -1;
+        assert_eq!(
+            rotate_stamp_annotation(handle, 0, 0, CAP, 90.0, &mut idx as *mut i32),
+            STATUS_OK_PDFIUM
+        );
+        let turned = red_bbox_norm(handle, 600).expect("marker missing after rotate");
+        close_document(handle);
+
+        println!("STAMP DIRECTION: marker {up:?} -> {turned:?}");
+
+        // Started left of the stamp's centre (0.50); a clockwise quarter turn
+        // must move it ABOVE the centre (smaller y), not below.
+        assert!(up_cx < 0.5, "the marker should start on the left, got {up:?}");
+        let t_cy = (turned.1 + turned.3) / 2.0;
+        assert!(
+            t_cy < 0.5,
+            "after a CLOCKWISE quarter turn the marker should sit above centre,              but its centre y is {t_cy:.3}; it turned the wrong way"
+        );
+    }
+
+    #[test]
+    fn rotating_a_stamp_twice_does_not_compound_or_smear_it() {
+        // Rotation is to an ABSOLUTE angle, so rotating to 45 and then to 90
+        // must land in exactly the same place as going straight to 90.
+        //
+        // It did not. The pixels were extracted with get_processed_bitmap,
+        // which bakes the object's current transform into the buffer, so the
+        // second rotation re-rotated already-rotated pixels: the angle added
+        // up and the picture was resampled again each time, growing visibly
+        // more skewed. This is the regression test for that.
+        const CAP: i32 = 1000;
+        let (pw, ph) = (40i32, 10i32);
+        let pixels = marker_stamp_pixels(pw, ph);
+        let (l, t, r, b) = (0.30 * CAP as f32, 0.45 * CAP as f32, 0.70 * CAP as f32, 0.55 * CAP as f32);
+
+        let place = || {
+            let h = open_fixture_named("tests/fixtures/blank.pdf");
+            assert_eq!(
+                add_stamp_annotation(h, 0, CAP, l, t, r, b, pixels.as_ptr(), pixels.len(), pw, ph),
+                STATUS_OK_PDFIUM
+            );
+            h
+        };
+
+        // Straight to 90.
+        let direct = place();
+        let mut i0 = -1;
+        assert_eq!(rotate_stamp_annotation(direct, 0, 0, CAP, 90.0, &mut i0 as *mut i32), STATUS_OK_PDFIUM);
+        let once = red_bbox_norm(direct, 600).expect("marker missing");
+        close_document(direct);
+
+        // Via 45.
+        let staged = place();
+        let mut i1 = -1;
+        assert_eq!(rotate_stamp_annotation(staged, 0, 0, CAP, 45.0, &mut i1 as *mut i32), STATUS_OK_PDFIUM);
+        let mut i2 = -1;
+        assert_eq!(rotate_stamp_annotation(staged, 0, i1, CAP, 90.0, &mut i2 as *mut i32), STATUS_OK_PDFIUM);
+        let twice = red_bbox_norm(staged, 600).expect("marker missing");
+        close_document(staged);
+
+        println!("STAMP COMPOUNDING: direct {once:?} vs via-45 {twice:?}");
+
+        let tol = 0.03;
+        for (a, b2, what) in [
+            (once.0, twice.0, "left"),
+            (once.1, twice.1, "top"),
+            (once.2, twice.2, "right"),
+            (once.3, twice.3, "bottom"),
+        ] {
+            assert!(
+                (a - b2).abs() < tol,
+                "rotating to 45 then 90 should match rotating straight to 90,                  but {what} differs: {a:.3} vs {b2:.3} - the angle is compounding"
+            );
+        }
     }
 
     #[test]
