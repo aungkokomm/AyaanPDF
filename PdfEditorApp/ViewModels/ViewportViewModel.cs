@@ -3161,7 +3161,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             _selectedRotationDeg = tag.RotationDeg;
             _selectedLoaded = new LoadedSelection(
-                sel.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom);
+                sel.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom, sel.Id);
         }
         else
         {
@@ -4198,7 +4198,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         for (int i = firstNewIndex; i < all.Count && i < firstNewIndex + emitted; i++)
         {
             var a = all[i];
-            var newSel = new LoadedSelection(page, a.Index, a.Left, a.Top, a.Right, a.Bottom);
+            var newSel = new LoadedSelection(page, a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id);
             if (_selectedLoaded is null) { _selectedLoaded = newSel; }
             else { _extraSelected.Add(newSel); }
         }
@@ -4508,7 +4508,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (all.Count == 0) { return false; }
         var newest = all[^1];
         _selectedLoaded = new LoadedSelection(
-            sel.PageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom);
+            sel.PageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom, newest.Id);
         _extraSelected.Clear();
         ApplyTextBoxSelectionInfo(sel.PageIndex, newest.Index);
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
@@ -4740,7 +4740,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             _selectedRotationDeg = tag.RotationDeg;
             _selectedLoaded = new LoadedSelection(
-                start.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom);
+                start.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom, start.Id);
         }
         else
         {
@@ -4767,7 +4767,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         var newest = all[^1];
         _selectedLoaded = new LoadedSelection(
-            pageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom);
+            pageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom, newest.Id);
         ApplyTextBoxSelectionInfo(pageIndex, newest.Index);
         _loadedDrag = null;
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
@@ -5251,7 +5251,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (a.Right < rect.Left || a.Left > rect.Right) { continue; }
             if (a.Bottom < rect.Top || a.Top > rect.Bottom) { continue; }
-            hits.Add(new LoadedSelection(_marqueePage, a.Index, a.Left, a.Top, a.Right, a.Bottom));
+            hits.Add(new LoadedSelection(_marqueePage, a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id));
         }
         if (hits.Count == 0)
         {
