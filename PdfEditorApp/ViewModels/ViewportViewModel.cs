@@ -5351,6 +5351,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             if (a.Bottom < rect.Top || a.Top > rect.Bottom) { continue; }
             hits.Add(new LoadedSelection(_marqueePage, a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id));
         }
+        Diag.Log($"EndSelectionMarquee: rect {rect.Left:F3},{rect.Top:F3}..{rect.Right:F3},{rect.Bottom:F3} hit {hits.Count} annotations");
         if (hits.Count == 0)
         {
             RefreshSelectionOutline();
@@ -5383,6 +5384,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
         }
 
+        Diag.Log($"EndSelectionMarquee done: SelectionCount={SelectionCount} (anchor + {_extraSelected.Count} extras)");
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));

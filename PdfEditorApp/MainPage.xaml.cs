@@ -579,11 +579,16 @@ public sealed partial class MainPage : Page
     // MenuFlyoutItem's KeyboardAccelerator (fires Ctrl+G directly - proven
     // to work from the Rulers/Ctrl+R precedent), and the RootGrid
     // KeyboardAccelerator below as a third belt.
-    private void Group_Click(object sender, RoutedEventArgs e) => ViewModel.GroupSelected();
+    private void Group_Click(object sender, RoutedEventArgs e)
+    {
+        Diag.Log("Group_Click fired (menu item)");
+        ViewModel.GroupSelected();
+    }
     private void Ungroup_Click(object sender, RoutedEventArgs e) => ViewModel.UngroupSelected();
 
     private void GroupShortcut_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
     {
+        Diag.Log($"GroupShortcut_Invoked fired (Ctrl+G accelerator), SelectionCount={ViewModel.SelectionCount}");
         ViewModel.GroupSelected();
         args.Handled = true;
     }
