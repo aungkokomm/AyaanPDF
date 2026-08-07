@@ -309,6 +309,105 @@ public class EditHistoryTests
     }
 
     [Fact]
+    public void Three_different_operations_undo_and_redo_in_order()
+    {
+        // A, B, C of DIFFERENT kinds, then three undos and three redos. Mixed
+        // kinds matter: a bug in one record type would otherwise hide behind
+        // the others in a uniform sequence.
+        var doc = new FakeDoc();
+        var history = new DocumentHistory();
+        var kept = Guid.NewGuid();
+        doc.Objects[kept] = (R(0), "orig");
+
+        var a = Entry("A create", Created(Guid.NewGuid(), 100));
+        var b = Entry("B move", new BoundsRecord(kept, 0, R(0), R(60)));
+        var c = Entry("C restyle", new TagRecord(kept, 0, "orig", "styled", R(60)));
+
+        foreach (var e in new[] { a, b, c })
+        {
+            history.Push(e);
+            doc.Apply(e, backwards: false);
+        }
+        Assert.Equal(2, doc.Objects.Count);
+        Assert.Equal("styled", doc.Objects[kept].Tag);
+        Assert.Equal(R(60), doc.Objects[kept].Rect);
+
+        doc.Apply(history.Undo(Identity)!, backwards: true);
+        Assert.Equal("orig", doc.Objects[kept].Tag);
+        doc.Apply(history.Undo(Identity)!, backwards: true);
+        Assert.Equal(R(0), doc.Objects[kept].Rect);
+        doc.Apply(history.Undo(Identity)!, backwards: true);
+        Assert.Single(doc.Objects);
+        Assert.False(history.CanUndo);
+
+        doc.Apply(history.Redo(Identity)!, backwards: false);
+        Assert.Equal(2, doc.Objects.Count);
+        doc.Apply(history.Redo(Identity)!, backwards: false);
+        Assert.Equal(R(60), doc.Objects[kept].Rect);
+        doc.Apply(history.Redo(Identity)!, backwards: false);
+        Assert.Equal("styled", doc.Objects[kept].Tag);
+        Assert.False(history.CanRedo);
+    }
+
+    [Fact]
+    public void Repeated_edits_to_the_same_object_unwind_one_at_a_time()
+    {
+        // Four moves of ONE object. Each undo must step back exactly one hop,
+        // not jump to the original or collapse the lot, which is what happens
+        // if records share state or the stack coalesces them.
+        var doc = new FakeDoc();
+        var history = new DocumentHistory();
+        var id = Guid.NewGuid();
+        doc.Objects[id] = (R(0), "t");
+
+        for (int i = 0; i < 4; i++)
+        {
+            var e = Entry($"Move {i}", new BoundsRecord(id, 0, R(i * 10), R((i + 1) * 10)));
+            history.Push(e);
+            doc.Apply(e, backwards: false);
+        }
+        Assert.Equal(R(40), doc.Objects[id].Rect);
+
+        for (int i = 3; i >= 0; i--)
+        {
+            doc.Apply(history.Undo(Identity)!, backwards: true);
+            Assert.Equal(R(i * 10), doc.Objects[id].Rect);
+        }
+        Assert.False(history.CanUndo);
+    }
+
+    [Fact]
+    public void A_recreated_object_keeps_the_identity_it_had_before_deletion()
+    {
+        // The app deletes and re-adds constantly, so identity has to be carried
+        // by the record rather than by whatever index the rebuild lands on.
+        // Anything still pointing at the object - a group, a later history
+        // record - resolves only if the SAME Guid comes back.
+        var doc = new FakeDoc();
+        var history = new DocumentHistory();
+        var id = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        doc.Objects[id] = (R(5), "AyaanShape:0:00FF00FF:2.0000:1:1");
+        doc.Objects[other] = (R(90), "AyaanShape:1:0000FFFF:2.0000:1:1");
+        doc.Groups.Add(new List<Guid> { id, other });
+
+        var del = Entry("Delete annotation",
+            new ExistenceRecord(id, 0, "AyaanShape:0:00FF00FF:2.0000:1:1", R(5),
+                                ExistsAfter: false, Recoverable: true));
+        history.Push(del);
+        doc.Apply(del, backwards: false);
+        Assert.False(doc.Objects.ContainsKey(id));
+
+        doc.Apply(history.Undo(Identity)!, backwards: true);
+
+        // Same Guid, same rectangle, and the group that referenced it still
+        // resolves to a live object.
+        Assert.True(doc.Objects.ContainsKey(id));
+        Assert.Equal(R(5), doc.Objects[id].Rect);
+        Assert.All(doc.Groups[0], member => Assert.True(doc.Objects.ContainsKey(member)));
+    }
+
+    [Fact]
     public void A_batch_of_records_is_applied_forwards_and_reversed_backwards()
     {
         // Ordering within one entry matters when records touch the same object:

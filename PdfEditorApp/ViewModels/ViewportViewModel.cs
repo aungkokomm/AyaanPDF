@@ -434,6 +434,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // a burn/save (preserveAnnotations) is also a clean slate: those marks
         // are now baked into the page content, so there is nothing to undo.
         _history.Clear();
+        // Any half-open action belongs to the document being closed.
+        _openBatch = null;
+        _openBatchFallback = null;
         IsDirty = false;
         NotifyHistoryChanged();
 
@@ -3715,6 +3718,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // Put the marquee back where the mark still is, rather than
             // leaving it somewhere the document does not agree with.
             _selectedLoaded = start;
+            AbandonEdit();
             RefreshSelectionOutline();
             Status = status == RenderStatus.Unsupported
                 ? (resizing ? "A drawing cannot be resized yet." : "That annotation cannot be moved.")
@@ -5036,6 +5040,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (status != RenderStatus.OkPdfium)
         {
+            // Nothing was removed, so there is nothing to record. Abandoning
+            // matters more than it looks: BeginEdit is re-entrant-guarded, so a
+            // batch left open here would swallow every later operation's
+            // records and silently stop the history.
+            AbandonEdit();
             Status = "Could not delete that annotation.";
             return true;
         }
@@ -5067,6 +5076,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             InvalidateLoadedPage(page);
         }
+        CommitEdit();
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
@@ -6451,7 +6461,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void BeginEdit(string label)
     {
-        if (_openBatch is not null) { return; }
+        // A batch left open by an early return would otherwise swallow every
+        // later operation's records, because this guard would keep ignoring
+        // the new BeginEdit and nothing would ever push. Rather than trust
+        // every exit path, an already-open batch is CLOSED here: whatever it
+        // collected is a complete user action in its own right, and pushing it
+        // is strictly better than discarding it or merging it into the next
+        // one. Genuine nesting does not occur - no operation here calls
+        // another that also records.
+        if (_openBatch is not null)
+        {
+            Diag.Log($"BeginEdit('{label}') found an open batch '{_openBatchLabel}' with {_openBatch.Count} records; closing it first");
+            CommitEdit();
+        }
         _openBatch = new List<EditRecord>();
         _openBatchLabel = label;
         _openBatchWasDirty = IsDirty;
