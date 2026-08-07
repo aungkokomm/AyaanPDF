@@ -4593,6 +4593,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // A mark can only be in ONE group at a time (flat, non-nested); drop
         // any group that overlaps with the new one, then add.
+        // DIAGNOSTIC (temporary): prove whether the ids just written are
+        // actually ON the annotations now. ReadId goes straight to the FFI, so
+        // this bypasses the loaded-annotation cache entirely and reports what
+        // the DOCUMENT holds, not what the app last remembered. Nothing here
+        // mutates anything - no invalidation, no write.
+        Diag.Log($"GroupSelected READBACK: expecting {ids.Count} persisted ids");
+        {
+            var members = new List<LoadedSelection> { anchor };
+            members.AddRange(_extraSelected);
+            foreach (var m in members)
+            {
+                if (m.Id == Guid.Empty) { continue; }
+                var persisted = Interop.AnnotationLoader.ReadId(_documentHandle, m.PageIndex, m.Index);
+                bool match = persisted == m.Id;
+                Diag.Log($"  READBACK p{m.PageIndex}#{m.Index} expected={m.Id:N} persisted={(persisted?.ToString("N") ?? "NULL")} {(match ? "MATCH" : "*** DIVERGED ***")}");
+            }
+        }
+
         var groupsBefore = SnapshotGroups();
         _groups.RemoveAll(g => g.Any(id => ids.Contains(id)));
         _groups.Add(ids);
