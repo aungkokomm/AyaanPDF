@@ -4570,16 +4570,41 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void StampSelectedIds()
     {
         if (_documentHandle == 0) { return; }
-        if (_selectedLoaded is LoadedSelection anchor && anchor.Id != Guid.Empty)
+        if (_selectedLoaded is LoadedSelection anchor)
         {
-            Interop.AnnotationLoader.WriteId(_documentHandle, anchor.PageIndex, anchor.Index, anchor.Id);
+            StampOne(anchor);
         }
         foreach (var ex in _extraSelected)
         {
-            if (ex.Id != Guid.Empty)
+            StampOne(ex);
+        }
+
+        // Locate the annotation by Id and write to THAT index, never to the
+        // index cached on the selection.
+        //
+        // This used to write to sel.Index directly, and it was destroying
+        // identity. By the time this runs, every write in the move loop has
+        // deleted and re-added its annotation, so the whole page has shifted
+        // and the cached indices name different marks. Stamping through them
+        // put one member's Id onto another member's annotation: a five-shape
+        // group lost a member outright (its slot was overwritten by the
+        // anchor's Id) and gained a duplicate elsewhere, after which the group
+        // could only ever expand to four, and NormalizeExtras dropped the
+        // duplicate as a repeat. That is the "select five, only one moves"
+        // report.
+        //
+        // Skipping when the Id cannot be found is the point: an annotation
+        // that does not answer to its Id must NOT be repaired by guessing at a
+        // slot, because guessing is what broke it.
+        void StampOne(LoadedSelection sel)
+        {
+            if (sel.Id == Guid.Empty) { return; }
+            if (FindLoadedById(sel.Id, sel.PageIndex) is not (int page, int index))
             {
-                Interop.AnnotationLoader.WriteId(_documentHandle, ex.PageIndex, ex.Index, ex.Id);
+                Diag.Log($"StampSelectedIds: id={sel.Id:N} not found, skipping rather than stamping a stale slot");
+                return;
             }
+            Interop.AnnotationLoader.WriteId(_documentHandle, page, index, sel.Id);
         }
     }
 
