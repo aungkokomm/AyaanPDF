@@ -185,7 +185,7 @@ public class AnnotationBoundsHistoryTests
     {
         Scope = HistoryScope.AnnotationBounds,
         Label = "Move annotation",
-        Bounds = new AnnotationBoundsState(0, index, left, top, left + 0.2, top + 0.1),
+        Bounds = [new AnnotationBoundsState(0, index, left, top, left + 0.2, top + 0.1, System.Guid.Empty)],
     };
 
     [Fact]
@@ -233,18 +233,18 @@ public class AnnotationBoundsHistoryTests
         {
             Scope = t.Scope,
             Label = t.Label,
-            Bounds = new AnnotationBoundsState(0, t.Bounds!.Index, 0.50, 0.50, 0.70, 0.60),
+            Bounds = [new AnnotationBoundsState(0, t.Bounds[0].Index, 0.50, 0.50, 0.70, 0.60, System.Guid.Empty)],
         });
 
         Assert.NotNull(target);
         Assert.Equal(HistoryScope.AnnotationBounds, target!.Scope);
-        Assert.Equal(3, target.Bounds!.Index);
-        Assert.Equal(0.20, target.Bounds.Left, 6);
+        Assert.Equal(3, target.Bounds[0].Index);
+        Assert.Equal(0.20, target.Bounds[0].Left, 6);
 
         // And redo goes back to where undo took it from.
         Assert.True(history.CanRedo);
         var back = history.Redo(t => t);
-        Assert.Equal(0.50, back!.Bounds!.Left, 6);
+        Assert.Equal(0.50, back!.Bounds[0].Left, 6);
     }
 
     [Fact]

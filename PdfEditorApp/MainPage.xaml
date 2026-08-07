@@ -754,6 +754,10 @@
                                             IsEnabled="{x:Bind ViewModel.CanRedo, Mode=OneWay}">
                                 <MenuFlyoutItem.KeyboardAccelerators>
                                     <KeyboardAccelerator Modifiers="Control" Key="Y" />
+                                    <!-- Ctrl+Shift+Z as well: both are standard for redo on
+                                         Windows and users arrive expecting whichever their
+                                         previous editor used. -->
+                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="Z" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <MenuFlyoutSeparator />

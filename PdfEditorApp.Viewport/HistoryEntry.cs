@@ -17,6 +17,17 @@ public enum HistoryScope
     Document,
 
     /// <summary>
+    /// One user action expressed as a list of reversible <see cref="EditRecord"/>s.
+    ///
+    /// The preferred scope for anything that edits annotations. Each record
+    /// carries the state before AND after, so undo and redo are the same walk
+    /// in opposite directions and neither has to reconstruct the other's
+    /// target. It also costs bytes rather than megabytes: a document snapshot
+    /// for a nudge copies the whole PDF.
+    /// </summary>
+    Records,
+
+    /// <summary>
     /// One or more annotation objects in the file were moved or resized.
     ///
     /// Its own scope because the inverse is exactly four numbers per object:
@@ -81,6 +92,26 @@ public sealed class HistoryEntry
     public byte[]? DocumentBytes { get; init; }
 
     /// <summary>
+    /// Set for <see cref="HistoryScope.Records"/> entries: the individual
+    /// changes this one user action made, in the order they were applied.
+    /// Undo walks them BACKWARDS applying each Before; redo walks them
+    /// forwards applying each After.
+    ///
+    /// A list because one user action routinely touches many objects: aligning
+    /// a multi-selection, dragging a group, pasting several marks. Those must
+    /// undo as ONE step, not as one step per object.
+    /// </summary>
+    public IReadOnlyList<EditRecord> Records { get; init; } = [];
+
+    /// <summary>
+    /// A document snapshot paired with records, for actions that include a
+    /// change no record can reverse (deleting an image stamp, whose pixels are
+    /// not recoverable from a tag). Undo restores the bytes and then still
+    /// applies the records, so the cheap parts stay cheap.
+    /// </summary>
+    public byte[]? FallbackBytes { get; init; }
+
+    /// <summary>
     /// Set only for <see cref="HistoryScope.AnnotationBounds"/> entries: the
     /// rectangles to put annotations back to.
     ///
@@ -100,7 +131,10 @@ public sealed class HistoryEntry
     /// </summary>
     public long Cost =>
         DocumentBytes?.LongLength
-        ?? (Bounds.Count > 0
+        ?? FallbackBytes?.LongLength
+        ?? (Records.Count > 0
+                ? Records.Count * 256L
+                : Bounds.Count > 0
                 ? Bounds.Count * 64L
                 : (Highlights.Count + InkStrokes.Count + Shapes.Count + Notes.Count) * 128L + 256L);
 }

@@ -11025,6 +11025,50 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_of_four_shapes_all_arrive_on_a_real_document() {
+        // Mirrors the C# ShapeInteropTests batch, which started failing with a
+        // count of 1 and NaN bounds. Same fixture, same four kinds.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        const CAP: i32 = 1000;
+        let mk = |kind: i32, x1: f32, y1: f32, x2: f32, y2: f32| ShapeSpec {
+            page_index: 0, kind,
+            x1, y1, x2, y2,
+            r: 255, g: 0, b: 0, a: 255,
+            width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0,
+        };
+        let specs = [
+            mk(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0),
+            mk(SHAPE_ELLIPSE, 350.0, 100.0, 550.0, 200.0),
+            mk(SHAPE_LINE, 100.0, 300.0, 550.0, 300.0),
+            mk(SHAPE_ARROW, 100.0, 400.0, 550.0, 400.0),
+        ];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let array = get_annotations(handle, 0);
+        let count = array.len;
+        let items: Vec<(f32, f32, f32, f32)> = if array.items.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(array.items, array.len) }
+                .iter()
+                .map(|i| (i.left, i.top, i.right, i.bottom))
+                .collect()
+        };
+        free_annotation_array(array);
+        close_document(handle);
+
+        println!("BATCH: count={count} first={:?}", items.first());
+        assert_eq!(count, 4, "all four shapes should be on the page");
+        for (i, it) in items.iter().enumerate() {
+            assert!(it.0.is_finite() && it.1.is_finite() && it.2.is_finite() && it.3.is_finite(),
+                    "shape {i} came back with non-finite bounds: {it:?}");
+        }
+    }
+
+    #[test]
     fn moving_three_shapes_as_a_group_moves_all_three_drawings() {
         // The whole reported failure, end to end, in the core: three shapes
         // drawn side by side, then every one of them moved down by the same

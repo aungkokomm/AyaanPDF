@@ -3646,9 +3646,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 e.PageIndex, e.Index, e.Left, e.Top, e.Right, e.Bottom, e.Id));
         }
 
-        PushHistory(HistoryScope.AnnotationBounds,
-                    resizing ? "Resize annotation" : "Move annotation",
-                    undoTargets);
+        // ONE entry for the whole gesture, however many objects it moved and
+        // however many pointer events produced it. The matching records are
+        // emitted at the end of this method, once the writes have landed and
+        // the real "after" rectangles can be read back.
+        BeginEdit(resizing ? "Resize annotation" : "Move annotation");
 
         // resize_annotation, not set_annotation_bounds: it does the same thing
         // for a move or a quad-point resize, and rebuilds the annotation when
@@ -3896,6 +3898,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // The anchor's own write also stripped its ID prefix, and a
         // single-selection move never enters the block above at all.
         StampSelectedIds();
+        RecordBoundsBatch(undoTargets);
+        CommitEdit();
         RefreshSelectionOutline();
     }
 
@@ -4443,8 +4447,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // A mark can only be in ONE group at a time (flat, non-nested); drop
         // any group that overlaps with the new one, then add.
+        var groupsBefore = SnapshotGroups();
         _groups.RemoveAll(g => g.Any(id => ids.Contains(id)));
         _groups.Add(ids);
+        BeginEdit("Group");
+        RecordEdit(new GroupsRecord(groupsBefore, SnapshotGroups()));
+        CommitEdit();
         Diag.Log($"GroupSelected done: groups={_groups.Count}, members=[{string.Join(",", ids)}]");
         Status = $"Grouped {ids.Count} marks.";
         return true;
@@ -4459,7 +4467,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Status = "Nothing selected to ungroup.";
             return false;
         }
+        var ungroupBefore = SnapshotGroups();
         int removed = _groups.RemoveAll(g => g.Contains(anchor.Id));
+        if (removed > 0)
+        {
+            BeginEdit("Ungroup");
+            RecordEdit(new GroupsRecord(ungroupBefore, SnapshotGroups()));
+            CommitEdit();
+        }
         Status = removed > 0 ? "Ungrouped." : "That mark isn't in a group.";
         return removed > 0;
     }
@@ -4997,12 +5012,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
         }
 
-        // A document snapshot, unlike move and resize. Undoing a delete means
-        // bringing the annotation's whole content back, and nothing smaller
-        // than the document holds it: the entry would have to carry the image,
-        // the quad points, the colours and the appearance stream. This is the
-        // one annotation edit worth the cost.
-        PushHistory(HistoryScope.Document, "Delete annotation");
+        // Deleting records each mark's tag so it can be rebuilt, and falls
+        // back to a document snapshot only for kinds a tag cannot describe -
+        // an image stamp, whose pixels live in the file. Shapes and text boxes,
+        // which is most of what gets deleted, cost bytes instead of megabytes.
+        BeginEdit("Delete annotation");
+        foreach (var victim in new[] { sel }.Concat(_extraSelected))
+        {
+            if (ReadAnnotationState(victim.PageIndex, victim.Index) is not (string vtag, EditRect vrect))
+            {
+                RecordUnreversible();
+                continue;
+            }
+            bool recoverable = vtag.StartsWith("AyaanShape:", StringComparison.Ordinal)
+                               || TextBoxTagReader.TryParse(vtag, out _);
+            if (!recoverable) { RecordUnreversible(); }
+            RecordEdit(new ExistenceRecord(
+                victim.Id, victim.PageIndex, vtag, vrect, ExistsAfter: false, Recoverable: recoverable));
+        }
 
         int status = RenderCoreNative.delete_annotation(_documentHandle, sel.PageIndex, sel.Index);
         Diag.Log($"delete loaded annotation p{sel.PageIndex}#{sel.Index} -> {status}");
@@ -5791,7 +5818,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 FillRgba = PackShapeFillRgba(ShapeFillHex),
             };
 
-            PushHistory(HistoryScope.Document, "Draw shape");
+            BeginEdit("Draw shape");
             int status = RenderCoreNative.add_shape_annotations(
                 _documentHandle, CaptureWidth, new[] { spec }, 1);
 
@@ -5800,9 +5827,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 IsDirty = true;
                 InvalidateLoadedPage(_shapePageIndex);
                 SelectNewestAnnotation(_shapePageIndex);
+
+                // A shape is fully described by its tag, so undo deletes it and
+                // redo rebuilds it from the same description. No document copy
+                // for the commonest edit there is.
+                if (_selectedLoaded is LoadedSelection made
+                    && ReadAnnotationState(made.PageIndex, made.Index) is (string tag, EditRect rect))
+                {
+                    RecordEdit(new ExistenceRecord(
+                        made.Id, made.PageIndex, tag, rect, ExistsAfter: true, Recoverable: true));
+                }
+                CommitEdit();
             }
             else
             {
+                AbandonEdit();
                 Diag.Log($"EndShape add_shape_annotations -> {status}");
                 Status = "Could not add that shape.";
             }
@@ -6387,7 +6426,335 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// the three overlay lists; document scope serializes the whole PDF, which
     /// is the only way to reverse a page delete or rotation.
     /// </summary>
-    private HistoryEntry Capture(HistoryEntry target) => Capture(target.Scope, target.Label, target.Bounds);
+    // ---------------- Record-based history ----------------
+
+    /// <summary>
+    /// Records being accumulated for the user action in progress, or null when
+    /// no action is open. One gesture opens a batch, makes any number of
+    /// changes, and closes it, so a drag firing hundreds of pointer events
+    /// still lands as ONE undo step.
+    /// </summary>
+    private List<EditRecord>? _openBatch;
+
+    private string _openBatchLabel = string.Empty;
+
+    private bool _openBatchWasDirty;
+
+    /// <summary>Snapshot taken at batch open, used only if a record in the
+    /// batch turns out to be unreversible (see ExistenceRecord).</summary>
+    private byte[]? _openBatchFallback;
+
+    /// <summary>
+    /// Opens a user action. Everything recorded until CommitEdit becomes one
+    /// undo step. Re-entrant calls are ignored, so a high-level operation that
+    /// internally calls a lower-level one still produces a single step.
+    /// </summary>
+    private void BeginEdit(string label)
+    {
+        if (_openBatch is not null) { return; }
+        _openBatch = new List<EditRecord>();
+        _openBatchLabel = label;
+        _openBatchWasDirty = IsDirty;
+        _openBatchFallback = null;
+    }
+
+    private void RecordEdit(EditRecord record) => _openBatch?.Add(record);
+
+    /// <summary>
+    /// Takes a document snapshot for the open batch, for an action containing a
+    /// change no record can reverse. Only the first call in a batch is kept,
+    /// since that is the state the batch started from.
+    /// </summary>
+    private void RecordUnreversible()
+    {
+        if (_openBatch is null || _openBatchFallback is not null || _documentHandle == 0) { return; }
+        _openBatchFallback = SnapshotDocumentBytes();
+    }
+
+    /// <summary>Closes the open action and pushes it. An action that recorded
+    /// nothing is dropped rather than pushed as an empty step the user would
+    /// have to undo through.</summary>
+    private void CommitEdit()
+    {
+        var batch = _openBatch;
+        _openBatch = null;
+        if (batch is null || batch.Count == 0) { return; }
+
+        _history.Push(new HistoryEntry
+        {
+            Scope = HistoryScope.Records,
+            Label = _openBatchLabel,
+            WasDirty = _openBatchWasDirty,
+            PageIndex = CurrentPageIndex,
+            Records = batch,
+            FallbackBytes = _openBatchFallback,
+        });
+        NotifyHistoryChanged();
+    }
+
+    /// <summary>Abandons the open action, for a gesture that changed nothing.</summary>
+    private void AbandonEdit() => _openBatch = null;
+
+    private byte[]? SnapshotDocumentBytes()
+    {
+        if (_documentHandle == 0) { return null; }
+        var buffer = RenderCoreNative.snapshot_document(_documentHandle);
+        byte[]? bytes = null;
+        if (buffer.Status == RenderStatus.OkPdfium && buffer.Data != IntPtr.Zero && buffer.Len > 0)
+        {
+            bytes = new byte[(int)buffer.Len];
+            Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+        }
+        RenderCoreNative.free_byte_buffer(buffer);
+        return bytes;
+    }
+
+    /// <summary>
+    /// Walks a record entry. backwards is undo: records replay in reverse, each
+    /// restoring its Before. Forwards is redo, applying each After in order.
+    /// One code path, so the two directions cannot drift apart.
+    /// </summary>
+    private void ApplyRecords(HistoryEntry entry, bool backwards)
+    {
+        // An unreversible member (a deleted stamp) means the batch carries the
+        // whole document as it was. Put that back first, then let the records
+        // run so anything they describe still lands exactly.
+        if (backwards && entry.FallbackBytes is { Length: > 0 })
+        {
+            RestoreDocumentBytes(entry.FallbackBytes);
+        }
+
+        var indices = Enumerable.Range(0, entry.Records.Count).ToList();
+        if (backwards) { indices.Reverse(); }
+
+        var touched = new HashSet<int>();
+        foreach (int i in indices)
+        {
+            switch (entry.Records[i])
+            {
+                case BoundsRecord b:
+                    ApplyBoundsRecord(b, backwards ? b.Before : b.After);
+                    touched.Add(b.PageIndex);
+                    break;
+
+                case TagRecord t:
+                    ApplyTagRecord(t, backwards ? t.BeforeTag : t.AfterTag);
+                    touched.Add(t.PageIndex);
+                    break;
+
+                case ExistenceRecord e:
+                    // Undo inverts what the edit did: a creation is removed, a
+                    // deletion is put back.
+                    ApplyExistenceRecord(e, backwards ? !e.ExistsAfter : e.ExistsAfter);
+                    touched.Add(e.PageIndex);
+                    break;
+
+                case GroupsRecord g:
+                    _groups.Clear();
+                    foreach (var members in backwards ? g.Before : g.After)
+                    {
+                        _groups.Add(new List<Guid>(members));
+                    }
+                    break;
+            }
+        }
+
+        foreach (int p in touched) { InvalidateLoadedPage(p); }
+
+        IsDirty = backwards ? entry.WasDirty : true;
+        ClearAnnotationSelection();
+        RefreshAnnotationsForCurrentPage();
+        RenderCurrentPage();
+        NotifyHistoryChanged();
+    }
+
+    /// <summary>Puts one annotation back to a rectangle, by Id, through the
+    /// same per-kind dispatch the move path uses.</summary>
+    private void ApplyBoundsRecord(BoundsRecord record, EditRect target)
+    {
+        if (FindLoadedById(record.Id, record.PageIndex) is not (int page, int index))
+        {
+            Diag.Log($"history bounds id={record.Id:N}: not found");
+            return;
+        }
+        var sel = new LoadedSelection(page, index, target.Left, target.Top, target.Right, target.Bottom, record.Id);
+        int newIndex = WriteMovedAnnotation(sel, sel, 1000);
+        if (newIndex >= 0)
+        {
+            InvalidateLoadedPage(page);
+            Interop.AnnotationLoader.WriteId(_documentHandle, page, newIndex, record.Id);
+            InvalidateLoadedPage(page);
+        }
+    }
+
+    /// <summary>Rewrites one annotation from a stored tag: remove it, then
+    /// re-create it from the tag's own description.</summary>
+    private void ApplyTagRecord(TagRecord record, string tag)
+    {
+        if (FindLoadedById(record.Id, record.PageIndex) is not (int page, int index))
+        {
+            Diag.Log($"history tag id={record.Id:N}: not found");
+            return;
+        }
+        if (RenderCoreNative.delete_annotation(_documentHandle, page, index) != RenderStatus.OkPdfium)
+        {
+            return;
+        }
+        InvalidateLoadedPage(page);
+        RecreateFromTag(page, tag, record.Rect, record.Id);
+    }
+
+    private void ApplyExistenceRecord(ExistenceRecord record, bool shouldExist)
+    {
+        var found = FindLoadedById(record.Id, record.PageIndex);
+        if ((found is not null) == shouldExist) { return; }
+
+        if (!shouldExist)
+        {
+            if (found is (int page, int index))
+            {
+                RenderCoreNative.delete_annotation(_documentHandle, page, index);
+                InvalidateLoadedPage(page);
+            }
+            return;
+        }
+
+        // Bringing it back. Anything not recoverable from its tag relied on the
+        // batch's document snapshot, which has already been restored.
+        if (record.Recoverable)
+        {
+            RecreateFromTag(record.PageIndex, record.Tag, record.Rect, record.Id);
+        }
+    }
+
+    /// <summary>
+    /// Re-creates an annotation from its tag at a rectangle, and stamps it with
+    /// the Id it had before, so anything referring to it (a group, a later
+    /// history record) still resolves.
+    /// </summary>
+    private void RecreateFromTag(int page, string tag, EditRect rect, Guid id)
+    {
+        const int Cap = 1000;
+        bool made = false;
+
+        if (tag.StartsWith("AyaanShape:", StringComparison.Ordinal))
+        {
+            var target = new LoadedSelection(page, -1, rect.Left, rect.Top, rect.Right, rect.Bottom, id);
+            if (ShapeSpecFromTag(tag, target, Cap, out var spec))
+            {
+                made = RenderCoreNative.add_shape_annotations(_documentHandle, Cap, new[] { spec }, 1)
+                       == RenderStatus.OkPdfium;
+            }
+        }
+        else if (TextBoxTagReader.TryParse(tag, out var box))
+        {
+            var (rr, gg, bb, aa) = ParseHex(box.ColorHex, defaultAlpha: 0xFF);
+            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(box.Text);
+            byte[]? fontUtf8 = string.IsNullOrEmpty(box.FontPath)
+                ? null
+                : System.Text.Encoding.UTF8.GetBytes(box.FontPath);
+            made = RenderCoreNative.add_text_box_annotation_styled(
+                _documentHandle, page, Cap,
+                (float)(rect.Left * Cap), (float)(rect.Top * Cap),
+                (float)(rect.Right * Cap), (float)(rect.Bottom * Cap),
+                utf8, (nuint)utf8.Length,
+                (float)(box.FontSizeNorm * Cap), rr, gg, bb, aa,
+                (int)box.Align,
+                PackRgba(box.FillHex), PackRgba(box.OutlineHex),
+                (float)(box.OutlineWidthNorm * Cap),
+                fontUtf8, (nuint)(fontUtf8?.Length ?? 0),
+                box.Underline ? 1 : 0, box.Strikethrough ? 1 : 0) == RenderStatus.OkPdfium;
+        }
+
+        if (!made) { return; }
+
+        InvalidateLoadedPage(page);
+        var all = LoadedFor(page);
+        if (all.Count > 0)
+        {
+            Interop.AnnotationLoader.WriteId(_documentHandle, page, all[^1].Index, id);
+            InvalidateLoadedPage(page);
+        }
+    }
+
+    private void RestoreDocumentBytes(byte[] bytes)
+    {
+        ulong restored = RenderCoreNative.open_document_from_bytes(bytes, (nuint)bytes.Length);
+        if (restored == 0) { return; }
+        CloseCurrentDocument();
+        _documentHandle = restored;
+        _textLayers.Clear();
+        ClearSelection();
+        ClearLoadedAnnotations();
+        PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
+        Thumbnails.Clear();
+        for (int i = 0; i < PageCount; i++)
+        {
+            Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
+        }
+    }
+
+    /// <summary>The tag and rectangle of one annotation right now, for
+    /// recording the "before" side of an edit. Null if it cannot be found.</summary>
+    private (string Tag, EditRect Rect)? ReadAnnotationState(int page, int index)
+    {
+        string? tag = ReadAnnotationContents(page, index);
+        if (tag is null) { return null; }
+        foreach (var a in LoadedFor(page))
+        {
+            if (a.Index == index)
+            {
+                return (tag, new EditRect(a.Left, a.Top, a.Right, a.Bottom));
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Emits one BoundsRecord per object of a finished move or resize, pairing
+    /// each object's pre-gesture rectangle with where it actually ended up.
+    ///
+    /// The "after" has to be read now rather than assumed from the drag: a text
+    /// box re-wraps to a different height, and a rotated mark's rectangle is
+    /// the enlarged box that contains it, so what was dragged is not always
+    /// what landed.
+    /// </summary>
+    private void RecordBoundsBatch(IReadOnlyList<AnnotationBoundsState> befores)
+    {
+        foreach (var b in befores)
+        {
+            if (b.Id == Guid.Empty) { continue; }
+            if (FindLoadedById(b.Id, b.PageIndex) is not (int page, int index)) { continue; }
+
+            foreach (var a in LoadedFor(page))
+            {
+                if (a.Index != index) { continue; }
+                RecordEdit(new BoundsRecord(
+                    b.Id, page,
+                    new EditRect(b.Left, b.Top, b.Right, b.Bottom),
+                    new EditRect(a.Left, a.Top, a.Right, a.Bottom)));
+                break;
+            }
+        }
+    }
+
+    /// <summary>Snapshot of the current grouping, for a GroupsRecord.</summary>
+    private IReadOnlyList<IReadOnlyList<Guid>> SnapshotGroups() =>
+        _groups.Select(g => (IReadOnlyList<Guid>)new List<Guid>(g)).ToList();
+
+    /// <summary>
+    /// The entry to put on the opposite stack when one is applied.
+    ///
+    /// A Records entry is returned UNCHANGED, because it already holds both
+    /// sides of every change it describes: undoing it is walking it backwards
+    /// and redoing it is walking it forwards, so the same object serves both
+    /// stacks. Only the older snapshot scopes need the current state captured
+    /// to build their inverse.
+    /// </summary>
+    private HistoryEntry Capture(HistoryEntry target) =>
+        target.Scope == HistoryScope.Records
+            ? target
+            : Capture(target.Scope, target.Label, target.Bounds);
 
     private HistoryEntry Capture(HistoryScope scope, string label,
                                  IReadOnlyList<AnnotationBoundsState>? boundsTargets = null)
@@ -6470,7 +6837,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_history.Undo(Capture) is { } target)
         {
-            ApplyHistoryEntry(target);
+            ApplyHistoryEntry(target, backwards: true);
         }
     }
 
@@ -6478,7 +6845,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_history.Redo(Capture) is { } target)
         {
-            ApplyHistoryEntry(target);
+            ApplyHistoryEntry(target, backwards: false);
         }
     }
 
@@ -6487,8 +6854,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// entry holds; an asymmetry between the two directions is not expressible
     /// because neither has its own restore code.
     /// </summary>
-    private void ApplyHistoryEntry(HistoryEntry entry)
+    private void ApplyHistoryEntry(HistoryEntry entry, bool backwards)
     {
+        // Record entries describe their own reversal, so they take the shared
+        // walker rather than any of the snapshot restores below.
+        if (entry.Scope == HistoryScope.Records)
+        {
+            ApplyRecords(entry, backwards);
+            return;
+        }
+
         // A per-annotation step restores one rectangle and leaves everything
         // else alone. It must NOT fall through to the overlay restore below:
         // this annotation lives in the document, not in those lists, and
