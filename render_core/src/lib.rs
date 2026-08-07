@@ -3488,7 +3488,19 @@ fn add_shape_annotations_inner(
             )
         };
 
-        let Ok(mut annotation) = page.annotations_mut().create_ink_annotation() else {
+        // A STAMP, not an Ink annotation.
+        //
+        // Both kinds take their appearance from the page objects added to
+        // them, so either renders correctly here. But an /Ink annotation is
+        // supposed to describe itself with an /InkList, and a shape drawn as
+        // paths has none. Acrobat treats such an annotation as malformed and
+        // refuses to select or move it, while text boxes (already stamps)
+        // behaved normally. Reported from the field: "shapes are not
+        // selectable in Acrobat, text are selectable and movable".
+        //
+        // Real freehand strokes DO get /Ink with a proper ink list; see
+        // add_ink_annotations_inner, which is left alone.
+        let Ok(mut annotation) = page.annotations_mut().create_stamp_annotation() else {
             return STATUS_INVALID_INPUT;
         };
 
@@ -7190,7 +7202,12 @@ mod tests {
 
         let before = read_annotations(handle, 0);
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].1, ANNOT_INK);
+        // A STAMP, not Ink. Both render from the objects added to them, but an
+        // /Ink annotation without an /InkList is malformed, and Acrobat will
+        // not let the user select or move one. Shapes were Ink until v2.3.1
+        // and were untouchable in Acrobat while text boxes, already stamps,
+        // behaved normally.
+        assert_eq!(before[0].1, ANNOT_STAMP);
 
         // Render before saving: this is what makes PDFium generate the
         // appearance stream, and without one a reopened file draws nothing.
@@ -7203,7 +7220,7 @@ mod tests {
 
         let after = read_annotations(reopened, 0);
         assert_eq!(after.len(), 1, "the shape should still be an annotation after reopening");
-        assert_eq!(after[0].1, ANNOT_INK, "and still a mark");
+        assert_eq!(after[0].1, ANNOT_STAMP, "and still a mark");
 
         for (b, a) in [
             (before[0].2, after[0].2),
