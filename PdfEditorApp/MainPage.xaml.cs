@@ -51,6 +51,17 @@ public sealed partial class MainPage : Page
     public MainPage()
     {
         InitializeComponent();
+
+        // DIAGNOSTIC (temporary): watch EVERY key that reaches RootGrid,
+        // including ones an earlier handler already marked Handled. The normal
+        // KeyDown handler below is skipped for those, so on its own it cannot
+        // tell "the key never arrived" from "something upstream ate it". This
+        // only writes to the log; it never sets Handled and never changes
+        // routing.
+        RootGrid.AddHandler(
+            UIElement.KeyDownEvent,
+            new KeyEventHandler(DiagKeyDownSpy),
+            handledEventsToo: true);
         ViewModel.InkStrokeChanged += OnInkStrokeChanged;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
         // Shapes are a SEPARATE collection but share the ink canvas, so without
@@ -3253,8 +3264,50 @@ public sealed partial class MainPage : Page
     private bool IsTextInputFocused =>
         FocusManager.GetFocusedElement(XamlRoot) is TextBox or RichEditBox or AutoSuggestBox or PasswordBox;
 
+    /// <summary>
+    /// DIAGNOSTIC (temporary). Reports every key seen at RootGrid with the
+    /// modifier state, whether it had already been Handled, and where focus
+    /// is. Registered with handledEventsToo, so a key consumed upstream still
+    /// shows up here - that is the difference between "not routed" and
+    /// "swallowed", which is exactly what is in question for Ctrl+G.
+    /// </summary>
+    private void DiagKeyDownSpy(object sender, KeyRoutedEventArgs e)
+    {
+        // Modifier keys themselves would triple the noise for no information.
+        if (e.Key is VirtualKey.Control or VirtualKey.LeftControl or VirtualKey.RightControl
+                  or VirtualKey.Shift or VirtualKey.LeftShift or VirtualKey.RightShift
+                  or VirtualKey.Menu)
+        {
+            return;
+        }
+
+        var ctrl = Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Control);
+        var shift = Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Shift);
+        bool ctrlNow = (ctrl & Windows.UI.Core.CoreVirtualKeyStates.Down)
+                       == Windows.UI.Core.CoreVirtualKeyStates.Down;
+        bool shiftNow = (shift & Windows.UI.Core.CoreVirtualKeyStates.Down)
+                        == Windows.UI.Core.CoreVirtualKeyStates.Down;
+
+        object? focused = null;
+        try { focused = FocusManager.GetFocusedElement(this.XamlRoot); } catch { }
+
+        Diag.Log($"KEYSPY key={e.Key} handledAlready={e.Handled} " +
+                 $"_isCtrlDown={_isCtrlDown} ctrlNow={ctrlNow} shiftNow={shiftNow} " +
+                 $"textFocused={IsTextInputFocused} focus={focused?.GetType().Name ?? "null"}");
+    }
+
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
+        // DIAGNOSTIC (temporary): does the REAL handler get this key at all?
+        // The spy above sees everything; this line only fires for keys that
+        // actually reach the switch, so the two together locate the loss.
+        if (e.Key is not (VirtualKey.Control or VirtualKey.LeftControl or VirtualKey.RightControl))
+        {
+            Diag.Log($"KEYDOWN key={e.Key} handled={e.Handled} _isCtrlDown={_isCtrlDown} textFocused={IsTextInputFocused}");
+        }
+
         // Modifier state is tracked even while typing, or releasing Ctrl in a
         // text field would leave the canvas thinking it is still held and the
         // next wheel scroll would zoom instead of pan.
