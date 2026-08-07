@@ -2362,6 +2362,67 @@ fn page_origin(page: &pdfium_render::prelude::PdfPage) -> (f32, f32) {
         .unwrap_or((0.0, page.height().value))
 }
 
+/// The annotation dictionary key our machine-readable tag lives under.
+///
+/// NOT `/Contents`. That field is the annotation's COMMENT text and readers
+/// display it: with the tag in there, every shape and text box this app made
+/// appeared in Acrobat's comment panel as a line of gibberish, with a sticky
+/// note icon on the page, in any PDF the user shared. A private key is
+/// ignored by readers, which is where private data belongs.
+///
+/// Reads fall back to `/Contents` so documents written by earlier versions
+/// stay editable; the next write moves them over and clears the comment.
+const TAG_KEY: &str = "AyaanTag";
+
+/// Writes the app's tag to the private key and clears `/Contents`, so the
+/// annotation carries no reader-visible comment.
+fn set_annotation_tag<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
+    annotation: &mut A,
+    tag: &str,
+) -> bool {
+    use pdfium_render::prelude::*;
+    let mut utf16: Vec<u16> = tag.encode_utf16().collect();
+    utf16.push(0);
+    let ok = annotation.library_bindings().FPDFAnnot_SetStringValue(
+        annotation.annotation_handle(),
+        TAG_KEY,
+        utf16.as_ptr(),
+    ) != 0;
+    // Clear the comment whether or not the private write succeeded; a stale
+    // tag left in /Contents would still be shown to the reader.
+    let _ = annotation.set_contents("");
+    ok
+}
+
+/// The app's tag for an annotation: the private key first, then `/Contents`
+/// for documents written before the key existed. `None` when the annotation
+/// is not one of ours.
+fn annotation_tag<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
+    annotation: &A,
+) -> Option<String> {
+    use pdfium_render::prelude::*;
+    let bindings = annotation.library_bindings();
+    let handle = annotation.annotation_handle();
+
+    // Length is in BYTES and includes the UTF-16 null terminator, so anything
+    // at or under 2 is an empty value rather than a tag.
+    let len = bindings.FPDFAnnot_GetStringValue(handle, TAG_KEY, std::ptr::null_mut(), 0);
+    if len > 2 {
+        let mut buf = vec![0u16; len as usize / 2];
+        bindings.FPDFAnnot_GetStringValue(handle, TAG_KEY, buf.as_mut_ptr(), len);
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
+        if let Ok(s) = String::from_utf16(&buf) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+
+    annotation.contents().filter(|s| !s.is_empty())
+}
+
 const ID_PREFIX: &str = "ID:";
 const ID_SEPARATOR: char = '|';
 const ID_HEX_LEN: usize = 32;
@@ -2416,7 +2477,7 @@ fn get_annotation_contents_inner(doc_handle: u64, page_index: i32, index: i32) -
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     };
 
-    let text = annotation.contents().unwrap_or_default();
+    let text = annotation_tag(&annotation).unwrap_or_default();
     let mut boxed = text.into_bytes().into_boxed_slice();
     let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
     std::mem::forget(boxed);
@@ -2451,7 +2512,7 @@ fn get_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32) -> Byte
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     };
 
-    let contents = annotation.contents().unwrap_or_default();
+    let contents = annotation_tag(&annotation).unwrap_or_default();
     let id_owned: String = strip_id_prefix(&contents).0.map(str::to_owned).unwrap_or_default();
     let mut boxed = id_owned.into_bytes().into_boxed_slice();
     let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
@@ -2509,10 +2570,10 @@ fn set_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32, id_hex:
         return STATUS_INVALID_INPUT;
     };
 
-    let existing = annotation.contents().unwrap_or_default();
+    let existing = annotation_tag(&annotation).unwrap_or_default();
     let body = strip_id_prefix(&existing).1;
-    let new_contents = format!("{ID_PREFIX}{id_hex}{ID_SEPARATOR}{body}");
-    if annotation.set_contents(&new_contents).is_err() {
+    let new_tag = format!("{ID_PREFIX}{id_hex}{ID_SEPARATOR}{body}");
+    if !set_annotation_tag(&mut annotation, &new_tag) {
         return STATUS_INVALID_INPUT;
     }
     STATUS_OK_PDFIUM
@@ -2944,7 +3005,7 @@ fn add_text_box_inner(
         (x1 - origin_x) / page_w,
         (origin_top - y_bottom) / page_w,
     ];
-    let _ = annotation.set_contents(&textbox_tag_styled(
+    let _ = set_annotation_tag(&mut annotation, &textbox_tag_styled(
         text, font_size_px, r, g, b, a, style, font_path, box_rect));
 
     drop(annotation);
@@ -3442,7 +3503,7 @@ fn add_shape_annotations_inner(
 
         // Records what this mark IS, so a reopened file still knows. Without
         // it a shape is just ink, and can then only be moved or deleted.
-        let _ = annotation.set_contents(&shape_tag(spec, width_pts));
+        let _ = set_annotation_tag(&mut annotation, &shape_tag(spec, width_pts));
 
         rotate_object_about!(path, rot, cx, cy);
         if annotation.objects_mut().add_path_object(path).is_err() {
@@ -3598,7 +3659,7 @@ fn restyle_shape_annotation_inner_with_rotation(
         let doc_guard = lock(&doc);
         let Ok(page) = doc_guard.pages().get(page_index as u16) else { return STATUS_INVALID_INPUT; };
         let Some(annotation) = page.annotations().iter().nth(index as usize) else { return STATUS_INVALID_INPUT; };
-        let Some(tag) = annotation.contents().as_deref().and_then(parse_shape_tag) else {
+        let Some(tag) = annotation_tag(&annotation).as_deref().and_then(parse_shape_tag) else {
             return STATUS_UNSUPPORTED;
         };
         let Ok(bx) = annotation.bounds() else { return STATUS_INVALID_INPUT; };
@@ -3708,7 +3769,7 @@ fn resize_shape_annotation_inner(
 
         // Contents is read BEFORE anything is removed, so a mark that turns out
         // not to be one of ours leaves the page untouched.
-        match annotation.contents().as_deref().and_then(parse_shape_tag) {
+        match annotation_tag(&annotation).as_deref().and_then(parse_shape_tag) {
             Some(t) => t,
             None => return STATUS_UNSUPPORTED,
         }
@@ -3964,7 +4025,7 @@ fn relayout_text_box_inner_v2(
         let Some(annotation) = page.annotations().iter().nth(index as usize) else {
             return STATUS_INVALID_INPUT;
         };
-        let parsed = match annotation.contents().as_deref().and_then(parse_textbox_tag_full) {
+        let parsed = match annotation_tag(&annotation).as_deref().and_then(parse_textbox_tag_full) {
             Some(p) => p,
             None => return STATUS_UNSUPPORTED,
         };
@@ -4051,7 +4112,7 @@ fn tag_box_rect(index: usize, doc_handle: u64, page_index: i32) -> Option<(f32, 
     let doc_guard = lock(&doc);
     let page = doc_guard.pages().get(page_index as u16).ok()?;
     let annotation = page.annotations().iter().nth(index)?;
-    let contents = annotation.contents()?;
+    let contents = annotation_tag(&annotation)?;
     let body = strip_id_prefix(&contents).1;
     let parts: Vec<&str> = body.strip_prefix(TEXTBOX_TAG_STYLED)?.split(':').collect();
     if parts.len() < 14 {
@@ -7977,14 +8038,18 @@ mod tests {
 
     // ---- The tag that keeps a shape a shape ----
 
+    /// The tag the APP sees for an annotation: the private key, falling back
+    /// to /Contents. Not a raw /Contents read - the tag moved off the comment
+    /// field so readers stop displaying it, and these tests are about whether
+    /// the app can still recognise its own marks. For the reader's view (which
+    /// must be empty) use raw_contents.
     fn contents_of(handle: u64, page_index: i32, index: usize) -> Option<String> {
-        use pdfium_render::prelude::*;
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&handle).cloned()?;
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(page_index as u16).ok()?;
         let annotation = page.annotations().iter().nth(index)?;
-        annotation.contents()
+        annotation_tag(&annotation)
     }
 
     #[test]
@@ -10248,6 +10313,137 @@ mod tests {
         }
         out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         out
+    }
+
+    /// The raw `/Contents` of an annotation: what a PDF reader shows the user
+    /// as the comment. Deliberately NOT annotation_tag(), which is the app's
+    /// private-key view.
+    fn raw_contents(handle: u64, page_index: i32, index: usize) -> Option<String> {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned()?;
+        let g = lock(&doc);
+        let page = g.pages().get(page_index as u16).ok()?;
+        let annotation = page.annotations().iter().nth(index)?;
+        annotation.contents()
+    }
+
+    #[test]
+    fn a_shape_leaves_no_comment_for_the_reader_to_see() {
+        // The tag is machine data and must NOT land in /Contents, which is the
+        // annotation's comment text: with it there, every shape and text box
+        // this app made showed up in Acrobat's comment panel as a line of
+        // gibberish, in any PDF the user shared.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 100.0, y1: 100.0, x2: 300.0, y2: 300.0,
+            r: 255, g: 0, b: 0, a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let comment = raw_contents(handle, 0, 0).unwrap_or_default();
+        assert!(
+            comment.is_empty(),
+            "a shape must leave /Contents empty, but a reader would show: {comment:?}"
+        );
+
+        // ...and the app must still recognise the shape, from the private key.
+        let tag = get_annotation_contents(handle, 0, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(tag.data, tag.len) }.to_vec();
+        free_byte_buffer(tag);
+        let tag = String::from_utf8(bytes).unwrap();
+        close_document(handle);
+        assert!(
+            tag.starts_with(SHAPE_TAG),
+            "the app should read its own tag back from the private key, got {tag:?}"
+        );
+    }
+
+    #[test]
+    fn an_id_round_trips_through_the_private_key_without_a_comment() {
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_ELLIPSE,
+            x1: 100.0, y1: 100.0, x2: 300.0, y2: 300.0,
+            r: 255, g: 0, b: 0, a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            unsafe { set_annotation_id(handle, 0, 0, id.as_ptr(), id.len()) },
+            STATUS_OK_PDFIUM
+        );
+
+        let got = get_annotation_id(handle, 0, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(got.data, got.len) }.to_vec();
+        free_byte_buffer(got);
+        let comment = raw_contents(handle, 0, 0).unwrap_or_default();
+        close_document(handle);
+
+        assert_eq!(String::from_utf8(bytes).unwrap(), id);
+        assert!(comment.is_empty(), "stamping an id must not write a comment, got {comment:?}");
+    }
+
+    #[test]
+    fn a_tag_written_the_old_way_in_contents_is_still_read() {
+        // Documents saved by earlier versions carry the tag in /Contents.
+        // Reads fall back to it so those files stay editable rather than
+        // turning into anonymous annotations nobody can select or resize.
+        use pdfium_render::prelude::*;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 100.0, y1: 100.0, x2: 300.0, y2: 300.0,
+            r: 255, g: 0, b: 0, a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+
+        // Force the legacy shape: wipe the private key, put the tag back in
+        // the comment field, exactly as an old build would have left it.
+        let legacy = format!("{SHAPE_TAG}0:FF0000FF:2.0000:1:1");
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let g = lock(&doc);
+            let mut page = g.pages().get(0).unwrap();
+            let mut annotation = page.annotations_mut().get(0).unwrap();
+            let empty: Vec<u16> = vec![0];
+            annotation.library_bindings().FPDFAnnot_SetStringValue(
+                annotation.annotation_handle(), TAG_KEY, empty.as_ptr());
+            annotation.set_contents(&legacy).unwrap();
+        }
+
+        let tag = get_annotation_contents(handle, 0, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(tag.data, tag.len) }.to_vec();
+        free_byte_buffer(tag);
+        close_document(handle);
+        assert_eq!(String::from_utf8(bytes).unwrap(), legacy);
     }
 
     #[test]

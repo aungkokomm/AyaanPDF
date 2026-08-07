@@ -878,6 +878,25 @@ impl<'a> PdfPageAnnotation<'a> {
 
 /// Functionality common to all [PdfPageAnnotation] objects, regardless of their [PdfPageAnnotationType].
 pub trait PdfPageAnnotationCommon {
+    /// Returns the raw `FPDF_ANNOTATION` handle for this annotation.
+    ///
+    /// AYAAN PDF FORK ADDITION (not in upstream 0.8.37): exposed so the app can
+    /// read and write PRIVATE dictionary keys via `FPDFAnnot_SetStringValue` /
+    /// `FPDFAnnot_GetStringValue`. The app keeps a machine-readable tag (shape
+    /// kind, text style, stable id) on every annotation it creates. That tag
+    /// used to live in `/Contents`, which is the annotation's COMMENT text and
+    /// is shown to the reader, so every shape and text box appeared in
+    /// Acrobat's comment panel as gibberish. A private key is ignored by
+    /// readers, which is where private data belongs.
+    fn annotation_handle(&self) -> FPDF_ANNOTATION;
+
+    /// Returns the [PdfiumLibraryBindings] this annotation was created with, so
+    /// raw `FPDFAnnot_*` calls can be made against
+    /// [PdfPageAnnotationCommon::annotation_handle].
+    ///
+    /// AYAAN PDF FORK ADDITION (not in upstream 0.8.37).
+    fn library_bindings(&self) -> &dyn PdfiumLibraryBindings;
+
     /// Returns the name of this [PdfPageAnnotation], if any. This is a text string uniquely identifying
     /// this annotation among all the annotations attached to the containing page.
     fn name(&self) -> Option<String>;
@@ -1129,6 +1148,16 @@ impl<'a, T> PdfPageAnnotationCommon for T
 where
     T: PdfPageAnnotationPrivate<'a>,
 {
+    #[inline]
+    fn annotation_handle(&self) -> FPDF_ANNOTATION {
+        self.handle()
+    }
+
+    #[inline]
+    fn library_bindings(&self) -> &dyn PdfiumLibraryBindings {
+        self.bindings()
+    }
+
     #[inline]
     fn name(&self) -> Option<String> {
         self.name_impl()
