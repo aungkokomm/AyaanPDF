@@ -15,8 +15,10 @@ namespace PdfEditorApp;
 internal static class Diag
 {
     private static readonly object Gate = new();
-    private static readonly bool Enabled =
-        Environment.GetEnvironmentVariable("PDFEDITOR_DIAG") == "1";
+    // Kept force-enabled for the Phase A group work so users don't have to
+    // set an env var to capture traces. Revert to the env-var check before
+    // shipping (see PDFEDITOR_DIAG history in git).
+    private static readonly bool Enabled = true;
     private static readonly string Path =
         System.IO.Path.Combine(AppContext.BaseDirectory, "diag.log");
 

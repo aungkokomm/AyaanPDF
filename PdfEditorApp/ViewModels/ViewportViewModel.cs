@@ -2734,6 +2734,32 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// sample and race off the page.</summary>
     private readonly List<LoadedSelection> _extraDragOrigin = new();
 
+    /// <summary>Strips any extras that duplicate the anchor's (page, index)
+    /// or duplicate another extra. Called before every multi-write so the
+    /// extras loop can't double-write the same annotation.
+    ///
+    /// The shift-click / marquee / group-expansion paths already dedup on
+    /// entry, but they trust invariants that occasionally break (e.g. the
+    /// plain-click "swap old anchor into extras" logic can add an entry that
+    /// was already in extras). Rather than proving every entry path clean,
+    /// we normalize at the multi-write boundary. Cheap; a linear scan of a
+    /// selection that in practice holds a handful of items.</summary>
+    private void NormalizeExtras(int anchorPage, int anchorIndex, string callerTag)
+    {
+        if (_extraSelected.Count == 0) { return; }
+        var seen = new HashSet<(int, int)> { (anchorPage, anchorIndex) };
+        int removed = _extraSelected.RemoveAll(e => !seen.Add((e.PageIndex, e.Index)));
+        if (removed > 0)
+        {
+            Diag.Log($"{callerTag}: dropped {removed} duplicate extras (anchor at p{anchorPage}#{anchorIndex}); extras now {_extraSelected.Count}");
+            if (_extraDragOrigin.Count > _extraSelected.Count)
+            {
+                _extraDragOrigin.Clear();
+                _extraDragOrigin.AddRange(_extraSelected);
+            }
+        }
+    }
+
     /// <summary>
     /// Whether the current selection is one of our text boxes. Read ONCE when the
     /// selection changes (an FFI + parse), then used by the per-sample drag path,
@@ -3554,6 +3580,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        NormalizeExtras(now.PageIndex, now.Index, "CommitLoadedMove");
+
         // The inverse of a move or resize is four numbers: put the rectangle
         // back. Recorded BEFORE the write, and at annotation granularity
         // rather than as a document snapshot, because dragging a stamp around
@@ -4284,7 +4312,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// group survives writes.</summary>
     public bool GroupSelected()
     {
-        Diag.Log($"GroupSelected: anchor={(_selectedLoaded.HasValue ? $"p{_selectedLoaded.Value.PageIndex}#{_selectedLoaded.Value.Index}" : "null")} extras={_extraSelected.Count}");
+        Diag.Log($"GroupSelected: anchor={(_selectedLoaded.HasValue ? $"p{_selectedLoaded.Value.PageIndex}#{_selectedLoaded.Value.Index} id={_selectedLoaded.Value.Id:N}" : "null")} extras={_extraSelected.Count}");
+        foreach (var e in _extraSelected)
+        {
+            Diag.Log($"  extra p{e.PageIndex}#{e.Index} id={e.Id:N}");
+        }
         if (_selectedLoaded is not LoadedSelection anchor)
         {
             Status = "Nothing selected to group.";
@@ -4360,6 +4392,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor) { return false; }
         const int CaptureWidth = 1000;
+
+        NormalizeExtras(anchor.PageIndex, anchor.Index, "BringSelectedToFront");
 
         // Build the joint list (anchor + extras) and sort by DESCENDING index
         // per page so each delete never disturbs a later item's index. The

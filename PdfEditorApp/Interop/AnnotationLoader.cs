@@ -57,7 +57,9 @@ internal static class AnnotationLoader
             for (int i = 0; i < count; i++)
             {
                 var native = Marshal.PtrToStructure<AnnotationInfo>(array.Items + i * structSize);
-                var id = ReadId(docHandle, pageIndex, native.Index) ?? Guid.NewGuid();
+                var readId = ReadId(docHandle, pageIndex, native.Index);
+                var id = readId ?? Guid.NewGuid();
+                PdfEditorApp.Diag.Log($"AnnotationLoader.Load p{pageIndex}#{native.Index}: readId={(readId?.ToString("N") ?? "null")} -> id={id:N}");
                 result.Add(new ExistingAnnotation(
                     pageIndex,
                     native.Index,
@@ -120,7 +122,8 @@ internal static class AnnotationLoader
     {
         // 32 ASCII hex chars, no dashes; matches ID_HEX_LEN on the Rust side.
         byte[] hex = Encoding.ASCII.GetBytes(id.ToString("N"));
-        _ = RenderCoreNative.set_annotation_id(docHandle, pageIndex, index, hex, (nuint)hex.Length);
+        int status = RenderCoreNative.set_annotation_id(docHandle, pageIndex, index, hex, (nuint)hex.Length);
+        PdfEditorApp.Diag.Log($"AnnotationLoader.WriteId p{pageIndex}#{index} id={id:N} -> status={status}");
     }
 
     private static bool IsHex(string s)
