@@ -2706,9 +2706,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // including ones this app cannot draw, so a file marked up in Acrobat is
     // editable here too.
 
-    /// <summary>A selected annotation that came from the file, in normalized units.</summary>
+    /// <summary>A selected annotation that came from the file, in normalized units.
+    /// <see cref="Id"/> is the stable identity that survives the delete+re-add
+    /// churn of every edit; groups reference it, so it must be carried through
+    /// every resize/move so the new PDFium index gets stamped with the same Id.</summary>
     private readonly record struct LoadedSelection(
-        int PageIndex, int Index, double Left, double Top, double Right, double Bottom);
+        int PageIndex, int Index, double Left, double Top, double Right, double Bottom, Guid Id = default);
 
     private LoadedSelection? _selectedLoaded;
 
@@ -2770,7 +2773,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private bool SelectLoadedAt(int pageIndex, double normX, double normY)
     {
         var boxes = LoadedFor(pageIndex)
-            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom))
+            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id))
             .ToList();
 
         if (LoadedAnnotationPicker.PickTopmost(boxes, normX, normY) is not AnnotationBox hit)
@@ -2787,28 +2790,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // click; index shifts inside the drag can't confuse the anchor because
         // it's cached above.
         bool shift = IsShiftDown();
-        Diag.Log($"SelectLoadedAt hit p{pageIndex}#{hit.Index} shift={shift} groupsCount={_groups.Count} inGroup={(GroupContaining(pageIndex, hit.Index) is not null)}");
-        if (!shift && GroupContaining(pageIndex, hit.Index) is { } group && group.Count > 1)
+        Diag.Log($"SelectLoadedAt hit p{pageIndex}#{hit.Index} id={hit.Id:N} shift={shift} groupsCount={_groups.Count} inGroup={(GroupContaining(hit.Id) is not null)}");
+        if (!shift && GroupContaining(hit.Id) is { } group && group.Count > 1)
         {
-            Diag.Log($"  expanding group of {group.Count}: [{string.Join(",", group.Select(m => $"p{m.Page}#{m.Index}"))}]");
+            Diag.Log($"  expanding group of {group.Count} members");
             _extraSelected.Clear();
             _selectedLoaded = new LoadedSelection(
-                pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
-            // Extras = every other group member. Use their CURRENT bounds via
-            // LoadedFor; a member's index might have been drifted by an earlier
-            // operation, in which case it silently drops from the pick (limit
-            // of session-only grouping without persistence).
-            foreach (var (p, idx) in group)
+                pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom, hit.Id);
+            // Extras = every other group member. Resolve each Guid back to
+            // its current (page, index) via the loaded cache; a member on an
+            // unvisited page or one whose page hasn't been loaded yet is
+            // silently dropped from the pick.
+            foreach (var memberId in group)
             {
-                if (p == pageIndex && idx == hit.Index) { continue; }
+                if (memberId == hit.Id) { continue; }
+                if (FindLoadedById(memberId) is not (int p, int idx)) { continue; }
                 var page = LoadedFor(p);
-                // ExistingAnnotation is a struct so FirstOrDefault yields
-                // default rather than null; match by explicit lookup and
-                // skip if not found (member's index drifted).
                 int mi = page.FindIndex(a => a.Index == idx);
                 if (mi < 0) { continue; }
                 var found = page[mi];
-                _extraSelected.Add(new LoadedSelection(p, idx, found.Left, found.Top, found.Right, found.Bottom));
+                _extraSelected.Add(new LoadedSelection(p, idx, found.Left, found.Top, found.Right, found.Bottom, found.Id));
             }
             ApplyTextBoxSelectionInfo(pageIndex, hit.Index);
             var gsel = _selectedLoaded.Value;
@@ -2903,7 +2904,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         _selectedLoaded = new LoadedSelection(
-            pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom);
+            pageIndex, hit.Index, hit.Left, hit.Top, hit.Right, hit.Bottom, hit.Id);
         ApplyTextBoxSelectionInfo(pageIndex, hit.Index);
         var sel = _selectedLoaded.Value;
         _loadedDrag = shift ? null : (normX, normY, sel);
@@ -3064,7 +3065,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             .Select(x => (Interop.ExistingAnnotation?)x)
             .FirstOrDefault();
         _selectedLoaded = actual is Interop.ExistingAnnotation a
-            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom)
+            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom, sel.Id)
             : sel with { Index = newIndex };
         RefreshSelectionOutline();
     }
@@ -3106,7 +3107,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             .Select(x => (Interop.ExistingAnnotation?)x)
             .FirstOrDefault();
         _selectedLoaded = actual is Interop.ExistingAnnotation a
-            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom)
+            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom, sel.Id)
             : sel with { Index = newIndex };
         RefreshSelectionOutline();
     }
@@ -3640,7 +3641,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             _selectedRotationDeg = tag.RotationDeg;
             _selectedLoaded = new LoadedSelection(
-                now.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom);
+                now.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom, start.Id);
         }
         else
         {
@@ -3780,26 +3781,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 }
             }
 
-            // Remap groups: after the delete+re-add churn from move-all,
-            // every member's index moved. Without this, groups' stored
-            // (page, index) tuples would go stale and the next click on a
-            // group member wouldn't find its group - so the extras would
-            // silently collapse to just the clicked shape on the second
-            // move, or come out stacked at wrong positions.
-            var oldToNew = new Dictionary<(int Page, int OldIndex), int>();
-            if (_selectedLoaded is LoadedSelection anchorNow)
-            {
-                oldToNew[(anchorNow.PageIndex, now.Index)] = anchorNow.Index;
-            }
-            for (int i = 0; i < _extraSelected.Count && i < _extraDragOrigin.Count; i++)
-            {
-                var extNow = _extraSelected[i];
-                var extOld = _extraDragOrigin[i];
-                oldToNew[(extOld.PageIndex, extOld.Index)] = extNow.Index;
-            }
-            RemapGroupIndices(oldToNew);
         }
 
+        // Groups are stored by Id, so no index remap is needed. But the
+        // resize FFIs rebuilt /Contents from the tag and didn't carry the
+        // ID prefix through, so re-stamp every selected annotation's Id at
+        // its current index. Without this, the next click on a group member
+        // would look up an Id that no longer exists in the file.
+        StampSelectedIds();
         RefreshSelectionOutline();
     }
 
@@ -4241,13 +4230,58 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // adding a new annotation ABOVE a group member would leave the group's
     // stored index pointing at the wrong mark). Acceptable MVP limitation.
 
-    private readonly List<List<(int Page, int Index)>> _groups = new();
+    // Groups are stored by stable annotation Id, not by (page, index).
+    // Indices reshuffle on every delete+re-add churn; Ids don't. This makes
+    // groups survive any multi-write (move, align, distribute, z-order)
+    // without a remap pass. See project-ayaanpdf-guid-migration-plan for the
+    // rationale.
+    private readonly List<List<Guid>> _groups = new();
 
     public bool HasGrouping => _groups.Count > 0;
 
+    /// <summary>Finds the current (page, index) of a loaded annotation by
+    /// its stable Id. Scans every page that's currently in the loaded cache;
+    /// returns null if the Id isn't among them (e.g. its page hasn't been
+    /// visited yet this session, or the annotation has been deleted).</summary>
+    private (int Page, int Index)? FindLoadedById(Guid id)
+    {
+        if (id == Guid.Empty) { return null; }
+        foreach (var kv in _loadedByPage)
+        {
+            foreach (var a in kv.Value)
+            {
+                if (a.Id == id) { return (kv.Key, a.Index); }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Stamps the current selection's Ids onto their /Contents so
+    /// they survive the next delete+re-add churn. Called at the end of every
+    /// multi-write that re-emits annotations (CommitLoadedMove, BringToFront).
+    /// The resize FFIs rebuild /Contents from the tag and don't carry the ID
+    /// prefix through; if we didn't re-stamp here, the next click on a group
+    /// member would look up an Id that no longer exists in the file.</summary>
+    private void StampSelectedIds()
+    {
+        if (_documentHandle == 0) { return; }
+        if (_selectedLoaded is LoadedSelection anchor && anchor.Id != Guid.Empty)
+        {
+            Interop.AnnotationLoader.WriteId(_documentHandle, anchor.PageIndex, anchor.Index, anchor.Id);
+        }
+        foreach (var ex in _extraSelected)
+        {
+            if (ex.Id != Guid.Empty)
+            {
+                Interop.AnnotationLoader.WriteId(_documentHandle, ex.PageIndex, ex.Index, ex.Id);
+            }
+        }
+    }
+
     /// <summary>Creates a group from the current multi-selection (anchor +
-    /// extras). Needs 2+ marks. Returns false if there's nothing to group
-    /// or if all the selected marks are already in the same group.</summary>
+    /// extras). Needs 2+ marks. Returns false if there's nothing to group.
+    /// Each member's Id is stamped to the annotation's /Contents so the
+    /// group survives writes.</summary>
     public bool GroupSelected()
     {
         Diag.Log($"GroupSelected: anchor={(_selectedLoaded.HasValue ? $"p{_selectedLoaded.Value.PageIndex}#{_selectedLoaded.Value.Index}" : "null")} extras={_extraSelected.Count}");
@@ -4256,23 +4290,36 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Status = "Nothing selected to group.";
             return false;
         }
-        var refs = new List<(int, int)> { (anchor.PageIndex, anchor.Index) };
-        foreach (var e in _extraSelected) { refs.Add((e.PageIndex, e.Index)); }
-        if (refs.Count < 2)
+        // Collect Ids and persist each to its annotation's /Contents. A member
+        // whose Id is Guid.Empty (legacy annotation whose ephemeral Id was
+        // never stamped) is skipped; that's rare because SelectLoadedAt fills
+        // Id from the loader, which generates one if the annotation had none.
+        var ids = new List<Guid>();
+        if (anchor.Id != Guid.Empty)
+        {
+            ids.Add(anchor.Id);
+            Interop.AnnotationLoader.WriteId(_documentHandle, anchor.PageIndex, anchor.Index, anchor.Id);
+        }
+        foreach (var e in _extraSelected)
+        {
+            if (e.Id != Guid.Empty && !ids.Contains(e.Id))
+            {
+                ids.Add(e.Id);
+                Interop.AnnotationLoader.WriteId(_documentHandle, e.PageIndex, e.Index, e.Id);
+            }
+        }
+        if (ids.Count < 2)
         {
             Status = "Select two or more marks (shift-click) before grouping.";
             return false;
         }
 
-        // Remove any existing groups those marks are in - a mark can only be
-        // in ONE group at a time (flat, non-nested). Then add the new one.
-        foreach (var r in refs)
-        {
-            _groups.RemoveAll(g => g.Contains(r));
-        }
-        _groups.Add(refs.Distinct().ToList());
-        Diag.Log($"GroupSelected done: groups={_groups.Count}, members=[{string.Join(",", refs.Select(r => $"p{r.Item1}#{r.Item2}"))}]");
-        Status = $"Grouped {refs.Count} marks.";
+        // A mark can only be in ONE group at a time (flat, non-nested); drop
+        // any group that overlaps with the new one, then add.
+        _groups.RemoveAll(g => g.Any(id => ids.Contains(id)));
+        _groups.Add(ids);
+        Diag.Log($"GroupSelected done: groups={_groups.Count}, members=[{string.Join(",", ids)}]");
+        Status = $"Grouped {ids.Count} marks.";
         return true;
     }
 
@@ -4280,48 +4327,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// false if the anchor isn't in a group.</summary>
     public bool UngroupSelected()
     {
-        if (_selectedLoaded is not LoadedSelection anchor)
+        if (_selectedLoaded is not LoadedSelection anchor || anchor.Id == Guid.Empty)
         {
             Status = "Nothing selected to ungroup.";
             return false;
         }
-        var key = (anchor.PageIndex, anchor.Index);
-        int removed = _groups.RemoveAll(g => g.Contains(key));
+        int removed = _groups.RemoveAll(g => g.Contains(anchor.Id));
         Status = removed > 0 ? "Ungrouped." : "That mark isn't in a group.";
         return removed > 0;
     }
 
-    /// <summary>Returns the group containing the given annotation, or null
-    /// if it isn't grouped. Called by SelectLoadedAt to expand a click into
-    /// a whole-group multi-selection.</summary>
-    private IReadOnlyList<(int Page, int Index)>? GroupContaining(int page, int index)
+    /// <summary>Returns the group containing the given annotation Id, or
+    /// null if it isn't grouped.</summary>
+    private IReadOnlyList<Guid>? GroupContaining(Guid id)
     {
-        var key = (page, index);
+        if (id == Guid.Empty) { return null; }
         foreach (var g in _groups)
         {
-            if (g.Contains(key)) { return g; }
+            if (g.Contains(id)) { return g; }
         }
         return null;
-    }
-
-    /// <summary>After a multi-write that re-emitted annotations at new
-    /// indices, rewrite any group members whose old indices matched with
-    /// their new ones. Called from BringSelectedToFront and the like.
-    /// oldToNew maps (page, oldIndex) to newIndex on the same page.</summary>
-    private void RemapGroupIndices(Dictionary<(int Page, int OldIndex), int> oldToNew)
-    {
-        if (_groups.Count == 0 || oldToNew.Count == 0) { return; }
-        for (int gi = 0; gi < _groups.Count; gi++)
-        {
-            var g = _groups[gi];
-            for (int mi = 0; mi < g.Count; mi++)
-            {
-                if (oldToNew.TryGetValue(g[mi], out int newIdx))
-                {
-                    g[mi] = (g[mi].Page, newIdx);
-                }
-            }
-        }
     }
 
     /// <summary>Moves the currently selected annotation(s) to the top of the
@@ -4377,23 +4402,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 newIndicesBySlot[slots[i]] = count - slots.Count + i;
             }
         }
-        // Build the (page, oldIndex) -> newIndex map for group remapping.
-        var oldToNew = new Dictionary<(int Page, int OldIndex), int>();
         if (newIndicesBySlot.TryGetValue(0, out int anchorIdx))
         {
-            oldToNew[(anchor.PageIndex, anchor.Index)] = anchorIdx;
             _selectedLoaded = anchor with { Index = anchorIdx };
         }
         for (int i = 0; i < _extraSelected.Count; i++)
         {
             if (newIndicesBySlot.TryGetValue(i + 1, out int idx))
             {
-                var old = _extraSelected[i];
-                oldToNew[(old.PageIndex, old.Index)] = idx;
-                _extraSelected[i] = old with { Index = idx };
+                _extraSelected[i] = _extraSelected[i] with { Index = idx };
             }
         }
-        RemapGroupIndices(oldToNew);
+        // Groups reference Ids, not indices, so no remap needed. But the
+        // delete+re-add rebuilt /Contents without the ID prefix; re-stamp
+        // so a subsequent click on any of these can still find its group.
+        StampSelectedIds();
         IsDirty = true;
         RefreshSelectionOutline();
         return true;
@@ -4770,12 +4793,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Drop the deleted marks from any groups they were in. A group whose
         // members are all deleted goes away entirely; a partially-deleted
         // group shrinks. Session-only groups so this doesn't touch the PDF.
-        var deleted = new HashSet<(int, int)> { (sel.PageIndex, sel.Index) };
-        foreach (var e in _extraSelected) { deleted.Add((e.PageIndex, e.Index)); }
-        for (int gi = _groups.Count - 1; gi >= 0; gi--)
+        var deletedIds = new HashSet<Guid>();
+        if (sel.Id != Guid.Empty) { deletedIds.Add(sel.Id); }
+        foreach (var e in _extraSelected)
         {
-            _groups[gi].RemoveAll(m => deleted.Contains(m));
-            if (_groups[gi].Count < 2) { _groups.RemoveAt(gi); }
+            if (e.Id != Guid.Empty) { deletedIds.Add(e.Id); }
+        }
+        if (deletedIds.Count > 0)
+        {
+            for (int gi = _groups.Count - 1; gi >= 0; gi--)
+            {
+                _groups[gi].RemoveAll(id => deletedIds.Contains(id));
+                if (_groups[gi].Count < 2) { _groups.RemoveAt(gi); }
+            }
         }
 
         // A document snapshot, unlike move and resize. Undoing a delete means
@@ -5951,7 +5981,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         var boxes = LoadedFor(pageIndex)
-            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom))
+            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id))
             .ToList();
 
         if (LoadedAnnotationPicker.PickTopmost(boxes, normX, normY) is not AnnotationBox hit)

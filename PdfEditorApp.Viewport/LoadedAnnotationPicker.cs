@@ -10,7 +10,7 @@ namespace PdfEditorApp.Viewport;
 /// which is the convention render_core reports and the overlay draws in.
 /// </summary>
 public readonly record struct AnnotationBox(
-    int Index, double Left, double Top, double Right, double Bottom)
+    int Index, double Left, double Top, double Right, double Bottom, System.Guid Id = default)
 {
     public double Width => Right - Left;
 
