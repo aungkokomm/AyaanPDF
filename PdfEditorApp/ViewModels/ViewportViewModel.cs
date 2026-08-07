@@ -2828,6 +2828,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // read once here on click and pinned to the selection until the next
         // click; index shifts inside the drag can't confuse the anchor because
         // it's cached above.
+        // Make the clicked annotation's Id real before anything relies on it.
+        // A mark that has never been stamped gets a fresh ephemeral Id from
+        // every cache reload, so any Id captured into a selection or a group
+        // would be stale the next time the page reloaded. Writing it on the
+        // click is the earliest point where we know the user cares about this
+        // particular mark.
+        if (hit.Id != Guid.Empty)
+        {
+            Interop.AnnotationLoader.WriteId(_documentHandle, pageIndex, hit.Index, hit.Id);
+        }
+
         bool shift = IsShiftDown();
         Diag.Log($"SelectLoadedAt hit p{pageIndex}#{hit.Index} id={hit.Id:N} shift={shift} groupsCount={_groups.Count} inGroup={(GroupContaining(hit.Id) is not null)}");
         if (!shift && GroupContaining(hit.Id) is { } group && group.Count > 1)
@@ -3746,7 +3757,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 if (target.Id != Guid.Empty)
                 {
                     InvalidateLoadedPage(target.PageIndex);
-                    if (FindLoadedById(target.Id) is (int livePage, int liveIndex))
+                    if (FindLoadedById(target.Id, target.PageIndex) is (int livePage, int liveIndex))
                     {
                         target = target with { PageIndex = livePage, Index = liveIndex };
                     }
@@ -4295,14 +4306,30 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// its stable Id. Scans every page that's currently in the loaded cache;
     /// returns null if the Id isn't among them (e.g. its page hasn't been
     /// visited yet this session, or the annotation has been deleted).</summary>
-    private (int Page, int Index)? FindLoadedById(Guid id)
+    private (int Page, int Index)? FindLoadedById(Guid id, int preferPage = -1)
     {
         if (id == Guid.Empty) { return null; }
-        foreach (var kv in _loadedByPage)
+
+        // LoadedFor, never a bare _loadedByPage scan. InvalidateLoadedPage
+        // REMOVES the page from that dictionary, so a scan straight after an
+        // invalidate looks at a page that isn't there and reports the
+        // annotation missing. That is what made every extra in a group move
+        // get skipped: each one invalidated its page, found nothing, and
+        // dropped out of the write loop, leaving only the dragged mark moving.
+        if (preferPage >= 0)
         {
-            foreach (var a in kv.Value)
+            foreach (var a in LoadedFor(preferPage))
             {
-                if (a.Id == id) { return (kv.Key, a.Index); }
+                if (a.Id == id) { return (preferPage, a.Index); }
+            }
+        }
+
+        for (int p = 0; p < PageCount; p++)
+        {
+            if (p == preferPage) { continue; }
+            foreach (var a in LoadedFor(p))
+            {
+                if (a.Id == id) { return (p, a.Index); }
             }
         }
         return null;
@@ -4824,6 +4851,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         var newest = all[^1];
+
+        // Persist the Id before selecting on it. Every creation path (shape,
+        // stamp, text box) comes through here, and a freshly added annotation
+        // carries NO Id in the file, so AnnotationLoader hands out a fresh
+        // ephemeral one on each load. Selecting on an ephemeral Id means the
+        // next cache reload issues a different value and the selection points
+        // at nothing; worse, two annotations can be handed colliding values,
+        // which is how a group ended up with two members claiming the same
+        // identity and one shape being dropped from the move. Writing it here
+        // makes the Id real. Already-persisted annotations rewrite the same
+        // value, so this is a no-op for them.
+        Interop.AnnotationLoader.WriteId(_documentHandle, pageIndex, newest.Index, newest.Id);
+
         _selectedLoaded = new LoadedSelection(
             pageIndex, newest.Index, newest.Left, newest.Top, newest.Right, newest.Bottom, newest.Id);
         ApplyTextBoxSelectionInfo(pageIndex, newest.Index);
