@@ -6170,6 +6170,30 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                                     text, colorHex, fontSizeNorm);
     }
 
+    /// <summary>
+    /// Removes the "ID:&lt;32 hex&gt;|" identity prefix, returning the bare tag
+    /// body ("AyaanShape:...", "AyaanTextB:...").
+    ///
+    /// Phase A put that prefix on the FRONT of every annotation's /Contents,
+    /// which silently broke every C# check of the form
+    /// contents.StartsWith("AyaanShape:"). A shape stopped being recognised
+    /// as a shape, so a group move sent its extras down the generic
+    /// resize_annotation path, which relocates the annotation rectangle and
+    /// leaves the drawn path where it was: the frames travelled and the
+    /// shapes stayed behind. Stripping here means every caller of
+    /// ReadAnnotationContents sees exactly what it saw before the prefix
+    /// existed. The Rust parsers already strip it on their side.
+    /// </summary>
+    private static string StripIdPrefix(string contents)
+    {
+        const string Prefix = "ID:";
+        const int HexLen = 32;
+        if (!contents.StartsWith(Prefix, StringComparison.Ordinal)) { return contents; }
+        int sep = contents.IndexOf('|', Prefix.Length);
+        if (sep != Prefix.Length + HexLen) { return contents; }
+        return contents[(sep + 1)..];
+    }
+
     /// <summary>Reads an annotation's /Contents, or null on any failure.</summary>
     private string? ReadAnnotationContents(int pageIndex, int index)
     {
@@ -6183,7 +6207,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             byte[] bytes = new byte[(int)buffer.Len];
             System.Runtime.InteropServices.Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
-            return System.Text.Encoding.UTF8.GetString(bytes);
+            return StripIdPrefix(System.Text.Encoding.UTF8.GetString(bytes));
         }
         finally
         {
