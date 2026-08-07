@@ -2365,6 +2365,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// one placed before stamps were tagged, no tag at all).</summary>
     private bool _selectedIsStamp;
 
+    /// <summary>The anchor's angle when a rotate drag began. The DELTA between
+    /// this and the live angle is what the rest of a multi-selection turns by;
+    /// the live angle alone is the anchor's absolute heading and means nothing
+    /// to the others.</summary>
+    private double _rotateStartDeg;
+
+    /// <summary>Every member's rectangle when a rotate drag began, anchor
+    /// first. Orbiting has to be measured from these, not from wherever the
+    /// members are mid-gesture, or the group creeps outward as it turns.</summary>
+    private readonly List<LoadedSelection> _rotateOrigin = new();
+
     /// <summary>Slot-space (DIP) inset from _selectedLoaded's /Rect back to
     /// the shape's outer stroke edge. The writer adds width/2 + 1 on every
     /// side to keep PDFium from clipping the stroke; the frame and grips
@@ -2982,6 +2993,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             _extraDragOrigin.AddRange(_extraSelected);
         }
+
+        // A rotate gesture needs its own starting state: the anchor's angle, so
+        // a delta can be derived, and every member's rectangle, so the orbit is
+        // measured from where the group actually was.
+        if (!shift && _loadedGrip == LoadedAnnotationPicker.Grip.Rotate)
+        {
+            _rotateStartDeg = _selectedRotationDeg;
+            _rotateOrigin.Clear();
+            _rotateOrigin.Add(sel);
+            _rotateOrigin.AddRange(_extraSelected);
+        }
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
         OnPropertyChanged(nameof(HasSelectedTextBox));
@@ -3240,6 +3262,126 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedLoaded = sel with { Index = newIndex };
         }
         RefreshSelectionOutline();
+    }
+
+    /// <summary>
+    /// Turns a whole multi-selection about its own centre.
+    ///
+    /// Two writes per member, because the core keeps position and angle apart:
+    /// the orbit is a bounds write and the spin is an angle write, and
+    /// rotate_shape_annotation takes no bounds so they cannot be combined.
+    /// Members are located by stable Id between the two, since the first write
+    /// deletes and re-adds and so moves the index.
+    /// </summary>
+    private void CommitGroupRotation()
+    {
+        const int CaptureWidth = 1000;
+        double delta = _selectedRotationDeg - _rotateStartDeg;
+        if (Math.Abs(delta) < 0.01)
+        {
+            RefreshSelectionOutline();
+            return;
+        }
+
+        var rects = _rotateOrigin
+            .Select(m => (m.Left, m.Top, m.Right, m.Bottom))
+            .ToList();
+        if (GroupRotation.BoundingBox(rects) is not { } box)
+        {
+            RefreshSelectionOutline();
+            return;
+        }
+        double pivotX = (box.Left + box.Right) / 2.0;
+        double pivotY = (box.Top + box.Bottom) / 2.0;
+
+        BeginEdit("Rotate group");
+
+        var placed = new List<LoadedSelection>();
+        foreach (var member in _rotateOrigin)
+        {
+            if (FindLoadedById(member.Id, member.PageIndex) is not (int page, int index))
+            {
+                continue;
+            }
+
+            // Its own heading before this gesture, so the spin ADDS to whatever
+            // it already had rather than resetting it.
+            string? tag = ReadAnnotationContents(page, index);
+            double ownAngle = tag is null ? 0 : AngleFromTag(tag);
+
+            var orbited = GroupRotation.OrbitRect(
+                (member.Left, member.Top, member.Right, member.Bottom), pivotX, pivotY, delta);
+
+            RecordEdit(new BoundsRecord(
+                member.Id, page,
+                new EditRect(member.Left, member.Top, member.Right, member.Bottom),
+                new EditRect(orbited.Left, orbited.Top, orbited.Right, orbited.Bottom)));
+
+            // 1. Orbit.
+            var target = new LoadedSelection(
+                page, index, orbited.Left, orbited.Top, orbited.Right, orbited.Bottom, member.Id);
+            int moved = WriteMovedAnnotation(target, target, CaptureWidth);
+            if (moved < 0) { continue; }
+            InvalidateLoadedPage(page);
+            Interop.AnnotationLoader.WriteId(_documentHandle, page, moved, member.Id);
+            InvalidateLoadedPage(page);
+
+            // 2. Spin, at the new home.
+            if (FindLoadedById(member.Id, page) is not (int p2, int i2)) { continue; }
+            float newAngle = (float)(ownAngle + delta);
+            int spun = i2;
+            bool isText = TextBoxTagReader.TryParse(ReadAnnotationContents(p2, i2), out _);
+            if (isText)
+            {
+                RenderCoreNative.rotate_text_box_annotation(
+                    _documentHandle, p2, i2, CaptureWidth,
+                    (float)(orbited.Left * CaptureWidth), (float)(orbited.Top * CaptureWidth),
+                    (float)(orbited.Right * CaptureWidth), (float)(orbited.Bottom * CaptureWidth),
+                    newAngle, out spun);
+            }
+            else if (ReadAnnotationContents(p2, i2) is string t2
+                     && t2.StartsWith("AyaanStamp:", StringComparison.Ordinal))
+            {
+                RenderCoreNative.rotate_stamp_annotation(
+                    _documentHandle, p2, i2, CaptureWidth, newAngle, out spun);
+            }
+            else
+            {
+                RenderCoreNative.rotate_shape_annotation(
+                    _documentHandle, p2, i2, CaptureWidth, newAngle, out spun);
+            }
+
+            InvalidateLoadedPage(p2);
+            if (spun >= 0)
+            {
+                Interop.AnnotationLoader.WriteId(_documentHandle, p2, spun, member.Id);
+                InvalidateLoadedPage(p2);
+            }
+
+            placed.Add(new LoadedSelection(
+                p2, spun, orbited.Left, orbited.Top, orbited.Right, orbited.Bottom, member.Id));
+        }
+
+        CommitEdit();
+        IsDirty = true;
+
+        // Rebuild the selection from what actually landed, anchor first.
+        if (placed.Count > 0)
+        {
+            _selectedLoaded = placed[0];
+            _extraSelected.Clear();
+            for (int i = 1; i < placed.Count; i++) { _extraSelected.Add(placed[i]); }
+        }
+        _rotateOrigin.Clear();
+        RefreshSelectionOutline();
+    }
+
+    /// <summary>An annotation's own rotation, whatever kind it is, or 0.</summary>
+    private static double AngleFromTag(string tag)
+    {
+        if (tag.StartsWith("AyaanShape:", StringComparison.Ordinal)) { return ParseShapeRotation(tag); }
+        if (tag.StartsWith("AyaanStamp:", StringComparison.Ordinal)) { return ParseStampRotation(tag); }
+        return TextBoxTagReader.TryParse(tag, out var box) ? box.RotationDeg : 0;
     }
 
     /// <summary>The handle under a point, accounting for the box's rotation: the
@@ -4851,6 +4993,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void CommitRotation(LoadedSelection start)
     {
         const int CaptureWidth = 1000;
+
+        // A multi-selection turns as one rigid body: every member ORBITS the
+        // selection's centre and SPINS by the same delta. Handled before the
+        // single-object paths below, which only know how to turn one mark on
+        // the spot.
+        if (_extraSelected.Count > 0 && _rotateOrigin.Count == _extraSelected.Count + 1)
+        {
+            CommitGroupRotation();
+            return;
+        }
 
         if (_selectedIsStamp)
         {

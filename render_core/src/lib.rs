@@ -11069,6 +11069,66 @@ mod tests {
     }
 
     #[test]
+    fn a_shape_can_be_repositioned_and_then_rotated_in_one_gesture() {
+        // What rotating a GROUP asks of each member: it has to ORBIT the
+        // selection centre (a reposition) and SPIN about its own centre (an
+        // angle). rotate_shape_annotation takes no bounds, so a shape needs
+        // two writes, and the second must not undo the first. This pins that
+        // sequence before the app is taught to drive it.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        // Deliberately oblong, so a spin is visible in the bounding box.
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 0.20 * CAP as f32, y1: 0.45 * CAP as f32,
+            x2: 0.40 * CAP as f32, y2: 0.50 * CAP as f32,
+            r: 255, g: 0, b: 0, a: 255,
+            width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+
+        // 1. Orbit: move it to where the group rotation puts it.
+        let mut idx = -1;
+        assert_eq!(
+            resize_shape_annotation(
+                handle, 0, 0, CAP,
+                0.55 * CAP as f32, 0.70 * CAP as f32,
+                0.75 * CAP as f32, 0.75 * CAP as f32,
+                &mut idx as *mut i32),
+            STATUS_OK_PDFIUM,
+            "the orbit write must succeed"
+        );
+
+        // 2. Spin: give it the group's delta angle, at its new home.
+        let mut idx2 = -1;
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, idx, CAP, 90.0, &mut idx2 as *mut i32),
+            STATUS_OK_PDFIUM,
+            "the spin write must succeed"
+        );
+
+        let bbox = red_bbox_norm(handle, 600).expect("shape should still be on the page");
+        close_document(handle);
+        println!("ORBIT+SPIN: {bbox:?}");
+
+        // It must be at the ORBITED position, not back at the original: the
+        // rotate write must have kept the move.
+        let cx = (bbox.0 + bbox.2) / 2.0;
+        let cy = (bbox.1 + bbox.3) / 2.0;
+        assert!((cx - 0.65).abs() < 0.04, "orbited centre x should be ~0.65, got {cx:.3}");
+        assert!((cy - 0.725).abs() < 0.04, "orbited centre y should be ~0.725, got {cy:.3}");
+
+        // And it must be TALL now, having been wide before the spin.
+        let w = bbox.2 - bbox.0;
+        let h = bbox.3 - bbox.1;
+        assert!(h > w, "after a quarter turn the shape should be taller than wide: {bbox:?}");
+    }
+
+    #[test]
     fn moving_three_shapes_as_a_group_moves_all_three_drawings() {
         // The whole reported failure, end to end, in the core: three shapes
         // drawn side by side, then every one of them moved down by the same
