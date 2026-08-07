@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace PdfEditorApp.Viewport;
@@ -16,12 +17,12 @@ public enum HistoryScope
     Document,
 
     /// <summary>
-    /// One annotation object in the file was moved or resized.
+    /// One or more annotation objects in the file were moved or resized.
     ///
-    /// Its own scope because the inverse is exactly four numbers: put the
-    /// rectangle back. Recording a whole-document snapshot for a nudge would
-    /// cost megabytes per drag, and dragging a stamp across a page is the most
-    /// repeated edit there is.
+    /// Its own scope because the inverse is exactly four numbers per object:
+    /// put the rectangles back. Recording a whole-document snapshot for a
+    /// nudge would cost megabytes per drag, and dragging something across a
+    /// page is the most repeated edit there is.
     ///
     /// Only for edits with a cheap exact inverse. DELETING an annotation does
     /// not qualify, because undoing it means recreating content this entry
@@ -33,8 +34,15 @@ public enum HistoryScope
 /// <summary>
 /// The rectangle to restore one annotation to, in normalized page coordinates.
 /// </summary>
+/// <param name="Id">
+/// The annotation's STABLE identity. Undo used to address its target by
+/// (page, index), which is volatile: every edit deletes and re-adds, so by
+/// the time undo ran the index could point at a different mark. The index is
+/// still carried as a hint for the common case where nothing moved, but the
+/// Id is what actually resolves the target.
+/// </param>
 public sealed record AnnotationBoundsState(
-    int PageIndex, int Index, double Left, double Top, double Right, double Bottom);
+    int PageIndex, int Index, double Left, double Top, double Right, double Bottom, Guid Id);
 
 /// <summary>
 /// A note's restorable state. Notes are the only mutable annotation (their
@@ -74,9 +82,13 @@ public sealed class HistoryEntry
 
     /// <summary>
     /// Set only for <see cref="HistoryScope.AnnotationBounds"/> entries: the
-    /// rectangle to put one annotation back to.
+    /// rectangles to put annotations back to.
+    ///
+    /// A LIST, because a move can carry a whole multi-selection. It used to be
+    /// a single state recording the drag's anchor only, so undoing a group
+    /// move returned one mark and left the rest where they had been dragged.
     /// </summary>
-    public AnnotationBoundsState? Bounds { get; init; }
+    public IReadOnlyList<AnnotationBoundsState> Bounds { get; init; } = [];
 
     /// <summary>The page in view when this state was captured.</summary>
     public int PageIndex { get; init; }
@@ -88,7 +100,7 @@ public sealed class HistoryEntry
     /// </summary>
     public long Cost =>
         DocumentBytes?.LongLength
-        ?? (Bounds is not null
-                ? 64L
+        ?? (Bounds.Count > 0
+                ? Bounds.Count * 64L
                 : (Highlights.Count + InkStrokes.Count + Shapes.Count + Notes.Count) * 128L + 256L);
 }

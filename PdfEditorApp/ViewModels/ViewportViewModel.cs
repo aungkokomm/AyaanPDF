@@ -3630,10 +3630,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // rather than as a document snapshot, because dragging a stamp around
         // a page is the most repeated edit there is and each snapshot is the
         // whole PDF.
+        // Every object the gesture touches, not just the anchor. Recording the
+        // anchor alone meant undoing a group move returned one mark and left
+        // the rest where they had been dragged. The extras' pre-drag rectangles
+        // come from _extraDragOrigin, which is the snapshot taken when the drag
+        // began; _extraSelected already holds their moved positions by now.
+        var undoTargets = new List<AnnotationBoundsState>
+        {
+            new(start.PageIndex, start.Index, start.Left, start.Top, start.Right, start.Bottom, start.Id),
+        };
+        var origins = _extraDragOrigin.Count == _extraSelected.Count ? _extraDragOrigin : _extraSelected;
+        foreach (var e in origins)
+        {
+            undoTargets.Add(new AnnotationBoundsState(
+                e.PageIndex, e.Index, e.Left, e.Top, e.Right, e.Bottom, e.Id));
+        }
+
         PushHistory(HistoryScope.AnnotationBounds,
                     resizing ? "Resize annotation" : "Move annotation",
-                    new AnnotationBoundsState(start.PageIndex, start.Index,
-                                              start.Left, start.Top, start.Right, start.Bottom));
+                    undoTargets);
 
         // resize_annotation, not set_annotation_bounds: it does the same thing
         // for a move or a quad-point resize, and rebuilds the annotation when
@@ -6375,28 +6390,39 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private HistoryEntry Capture(HistoryEntry target) => Capture(target.Scope, target.Label, target.Bounds);
 
     private HistoryEntry Capture(HistoryScope scope, string label,
-                                 AnnotationBoundsState? boundsTarget = null)
+                                 IReadOnlyList<AnnotationBoundsState>? boundsTargets = null)
     {
-        // For a per-annotation step the inverse is that SAME annotation's
-        // rectangle as it stands right now, so redo puts it back where undo
-        // took it from. Read live rather than remembered, since a rebuild on
-        // resize can have changed its index.
-        AnnotationBoundsState? bounds = null;
-        if (scope == HistoryScope.AnnotationBounds && boundsTarget is not null)
+        // For a per-annotation step the inverse is those SAME annotations'
+        // rectangles as they stand right now, so redo puts them back where
+        // undo took them from. Read live rather than remembered, since every
+        // write deletes and re-adds and so changes indices.
+        var bounds = new List<AnnotationBoundsState>();
+        if (scope == HistoryScope.AnnotationBounds && boundsTargets is not null)
         {
-            foreach (var a in LoadedFor(boundsTarget.PageIndex))
+            foreach (var target in boundsTargets)
             {
-                if (a.Index == boundsTarget.Index)
-                {
-                    bounds = new AnnotationBoundsState(
-                        boundsTarget.PageIndex, a.Index, a.Left, a.Top, a.Right, a.Bottom);
-                    break;
-                }
-            }
+                AnnotationBoundsState? live = null;
 
-            // The annotation is gone, so there is nothing to restore to. Fall
-            // back to the remembered rectangle rather than dropping the step.
-            bounds ??= boundsTarget;
+                // By Id first. The index in the target is a hint from when the
+                // drag started and may already be stale.
+                if (target.Id != Guid.Empty
+                    && FindLoadedById(target.Id, target.PageIndex) is (int lp, int li))
+                {
+                    foreach (var a in LoadedFor(lp))
+                    {
+                        if (a.Index == li)
+                        {
+                            live = new AnnotationBoundsState(lp, li, a.Left, a.Top, a.Right, a.Bottom, target.Id);
+                            break;
+                        }
+                    }
+                }
+
+                // The annotation is gone, or was never stamped, so there is
+                // nothing live to read. Keep the remembered rectangle rather
+                // than dropping the step.
+                bounds.Add(live ?? target);
+            }
         }
 
         byte[]? bytes = null;
@@ -6431,7 +6457,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>Records the pre-edit state. Call immediately BEFORE mutating.</summary>
     private void PushHistory(HistoryScope scope, string label,
-                             AnnotationBoundsState? bounds = null)
+                             IReadOnlyList<AnnotationBoundsState>? bounds = null)
     {
         // A bounds step records the rectangle as it is RIGHT NOW, which is
         // where undo has to put it back to. Passed through Capture rather than
@@ -6467,30 +6493,60 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // else alone. It must NOT fall through to the overlay restore below:
         // this annotation lives in the document, not in those lists, and
         // rewriting them would wipe marks made since.
-        if (entry.Scope == HistoryScope.AnnotationBounds && entry.Bounds is { } b)
+        if (entry.Scope == HistoryScope.AnnotationBounds && entry.Bounds.Count > 0)
         {
             const int CaptureWidth = 1000;
-            int status = RenderCoreNative.resize_annotation(
-                _documentHandle, b.PageIndex, b.Index, CaptureWidth,
-                (float)(b.Left * CaptureWidth), (float)(b.Top * CaptureWidth),
-                (float)(b.Right * CaptureWidth), (float)(b.Bottom * CaptureWidth),
-                out int newIndex);
+            _extraSelected.Clear();
+            LoadedSelection? restoredAnchor = null;
 
-            Diag.Log($"undo bounds p{b.PageIndex}#{b.Index} -> {status}, index now {newIndex}");
+            foreach (var b in entry.Bounds)
+            {
+                // Resolve by Id. The recorded index is a hint: every write in
+                // between deleted and re-added annotations, so it may now name
+                // a different mark entirely.
+                int page = b.PageIndex;
+                int index = b.Index;
+                if (b.Id != Guid.Empty && FindLoadedById(b.Id, b.PageIndex) is (int lp, int li))
+                {
+                    page = lp;
+                    index = li;
+                }
 
-            if (status == RenderStatus.OkPdfium)
+                // WriteMovedAnnotation, NOT resize_annotation. The latter
+                // REFUSES a shape outright, so undoing a shape move used to
+                // fail silently: the history step was consumed and the drawing
+                // never moved. Proved by
+                // undoing_a_shape_move_puts_the_drawing_back. This helper does
+                // the same per-kind dispatch the move path uses.
+                var from = new LoadedSelection(page, index, b.Left, b.Top, b.Right, b.Bottom, b.Id);
+                int newIndex = WriteMovedAnnotation(from, from, CaptureWidth);
+                Diag.Log($"undo bounds p{page}#{index} id={b.Id:N} -> newIndex {newIndex}");
+                if (newIndex < 0) { continue; }
+
+                InvalidateLoadedPage(page);
+                if (b.Id != Guid.Empty)
+                {
+                    Interop.AnnotationLoader.WriteId(_documentHandle, page, newIndex, b.Id);
+                    InvalidateLoadedPage(page);
+                }
+
+                var restored = new LoadedSelection(page, newIndex, b.Left, b.Top, b.Right, b.Bottom, b.Id);
+                if (restoredAnchor is null) { restoredAnchor = restored; }
+                else { _extraSelected.Add(restored); }
+            }
+
+            if (restoredAnchor is not null)
             {
                 IsDirty = entry.WasDirty;
-                _selectedLoaded = new LoadedSelection(
-                    b.PageIndex, newIndex, b.Left, b.Top, b.Right, b.Bottom);
+                _selectedLoaded = restoredAnchor;
                 _loadedGrip = LoadedAnnotationPicker.Grip.None;
                 _loadedDrag = null;
-                InvalidateLoadedPage(b.PageIndex);
+                _extraDragOrigin.Clear();
                 RefreshSelectionOutline();
                 OnPropertyChanged(nameof(HasSelectedAnnotation));
-        OnPropertyChanged(nameof(HasSelectedTextBox));
-        OnPropertyChanged(nameof(HasSelectedShape));
-        OnPropertyChanged(nameof(HasMultiSelection));
+                OnPropertyChanged(nameof(HasSelectedTextBox));
+                OnPropertyChanged(nameof(HasSelectedShape));
+                OnPropertyChanged(nameof(HasMultiSelection));
             }
 
             NotifyHistoryChanged();

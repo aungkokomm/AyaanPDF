@@ -10941,6 +10941,90 @@ mod tests {
     }
 
     #[test]
+    fn undoing_a_shape_move_puts_the_drawing_back() {
+        // Models exactly what the app's undo does to a moved shape.
+        //
+        // CommitLoadedMove writes a shape with resize_shape_annotation (which
+        // redraws it from its tag). The undo entry then restores the old
+        // rectangle with resize_annotation - and resize_annotation REFUSES a
+        // shape, as pinned by
+        // moving_a_shape_moves_the_drawing_not_just_the_rectangle. The failure
+        // is swallowed: the history step is consumed and the drawing does not
+        // move, so undo appears to do nothing.
+        //
+        // Undo has to dispatch per kind, the same way the move path was taught
+        // to in v2.2.3.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        const CAP: i32 = 1000;
+        let spec = ShapeSpec {
+            page_index: 0,
+            kind: SHAPE_RECTANGLE,
+            x1: 0.10 * CAP as f32,
+            y1: 0.10 * CAP as f32,
+            x2: 0.30 * CAP as f32,
+            y2: 0.30 * CAP as f32,
+            r: 255, g: 0, b: 0, a: 255,
+            width_px: 4.0,
+            rotation_deg: 0.0,
+            fill_rgba: 0,
+        };
+        assert_eq!(
+            add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
+            STATUS_OK_PDFIUM
+        );
+        let before = red_bbox_norm(handle, 600).expect("shape should be on the page");
+
+        // The move, as CommitLoadedMove performs it.
+        let mut moved_index = -1;
+        assert_eq!(
+            resize_shape_annotation(
+                handle, 0, 0, CAP,
+                0.50 * CAP as f32, 0.50 * CAP as f32,
+                0.70 * CAP as f32, 0.70 * CAP as f32,
+                &mut moved_index as *mut i32,
+            ),
+            STATUS_OK_PDFIUM
+        );
+        let moved = red_bbox_norm(handle, 600).expect("shape should still be on the page");
+        assert!((moved.0 - 0.50).abs() < 0.03, "the move itself should work: {moved:?}");
+
+        // The undo, as ApplyHistoryEntry now performs it: put the old
+        // rectangle back through the SAME per-kind dispatch the move used.
+        // resize_annotation is still asserted to refuse a shape, so that the
+        // day it starts succeeding somebody notices.
+        let mut refused = -1;
+        assert_eq!(
+            resize_annotation(
+                handle, 0, moved_index, CAP,
+                0.10 * CAP as f32, 0.10 * CAP as f32,
+                0.30 * CAP as f32, 0.30 * CAP as f32,
+                &mut refused as *mut i32,
+            ),
+            STATUS_UNSUPPORTED,
+            "resize_annotation must still refuse shapes; undo relies on              dispatching to the shape path instead"
+        );
+
+        let mut undone_index = -1;
+        let status = resize_shape_annotation(
+            handle, 0, moved_index, CAP,
+            0.10 * CAP as f32, 0.10 * CAP as f32,
+            0.30 * CAP as f32, 0.30 * CAP as f32,
+            &mut undone_index as *mut i32,
+        );
+        let after = red_bbox_norm(handle, 600).expect("shape should still be on the page");
+        close_document(handle);
+
+        println!("UNDO SHAPE MOVE: before {before:?} moved {moved:?} undo-status {status} after {after:?}");
+
+        assert!(
+            (after.0 - before.0).abs() < 0.03,
+            "undo should have put the drawing back at x {:.3}, but it is at x {:.3}              (resize_annotation returned {status}). Undo is not dispatching per              annotation kind.",
+            before.0,
+            after.0
+        );
+    }
+
+    #[test]
     fn moving_three_shapes_as_a_group_moves_all_three_drawings() {
         // The whole reported failure, end to end, in the core: three shapes
         // drawn side by side, then every one of them moved down by the same
