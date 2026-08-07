@@ -26,7 +26,13 @@
         contrast is what makes it feel like a canvas rather than a borderless
         region of the window.
     -->
-    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp">
+    <!-- KeyboardAcceleratorPlacementMode=Hidden: WinUI otherwise advertises an
+         accelerator by floating a tooltip ("Ctrl+G") over its owner. On a menu
+         item that is helpful; on this Grid, whose owner is the whole editor,
+         it parks a label in the middle of the canvas on top of the user's
+         drawing and stays there. The menu entries still show their shortcuts. -->
+    <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
+          KeyboardAcceleratorPlacementMode="Hidden">
         <!-- Editor shortcuts as XAML KeyboardAccelerators. They route through
              the WinUI accelerator system, which fires regardless of which
              visual has focus within this Grid - the custom KeyDown switch

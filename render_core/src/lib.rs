@@ -1621,22 +1621,14 @@ fn extract_stamp_pixels(doc_handle: u64, page_index: i32, index: i32) -> Option<
             continue;
         };
         if let PdfPageObject::Image(image) = &object {
-            // RAW, the opposite of what the resize path wants.
-            //
-            // get_processed_bitmap applies the object's transforms, so on an
-            // already-turned stamp it returns pixels with the current angle
-            // BAKED IN. Re-placing those at a new angle adds the two together
-            // and resamples the picture again every time: the stamp turned the
-            // wrong distance and grew visibly more skewed with each rotation.
-            //
-            // The raw buffer is the source image, untransformed, which is
-            // exactly what a rotation to an ABSOLUTE angle needs. It also
-            // ignores a separate image mask, which is safe here because these
-            // stamps are created by set_bitmap from decoded BGRA and carry
-            // their alpha in the buffer itself rather than in a mask.
+            // PROCESSED, so the image's transparency comes with it: the raw
+            // buffer ignores the soft mask and turned a signature into a
+            // black block. Processed also applies the object's transform,
+            // which would bake in the current angle - that is why the caller
+            // resets the object to UPRIGHT before extracting.
             let bitmap = image
-                .get_raw_bitmap()
-                .or_else(|_| image.get_processed_bitmap(&doc_guard));
+                .get_processed_bitmap(&doc_guard)
+                .or_else(|_| image.get_raw_bitmap());
             if let Ok(bitmap) = bitmap {
                 let format = bitmap.format().unwrap_or(PdfBitmapFormat::BGRA);
                 return to_bgra(bitmap.width(), bitmap.height(), format, &bitmap.as_raw_bytes());
@@ -1690,36 +1682,49 @@ fn rotate_stamp_annotation_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    // The upright box, from the tag. A stamp placed before stamps were tagged
-    // has none, so fall back to its current rectangle and treat it as upright,
-    // which is exactly what it is in that case.
+    // Step 1: read the UPRIGHT box from the tag, and put the image object back
+    // upright before anything reads its pixels.
+    //
+    // The pixels have to come out with their transparency (or a signature
+    // becomes a black block) and WITHOUT the current angle baked in (or each
+    // rotation compounds and resamples). get_processed_bitmap gives the first
+    // and, on a turned stamp, spoils the second. Resetting the object's matrix
+    // to upright first makes processed give both. FPDFAnnot_GetObject plus
+    // FPDFAnnot_UpdateObject is what actually reaches the stored object;
+    // pdfium-render's own accessor hands back a detached copy, which is the
+    // "does nothing" noted on set_annotation_bounds.
     let upright = {
         let _guard = lock(&CALL_LOCK);
         let Some(doc) = lock(&core().documents).get(&doc_handle).cloned() else {
             return STATUS_INVALID_INPUT;
         };
         let doc_guard = lock(&doc);
-        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
             return STATUS_INVALID_INPUT;
         };
-        let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            return STATUS_INVALID_INPUT;
+        }
+        let (origin_x, origin_top) = page_origin(&page);
+        let scale = page_w / capture_width as f32;
+
+        let mut annotations = page.annotations_mut();
+        let Ok(annotation) = annotations.get(index as usize) else {
             return STATUS_INVALID_INPUT;
         };
         if !matches!(annotation, PdfPageAnnotation::Stamp(_)) {
             return STATUS_UNSUPPORTED;
         }
 
-        match annotation_tag(&annotation).as_deref().and_then(parse_stamp_tag) {
+        let (ul, ut, ur, ub) = match annotation_tag(&annotation).as_deref().and_then(parse_stamp_tag)
+        {
             Some((_, l, t, r, b)) => (l, t, r, b),
             None => {
+                // Never rotated, so its rectangle IS its upright box.
                 let Ok(bounds) = annotation.bounds() else {
                     return STATUS_INVALID_INPUT;
                 };
-                let page_w = page.width().value;
-                if page_w <= 0.0 {
-                    return STATUS_INVALID_INPUT;
-                }
-                let (origin_x, origin_top) = page_origin(&page);
                 let per_pt = capture_width as f32 / page_w;
                 (
                     (bounds.left().value - origin_x) * per_pt,
@@ -1728,14 +1733,40 @@ fn rotate_stamp_annotation_inner(
                     (origin_top - bounds.bottom().value) * per_pt,
                 )
             }
+        };
+
+        let x0 = origin_x + ul * scale;
+        let x1 = origin_x + ur * scale;
+        let y1 = origin_top - ut * scale;
+        let y0 = origin_top - ub * scale;
+
+        let bindings = annotation.library_bindings();
+        let annot_handle = annotation.annotation_handle();
+        if bindings.FPDFAnnot_GetObjectCount(annot_handle) >= 1 {
+            let object = bindings.FPDFAnnot_GetObject(annot_handle, 0);
+            if !object.is_null() {
+                // The plain unit-square placement: no rotation, upright box.
+                let upright_matrix = FS_MATRIX {
+                    a: x1 - x0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: y1 - y0,
+                    e: x0,
+                    f: y0,
+                };
+                bindings.FPDFPageObj_SetMatrix(object, &upright_matrix);
+                bindings.FPDFAnnot_UpdateObject(annot_handle, object);
+            }
         }
+
+        (ul, ut, ur, ub)
     };
 
+    // Step 2: take the pixels, now upright and still transparent.
     let Some((px_width, px_height, pixels)) = extract_stamp_pixels(doc_handle, page_index, index)
     else {
         return STATUS_UNSUPPORTED;
     };
-
     let expected = (px_width as usize)
         .saturating_mul(px_height as usize)
         .saturating_mul(4);
@@ -1743,7 +1774,10 @@ fn rotate_stamp_annotation_inner(
         return STATUS_INVALID_INPUT;
     }
 
-    // Remove before re-placing, so a failure in between cannot leave two.
+    // Step 3: re-place at the requested ABSOLUTE angle, through the same path
+    // that puts a stamp down in the first place. Setting the annotation's
+    // rectangle in place is not an option: PDFium re-fits a stamp's objects to
+    // a changed rectangle, which squashes the picture by its own aspect.
     let removed = delete_annotation(doc_handle, page_index, index);
     if removed != STATUS_OK_PDFIUM {
         return removed;
@@ -11166,3 +11200,4 @@ mod tests {
         );
     }
 }
+
