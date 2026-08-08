@@ -94,6 +94,12 @@ public abstract record DocumentObject
     public DocumentObjectKind Kind { get; init; }
 
     /// <summary>
+    /// The group this object belongs to, or empty when it belongs to none.
+    /// Stored on the annotation itself, so a group survives the file closing.
+    /// </summary>
+    public Guid GroupId { get; init; }
+
+    /// <summary>
     /// Whether this object can be removed and put back faithfully.
     ///
     /// Reordering is a run of removals and re-adds, because appending is the

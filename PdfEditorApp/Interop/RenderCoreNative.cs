@@ -819,6 +819,27 @@ internal static partial class RenderCoreNative
         float bottom,
         out int newIndex);
 
+    /// <summary>
+    /// Records which group an annotation belongs to, as 32 lowercase hex chars.
+    /// A null/zero-length value clears it.
+    ///
+    /// A key of its own rather than a tag field: a group can hold shapes, text
+    /// boxes and stamps together, and those have entirely different tag
+    /// formats, so no single tag field could carry it.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_annotation_group_id(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        [In] byte[]? groupUtf8,
+        nuint groupLen);
+
+    /// <summary>The annotation's group id, or an empty buffer when it is in no
+    /// group. Release with <see cref="free_byte_buffer"/>.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_annotation_group_id(ulong docHandle, int pageIndex, int index);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int set_annotation_bounds(
         ulong docHandle,

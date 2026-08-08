@@ -23,7 +23,8 @@ public readonly record struct AnnotationSnapshot(
     double Bottom,
     double Opacity,
     Guid Id,
-    string? Contents);
+    string? Contents,
+    Guid GroupId = default);
 
 /// <summary>
 /// Turns annotations read out of a PDF into the read-only document model.
@@ -69,6 +70,7 @@ public static class DocumentModelBuilder
                 Bounds = bounds,
                 Opacity = a.Opacity,
                 RawTag = a.Contents,
+                GroupId = a.GroupId,
                 Kind = DocumentObjectKind.Shape,
                 ShapeKind = tag.Kind,
                 Geometry = GeometryFrom(tag, bounds),
@@ -88,6 +90,7 @@ public static class DocumentModelBuilder
             Bounds = bounds,
             Opacity = a.Opacity,
             RawTag = a.Contents,
+            GroupId = a.GroupId,
             Kind = ClassifyOpaque(a),
             Subtype = a.Subtype,
         };

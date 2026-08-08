@@ -24,7 +24,9 @@ internal readonly record struct ExistingAnnotation(
     double Bottom,
     int Color,
     double Opacity,
-    Guid Id);
+    Guid Id,
+    /// <summary>The group this mark belongs to, or Guid.Empty for none.</summary>
+    Guid GroupId);
 
 /// <summary>
 /// Marshals render_core::get_annotations, always freeing the native array.
@@ -94,7 +96,8 @@ internal static class AnnotationLoader
                     native.Bottom,
                     native.Color,
                     native.Opacity,
-                    id));
+                    id,
+                    ReadGroup(docHandle, pageIndex, native.Index) ?? Guid.Empty));
             }
 
             PdfEditorApp.Diag.Log($"Load p{pageIndex}: {count} annotations, {unstamped} with no persisted id");
@@ -135,6 +138,56 @@ internal static class AnnotationLoader
         finally
         {
             RenderCoreNative.free_byte_buffer(buffer);
+        }
+    }
+
+    /// <summary>
+    /// The group this annotation belongs to, or null when it belongs to none.
+    ///
+    /// Stored on a key of its own rather than in the tag, because a group can
+    /// hold shapes, text boxes and stamps together and those have entirely
+    /// different tag formats.
+    /// </summary>
+    public static Guid? ReadGroup(ulong docHandle, int pageIndex, int index)
+    {
+        var buffer = RenderCoreNative.get_annotation_group_id(docHandle, pageIndex, index);
+        try
+        {
+            if (buffer.Status != RenderStatus.OkPdfium || buffer.Data == System.IntPtr.Zero || buffer.Len == 0)
+            {
+                return null;
+            }
+            byte[] bytes = new byte[(int)buffer.Len];
+            Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+            string hex = Encoding.UTF8.GetString(bytes);
+            // Anything but a well formed id is treated as no group rather than
+            // thrown: a hand-edited PDF is a legal state, and inventing a
+            // membership from a bad value would bucket unrelated marks together.
+            return hex.Length == 32 && IsHex(hex) ? Guid.ParseExact(hex, "N") : null;
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buffer);
+        }
+    }
+
+    /// <summary>Records the annotation's group. Null clears it.</summary>
+    public static void WriteGroup(ulong docHandle, int pageIndex, int index, Guid? group)
+    {
+        int status;
+        if (group is Guid g && g != Guid.Empty)
+        {
+            byte[] hex = Encoding.ASCII.GetBytes(g.ToString("N"));
+            status = RenderCoreNative.set_annotation_group_id(docHandle, pageIndex, index, hex, (nuint)hex.Length);
+        }
+        else
+        {
+            status = RenderCoreNative.set_annotation_group_id(docHandle, pageIndex, index, null, 0);
+        }
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            PdfEditorApp.Diag.Log($"WriteGroup p{pageIndex}#{index} FAILED status={status}");
         }
     }
 

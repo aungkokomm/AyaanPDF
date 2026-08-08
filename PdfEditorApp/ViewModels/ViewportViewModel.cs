@@ -1071,6 +1071,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         bool burned = flatten ? BurnAllAnnotations() : WriteAnnotationObjects();
 
+        // Groups live in memory while the app runs; this is where they become
+        // part of the file. Before it, every group the user made was lost the
+        // moment the document closed.
+        PersistGroups();
+
         bool saved = RenderCoreNative.save_document(_documentHandle, path) == RenderStatus.OkPdfium;
 
         if (burned && saved)
@@ -2896,7 +2901,79 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             ? new List<Interop.ExistingAnnotation>()
             : Interop.AnnotationLoader.Load(_documentHandle, pageIndex);
         _loadedByPage[pageIndex] = list;
+        AbsorbGroupsFrom(list);
         return list;
+    }
+
+    /// <summary>
+    /// Rebuilds session groups from what the document says, as pages load.
+    ///
+    /// Groups used to live only in memory, so every group the user made
+    /// evaporated when the file closed. They are written to the annotations on
+    /// save and read back here.
+    ///
+    /// Per page rather than in one pass at open, because pages load lazily and
+    /// scanning a 300-page document to find groupings the user may never look
+    /// at would undo that. A group spanning pages assembles as its pages load,
+    /// which is enough: nothing can act on a member before its page is loaded.
+    /// </summary>
+    private void AbsorbGroupsFrom(IReadOnlyList<Interop.ExistingAnnotation> loaded)
+    {
+        foreach (var byGroup in loaded
+            .Where(a => a.GroupId != Guid.Empty && a.Id != Guid.Empty)
+            .GroupBy(a => a.GroupId))
+        {
+            var members = byGroup.Select(a => a.Id).ToList();
+
+            // Merge into whichever existing group already holds any of these,
+            // so the halves of a group split across pages become one group
+            // rather than two.
+            var existing = _groups.FirstOrDefault(g => g.Any(members.Contains));
+            if (existing is null)
+            {
+                if (members.Count >= 1) { _groups.Add(members); }
+                continue;
+            }
+            foreach (var id in members)
+            {
+                if (!existing.Contains(id)) { existing.Add(id); }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes every session group onto its members, so they survive the file
+    /// being closed. Called just before a save.
+    ///
+    /// The group's id is its smallest member Guid: deterministic, needs no
+    /// extra state, and a change of membership is a different group anyway.
+    /// Marks in no group have any stale id cleared, so an ungroup sticks.
+    /// </summary>
+    private void PersistGroups()
+    {
+        if (_documentHandle == 0) { return; }
+
+        var groupOf = new Dictionary<Guid, Guid>();
+        foreach (var g in _groups)
+        {
+            if (g.Count < 2) { continue; }
+            Guid key = g.Min();
+            foreach (var id in g) { groupOf[id] = key; }
+        }
+
+        foreach (int page in _loadedByPage.Keys.ToList())
+        {
+            foreach (var a in LoadedFor(page))
+            {
+                Guid wanted = groupOf.TryGetValue(a.Id, out var k) ? k : Guid.Empty;
+                if (wanted != a.GroupId)
+                {
+                    Interop.AnnotationLoader.WriteGroup(
+                        _documentHandle, page, a.Index, wanted == Guid.Empty ? null : wanted);
+                }
+            }
+        }
+        Diag.Log($"PersistGroups: {_groups.Count(g => g.Count >= 2)} groups written");
     }
 
     /// <summary>
@@ -5297,7 +5374,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             snapshots.Add(new AnnotationSnapshot(
                 a.Index, a.Subtype, a.Left, a.Top, a.Right, a.Bottom,
-                a.Opacity, a.Id, ReadAnnotationContents(pageIndex, a.Index)));
+                a.Opacity, a.Id, ReadAnnotationContents(pageIndex, a.Index), a.GroupId));
         }
         return DocumentModelBuilder.BuildPage(pageIndex, snapshots);
     }

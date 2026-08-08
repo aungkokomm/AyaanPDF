@@ -2707,6 +2707,139 @@ fn page_origin(page: &pdfium_render::prelude::PdfPage) -> (f32, f32) {
 /// stay editable; the next write moves them over and clears the comment.
 const TAG_KEY: &str = "AyaanTag";
 
+/// Private key holding an annotation's GROUP, separate from its tag.
+///
+/// Separate on purpose. A group can hold shapes, text boxes and image stamps
+/// together, and those three have entirely different tag formats, so there is
+/// no one tag field that could carry it. A key of its own is kind-agnostic and
+/// touches none of the existing formats.
+const GROUP_KEY: &str = "AyaanGroup";
+
+/// Writes an annotation's group key. An empty value clears it.
+fn set_annotation_group<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
+    annotation: &mut A,
+    group: &str,
+) -> bool {
+    use pdfium_render::prelude::*;
+    let mut utf16: Vec<u16> = group.encode_utf16().collect();
+    utf16.push(0);
+    annotation.library_bindings().FPDFAnnot_SetStringValue(
+        annotation.annotation_handle(),
+        GROUP_KEY,
+        utf16.as_ptr(),
+    ) != 0
+}
+
+/// Reads an annotation's group key, or None when it belongs to no group.
+///
+/// Unlike the tag there is NO /Contents fallback: a group is something this app
+/// wrote or it does not exist, and reading a user's comment as a group id would
+/// invent memberships out of prose.
+fn annotation_group<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
+    annotation: &A,
+) -> Option<String> {
+    use pdfium_render::prelude::*;
+    let bindings = annotation.library_bindings();
+    let handle = annotation.annotation_handle();
+
+    // Length is in BYTES and includes the UTF-16 terminator, so 2 or under is
+    // empty rather than a value.
+    let len = bindings.FPDFAnnot_GetStringValue(handle, GROUP_KEY, std::ptr::null_mut(), 0);
+    if len <= 2 {
+        return None;
+    }
+    let mut buf = vec![0u16; len as usize / 2];
+    bindings.FPDFAnnot_GetStringValue(handle, GROUP_KEY, buf.as_mut_ptr(), len);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf16(&buf).ok().filter(|s| !s.is_empty())
+}
+
+/// Records which group an annotation belongs to. `group_len` of 0 clears it.
+///
+/// Groups are held in the view model while the app runs and written here when
+/// the document is saved, so they survive a close and reopen. Before this they
+/// were session-only: every group the user made evaporated when the file did.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn set_annotation_group_id(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    group_utf8: *const u8,
+    group_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    // Either empty (clear) or exactly one id, same shape as an annotation id.
+    if group_len != 0 && (group_utf8.is_null() || group_len != ID_HEX_LEN) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let owned = if group_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(group_utf8, group_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) if s.chars().all(|c| c.is_ascii_hexdigit()) => s.to_string(),
+            _ => return STATUS_INVALID_INPUT,
+        }
+    };
+
+    panic::catch_unwind(|| {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
+        let doc_guard = lock(&doc);
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let annotations = page.annotations_mut();
+        let Some(mut annotation) = annotations.iter().nth(index as usize) else {
+            return STATUS_INVALID_INPUT;
+        };
+        if set_annotation_group(&mut annotation, &owned) {
+            STATUS_OK_PDFIUM
+        } else {
+            STATUS_INVALID_INPUT
+        }
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// The annotation's group id as 32 lowercase hex chars, or empty.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_annotation_group_id(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&doc_handle).cloned();
+        let Some(doc) = doc else { return ByteBuffer::err(STATUS_INVALID_INPUT); };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        // Same hand-off as the id reader: leak the box to the caller, who frees
+        // it with free_byte_buffer.
+        let owned = annotation_group(&annotation).unwrap_or_default();
+        let mut boxed = owned.into_bytes().into_boxed_slice();
+        let buffer = ByteBuffer {
+            data: boxed.as_mut_ptr(),
+            len: boxed.len(),
+            status: STATUS_OK_PDFIUM,
+        };
+        std::mem::forget(boxed);
+        buffer
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
 /// Writes the app's tag to the private key and clears `/Contents`, so the
 /// annotation carries no reader-visible comment.
 fn set_annotation_tag<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
@@ -8811,6 +8944,119 @@ mod tests {
         assert!(parse_shape_tag("AyaanShape:0:GGGGGGGG:2:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:0:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:abc:1:1").is_none());
+    }
+
+    #[test]
+    fn a_group_survives_a_save_and_reopen() {
+        // The whole point. Grouping has been session-only: every group the user
+        // made evaporated when the file closed.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [
+            shape(SHAPE_RECTANGLE, 50.0, 50.0, 200.0, 150.0),
+            shape(SHAPE_RECTANGLE, 250.0, 50.0, 400.0, 150.0),
+            shape(SHAPE_ELLIPSE, 450.0, 50.0, 600.0, 150.0),
+        ];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        // The first two are grouped; the third is not.
+        let group: String = std::iter::repeat('7').take(ID_HEX_LEN).collect();
+        for i in 0..2 {
+            assert_eq!(
+                unsafe { set_annotation_group_id(handle, 0, i, group.as_ptr(), group.len()) },
+                STATUS_OK_PDFIUM
+            );
+        }
+
+        let saved = snapshot_document(handle);
+        close_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0, "the saved document would not reopen");
+
+        let read = |i: i32| -> String {
+            let buf = get_annotation_group_id(reopened, 0, i);
+            let out = if buf.status == STATUS_OK_PDFIUM && !buf.data.is_null() && buf.len > 0 {
+                let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
+                String::from_utf8_lossy(bytes).to_string()
+            } else {
+                String::new()
+            };
+            free_byte_buffer(buf);
+            out
+        };
+        let (g0, g1, g2) = (read(0), read(1), read(2));
+        close_document(reopened);
+
+        println!("GROUP RELOAD: [{g0}] [{g1}] [{g2}]");
+        assert_eq!(g0, group, "member 0 lost its group");
+        assert_eq!(g1, group, "member 1 lost its group");
+        assert!(g2.is_empty(), "an ungrouped mark came back in a group: {g2}");
+    }
+
+    #[test]
+    fn clearing_a_group_removes_it_rather_than_leaving_a_stale_one() {
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 50.0, 50.0, 200.0, 150.0)];
+        assert_eq!(add_shape_annotations(handle, CAP, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let group: String = std::iter::repeat('a').take(ID_HEX_LEN).collect();
+        assert_eq!(
+            unsafe { set_annotation_group_id(handle, 0, 0, group.as_ptr(), group.len()) },
+            STATUS_OK_PDFIUM
+        );
+        // Ungroup: an empty value, which is how the app says "no group".
+        assert_eq!(
+            unsafe { set_annotation_group_id(handle, 0, 0, std::ptr::null(), 0) },
+            STATUS_OK_PDFIUM
+        );
+
+        let buf = get_annotation_group_id(handle, 0, 0);
+        let len = buf.len;
+        free_byte_buffer(buf);
+        close_document(handle);
+        assert_eq!(len, 0, "the group survived being cleared");
+    }
+
+    #[test]
+    fn a_group_id_that_is_not_an_id_is_refused() {
+        // Guards the one thing that would corrupt membership: a value that is
+        // not an id would bucket unrelated marks together on the next load.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 50.0, 50.0, 200.0, 150.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        for bad in ["short", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] {
+            assert_eq!(
+                unsafe { set_annotation_group_id(handle, 0, 0, bad.as_ptr(), bad.len()) },
+                STATUS_INVALID_INPUT,
+                "wrongly accepted {bad:?}"
+            );
+        }
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_group_key_does_not_disturb_the_shape_tag() {
+        // The two are separate keys, so grouping a shape must not touch what it
+        // is or how it draws.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [shape(SHAPE_ROUNDED_RECT, 50.0, 50.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+        let before = contents_of(handle, 0, 0).expect("no tag");
+
+        let group: String = std::iter::repeat('b').take(ID_HEX_LEN).collect();
+        assert_eq!(
+            unsafe { set_annotation_group_id(handle, 0, 0, group.as_ptr(), group.len()) },
+            STATUS_OK_PDFIUM
+        );
+        let after = contents_of(handle, 0, 0).expect("tag vanished");
+        close_document(handle);
+
+        assert_eq!(before, after, "grouping rewrote the shape's tag");
     }
 
     #[test]
