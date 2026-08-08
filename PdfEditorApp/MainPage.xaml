@@ -33,18 +33,16 @@
          drawing and stays there. The menu entries still show their shortcuts. -->
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
           KeyboardAcceleratorPlacementMode="Hidden">
-        <!-- Ctrl+G and Ctrl+Shift+G used to ALSO be declared here, as a second
-             belt after the custom KeyDown switch proved unreliable. When the
-             MenuFlyoutItem accelerators were added later as the proper fix,
-             this pair was never removed, so two elements in one visual tree
-             claimed the same chord. WinUI resolves that ambiguously and here
-             it resolved to NEITHER: the menu item grouped, the keystroke did
-             nothing, and no handler was entered at all.
+        <!-- Ctrl chords are NOT declared as accelerators on this Grid, and the
+             accelerators on the MenuFlyoutItems below are not what makes them
+             fire. Those items live in a Button's MenuFlyout, so they are not in
+             the visual tree until the flyout opens, and an accelerator on an
+             unrealised element is not live. They are kept only because they are
+             what renders "Ctrl+G" beside the menu entry.
 
-             Every accelerator that works in this window (Ctrl+O, Ctrl+S,
-             Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z, Ctrl+R) is declared exactly once, on
-             its MenuFlyoutItem. Group and Ungroup now match them. Keep it that
-             way: one chord, one registration. -->
+             Every Ctrl chord that actually works from the canvas is a case in
+             RootGrid_KeyDown. That is the single registration point; add new
+             ones there. -->
         <!--
             The canvas surface. A fixed neutral grey rather than a theme
             brush: theme surface colours are near-white in light mode, so a
@@ -608,6 +606,63 @@
         </ScrollView>
 
         <!--
+            Contextual object toolbar. Floats over the viewport and follows the
+            selection, so object commands are reachable without going to the
+            menu. This is now the primary route to Group and Ungroup, because
+            Ctrl+G proved to be interceptable outside the app entirely.
+
+            OUTSIDE the ScrollView on purpose. Inside it the buttons would be
+            scaled by ZoomFactor along with the page and would be the size of a
+            postage stamp at 25% and unusable at 800%. Its Margin mirrors
+            PageScroller's so that its origin is the viewport's top-left, which
+            is the space ObjectToolbarPlacement computes in; SetRulersVisible
+            keeps the two margins in step.
+
+            Text labels rather than icons: no Segoe glyph reads unambiguously as
+            "ungroup", and a guessed glyph that is missing from the font renders
+            as a tofu box.
+        -->
+        <Border x:Name="ObjectToolbar" Grid.Column="2"
+                Margin="22,22,0,0"
+                HorizontalAlignment="Left" VerticalAlignment="Top"
+                Visibility="Collapsed" Canvas.ZIndex="20"
+                Background="{ThemeResource LayerFillColorAltBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="6" Padding="3"
+                SizeChanged="ObjectToolbar_SizeChanged">
+            <Border.RenderTransform>
+                <TranslateTransform x:Name="ObjectToolbarOffset" />
+            </Border.RenderTransform>
+            <StackPanel Orientation="Horizontal" Spacing="2">
+                <Button x:Name="ObjToolGroup" Content="Group" Padding="10,4"
+                        Click="ObjToolGroup_Click"
+                        ToolTipService.ToolTip="Group the selected objects so they move together" />
+                <Button x:Name="ObjToolUngroup" Content="Ungroup" Padding="10,4"
+                        Click="ObjToolUngroup_Click"
+                        ToolTipService.ToolTip="Break this group apart" />
+                <Rectangle Width="1" Margin="3,4" VerticalAlignment="Stretch"
+                           Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                <Button x:Name="ObjToolBack" Content="To back" Padding="10,4"
+                        Click="ObjToolBack_Click"
+                        ToolTipService.ToolTip="Send behind everything else on the page" />
+                <Button x:Name="ObjToolBackward" Content="&#x2013;1" Padding="10,4"
+                        Click="ObjToolBackward_Click"
+                        ToolTipService.ToolTip="Send backward one step" />
+                <Button x:Name="ObjToolForward" Content="+1" Padding="10,4"
+                        Click="ObjToolForward_Click"
+                        ToolTipService.ToolTip="Bring forward one step" />
+                <Button x:Name="ObjToolFront" Content="To front" Padding="10,4"
+                        Click="ObjToolFront_Click"
+                        ToolTipService.ToolTip="Bring in front of everything else on the page" />
+                <Rectangle Width="1" Margin="3,4" VerticalAlignment="Stretch"
+                           Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                <Button x:Name="ObjToolDelete" Content="Delete" Padding="10,4"
+                        Click="ObjToolDelete_Click"
+                        ToolTipService.ToolTip="Delete the selected objects" />
+            </StackPanel>
+        </Border>
+
+        <!--
             Empty state. Without it a fresh launch is an unexplained grey void
             with no indication that anything works or what to do next.
         -->
@@ -831,7 +886,13 @@
             Collapsed entirely for tools that offer nothing, so the canvas is
             uncluttered whenever the bar has nothing to say.
         -->
+        <!-- ZIndex 30: ABOVE the floating object toolbar (20). Both are
+             top-aligned in this column and the object toolbar clamps to a few
+             pixels from the top of the viewport, so a selection near the top of
+             a page put it straight over this bar and hid whatever was under it.
+             The property bar is the app's chrome and wins. -->
         <Border x:Name="PropertyBar" Grid.Column="2" Visibility="Collapsed"
+                Canvas.ZIndex="30"
                 HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12,12,12,0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
@@ -1065,6 +1126,21 @@
                                 <Polygon Points="19,1 14.8,7.3 11.6,2.5"
                                          Fill="{ThemeResource TextFillColorPrimaryBrush}" />
                             </Grid>
+                        </ListViewItem>
+                        <!--
+                            APPENDED, not inserted. SetToolSections selects by
+                            `SelectedIndex = (int)ActiveShapeKind`, so an item
+                            placed anywhere but last would put every kind after
+                            it out of step with its enum value.
+
+                            RadiusX/Y 4 against the plain Rectangle icon's 1, so
+                            the two are told apart at 20x14.
+                        -->
+                        <ListViewItem Tag="RoundedRectangle" ToolTipService.ToolTip="Rounded rectangle"
+                                      AutomationProperties.Name="Rounded rectangle">
+                            <Rectangle Width="20" Height="14" RadiusX="4" RadiusY="4"
+                                       Stroke="{ThemeResource TextFillColorPrimaryBrush}"
+                                       StrokeThickness="1.5" />
                         </ListViewItem>
                     </ListView>
                 </StackPanel>
@@ -1366,6 +1442,32 @@
                                 ToolTipService.ToolTip="Fill opacity"
                                 ValueChanged="FillOpacity_ValueChanged" />
                         <TextBlock x:Name="FillOpacityReadout" VerticalAlignment="Center" MinWidth="34"
+                                   TextAlignment="Right"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                    </StackPanel>
+
+                    <!-- Corner radius. Only meaningful for a rounded rectangle,
+                         so it is collapsed for every other kind rather than sat
+                         there doing nothing. A PERCENTAGE of the roundest the
+                         box can be, not an absolute measurement: the control
+                         then means the same thing on a small badge and a
+                         full-page box, and it survives a resize. -->
+                    <StackPanel x:Name="CornerRadiusSection" Orientation="Horizontal"
+                                Spacing="6" VerticalAlignment="Center"
+                                Visibility="Collapsed">
+                        <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                                   Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                        <TextBlock Text="Corners" VerticalAlignment="Center"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <Slider x:Name="CornerRadiusSlider" Width="88" Maximum="100" Minimum="0"
+                                StepFrequency="5" TickFrequency="25"
+                                VerticalAlignment="Center"
+                                AutomationProperties.Name="Corner radius"
+                                ToolTipService.ToolTip="Corner radius (0 is square)"
+                                ValueChanged="CornerRadius_ValueChanged" />
+                        <TextBlock x:Name="CornerRadiusReadout" VerticalAlignment="Center" MinWidth="34"
                                    TextAlignment="Right"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                    Style="{StaticResource CaptionTextBlockStyle}" />

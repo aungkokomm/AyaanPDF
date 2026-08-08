@@ -42,6 +42,13 @@ public class AlignMultiWriteTests
         public byte B;
         public byte A;
         public float WidthPx;
+        // The native struct has grown three times since this mirror was
+        // written: RotationDeg, FillRgba, then CornerRadiusPx. A short mirror
+        // does not error, it just marshals the array with the wrong stride and
+        // feeds the core garbage from the next element.
+        public float RotationDeg;
+        public uint FillRgba;
+        public float CornerRadiusPx;
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -63,6 +63,7 @@ public sealed partial class MainPage : Page
             new KeyEventHandler(DiagKeyDownSpy),
             handledEventsToo: true);
         ViewModel.InkStrokeChanged += OnInkStrokeChanged;
+        ViewModel.SelectionVisualsChanged += UpdateObjectToolbar;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
         // Shapes are a SEPARATE collection but share the ink canvas, so without
         // this a finished shape was added to the model and nothing ever redrew
@@ -515,6 +516,9 @@ public sealed partial class MainPage : Page
     {
         UpdateZoomReadout();
 
+        // Anchored to a page position, so every scroll and zoom moves it.
+        UpdateObjectToolbar();
+
         // A zoom that no longer matches fit-width means the user took over,
         // by pinch, Ctrl+wheel or a zoom command. Detecting it from the state
         // rather than from each input path means no gesture can be forgotten.
@@ -585,29 +589,115 @@ public sealed partial class MainPage : Page
     private enum RulerUnit { Points, Picas, Millimeters, Centimeters, Inches }
     private RulerUnit _rulerUnit = RulerUnit.Inches;
 
-    // Group/Ungroup - three separate routes so at least ONE fires no matter
-    // where focus is: MenuFlyoutItem Click (opens menu, clicks item), the
-    // MenuFlyoutItem's KeyboardAccelerator (fires Ctrl+G directly - proven
-    // to work from the Rulers/Ctrl+R precedent), and the RootGrid
-    // KeyboardAccelerator below as a third belt.
-    private void Group_Click(object sender, RoutedEventArgs e)
-    {
-        Diag.Log("Group_Click fired (menu item)");
-        ViewModel.GroupSelected();
-    }
+    // Group/Ungroup from the menu. The keyboard route is a case in
+    // RootGrid_KeyDown, NOT the MenuFlyoutItem's accelerator: that accelerator
+    // is only live while the flyout is open. See the Ctrl+O/Ctrl+S block there.
+    private void Group_Click(object sender, RoutedEventArgs e) => ViewModel.GroupSelected();
+
     private void Ungroup_Click(object sender, RoutedEventArgs e) => ViewModel.UngroupSelected();
 
-    private void GroupShortcut_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
-    {
-        Diag.Log($"GroupShortcut_Invoked fired (Ctrl+G accelerator), SelectionCount={ViewModel.SelectionCount}");
-        ViewModel.GroupSelected();
-        args.Handled = true;
-    }
+    // ---------------- Contextual object toolbar ----------------
 
-    private void UngroupShortcut_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs args)
+    /// <summary>True while a pointer drag is in flight. The toolbar hides for
+    /// the duration: it is anchored to the selection, so during a drag it would
+    /// chase the object around under the user's cursor.</summary>
+    private bool _objectToolbarSuppressed;
+
+    private void ObjToolGroup_Click(object sender, RoutedEventArgs e) => ViewModel.GroupSelected();
+
+    private void ObjToolUngroup_Click(object sender, RoutedEventArgs e) => ViewModel.UngroupSelected();
+
+    private void ObjToolFront_Click(object sender, RoutedEventArgs e) => ViewModel.BringSelectedToFront();
+
+    private void ObjToolBack_Click(object sender, RoutedEventArgs e) => ViewModel.SendSelectedToBack();
+
+    private void ObjToolForward_Click(object sender, RoutedEventArgs e) => ViewModel.BringSelectedForward();
+
+    private void ObjToolBackward_Click(object sender, RoutedEventArgs e) => ViewModel.SendSelectedBackward();
+
+    private void ObjToolDelete_Click(object sender, RoutedEventArgs e) => ViewModel.DeleteSelectedAnnotation();
+
+    /// <summary>The toolbar's width is only known once it has been measured, and
+    /// it changes when a button's label does. Re-place it whenever that
+    /// happens, or it stays centred on its previous width.</summary>
+    private void ObjectToolbar_SizeChanged(object sender, SizeChangedEventArgs e) => UpdateObjectToolbar();
+
+    /// <summary>
+    /// Puts the floating toolbar over the current selection, or hides it.
+    ///
+    /// Coordinates travel: normalized annotation units -> page-local slot DIPs
+    /// (the view model's job) -> ScrollView viewport DIPs via TransformToVisual,
+    /// which is what applies the zoom and the scroll offset and the horizontal
+    /// centring of a page narrower than the viewport. Doing that last step by
+    /// hand is what put the rulers on page 0's origin instead of the current
+    /// page's, so let the transform do it.
+    /// </summary>
+    private void UpdateObjectToolbar()
     {
-        ViewModel.UngroupSelected();
-        args.Handled = true;
+        // Fires from a view-model event that can outlive the page during
+        // teardown, and from SizeChanged before the field is assigned.
+        if (ObjectToolbar is null || ViewportHost is null || PageScroller is null) { return; }
+
+        if (_objectToolbarSuppressed
+            || !ViewModel.TryGetSelectionBox(out int page, out double l, out double t, out double r, out double b))
+        {
+            ObjectToolbar.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        double padL = ViewportHost.Padding.Left;
+        double padT = ViewportHost.Padding.Top;
+        double slotTop = ViewModel.SlotTopOf(page);
+
+        Windows.Foundation.Point tl, br;
+        try
+        {
+            var toViewport = ViewportHost.TransformToVisual(PageScroller);
+            tl = toViewport.TransformPoint(new Windows.Foundation.Point(padL + l, padT + slotTop + t));
+            br = toViewport.TransformPoint(new Windows.Foundation.Point(padL + r, padT + slotTop + b));
+        }
+        catch
+        {
+            // TransformToVisual throws while the tree is being rebuilt. The next
+            // ViewChanged or selection change repositions, so a skipped frame
+            // here is invisible.
+            return;
+        }
+
+        double barW = ObjectToolbar.ActualWidth;
+        double barH = ObjectToolbar.ActualHeight;
+        if (barW <= 0 || barH <= 0)
+        {
+            // Never shown yet, so it has no measured size and nowhere correct to
+            // go. Make it visible but fully transparent; the SizeChanged that
+            // follows re-enters here with real numbers and fades it in. Showing
+            // it opaque now would flash the buttons at the viewport corner.
+            ObjectToolbar.Opacity = 0;
+            ObjectToolbar.Visibility = Visibility.Visible;
+            return;
+        }
+
+        // The property bar sits at the top of this same column and draws ABOVE
+        // this toolbar, so anything placed under it is unreachable. Reserve its
+        // height, measured rather than assumed, since it is one or two rows.
+        double topInset = PropertyBar.Visibility == Visibility.Visible
+            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
+            : 0;
+
+        var place = ObjectToolbarPlacement.Place(
+            tl.X, tl.Y, br.X, br.Y,
+            barW, barH,
+            PageScroller.ViewportWidth, PageScroller.ViewportHeight,
+            Math.Max(0, topInset));
+
+        ObjectToolbarOffset.X = place.Left;
+        ObjectToolbarOffset.Y = place.Top;
+
+        ObjToolGroup.IsEnabled = ViewModel.CanGroupSelection;
+        ObjToolUngroup.IsEnabled = ViewModel.CanUngroupSelection;
+
+        ObjectToolbar.Opacity = 1;
+        ObjectToolbar.Visibility = Visibility.Visible;
     }
 
     private void RulersToggle_Click(object sender, RoutedEventArgs e)
@@ -631,6 +721,10 @@ public sealed partial class MainPage : Page
         // ScrollView's other margins never change, so this doesn't fight any
         // other layout hint.
         PageScroller.Margin = on ? new Thickness(22, 22, 0, 0) : new Thickness(0);
+        // The floating toolbar is positioned in the scroller's viewport space,
+        // so its origin has to move with the scroller's or it lands 22px out
+        // whenever the rulers are toggled.
+        ObjectToolbar.Margin = PageScroller.Margin;
         if (on) { RedrawRulers(); }
     }
 
@@ -2301,6 +2395,24 @@ public sealed partial class MainPage : Page
         FillOpacityReadout.Text = $"{percent}%";
     }
 
+    /// <summary>
+    /// Shows the corner slider when it would do something: a rounded rectangle
+    /// is selected, or the shape tool is armed with that kind so the next drag
+    /// will make one. Otherwise it is collapsed rather than left inert.
+    /// </summary>
+    /// <summary>Puts the corner slider on the selected shape's own radius.
+    /// VISIBILITY is not decided here: that comes from PropertyBarLayout with
+    /// every other section, which is the whole point of the record.</summary>
+    private void SyncCornerRadius()
+    {
+        int percent = (int)Math.Round(ViewModel.ShapeCornerPercent);
+        bool prior = _suppressCornerRadiusChange;
+        _suppressCornerRadiusChange = true;
+        CornerRadiusSlider.Value = Math.Clamp(percent, CornerRadiusSlider.Minimum, CornerRadiusSlider.Maximum);
+        _suppressCornerRadiusChange = prior;
+        CornerRadiusReadout.Text = $"{percent}%";
+    }
+
     /// <summary>Starts SET so the value the slider raises while the page is
     /// still building up isn't mistaken for a deliberate change. Cleared once
     /// the pickers are initialized (same pattern as <see cref="_suppressOpacityChange"/>).</summary>
@@ -2311,6 +2423,26 @@ public sealed partial class MainPage : Page
     /// nothing with a fill is selected (the section itself is hidden then, so
     /// this handler mostly doesn't fire, but the guard makes it safe if it
     /// does).</summary>
+    /// <summary>
+    /// Corner radius, as a percentage of the roundest the selected box can be.
+    /// Applies to the selection when there is a rounded rectangle picked, and in
+    /// every case stays as the setting the NEXT rounded rectangle is drawn with,
+    /// which is how the colour and width controls already behave.
+    /// </summary>
+    private void CornerRadius_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (_suppressCornerRadiusChange) { return; }
+
+        ViewModel.ShapeCornerPercent = e.NewValue;
+        ViewModel.ApplyCornerRadiusToSelectedShape();
+        CornerRadiusReadout.Text = $"{(int)Math.Round(e.NewValue)}%";
+    }
+
+    /// <summary>Guards the same way the opacity sliders do: putting the control
+    /// where a freshly selected shape already is must not be read as the user
+    /// asking to change it.</summary>
+    private bool _suppressCornerRadiusChange;
+
     private void FillOpacity_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
         if (_suppressFillOpacityChange)
@@ -2482,6 +2614,11 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void ResetPointerInteraction()
     {
+        // Capture can be lost without a PointerReleased ever arriving, so the
+        // toolbar's suppression has to be lifted here too or it stays hidden
+        // for the rest of the session.
+        _objectToolbarSuppressed = false;
+
         // Drop every drag-time visual (smart alignment lines, snap-flash)
         // FIRST, so a capture-lost mid-drag never leaves orange guides
         // stranded on the page. EndAnnotationMove below also calls this via
@@ -2527,6 +2664,8 @@ public sealed partial class MainPage : Page
         _isMarqueeing = false;
         _isSelectingText = false;
         _isDrawing = false;
+
+        UpdateObjectToolbar();
     }
 
     /// <summary>
@@ -2594,12 +2733,23 @@ public sealed partial class MainPage : Page
     /// rather than the list being bound to the enum's values. The items are
     /// hand-drawn geometry, one per kind, so there is nothing to template over.
     /// </summary>
+    /// <summary>Set while UpdateToolRail writes the picker's selection back, so
+    /// its own write is not read as the user choosing a shape.</summary>
+    private bool _suppressShapeKindChange;
+
     private void ShapeKind_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_suppressShapeKindChange) { return; }
+
         if (ShapeChoices.SelectedItem is FrameworkElement { Tag: string tag }
             && Enum.TryParse(tag, out ShapeKind kind))
         {
             ViewModel.ActiveShapeKind = kind;
+            // Switching to or away from the rounded kind changes which sections
+            // are relevant, so recompute the whole bar rather than poking one
+            // section. UpdateToolRail writes back to ShapeChoices, hence the
+            // guard below on its assignment.
+            UpdateToolRail();
             ReturnFocusAfterPointerUse();
         }
     }
@@ -2624,66 +2774,52 @@ public sealed partial class MainPage : Page
 
         PropertyBarToolName.Text = tool.Name;
 
-        // Colour and width sections show for tools that offer them AND for a
-        // selected shape under any tool, so clicking a shape in Select mode
-        // still exposes its style, the way Word does for text.
-        bool color = tool.Offers(ToolOptions.Color) || ViewModel.HasSelectedShape;
-        ColorSection.Visibility = Show(color);
-        WidthSection.Visibility = Show(tool.Offers(ToolOptions.Width) || ViewModel.HasSelectedShape);
+        // EVERY section's visibility comes from one pure function, so a new
+        // section cannot be wired up in the wrong place. The corner slider
+        // shipped invisible because its visibility was decided in a fill-flyout
+        // handler instead of here; a section that is a field of
+        // PropertyBarSections cannot be left out of the decision.
+        var sections = PropertyBarLayout.For(new PropertyBarState(
+            ToolOptions: tool.Options,
+            ActiveShapeKind: ViewModel.ActiveShapeKind,
+            ToolIsShape: ViewModel.ActiveTool == ToolMode.Shape,
+            HasSelectedShape: ViewModel.HasSelectedShape,
+            HasSelectedTextBox: ViewModel.HasSelectedTextBox,
+            HasSelectedRoundedRect: ViewModel.HasSelectedRoundedRect,
+            HasMultiSelection: ViewModel.HasMultiSelection,
+            HasSelectedAnnotation: ViewModel.HasSelectedAnnotationLoaded));
 
-        // Opacity is UNIVERSAL: it applies to the primary colour of whichever
-        // object is selected (text of a text box, stroke of a shape, or the
-        // tool's next mark). Shown for any of those.
-        OpacitySection.Visibility = Show(color || ViewModel.HasSelectedTextBox);
+        ColorSection.Visibility = Show(sections.Color);
+        WidthSection.Visibility = Show(sections.Width);
+        OpacitySection.Visibility = Show(sections.Opacity);
+        StampSection.Visibility = Show(sections.Stamp);
+        AlignSection.Visibility = Show(sections.Align);
+        CornerRadiusSection.Visibility = Show(sections.CornerRadius);
+        ShapeSection.Visibility = Show(sections.Shape);
+        FontSizeSection.Visibility = Show(sections.FontSize);
+        FontSection.Visibility = Show(sections.Font);
+        TextStyleSection.Visibility = Show(sections.TextStyle);
+        TextAlignRow.Visibility = Show(sections.TextAlign);
+        OutlineButton.Visibility = Show(sections.Outline);
+        PropertyBarRow2.Visibility = Show(sections.Row2);
+        PropertyBar.Visibility = Show(sections.Bar);
 
-        bool stamps = tool.Offers(ToolOptions.Stamp);
-        StampSection.Visibility = Show(stamps);
-
-        // Align + distribute shows only for a real multi-selection; alignment
-        // on one object is a no-op.
-        AlignSection.Visibility = Show(ViewModel.HasMultiSelection);
-
-        bool shapes = tool.Offers(ToolOptions.Shape);
-        ShapeSection.Visibility = Show(shapes);
-        if (shapes)
+        bool color = sections.Color;
+        if (sections.CornerRadius) { SyncCornerRadius(); }
+        if (sections.Shape)
         {
+            // Assigning this re-enters ShapeKind_SelectionChanged, which calls
+            // back here. Without the guard that is an infinite loop.
+            _suppressShapeKindChange = true;
             ShapeChoices.SelectedIndex = (int)ViewModel.ActiveShapeKind;
+            _suppressShapeKindChange = false;
         }
-
-        // The text sections show for the Text tool AND whenever a text box is
-        // selected under any tool: without that second half, clicking a text box
-        // in Select mode gave no way to modify its style. Word behaves the same.
-        bool textSections = tool.Offers(ToolOptions.FontSize) || ViewModel.HasSelectedTextBox;
-        FontSizeSection.Visibility = Show(textSections);
-        FontSection.Visibility = Show(textSections);
-        // TextStyleSection also carries the Fill button, which now applies to
-        // shapes too, so it shows for a selected shape as well. The alignment
-        // sub-row and Outline stay hidden for the shape case (a shape has no
-        // text to align and no separate outline distinct from its stroke).
-        TextStyleSection.Visibility = Show(textSections || ViewModel.HasSelectedShape);
-        TextAlignRow.Visibility = Show(textSections);
-        OutlineButton.Visibility = Show(textSections);
-        if (textSections)
+        if (sections.FontSize)
         {
             ViewModel.EnsureFontsLoaded();
             ShowFontSize();
             SyncTextStyleControls();
         }
-
-        // Row 2 only exists when one of its sections (font, text style, opacity,
-        // stamps, align) is showing, so a simple tool stays a single row.
-        bool row2 = FontSection.Visibility == Visibility.Visible
-                 || TextStyleSection.Visibility == Visibility.Visible
-                 || OpacitySection.Visibility == Visibility.Visible
-                 || StampSection.Visibility == Visibility.Visible
-                 || AlignSection.Visibility == Visibility.Visible;
-        PropertyBarRow2.Visibility = Show(row2);
-
-        // A bar with every section collapsed is an empty pill floating over the
-        // page, so the whole thing goes when the tool offers nothing AND no
-        // selection-driven section is showing.
-        PropertyBar.Visibility = Show(tool.Options != ToolOptions.None
-            || ViewModel.HasMultiSelection);
 
         if (color)
         {
@@ -2691,7 +2827,7 @@ public sealed partial class MainPage : Page
             ShowOpacity();
         }
 
-        if (stamps)
+        if (sections.Stamp)
         {
             RefreshStamps();
         }
@@ -3298,15 +3434,33 @@ public sealed partial class MainPage : Page
                  $"textFocused={IsTextInputFocused} focus={focused?.GetType().Name ?? "null"}");
     }
 
+    /// <summary>Runs a command resolved from the keyboard. One place, so a
+    /// chord and its menu item cannot drift apart.</summary>
+    private void Run(EditorCommand command)
+    {
+        switch (command)
+        {
+            case EditorCommand.Open: OpenFile_Click(this, null!); break;
+            case EditorCommand.SaveAs: SaveAs_Click(this, null!); break;
+            case EditorCommand.Undo: ViewModel.Undo(); break;
+            case EditorCommand.Redo: ViewModel.Redo(); break;
+            case EditorCommand.Group: ViewModel.GroupSelected(); break;
+            case EditorCommand.Ungroup: ViewModel.UngroupSelected(); break;
+            case EditorCommand.ToggleRulers:
+                RulersToggle.IsChecked = !RulersToggle.IsChecked;
+                SetRulersVisible(RulersToggle.IsChecked);
+                break;
+        }
+    }
+
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         // DIAGNOSTIC (temporary): does the REAL handler get this key at all?
         // The spy above sees everything; this line only fires for keys that
         // actually reach the switch, so the two together locate the loss.
-        if (e.Key is not (VirtualKey.Control or VirtualKey.LeftControl or VirtualKey.RightControl))
-        {
-            Diag.Log($"KEYDOWN key={e.Key} handled={e.Handled} _isCtrlDown={_isCtrlDown} textFocused={IsTextInputFocused}");
-        }
+        // Control is logged too: suppressing it hid whether the modifier was
+        // even arriving, which is half of "Ctrl+G does nothing".
+        Diag.Log($"KEYDOWN key={e.Key} handled={e.Handled} _isCtrlDown={_isCtrlDown} textFocused={IsTextInputFocused}");
 
         // Modifier state is tracked even while typing, or releasing Ctrl in a
         // text field would leave the canvas thinking it is still held and the
@@ -3330,6 +3484,21 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
             }
 
+            return;
+        }
+
+        // The menu-command chords resolve through KeyboardCommands, which is
+        // tested. These were declared ONLY as accelerators on MenuFlyoutItems,
+        // whose accelerators are not live until the flyout opens, so keyboard
+        // undo had never worked and nothing could tell. The menu items keep
+        // their accelerators because that is what prints "Ctrl+Z" beside the
+        // entry; this is what actually runs them.
+        var command = KeyboardCommands.Resolve(
+            (int)e.Key, _isCtrlDown, IsShiftDown(), IsTextInputFocused);
+        if (command != EditorCommand.None)
+        {
+            Run(command);
+            e.Handled = true;
             return;
         }
 
@@ -3357,29 +3526,12 @@ public sealed partial class MainPage : Page
             case (VirtualKey)0xDD when _isCtrlDown && IsShiftDown():
                 if (ViewModel.BringSelectedToFront()) { e.Handled = true; }
                 break;
-            // Ctrl+G / Ctrl+Shift+G moved to a Grid.KeyboardAccelerator in
-            // MainPage.xaml because this switch was intermittently NOT
-            // matching on real machines (the case was correct, so probably a
-            // focus/routing quirk somewhere - accelerators fire regardless).
-            // See GroupShortcut_Invoked / UngroupShortcut_Invoked below.
             case VirtualKey.F when _isCtrlDown:
                 SearchBox.Focus(FocusState.Programmatic);
                 SearchBox.SelectAll();
                 e.Handled = true;
                 break;
 
-            // Ctrl+O and Ctrl+S are handled HERE, not only as accelerators on
-            // the menu items: a KeyboardAccelerator inside a MenuFlyout is only
-            // live while that flyout is open, so from the canvas they did
-            // nothing at all.
-            case VirtualKey.O when _isCtrlDown:
-                OpenFile_Click(this, null!);
-                e.Handled = true;
-                break;
-            case VirtualKey.S when _isCtrlDown:
-                SaveAs_Click(this, null!);
-                e.Handled = true;
-                break;
 
             // NOT Tab. Tab is the focus-traversal key, and binding it here
             // meant keyboard users could never move focus anywhere in the app.
@@ -3722,6 +3874,12 @@ public sealed partial class MainPage : Page
             return;   // let ScrollView handle touch/pen pan + pinch
         }
 
+        // Get the floating toolbar out of the way for the whole gesture. It is
+        // anchored to the selection, so left up it would slide around under the
+        // cursor mid-drag and could end up beneath the pointer.
+        _objectToolbarSuppressed = true;
+        UpdateObjectToolbar();
+
         if (!current.Properties.IsLeftButtonPressed)
         {
             return;
@@ -4016,6 +4174,12 @@ public sealed partial class MainPage : Page
 
     private void ViewportHost_PointerReleased(object sender, PointerRoutedEventArgs e)
     {
+        // Lifted BEFORE the pointer-id check. A press that never became a drag
+        // still suppressed the toolbar, and bailing out below would leave it
+        // hidden until the next selection change.
+        _objectToolbarSuppressed = false;
+        UpdateObjectToolbar();
+
         if (e.Pointer.PointerId != _dragPointerId)
         {
             return;

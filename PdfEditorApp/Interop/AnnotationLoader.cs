@@ -69,16 +69,20 @@ internal static class AnnotationLoader
                 if (readId is null)
                 {
                     unstamped++;
-                    // DIAGNOSTIC (temporary): the annotation carries no
-                    // persisted id, so a FRESH one is being invented here. Any
-                    // group or history entry naming the old value stops
-                    // resolving at this exact point.
-                    PdfEditorApp.Diag.Log(
-                        $"  Load p{pageIndex}#{native.Index}: NO persisted id -> inventing ephemeral {id:N}");
-                }
-                else
-                {
-                    PdfEditorApp.Diag.Log($"  Load p{pageIndex}#{native.Index}: persisted id={id:N}");
+
+                    // PERSIST it, here, immediately. An invented id that is not
+                    // written back is a different value on every load, and every
+                    // Guid-addressed operation in this app then works against
+                    // identities that cease to exist the moment the page is
+                    // reloaded. Z-order showed it plainly: the planner built a
+                    // correct plan, and each write reloaded the page, invented
+                    // fresh ids, and could no longer find the object it had just
+                    // planned to move.
+                    //
+                    // Safe during a read: set_annotation_id edits the tag in
+                    // place, with no delete and re-add, so no index moves under
+                    // the loop.
+                    WriteId(docHandle, pageIndex, native.Index, id);
                 }
                 result.Add(new ExistingAnnotation(
                     pageIndex,
@@ -144,11 +148,12 @@ internal static class AnnotationLoader
         // 32 ASCII hex chars, no dashes; matches ID_HEX_LEN on the Rust side.
         byte[] hex = Encoding.ASCII.GetBytes(id.ToString("N"));
         int status = RenderCoreNative.set_annotation_id(docHandle, pageIndex, index, hex, (nuint)hex.Length);
-        // DIAGNOSTIC (temporary): every call, not just failures, while tracing
-        // where a grouped member's Guid is lost. Normally this is failures-only
-        // because it runs on every click and every write in a move.
-        PdfEditorApp.Diag.Log(
-            $"WriteId p{pageIndex}#{index} id={id:N} -> {(status == RenderStatus.OkPdfium ? "OK" : "FAILED status=" + status)}");
+        // Failures only. This runs on every click and on every write of a move,
+        // so logging the successes buries everything else in the file.
+        if (status != RenderStatus.OkPdfium)
+        {
+            PdfEditorApp.Diag.Log($"WriteId p{pageIndex}#{index} id={id:N} FAILED status={status}");
+        }
     }
 
     private static bool IsHex(string s)

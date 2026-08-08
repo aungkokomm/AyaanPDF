@@ -35,6 +35,13 @@ public class ShapeInteropTests
         public byte B;
         public byte A;
         public float WidthPx;
+        // The native struct has grown three times since this mirror was
+        // written: RotationDeg, FillRgba, then CornerRadiusPx. A short mirror
+        // does not error, it just marshals the array with the wrong stride and
+        // feeds the core garbage from the next element.
+        public float RotationDeg;
+        public uint FillRgba;
+        public float CornerRadiusPx;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -132,9 +139,10 @@ public class ShapeInteropTests
     [Fact]
     public void the_shape_struct_is_the_size_the_native_side_writes()
     {
-        // Two ints, four floats, four bytes and a float. No padding, because
-        // every field is four-byte aligned or a byte inside a four-byte group.
-        Assert.Equal(32, Marshal.SizeOf<ShapeSpec>());
+        // Two ints, four floats, four bytes, then width, rotation, fill and
+        // corner radius. No padding, because every field is four-byte aligned
+        // or a byte inside a four-byte group.
+        Assert.Equal(44, Marshal.SizeOf<ShapeSpec>());
     }
 
     [Fact]

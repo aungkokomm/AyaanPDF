@@ -1469,7 +1469,53 @@ pub extern "C" fn resize_annotation(
 
     panic::catch_unwind(|| {
         resize_annotation_inner(doc_handle, page_index, index, capture_width,
-                                left, top, right, bottom, out_new_index)
+                                left, top, right, bottom, out_new_index,
+                                false)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Rebuilds a stamp at the bounds given purely so that it lands at the END of
+/// the page's annotation list, which is the TOP of the paint order.
+///
+/// Reordering is the one thing PDFium's annotation API cannot do: there is no
+/// move or swap, and the /Annots array is not reachable through the public
+/// surface. Appending is the only ordering primitive there is, and a rebuild is
+/// the only way to append something that already exists.
+///
+/// `resize_annotation` cannot serve here. It tries an in-place bounds write
+/// first, and for a same-size move that SUCCEEDS, leaving the annotation exactly
+/// where it was in the list. That is correct for a move and useless for a
+/// raise, so this entry point skips straight to the rebuild.
+///
+/// Stamps only. Ink has no rebuildable description, and an annotation this app
+/// did not create (an Acrobat comment, a form widget) would come back as
+/// something else or not at all, so those report UNSUPPORTED and the caller is
+/// expected to leave the page's order alone rather than lose them.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn raise_stamp_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if !(right > left) || !(bottom > top) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        resize_annotation_inner(doc_handle, page_index, index, capture_width,
+                                left, top, right, bottom, out_new_index,
+                                true)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -1485,19 +1531,26 @@ fn resize_annotation_inner(
     right: f32,
     bottom: f32,
     out_new_index: *mut i32,
+    force_rebuild: bool,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
     // The straightforward path first. It succeeds for a move of anything, and
     // for a resize of the quad-point kinds, and only reports UNSUPPORTED for
     // the cases that genuinely need rebuilding.
-    let direct = set_annotation_bounds(doc_handle, page_index, index, capture_width,
-                                       left, top, right, bottom);
-    if direct != STATUS_UNSUPPORTED {
-        if direct == STATUS_OK_PDFIUM && !out_new_index.is_null() {
-            unsafe { *out_new_index = index };
+    //
+    // Skipped entirely when the CALLER wants the rebuild for its own sake: a
+    // raise needs the annotation to be removed and re-appended, and an in-place
+    // write would report success without moving it in the list at all.
+    if !force_rebuild {
+        let direct = set_annotation_bounds(doc_handle, page_index, index, capture_width,
+                                           left, top, right, bottom);
+        if direct != STATUS_UNSUPPORTED {
+            if direct == STATUS_OK_PDFIUM && !out_new_index.is_null() {
+                unsafe { *out_new_index = index };
+            }
+            return direct;
         }
-        return direct;
     }
 
     // Rebuild. Pull the pixels out of the existing annotation before removing
@@ -1566,6 +1619,24 @@ fn resize_annotation_inner(
         return STATUS_INVALID_INPUT;
     }
 
+    // Carry the stable id across the rebuild. add_stamp_annotation makes a
+    // FRESH annotation, so without this the rebuilt stamp comes back anonymous
+    // and every group, history entry and multi-selection naming it stops
+    // resolving. Losing identity during an operation whose whole purpose is to
+    // move an object around the list is the exact shape of bug that cost a
+    // fortnight in v2.7.5, so it is closed here rather than left to callers.
+    let carried_id = {
+        let buf = get_annotation_id(doc_handle, page_index, index);
+        let id = if buf.status == STATUS_OK_PDFIUM && !buf.data.is_null() && buf.len == ID_HEX_LEN {
+            let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
+            std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+        } else {
+            None
+        };
+        free_byte_buffer(buf);
+        id
+    };
+
     // Remove, then re-place at the new size. Order matters: adding first would
     // briefly leave two copies, and a failure between the two would leave the
     // duplicate behind.
@@ -1583,11 +1654,19 @@ fn resize_annotation_inner(
     }
 
     // The rebuilt annotation is now last on the page.
+    let array = get_annotations(doc_handle, page_index);
+    let count = array.len;
+    free_annotation_array(array);
+    let new_index = count.saturating_sub(1) as i32;
+
+    if let Some(id_hex) = carried_id {
+        unsafe {
+            set_annotation_id(doc_handle, page_index, new_index, id_hex.as_ptr(), id_hex.len());
+        }
+    }
+
     if !out_new_index.is_null() {
-        let array = get_annotations(doc_handle, page_index);
-        let count = array.len;
-        free_annotation_array(array);
-        unsafe { *out_new_index = count.saturating_sub(1) as i32 };
+        unsafe { *out_new_index = new_index };
     }
 
     STATUS_OK_PDFIUM
@@ -3354,6 +3433,41 @@ pub const SHAPE_RECTANGLE: i32 = 0;
 pub const SHAPE_ELLIPSE: i32 = 1;
 pub const SHAPE_LINE: i32 = 2;
 pub const SHAPE_ARROW: i32 = 3;
+pub const SHAPE_ROUNDED_RECT: i32 = 4;
+
+/// Every kind the tag parser and the writer accept. One list rather than three
+/// copies of the same `matches!`, because a kind added to only some of them is
+/// a shape that can be drawn and then fails to reload.
+macro_rules! known_shape_kinds {
+    () => {
+        SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_LINE | SHAPE_ARROW | SHAPE_ROUNDED_RECT
+    };
+}
+
+/// Default corner radius of a rounded rectangle, as a fraction of its SHORTER
+/// side. Proportional rather than absolute so a small badge and a full-page box
+/// look like the same shape family, and so a resize keeps looking right.
+pub const ROUNDED_RECT_DEFAULT_RADIUS: f32 = 0.18;
+
+/// Circular-arc approximation constant for a cubic Bezier: the control points
+/// sit this fraction of the radius along the tangents. The standard 4-arc
+/// circle approximation, accurate to about one part in a thousand.
+const KAPPA: f32 = 0.552_284_75;
+
+/// The corner radius actually drawn, in the same units as the rectangle.
+///
+/// Clamped to half the shorter side: past that the two corners on a side meet
+/// and any larger value would make the arcs overlap and cross, which draws as a
+/// bow-tie rather than a stadium. Clamping at DRAW time rather than at entry
+/// means a stored radius stays intact when a shape is squeezed small and then
+/// grown again.
+fn clamped_corner_radius(radius: f32, width: f32, height: f32) -> f32 {
+    let limit = width.abs().min(height.abs()) / 2.0;
+    if !radius.is_finite() || radius <= 0.0 {
+        return 0.0;
+    }
+    radius.min(limit).max(0.0)
+}
 
 /// Barb length as a multiple of the stroke width, with a floor so a hairline
 /// arrow still has a visible head rather than a dot.
@@ -3412,7 +3526,7 @@ fn parse_stamp_tag(contents: &str) -> Option<(f32, f32, f32, f32, f32)> {
 
 const SHAPE_TAG: &str = "AyaanShape:";
 
-fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
+fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32) -> String {
     let fx = u8::from(spec.x2 >= spec.x1);
     let fy = u8::from(spec.y2 >= spec.y1);
     // Rotation and fill are BOTH appended so an older reader that stops after
@@ -3422,7 +3536,17 @@ fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
     // Keeps unrotated stroke-only shapes byte-identical to older tags, so a
     // shape file diffed against the old build shows no change unless the
     // shape actually uses one of these new features.
-    if spec.rotation_deg == 0.0 && spec.fill_rgba == 0 {
+    if radius_pts > 0.0 {
+        // Radius is last, so it is only paid for by the shape that has one.
+        // Rotation and fill have to be emitted alongside it even when zero:
+        // the fields are positional, and skipping one would shift the radius
+        // into the fill's slot on read.
+        format!(
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}:{:.4}",
+            spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts,
+            spec.rotation_deg, spec.fill_rgba, radius_pts
+        )
+    } else if spec.rotation_deg == 0.0 && spec.fill_rgba == 0 {
         format!(
             "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}",
             spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts
@@ -3444,13 +3568,13 @@ fn shape_tag(spec: &ShapeSpec, width_pts: f32) -> String {
 /// on one of our shape annotations, or None if it is not one of ours. Rotation
 /// is 0 and fill is 0 on older tags that predate those fields; the caller does
 /// not need to know which form the tag was in.
-fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32)> {
+fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32)> {
     let contents = strip_id_prefix(contents).1;
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
 
     let kind: i32 = parts.next()?.parse().ok()?;
-    if !matches!(kind, SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_LINE | SHAPE_ARROW) {
+    if !matches!(kind, known_shape_kinds!()) {
         return None;
     }
 
@@ -3482,7 +3606,16 @@ fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bo
         .and_then(|s| u32::from_str_radix(s, 16).ok())
         .unwrap_or(0);
 
-    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill))
+    // Corner radius in POINTS, if present. Absent on every tag written before
+    // rounded rectangles existed, and on every kind that has no corners, which
+    // is why it reads as 0 rather than failing.
+    let radius: f32 = parts
+        .next()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
+
+    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill, radius))
 }
 
 /// One shape to add, in render-pixel space.
@@ -3517,6 +3650,12 @@ pub struct ShapeSpec {
     /// it. APPENDED to the struct: existing callers that zero-init the whole
     /// thing get stroke-only shapes, same as before this field was added.
     pub fill_rgba: u32,
+    /// Corner radius for `SHAPE_ROUNDED_RECT`, in capture-space pixels (the
+    /// same space as `width_px`). Ignored by every other kind. Zero draws
+    /// square corners, so a rounded rect with no radius degrades to a plain
+    /// rectangle rather than to nothing. APPENDED to the struct for the same
+    /// additive-ABI reason as the two fields above.
+    pub corner_radius_px: f32,
 }
 
 /// Half-width of an arrowhead as a fraction of its length, giving the roughly
@@ -3618,7 +3757,7 @@ fn add_shape_annotations_inner(
     let doc_guard = lock(&doc);
 
     for spec in specs {
-        if !matches!(spec.kind, SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_LINE | SHAPE_ARROW) {
+        if !matches!(spec.kind, known_shape_kinds!()) {
             return STATUS_INVALID_INPUT;
         }
 
@@ -3649,6 +3788,20 @@ fn add_shape_annotations_inner(
         // and for an arrow it would cut the barbs clean off.
         let mut extent: Vec<(f32, f32)> = vec![(x1, y1), (x2, y2)];
 
+        // Fill is optional. Historically shapes were stroke-only so they'd
+        // never hide the underlying page; a non-zero fill_rgba opts a closed
+        // shape into a solid fill (with alpha, so a light fill still shows the
+        // page through it).
+        let fill = if spec.fill_rgba != 0 {
+            let r = ((spec.fill_rgba >> 16) & 0xFF) as u8;
+            let g = ((spec.fill_rgba >> 8) & 0xFF) as u8;
+            let b = (spec.fill_rgba & 0xFF) as u8;
+            let a = ((spec.fill_rgba >> 24) & 0xFF) as u8;
+            Some(PdfColor::new(r, g, b, a))
+        } else {
+            None
+        };
+
         let path = match spec.kind {
             SHAPE_RECTANGLE | SHAPE_ELLIPSE => {
                 let rect = PdfRect::new(
@@ -3662,20 +3815,58 @@ fn add_shape_annotations_inner(
                 } else {
                     PdfPagePathObject::new_ellipse
                 };
-                // Fill is optional. Historically shapes were stroke-only so
-                // they'd never hide the underlying page; a non-zero fill_rgba
-                // opts a rectangle or ellipse into a solid fill (with alpha,
-                // so a light fill still shows the page through it).
-                let fill = if spec.fill_rgba != 0 {
-                    let r = ((spec.fill_rgba >> 16) & 0xFF) as u8;
-                    let g = ((spec.fill_rgba >> 8) & 0xFF) as u8;
-                    let b = (spec.fill_rgba & 0xFF) as u8;
-                    let a = ((spec.fill_rgba >> 24) & 0xFF) as u8;
-                    Some(PdfColor::new(r, g, b, a))
-                } else {
-                    None
-                };
                 build(&doc_guard, rect, Some(color), Some(PdfPoints::new(width_pts)), fill)
+            }
+            SHAPE_ROUNDED_RECT => {
+                // Built by hand rather than with a rect helper, because PDFium
+                // has no rounded-rect primitive: it is four straight sides with
+                // a quarter-circle Bezier at each corner.
+                let (left, right) = (x1.min(x2), x1.max(x2));
+                let (bottom, top) = (y1.min(y2), y1.max(y2));
+                let radius = clamped_corner_radius(
+                    spec.corner_radius_px * scale, right - left, top - bottom);
+
+                if radius <= 0.0 {
+                    // Degenerate to a square-cornered rectangle rather than
+                    // drawing a collapsed path. A rounded rect dragged out to a
+                    // sliver is still a rectangle, not an absence.
+                    let rect = PdfRect::new(
+                        PdfPoints::new(bottom), PdfPoints::new(left),
+                        PdfPoints::new(top), PdfPoints::new(right),
+                    );
+                    PdfPagePathObject::new_rect(
+                        &doc_guard, rect, Some(color), Some(PdfPoints::new(width_pts)), fill)
+                } else {
+                    let k = radius * KAPPA;
+                    let p = PdfPoints::new;
+                    // Anticlockwise from the bottom edge, in PDF space where y
+                    // runs UP. Each corner's control points sit KAPPA along the
+                    // two tangents meeting there.
+                    PdfPagePathObject::new(
+                        &doc_guard, p(left + radius), p(bottom),
+                        Some(color), Some(PdfPoints::new(width_pts)), fill,
+                    )
+                    .and_then(|mut path| {
+                        path.line_to(p(right - radius), p(bottom))?;
+                        path.bezier_to(p(right), p(bottom + radius),
+                                       p(right - radius + k), p(bottom),
+                                       p(right), p(bottom + radius - k))?;
+                        path.line_to(p(right), p(top - radius))?;
+                        path.bezier_to(p(right - radius), p(top),
+                                       p(right), p(top - radius + k),
+                                       p(right - radius + k), p(top))?;
+                        path.line_to(p(left + radius), p(top))?;
+                        path.bezier_to(p(left), p(top - radius),
+                                       p(left + radius - k), p(top),
+                                       p(left), p(top - radius + k))?;
+                        path.line_to(p(left), p(bottom + radius))?;
+                        path.bezier_to(p(left + radius), p(bottom),
+                                       p(left), p(bottom + radius - k),
+                                       p(left + radius - k), p(bottom))?;
+                        path.close_path()?;
+                        Ok(path)
+                    })
+                }
             }
             _ => {
                 // For an arrow the shaft stops at the head's BASE; the head is
@@ -3803,7 +3994,16 @@ fn add_shape_annotations_inner(
 
         // Records what this mark IS, so a reopened file still knows. Without
         // it a shape is just ink, and can then only be moved or deleted.
-        let _ = set_annotation_tag(&mut annotation, &shape_tag(spec, width_pts));
+        // Radius is recorded UNCLAMPED, in points. Clamping happens at draw
+        // time against the current box, so squeezing a rounded rect thin and
+        // pulling it back out restores the corners it was drawn with instead of
+        // permanently flattening them.
+        let radius_pts = if spec.kind == SHAPE_ROUNDED_RECT {
+            (spec.corner_radius_px * scale).max(0.0)
+        } else {
+            0.0
+        };
+        let _ = set_annotation_tag(&mut annotation, &shape_tag(spec, width_pts, radius_pts));
 
         rotate_object_about!(path, rot, cx, cy);
         if annotation.objects_mut().add_path_object(path).is_err() {
@@ -3879,7 +4079,7 @@ pub extern "C" fn rotate_shape_annotation(
         // (None), so a rotate does not clear or change a filled shape.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, Some(degrees), None, out_new_index)
+            0, -1.0, Some(degrees), None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -3904,7 +4104,7 @@ pub extern "C" fn restyle_shape_annotation(
     }
     panic::catch_unwind(|| {
         restyle_shape_annotation_inner_with_rotation(
-            doc_handle, page_index, index, capture_width, color_rgba, width_px, None, None, out_new_index)
+            doc_handle, page_index, index, capture_width, color_rgba, width_px, None, None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -3931,7 +4131,39 @@ pub extern "C" fn restyle_shape_fill_annotation(
         // colour, width and rotation. Only the fill changes.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, None, Some(fill_rgba), out_new_index)
+            0, -1.0, None, Some(fill_rgba), None, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Sets the corner radius of one of our rounded rectangles, in capture-space
+/// pixels, without moving or restyling it.
+///
+/// A negative radius is rejected rather than treated as zero: zero is a
+/// meaningful value here (square corners), so silently coercing a bad number
+/// into it would hide the caller's mistake as a legitimate-looking shape.
+///
+/// Every other kind ignores the radius, and setting it on one is harmless: the
+/// value round-trips through the tag and nothing draws with it.
+#[unsafe(no_mangle)]
+pub extern "C" fn restyle_shape_radius_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    radius_px: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if !radius_px.is_finite() || radius_px < 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        restyle_shape_annotation_inner_with_rotation(
+            doc_handle, page_index, index, capture_width,
+            0, -1.0, None, None, Some(radius_px), out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -3946,13 +4178,15 @@ fn restyle_shape_annotation_inner_with_rotation(
     width_px: f32,
     rotation_override: Option<f32>,
     fill_override: Option<u32>,
+    radius_override: Option<f32>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
     // Read tag AND the annotation's own bounds BEFORE the delete, so a mark
     // that is not one of our shapes leaves the page untouched.
-    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, page_left, page_top, page_w, bounds) = {
+    let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, cur_radius_pts,
+         page_left, page_top, page_w, bounds) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
@@ -3966,7 +4200,8 @@ fn restyle_shape_annotation_inner_with_rotation(
         let pw = page.width().value;
         if pw <= 0.0 { return STATUS_INVALID_INPUT; }
         let (page_left, page_top) = page_origin(&page);
-        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, page_left, page_top, pw, bx)
+        (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, tag.10,
+         page_left, page_top, pw, bx)
     };
 
     // Convert the annotation's PDF-point bounds back into capture space AND
@@ -4019,6 +4254,11 @@ fn restyle_shape_annotation_inner_with_rotation(
         // (so a restyle of colour or width alone preserves the fill). A caller
         // that wants to CLEAR the fill passes Some(0), not None.
         fill_rgba: fill_override.unwrap_or(cur_fill),
+        // A radius override is already in capture pixels; without one the
+        // radius comes straight back off the tag, converted through the same
+        // scale the width uses. Restyling colour or fill must never disturb the
+        // corners of a rounded rectangle.
+        corner_radius_px: radius_override.unwrap_or(cur_radius_pts * scale_cap_per_pt),
     };
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
     if status != STATUS_OK_PDFIUM { return status; }
@@ -4075,7 +4315,7 @@ fn resize_shape_annotation_inner(
         }
     };
 
-    let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba) = tag;
+    let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts) = tag;
 
     if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
         return STATUS_INVALID_INPUT;
@@ -4088,7 +4328,7 @@ fn resize_shape_annotation_inner(
 
     // Width was stored in PDF points and the spec wants capture-space pixels,
     // so it goes back through the same scale the writer applied.
-    let width_px = {
+    let (width_px, radius_px) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
@@ -4102,7 +4342,13 @@ fn resize_shape_annotation_inner(
         if page_w <= 0.0 {
             return STATUS_INVALID_INPUT;
         }
-        width_pts * capture_width as f32 / page_w
+        let cap_per_pt = capture_width as f32 / page_w;
+        // The radius rides through a resize unchanged. Keeping the absolute
+        // value means a box stretched wider keeps the same corner curve rather
+        // than having it grow with the box, which is what a rounded rectangle
+        // is expected to do. The draw-time clamp handles a box shrunk below
+        // twice the radius.
+        (width_pts * cap_per_pt, radius_pts * cap_per_pt)
     };
 
     let spec = ShapeSpec {
@@ -4119,6 +4365,7 @@ fn resize_shape_annotation_inner(
         width_px,
         rotation_deg: rot,
         fill_rgba,
+        corner_radius_px: radius_px,
     };
 
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
@@ -7316,7 +7563,7 @@ mod tests {
             a: 255,
             width_px: 3.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         }
     }
 
@@ -8379,7 +8626,7 @@ mod tests {
         let contents = contents_of(reopened, 0, 0).expect("the reopened shape has no contents");
         let parsed = parse_shape_tag(&contents);
         assert!(parsed.is_some(), "tag did not parse: {contents}");
-        let (kind, r, g, b, a, width, _, _, _, _) = parsed.unwrap();
+        let (kind, r, g, b, a, width, _, _, _, _, _) = parsed.unwrap();
 
         assert_eq!(kind, SHAPE_ELLIPSE);
         assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x78));
@@ -8397,7 +8644,7 @@ mod tests {
                 for (y1, y2, fy) in [(20.0, 80.0, true), (80.0, 20.0, false)] {
                     let mut s = shape(kind, x1, y1, x2, y2);
                     s.a = 0xC0;
-                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5)).expect("tag did not parse");
+                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5, 0.0)).expect("tag did not parse");
 
                     assert_eq!(parsed.0, kind);
                     assert_eq!(parsed.4, 0xC0);
@@ -8422,6 +8669,100 @@ mod tests {
         assert!(parse_shape_tag("AyaanShape:0:GGGGGGGG:2:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:0:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:abc:1:1").is_none());
+    }
+
+    #[test]
+    fn raising_a_shape_repeatedly_does_not_grow_it() {
+        // Z-order is a run of removals and re-adds, so a shape can be rebuilt
+        // several times in one command and many times over a session. If each
+        // rebuild moves the geometry at all, the shape creeps.
+        //
+        // The trap: the writer stores /Rect as the shape's extent INFLATED by
+        // width/2 + 1 on every side so PDFium does not clip the stroke. Feeding
+        // that reported rectangle back in as the new extent inflates it again.
+        // Send to back then to front and the shape is visibly fatter.
+        //
+        // restyle_shape_annotation is the correct primitive for a raise: it
+        // takes no bounds, undoes the pad itself, and rebuilds from the tag, so
+        // the geometry is a fixed point.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (start_l, start_t, start_r, start_b) = (first.2, first.3, first.4, first.5);
+
+        let mut index = 0i32;
+        for pass in 0..4 {
+            let mut next = -1;
+            assert_eq!(
+                restyle_shape_annotation(handle, 0, index, 1000, 0, -1.0, &mut next),
+                STATUS_OK_PDFIUM,
+                "raise {pass} was refused"
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+
+        assert_eq!(after.len(), 1, "raising left duplicates: {}", after.len());
+        let (_, _, l, t, r, b) = after[0];
+        println!("RAISE DRIFT: ({start_l:.4},{start_t:.4},{start_r:.4},{start_b:.4}) \
+                  -> ({l:.4},{t:.4},{r:.4},{b:.4})");
+
+        // A pad re-applied four times would show up as roughly four stroke
+        // widths of growth on each axis, which is obvious on screen.
+        let tol = 0.002;
+        assert!((l - start_l).abs() < tol && (t - start_t).abs() < tol
+             && (r - start_r).abs() < tol && (b - start_b).abs() < tol,
+            "the shape drifted: width {:.4} -> {:.4}, height {:.4} -> {:.4}",
+            start_r - start_l, r - l, start_b - start_t, b - t);
+    }
+
+    #[test]
+    fn raising_a_stamp_repeatedly_does_not_move_it() {
+        // Same question as the shape case, for the other kind the z-order
+        // engine rebuilds. A stamp's /Rect is its image rectangle with no pad,
+        // so feeding it back should be a fixed point, but "should" is what the
+        // shape case said too.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let (pw, ph) = (40i32, 10i32);
+        let pixels = marker_stamp_pixels(pw, ph);
+        assert_eq!(
+            add_stamp_annotation(handle, 0, CAP,
+                0.30 * CAP as f32, 0.40 * CAP as f32, 0.70 * CAP as f32, 0.50 * CAP as f32,
+                pixels.as_ptr(), pixels.len(), pw, ph),
+            STATUS_OK_PDFIUM
+        );
+
+        let first = read_annotations(handle, 0)[0];
+        let (sl, st, sr, sb) = (first.2, first.3, first.4, first.5);
+
+        let mut index = 0i32;
+        for _ in 0..4 {
+            let cur = read_annotations(handle, 0)[0];
+            let mut next = -1;
+            assert_eq!(
+                raise_stamp_annotation(handle, 0, index, CAP,
+                    cur.2 * CAP as f32, cur.3 * CAP as f32,
+                    cur.4 * CAP as f32, cur.5 * CAP as f32, &mut next),
+                STATUS_OK_PDFIUM
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+        let (_, _, l, t, r, b) = after[0];
+        println!("STAMP RAISE DRIFT: ({sl:.4},{st:.4},{sr:.4},{sb:.4}) -> ({l:.4},{t:.4},{r:.4},{b:.4})");
+
+        assert_eq!(after.len(), 1);
+        let tol = 0.002;
+        assert!((l - sl).abs() < tol && (t - st).abs() < tol
+             && (r - sr).abs() < tol && (b - sb).abs() < tol,
+            "the stamp drifted: {:.4} wide -> {:.4}", sr - sl, r - l);
     }
 
     #[test]
@@ -8550,15 +8891,15 @@ mod tests {
 
         let specs = [
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 100.0, x2: 700.0, y2: 100.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 },
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 200.0, x2: 700.0, y2: 320.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 },
+                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 700.0, y1: 420.0, x2: 80.0, y2: 420.0,
-                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 },
+                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
             ShapeSpec { page_index: 0, kind: SHAPE_RECTANGLE, x1: 80.0, y1: 500.0, x2: 350.0, y2: 640.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 },
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
             ShapeSpec { page_index: 0, kind: SHAPE_ELLIPSE, x1: 420.0, y1: 500.0, x2: 700.0, y2: 640.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 },
+                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
         ];
         assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()), STATUS_OK_PDFIUM);
 
@@ -10522,6 +10863,252 @@ mod tests {
         Some((lo_x as f32 / wf, lo_y as f32 / wf, hi_x as f32 / wf, hi_y as f32 / wf))
     }
 
+    /// Is the pixel at this normalized-by-page-width point red? Capture space
+    /// divides BOTH axes by the page width, so a capture coordinate over CAP is
+    /// the same fraction here.
+    fn is_red_at(bytes: &[u8], w: usize, nx: f32, ny: f32) -> bool {
+        let x = (nx * w as f32) as usize;
+        let y = (ny * w as f32) as usize;
+        let px = (y * w + x) * 4;
+        if px + 2 >= bytes.len() {
+            return false;
+        }
+        let (b, g, r) = (bytes[px], bytes[px + 1], bytes[px + 2]);
+        r > 140 && g < 90 && b < 90
+    }
+
+    /// A filled rounded rectangle covering 0.2..0.8 by 0.2..0.6 of the page
+    /// width, with a 0.15-wide corner radius.
+    fn filled_rounded_rect(kind: i32, radius_px: f32) -> ShapeSpec {
+        let mut s = shape(kind, 200.0, 200.0, 800.0, 600.0);
+        s.fill_rgba = 0xFF_DC_00_00;    // opaque, same red the probe looks for
+        s.corner_radius_px = radius_px;
+        s
+    }
+
+    #[test]
+    fn a_rounded_rectangle_has_its_corners_cut_away() {
+        // The whole visual claim of the feature, with a square-cornered
+        // rectangle as the control. Both are drawn from the same box and the
+        // same fill; the ONLY difference is the kind and its radius, so a
+        // difference at the corner pixel can only come from the rounding.
+        //
+        // Probe point: 20 capture units in from the top-left corner. The corner
+        // arc has its centre at (350,350) with r=150, and that point is 184
+        // away from it, so it lies outside the round and inside the square.
+        const CAP: i32 = 1000;
+        const PROBE: (f32, f32) = (0.22, 0.22);
+        const CENTRE: (f32, f32) = (0.50, 0.40);
+
+        let square = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_RECTANGLE, 0.0)];
+        assert_eq!(
+            add_shape_annotations(square, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+        let (sq_bytes, sq_w) = render_bytes(square, 0, 600);
+        let square_corner = is_red_at(&sq_bytes, sq_w, PROBE.0, PROBE.1);
+        let square_centre = is_red_at(&sq_bytes, sq_w, CENTRE.0, CENTRE.1);
+        close_document(square);
+
+        let round = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 150.0)];
+        assert_eq!(
+            add_shape_annotations(round, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+        let (rd_bytes, rd_w) = render_bytes(round, 0, 600);
+        let round_corner = is_red_at(&rd_bytes, rd_w, PROBE.0, PROBE.1);
+        let round_centre = is_red_at(&rd_bytes, rd_w, CENTRE.0, CENTRE.1);
+        close_document(round);
+
+        println!("ROUNDED: corner square={square_corner} round={round_corner}, \
+                  centre square={square_centre} round={round_centre}");
+
+        assert!(square_centre, "the control rectangle did not draw at all");
+        assert!(square_corner, "the control rectangle should fill its own corner");
+        assert!(round_centre, "the rounded rectangle did not draw at all");
+        assert!(!round_corner, "the corner was NOT cut away; it drew square");
+    }
+
+    #[test]
+    fn a_rounded_rectangles_radius_survives_save_and_reopen() {
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 150.0)];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let saved = snapshot_document(handle);
+        close_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        assert_ne!(reopened, 0, "the saved document would not reopen");
+
+        let contents = contents_of(reopened, 0, 0).expect("reopened shape has no tag");
+        let parsed = parse_shape_tag(&contents).expect("reopened tag did not parse");
+        close_document(reopened);
+
+        println!("ROUNDED RELOAD: {contents}");
+        assert_eq!(parsed.0, SHAPE_ROUNDED_RECT, "came back as a different kind");
+        assert!(parsed.10 > 0.0, "the corner radius came back as {}", parsed.10);
+    }
+
+    #[test]
+    fn resizing_a_rounded_rectangle_keeps_its_kind_and_its_radius() {
+        // Resize is a delete-and-rebuild driven entirely by the tag, so a field
+        // the rebuild forgets to carry is silently lost on the first drag of a
+        // corner handle. That is how a rounded rect would turn back into a
+        // plain rectangle the moment you resized it.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 150.0)];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+        let before = parse_shape_tag(&contents_of(handle, 0, 0).unwrap()).unwrap();
+
+        let mut new_index = -1;
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, CAP, 150.0, 150.0, 900.0, 700.0, &mut new_index),
+            STATUS_OK_PDFIUM
+        );
+        let after = parse_shape_tag(&contents_of(handle, 0, new_index as usize).unwrap())
+            .expect("resized shape lost its tag");
+        close_document(handle);
+
+        println!("ROUNDED RESIZE: radius {} -> {}", before.10, after.10);
+        assert_eq!(after.0, SHAPE_ROUNDED_RECT, "resize changed the kind");
+        assert!((after.10 - before.10).abs() < 0.5,
+            "resize changed the radius from {} to {}", before.10, after.10);
+    }
+
+    #[test]
+    fn a_squeezed_rounded_rectangle_clamps_its_corners_instead_of_crossing_them() {
+        // Past half the shorter side the two arcs on one side would meet and
+        // then cross, drawing a bow tie. The clamp is applied at DRAW time, so
+        // the stored radius is left intact for when the box grows again.
+        assert_eq!(clamped_corner_radius(150.0, 600.0, 400.0), 150.0);
+        assert_eq!(clamped_corner_radius(500.0, 600.0, 400.0), 200.0, "not clamped to half the height");
+        assert_eq!(clamped_corner_radius(500.0, 40.0, 400.0), 20.0, "not clamped to half the width");
+        assert_eq!(clamped_corner_radius(-5.0, 600.0, 400.0), 0.0, "a negative radius must not draw");
+        assert_eq!(clamped_corner_radius(f32::NAN, 600.0, 400.0), 0.0, "NaN must not reach the path builder");
+    }
+
+    #[test]
+    fn setting_the_radius_changes_the_drawn_corner_and_nothing_else() {
+        // What the corner-radius slider does. Two things have to hold: the
+        // corner actually changes on the PAGE (not just in the tag), and the
+        // colour, width and fill survive, since a restyle that quietly reset
+        // them would undo the user's other choices on every drag of the slider.
+        const CAP: i32 = 1000;
+        const CORNER: (f32, f32) = (0.22, 0.22);
+
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 20.0)];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        // A small radius leaves the probe point covered.
+        let (small_bytes, w) = render_bytes(handle, 0, 600);
+        let corner_small = is_red_at(&small_bytes, w, CORNER.0, CORNER.1);
+        let before = parse_shape_tag(&contents_of(handle, 0, 0).unwrap()).unwrap();
+
+        let mut idx = -1;
+        assert_eq!(
+            restyle_shape_radius_annotation(handle, 0, 0, CAP, 150.0, &mut idx as *mut i32),
+            STATUS_OK_PDFIUM
+        );
+
+        let (big_bytes, w2) = render_bytes(handle, 0, 600);
+        let corner_big = is_red_at(&big_bytes, w2, CORNER.0, CORNER.1);
+        let after = parse_shape_tag(&contents_of(handle, 0, idx as usize).unwrap())
+            .expect("restyled shape lost its tag");
+        close_document(handle);
+
+        println!("RADIUS SLIDER: corner small={corner_small} big={corner_big}, \
+                  radius {} -> {}", before.10, after.10);
+
+        assert!(corner_small, "a barely-rounded corner should still cover the probe");
+        assert!(!corner_big, "raising the radius did not cut the corner away");
+        assert!(after.10 > before.10, "the tag's radius did not grow");
+
+        // Everything else untouched.
+        assert_eq!(after.0, before.0, "kind changed");
+        assert_eq!((after.1, after.2, after.3, after.4),
+                   (before.1, before.2, before.3, before.4), "stroke colour changed");
+        assert_eq!(after.9, before.9, "fill changed");
+        assert!((after.5 - before.5).abs() < 0.01, "stroke width changed");
+    }
+
+    #[test]
+    fn a_zero_radius_from_the_slider_squares_the_corners_again() {
+        // The bottom of the slider's travel. It must return the shape to square
+        // corners rather than refusing, so the control is reversible.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 150.0)];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let mut idx = -1;
+        assert_eq!(
+            restyle_shape_radius_annotation(handle, 0, 0, CAP, 0.0, &mut idx as *mut i32),
+            STATUS_OK_PDFIUM
+        );
+        let (bytes, w) = render_bytes(handle, 0, 600);
+        let corner = is_red_at(&bytes, w, 0.22, 0.22);
+        close_document(handle);
+
+        assert!(corner, "dropping the radius to zero did not restore square corners");
+    }
+
+    #[test]
+    fn a_nonsense_radius_is_refused_rather_than_drawn() {
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 60.0)];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+
+        let mut idx = -1;
+        assert_eq!(
+            restyle_shape_radius_annotation(handle, 0, 0, CAP, -1.0, &mut idx as *mut i32),
+            STATUS_INVALID_INPUT
+        );
+        assert_eq!(
+            restyle_shape_radius_annotation(handle, 0, 0, CAP, f32::NAN, &mut idx as *mut i32),
+            STATUS_INVALID_INPUT
+        );
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_rounded_rectangle_with_no_radius_still_draws_as_a_rectangle() {
+        // A rounded rect dragged out to a sliver, or one whose radius was
+        // cleared, must degrade to square corners rather than to nothing.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let specs = [filled_rounded_rect(SHAPE_ROUNDED_RECT, 0.0)];
+        assert_eq!(
+            add_shape_annotations(handle, CAP, specs.as_ptr(), specs.len()),
+            STATUS_OK_PDFIUM
+        );
+        let (bytes, w) = render_bytes(handle, 0, 600);
+        let drew = is_red_at(&bytes, w, 0.50, 0.40);
+        close_document(handle);
+
+        assert!(drew, "a zero-radius rounded rectangle vanished instead of drawing square");
+    }
+
     #[test]
     fn the_bundled_blank_page_opens_renders_and_accepts_a_shape() {
         // The document the app opens at startup so there is always something
@@ -10556,7 +11143,7 @@ mod tests {
             a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -10648,7 +11235,7 @@ mod tests {
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -10684,7 +11271,7 @@ mod tests {
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -10722,7 +11309,7 @@ mod tests {
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -10766,6 +11353,118 @@ mod tests {
             }
         }
         px
+    }
+
+    /// Reads the page's annotation ids in paint order, so a test can assert on
+    /// the STACK rather than on indices that every write reshuffles.
+    fn stack_ids(handle: u64) -> Vec<String> {
+        let array = get_annotations(handle, 0);
+        let count = array.len as i32;
+        free_annotation_array(array);
+
+        let mut out = Vec::new();
+        for i in 0..count {
+            let buf = get_annotation_id(handle, 0, i);
+            let id = if buf.status == STATUS_OK_PDFIUM && !buf.data.is_null() && buf.len > 0 {
+                let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
+                String::from_utf8_lossy(bytes).to_string()
+            } else {
+                "?".to_string()
+            };
+            free_byte_buffer(buf);
+            out.push(id);
+        }
+        out
+    }
+
+    /// Adds a stamp and tags it with a recognisable 32-hex id.
+    fn add_tagged_stamp(handle: u64, cap: i32, top: f32, tag: char) -> i32 {
+        let (pw, ph) = (40i32, 10i32);
+        let pixels = marker_stamp_pixels(pw, ph);
+        let (l, t, r, b) = (0.30 * cap as f32, top, 0.70 * cap as f32, top + 0.08 * cap as f32);
+        let status = add_stamp_annotation(
+            handle, 0, cap, l, t, r, b, pixels.as_ptr(), pixels.len(), pw, ph);
+        assert_eq!(status, STATUS_OK_PDFIUM, "stamp {tag} could not be added");
+
+        let array = get_annotations(handle, 0);
+        let last = array.len as i32 - 1;
+        free_annotation_array(array);
+
+        let id: String = std::iter::repeat(tag).take(ID_HEX_LEN).collect();
+        let status = unsafe {
+            set_annotation_id(handle, 0, last, id.as_ptr(), id.len())
+        };
+        assert_eq!(status, STATUS_OK_PDFIUM, "stamp {tag} could not be tagged");
+        last
+    }
+
+    #[test]
+    fn raising_a_stamp_moves_it_to_the_top_of_the_stack() {
+        // Z-order is the order of the page's annotation list, and PDFium offers
+        // no way to move an entry within it. The only lever is that a rebuilt
+        // annotation is APPENDED, so "raise" has to mean "remove and re-add".
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+
+        add_tagged_stamp(handle, CAP, 0.10 * CAP as f32, 'a');
+        add_tagged_stamp(handle, CAP, 0.30 * CAP as f32, 'b');
+        add_tagged_stamp(handle, CAP, 0.50 * CAP as f32, 'c');
+
+        let before = stack_ids(handle);
+        println!("Z-ORDER before: {before:?}");
+        assert_eq!(before.len(), 3, "expected three stamps, got {before:?}");
+
+        // Raise the BOTTOM one at its own current bounds.
+        let mut idx = -1;
+        let status = raise_stamp_annotation(
+            handle, 0, 0, CAP,
+            0.30 * CAP as f32, 0.10 * CAP as f32,
+            0.70 * CAP as f32, 0.18 * CAP as f32,
+            &mut idx as *mut i32);
+        assert_eq!(status, STATUS_OK_PDFIUM, "raise refused");
+
+        let after = stack_ids(handle);
+        close_document(handle);
+        println!("Z-ORDER after:  {after:?} (new index {idx})");
+
+        // 'a' started at the bottom and must now be on top, with b and c having
+        // closed up beneath it in their original order.
+        assert_eq!(after.len(), 3, "an annotation was lost or duplicated: {after:?}");
+        assert_eq!(after[2], before[0], "the raised stamp is not on top");
+        assert_eq!(after[0], before[1]);
+        assert_eq!(after[1], before[2]);
+        assert_eq!(idx, 2, "out_new_index should report the top slot");
+    }
+
+    #[test]
+    fn resizing_a_stamp_to_its_own_bounds_leaves_the_stack_alone() {
+        // The CONTROL for the test above, and the reason raise_stamp_annotation
+        // has to exist at all. resize_annotation tries an in-place bounds write
+        // first, and for a same-size "move" that succeeds, so it reports success
+        // while changing nothing about the order. Reaching for it to implement
+        // Bring to Front would silently do nothing.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+
+        add_tagged_stamp(handle, CAP, 0.10 * CAP as f32, 'a');
+        add_tagged_stamp(handle, CAP, 0.30 * CAP as f32, 'b');
+
+        let before = stack_ids(handle);
+
+        let mut idx = -1;
+        let status = resize_annotation(
+            handle, 0, 0, CAP,
+            0.30 * CAP as f32, 0.10 * CAP as f32,
+            0.70 * CAP as f32, 0.18 * CAP as f32,
+            &mut idx as *mut i32);
+        assert_eq!(status, STATUS_OK_PDFIUM);
+
+        let after = stack_ids(handle);
+        close_document(handle);
+        println!("CONTROL resize: {before:?} -> {after:?} (index {idx})");
+
+        assert_eq!(before, after, "resize_annotation unexpectedly reordered the page");
+        assert_eq!(idx, 0, "an in-place write must report the same index");
     }
 
     #[test]
@@ -10966,7 +11665,7 @@ mod tests {
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -11034,7 +11733,7 @@ mod tests {
             page_index: 0, kind,
             x1, y1, x2, y2,
             r: 255, g: 0, b: 0, a: 255,
-            width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0,
+            width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0, corner_radius_px: 0.0,
         };
         let specs = [
             mk(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0),
@@ -11084,7 +11783,7 @@ mod tests {
             x1: 0.20 * CAP as f32, y1: 0.45 * CAP as f32,
             x2: 0.40 * CAP as f32, y2: 0.50 * CAP as f32,
             r: 255, g: 0, b: 0, a: 255,
-            width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0,
+            width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -11155,7 +11854,7 @@ mod tests {
                 a: 255,
                 width_px: 4.0,
                 rotation_deg: 0.0,
-                fill_rgba: 0,
+                fill_rgba: 0, corner_radius_px: 0.0,
             };
             assert_eq!(
                 add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -11220,7 +11919,7 @@ mod tests {
             a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -11292,7 +11991,7 @@ mod tests {
             a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -11362,7 +12061,7 @@ mod tests {
             a: 255,
             width_px: 4.0,
             rotation_deg: 0.0,
-            fill_rgba: 0,
+            fill_rgba: 0, corner_radius_px: 0.0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),

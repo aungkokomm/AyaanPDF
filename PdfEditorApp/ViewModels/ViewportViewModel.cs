@@ -352,6 +352,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Fires on every point added to the in-progress ink stroke, so MainPage can redraw its live preview.</summary>
     public event Action? InkStrokeChanged;
 
+    /// <summary>Fires whenever the selection's on-screen geometry changes, so
+    /// the view can move chrome anchored to it. Separate from the property
+    /// notifications because the geometry can change while the COUNT does not,
+    /// which is exactly what a drag does.</summary>
+    public event Action? SelectionVisualsChanged;
+
     /// <summary>
     /// DIPs per NORMALIZED unit, i.e. the multiplier that turns a stored
     /// overlay coordinate into a position inside the page's layout box.
@@ -544,6 +550,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void ClearLoadedAnnotations()
     {
         _loadedByPage.Clear();
+        _pageModelByPage.Clear();   // same lifetime as the cache it projects
         _selectedLoaded = null;
         _loadedDrag = null;
     }
@@ -1247,6 +1254,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 Y2 = (float)(sh.Draft.Y2 * CaptureWidth),
                 R = r, G = g, B = b, A = a,
                 WidthPx = (float)(sh.StrokeWidth * CaptureWidth),
+                // From the DRAFT, the single definition the live preview also
+                // draws with. Zero for every other kind, which ignores it.
+                CornerRadiusPx = (float)(sh.Draft.CornerRadius * CaptureWidth),
             });
         }
 
@@ -2354,6 +2364,60 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// alignment and grouping become meaningful.</summary>
     public bool HasMultiSelection => SelectionCount >= 2;
 
+    /// <summary>True when Group would do something: two or more objects picked.</summary>
+    public bool CanGroupSelection => SelectionCount >= 2;
+
+    /// <summary>True when the anchor belongs to a group, so Ungroup has a target.</summary>
+    public bool CanUngroupSelection =>
+        _selectedLoaded is LoadedSelection a && GroupContaining(a.Id) is not null;
+
+    /// <summary>
+    /// The rectangle floating chrome must keep clear of: the selection on the
+    /// ANCHOR's page, in that page's slot-space DIPs, GROWN upward by the rotate
+    /// handle's reach when one is showing. The handle floats above the top edge
+    /// on a stem, so a box that stopped at the annotation bounds would let the
+    /// toolbar land across it.
+    ///
+    /// Extras on OTHER pages are left out rather than unioned in: a box spanning
+    /// two pages would centre the toolbar in the gutter between them, pointing
+    /// at nothing.
+    /// </summary>
+    public bool TryGetSelectionBox(
+        out int pageIndex, out double left, out double top, out double right, out double bottom)
+    {
+        pageIndex = -1;
+        left = top = right = bottom = 0;
+        if (_selectedLoaded is not LoadedSelection anchor) { return false; }
+
+        pageIndex = anchor.PageIndex;
+        left = anchor.Left;
+        top = anchor.Top;
+        right = anchor.Right;
+        bottom = anchor.Bottom;
+        foreach (var ex in _extraSelected)
+        {
+            if (ex.PageIndex != pageIndex) { continue; }
+            left = Math.Min(left, ex.Left);
+            top = Math.Min(top, ex.Top);
+            right = Math.Max(right, ex.Right);
+            bottom = Math.Max(bottom, ex.Bottom);
+        }
+
+        // Mirrors the condition RefreshSelectionOutline draws the handle under.
+        bool hasRotateHandle =
+            (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp) && CanResize(anchor);
+        if (hasRotateHandle)
+        {
+            top -= LoadedAnnotationPicker.RotateHandleGap + LoadedAnnotationPicker.GripReach;
+        }
+
+        left *= SlotLayoutWidth;
+        top *= SlotLayoutWidth;
+        right *= SlotLayoutWidth;
+        bottom *= SlotLayoutWidth;
+        return true;
+    }
+
     /// <summary>Whether the current selection is a shape (rectangle, ellipse,
     /// line, arrow). Set once on selection so the drag path pays no per-sample
     /// FFI cost. Cleared alongside the other selection flags.</summary>
@@ -2630,7 +2694,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// outline is a plain rect collection rather than per-annotation state, so
     /// nothing in the annotation templates has to know about selection.
     /// </summary>
+    /// <summary>Rebuilds the selection chrome, then tells the view its geometry
+    /// moved. Wrapping rather than signalling inside is deliberate: the body has
+    /// several early returns, and a signal missed on one of them would strand
+    /// the floating toolbar at a stale position.</summary>
     private void RefreshSelectionOutline()
+    {
+        RefreshSelectionOutlineCore();
+        SelectionVisualsChanged?.Invoke();
+    }
+
+    private void RefreshSelectionOutlineCore()
     {
         foreach (var slot in PageSlots)
         {
@@ -3022,6 +3096,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         _selectedRotationDeg = 0;
         _selectedShapePadDips = 0;
+        _selectedIsRoundedRect = false;
         // Whether the selection is a shape is decided by whether its /Contents
         // parses as our shape tag; the shape check comes first because it is a
         // cheap prefix test and rules out most other marks.
@@ -3062,6 +3137,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // ACTUAL fill (which the tool state does not know about — a user can
             // pick a shape drawn a week ago). Null clears the picker to No Fill.
             ShapeFillHex = ParseShapeFill(contents!);
+
+            // And its corners, for the same reason: the slider must show where
+            // THIS shape is, not where the tool was left. The tag holds the
+            // radius in POINTS, so it goes back through the page width to become
+            // the fraction of maximum the slider works in.
+            _selectedIsRoundedRect = ParseShapeKind(contents!) == (int)ShapeKind.RoundedRectangle;
+            if (_selectedIsRoundedRect && _selectedLoaded is LoadedSelection box)
+            {
+                var (wpt, _) = PagePointsFor(pageIndex);
+                double radiusNorm = wpt > 0 ? ParseShapeCornerRadiusPts(contents!) / wpt : 0;
+                ShapeCornerPercent = ShapeGeometry.CornerFractionFromRadius(
+                    radiusNorm, box.Right - box.Left, box.Bottom - box.Top) * 100;
+            }
 
             // Compute the pad the writer added around the stroke (width/2 + 1
             // on every side, so PDFium doesn't clip). Stored in slot DIPs so
@@ -3169,6 +3257,73 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// ApplyStyleToSelectedShape because fill has its own picker and it would
     /// be surprising if picking a fill also re-wrote the stroke colour with
     /// whatever InkColorHex happens to be.</summary>
+    /// <summary>
+    /// How round the corners of a rounded rectangle are, 0 to 100, where 100 is
+    /// the roundest the box can be (half its shorter side). Doubles as the tool
+    /// state for the NEXT shape drawn and as the editor for the selected one,
+    /// which is how colour and stroke width already behave here.
+    ///
+    /// A percentage of the maximum rather than an absolute measurement, so the
+    /// control means the same thing on a badge and on a full-page box, and so
+    /// the number stays meaningful after a resize.
+    /// </summary>
+    [ObservableProperty]
+    public partial double ShapeCornerPercent { get; set; }
+        = ShapeGeometry.DefaultCornerFraction * 100;
+
+    /// <summary>True when the selection is a rounded rectangle, so the corner
+    /// slider can show itself only where it does something.</summary>
+    public bool HasSelectedRoundedRect => _selectedIsRoundedRect;
+
+    private bool _selectedIsRoundedRect;
+
+    /// <summary>
+    /// Re-writes the selected rounded rectangle at the corner radius the slider
+    /// is on. Bounds, colour, stroke width and fill are untouched: the core
+    /// rebuilds everything else from the shape's own tag.
+    /// </summary>
+    public void ApplyCornerRadiusToSelectedShape()
+    {
+        if (_documentHandle == 0
+            || _selectedLoaded is not LoadedSelection sel
+            || !_selectedIsShape
+            || !_selectedIsRoundedRect)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+        double radiusNorm = ShapeGeometry.CornerRadiusFromFraction(
+            ShapeCornerPercent / 100.0,
+            sel.Right - sel.Left,
+            sel.Bottom - sel.Top);
+
+        PushHistory(HistoryScope.Document, "Corner radius");
+        int status = RenderCoreNative.restyle_shape_radius_annotation(
+            _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
+            (float)(radiusNorm * CaptureWidth), out int newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not change that corner radius.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+
+        // Same re-selection dance as the fill restyle: the shape was deleted and
+        // re-added, so the marquee has to follow it to its new index.
+        var actual = LoadedFor(sel.PageIndex)
+            .Where(x => x.Index == newIndex)
+            .Select(x => (Interop.ExistingAnnotation?)x)
+            .FirstOrDefault();
+        _selectedLoaded = actual is Interop.ExistingAnnotation a
+            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom, sel.Id)
+            : sel with { Index = newIndex };
+        RefreshSelectionOutline();
+    }
+
     public void ApplyFillToSelectedShape()
     {
         if (_documentHandle == 0
@@ -3770,22 +3925,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         NormalizeExtras(now.Id, "CommitLoadedMove");
 
-        // DIAGNOSTIC (temporary): the drag delta the anchor actually travelled,
-        // and every extra's origin -> target. If the extras' targets equal
-        // their origins, the delta never reached them; if the targets are right
-        // but nothing moves on screen, the write or the redraw is at fault.
-        Diag.Log($"MOVEDIAG anchor id={now.Id:N} start=({start.Left:F4},{start.Top:F4}) " +
-                 $"now=({now.Left:F4},{now.Top:F4}) delta=({now.Left - start.Left:F4},{now.Top - start.Top:F4})");
-        Diag.Log($"MOVEDIAG extras={_extraSelected.Count} origins={_extraDragOrigin.Count}");
-        for (int di = 0; di < _extraSelected.Count; di++)
-        {
-            var cur = _extraSelected[di];
-            string org = di < _extraDragOrigin.Count
-                ? $"({_extraDragOrigin[di].Left:F4},{_extraDragOrigin[di].Top:F4}) id={_extraDragOrigin[di].Id:N}"
-                : "NO-ORIGIN";
-            Diag.Log($"  MOVEDIAG extra[{di}] origin={org} target=({cur.Left:F4},{cur.Top:F4}) id={cur.Id:N}");
-        }
-
         // The inverse of a move or resize is four numbers: put the rectangle
         // back. Recorded BEFORE the write, and at annotation granularity
         // rather than as a document snapshot, because dragging a stamp around
@@ -4012,24 +4151,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                         exl, ext, exr, exb, out extNewIndex);
                 }
 
-                // DIAGNOSTIC (temporary): the rect this write was handed, and
-                // the rect the document reports for that annotation afterwards.
-                // A mismatch between them is the write ignoring its bounds; a
-                // match with no visible movement is a redraw problem.
                 if (extStatus == RenderStatus.OkPdfium)
                 {
-                    InvalidateLoadedPage(target.PageIndex);
-                    string landed = "NOT-FOUND";
-                    foreach (var la in LoadedFor(target.PageIndex))
-                    {
-                        if (la.Index == extNewIndex)
-                        {
-                            landed = $"({la.Left:F4},{la.Top:F4})";
-                            break;
-                        }
-                    }
-                    Diag.Log($"  MOVEDIAG wrote id={target.Id:N} asked=({target.Left:F4},{target.Top:F4}) landed={landed} idx {target.Index}->{extNewIndex}");
-
                     _extraSelected[slot] = target with { Index = extNewIndex };
                     pagesTouched.Add(target.PageIndex);
 
@@ -4650,24 +4773,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // A mark can only be in ONE group at a time (flat, non-nested); drop
         // any group that overlaps with the new one, then add.
-        // DIAGNOSTIC (temporary): prove whether the ids just written are
-        // actually ON the annotations now. ReadId goes straight to the FFI, so
-        // this bypasses the loaded-annotation cache entirely and reports what
-        // the DOCUMENT holds, not what the app last remembered. Nothing here
-        // mutates anything - no invalidation, no write.
-        Diag.Log($"GroupSelected READBACK: expecting {ids.Count} persisted ids");
-        {
-            var members = new List<LoadedSelection> { anchor };
-            members.AddRange(_extraSelected);
-            foreach (var m in members)
-            {
-                if (m.Id == Guid.Empty) { continue; }
-                var persisted = Interop.AnnotationLoader.ReadId(_documentHandle, m.PageIndex, m.Index);
-                bool match = persisted == m.Id;
-                Diag.Log($"  READBACK p{m.PageIndex}#{m.Index} expected={m.Id:N} persisted={(persisted?.ToString("N") ?? "NULL")} {(match ? "MATCH" : "*** DIVERGED ***")}");
-            }
-        }
-
         var groupsBefore = SnapshotGroups();
         _groups.RemoveAll(g => g.Any(id => ids.Contains(id)));
         _groups.Add(ids);
@@ -4719,72 +4824,211 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// on top of the extras. Non-Ayaan annotations on the page keep their
     /// existing positions relative to each other, but of course our resused
     /// ones now sit above them.</summary>
-    public bool BringSelectedToFront()
+    public bool BringSelectedToFront() =>
+        Reorder(AnnotationOrder.BringToFront, "Bring to front");
+
+    /// <summary>Puts the selection underneath everything else on its page.</summary>
+    public bool SendSelectedToBack() =>
+        Reorder(AnnotationOrder.SendToBack, "Send to back");
+
+    /// <summary>Raises the selection by exactly one place.</summary>
+    public bool BringSelectedForward() =>
+        Reorder(AnnotationOrder.BringForward, "Bring forward");
+
+    /// <summary>Lowers the selection by exactly one place.</summary>
+    public bool SendSelectedBackward() =>
+        Reorder(AnnotationOrder.SendBackward, "Send backward");
+
+    /// <summary>
+    /// The one z-order path. Works out the target paint order as data, checks
+    /// what it would cost, and only then rewrites the page.
+    ///
+    /// The rewrite is a run of removals and re-adds, because appending is the
+    /// only ordering primitive PDFium has. That has two consequences worth
+    /// knowing before reading the loop:
+    ///
+    /// 1. Only the tail that actually changed is rewritten. An annotation
+    ///    sitting in the untouched prefix is never removed, which is what lets
+    ///    a page carrying an Acrobat comment survive some reorders intact.
+    /// 2. Every write reshuffles the indices of everything after it, so each
+    ///    step re-resolves its target by Guid immediately before writing. Aiming
+    ///    a write at an index cached before the previous write is what destroyed
+    ///    annotation identities in v2.7.5.
+    ///
+    /// Single page only: the anchor's. A selection spanning pages has no single
+    /// stack to reorder within.
+    /// </summary>
+    private bool Reorder(
+        Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>> plan, string label)
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor) { return false; }
-        const int CaptureWidth = 1000;
 
-        NormalizeExtras(anchor.Id, "BringSelectedToFront");
+        NormalizeExtras(anchor.Id, label);
+        int page = anchor.PageIndex;
 
-        // Build the joint list (anchor + extras) and sort by DESCENDING index
-        // per page so each delete never disturbs a later item's index. The
-        // last-N run-at-end pattern (proven in v1.79.1 for align/distribute)
-        // gives us the final indices to write back.
-        var jobs = new List<(LoadedSelection Sel, int Slot)>();
-        jobs.Add((anchor, 0));
-        for (int i = 0; i < _extraSelected.Count; i++) { jobs.Add((_extraSelected[i], i + 1)); }
-        jobs.Sort((a, b) =>
+        InvalidateLoadedPage(page);
+
+        // The page as OBJECTS, from the model, rather than as annotations to be
+        // re-parsed. The model already knows each object's kind and whether it
+        // can be rebuilt, which is exactly what this operation has to decide;
+        // asking it costs one pass instead of re-reading every annotation's tag
+        // twice, once for the guard and again for the write.
+        var stack = PageModelFor(page).Objects;
+        var current = stack.Select(o => o.Id).ToList();
+
+        var moving = new HashSet<Guid>();
+        if (anchor.Id != Guid.Empty) { moving.Add(anchor.Id); }
+        foreach (var ex in _extraSelected)
         {
-            int p = b.Sel.PageIndex.CompareTo(a.Sel.PageIndex);
-            return p != 0 ? p : b.Sel.Index.CompareTo(a.Sel.Index);
-        });
+            if (ex.PageIndex == page && ex.Id != Guid.Empty) { moving.Add(ex.Id); }
+        }
+        if (moving.Count == 0) { return false; }
 
-        PushHistory(HistoryScope.Document, "Bring to front");
-        var writeOrderPerPage = new Dictionary<int, List<int>>();
-        var pagesTouched = new HashSet<int>();
-        foreach (var (sel, slot) in jobs)
+        var target = plan(current, moving);
+        int from = AnnotationOrder.RewriteFrom(current, target);
+
+        if (from >= target.Count)
         {
-            int newIdx = WriteMovedAnnotation(sel, sel, CaptureWidth);
-            if (newIdx < 0) { continue; }
-            pagesTouched.Add(sel.PageIndex);
-            if (!writeOrderPerPage.TryGetValue(sel.PageIndex, out var list))
+            Status = label switch
             {
-                list = new List<int>();
-                writeOrderPerPage[sel.PageIndex] = list;
-            }
-            list.Add(slot);
+                "Bring to front" or "Bring forward" => "Already at the front.",
+                _ => "Already at the back.",
+            };
+            return false;
         }
-        if (pagesTouched.Count == 0) { return false; }
 
-        foreach (int p in pagesTouched) { InvalidateLoadedPage(p); }
-        var newIndicesBySlot = new Dictionary<int, int>(jobs.Count);
-        foreach (var kv in writeOrderPerPage)
+        // Refuse BEFORE touching anything. A rewrite that discovers halfway
+        // through that it cannot rebuild an annotation has already deleted the
+        // ones before it, and there is nothing honest to do at that point.
+        for (int i = from; i < target.Count; i++)
         {
-            int count = LoadedFor(kv.Key).Count;
-            var slots = kv.Value;
-            for (int i = 0; i < slots.Count; i++)
+            var obj = stack.FirstOrDefault(o => o.Id == target[i]);
+            if (obj is null || !obj.IsRebuildable)
             {
-                newIndicesBySlot[slots[i]] = count - slots.Count + i;
+                Status = "Cannot reorder here: the page has a mark this app did not create, "
+                       + "and moving it would lose it.";
+                return false;
+            }
+
+            // And it must still be FINDABLE by that id after a reload, because
+            // that is how every write in the loop below addresses its target.
+            // An annotation whose id was invented rather than persisted gets a
+            // different one on the next load, so the plan is built against an
+            // identity that no longer exists. Checking here means the command
+            // refuses whole rather than rewriting half the page and stopping.
+            InvalidateLoadedPage(page);
+            if (FindLoadedById(obj.Id, page) is null)
+            {
+                Diag.Log($"{label}: id={obj.Id:N} does not survive a reload, refusing");
+                Status = "Cannot reorder here: one of these marks has no stable identity.";
+                return false;
             }
         }
-        if (newIndicesBySlot.TryGetValue(0, out int anchorIdx))
+
+        PushHistory(HistoryScope.Document, label);
+        for (int i = from; i < target.Count; i++)
         {
-            _selectedLoaded = anchor with { Index = anchorIdx };
-        }
-        for (int i = 0; i < _extraSelected.Count; i++)
-        {
-            if (newIndicesBySlot.TryGetValue(i + 1, out int idx))
+            if (!RaiseToTop(page, target[i]))
             {
-                _extraSelected[i] = _extraSelected[i] with { Index = idx };
+                Diag.Log($"{label}: raise failed for id={target[i]:N}, page left partially reordered");
+                break;
             }
         }
-        // Groups reference Ids, not indices, so no remap needed. But the
-        // delete+re-add rebuilt /Contents without the ID prefix; re-stamp
-        // so a subsequent click on any of these can still find its group.
+
+        InvalidateLoadedPage(page);
+        ResolveSelectionById(page);
         StampSelectedIds();
         IsDirty = true;
         RefreshSelectionOutline();
+        RenderCurrentPage();
         return true;
+    }
+
+
+    /// <summary>Moves one annotation, named by Id, to the top of its page's
+    /// paint order. Resolves the live index at the moment of the write, since
+    /// the previous iteration's write already shifted the page.</summary>
+    private bool RaiseToTop(int page, Guid id)
+    {
+        const int CaptureWidth = 1000;
+
+        InvalidateLoadedPage(page);
+        if (FindLoadedById(id, page) is not (int livePage, int liveIndex)) { return false; }
+
+        var live = LoadedFor(livePage).ToList();
+        int at = live.FindIndex(a => a.Index == liveIndex);
+        if (at < 0) { return false; }
+        var item = live[at];
+
+        string? contents = ReadAnnotationContents(livePage, liveIndex);
+        bool isText = TextBoxTagReader.TryParse(contents, out _);
+        bool isShape = ShapeTagReader.IsShapeTag(contents);
+
+        int status;
+        int newIndex;
+        if (isShape)
+        {
+            // NO BOUNDS. A raise must not touch geometry, and passing the
+            // annotation's own rectangle back in is not geometry-neutral: the
+            // writer stores /Rect INFLATED by the stroke pad, and resize treats
+            // what it is given as the un-inflated extent, so it pads again.
+            // Send to back then to front and the shape came back visibly fatter,
+            // by roughly a stroke width each time.
+            //
+            // restyle with no overrides is the geometry-preserving rebuild: it
+            // undoes the pad itself and redraws from the tag, so repeated raises
+            // are a fixed point. Proved by
+            // raising_a_shape_repeatedly_does_not_grow_it in render_core.
+            status = RenderCoreNative.restyle_shape_annotation(
+                _documentHandle, livePage, liveIndex, CaptureWidth,
+                colorRgba: 0, widthPx: -1f, out newIndex);
+        }
+        else if (isText)
+        {
+            float tl = (float)(item.Left * CaptureWidth);
+            float tt = (float)(item.Top * CaptureWidth);
+            float tr = (float)(item.Right * CaptureWidth);
+            float tb = (float)(item.Bottom * CaptureWidth);
+            status = RenderCoreNative.resize_text_box_annotation(
+                _documentHandle, livePage, liveIndex, CaptureWidth, tl, tt, tr, tb, out newIndex);
+        }
+        else
+        {
+            float l = (float)(item.Left * CaptureWidth);
+            float t = (float)(item.Top * CaptureWidth);
+            float r = (float)(item.Right * CaptureWidth);
+            float b = (float)(item.Bottom * CaptureWidth);
+            // NOT resize_annotation: it writes bounds in place for a same-size
+            // call and would report success without moving anything.
+            status = RenderCoreNative.raise_stamp_annotation(
+                _documentHandle, livePage, liveIndex, CaptureWidth, l, t, r, b, out newIndex);
+        }
+
+        if (status != RenderStatus.OkPdfium) { return false; }
+
+        // The text and shape rebuilds regenerate /Contents from the tag and drop
+        // the id with it. (The stamp path carries its own across.)
+        Interop.AnnotationLoader.WriteId(_documentHandle, livePage, newIndex, id);
+        return true;
+    }
+
+    /// <summary>Re-points the selection at wherever the document now holds each
+    /// member, by Id. After a reorder every cached index is meaningless.</summary>
+    private void ResolveSelectionById(int page)
+    {
+        if (_selectedLoaded is LoadedSelection a && a.Id != Guid.Empty
+            && FindLoadedById(a.Id, page) is (int ap, int ai))
+        {
+            _selectedLoaded = a with { PageIndex = ap, Index = ai };
+        }
+        for (int i = 0; i < _extraSelected.Count; i++)
+        {
+            var ex = _extraSelected[i];
+            if (ex.Id != Guid.Empty && FindLoadedById(ex.Id, page) is (int ep, int ei))
+            {
+                _extraSelected[i] = ex with { PageIndex = ep, Index = ei };
+            }
+        }
     }
 
     public bool DuplicateSelectedForDrag()
@@ -4921,6 +5165,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             && parts[6].Length == 8
             && uint.TryParse(parts[6], System.Globalization.NumberStyles.HexNumber,
                 System.Globalization.CultureInfo.InvariantCulture, out uint fv) ? fv : 0;
+        // Corner radius at position 7, in POINTS, for a rounded rectangle.
+        // Absent on every other kind and on every tag written before rounded
+        // rectangles existed, so a miss is 0, which draws square corners.
+        // Dropping it here would flatten the corners of a Ctrl-drag duplicate.
+        double radiusPts = parts.Length >= 8
+            && double.TryParse(parts[7], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double rr) ? rr : 0;
 
         // The drag-direction flags let the arrow head keep its side.
         float x1 = (float)((fx ? sel.Left : sel.Right) * captureWidth);
@@ -4942,74 +5193,146 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             R = r, G = g, B = b, A = a,
             WidthPx = widthPx, RotationDeg = (float)rot,
             FillRgba = fillRgba,
+            // Same points-as-pixels approximation the width above uses, for the
+            // same reason: the page width is not available here.
+            CornerRadiusPx = (float)radiusPts,
         };
         return true;
     }
+
+    /// <summary>
+    /// The one place a <see cref="ShapeWriteSpec"/> becomes the interop struct.
+    /// Every field is copied here and nowhere else, so a field added to the
+    /// native struct has exactly one site to be threaded through.
+    /// </summary>
+    private static Interop.NativeShapeSpec ToNative(
+        ShapeWriteSpec s, int pageIndex, byte r, byte g, byte b, byte a, uint fillRgba) => new()
+        {
+            PageIndex = pageIndex,
+            Kind = (int)s.Kind,
+            X1 = s.X1,
+            Y1 = s.Y1,
+            X2 = s.X2,
+            Y2 = s.Y2,
+            R = r, G = g, B = b, A = a,
+            WidthPx = s.StrokeWidthPx,
+            RotationDeg = s.RotationDeg,
+            FillRgba = fillRgba,
+            CornerRadiusPx = s.CornerRadiusPx,
+        };
+
+    // ---------------- Read-only document model ----------------
+    //
+    // A SNAPSHOT of the objects on a page, built from the annotations already
+    // read back from the document. Deliberately NOT authoritative: nothing in
+    // this class reads it, no rendering, selection, grouping, history or save
+    // path consults it, and it goes stale the moment the document is edited.
+    //
+    // It exists so that a later stage has something to reason about other than
+    // a tag string re-parsed on demand. Making it the source of truth before it
+    // is proven accurate would put a SECOND source of truth into a codebase
+    // whose worst bugs have come from having two.
+    //
+    // Neither method is called from a render or edit path. Building a page's
+    // model costs one tag read per annotation, which is fine on demand and
+    // would not be fine on every invalidation, and this app invalidates a page
+    // after every single edit.
+
+    /// <summary>
+    /// The objects on one page, in paint order, as the model sees them.
+    /// Reads the annotations already loaded for that page; does not touch the
+    /// document.
+    /// </summary>
+    private readonly Dictionary<int, PageModel> _pageModelByPage = new();
+
+    /// <summary>
+    /// The page's objects, built once per page load and dropped with the
+    /// annotation cache.
+    ///
+    /// Cached because building costs one tag read per annotation, and this app
+    /// invalidates a page after every edit; rebuilding per lookup would turn a
+    /// single read into one per object on every click and every drag commit.
+    /// Callers that run once per user command can afford it, which is why
+    /// z-order reads from here and selection does not.
+    /// </summary>
+    private PageModel PageModelFor(int pageIndex)
+    {
+        if (_pageModelByPage.TryGetValue(pageIndex, out var cached)) { return cached; }
+        var model = BuildPageModel(pageIndex);
+        _pageModelByPage[pageIndex] = model;
+        return model;
+    }
+
+    public PageModel BuildPageModel(int pageIndex)
+    {
+        var snapshots = new List<AnnotationSnapshot>();
+        foreach (var a in LoadedFor(pageIndex))
+        {
+            snapshots.Add(new AnnotationSnapshot(
+                a.Index, a.Subtype, a.Left, a.Top, a.Right, a.Bottom,
+                a.Opacity, a.Id, ReadAnnotationContents(pageIndex, a.Index)));
+        }
+        return DocumentModelBuilder.BuildPage(pageIndex, snapshots);
+    }
+
+    /// <summary>
+    /// A snapshot of every page currently loaded. Pages are loaded lazily, so
+    /// this covers what the user has actually visited rather than forcing a
+    /// 300-page document to be read end to end.
+    /// </summary>
+    public DocumentModel BuildDocumentModel()
+    {
+        var pages = new List<PageModel>();
+        for (int p = 0; p < PageCount; p++)
+        {
+            if (!_loadedByPage.ContainsKey(p)) { continue; }
+            pages.Add(PageModelFor(p));
+        }
+        return DocumentModelBuilder.Build(pages);
+    }
+
+    // ---------------- Shape tag reads ----------------
+    //
+    // All six of these used to pick their own field out of the same string,
+    // each re-splitting it and each with its own idea of what a malformed value
+    // meant. They now share ShapeTagReader, which is tested and is also what
+    // the document model is built from, so the model and the selection code can
+    // no longer disagree about what a shape is.
+    //
+    // Behaviour is unchanged: the defaults below are the ones these helpers
+    // already returned for a tag that does not parse.
+
+    /// <summary>The kind number from a shape tag, or -1 if it is malformed.</summary>
+    private static int ParseShapeKind(string contents) =>
+        ShapeTagReader.TryParse(contents, out var t) ? (int)t.Kind : -1;
+
+    /// <summary>The corner radius from a shape tag, in PDF points. Zero for a
+    /// kind that has no corners, and for any tag written before rounded
+    /// rectangles existed.</summary>
+    private static double ParseShapeCornerRadiusPts(string contents) =>
+        ShapeTagReader.TryParse(contents, out var t) ? t.CornerRadiusPts : 0;
 
     /// <summary>The shape's colour from its tag, as "#AARRGGBB" including the
     /// alpha, or null if the tag is malformed. Used to mirror the shape's actual
     /// colour and opacity into the tool state on selection so the pickers and
     /// the opacity slider reflect this shape, not the tool's leftover state.</summary>
-    private static string? ParseShapeColor(string contents)
-    {
-        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
-            ? contents.Substring("AyaanShape:".Length)
-            : null;
-        if (rest is null) { return null; }
-        string[] parts = rest.Split(':');
-        if (parts.Length < 2) { return null; }
-        string rgba = parts[1]; // RRGGBBAA
-        if (rgba.Length != 8) { return null; }
-        foreach (char ch in rgba)
-        {
-            if (!Uri.IsHexDigit(ch)) { return null; }
-        }
-        // Tag stores RRGGBBAA; the app uses "#AARRGGBB".
-        return $"#{rgba.Substring(6, 2)}{rgba.Substring(0, 6)}";
-    }
+    private static string? ParseShapeColor(string contents) =>
+        ShapeTagReader.TryParse(contents, out var t) ? t.StrokeHex : null;
 
-    /// <summary>The shape tag's stroke width field (position 2: kind, rgba,
-    /// WIDTH). Points. Returns 0 on a malformed tag.</summary>
-    private static double ParseShapeStrokeWidthPts(string contents)
-    {
-        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
-            ? contents.Substring("AyaanShape:".Length)
-            : null;
-        if (rest is null) { return 0; }
-        string[] parts = rest.Split(':');
-        if (parts.Length < 3) { return 0; }
-        return double.TryParse(parts[2], System.Globalization.NumberStyles.Float,
-                               System.Globalization.CultureInfo.InvariantCulture, out double v)
-               && double.IsFinite(v) && v > 0
-            ? v : 0;
-    }
+    /// <summary>The shape tag's stroke width field, in points. Returns 0 on a
+    /// malformed tag.</summary>
+    private static double ParseShapeStrokeWidthPts(string contents) =>
+        ShapeTagReader.TryParse(contents, out var t) ? t.StrokeWidthPts : 0;
 
-    /// <summary>The shape tag's optional fill field (position 6: kind, rgba,
-    /// width, fx, fy, rot, FILL). Returns null when the tag has no fill or is
-    /// stroke-only. Format is 8-char hex AARRGGBB; the app uses "#AARRGGBB".</summary>
-    private static string? ParseShapeFill(string contents)
-    {
-        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
-            ? contents.Substring("AyaanShape:".Length)
-            : null;
-        if (rest is null) { return null; }
-        string[] parts = rest.Split(':');
-        // Fields: 0=kind, 1=rgba, 2=width, 3=fx, 4=fy, 5=rot, 6=fillARGB
-        if (parts.Length < 7) { return null; }
-        string fill = parts[6];
-        if (fill.Length != 8) { return null; }
-        foreach (char ch in fill)
-        {
-            if (!Uri.IsHexDigit(ch)) { return null; }
-        }
-        // Tag already stores fill as AARRGGBB (unlike the stroke rgba above,
-        // which is RRGGBBAA). Zero means "no fill" — treat as null.
-        if (string.Equals(fill, "00000000", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-        return "#" + fill;
-    }
+    /// <summary>The shape tag's optional fill, as "#AARRGGBB". Null when the
+    /// shape is stroke-only.</summary>
+    private static string? ParseShapeFill(string contents) =>
+        ShapeTagReader.TryParse(contents, out var t) ? t.FillHex : null;
+
+    /// <summary>The shape's clockwise rotation in degrees. Zero on a tag
+    /// written before rotation existed.</summary>
+    private static double ParseShapeRotation(string contents) =>
+        ShapeTagReader.TryParse(contents, out var t) ? t.RotationDeg : 0;
 
     /// <summary>Packs a "#AARRGGBB" fill hex into the 0xAARRGGBB uint the FFI
     /// wants. Null (no fill) becomes 0.</summary>
@@ -5023,29 +5346,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             ? v : 0;
     }
 
-    /// <summary>The shape tag has fields separated by ':'; the rotation, if
-    /// present, is the ninth (after kind, RGBA, width, fx, fy). An older tag
-    /// without it comes back as 0.</summary>
-    private static double ParseShapeRotation(string contents)
-    {
-        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
-            ? contents.Substring("AyaanShape:".Length)
-            : null;
-        if (rest is null)
-        {
-            return 0;
-        }
-        string[] parts = rest.Split(':');
-        // Fields: 0=kind, 1=rgba, 2=width, 3=fx, 4=fy, 5=rotation
-        if (parts.Length < 6)
-        {
-            return 0;
-        }
-        return double.TryParse(parts[5], System.Globalization.NumberStyles.Float,
-                               System.Globalization.CultureInfo.InvariantCulture, out double v)
-               && double.IsFinite(v)
-            ? v : 0;
-    }
 
     /// <summary>Writes a finished ROTATE through to the document: the object is
     /// re-laid-out at its own upright bounds, turned to the new angle. Bounds
@@ -5322,6 +5622,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void InvalidateLoadedPage(int pageIndex)
     {
         _loadedByPage.Remove(pageIndex);
+        // The model is a projection of the annotation cache, so it is dropped
+        // with it and can never be staler than the data everything else already
+        // trusts. Giving it a lifetime of its own is how a second source of
+        // truth starts.
+        _pageModelByPage.Remove(pageIndex);
 
         var slot = SlotFor(pageIndex);
         if (slot is not null)
@@ -5973,7 +6278,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // past a page edge belongs to the page it started on rather than
         // jumping to whichever page the pointer ended over.
         _shapePageIndex = pageIndex;
-        _shapeDraft = new ShapeDraft(ActiveShapeKind, Norm(x), Norm(y), Norm(x), Norm(y));
+        // The corner setting is captured on the DRAFT at the start of the drag,
+        // so the preview and the written annotation round the shape by the same
+        // amount even if the slider is touched mid-gesture.
+        _shapeDraft = new ShapeDraft(ActiveShapeKind, Norm(x), Norm(y), Norm(x), Norm(y))
+        {
+            CornerFraction = ShapeCornerPercent / 100.0,
+        };
         InkStrokeChanged?.Invoke();
     }
 
@@ -6000,6 +6311,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             switch (d.Kind)
             {
                 case ShapeKind.Rectangle:
+                case ShapeKind.RoundedRectangle:
                 case ShapeKind.Ellipse:
                 {
                     double side = Math.Max(Math.Abs(dx), Math.Abs(dy));
@@ -6041,19 +6353,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // and no handles. Immediate write unifies the two lives of a shape.
             const int CaptureWidth = 1000;
             var (r, g, b, a) = ParseHex(InkColorHex, defaultAlpha: 0xFF);
-            var spec = new Interop.NativeShapeSpec
-            {
-                PageIndex = _shapePageIndex,
-                Kind = (int)d.Kind,
-                X1 = (float)(d.X1 * CaptureWidth),
-                Y1 = (float)(d.Y1 * CaptureWidth),
-                X2 = (float)(d.X2 * CaptureWidth),
-                Y2 = (float)(d.Y2 * CaptureWidth),
-                R = r, G = g, B = b, A = a,
-                WidthPx = (float)(InkWidth * CaptureWidth),
-                RotationDeg = 0f,
-                FillRgba = PackShapeFillRgba(ShapeFillHex),
-            };
+            // Built by ShapeWriter, not by hand. Building it here by hand is
+            // what made a rounded rectangle snap square the moment the pointer
+            // lifted: the preview rounded it, this write said radius 0, and the
+            // core honoured the write. One builder, one place to forget a field,
+            // and a test that watches that place.
+            var spec = ToNative(
+                ShapeWriter.ForNewShape(d, InkWidth, CaptureWidth),
+                _shapePageIndex, r, g, b, a, PackShapeFillRgba(ShapeFillHex));
 
             BeginEdit("Draw shape");
             int status = RenderCoreNative.add_shape_annotations(
