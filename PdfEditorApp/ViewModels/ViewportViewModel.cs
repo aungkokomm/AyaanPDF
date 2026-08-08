@@ -5178,6 +5178,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    /// <summary>
+    /// The one place a <see cref="ShapeWriteSpec"/> becomes the interop struct.
+    /// Every field is copied here and nowhere else, so a field added to the
+    /// native struct has exactly one site to be threaded through.
+    /// </summary>
+    private static Interop.NativeShapeSpec ToNative(
+        ShapeWriteSpec s, int pageIndex, byte r, byte g, byte b, byte a, uint fillRgba) => new()
+        {
+            PageIndex = pageIndex,
+            Kind = (int)s.Kind,
+            X1 = s.X1,
+            Y1 = s.Y1,
+            X2 = s.X2,
+            Y2 = s.Y2,
+            R = r, G = g, B = b, A = a,
+            WidthPx = s.StrokeWidthPx,
+            RotationDeg = s.RotationDeg,
+            FillRgba = fillRgba,
+            CornerRadiusPx = s.CornerRadiusPx,
+        };
+
     // ---------------- Read-only document model ----------------
     //
     // A SNAPSHOT of the objects on a page, built from the annotations already
@@ -6285,24 +6306,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // and no handles. Immediate write unifies the two lives of a shape.
             const int CaptureWidth = 1000;
             var (r, g, b, a) = ParseHex(InkColorHex, defaultAlpha: 0xFF);
-            var spec = new Interop.NativeShapeSpec
-            {
-                PageIndex = _shapePageIndex,
-                Kind = (int)d.Kind,
-                X1 = (float)(d.X1 * CaptureWidth),
-                Y1 = (float)(d.Y1 * CaptureWidth),
-                X2 = (float)(d.X2 * CaptureWidth),
-                Y2 = (float)(d.Y2 * CaptureWidth),
-                R = r, G = g, B = b, A = a,
-                WidthPx = (float)(InkWidth * CaptureWidth),
-                RotationDeg = 0f,
-                FillRgba = PackShapeFillRgba(ShapeFillHex),
-                // From the DRAFT, which is the same value the live preview drew
-                // with. Omitting it here is what made a rounded rectangle snap
-                // square the moment the pointer lifted: the preview rounded it,
-                // this write said radius 0, and the core honoured the write.
-                CornerRadiusPx = (float)(d.CornerRadius * CaptureWidth),
-            };
+            // Built by ShapeWriter, not by hand. Building it here by hand is
+            // what made a rounded rectangle snap square the moment the pointer
+            // lifted: the preview rounded it, this write said radius 0, and the
+            // core honoured the write. One builder, one place to forget a field,
+            // and a test that watches that place.
+            var spec = ToNative(
+                ShapeWriter.ForNewShape(d, InkWidth, CaptureWidth),
+                _shapePageIndex, r, g, b, a, PackShapeFillRgba(ShapeFillHex));
 
             BeginEdit("Draw shape");
             int status = RenderCoreNative.add_shape_annotations(

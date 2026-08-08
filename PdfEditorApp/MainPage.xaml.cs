@@ -2392,17 +2392,11 @@ public sealed partial class MainPage : Page
     /// is selected, or the shape tool is armed with that kind so the next drag
     /// will make one. Otherwise it is collapsed rather than left inert.
     /// </summary>
-    private void ShowCornerRadius()
+    /// <summary>Puts the corner slider on the selected shape's own radius.
+    /// VISIBILITY is not decided here: that comes from PropertyBarLayout with
+    /// every other section, which is the whole point of the record.</summary>
+    private void SyncCornerRadius()
     {
-        bool relevant = ShapePropertyBar.ShouldShowCornerRadius(
-            selectionIsRoundedRect: ViewModel.HasSelectedRoundedRect,
-            toolDrawsShapes: ViewModel.ActiveTool == ToolMode.Shape,
-            activeShapeKind: ViewModel.ActiveShapeKind,
-            anythingSelected: ViewModel.HasSelectedAnnotationLoaded);
-
-        CornerRadiusSection.Visibility = relevant ? Visibility.Visible : Visibility.Collapsed;
-        if (!relevant) { return; }
-
         int percent = (int)Math.Round(ViewModel.ShapeCornerPercent);
         bool prior = _suppressCornerRadiusChange;
         _suppressCornerRadiusChange = true;
@@ -2731,15 +2725,23 @@ public sealed partial class MainPage : Page
     /// rather than the list being bound to the enum's values. The items are
     /// hand-drawn geometry, one per kind, so there is nothing to template over.
     /// </summary>
+    /// <summary>Set while UpdateToolRail writes the picker's selection back, so
+    /// its own write is not read as the user choosing a shape.</summary>
+    private bool _suppressShapeKindChange;
+
     private void ShapeKind_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_suppressShapeKindChange) { return; }
+
         if (ShapeChoices.SelectedItem is FrameworkElement { Tag: string tag }
             && Enum.TryParse(tag, out ShapeKind kind))
         {
             ViewModel.ActiveShapeKind = kind;
-            // Switching to or away from the rounded kind changes whether the
-            // corner slider is relevant.
-            ShowCornerRadius();
+            // Switching to or away from the rounded kind changes which sections
+            // are relevant, so recompute the whole bar rather than poking one
+            // section. UpdateToolRail writes back to ShapeChoices, hence the
+            // guard below on its assignment.
+            UpdateToolRail();
             ReturnFocusAfterPointerUse();
         }
     }
@@ -2764,72 +2766,52 @@ public sealed partial class MainPage : Page
 
         PropertyBarToolName.Text = tool.Name;
 
-        // Colour and width sections show for tools that offer them AND for a
-        // selected shape under any tool, so clicking a shape in Select mode
-        // still exposes its style, the way Word does for text.
-        bool color = tool.Offers(ToolOptions.Color) || ViewModel.HasSelectedShape;
-        ColorSection.Visibility = Show(color);
-        WidthSection.Visibility = Show(tool.Offers(ToolOptions.Width) || ViewModel.HasSelectedShape);
+        // EVERY section's visibility comes from one pure function, so a new
+        // section cannot be wired up in the wrong place. The corner slider
+        // shipped invisible because its visibility was decided in a fill-flyout
+        // handler instead of here; a section that is a field of
+        // PropertyBarSections cannot be left out of the decision.
+        var sections = PropertyBarLayout.For(new PropertyBarState(
+            ToolOptions: tool.Options,
+            ActiveShapeKind: ViewModel.ActiveShapeKind,
+            ToolIsShape: ViewModel.ActiveTool == ToolMode.Shape,
+            HasSelectedShape: ViewModel.HasSelectedShape,
+            HasSelectedTextBox: ViewModel.HasSelectedTextBox,
+            HasSelectedRoundedRect: ViewModel.HasSelectedRoundedRect,
+            HasMultiSelection: ViewModel.HasMultiSelection,
+            HasSelectedAnnotation: ViewModel.HasSelectedAnnotationLoaded));
 
-        // Opacity is UNIVERSAL: it applies to the primary colour of whichever
-        // object is selected (text of a text box, stroke of a shape, or the
-        // tool's next mark). Shown for any of those.
-        OpacitySection.Visibility = Show(color || ViewModel.HasSelectedTextBox);
+        ColorSection.Visibility = Show(sections.Color);
+        WidthSection.Visibility = Show(sections.Width);
+        OpacitySection.Visibility = Show(sections.Opacity);
+        StampSection.Visibility = Show(sections.Stamp);
+        AlignSection.Visibility = Show(sections.Align);
+        CornerRadiusSection.Visibility = Show(sections.CornerRadius);
+        ShapeSection.Visibility = Show(sections.Shape);
+        FontSizeSection.Visibility = Show(sections.FontSize);
+        FontSection.Visibility = Show(sections.Font);
+        TextStyleSection.Visibility = Show(sections.TextStyle);
+        TextAlignRow.Visibility = Show(sections.TextAlign);
+        OutlineButton.Visibility = Show(sections.Outline);
+        PropertyBarRow2.Visibility = Show(sections.Row2);
+        PropertyBar.Visibility = Show(sections.Bar);
 
-        bool stamps = tool.Offers(ToolOptions.Stamp);
-        StampSection.Visibility = Show(stamps);
-
-        // Align + distribute shows only for a real multi-selection; alignment
-        // on one object is a no-op.
-        AlignSection.Visibility = Show(ViewModel.HasMultiSelection);
-
-        // Corner radius belongs HERE, with every other section, because this is
-        // the method that runs on every selection and tool change. Hanging it
-        // off the fill-flyout handlers instead is why it never appeared: those
-        // only run when the fill picker is used.
-        ShowCornerRadius();
-
-        bool shapes = tool.Offers(ToolOptions.Shape);
-        ShapeSection.Visibility = Show(shapes);
-        if (shapes)
+        bool color = sections.Color;
+        if (sections.CornerRadius) { SyncCornerRadius(); }
+        if (sections.Shape)
         {
+            // Assigning this re-enters ShapeKind_SelectionChanged, which calls
+            // back here. Without the guard that is an infinite loop.
+            _suppressShapeKindChange = true;
             ShapeChoices.SelectedIndex = (int)ViewModel.ActiveShapeKind;
+            _suppressShapeKindChange = false;
         }
-
-        // The text sections show for the Text tool AND whenever a text box is
-        // selected under any tool: without that second half, clicking a text box
-        // in Select mode gave no way to modify its style. Word behaves the same.
-        bool textSections = tool.Offers(ToolOptions.FontSize) || ViewModel.HasSelectedTextBox;
-        FontSizeSection.Visibility = Show(textSections);
-        FontSection.Visibility = Show(textSections);
-        // TextStyleSection also carries the Fill button, which now applies to
-        // shapes too, so it shows for a selected shape as well. The alignment
-        // sub-row and Outline stay hidden for the shape case (a shape has no
-        // text to align and no separate outline distinct from its stroke).
-        TextStyleSection.Visibility = Show(textSections || ViewModel.HasSelectedShape);
-        TextAlignRow.Visibility = Show(textSections);
-        OutlineButton.Visibility = Show(textSections);
-        if (textSections)
+        if (sections.FontSize)
         {
             ViewModel.EnsureFontsLoaded();
             ShowFontSize();
             SyncTextStyleControls();
         }
-
-        // Row 2 only exists when one of its sections (font, text style, opacity,
-        // stamps, align) is showing, so a simple tool stays a single row.
-        bool row2 = FontSection.Visibility == Visibility.Visible
-                 || TextStyleSection.Visibility == Visibility.Visible
-                 || OpacitySection.Visibility == Visibility.Visible
-                 || StampSection.Visibility == Visibility.Visible
-                 || AlignSection.Visibility == Visibility.Visible;
-        PropertyBarRow2.Visibility = Show(row2);
-
-        // A bar with every section collapsed is an empty pill floating over the
-        // page, so the whole thing goes when the tool offers nothing AND no
-        // selection-driven section is showing.
-        PropertyBar.Visibility = Show(tool.Options != ToolOptions.None
-            || ViewModel.HasMultiSelection);
 
         if (color)
         {
@@ -2837,7 +2819,7 @@ public sealed partial class MainPage : Page
             ShowOpacity();
         }
 
-        if (stamps)
+        if (sections.Stamp)
         {
             RefreshStamps();
         }
@@ -3444,6 +3426,25 @@ public sealed partial class MainPage : Page
                  $"textFocused={IsTextInputFocused} focus={focused?.GetType().Name ?? "null"}");
     }
 
+    /// <summary>Runs a command resolved from the keyboard. One place, so a
+    /// chord and its menu item cannot drift apart.</summary>
+    private void Run(EditorCommand command)
+    {
+        switch (command)
+        {
+            case EditorCommand.Open: OpenFile_Click(this, null!); break;
+            case EditorCommand.SaveAs: SaveAs_Click(this, null!); break;
+            case EditorCommand.Undo: ViewModel.Undo(); break;
+            case EditorCommand.Redo: ViewModel.Redo(); break;
+            case EditorCommand.Group: ViewModel.GroupSelected(); break;
+            case EditorCommand.Ungroup: ViewModel.UngroupSelected(); break;
+            case EditorCommand.ToggleRulers:
+                RulersToggle.IsChecked = !RulersToggle.IsChecked;
+                SetRulersVisible(RulersToggle.IsChecked);
+                break;
+        }
+    }
+
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         // DIAGNOSTIC (temporary): does the REAL handler get this key at all?
@@ -3478,6 +3479,21 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // The menu-command chords resolve through KeyboardCommands, which is
+        // tested. These were declared ONLY as accelerators on MenuFlyoutItems,
+        // whose accelerators are not live until the flyout opens, so keyboard
+        // undo had never worked and nothing could tell. The menu items keep
+        // their accelerators because that is what prints "Ctrl+Z" beside the
+        // entry; this is what actually runs them.
+        var command = KeyboardCommands.Resolve(
+            (int)e.Key, _isCtrlDown, IsShiftDown(), IsTextInputFocused);
+        if (command != EditorCommand.None)
+        {
+            Run(command);
+            e.Handled = true;
+            return;
+        }
+
         switch (e.Key)
         {
             case VirtualKey.Space when !_isSpaceHandActive:
@@ -3508,48 +3524,6 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
-            // Everything below is handled HERE, not only as an accelerator on
-            // its menu item: a KeyboardAccelerator inside a MenuFlyout is only
-            // live while that flyout is open, so from the canvas they did
-            // nothing at all. The menu items keep their accelerators anyway,
-            // because that is what prints "Ctrl+G" beside the entry.
-            //
-            // The Shift variants must come FIRST. A switch tests `when` guards
-            // in source order, so an unguarded-for-Shift case listed above its
-            // Shift sibling would swallow the chord.
-            case VirtualKey.O when _isCtrlDown:
-                OpenFile_Click(this, null!);
-                e.Handled = true;
-                break;
-            case VirtualKey.S when _isCtrlDown:
-                SaveAs_Click(this, null!);
-                e.Handled = true;
-                break;
-            case VirtualKey.G when _isCtrlDown && IsShiftDown():
-                ViewModel.UngroupSelected();
-                e.Handled = true;
-                break;
-            case VirtualKey.G when _isCtrlDown:
-                ViewModel.GroupSelected();
-                e.Handled = true;
-                break;
-            case VirtualKey.Z when _isCtrlDown && IsShiftDown():
-                ViewModel.Redo();
-                e.Handled = true;
-                break;
-            case VirtualKey.Z when _isCtrlDown:
-                ViewModel.Undo();
-                e.Handled = true;
-                break;
-            case VirtualKey.Y when _isCtrlDown:
-                ViewModel.Redo();
-                e.Handled = true;
-                break;
-            case VirtualKey.R when _isCtrlDown:
-                RulersToggle.IsChecked = !RulersToggle.IsChecked;
-                SetRulersVisible(RulersToggle.IsChecked);
-                e.Handled = true;
-                break;
 
             // NOT Tab. Tab is the focus-traversal key, and binding it here
             // meant keyboard users could never move focus anywhere in the app.
