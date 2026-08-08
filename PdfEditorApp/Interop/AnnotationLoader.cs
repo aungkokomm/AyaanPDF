@@ -69,16 +69,6 @@ internal static class AnnotationLoader
                 if (readId is null)
                 {
                     unstamped++;
-                    // DIAGNOSTIC (temporary): the annotation carries no
-                    // persisted id, so a FRESH one is being invented here. Any
-                    // group or history entry naming the old value stops
-                    // resolving at this exact point.
-                    PdfEditorApp.Diag.Log(
-                        $"  Load p{pageIndex}#{native.Index}: NO persisted id -> inventing ephemeral {id:N}");
-                }
-                else
-                {
-                    PdfEditorApp.Diag.Log($"  Load p{pageIndex}#{native.Index}: persisted id={id:N}");
                 }
                 result.Add(new ExistingAnnotation(
                     pageIndex,
@@ -144,11 +134,12 @@ internal static class AnnotationLoader
         // 32 ASCII hex chars, no dashes; matches ID_HEX_LEN on the Rust side.
         byte[] hex = Encoding.ASCII.GetBytes(id.ToString("N"));
         int status = RenderCoreNative.set_annotation_id(docHandle, pageIndex, index, hex, (nuint)hex.Length);
-        // DIAGNOSTIC (temporary): every call, not just failures, while tracing
-        // where a grouped member's Guid is lost. Normally this is failures-only
-        // because it runs on every click and every write in a move.
-        PdfEditorApp.Diag.Log(
-            $"WriteId p{pageIndex}#{index} id={id:N} -> {(status == RenderStatus.OkPdfium ? "OK" : "FAILED status=" + status)}");
+        // Failures only. This runs on every click and on every write of a move,
+        // so logging the successes buries everything else in the file.
+        if (status != RenderStatus.OkPdfium)
+        {
+            PdfEditorApp.Diag.Log($"WriteId p{pageIndex}#{index} id={id:N} FAILED status={status}");
+        }
     }
 
     private static bool IsHex(string s)

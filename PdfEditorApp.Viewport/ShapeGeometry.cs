@@ -15,6 +15,7 @@ public enum ShapeKind
     Ellipse = 1,
     Line = 2,
     Arrow = 3,
+    RoundedRectangle = 4,
 }
 
 /// <summary>
@@ -35,6 +36,33 @@ public readonly record struct ShapeDraft(
 
     public double Width => Right - Left;
     public double Height => Bottom - Top;
+
+    /// <summary>
+    /// The corner radius this shape draws with, in the same normalized units,
+    /// or zero for a kind that has no corners.
+    ///
+    /// Defined HERE, on the draft, rather than at each place that needs it. The
+    /// live preview and the annotation writer must derive the same radius from
+    /// the same box or the shape changes the instant the pointer lifts, and
+    /// that is exactly what happened when the two write paths were each left to
+    /// work it out for themselves: one of them simply did not, and every
+    /// rounded rectangle came out square.
+    /// </summary>
+    public double CornerRadius => Kind == ShapeKind.RoundedRectangle
+        ? ShapeGeometry.CornerRadiusFromFraction(CornerFraction, Width, Height)
+        : 0;
+
+    /// <summary>
+    /// How round the corners are, as a fraction of the maximum: 0 square, 1
+    /// fully rounded. Carried on the DRAFT so the shape the preview traces and
+    /// the shape written to the page are the same one, whatever the corner
+    /// slider was set to when the drag began.
+    ///
+    /// Note that <c>default(ShapeDraft)</c> gets 0, not this default. That is
+    /// deliberate: a zero-initialised draft is not a real shape, and square
+    /// corners are the safe reading of one.
+    /// </summary>
+    public double CornerFraction { get; init; } = ShapeGeometry.DefaultCornerFraction;
 }
 
 /// <summary>
@@ -157,6 +185,70 @@ public sealed record ShapeAnnotation(
 /// </summary>
 public static class ShapeGeometry
 {
+    /// <summary>
+    /// A rounded rectangle's default corner radius, as a fraction of its SHORTER
+    /// side. Proportional rather than absolute so a small badge and a full-page
+    /// box read as the same shape family. Mirrors ROUNDED_RECT_DEFAULT_RADIUS in
+    /// render_core: the preview and the written annotation must derive the same
+    /// radius from the same box, or the shape would change the instant the
+    /// pointer lifts.
+    /// </summary>
+    public const double RoundedRectDefaultRadius = 0.18;
+
+    /// <summary>
+    /// The largest radius a box this size can draw: half its shorter side, the
+    /// point at which the shape becomes a stadium. Anything beyond makes the
+    /// corner arcs cross.
+    /// </summary>
+    public static double MaxCornerRadius(double width, double height) =>
+        Math.Min(Math.Abs(width), Math.Abs(height)) / 2;
+
+    /// <summary>
+    /// The default as a FRACTION of the maximum, which is what the corner-radius
+    /// slider works in: 0 is square, 1 is fully rounded. Expressed this way so
+    /// the control means the same thing on any size of box, and so a shape keeps
+    /// looking right when it is resized.
+    /// </summary>
+    public const double DefaultCornerFraction = RoundedRectDefaultRadius * 2;
+
+    /// <summary>Radius for a fraction of the maximum, in the box's own units.
+    /// Out-of-range fractions are pulled back to 0..1 rather than rejected: a
+    /// slider is a blunt instrument and its ends should be the shape's ends.</summary>
+    public static double CornerRadiusFromFraction(double fraction, double width, double height)
+    {
+        if (double.IsNaN(fraction)) { return 0; }
+        return Math.Clamp(fraction, 0, 1) * MaxCornerRadius(width, height);
+    }
+
+    /// <summary>The fraction of maximum that this radius represents, for putting
+    /// the slider where a selected shape actually is. Zero-size boxes report 0
+    /// rather than dividing by zero.</summary>
+    public static double CornerFractionFromRadius(double radius, double width, double height)
+    {
+        double max = MaxCornerRadius(width, height);
+        if (max <= 0 || double.IsNaN(radius)) { return 0; }
+        return Math.Clamp(radius / max, 0, 1);
+    }
+
+    /// <summary>The default radius for a box of this size, in the same units.</summary>
+    public static double DefaultCornerRadius(double width, double height) =>
+        CornerRadiusFromFraction(DefaultCornerFraction, width, height);
+
+    /// <summary>
+    /// The radius that can actually be drawn in a box this size.
+    ///
+    /// Half the shorter side is the ceiling: past it the two corner arcs on a
+    /// side meet and then cross, which draws as a bow tie rather than a stadium.
+    /// Mirrors clamped_corner_radius in render_core, which is what the PDF is
+    /// actually drawn with; this copy exists so the on-screen preview agrees.
+    /// </summary>
+    public static double ClampCornerRadius(double radius, double width, double height)
+    {
+        if (double.IsNaN(radius) || radius <= 0) { return 0; }
+        double limit = Math.Min(Math.Abs(width), Math.Abs(height)) / 2;
+        return Math.Min(radius, limit);
+    }
+
     /// <summary>Spread of an arrow's barbs from its shaft, in radians (about 26°).</summary>
     public const double ArrowHeadAngle = 0.45;
 
@@ -283,6 +375,45 @@ public static class ShapeGeometry
                     (s.Left, s.Bottom),
                     (s.Left, s.Top),
                 ];
+
+            case ShapeKind.RoundedRectangle:
+            {
+                double r = s.CornerRadius;
+                if (r <= 0)
+                {
+                    // Too thin to round. Preview it as the rectangle it will be
+                    // written as, rather than as nothing.
+                    goto case ShapeKind.Rectangle;
+                }
+
+                // A quarter of the ellipse budget per corner, so a rounded rect
+                // and an ellipse are equally smooth at the same zoom.
+                int perCorner = Math.Max(2, ellipseSegments / 4);
+                var pts = new List<(double, double)>((perCorner + 1) * 4 + 1);
+
+                // Centre of each corner's arc, and the angle its sweep starts
+                // at, going clockwise from the top-left in SCREEN coordinates
+                // (y down), which is the order the outline is drawn in.
+                (double Cx, double Cy, double Start)[] corners =
+                [
+                    (s.Left + r,  s.Top + r,     Math.PI),
+                    (s.Right - r, s.Top + r,     -Math.PI / 2),
+                    (s.Right - r, s.Bottom - r,  0),
+                    (s.Left + r,  s.Bottom - r,  Math.PI / 2),
+                ];
+
+                foreach (var (cx0, cy0, start) in corners)
+                {
+                    for (int i = 0; i <= perCorner; i++)
+                    {
+                        double t = start + (Math.PI / 2 * i / perCorner);
+                        pts.Add((cx0 + (r * Math.Cos(t)), cy0 + (r * Math.Sin(t))));
+                    }
+                }
+
+                pts.Add(pts[0]);
+                return pts;
+            }
 
             case ShapeKind.Ellipse:
             {

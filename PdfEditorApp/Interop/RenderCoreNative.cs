@@ -187,6 +187,12 @@ internal struct NativeShapeSpec
     /// APPENDED after RotationDeg for the same additive-ABI reason.
     /// </summary>
     public uint FillRgba;
+    /// <summary>
+    /// Corner radius for <see cref="ShapeKind.RoundedRectangle"/>, in capture
+    /// pixels (the same space as <see cref="WidthPx"/>). Ignored by every other
+    /// kind. APPENDED after FillRgba for the same additive-ABI reason.
+    /// </summary>
+    public float CornerRadiusPx;
 }
 
 /// <summary>
@@ -728,6 +734,21 @@ internal static partial class RenderCoreNative
         uint fillRgba,
         out int newIndex);
 
+    /// <summary>
+    /// Sets a rounded rectangle's corner radius, in capture pixels, leaving its
+    /// position, size, colour, width and fill alone. A negative or non-finite
+    /// radius is refused rather than coerced to zero, since zero is itself a
+    /// meaningful value here.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int restyle_shape_radius_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float radiusPx,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int restyle_text_box_annotation(
         ulong docHandle,
@@ -745,6 +766,28 @@ internal static partial class RenderCoreNative
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int resize_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        out int newIndex);
+
+    /// <summary>
+    /// Rebuilds a STAMP at the bounds given so that it lands at the end of the
+    /// page's annotation list, which is the top of the paint order.
+    ///
+    /// Not interchangeable with <see cref="resize_annotation"/>: that one writes
+    /// the bounds in place when it can, which for a same-size call succeeds and
+    /// leaves the stamp exactly where it was in the list. Reordering needs the
+    /// rebuild, so this entry point skips the in-place attempt. Anything that is
+    /// not a stamp comes back Unsupported.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int raise_stamp_annotation(
         ulong docHandle,
         int pageIndex,
         int index,
