@@ -3997,7 +3997,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // the shape yet, which is why moving a group behaved differently
             // from one attempt to the next. Anchor and extras now take the
             // same path for the same operation.
-            status = RenderCoreNative.resize_shape_annotation(
+            status = RenderCoreNative.move_shape_annotation(
                 _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
         }
 
@@ -4140,7 +4140,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 }
                 if (extStatus != RenderStatus.OkPdfium && extIsShape)
                 {
-                    extStatus = RenderCoreNative.resize_shape_annotation(
+                    extStatus = RenderCoreNative.move_shape_annotation(
                         _documentHandle, target.PageIndex, target.Index, CaptureWidth,
                         exl, ext, exr, exb, out extNewIndex);
                 }
@@ -4468,7 +4468,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         if (status != RenderStatus.OkPdfium && isShape)
         {
-            status = RenderCoreNative.resize_shape_annotation(
+            status = RenderCoreNative.move_shape_annotation(
                 _documentHandle, oldSel.PageIndex, oldSel.Index, captureWidth,
                 l, t, r, b, out newIndex);
         }

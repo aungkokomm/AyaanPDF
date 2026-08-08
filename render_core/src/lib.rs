@@ -4053,7 +4053,48 @@ pub extern "C" fn resize_shape_annotation(
 
     panic::catch_unwind(|| {
         resize_shape_annotation_inner(
-            doc_handle, page_index, index, capture_width, left, top, right, bottom, out_new_index)
+            doc_handle, page_index, index, capture_width, left, top, right, bottom,
+            out_new_index, false)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Moves or resizes a shape whose new bounds are given in **/Rect space**, that
+/// is, INCLUDING the stroke pad the writer adds.
+///
+/// This is what the app actually has. It reads an annotation's reported
+/// rectangle, shifts it by the drag delta, and hands it back. That rectangle is
+/// padded, and `resize_shape_annotation` treats what it is given as the
+/// UNPADDED extent, so every move inflated the shape by another pad. Recorded
+/// for weeks as "about 2pt of drift per move"; it is a whole stroke pad, on
+/// every drag.
+///
+/// The pad is applied by the writer down here, so undoing it belongs down here
+/// too, not in arithmetic scattered across the caller.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn move_shape_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if right <= left || bottom <= top {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        resize_shape_annotation_inner(
+            doc_handle, page_index, index, capture_width, left, top, right, bottom,
+            out_new_index, true)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -4278,6 +4319,7 @@ fn restyle_shape_annotation_inner_with_rotation(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn resize_shape_annotation_inner(
     doc_handle: u64,
     page_index: i32,
@@ -4288,6 +4330,7 @@ fn resize_shape_annotation_inner(
     right: f32,
     bottom: f32,
     out_new_index: *mut i32,
+    bounds_are_padded: bool,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -4316,6 +4359,39 @@ fn resize_shape_annotation_inner(
     };
 
     let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts) = tag;
+
+    // Undo the stroke pad when the caller's bounds came from the annotation's
+    // own /Rect. The writer inflates the extent by width/2 + 1 on every side so
+    // PDFium does not clip the stroke; feeding that back as the new extent
+    // inflates it again, which is the drift.
+    //
+    // Deliberately NOT applied to a rotated shape: its /Rect is the axis-aligned
+    // box of the TURNED content plus the pad, so insetting by the pad alone
+    // would be wrong in a different way. Leaving it padded keeps the existing
+    // behaviour for that case rather than replacing one error with another.
+    let (left, top, right, bottom) = if bounds_are_padded && rot == 0.0 {
+        let page_w = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&doc_handle).cloned();
+            let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
+            let doc_guard = lock(&doc);
+            let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+                return STATUS_INVALID_INPUT;
+            };
+            page.width().value
+        };
+        if page_w <= 0.0 {
+            return STATUS_INVALID_INPUT;
+        }
+        let pad_cap = (width_pts / 2.0 + 1.0) * capture_width as f32 / page_w;
+        // Never inset past nothing: a hairline shape dragged very small would
+        // otherwise invert.
+        let max_inset = ((right - left).min(bottom - top) / 2.0 - 0.5).max(0.0);
+        let inset = pad_cap.min(max_inset);
+        (left + inset, top + inset, right - inset, bottom - inset)
+    } else {
+        (left, top, right, bottom)
+    };
 
     if delete_annotation(doc_handle, page_index, index) != STATUS_OK_PDFIUM {
         return STATUS_INVALID_INPUT;
@@ -8669,6 +8745,58 @@ mod tests {
         assert!(parse_shape_tag("AyaanShape:0:GGGGGGGG:2:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:0:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:abc:1:1").is_none());
+    }
+
+    #[test]
+    fn moving_a_shape_repeatedly_does_not_grow_it() {
+        // Dragging a shape around a page is the most repeated edit there is, and
+        // the app moves one by handing back the annotation's reported rectangle
+        // shifted by the drag delta.
+        //
+        // That rectangle is /Rect, which is the shape's extent INFLATED by the
+        // stroke pad. resize_shape_annotation treats what it is given as the
+        // un-inflated extent, so every move inflates it once more and the shape
+        // creeps outward. Long recorded as "about 2pt of drift per move"; it is
+        // really a whole stroke pad, on every single drag.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, CAP, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (w0, h0) = (first.4 - first.2, first.5 - first.3);
+
+        // Four small drags, the way a user nudges something into place.
+        let mut index = 0i32;
+        let step = 10.0f32;
+        for _ in 0..4 {
+            let cur = read_annotations(handle, 0)[0];
+            let mut next = -1;
+            assert_eq!(
+                move_shape_annotation(handle, 0, index, CAP,
+                    cur.2 * CAP as f32 + step, cur.3 * CAP as f32 + step,
+                    cur.4 * CAP as f32 + step, cur.5 * CAP as f32 + step,
+                    &mut next),
+                STATUS_OK_PDFIUM
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+        let (_, _, l, t, r, b) = after[0];
+        let (w, h) = (r - l, b - t);
+        println!("MOVE DRIFT: {w0:.4}x{h0:.4} -> {w:.4}x{h:.4}, now at ({l:.4},{t:.4})");
+
+        assert_eq!(after.len(), 1);
+        assert!((w - w0).abs() < 0.002 && (h - h0).abs() < 0.002,
+            "the shape grew while being moved: {w0:.4}x{h0:.4} -> {w:.4}x{h:.4}");
+
+        // And it actually travelled: a fix that froze the shape would pass the
+        // size check and be useless.
+        let travelled = (l - first.2) * CAP as f32;
+        assert!((travelled - 4.0 * step).abs() < 2.0,
+            "expected to travel {} capture units, went {travelled:.1}", 4.0 * step);
     }
 
     #[test]

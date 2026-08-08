@@ -786,6 +786,27 @@ internal static partial class RenderCoreNative
     /// rebuild, so this entry point skips the in-place attempt. Anything that is
     /// not a stamp comes back Unsupported.
     /// </summary>
+    /// <summary>
+    /// Moves or resizes a shape whose new bounds are in /Rect space, that is,
+    /// INCLUDING the stroke pad the writer adds.
+    ///
+    /// This is what the app has: it reads an annotation's reported rectangle,
+    /// shifts it by the drag delta and hands it back. Use this rather than
+    /// <see cref="resize_shape_annotation"/>, which treats its bounds as the
+    /// UNPADDED extent and so inflates the shape a little on every move.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int move_shape_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        out int newIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int raise_stamp_annotation(
         ulong docHandle,
