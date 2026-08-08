@@ -550,6 +550,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void ClearLoadedAnnotations()
     {
         _loadedByPage.Clear();
+        _pageModelByPage.Clear();   // same lifetime as the cache it projects
         _selectedLoaded = null;
         _loadedDrag = null;
     }
@@ -4866,8 +4867,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         int page = anchor.PageIndex;
 
         InvalidateLoadedPage(page);
-        var stack = LoadedFor(page).OrderBy(a => a.Index).ToList();
-        var current = stack.Select(a => a.Id).ToList();
+
+        // The page as OBJECTS, from the model, rather than as annotations to be
+        // re-parsed. The model already knows each object's kind and whether it
+        // can be rebuilt, which is exactly what this operation has to decide;
+        // asking it costs one pass instead of re-reading every annotation's tag
+        // twice, once for the guard and again for the write.
+        var stack = PageModelFor(page).Objects;
+        var current = stack.Select(o => o.Id).ToList();
 
         var moving = new HashSet<Guid>();
         if (anchor.Id != Guid.Empty) { moving.Add(anchor.Id); }
@@ -4894,8 +4901,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // ones before it, and there is nothing honest to do at that point.
         for (int i = from; i < target.Count; i++)
         {
-            int at = stack.FindIndex(a => a.Id == target[i]);
-            if (at < 0 || !CanRebuildForReorder(page, stack[at]))
+            var obj = stack.FirstOrDefault(o => o.Id == target[i]);
+            if (obj is null || !obj.IsRebuildable)
             {
                 Status = "Cannot reorder here: the page has a mark this app did not create, "
                        + "and moving it would lose it.";
@@ -4922,20 +4929,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    /// <summary>Whether this annotation can be removed and rebuilt faithfully.
-    /// Text boxes and shapes are fully described by their tag; a stamp carries
-    /// its own pixels and the core can pull them back out. Anything else, an ink
-    /// stroke or a mark made in another editor, would not come back.</summary>
-    private bool CanRebuildForReorder(int page, Interop.ExistingAnnotation item)
-    {
-        string? contents = ReadAnnotationContents(page, item.Index);
-        if (TextBoxTagReader.TryParse(contents, out _)) { return true; }
-        if (contents is not null && contents.StartsWith("AyaanShape:", StringComparison.Ordinal))
-        {
-            return true;
-        }
-        return item.Subtype == AnnotSubtype.Stamp;
-    }
 
     /// <summary>Moves one annotation, named by Id, to the top of its page's
     /// paint order. Resolves the live index at the moment of the write, since
@@ -5221,6 +5214,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// Reads the annotations already loaded for that page; does not touch the
     /// document.
     /// </summary>
+    private readonly Dictionary<int, PageModel> _pageModelByPage = new();
+
+    /// <summary>
+    /// The page's objects, built once per page load and dropped with the
+    /// annotation cache.
+    ///
+    /// Cached because building costs one tag read per annotation, and this app
+    /// invalidates a page after every edit; rebuilding per lookup would turn a
+    /// single read into one per object on every click and every drag commit.
+    /// Callers that run once per user command can afford it, which is why
+    /// z-order reads from here and selection does not.
+    /// </summary>
+    private PageModel PageModelFor(int pageIndex)
+    {
+        if (_pageModelByPage.TryGetValue(pageIndex, out var cached)) { return cached; }
+        var model = BuildPageModel(pageIndex);
+        _pageModelByPage[pageIndex] = model;
+        return model;
+    }
+
     public PageModel BuildPageModel(int pageIndex)
     {
         var snapshots = new List<AnnotationSnapshot>();
@@ -5244,7 +5257,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         for (int p = 0; p < PageCount; p++)
         {
             if (!_loadedByPage.ContainsKey(p)) { continue; }
-            pages.Add(BuildPageModel(p));
+            pages.Add(PageModelFor(p));
         }
         return DocumentModelBuilder.Build(pages);
     }
@@ -5580,6 +5593,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void InvalidateLoadedPage(int pageIndex)
     {
         _loadedByPage.Remove(pageIndex);
+        // The model is a projection of the annotation cache, so it is dropped
+        // with it and can never be staler than the data everything else already
+        // trusts. Giving it a lifetime of its own is how a second source of
+        // truth starts.
+        _pageModelByPage.Remove(pageIndex);
 
         var slot = SlotFor(pageIndex);
         if (slot is not null)

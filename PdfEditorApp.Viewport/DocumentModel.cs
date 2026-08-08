@@ -92,6 +92,22 @@ public abstract record DocumentObject
     public string? RawTag { get; init; }
 
     public DocumentObjectKind Kind { get; init; }
+
+    /// <summary>
+    /// Whether this object can be removed and put back faithfully.
+    ///
+    /// Reordering is a run of removals and re-adds, because appending is the
+    /// only ordering primitive PDFium has, so an object that cannot be rebuilt
+    /// cannot be reordered past either: the operation would destroy it. A shape
+    /// and a text box are fully described by their tags, and a stamp carries its
+    /// own pixels, which the core can read back out. An ink stroke is an
+    /// arbitrary point cloud with no such description, and a mark from another
+    /// editor would come back as something else or not at all.
+    /// </summary>
+    public bool IsRebuildable => Kind
+        is DocumentObjectKind.Shape
+        or DocumentObjectKind.TextBox
+        or DocumentObjectKind.Stamp;
 }
 
 /// <summary>

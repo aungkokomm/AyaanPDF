@@ -226,6 +226,53 @@ public class DocumentModelTests
         Assert.Null(page.ById(Guid.NewGuid()));
     }
 
+    // ---------------- What can be reordered ----------------
+    //
+    // Reordering is a run of removals and re-adds, so an object that cannot be
+    // rebuilt cannot be reordered past either: the operation would destroy it.
+    // This rule is now the ONLY guard on the z-order engine, so it is the thing
+    // standing between a Send to Back and a lost Acrobat comment.
+
+    [Fact]
+    public void our_own_objects_can_be_rebuilt_and_so_can_be_reordered()
+    {
+        var page = DocumentModelBuilder.BuildPage(0,
+        [
+            Snap(0, PlainRect),
+            Snap(1, "AyaanText:24:FF0000FF:" + Convert.ToBase64String("hi"u8.ToArray())),
+            Snap(2, "AyaanStamp:0.00:0.1000:0.2000:0.5000:0.4000"),
+        ]);
+
+        Assert.All(page.Objects, o => Assert.True(o.IsRebuildable, $"{o.Kind} should be rebuildable"));
+    }
+
+    [Theory]
+    [InlineData(PdfAnnotationSubtype.Ink)]
+    [InlineData(PdfAnnotationSubtype.Highlight)]
+    [InlineData(PdfAnnotationSubtype.Square)]
+    [InlineData(PdfAnnotationSubtype.Text)]
+    public void anything_this_app_cannot_recreate_refuses_to_be_reordered(int subtype)
+    {
+        // An ink stroke is an arbitrary point cloud with no description to
+        // rebuild from, and a foreign annotation would come back as something
+        // else or not at all. Refusing is the only honest answer.
+        var page = DocumentModelBuilder.BuildPage(0, [Snap(0, contents: null, subtype: subtype)]);
+
+        Assert.False(page.Objects[0].IsRebuildable);
+    }
+
+    [Fact]
+    public void an_untagged_stamps_pixels_are_recoverable_so_it_can_be_reordered()
+    {
+        // The core reads a stamp's image back out of the annotation, so a stamp
+        // placed before stamps carried tags is still safe to rebuild.
+        var page = DocumentModelBuilder.BuildPage(
+            0, [Snap(0, contents: null, subtype: PdfAnnotationSubtype.Stamp)]);
+
+        Assert.Equal(DocumentObjectKind.Stamp, page.Objects[0].Kind);
+        Assert.True(page.Objects[0].IsRebuildable);
+    }
+
     // ---------------- Tag reader edge cases ----------------
 
     [Fact]
