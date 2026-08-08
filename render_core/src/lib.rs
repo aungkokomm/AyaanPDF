@@ -3526,7 +3526,7 @@ fn parse_stamp_tag(contents: &str) -> Option<(f32, f32, f32, f32, f32)> {
 
 const SHAPE_TAG: &str = "AyaanShape:";
 
-fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32) -> String {
+fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32, box_w_pts: f32, box_h_pts: f32) -> String {
     let fx = u8::from(spec.x2 >= spec.x1);
     let fy = u8::from(spec.y2 >= spec.y1);
     // Rotation and fill are BOTH appended so an older reader that stops after
@@ -3536,15 +3536,24 @@ fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32) -> String {
     // Keeps unrotated stroke-only shapes byte-identical to older tags, so a
     // shape file diffed against the old build shows no change unless the
     // shape actually uses one of these new features.
-    if radius_pts > 0.0 {
-        // Radius is last, so it is only paid for by the shape that has one.
-        // Rotation and fill have to be emitted alongside it even when zero:
-        // the fields are positional, and skipping one would shift the radius
-        // into the fill's slot on read.
+    if radius_pts > 0.0 || spec.rotation_deg != 0.0 {
+        // The longest rung. Radius is only paid for by a shape that has one,
+        // and the upright box only by a shape that is TURNED.
+        //
+        // The box matters because a rotated shape's /Rect is the axis-aligned
+        // box of the turned content, which is bigger than the shape in both
+        // axes and cannot be inverted at 45 degrees (infinitely many boxes
+        // share one AABB there). Recording the upright size means no rebuild
+        // ever has to work it out: the centre comes from /Rect, which IS exact,
+        // and the size comes from here. Text boxes already store their own box
+        // for the same reason.
+        //
+        // Fields are positional, so everything before it is emitted too, zero
+        // or not; skipping one would shift the rest into the wrong slots.
         format!(
-            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}:{:.4}",
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}:{:.4}:{:.4}:{:.4}",
             spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts,
-            spec.rotation_deg, spec.fill_rgba, radius_pts
+            spec.rotation_deg, spec.fill_rgba, radius_pts, box_w_pts, box_h_pts
         )
     } else if spec.rotation_deg == 0.0 && spec.fill_rgba == 0 {
         format!(
@@ -3568,7 +3577,7 @@ fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32) -> String {
 /// on one of our shape annotations, or None if it is not one of ours. Rotation
 /// is 0 and fill is 0 on older tags that predate those fields; the caller does
 /// not need to know which form the tag was in.
-fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32)> {
+fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32, f32, f32)> {
     let contents = strip_id_prefix(contents).1;
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
@@ -3615,7 +3624,13 @@ fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bo
         .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(0.0);
 
-    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill, radius))
+    // The shape's own UPRIGHT box, in points, present only on a rotated or
+    // rounded shape. Zero means "not recorded", and the caller falls back to
+    // treating /Rect as the extent, which is correct for an upright shape.
+    let box_w: f32 = parts.next().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+    let box_h: f32 = parts.next().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+
+    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill, radius, box_w, box_h))
 }
 
 /// One shape to add, in render-pixel space.
@@ -4003,7 +4018,13 @@ fn add_shape_annotations_inner(
         } else {
             0.0
         };
-        let _ = set_annotation_tag(&mut annotation, &shape_tag(spec, width_pts, radius_pts));
+        // The upright box in POINTS: the drag's own extent, before any rotation
+        // and before the pad. This is what a rebuild needs and cannot otherwise
+        // recover once the shape is turned.
+        let box_w_pts = (x2 - x1).abs();
+        let box_h_pts = (y2 - y1).abs();
+        let _ = set_annotation_tag(
+            &mut annotation, &shape_tag(spec, width_pts, radius_pts, box_w_pts, box_h_pts));
 
         rotate_object_about!(path, rot, cx, cy);
         if annotation.objects_mut().add_path_object(path).is_err() {
@@ -4227,6 +4248,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     // Read tag AND the annotation's own bounds BEFORE the delete, so a mark
     // that is not one of our shapes leaves the page untouched.
     let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, cur_radius_pts,
+         cur_box_w_pts, cur_box_h_pts,
          page_left, page_top, page_w, bounds) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -4242,6 +4264,7 @@ fn restyle_shape_annotation_inner_with_rotation(
         if pw <= 0.0 { return STATUS_INVALID_INPUT; }
         let (page_left, page_top) = page_origin(&page);
         (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, tag.10,
+         tag.11, tag.12,
          page_left, page_top, pw, bx)
     };
 
@@ -4257,10 +4280,26 @@ fn restyle_shape_annotation_inner_with_rotation(
     // opacity-slider case is un-rotated in practice.)
     let scale_cap_per_pt = capture_width as f32 / page_w;
     let pad_pts = cur_width_pts / 2.0 + 1.0;
-    let cap_left = (bounds.left().value + pad_pts - page_left) * scale_cap_per_pt;
-    let cap_right = (bounds.right().value - pad_pts - page_left) * scale_cap_per_pt;
-    let cap_top = (page_top - bounds.top().value + pad_pts) * scale_cap_per_pt;
-    let cap_bottom = (page_top - bounds.bottom().value - pad_pts) * scale_cap_per_pt;
+    let (cap_left, cap_right, cap_top, cap_bottom) =
+        if cur_rot != 0.0 && cur_box_w_pts > 0.0 && cur_box_h_pts > 0.0 {
+            // A TURNED shape's /Rect is the axis-aligned box of the rotated
+            // content, so insetting it by the pad does not give the extent back;
+            // it gives something bigger, and restyling repeatedly inflates the
+            // shape. Its own upright size is on the tag, and the CENTRE of /Rect
+            // is exact at any angle, so the two together reconstruct it.
+            let cx = ((bounds.left().value + bounds.right().value) / 2.0 - page_left) * scale_cap_per_pt;
+            let cy = (page_top - (bounds.top().value + bounds.bottom().value) / 2.0) * scale_cap_per_pt;
+            let hw = cur_box_w_pts * scale_cap_per_pt / 2.0;
+            let hh = cur_box_h_pts * scale_cap_per_pt / 2.0;
+            (cx - hw, cx + hw, cy - hh, cy + hh)
+        } else {
+            (
+                (bounds.left().value + pad_pts - page_left) * scale_cap_per_pt,
+                (bounds.right().value - pad_pts - page_left) * scale_cap_per_pt,
+                (page_top - bounds.top().value + pad_pts) * scale_cap_per_pt,
+                (page_top - bounds.bottom().value - pad_pts) * scale_cap_per_pt,
+            )
+        };
 
     // Apply the caller's overrides on top of the tag's own values.
     let (nr, ng, nb, na) = if (color_rgba & 0xFF) != 0 {
@@ -4358,7 +4397,7 @@ fn resize_shape_annotation_inner(
         }
     };
 
-    let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts) = tag;
+    let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts, box_w_pts, box_h_pts) = tag;
 
     // Undo the stroke pad when the caller's bounds came from the annotation's
     // own /Rect. The writer inflates the extent by width/2 + 1 on every side so
@@ -4369,7 +4408,34 @@ fn resize_shape_annotation_inner(
     // box of the TURNED content plus the pad, so insetting by the pad alone
     // would be wrong in a different way. Leaving it padded keeps the existing
     // behaviour for that case rather than replacing one error with another.
-    let (left, top, right, bottom) = if bounds_are_padded && rot == 0.0 {
+    // A TURNED shape cannot be de-padded, because its /Rect is the axis-aligned
+    // box of the rotated content: bigger than the shape in both axes, and not
+    // invertible at 45 degrees. Its own upright size is recorded on the tag
+    // instead. The CENTRE of /Rect is exact whatever the angle, so centre plus
+    // recorded size reconstructs the shape precisely.
+    let rotated_box = if bounds_are_padded && rot != 0.0 && box_w_pts > 0.0 && box_h_pts > 0.0 {
+        let page_w = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&doc_handle).cloned();
+            let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
+            let doc_guard = lock(&doc);
+            let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+                return STATUS_INVALID_INPUT;
+            };
+            page.width().value
+        };
+        if page_w <= 0.0 { return STATUS_INVALID_INPUT; }
+        let per_pt = capture_width as f32 / page_w;
+        let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
+        let (hw, hh) = (box_w_pts * per_pt / 2.0, box_h_pts * per_pt / 2.0);
+        Some((cx - hw, cy - hh, cx + hw, cy + hh))
+    } else {
+        None
+    };
+
+    let (left, top, right, bottom) = if let Some(bx) = rotated_box {
+        bx
+    } else if bounds_are_padded && rot == 0.0 {
         let page_w = {
             let _guard = lock(&CALL_LOCK);
             let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -8702,7 +8768,7 @@ mod tests {
         let contents = contents_of(reopened, 0, 0).expect("the reopened shape has no contents");
         let parsed = parse_shape_tag(&contents);
         assert!(parsed.is_some(), "tag did not parse: {contents}");
-        let (kind, r, g, b, a, width, _, _, _, _, _) = parsed.unwrap();
+        let (kind, r, g, b, a, width, _, _, _, _, _, _, _) = parsed.unwrap();
 
         assert_eq!(kind, SHAPE_ELLIPSE);
         assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x78));
@@ -8720,7 +8786,7 @@ mod tests {
                 for (y1, y2, fy) in [(20.0, 80.0, true), (80.0, 20.0, false)] {
                     let mut s = shape(kind, x1, y1, x2, y2);
                     s.a = 0xC0;
-                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5, 0.0)).expect("tag did not parse");
+                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5, 0.0, 0.0, 0.0)).expect("tag did not parse");
 
                     assert_eq!(parsed.0, kind);
                     assert_eq!(parsed.4, 0xC0);
@@ -8745,6 +8811,95 @@ mod tests {
         assert!(parse_shape_tag("AyaanShape:0:GGGGGGGG:2:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:0:1:1").is_none());
         assert!(parse_shape_tag("AyaanShape:0:FFFFFFFF:abc:1:1").is_none());
+    }
+
+    #[test]
+    fn raising_a_rotated_shape_repeatedly_does_not_grow_it() {
+        // Z-order rebuilds a shape through the restyle path, which de-pads
+        // /Rect and uses it as the new extent. Correct for an upright shape and
+        // wrong for a turned one, whose /Rect is the axis-aligned box of the
+        // rotated content. Reorder a rotated shape a few times and it inflates.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, CAP, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let mut index = -1;
+        assert_eq!(rotate_shape_annotation(handle, 0, 0, CAP, 30.0, &mut index), STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (w0, h0) = (first.4 - first.2, first.5 - first.3);
+
+        for pass in 0..4 {
+            let mut next = -1;
+            assert_eq!(
+                restyle_shape_annotation(handle, 0, index, CAP, 0, -1.0, &mut next),
+                STATUS_OK_PDFIUM, "raise {pass} refused");
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        let tag = parse_shape_tag(&contents_of(handle, 0, index as usize).unwrap()).unwrap();
+        close_document(handle);
+        let (_, _, l, t, r, b) = after[0];
+        println!("ROTATED RAISE DRIFT: {w0:.4}x{h0:.4} -> {:.4}x{:.4}, angle {:.1}",
+                 r - l, b - t, tag.8);
+
+        assert!((tag.8 - 30.0).abs() < 0.01, "rotation lost: {}", tag.8);
+        assert!(((r - l) - w0).abs() < 0.003 && ((b - t) - h0).abs() < 0.003,
+            "the rotated shape grew while being raised: {w0:.4}x{h0:.4} -> {:.4}x{:.4}", r - l, b - t);
+        // And it did not wander: a raise must not move anything.
+        assert!((l - first.2).abs() < 0.003 && (t - first.3).abs() < 0.003,
+            "the rotated shape moved while being raised");
+    }
+
+    #[test]
+    fn moving_a_rotated_shape_repeatedly_does_not_grow_it() {
+        // A rotated shape's /Rect is the axis-aligned box of the TURNED content
+        // plus the pad, so it is BIGGER than the shape in both axes. Handing it
+        // back as the new extent redraws the shape to fill that larger box and
+        // then turns it again, so a rotated shape grows much faster than an
+        // upright one and changes proportion as it goes.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, CAP, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let mut idx = -1;
+        assert_eq!(rotate_shape_annotation(handle, 0, 0, CAP, 30.0, &mut idx), STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (w0, h0) = (first.4 - first.2, first.5 - first.3);
+
+        let step = 10.0f32;
+        let mut index = idx;
+        for _ in 0..4 {
+            let cur = read_annotations(handle, 0)[0];
+            let mut next = -1;
+            assert_eq!(
+                move_shape_annotation(handle, 0, index, CAP,
+                    cur.2 * CAP as f32 + step, cur.3 * CAP as f32 + step,
+                    cur.4 * CAP as f32 + step, cur.5 * CAP as f32 + step,
+                    &mut next),
+                STATUS_OK_PDFIUM
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        let tag = parse_shape_tag(&contents_of(handle, 0, index as usize).unwrap()).unwrap();
+        close_document(handle);
+        let (_, _, l, t, r, b) = after[0];
+        let (w, h) = (r - l, b - t);
+        println!("ROTATED MOVE DRIFT: {w0:.4}x{h0:.4} -> {w:.4}x{h:.4}, angle {:.1}", tag.8);
+
+        assert!((tag.8 - 30.0).abs() < 0.01, "the rotation was lost: {}", tag.8);
+        assert!((w - w0).abs() < 0.003 && (h - h0).abs() < 0.003,
+            "the rotated shape grew while being moved: {w0:.4}x{h0:.4} -> {w:.4}x{h:.4}");
+
+        let travelled = (l - first.2) * CAP as f32;
+        assert!((travelled - 4.0 * step).abs() < 2.0,
+            "expected to travel {}, went {travelled:.1}", 4.0 * step);
     }
 
     #[test]
