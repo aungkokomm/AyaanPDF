@@ -4945,30 +4945,44 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (at < 0) { return false; }
         var item = live[at];
 
-        float l = (float)(item.Left * CaptureWidth);
-        float t = (float)(item.Top * CaptureWidth);
-        float r = (float)(item.Right * CaptureWidth);
-        float b = (float)(item.Bottom * CaptureWidth);
-
         string? contents = ReadAnnotationContents(livePage, liveIndex);
         bool isText = TextBoxTagReader.TryParse(contents, out _);
-        bool isShape = contents is not null
-            && contents.StartsWith("AyaanShape:", StringComparison.Ordinal);
+        bool isShape = ShapeTagReader.IsShapeTag(contents);
 
         int status;
         int newIndex;
-        if (isText)
+        if (isShape)
         {
-            status = RenderCoreNative.resize_text_box_annotation(
-                _documentHandle, livePage, liveIndex, CaptureWidth, l, t, r, b, out newIndex);
+            // NO BOUNDS. A raise must not touch geometry, and passing the
+            // annotation's own rectangle back in is not geometry-neutral: the
+            // writer stores /Rect INFLATED by the stroke pad, and resize treats
+            // what it is given as the un-inflated extent, so it pads again.
+            // Send to back then to front and the shape came back visibly fatter,
+            // by roughly a stroke width each time.
+            //
+            // restyle with no overrides is the geometry-preserving rebuild: it
+            // undoes the pad itself and redraws from the tag, so repeated raises
+            // are a fixed point. Proved by
+            // raising_a_shape_repeatedly_does_not_grow_it in render_core.
+            status = RenderCoreNative.restyle_shape_annotation(
+                _documentHandle, livePage, liveIndex, CaptureWidth,
+                colorRgba: 0, widthPx: -1f, out newIndex);
         }
-        else if (isShape)
+        else if (isText)
         {
-            status = RenderCoreNative.resize_shape_annotation(
-                _documentHandle, livePage, liveIndex, CaptureWidth, l, t, r, b, out newIndex);
+            float tl = (float)(item.Left * CaptureWidth);
+            float tt = (float)(item.Top * CaptureWidth);
+            float tr = (float)(item.Right * CaptureWidth);
+            float tb = (float)(item.Bottom * CaptureWidth);
+            status = RenderCoreNative.resize_text_box_annotation(
+                _documentHandle, livePage, liveIndex, CaptureWidth, tl, tt, tr, tb, out newIndex);
         }
         else
         {
+            float l = (float)(item.Left * CaptureWidth);
+            float t = (float)(item.Top * CaptureWidth);
+            float r = (float)(item.Right * CaptureWidth);
+            float b = (float)(item.Bottom * CaptureWidth);
             // NOT resize_annotation: it writes bounds in place for a same-size
             // call and would report success without moving anything.
             status = RenderCoreNative.raise_stamp_annotation(

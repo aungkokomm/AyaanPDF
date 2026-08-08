@@ -8672,6 +8672,100 @@ mod tests {
     }
 
     #[test]
+    fn raising_a_shape_repeatedly_does_not_grow_it() {
+        // Z-order is a run of removals and re-adds, so a shape can be rebuilt
+        // several times in one command and many times over a session. If each
+        // rebuild moves the geometry at all, the shape creeps.
+        //
+        // The trap: the writer stores /Rect as the shape's extent INFLATED by
+        // width/2 + 1 on every side so PDFium does not clip the stroke. Feeding
+        // that reported rectangle back in as the new extent inflates it again.
+        // Send to back then to front and the shape is visibly fatter.
+        //
+        // restyle_shape_annotation is the correct primitive for a raise: it
+        // takes no bounds, undoes the pad itself, and rebuilds from the tag, so
+        // the geometry is a fixed point.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let specs = [shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0)];
+        assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), 1), STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (start_l, start_t, start_r, start_b) = (first.2, first.3, first.4, first.5);
+
+        let mut index = 0i32;
+        for pass in 0..4 {
+            let mut next = -1;
+            assert_eq!(
+                restyle_shape_annotation(handle, 0, index, 1000, 0, -1.0, &mut next),
+                STATUS_OK_PDFIUM,
+                "raise {pass} was refused"
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+
+        assert_eq!(after.len(), 1, "raising left duplicates: {}", after.len());
+        let (_, _, l, t, r, b) = after[0];
+        println!("RAISE DRIFT: ({start_l:.4},{start_t:.4},{start_r:.4},{start_b:.4}) \
+                  -> ({l:.4},{t:.4},{r:.4},{b:.4})");
+
+        // A pad re-applied four times would show up as roughly four stroke
+        // widths of growth on each axis, which is obvious on screen.
+        let tol = 0.002;
+        assert!((l - start_l).abs() < tol && (t - start_t).abs() < tol
+             && (r - start_r).abs() < tol && (b - start_b).abs() < tol,
+            "the shape drifted: width {:.4} -> {:.4}, height {:.4} -> {:.4}",
+            start_r - start_l, r - l, start_b - start_t, b - t);
+    }
+
+    #[test]
+    fn raising_a_stamp_repeatedly_does_not_move_it() {
+        // Same question as the shape case, for the other kind the z-order
+        // engine rebuilds. A stamp's /Rect is its image rectangle with no pad,
+        // so feeding it back should be a fixed point, but "should" is what the
+        // shape case said too.
+        const CAP: i32 = 1000;
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let (pw, ph) = (40i32, 10i32);
+        let pixels = marker_stamp_pixels(pw, ph);
+        assert_eq!(
+            add_stamp_annotation(handle, 0, CAP,
+                0.30 * CAP as f32, 0.40 * CAP as f32, 0.70 * CAP as f32, 0.50 * CAP as f32,
+                pixels.as_ptr(), pixels.len(), pw, ph),
+            STATUS_OK_PDFIUM
+        );
+
+        let first = read_annotations(handle, 0)[0];
+        let (sl, st, sr, sb) = (first.2, first.3, first.4, first.5);
+
+        let mut index = 0i32;
+        for _ in 0..4 {
+            let cur = read_annotations(handle, 0)[0];
+            let mut next = -1;
+            assert_eq!(
+                raise_stamp_annotation(handle, 0, index, CAP,
+                    cur.2 * CAP as f32, cur.3 * CAP as f32,
+                    cur.4 * CAP as f32, cur.5 * CAP as f32, &mut next),
+                STATUS_OK_PDFIUM
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+        let (_, _, l, t, r, b) = after[0];
+        println!("STAMP RAISE DRIFT: ({sl:.4},{st:.4},{sr:.4},{sb:.4}) -> ({l:.4},{t:.4},{r:.4},{b:.4})");
+
+        assert_eq!(after.len(), 1);
+        let tol = 0.002;
+        assert!((l - sl).abs() < tol && (t - st).abs() < tol
+             && (r - sr).abs() < tol && (b - sb).abs() < tol,
+            "the stamp drifted: {:.4} wide -> {:.4}", sr - sl, r - l);
+    }
+
+    #[test]
     fn resizing_a_shape_redraws_it_in_the_new_box() {
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
 
