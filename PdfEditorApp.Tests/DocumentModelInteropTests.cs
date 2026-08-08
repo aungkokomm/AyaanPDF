@@ -107,6 +107,11 @@ public class DocumentModelInteropTests
         ulong docHandle, int pageIndex, int index,
         [In] byte[] idUtf8, nuint idLen);
 
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int restyle_shape_annotation(
+        ulong docHandle, int pageIndex, int index, int captureWidth,
+        uint colorRgba, float widthPx, out int newIndex);
+
     private static ulong OpenFixture()
     {
         string path = System.IO.Path.Combine(AppContext.BaseDirectory, "sample_20pages.pdf");
@@ -341,6 +346,67 @@ public class DocumentModelInteropTests
         finally
         {
             close_document(reopened);
+        }
+    }
+
+    [Fact]
+    public void repeated_reorders_keep_every_objects_identity()
+    {
+        // The reported symptom: a z-order command works ONCE and then every
+        // later command does nothing. That is what a lost identity looks like
+        // from the outside. The engine works entirely in Guids, so an object
+        // whose Guid stopped matching the page is invisible to the planner, the
+        // plan comes back unchanged, and the command reports "already at the
+        // back" rather than failing.
+        //
+        // This replays exactly what RaiseToTop does for a shape, three rounds
+        // deep: rebuild via restyle, then re-stamp the identity onto whatever
+        // index the rebuild reported.
+        ulong handle = OpenFixture();
+        try
+        {
+            var specs = new[]
+            {
+                Spec(ShapeKind.Rectangle, 50, 50, 200, 150),
+                Spec(ShapeKind.Rectangle, 250, 50, 400, 150),
+                Spec(ShapeKind.Rectangle, 450, 50, 600, 150),
+            };
+            Assert.Equal(OkPdfium, add_shape_annotations(handle, Cap, specs, 3));
+
+            var ids = new[] { Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid() };
+            for (int i = 0; i < 3; i++)
+            {
+                byte[] hex = System.Text.Encoding.ASCII.GetBytes(ids[i].ToString("N"));
+                Assert.Equal(OkPdfium, set_annotation_id(handle, 0, i, hex, (nuint)hex.Length));
+            }
+
+            for (int round = 1; round <= 3; round++)
+            {
+                // Raise whichever object is currently at the bottom, the way a
+                // reorder rewrites the changed tail.
+                var before = ModelOf(handle, 0).Objects;
+                Guid moving = before[0].Id;
+                Assert.NotEqual(Guid.Empty, moving);
+
+                Assert.Equal(OkPdfium, restyle_shape_annotation(
+                    handle, 0, before[0].ZOrder, Cap, 0, -1f, out int newIndex));
+
+                byte[] hex = System.Text.Encoding.ASCII.GetBytes(moving.ToString("N"));
+                Assert.Equal(OkPdfium, set_annotation_id(handle, 0, newIndex, hex, (nuint)hex.Length));
+
+                var after = ModelOf(handle, 0).Objects;
+
+                Assert.Equal(3, after.Count);
+                Assert.All(after, o => Assert.NotEqual(Guid.Empty, o.Id));
+                Assert.Equal(
+                    ids.OrderBy(g => g).ToList(),
+                    after.Select(o => o.Id).OrderBy(g => g).ToList());
+                Assert.Equal(moving, after[^1].Id);
+            }
+        }
+        finally
+        {
+            close_document(handle);
         }
     }
 

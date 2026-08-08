@@ -4886,6 +4886,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         var target = plan(current, moving);
         int from = AnnotationOrder.RewriteFrom(current, target);
+
         if (from >= target.Count)
         {
             Status = label switch
@@ -4906,6 +4907,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 Status = "Cannot reorder here: the page has a mark this app did not create, "
                        + "and moving it would lose it.";
+                return false;
+            }
+
+            // And it must still be FINDABLE by that id after a reload, because
+            // that is how every write in the loop below addresses its target.
+            // An annotation whose id was invented rather than persisted gets a
+            // different one on the next load, so the plan is built against an
+            // identity that no longer exists. Checking here means the command
+            // refuses whole rather than rewriting half the page and stopping.
+            InvalidateLoadedPage(page);
+            if (FindLoadedById(obj.Id, page) is null)
+            {
+                Diag.Log($"{label}: id={obj.Id:N} does not survive a reload, refusing");
+                Status = "Cannot reorder here: one of these marks has no stable identity.";
                 return false;
             }
         }

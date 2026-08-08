@@ -69,6 +69,20 @@ internal static class AnnotationLoader
                 if (readId is null)
                 {
                     unstamped++;
+
+                    // PERSIST it, here, immediately. An invented id that is not
+                    // written back is a different value on every load, and every
+                    // Guid-addressed operation in this app then works against
+                    // identities that cease to exist the moment the page is
+                    // reloaded. Z-order showed it plainly: the planner built a
+                    // correct plan, and each write reloaded the page, invented
+                    // fresh ids, and could no longer find the object it had just
+                    // planned to move.
+                    //
+                    // Safe during a read: set_annotation_id edits the tag in
+                    // place, with no delete and re-add, so no index moves under
+                    // the loop.
+                    WriteId(docHandle, pageIndex, native.Index, id);
                 }
                 result.Add(new ExistingAnnotation(
                     pageIndex,
