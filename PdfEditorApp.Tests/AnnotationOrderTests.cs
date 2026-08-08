@@ -132,6 +132,67 @@ public class AnnotationOrderTests
         Assert.Equal(target, page);
     }
 
+    /// <summary>Replays the engine's only write primitive: remove and append.</summary>
+    private static List<Guid> ApplyOrder(IReadOnlyList<Guid> page, IReadOnlyList<Guid> target)
+    {
+        var result = new List<Guid>(page);
+        for (int i = AnnotationOrder.RewriteFrom(page, target); i < target.Count; i++)
+        {
+            result.Remove(target[i]);
+            result.Add(target[i]);
+        }
+        return result;
+    }
+
+    [Theory]
+    [InlineData("SendToBack")]
+    [InlineData("BringToFront")]
+    [InlineData("BringForward")]
+    [InlineData("SendBackward")]
+    public void undoing_a_reorder_returns_the_original_order(string command)
+    {
+        // A z-order command records the whole before and after order and undoes
+        // by rewriting to Before with the SAME code that applied After. If that
+        // rewrite is not a true inverse, undo silently leaves the page in a
+        // third order that is neither.
+        var page = new List<Guid> { A, B, C, D };
+        var moving = Moving(B);
+
+        var after = command switch
+        {
+            "SendToBack" => AnnotationOrder.SendToBack(page, moving),
+            "BringToFront" => AnnotationOrder.BringToFront(page, moving),
+            "BringForward" => AnnotationOrder.BringForward(page, moving),
+            _ => AnnotationOrder.SendBackward(page, moving),
+        };
+
+        var applied = ApplyOrder(page, after);
+        Assert.Equal(after, applied);
+
+        var undone = ApplyOrder(applied, page);
+        Assert.Equal(page, undone);
+
+        // And redo lands back on the same result, so the pair can be walked
+        // repeatedly without the order creeping.
+        Assert.Equal(after, ApplyOrder(undone, after));
+    }
+
+    [Fact]
+    public void undo_and_redo_can_be_walked_repeatedly_without_drifting()
+    {
+        var original = new List<Guid> { A, B, C, D };
+        var target = AnnotationOrder.SendToBack(original, Moving(C, D));
+
+        var page = new List<Guid>(original);
+        for (int i = 0; i < 5; i++)
+        {
+            page = ApplyOrder(page, target);
+            Assert.Equal(target, page);
+            page = ApplyOrder(page, original);
+            Assert.Equal(original, page);
+        }
+    }
+
     [Fact]
     public void the_untouched_prefix_is_never_rewritten()
     {

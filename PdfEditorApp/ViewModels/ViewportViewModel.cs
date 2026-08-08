@@ -4925,7 +4925,39 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
         }
 
-        PushHistory(HistoryScope.Document, label);
+        // A LIST OF GUIDS, not a copy of the PDF. This used to push a whole
+        // document snapshot, so every click of one of the four z-order buttons
+        // copied the entire file into the undo stack. A page of fifty marks
+        // costs about a kilobyte here.
+        BeginEdit(label);
+        RecordEdit(new OrderRecord(page, current, target));
+        ApplyOrder(page, target, label);
+        CommitEdit();
+
+        ResolveSelectionById(page);
+        StampSelectedIds();
+        RefreshSelectionOutline();
+        RenderCurrentPage();
+        return true;
+    }
+
+    /// <summary>
+    /// Rewrites a page into the given paint order.
+    ///
+    /// Shared by the commands and by undo/redo, so reversing a reorder runs the
+    /// identical code in the other direction and the two cannot drift apart.
+    ///
+    /// Only the tail after the first disagreement is rewritten, because
+    /// appending is the only ordering primitive there is: re-adding those in the
+    /// wanted order lands the page exactly on it, and anything in the untouched
+    /// prefix is never removed.
+    /// </summary>
+    private void ApplyOrder(int page, IReadOnlyList<Guid> target, string label)
+    {
+        InvalidateLoadedPage(page);
+        var current = PageModelFor(page).Objects.Select(o => o.Id).ToList();
+        int from = AnnotationOrder.RewriteFrom(current, target);
+
         for (int i = from; i < target.Count; i++)
         {
             if (!RaiseToTop(page, target[i]))
@@ -4936,12 +4968,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         InvalidateLoadedPage(page);
-        ResolveSelectionById(page);
-        StampSelectedIds();
         IsDirty = true;
-        RefreshSelectionOutline();
-        RenderCurrentPage();
-        return true;
     }
 
 
@@ -7103,6 +7130,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     // deletion is put back.
                     ApplyExistenceRecord(e, backwards ? !e.ExistsAfter : e.ExistsAfter);
                     touched.Add(e.PageIndex);
+                    break;
+
+                case OrderRecord o:
+                    // The same rewrite the command ran, aimed the other way.
+                    ApplyOrder(o.Page, backwards ? o.Before : o.After, "Undo order");
+                    touched.Add(o.Page);
                     break;
 
                 case GroupsRecord g:

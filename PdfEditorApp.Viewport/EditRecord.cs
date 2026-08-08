@@ -51,6 +51,26 @@ public sealed record ExistenceRecord(
     : EditRecord(Id, PageIndex);
 
 /// <summary>
+/// A page's paint order changed: Bring to Front, Send to Back, and the one-step
+/// moves.
+///
+/// The whole order is stored, before and after, rather than a description of
+/// the change. It is a list of Guids, so a page of fifty marks costs about a
+/// kilobyte, against the WHOLE PDF that a document snapshot copied for every
+/// click of one of these buttons.
+///
+/// Reversing is the same operation in the other direction: re-add the objects
+/// after the first disagreement, in the wanted order, because appending is the
+/// only ordering primitive PDFium has. So undo and redo run identical code and
+/// cannot drift apart.
+/// </summary>
+public sealed record OrderRecord(
+    int Page,
+    IReadOnlyList<Guid> Before,
+    IReadOnlyList<Guid> After)
+    : EditRecord(Guid.Empty, Page);
+
+/// <summary>
 /// Session grouping changed. Groups are held in the view model rather than in
 /// the PDF, so the whole before/after membership is small enough to store
 /// outright. Covers group, ungroup, and the implicit regrouping that happens
