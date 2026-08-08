@@ -677,10 +677,18 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // The property bar sits at the top of this same column and draws ABOVE
+        // this toolbar, so anything placed under it is unreachable. Reserve its
+        // height, measured rather than assumed, since it is one or two rows.
+        double topInset = PropertyBar.Visibility == Visibility.Visible
+            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
+            : 0;
+
         var place = ObjectToolbarPlacement.Place(
             tl.X, tl.Y, br.X, br.Y,
             barW, barH,
-            PageScroller.ViewportWidth, PageScroller.ViewportHeight);
+            PageScroller.ViewportWidth, PageScroller.ViewportHeight,
+            Math.Max(0, topInset));
 
         ObjectToolbarOffset.X = place.Left;
         ObjectToolbarOffset.Y = place.Top;

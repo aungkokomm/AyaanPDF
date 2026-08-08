@@ -886,7 +886,13 @@
             Collapsed entirely for tools that offer nothing, so the canvas is
             uncluttered whenever the bar has nothing to say.
         -->
+        <!-- ZIndex 30: ABOVE the floating object toolbar (20). Both are
+             top-aligned in this column and the object toolbar clamps to a few
+             pixels from the top of the viewport, so a selection near the top of
+             a page put it straight over this bar and hid whatever was under it.
+             The property bar is the app's chrome and wins. -->
         <Border x:Name="PropertyBar" Grid.Column="2" Visibility="Collapsed"
+                Canvas.ZIndex="30"
                 HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12,12,12,0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"

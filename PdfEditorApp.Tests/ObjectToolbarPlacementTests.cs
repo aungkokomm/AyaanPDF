@@ -92,6 +92,48 @@ public class ObjectToolbarPlacementTests
     }
 
     [Fact]
+    public void it_never_slides_under_the_property_bar()
+    {
+        // The property bar occupies the top of the same column and draws ABOVE
+        // this toolbar, so a position beneath it is unreachable rather than
+        // merely untidy. The two collided as soon as this toolbar was added and
+        // the symptom was a control on the OTHER bar looking like it was
+        // missing, which took three attempts to see.
+        const double Inset = 90;
+
+        var p = ObjectToolbarPlacement.Place(
+            selLeft: 400, selTop: 100, selRight: 600, selBottom: 200,
+            BarW, BarH, ViewW, ViewH, topInset: Inset);
+
+        Assert.True(p.Top >= Inset,
+            $"the toolbar was placed at {p.Top}, under a property bar {Inset} tall");
+    }
+
+    [Fact]
+    public void a_selection_high_on_the_page_pushes_the_toolbar_below_it()
+    {
+        // With chrome reserved above, there is no room over a selection near the
+        // top, so it has to flip under rather than be hidden.
+        var p = ObjectToolbarPlacement.Place(
+            selLeft: 400, selTop: 100, selRight: 600, selBottom: 200,
+            BarW, BarH, ViewW, ViewH, topInset: 90);
+
+        Assert.True(p.Below);
+        Assert.Equal(200 + ObjectToolbarPlacement.Gap, p.Top, 3);
+    }
+
+    [Fact]
+    public void with_no_chrome_reserved_it_behaves_exactly_as_before()
+    {
+        // The inset defaults to zero, so every existing caller and every case
+        // above is unaffected.
+        var withZero = ObjectToolbarPlacement.Place(400, 300, 600, 500, BarW, BarH, ViewW, ViewH, 0);
+        var without = ObjectToolbarPlacement.Place(400, 300, 600, 500, BarW, BarH, ViewW, ViewH);
+
+        Assert.Equal(without, withZero);
+    }
+
+    [Fact]
     public void it_tracks_the_selection_rather_than_snapping_to_a_fixed_spot()
     {
         // Guards the whole point of a contextual toolbar: two different
