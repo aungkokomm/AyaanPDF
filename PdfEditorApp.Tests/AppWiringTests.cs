@@ -43,6 +43,7 @@ public class AppWiringTests
     [InlineData("Save_Click", "Control", "S", EditorCommand.Save)]
     [InlineData("SaveAs_Click", "Control,Shift", "S", EditorCommand.SaveAs)]
     [InlineData("OpenFile_Click", "Control", "O", EditorCommand.Open)]
+    [InlineData("Print_Click", "Control", "P", EditorCommand.Print)]
     public void a_menu_item_advertises_the_chord_that_actually_runs_it(
         string handler, string modifiers, string key, EditorCommand expected)
     {

@@ -1167,6 +1167,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Starts an empty document.
+    ///
+    /// The blank page is loaded from the app's own template, but the document
+    /// must NOT remember that path: it lives in the install folder, so a Save
+    /// would write over the template that every new document is made from.
+    /// Clearing the path is what makes Save fall through to Save As, which is
+    /// the correct behaviour for a document that has never been saved.
+    /// </summary>
+    public void OpenBlankDocument()
+    {
+        OpenDocument(Path.Combine(AppContext.BaseDirectory, "blank.pdf"));
+        _currentDocumentPath = null;
+        IsDirty = false;
+        NotifyDocumentTitleChanged();
+    }
+
+    /// <summary>
     /// Saves back over the file this document came from. False when there is
     /// nowhere to save to yet, which is the caller's cue to run Save As.
     /// </summary>
@@ -2067,6 +2084,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// tile cache, and the fallback a page returns to when it stops being
     /// near the viewport.
     /// </summary>
+    /// <summary>
+    /// Renders one page for printing, at a width the caller chooses.
+    ///
+    /// Separate from the viewport's tiers because print resolution has nothing
+    /// to do with what fits on screen: the page is rendered once, at print
+    /// density, and never cached into a slot. Synchronous because the print
+    /// framework asks for a page and expects an element back, with nowhere to
+    /// await.
+    ///
+    /// Kept here rather than handing the document handle out, so the handle
+    /// stays private and every render goes through the same place.
+    /// </summary>
+    public WriteableBitmap? RenderPageForPrint(int pageIndex, int widthPx)
+    {
+        if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount)
+        {
+            return null;
+        }
+
+        var raw = PageRenderer.RenderLowResRaw(_documentHandle, pageIndex, widthPx);
+        return raw.Bgra is null ? null : PageRenderer.ToBitmap(raw).Bitmap;
+    }
+
     private async void RenderBaseTier(PageSlot slot)
     {
         if (!slot.TryBeginRender())
@@ -5740,6 +5780,51 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// the one just placed. Used to hand a freshly stamped image straight to
     /// the Select tool, already picked up and ready to nudge.
     /// </summary>
+    /// <summary>
+    /// Selects every mark on the current page.
+    ///
+    /// Ctrl+A means this everywhere else and had no equivalent here at all, so
+    /// the only way to act on a whole page of marks was to marquee them, which
+    /// fails as soon as one sits outside the rectangle you can drag.
+    /// </summary>
+    public bool SelectAllOnPage()
+    {
+        if (_documentHandle == 0)
+        {
+            return false;
+        }
+
+        int page = CurrentPageIndex;
+        var all = LoadedFor(page);
+        if (all.Count == 0)
+        {
+            return false;
+        }
+
+        // First becomes the anchor and the rest extras, which is the shape the
+        // rest of the selection code expects: every operation reads the anchor
+        // and treats _extraSelected as the ones that follow it.
+        _extraSelected.Clear();
+        var first = all[0];
+        _selectedLoaded = new LoadedSelection(
+            page, first.Index, first.Left, first.Top, first.Right, first.Bottom, first.Id);
+        ApplyTextBoxSelectionInfo(page, first.Index);
+
+        for (int i = 1; i < all.Count; i++)
+        {
+            var a = all[i];
+            _extraSelected.Add(new LoadedSelection(page, a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id));
+        }
+
+        Diag.Log($"SelectAllOnPage p{page}: {all.Count} marks");
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasSelectedTextBox));
+        OnPropertyChanged(nameof(HasSelectedShape));
+        OnPropertyChanged(nameof(HasMultiSelection));
+        return true;
+    }
+
     public void SelectNewestAnnotation(int pageIndex)
     {
         var all = LoadedFor(pageIndex);

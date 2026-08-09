@@ -783,6 +783,11 @@
                     <FontIcon Glyph="&#xE712;" FontSize="16" />
                     <Button.Flyout>
                         <MenuFlyout Placement="Right">
+                            <MenuFlyoutItem Text="New" Click="New_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="N" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
                             <MenuFlyoutItem Text="Open..." Click="OpenFile_Click">
                                 <MenuFlyoutItem.KeyboardAccelerators>
                                     <KeyboardAccelerator Modifiers="Control" Key="O" />
@@ -818,6 +823,21 @@
                                 cannot be undone by reopening the file.
                             -->
                             <MenuFlyoutItem Text="Flatten and save a copy..." Click="FlattenSaveAs_Click" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Print..." Click="Print_Click">
+                                <MenuFlyoutItem.Icon>
+                                    <FontIcon Glyph="&#xE749;" />
+                                </MenuFlyoutItem.Icon>
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="P" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Close document" Click="CloseDocument_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="W" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}" Click="Undo_Click"
                                             IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">

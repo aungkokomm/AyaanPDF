@@ -8,6 +8,7 @@ public enum EditorCommand
     /// <summary>Write back over the open file. Falls back to Save As when there is none.</summary>
     Save,
     SaveAs,
+    Print,
     Undo,
     Redo,
     Group,
@@ -38,6 +39,7 @@ public static class KeyboardCommands
     public const int KeyS = 0x53;
     public const int KeyG = 0x47;
     public const int KeyY = 0x59;
+    public const int KeyP = 0x50;
     public const int KeyZ = 0x5A;
 
     /// <summary>
@@ -61,6 +63,7 @@ public static class KeyboardCommands
             // Save As picker, which meant the commonest keystroke in any editor
             // could not save the file you already had open.
             KeyS => shift ? EditorCommand.SaveAs : EditorCommand.Save,
+            KeyP when !shift => EditorCommand.Print,
             KeyR when !shift => EditorCommand.ToggleRulers,
             KeyG => shift ? EditorCommand.Ungroup : EditorCommand.Group,
             KeyZ => shift ? EditorCommand.Redo : EditorCommand.Undo,

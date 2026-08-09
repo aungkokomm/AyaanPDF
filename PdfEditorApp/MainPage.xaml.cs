@@ -125,11 +125,11 @@ public sealed partial class MainPage : Page
                 // is a real one-page document, so every tool, the rulers and
                 // the save path all behave exactly as they do for a file the
                 // user opened; File>Open still replaces it.
-                string blank = System.IO.Path.Combine(AppContext.BaseDirectory, "blank.pdf");
-                if (System.IO.File.Exists(blank))
-                {
-                    ViewModel.OpenDocument(blank);
-                }
+                // OpenBlankDocument, not OpenDocument: the startup page must not
+                // remember the template's path inside the install folder, or
+                // Ctrl+S on a freshly started app would write over the blank
+                // every new document is made from.
+                ViewModel.OpenBlankDocument();
             }
 
             // Places a stamp straight after opening, so the decode-and-place
@@ -2853,8 +2853,33 @@ public sealed partial class MainPage : Page
 
     // ---------------- File menu ----------------
 
+    /// <summary>
+    /// A blank document, after offering to save whatever is open.
+    /// </summary>
+    private async void New_Click(object sender, RoutedEventArgs e)
+    {
+        if (!await ConfirmCloseAsync()) { return; }
+        ViewModel.OpenBlankDocument();
+    }
+
+    /// <summary>
+    /// Closes the open document, which means going back to a blank page: this
+    /// is a single-document app, so there is nothing behind it to reveal.
+    /// </summary>
+    private async void CloseDocument_Click(object sender, RoutedEventArgs e)
+    {
+        if (!await ConfirmCloseAsync()) { return; }
+        ViewModel.OpenBlankDocument();
+    }
+
     private async void OpenFile_Click(object sender, RoutedEventArgs e)
     {
+        // Opening REPLACES the open document, so it has to offer to save first.
+        // Without this, File>Open on a document with unsaved marks discarded
+        // them silently, which is the same loss the window close prompt exists
+        // to prevent.
+        if (!await ConfirmCloseAsync()) { return; }
+
         var picker = new Windows.Storage.Pickers.FileOpenPicker();
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
@@ -2881,6 +2906,14 @@ public sealed partial class MainPage : Page
         {
             w.SetDocumentTitle(ViewModel.WindowTitle);
         }
+    }
+
+    private Printing.DocumentPrinter? _printer;
+
+    private async void Print_Click(object sender, RoutedEventArgs e)
+    {
+        _printer ??= new Printing.DocumentPrinter(ViewModel);
+        await _printer.ShowAsync(App.WindowHandle);
     }
 
     private async void Save_Click(object sender, RoutedEventArgs e) => await SaveAsync();
@@ -3490,6 +3523,7 @@ public sealed partial class MainPage : Page
         {
             case EditorCommand.Open: OpenFile_Click(this, null!); break;
             case EditorCommand.Save: Save_Click(this, null!); break;
+            case EditorCommand.Print: Print_Click(this, null!); break;
             case EditorCommand.SaveAs: SaveAs_Click(this, null!); break;
             case EditorCommand.Undo: ViewModel.Undo(); break;
             case EditorCommand.Redo: ViewModel.Redo(); break;
@@ -3556,6 +3590,16 @@ public sealed partial class MainPage : Page
             case VirtualKey.Space when !_isSpaceHandActive:
                 _isSpaceHandActive = true;
                 UpdateCursor();
+                break;
+            case VirtualKey.A when _isCtrlDown:
+                // Not in KeyboardCommands, for the same reason Ctrl+C is not:
+                // in a text field Ctrl+A belongs to the field, and whether this
+                // counts as handled depends on what has focus.
+                if (!IsTextInputFocused && ViewModel.SelectAllOnPage())
+                {
+                    UpdateObjectToolbar();
+                    e.Handled = true;
+                }
                 break;
             case VirtualKey.C when _isCtrlDown:
                 // Selected annotation wins over selected text: if the user has
