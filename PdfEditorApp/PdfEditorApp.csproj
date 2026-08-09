@@ -70,7 +70,16 @@
     <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
     <Content Include="Assets\Square44x44Logo.targetsize-48_altform-lightunplated.png" />
     <Content Include="Assets\StoreLogo.png" />
-    <Content Include="Assets\AppIcon.ico" />
+    <!--
+      Copied, not just listed. ApplicationIcon embeds this in the exe, which is
+      what the taskbar reads, but nothing put the FILE beside the exe: the
+      Assets folder was absent from the build output entirely. So
+      AppWindow.SetIcon("Assets/AppIcon.ico") had been failing silently, and
+      the title bar could not load it either.
+    -->
+    <Content Include="Assets\AppIcon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
   </ItemGroup>
 
