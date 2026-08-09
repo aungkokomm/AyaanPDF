@@ -4227,6 +4227,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // Text box: full re-layout preserves rotation/font/wrapping.
                 // Shape: same via its shape restyle path (no bounds change tool,
                 // so use generic resize which just moves for a matching size).
+                // Ink: re-drawn from its control points, since the generic call
+                // refuses it.
                 // Anything else: generic resize_annotation (moves the /Rect).
                 int extStatus = RenderStatus.Unsupported;
                 int extNewIndex = target.Index;
@@ -4248,6 +4250,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                         _documentHandle, target.PageIndex, target.Index, CaptureWidth,
                         exl, ext, exr, exb, out extNewIndex);
                 }
+
+                // A stroke, re-drawn from its tag exactly as the anchor is.
+                // The anchor got this branch first and the extras did not,
+                // which made a drawing move on its own but sit still inside a
+                // group: the generic call below answers Unsupported for ink, so
+                // the member was silently skipped while everything else moved.
+                //
+                // Re-adding shifts every later index on the page, but the loop
+                // already re-resolves each target by Id at the top of the next
+                // iteration, which is what that invalidate is for.
+                if (extStatus != RenderStatus.OkPdfium
+                    && InkTag.TryParse(extContents, out string exInkColor, out double exInkWidth, out var exInkControl))
+                {
+                    extStatus = RebuildInkAt(
+                        target.PageIndex, target.Index, CaptureWidth, exInkColor, exInkWidth, exInkControl,
+                        target.Left, target.Top, target.Right, target.Bottom, target.Id, out extNewIndex);
+                }
+
                 if (extStatus != RenderStatus.OkPdfium)
                 {
                     extStatus = RenderCoreNative.resize_annotation(
