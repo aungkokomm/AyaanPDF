@@ -15,6 +15,55 @@ namespace PdfEditorApp.Tests;
 /// </summary>
 public class AppWiringTests
 {
+    // ---------------- Regression: the menu's accelerators are the real chords ----------------
+    //
+    // A MenuFlyoutItem's KeyboardAccelerator is dead until the flyout has been
+    // opened once, and LIVE forever after, firing before the page's key
+    // handler. Both halves have shipped bugs: six chords silently did nothing
+    // because they were only ever declared as accelerators, and later Ctrl+S
+    // went on opening the Save As picker because Save As kept the accelerator
+    // after Save was added.
+    //
+    // So the XAML is read here and checked against KeyboardCommands, which is
+    // the thing the key handler actually consults. A menu that advertises a
+    // chord the resolver maps somewhere else is the bug, whichever way round.
+
+    private static string MainPageXaml()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "PdfEditorApp", "MainPage.xaml")))
+        {
+            dir = dir.Parent;
+        }
+        Assert.NotNull(dir);
+        return File.ReadAllText(Path.Combine(dir!.FullName, "PdfEditorApp", "MainPage.xaml"));
+    }
+
+    [Theory]
+    [InlineData("Save_Click", "Control", "S", EditorCommand.Save)]
+    [InlineData("SaveAs_Click", "Control,Shift", "S", EditorCommand.SaveAs)]
+    [InlineData("OpenFile_Click", "Control", "O", EditorCommand.Open)]
+    public void a_menu_item_advertises_the_chord_that_actually_runs_it(
+        string handler, string modifiers, string key, EditorCommand expected)
+    {
+        string xaml = MainPageXaml();
+
+        // The item, then everything up to the end of its accelerator block.
+        int item = xaml.IndexOf($"Click=\"{handler}\"", StringComparison.Ordinal);
+        Assert.True(item >= 0, $"no menu item calls {handler}");
+        int end = xaml.IndexOf("</MenuFlyoutItem>", item, StringComparison.Ordinal);
+        string block = xaml[item..end];
+
+        Assert.True(
+            block.Contains($"Modifiers=\"{modifiers}\"", StringComparison.Ordinal)
+            && block.Contains($"Key=\"{key}\"", StringComparison.Ordinal),
+            $"{handler} does not declare {modifiers}+{key}, so the menu and the key handler disagree");
+
+        bool ctrl = modifiers.Contains("Control", StringComparison.Ordinal);
+        bool shift = modifiers.Contains("Shift", StringComparison.Ordinal);
+        Assert.Equal(expected, KeyboardCommands.Resolve(key[0], ctrl, shift, textFocused: false));
+    }
+
     // ---------------- Regression 1: a drawn shape is written as drawn ----------------
     //
     // EndShape built the interop struct by hand and left the corner radius at

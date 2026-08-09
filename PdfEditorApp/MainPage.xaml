@@ -788,15 +788,27 @@
                                     <KeyboardAccelerator Modifiers="Control" Key="O" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
+                            <!--
+                                The accelerators here have to match
+                                KeyboardCommands, not just look right in the
+                                menu. Once a flyout has been opened its
+                                accelerators go live and fire BEFORE the page's
+                                key handler, so a stale one silently steals the
+                                chord: Save As kept Ctrl+S after Save was added
+                                and went on opening the picker.
+                            -->
                             <MenuFlyoutItem Text="Save" Click="Save_Click"
                                             IsEnabled="{x:Bind ViewModel.HasDocumentPath, Mode=OneWay}">
                                 <MenuFlyoutItem.Icon>
                                     <FontIcon Glyph="&#xE74E;" />
                                 </MenuFlyoutItem.Icon>
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="S" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click">
                                 <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="S" />
+                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="S" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <!--
