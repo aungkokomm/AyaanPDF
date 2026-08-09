@@ -5774,7 +5774,26 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     };
 
     let doc_guard = lock(&doc);
-    let _ = doc_guard.form(); // bind the form-fill environment before reading fields
+
+    // Ask whether the document has a form AT ALL before walking it.
+    //
+    // The loop below iterates pages, and iterating pages LOADS them. On a
+    // 3352-page book with no form that was 34 seconds of parsing content
+    // streams to discover there were no fields, which is most of the time the
+    // app spent between laying a big document out and drawing its first page.
+    //
+    // FPDF_GetFormType reads the catalog and answers in constant time. Almost
+    // every PDF that is not a form answers NONE here and never touches a page.
+    if doc_guard.form().is_none() {
+        let mut boxed = 0u32.to_le_bytes().to_vec().into_boxed_slice();
+        let buffer = ByteBuffer {
+            data: boxed.as_mut_ptr(),
+            len: boxed.len(),
+            status: STATUS_OK_PDFIUM,
+        };
+        std::mem::forget(boxed);
+        return buffer;
+    }
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&0u32.to_le_bytes()); // count placeholder, backfilled below

@@ -231,13 +231,25 @@
                     and would make scroll-offset-to-page mapping depend on
                     realization order.
                 -->
-                <ItemsControl ItemsSource="{x:Bind ViewModel.PageSlots}">
-                    <ItemsControl.ItemsPanel>
-                        <ItemsPanelTemplate>
-                            <StackPanel Orientation="Vertical" Spacing="16" HorizontalAlignment="Center" />
-                        </ItemsPanelTemplate>
-                    </ItemsControl.ItemsPanel>
-                    <ItemsControl.ItemTemplate>
+                <!--
+                    ItemsRepeater, not ItemsControl: an ItemsControl over a
+                    StackPanel realises EVERY item up front. A 3352-page book
+                    therefore built 3352 shadowed cards before it could show
+                    one, which took 69 seconds and 1.1 GB.
+
+                    The original objection to virtualising was that
+                    scroll-offset-to-page mapping would depend on realisation
+                    order. It does not: PageAt reads _layout.TopOf(i) and the
+                    slot's own height, both of which are known for every page
+                    the moment the layout is built, whether or not a container
+                    for it exists. Nothing in the code-behind looks a page card
+                    up by container either.
+                -->
+                <ItemsRepeater ItemsSource="{x:Bind ViewModel.PageSlots}" HorizontalAlignment="Center">
+                    <ItemsRepeater.Layout>
+                        <StackLayout Orientation="Vertical" Spacing="16" />
+                    </ItemsRepeater.Layout>
+                    <ItemsRepeater.ItemTemplate>
                         <DataTemplate x:DataType="viewmodels:PageSlot">
                             <!-- The page card: white sheet, thin border, drop shadow. -->
                             <Border Width="{x:Bind SlotWidth}" Height="{x:Bind SlotHeight}"
@@ -565,8 +577,8 @@
                                 </Grid>
                             </Border>
                         </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                    </ItemsRepeater.ItemTemplate>
+                </ItemsRepeater>
 
                 <!--
                     Ink layer, spanning the WHOLE stack rather than sitting
