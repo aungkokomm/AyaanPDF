@@ -2010,6 +2010,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public string PagePositionLabel =>
         PageCount > 0 ? $"{CurrentPageIndex + 1} / {PageCount}" : string.Empty;
 
+    /// <summary>
+    /// The "/ 20" half of the readout. The current page is no longer text: it
+    /// is an editable box the user can type a page number into, so only the
+    /// total is still a label.
+    /// </summary>
+    public string PageCountSuffix => PageCount > 0 ? $"/ {PageCount}" : string.Empty;
+
     /// <summary>Shown only when nothing is open, so the canvas is never a blank void.</summary>
     public Visibility EmptyStateVisibility =>
         PageCount == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -2023,6 +2030,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     partial void OnPageCountChanged(int value)
     {
         OnPropertyChanged(nameof(PagePositionLabel));
+        OnPropertyChanged(nameof(PageCountSuffix));
         OnPropertyChanged(nameof(EmptyStateVisibility));
         OnPropertyChanged(nameof(TextAvailabilityLabel));
     }

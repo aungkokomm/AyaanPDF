@@ -1676,27 +1676,10 @@
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="Pages" VerticalAlignment="Center"
                                Style="{StaticResource BodyStrongTextBlockStyle}" />
-                    <!--
-                        Type a page number and press Enter. Navigation was
-                        Home/End/PageUp/PageDown and clicking thumbnails, which
-                        is unusable in a document of any length.
-                    -->
-                    <StackPanel Grid.Column="2" Orientation="Horizontal"
-                                Spacing="4" VerticalAlignment="Center">
-                        <TextBox x:Name="PageJumpBox" Width="48" Height="28"
-                                 Padding="6,2,6,2" TextAlignment="Center"
-                                 InputScope="Number"
-                                 KeyDown="PageJumpBox_KeyDown"
-                                 LostFocus="PageJumpBox_LostFocus"
-                                 ToolTipService.ToolTip="Go to page" />
-                        <TextBlock Text="/" VerticalAlignment="Center"
-                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                   Style="{StaticResource CaptionTextBlockStyle}" />
-                        <TextBlock VerticalAlignment="Center"
-                                   Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
-                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                   Style="{StaticResource CaptionTextBlockStyle}" />
-                    </StackPanel>
+                    <TextBlock Grid.Column="2" VerticalAlignment="Center"
+                               Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
                 </Grid>
 
                 <ListView
@@ -1858,9 +1841,25 @@
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="18" Padding="6,3">
             <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                <TextBlock Text="{x:Bind ViewModel.PagePositionLabel, Mode=OneWay}"
-                           VerticalAlignment="Center" Margin="10,0,6,0"
-                           Style="{StaticResource CaptionTextBlockStyle}" />
+                <!--
+                    The page readout is editable: type a number, press Enter.
+                    It lives HERE, in the always-visible status bar, and not in
+                    the thumbnail panel header where it was first put: that
+                    panel is Collapsed by default, so the box was invisible
+                    until someone opened the panel.
+                -->
+                <StackPanel Orientation="Horizontal" Spacing="4"
+                            VerticalAlignment="Center" Margin="10,0,6,0">
+                    <TextBox x:Name="PageJumpBox" Width="44" Height="26"
+                             Padding="4,1,4,1" TextAlignment="Center"
+                             FontSize="12" InputScope="Number"
+                             KeyDown="PageJumpBox_KeyDown"
+                             LostFocus="PageJumpBox_LostFocus"
+                             ToolTipService.ToolTip="Go to page" />
+                    <TextBlock VerticalAlignment="Center"
+                               Text="{x:Bind ViewModel.PageCountSuffix, Mode=OneWay}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                </StackPanel>
                 <!-- Says why text selection is unavailable, instead of the
                      tool silently doing nothing on a scanned page. -->
                 <TextBlock Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
