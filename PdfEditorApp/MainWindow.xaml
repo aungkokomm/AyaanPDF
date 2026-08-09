@@ -35,10 +35,16 @@
         </Grid>
 
         <!--
-            The Frame hosts pages for your application content. Add your UI to
-            MainPage.xaml rather than here so you can use Page features such as
-            navigation events and the Loaded lifecycle.
+            One tab per open document. Each tab's content is its own MainPage,
+            and a MainPage owns a ViewportViewModel, so a document's handle,
+            path, page slots, selection, history and groups are already
+            per-page: tabs needed no change to the view model at all.
         -->
-        <Frame x:Name="RootFrame" Grid.Row="1" />
+        <TabView x:Name="Tabs" Grid.Row="1"
+                 TabWidthMode="SizeToContent"
+                 IsAddTabButtonVisible="True"
+                 AddTabButtonClick="Tabs_AddTabButtonClick"
+                 TabCloseRequested="Tabs_TabCloseRequested"
+                 SelectionChanged="Tabs_SelectionChanged" />
     </Grid>
 </Window>

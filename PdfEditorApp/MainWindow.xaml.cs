@@ -1,4 +1,7 @@
+using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 
 // To learn more about WinUI, the WinUI project structure,
 // and more about our project templates, see: http://aka.ms/winui-project-info.
@@ -26,8 +29,93 @@ public sealed partial class MainWindow : Window
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AppWindow.Closing += OnClosing;
 
-        // Navigate the root frame to the main page on startup.
-        RootFrame.Navigate(typeof(MainPage));
+        AddDocumentTab(null);
+    }
+
+    /// <summary>The document the user is looking at, or null before the first tab exists.</summary>
+    public MainPage? ActivePage => (Tabs.SelectedItem as TabViewItem)?.Content as MainPage;
+
+    /// <summary>
+    /// Opens a document in a new tab, or a blank one when the path is null.
+    ///
+    /// The page is created here rather than navigated to, because a Page hosted
+    /// in a Frame gets recycled by navigation and each tab needs its own live
+    /// instance for as long as its tab exists.
+    /// </summary>
+    public MainPage AddDocumentTab(string? path)
+    {
+        var page = new MainPage { InitialDocumentPath = path };
+        var item = new TabViewItem
+        {
+            Content = page,
+            Header = System.IO.Path.GetFileName(path) ?? "Untitled",
+            IconSource = new SymbolIconSource { Symbol = Symbol.Document },
+        };
+
+        // The page tells us its title; we decide where it belongs. A background
+        // document must be able to retitle its own tab without touching the
+        // window.
+        page.DocumentTitleChanged += p =>
+        {
+            item.Header = p.DocumentTitle;
+            if (ReferenceEquals(ActivePage, p))
+            {
+                SetDocumentTitle(p.DocumentTitle);
+            }
+        };
+
+        Tabs.TabItems.Add(item);
+        Tabs.SelectedItem = item;
+        return page;
+    }
+
+    /// <summary>Closes a document's tab, offering to save it first.</summary>
+    public async Task CloseDocumentTab(MainPage page)
+    {
+        var item = Tabs.TabItems
+            .OfType<TabViewItem>()
+            .FirstOrDefault(t => ReferenceEquals(t.Content, page));
+        if (item is not null)
+        {
+            await CloseTab(item);
+        }
+    }
+
+    private async Task CloseTab(TabViewItem item)
+    {
+        if (item.Content is MainPage page && !await page.ConfirmCloseAsync())
+        {
+            return;
+        }
+
+        Tabs.TabItems.Remove(item);
+
+        // Never leave an empty window: closing the last document lands on a
+        // blank page, the same state the app starts in, rather than a grey void
+        // with a menu bar over it.
+        if (Tabs.TabItems.Count == 0)
+        {
+            AddDocumentTab(null);
+        }
+    }
+
+    private void Tabs_AddTabButtonClick(TabView sender, object args) => AddDocumentTab(null);
+
+    private async void Tabs_TabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
+    {
+        if (args.Tab is TabViewItem item)
+        {
+            await CloseTab(item);
+        }
+    }
+
+    private void Tabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        // The window's title follows whichever document is in front.
+        if (ActivePage is { } page)
+        {
+            SetDocumentTitle(page.DocumentTitle);
+        }
     }
 
     /// <summary>
@@ -53,17 +141,33 @@ public sealed partial class MainWindow : Window
         Microsoft.UI.Windowing.AppWindow sender,
         Microsoft.UI.Windowing.AppWindowClosingEventArgs args)
     {
-        if (_closeConfirmed || RootFrame.Content is not MainPage page)
+        if (_closeConfirmed)
         {
             return;
         }
 
         args.Cancel = true;
 
-        if (await page.ConfirmCloseAsync())
+        // EVERY tab, not just the one in front. Asking only about the visible
+        // document is how closing the window quietly threw away edits in the
+        // ones behind it. Selecting each tab first means the prompt appears
+        // over the document it is asking about, rather than over an unrelated
+        // page.
+        foreach (var item in Tabs.TabItems.OfType<TabViewItem>().ToList())
         {
-            _closeConfirmed = true;
-            Close();
+            if (item.Content is not MainPage page)
+            {
+                continue;
+            }
+
+            Tabs.SelectedItem = item;
+            if (!await page.ConfirmCloseAsync())
+            {
+                return;
+            }
         }
+
+        _closeConfirmed = true;
+        Close();
     }
 }

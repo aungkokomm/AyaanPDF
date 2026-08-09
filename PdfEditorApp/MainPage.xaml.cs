@@ -114,7 +114,14 @@ public sealed partial class MainPage : Page
         Loaded += async (_, _) =>
         {
             string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
-            if (probe.Length > 0 && System.IO.File.Exists(probe))
+            if (InitialDocumentPath is { } wanted && System.IO.File.Exists(wanted))
+            {
+                // A tab opened for a specific file. Set before this page is
+                // shown, because a Page has no constructor the window can pass
+                // arguments to.
+                ViewModel.OpenDocument(wanted);
+            }
+            else if (probe.Length > 0 && System.IO.File.Exists(probe))
             {
                 ViewModel.OpenDocument(probe);
             }
@@ -2856,10 +2863,11 @@ public sealed partial class MainPage : Page
     /// <summary>
     /// A blank document, after offering to save whatever is open.
     /// </summary>
-    private async void New_Click(object sender, RoutedEventArgs e)
+    private void New_Click(object sender, RoutedEventArgs e)
     {
-        if (!await ConfirmCloseAsync()) { return; }
-        ViewModel.OpenBlankDocument();
+        // A new TAB, not a replacement. Nothing is discarded, so there is
+        // nothing to prompt about.
+        if (App.Window is MainWindow w) { w.AddDocumentTab(null); }
     }
 
     /// <summary>
@@ -2868,18 +2876,11 @@ public sealed partial class MainPage : Page
     /// </summary>
     private async void CloseDocument_Click(object sender, RoutedEventArgs e)
     {
-        if (!await ConfirmCloseAsync()) { return; }
-        ViewModel.OpenBlankDocument();
+        if (App.Window is MainWindow w) { await w.CloseDocumentTab(this); }
     }
 
     private async void OpenFile_Click(object sender, RoutedEventArgs e)
     {
-        // Opening REPLACES the open document, so it has to offer to save first.
-        // Without this, File>Open on a document with unsaved marks discarded
-        // them silently, which is the same loss the window close prompt exists
-        // to prevent.
-        if (!await ConfirmCloseAsync()) { return; }
-
         var picker = new Windows.Storage.Pickers.FileOpenPicker();
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
@@ -2891,22 +2892,44 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        ViewModel.OpenDocument(file.Path);
+        // Opens in its own TAB, so the document you were working on is still
+        // there. Before tabs this replaced it, and originally did so without
+        // even offering to save.
+        //
+        // The exception is an untouched blank page: opening a file from a
+        // freshly started app should use the tab that is already there rather
+        // than leave an empty one behind.
+        if (App.Window is MainWindow w && (ViewModel.HasDocumentPath || ViewModel.IsDirty))
+        {
+            w.AddDocumentTab(file.Path);
+        }
+        else
+        {
+            ViewModel.OpenDocument(file.Path);
+        }
         Debug.WriteLine($"[MainPage] Opened \"{file.Path}\"");
     }
 
     /// <summary>
-    /// Copies the view model's title onto the window. The title bar belongs to
-    /// the Window and the document to this page, with a Frame in between and no
-    /// binding path across it.
+    /// The file this page should open once it loads, set by the window when it
+    /// creates a tab for a specific document. Null means a blank page.
     /// </summary>
-    private void PushWindowTitle()
-    {
-        if (App.Window is MainWindow w)
-        {
-            w.SetDocumentTitle(ViewModel.WindowTitle);
-        }
-    }
+    public string? InitialDocumentPath { get; set; }
+
+    /// <summary>
+    /// Raised whenever this document's title changes, so the window can retitle
+    /// the tab and, if this is the active one, the window itself.
+    ///
+    /// An event rather than the page reaching for the window: with tabs there
+    /// are several pages and only one is showing, so a page that wrote straight
+    /// to the title bar would let a background document rename the window.
+    /// </summary>
+    public event Action<MainPage>? DocumentTitleChanged;
+
+    /// <summary>Title for the tab and the window, unsaved marker included.</summary>
+    public string DocumentTitle => ViewModel.WindowTitle;
+
+    private void PushWindowTitle() => DocumentTitleChanged?.Invoke(this);
 
     private Printing.DocumentPrinter? _printer;
 
