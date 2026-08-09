@@ -881,6 +881,7 @@
                                 <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
                                 <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
                             </MenuFlyoutSubItem>
+                            <MenuFlyoutSubItem x:Name="SignatureMenu" Text="Signature" />
                             <MenuFlyoutSubItem Text="Arrange">
                                 <MenuFlyoutItem Text="Group" Click="Group_Click">
                                     <MenuFlyoutItem.KeyboardAccelerators>

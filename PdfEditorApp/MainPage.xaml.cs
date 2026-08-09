@@ -119,6 +119,7 @@ public sealed partial class MainPage : Page
             UpdateCursor();
             PushWindowTitle();
             RefreshRecentMenu();
+            RefreshSignatureMenu();
             SyncPageJumpBox();
         };
 
@@ -3005,6 +3006,112 @@ public sealed partial class MainPage : Page
         }
     }
 
+    // ---------------- Signatures ----------------
+
+    /// <summary>
+    /// Set when a signature has been picked and is waiting for a click to say
+    /// where it goes. Deliberately not a ToolMode: it survives one click and
+    /// then clears, so making it a tool would leave the rail showing a mode
+    /// that no longer exists.
+    /// </summary>
+    private SignatureShape? _pendingSignature;
+
+    /// <summary>Placed width, as a fraction of the page. About a signature's worth of a form line.</summary>
+    private const double SignaturePlaceWidth = 0.28;
+
+    private void RefreshSignatureMenu()
+    {
+        SignatureMenu.Items.Clear();
+
+        var save = new MenuFlyoutItem { Text = "Save selection as signature..." };
+        save.Click += async (_, _) => await SaveSelectionAsSignatureAsync();
+        SignatureMenu.Items.Add(save);
+
+        var saved = SignatureLibrary.Load();
+        if (saved.Count == 0)
+        {
+            // Says how to get one rather than showing an empty list.
+            SignatureMenu.Items.Add(new MenuFlyoutSeparator());
+            SignatureMenu.Items.Add(new MenuFlyoutItem
+            {
+                Text = "Draw one with the pen, select it, then save",
+                IsEnabled = false,
+            });
+            return;
+        }
+
+        SignatureMenu.Items.Add(new MenuFlyoutSeparator());
+        foreach (var signature in saved)
+        {
+            var place = new MenuFlyoutItem { Text = signature.Name };
+            ToolTipService.SetToolTip(place, "Click on the page to place it");
+            place.Click += (_, _) =>
+            {
+                _pendingSignature = signature;
+                ViewModel.Status = $"Click where {signature.Name} should go.";
+            };
+            SignatureMenu.Items.Add(place);
+        }
+
+        SignatureMenu.Items.Add(new MenuFlyoutSeparator());
+        var manage = new MenuFlyoutItem { Text = "Open signatures folder" };
+        manage.Click += (_, _) =>
+        {
+            System.IO.Directory.CreateDirectory(SignatureLibrary.FolderPath);
+            Process.Start(new ProcessStartInfo(SignatureLibrary.FolderPath) { UseShellExecute = true });
+        };
+        SignatureMenu.Items.Add(manage);
+    }
+
+    private async Task SaveSelectionAsSignatureAsync()
+    {
+        if (ViewModel.SelectionCount == 0)
+        {
+            ViewModel.Status = "Draw your signature with the pen, select it, then save it.";
+            return;
+        }
+
+        var box = new TextBox { PlaceholderText = "My signature", Width = 260 };
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Save signature",
+            Content = box,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        string name = string.IsNullOrWhiteSpace(box.Text) ? "Signature" : box.Text.Trim();
+        if (ViewModel.CaptureSelectionAsSignature(name) is { } signature
+            && SignatureLibrary.Save(signature))
+        {
+            ViewModel.Status = $"Saved {name}.";
+            RefreshSignatureMenu();
+        }
+    }
+
+    /// <summary>
+    /// Places the waiting signature, if there is one. Returns true when the
+    /// click was consumed, so the caller does not also treat it as a tool
+    /// gesture.
+    /// </summary>
+    private bool TryPlacePendingSignature(int pageIndex, double normX, double normY)
+    {
+        if (_pendingSignature is not { } signature)
+        {
+            return false;
+        }
+
+        _pendingSignature = null;
+        return ViewModel.PlaceSignature(signature, pageIndex, normX, normY, SignaturePlaceWidth);
+    }
+
     // ---------------- Recent files ----------------
 
     /// <summary>
@@ -4173,6 +4280,17 @@ public sealed partial class MainPage : Page
         // live in.
         double nx = content.X / ViewModel.OverlayScale;
         double ny = content.Y / ViewModel.OverlayScale;
+
+        // A waiting signature takes the click before any tool sees it, whatever
+        // tool is armed: the user picked it from a menu and is now pointing at
+        // where it goes, so the pen or the select tool acting instead would be
+        // the wrong answer to a question they already asked.
+        if (TryPlacePendingSignature(content.Page, nx, ny))
+        {
+            UpdateObjectToolbar();
+            e.Handled = true;
+            return;
+        }
 
         Diag.Log($"press tool={ViewModel.ActiveTool} raw=({e.GetCurrentPoint(ViewportHost).Position.X:F0},{e.GetCurrentPoint(ViewportHost).Position.Y:F0}) " +
                  $"page={content.Page} local=({content.X:F1},{content.Y:F1}) norm=({nx:F3},{ny:F3})");

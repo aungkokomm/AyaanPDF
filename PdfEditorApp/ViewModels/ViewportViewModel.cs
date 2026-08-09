@@ -7042,6 +7042,137 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return RenderStatus.OkPdfium;
     }
 
+    /// <summary>
+    /// Turns the selected drawing into a reusable signature.
+    ///
+    /// Capture is "select what you drew", not a signing dialog of its own: you
+    /// sign on a real page with the real pen, at whatever zoom suits, with undo
+    /// and a second attempt available. Anything selected that is not ink is
+    /// ignored rather than refused, so a stray shape in the marquee does not
+    /// lose the signature.
+    /// </summary>
+    public SignatureShape? CaptureSelectionAsSignature(string name)
+    {
+        var strokes = new List<(string ColorHex, double WidthNorm, IReadOnlyList<(double X, double Y)> Points)>();
+
+        foreach (var sel in SelectedLoadedAnnotations())
+        {
+            if (InkTag.TryParse(ReadAnnotationContents(sel.PageIndex, sel.Index),
+                                out string color, out double width, out var control))
+            {
+                strokes.Add((color, width, control));
+            }
+        }
+
+        if (strokes.Count == 0)
+        {
+            Status = "Select a drawing first, then save it as a signature.";
+            return null;
+        }
+
+        var shape = SignatureShape.FromDrawn(name, strokes);
+        Diag.Log($"signature '{name}' captured: {strokes.Count} strokes, aspect {shape.AspectRatio:F2}");
+        return shape;
+    }
+
+    /// <summary>The anchor and every extra, in one list.</summary>
+    private IEnumerable<LoadedSelection> SelectedLoadedAnnotations()
+    {
+        if (_selectedLoaded is LoadedSelection anchor) { yield return anchor; }
+        foreach (var extra in _extraSelected) { yield return extra; }
+    }
+
+    /// <summary>
+    /// Drops a signature onto a page, centred on a point.
+    ///
+    /// Written as ordinary ink and then grouped, so it behaves as one object
+    /// afterwards: drag it, resize it, delete it, undo it. That only works
+    /// because drawings became real annotations first; before that a placed
+    /// signature would have been invisible to selection.
+    /// </summary>
+    public bool PlaceSignature(SignatureShape signature, int pageIndex, double normX, double normY, double width)
+    {
+        if (_documentHandle == 0 || signature.Strokes.Count == 0)
+        {
+            return false;
+        }
+
+        const int CaptureWidth = 1000;
+        var (l, t, r, b) = signature.BoxAt(normX, normY, width);
+        var placed = signature.PlaceInto(l, t, r, b);
+
+        BeginEdit("Place signature");
+        var madeIds = new List<Guid>();
+
+        foreach (var stroke in placed)
+        {
+            if (!AddInkFromControl(pageIndex, CaptureWidth, stroke.ColorHex, stroke.WidthNorm, stroke.Points, out int index))
+            {
+                continue;
+            }
+
+            WriteInkTag(pageIndex, index, stroke.ColorHex, stroke.WidthNorm, stroke.Points);
+
+            // Read the id back rather than inventing one: AnnotationLoader
+            // stamps ids on load, and an id invented here and not written would
+            // be a different value the moment the page reloaded.
+            var loaded = LoadedFor(pageIndex);
+            var made = loaded.FirstOrDefault(a => a.Index == index);
+            if (made.Id != Guid.Empty)
+            {
+                madeIds.Add(made.Id);
+                if (ReadAnnotationState(pageIndex, index) is (string tag, EditRect rect))
+                {
+                    RecordEdit(new ExistenceRecord(made.Id, pageIndex, tag, rect, ExistsAfter: true, Recoverable: true));
+                }
+            }
+        }
+
+        if (madeIds.Count == 0)
+        {
+            AbandonEdit();
+            Status = "Could not place the signature.";
+            return false;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(pageIndex);
+        SelectByIds(pageIndex, madeIds);
+
+        // One object, not a scattering of strokes.
+        if (madeIds.Count > 1)
+        {
+            GroupSelected();
+        }
+
+        CommitEdit();
+        Status = $"Placed {signature.Name}.";
+        return true;
+    }
+
+    /// <summary>Selects exactly the given marks on a page, anchor first.</summary>
+    private void SelectByIds(int pageIndex, IReadOnlyList<Guid> ids)
+    {
+        _extraSelected.Clear();
+        _selectedLoaded = null;
+
+        var loaded = LoadedFor(pageIndex);
+        foreach (var id in ids)
+        {
+            int i = loaded.FindIndex(a => a.Id == id);
+            if (i < 0) { continue; }
+
+            var a = loaded[i];
+            var sel = new LoadedSelection(pageIndex, a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id);
+            if (_selectedLoaded is null) { _selectedLoaded = sel; }
+            else { _extraSelected.Add(sel); }
+        }
+
+        RefreshSelectionOutline();
+        OnPropertyChanged(nameof(HasSelectedAnnotation));
+        OnPropertyChanged(nameof(HasMultiSelection));
+    }
+
     /// <summary>Stamps a stroke's description onto the annotation at an index.</summary>
     private void WriteInkTag(
         int page, int index, string colorHex, double width, IReadOnlyList<(double X, double Y)> control)
