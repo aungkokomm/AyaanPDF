@@ -953,13 +953,21 @@ fn get_page_sizes_inner(doc_handle: u64) -> PageSizeArray {
     let count = pages.len();
     let mut out: Vec<PageSize> = Vec::with_capacity(count as usize);
     for i in 0..count {
-        match pages.get(i) {
-            Ok(page) => out.push(PageSize {
-                width: page.width().value,
-                height: page.height().value,
+        // page_size(), NOT get(). get() LOADS the page: it parses the content
+        // streams, builds the object list, and is then thrown away because all
+        // we wanted was two floats. page_size() reads them out of the page
+        // dictionary via FPDF_GetPageSizeByIndexF without loading anything.
+        //
+        // Measured on a real 3352-page book: 37.8 SECONDS the old way, on the
+        // UI thread, before a single page could be drawn. That was the whole of
+        // "the app stops responding when I open a big PDF".
+        match pages.page_size(i) {
+            Ok(rect) => out.push(PageSize {
+                width: rect.width().value,
+                height: rect.height().value,
             }),
             // Keep the array index-aligned with page indices even if one page
-            // fails to load; a zero size is a slot the caller can skip.
+            // fails; a zero size is a slot the caller can skip.
             Err(_) => out.push(PageSize { width: 0.0, height: 0.0 }),
         }
     }
