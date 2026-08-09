@@ -166,7 +166,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public ObservableCollection<ShapeAnnotation> Shapes { get; } = new();
 
     /// <summary>The stroke currently being drawn (Draw tool, drag in progress), or null between strokes.</summary>
-    public IReadOnlyList<(double X, double Y)>? CurrentStrokeInProgress => _currentStroke;
+    /// <summary>
+    /// The stroke being drawn, smoothed, as the preview should show it.
+    ///
+    /// Smoothed HERE rather than only when the pen lifts. Both this and
+    /// EndInkStroke run the same pure function over the same raw samples, so
+    /// they cannot disagree and the stroke cannot change shape at the moment
+    /// of release. Smoothing only on commit is the split-path failure that
+    /// made a rounded rectangle snap square when the pointer came up.
+    /// </summary>
+    public IReadOnlyList<(double X, double Y)>? CurrentStrokeInProgress =>
+        _currentStroke is null ? null : StrokeSmoothing.Smooth(_currentStroke);
 
     /// <summary>
     /// Every ink stroke on every page. The ink canvas draws from THIS, not the
@@ -4080,6 +4090,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
         }
 
+        // A stroke takes the same route as a shape, and for the same reason:
+        // its tag describes it completely, so it can be re-drawn into any
+        // rectangle. Without this it fell through to resize_annotation, which
+        // answers Unsupported for ink, and a drawing could not be resized at
+        // all. Move works here too, so a drawing stops being the one mark that
+        // has to be deleted and drawn again to be adjusted.
+        if (status != RenderStatus.OkPdfium
+            && InkTag.TryParse(ReadAnnotationContents(now.PageIndex, now.Index),
+                               out string inkColor, out double inkWidth, out var inkControl))
+        {
+            status = RebuildInkAt(
+                now.PageIndex, now.Index, CaptureWidth, inkColor, inkWidth, inkControl,
+                now.Left, now.Top, now.Right, now.Bottom, now.Id, out newIndex);
+        }
+
         if (status != RenderStatus.OkPdfium)
         {
             status = RenderCoreNative.resize_annotation(
@@ -6621,24 +6646,176 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial string? ShapeFillHex { get; set; }
 
+    /// <summary>
+    /// Commits the stroke as a real /Ink annotation, the way EndShape commits a
+    /// shape.
+    ///
+    /// Ink was the last mark still living two lives: it sat in an overlay list
+    /// and only became an annotation on save. That is exactly the state shapes
+    /// were rescued from, and it has the same consequence, that the selection
+    /// code never sees the object, so a drawing could not be picked, moved,
+    /// grouped, reordered or given handles. Writing at pen-up gives it one
+    /// life, and identity, selection and undo all follow from being a real
+    /// annotation rather than being built separately for ink.
+    /// </summary>
     public void EndInkStroke()
     {
-        if (_currentStroke is { Count: > 1 })
+        var raw = _currentStroke;
+        _currentStroke = null;
+
+        // The control points, not the fitted curve. The curve goes into the
+        // PDF's /InkList to be drawn; these go into the tag, so the stroke can
+        // be rebuilt by undo and re-drawn at a new size by a resize.
+        var control = raw is null ? new List<(double X, double Y)>() : StrokeSmoothing.Thin(raw);
+        if (control.Count < 2 || _documentHandle == 0)
         {
-            PushHistory(HistoryScope.Annotations, "Draw");
-            var stroke = new InkStrokeAnnotation(
-                _inkPageIndex,
-                new List<(double X, double Y)>(_currentStroke),
-                InkColorHex,
-                InkWidth);
-            _allInkStrokes.Add(stroke);
-            InkStrokes.Add(stroke);
-            SlotFor(stroke.PageIndex)?.InkStrokes.Add(stroke);
-            IsDirty = true;
+            InkStrokeChanged?.Invoke();
+            return;
         }
 
-        _currentStroke = null;
+        const int CaptureWidth = 1000;
+
+        BeginEdit("Draw");
+        if (!AddInkFromControl(_inkPageIndex, CaptureWidth, InkColorHex, InkWidth, control, out int index))
+        {
+            AbandonEdit();
+            InkStrokeChanged?.Invoke();
+            return;
+        }
+
+        // The tag is written after the add, because add_ink_annotations writes
+        // the geometry and nothing else.
+        WriteInkTag(_inkPageIndex, index, InkColorHex, InkWidth, control);
+
+        IsDirty = true;
+        InvalidateLoadedPage(_inkPageIndex);
+        SelectNewestAnnotation(_inkPageIndex);
+
+        if (_selectedLoaded is LoadedSelection made
+            && ReadAnnotationState(made.PageIndex, made.Index) is (string tag, EditRect rect))
+        {
+            // Recoverable, because the tag now describes the whole stroke.
+            // Undo deletes it and redo re-draws it, with no document copy for
+            // what is one of the commonest edits there is.
+            RecordEdit(new ExistenceRecord(
+                made.Id, made.PageIndex, tag, rect, ExistsAfter: true, Recoverable: true));
+        }
+
+        CommitEdit();
         InkStrokeChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Fits the control points and writes the curve as an /Ink annotation,
+    /// reporting the index it landed at.
+    ///
+    /// The one place ink geometry crosses the FFI, so a caller cannot forget to
+    /// fit first and write the bare control points, which would put a visibly
+    /// angular stroke in the document next to a smooth preview.
+    /// </summary>
+    private bool AddInkFromControl(
+        int page, int captureWidth, string colorHex, double width,
+        IReadOnlyList<(double X, double Y)> control, out int index)
+    {
+        index = -1;
+        var curve = StrokeSmoothing.Fit(control);
+        if (curve.Count < 2 || _documentHandle == 0)
+        {
+            return false;
+        }
+
+        var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
+        var spec = new BurnStroke
+        {
+            PageIndex = page,
+            PointOffset = 0,
+            PointCount = (uint)curve.Count,
+            WidthPx = (float)(width * captureWidth),
+            R = r, G = g, B = b, A = a,
+        };
+        var points = new BurnPoint[curve.Count];
+        for (int i = 0; i < curve.Count; i++)
+        {
+            points[i] = new BurnPoint
+            {
+                X = (float)(curve[i].X * captureWidth),
+                Y = (float)(curve[i].Y * captureWidth),
+            };
+        }
+
+        int status = RenderCoreNative.add_ink_annotations(
+            _documentHandle, captureWidth, new[] { spec }, 1, points, (nuint)points.Length);
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"AddInkFromControl p{page} -> {status}");
+            return false;
+        }
+
+        // Cache only, not a repaint: the caller is mid-command and will redraw
+        // once at the end. Appending is the only ordering primitive, so the new
+        // annotation is the last one.
+        InvalidateAnnotationCache(page);
+        var all = LoadedFor(page);
+        index = all.Count > 0 ? all[^1].Index : -1;
+        return index >= 0;
+    }
+
+    /// <summary>
+    /// Re-draws a stroke into a new rectangle, keeping its identity.
+    ///
+    /// Delete then re-add, because PDFium cannot edit an annotation's geometry
+    /// in place; that is the same churn every other edit in this app pays, and
+    /// the reason the Id is stamped back afterwards.
+    /// </summary>
+    private int RebuildInkAt(
+        int page, int index, int captureWidth, string colorHex, double width,
+        IReadOnlyList<(double X, double Y)> control,
+        double left, double top, double right, double bottom, Guid id, out int newIndex)
+    {
+        newIndex = index;
+        var scaled = InkTag.ScaleTo(control, left, top, right, bottom);
+
+        if (RenderCoreNative.delete_annotation(_documentHandle, page, index) != RenderStatus.OkPdfium)
+        {
+            return RenderStatus.Unsupported;
+        }
+        InvalidateAnnotationCache(page);
+
+        if (!AddInkFromControl(page, captureWidth, colorHex, width, scaled, out int added))
+        {
+            return RenderStatus.Unsupported;
+        }
+
+        // Description first, then identity: WriteId reads the tag body and puts
+        // the ID in front of it, so stamping the Id before the body would have
+        // the body overwrite it.
+        WriteInkTag(page, added, colorHex, width, scaled);
+        if (id != Guid.Empty)
+        {
+            Interop.AnnotationLoader.WriteId(_documentHandle, page, added, id);
+        }
+        InvalidateAnnotationCache(page);
+
+        newIndex = added;
+        return RenderStatus.OkPdfium;
+    }
+
+    /// <summary>Stamps a stroke's description onto the annotation at an index.</summary>
+    private void WriteInkTag(
+        int page, int index, string colorHex, double width, IReadOnlyList<(double X, double Y)> control)
+    {
+        // AARRGGBB, alpha FIRST, because that is the order ParseHex reads an
+        // eight-character colour back in. Writing RRGGBBAA here round-trips a
+        // stroke with its red and alpha swapped.
+        var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
+        string body = InkTag.Write($"{a:X2}{r:X2}{g:X2}{b:X2}", width, control);
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(body);
+        int status = RenderCoreNative.set_annotation_body(
+            _documentHandle, page, index, bytes, (nuint)bytes.Length);
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"WriteInkTag p{page}#{index} FAILED status={status}");
+        }
     }
 
     /// <summary>
@@ -7397,6 +7574,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                        == RenderStatus.OkPdfium;
             }
         }
+        else if (InkTag.TryParse(tag, out string inkColor, out double inkWidth, out var control))
+        {
+            // Re-drawn at the RECT the record carries, not where it was first
+            // drawn, so undoing a move-then-delete puts the stroke back where
+            // it last was. Scaling to the rect is the same operation a resize
+            // performs, which is why both go through InkTag.ScaleTo.
+            made = AddInkFromControl(
+                page, Cap, inkColor, inkWidth,
+                InkTag.ScaleTo(control, rect.Left, rect.Top, rect.Right, rect.Bottom),
+                out int inkIndex);
+
+            // The tag has to be re-stamped: add_ink_annotations writes geometry
+            // only, so without this the rebuilt stroke would come back with no
+            // description and could never be undone or resized again.
+            if (made)
+            {
+                WriteInkTag(page, inkIndex, inkColor, inkWidth,
+                    InkTag.ScaleTo(control, rect.Left, rect.Top, rect.Right, rect.Bottom));
+            }
+        }
         else if (TextBoxTagReader.TryParse(tag, out var box))
         {
             var (rr, gg, bb, aa) = ParseHex(box.ColorHex, defaultAlpha: 0xFF);
@@ -7584,9 +7781,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         NotifyHistoryChanged();
     }
 
+    // Both log whether an entry came back. Without it a press that found
+    // nothing to undo and a press that never reached here look identical from
+    // the outside, and both read to the user as "undo is laggy".
     public void Undo()
     {
-        if (_history.Undo(Capture) is { } target)
+        var target = _history.Undo(Capture);
+        Diag.Log($"undo: {(target is null ? "NOTHING to undo" : "applying")} canUndo={_history.CanUndo} canRedo={_history.CanRedo}");
+        if (target is not null)
         {
             ApplyHistoryEntry(target, backwards: true);
         }
@@ -7594,7 +7796,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void Redo()
     {
-        if (_history.Redo(Capture) is { } target)
+        var target = _history.Redo(Capture);
+        Diag.Log($"redo: {(target is null ? "NOTHING to redo" : "applying")} canUndo={_history.CanUndo} canRedo={_history.CanRedo}");
+        if (target is not null)
         {
             ApplyHistoryEntry(target, backwards: false);
         }

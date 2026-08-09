@@ -3045,6 +3045,67 @@ fn set_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32, id_hex:
     STATUS_OK_PDFIUM
 }
 
+/// Replaces an annotation's tag BODY, keeping any ID prefix intact.
+///
+/// The complement of [`set_annotation_id`]: that one swaps the identity and
+/// keeps the description, this one swaps the description and keeps the
+/// identity. Ink needs it because a stroke's geometry belongs in its tag, the
+/// way a shape's does, but the points are only known to the caller after
+/// smoothing, so they cannot be written by the add call itself.
+///
+/// # Safety
+/// `body_utf8` must point to `body_len` valid UTF-8 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn set_annotation_body(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    body_utf8: *const u8,
+    body_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || body_utf8.is_null() {
+        return STATUS_INVALID_INPUT;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(body_utf8, body_len) };
+    let Ok(body) = std::str::from_utf8(bytes) else {
+        return STATUS_INVALID_INPUT;
+    };
+    let body_owned = body.to_owned();
+    panic::catch_unwind(|| set_annotation_body_inner(doc_handle, page_index, index, &body_owned))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn set_annotation_body_inner(doc_handle: u64, page_index: i32, index: i32, body: &str) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+    let annotations = page.annotations_mut();
+    let Some(mut annotation) = annotations.iter().nth(index as usize) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // Read the ID back out and put it in front again. Writing the body alone
+    // would drop the identity, and an annotation whose id changes under it is
+    // the bug class that broke grouping and z-order.
+    let existing = annotation_tag(&annotation).unwrap_or_default();
+    let new_tag = match strip_id_prefix(&existing).0 {
+        Some(id) => format!("{ID_PREFIX}{id}{ID_SEPARATOR}{body}"),
+        None => body.to_owned(),
+    };
+    if !set_annotation_tag(&mut annotation, &new_tag) {
+        return STATUS_INVALID_INPUT;
+    }
+    STATUS_OK_PDFIUM
+}
+
 /// `capture_width` is the render width the box and font size were captured at.
 /// `font_size_px` is in that same capture space. Lines are split on `\n`.
 ///

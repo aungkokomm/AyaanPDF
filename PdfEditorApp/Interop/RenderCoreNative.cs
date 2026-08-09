@@ -417,6 +417,17 @@ internal static partial class RenderCoreNative
     public static extern int set_annotation_id(ulong docHandle, int pageIndex, int index, [In] byte[] idHex, nuint idLen);
 
     /// <summary>
+    /// Replaces the tag BODY, preserving any ID prefix. The mirror of
+    /// <see cref="set_annotation_id"/>.
+    ///
+    /// Ink uses it: a stroke's geometry belongs in its tag the way a shape's
+    /// does, but the points are only known here, after smoothing, so the add
+    /// call cannot write them itself.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_annotation_body(ulong docHandle, int pageIndex, int index, [In] byte[] bodyUtf8, nuint bodyLen);
+
+    /// <summary>
     /// Rebuilds the document from a list of its own page indices: reorder,
     /// duplicate (repeat an index), delete (omit one) or extract (a subset).
     /// The handle is preserved. Pages keep their annotations.
