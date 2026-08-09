@@ -800,12 +800,13 @@
                                     <KeyboardAccelerator Modifiers="Control" Key="N" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
-                            <MenuFlyoutSubItem x:Name="RecentMenu" Text="Recent files" />
                             <MenuFlyoutItem Text="Open..." Click="OpenFile_Click">
                                 <MenuFlyoutItem.KeyboardAccelerators>
                                     <KeyboardAccelerator Modifiers="Control" Key="O" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
+                            <MenuFlyoutSubItem x:Name="RecentMenu" Text="Recent files" />
+                            <MenuFlyoutSeparator />
                             <!--
                                 The accelerators here have to match
                                 KeyboardCommands, not just look right in the
@@ -836,19 +837,12 @@
                                 cannot be undone by reopening the file.
                             -->
                             <MenuFlyoutItem Text="Flatten and save a copy..." Click="FlattenSaveAs_Click" />
-                            <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="Print..." Click="Print_Click">
                                 <MenuFlyoutItem.Icon>
                                     <FontIcon Glyph="&#xE749;" />
                                 </MenuFlyoutItem.Icon>
                                 <MenuFlyoutItem.KeyboardAccelerators>
                                     <KeyboardAccelerator Modifiers="Control" Key="P" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="Close document" Click="CloseDocument_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="W" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
@@ -869,34 +863,44 @@
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <MenuFlyoutSeparator />
-                            <MenuFlyoutSubItem Text="Insert pages">
-                                <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
-                                <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
+                            <!--
+                                Everything below is grouped by what it acts on.
+                                These are the entries that made the menu thirty
+                                rows long, and they are also the ones reached
+                                least often, so they cost a hover and save the
+                                list.
+                            -->
+                            <MenuFlyoutSubItem Text="Pages">
+                                <MenuFlyoutSubItem Text="Insert">
+                                    <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
+                                    <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
+                                </MenuFlyoutSubItem>
+                                <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
+                                <MenuFlyoutSeparator />
+                                <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
+                                <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
+                                <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
                             </MenuFlyoutSubItem>
-                            <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
-                            <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="Group" Click="Group_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="G" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="Ungroup" Click="Ungroup_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="G" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
-                            <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
-                            <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
-                            <MenuFlyoutSeparator />
-                            <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
-                                                  IsChecked="True" Click="RulersToggle_Click">
-                                <ToggleMenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="R" />
-                                </ToggleMenuFlyoutItem.KeyboardAccelerators>
-                            </ToggleMenuFlyoutItem>
-                            <MenuFlyoutSubItem Text="Ruler units">
+                            <MenuFlyoutSubItem Text="Arrange">
+                                <MenuFlyoutItem Text="Group" Click="Group_Click">
+                                    <MenuFlyoutItem.KeyboardAccelerators>
+                                        <KeyboardAccelerator Modifiers="Control" Key="G" />
+                                    </MenuFlyoutItem.KeyboardAccelerators>
+                                </MenuFlyoutItem>
+                                <MenuFlyoutItem Text="Ungroup" Click="Ungroup_Click">
+                                    <MenuFlyoutItem.KeyboardAccelerators>
+                                        <KeyboardAccelerator Modifiers="Control,Shift" Key="G" />
+                                    </MenuFlyoutItem.KeyboardAccelerators>
+                                </MenuFlyoutItem>
+                            </MenuFlyoutSubItem>
+                            <MenuFlyoutSubItem Text="View">
+                                <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
+                                                      IsChecked="True" Click="RulersToggle_Click">
+                                    <ToggleMenuFlyoutItem.KeyboardAccelerators>
+                                        <KeyboardAccelerator Modifiers="Control" Key="R" />
+                                    </ToggleMenuFlyoutItem.KeyboardAccelerators>
+                                </ToggleMenuFlyoutItem>
+                                <MenuFlyoutSubItem Text="Ruler units">
                                 <RadioMenuFlyoutItem x:Name="UnitInches" Text="Inches"
                                                      GroupName="RulerUnit" IsChecked="True"
                                                      Click="RulerUnit_Click" Tag="Inches" />
@@ -909,11 +913,17 @@
                                 <RadioMenuFlyoutItem x:Name="UnitPoints" Text="Points"
                                                      GroupName="RulerUnit"
                                                      Click="RulerUnit_Click" Tag="Points" />
-                                <RadioMenuFlyoutItem x:Name="UnitPicas" Text="Picas"
-                                                     GroupName="RulerUnit"
-                                                     Click="RulerUnit_Click" Tag="Picas" />
+                                    <RadioMenuFlyoutItem x:Name="UnitPicas" Text="Picas"
+                                                         GroupName="RulerUnit"
+                                                         Click="RulerUnit_Click" Tag="Picas" />
+                                </MenuFlyoutSubItem>
                             </MenuFlyoutSubItem>
                             <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Close document" Click="CloseDocument_Click">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="W" />
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
                             <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
                             <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
                         </MenuFlyout>
