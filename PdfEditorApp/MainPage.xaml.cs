@@ -102,6 +102,14 @@ public sealed partial class MainPage : Page
             {
                 SyncPageJumpBox();
             }
+
+            if (args.PropertyName is nameof(ViewModel.CanUndo)
+                or nameof(ViewModel.CanRedo)
+                or nameof(ViewModel.HasDocumentPath)
+                or nameof(ViewModel.IsDirty))
+            {
+                CommandStateChanged?.Invoke(this);
+            }
         };
         Loaded += (_, _) =>
         {
@@ -2936,6 +2944,26 @@ public sealed partial class MainPage : Page
 
     /// <summary>Title for the tab and the window, unsaved marker included.</summary>
     public string DocumentTitle => ViewModel.WindowTitle;
+
+    /// <summary>
+    /// Raised when a quick-action's availability changes, so the title bar can
+    /// grey its buttons for the document actually in front.
+    ///
+    /// Separate from DocumentTitleChanged because these move independently: a
+    /// first edit enables Undo without renaming anything.
+    /// </summary>
+    public event Action<MainPage>? CommandStateChanged;
+
+    public bool CanUndo => ViewModel.CanUndo;
+    public bool CanRedo => ViewModel.CanRedo;
+    public bool CanSave => ViewModel.HasDocumentPath || ViewModel.IsDirty;
+
+    // The title bar lives in the Window and these handlers live here, so the
+    // window calls in rather than duplicating any of it.
+    public void RunOpen() => OpenFile_Click(this, null!);
+    public void RunSave() => Save_Click(this, null!);
+    public void RunUndo() => ViewModel.Undo();
+    public void RunRedo() => ViewModel.Redo();
 
     private void PushWindowTitle() => DocumentTitleChanged?.Invoke(this);
 

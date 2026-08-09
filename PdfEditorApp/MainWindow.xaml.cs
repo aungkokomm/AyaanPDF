@@ -24,7 +24,11 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
 
         ExtendsContentIntoTitleBar = true;
-        SetTitleBar(AppTitleBar);
+        // Only the empty remainder, NOT the whole bar: whatever is handed to
+        // SetTitleBar becomes the drag region, and its children stop receiving
+        // clicks. Passing AppTitleBar here would leave the quick actions
+        // looking like buttons and behaving like a title bar.
+        SetTitleBar(TitleDragArea);
 
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AppWindow.Closing += OnClosing;
@@ -61,6 +65,16 @@ public sealed partial class MainWindow : Window
             if (ReferenceEquals(ActivePage, p))
             {
                 SetDocumentTitle(p.DocumentTitle);
+            }
+        };
+
+        // Only the front document drives the buttons; a background tab
+        // finishing an edit must not enable Undo for the one on screen.
+        page.CommandStateChanged += p =>
+        {
+            if (ReferenceEquals(ActivePage, p))
+            {
+                RefreshQuickActions();
             }
         };
 
@@ -116,6 +130,7 @@ public sealed partial class MainWindow : Window
         {
             SetDocumentTitle(page.DocumentTitle);
         }
+        RefreshQuickActions();
     }
 
     /// <summary>
@@ -126,10 +141,37 @@ public sealed partial class MainWindow : Window
     /// "Ayaan PDF" and there was no way to tell which of two open documents
     /// you were looking at, or that either had unsaved edits.
     /// </summary>
-    public void SetDocumentTitle(string title)
+    /// <summary>
+    /// The document's name goes to the WINDOW, which is what the taskbar and
+    /// Alt+Tab read. The strip itself keeps saying "Ayaan PDF": the tabs below
+    /// already name every open file, and repeating the active one above them
+    /// says nothing new.
+    /// </summary>
+    public void SetDocumentTitle(string title) => Title = title;
+
+    // ---------------- Quick actions ----------------
+
+    private void QuickOpen_Click(object sender, RoutedEventArgs e) => ActivePage?.RunOpen();
+
+    private void QuickSave_Click(object sender, RoutedEventArgs e) => ActivePage?.RunSave();
+
+    private void QuickUndo_Click(object sender, RoutedEventArgs e) => ActivePage?.RunUndo();
+
+    private void QuickRedo_Click(object sender, RoutedEventArgs e) => ActivePage?.RunRedo();
+
+    /// <summary>
+    /// Greys the quick actions for the document in FRONT.
+    ///
+    /// Called on tab switch as well as on the active page's own changes,
+    /// because switching tabs changes what the buttons act on without anything
+    /// about either document having changed.
+    /// </summary>
+    private void RefreshQuickActions()
     {
-        TitleText.Text = title;
-        Title = title;
+        var page = ActivePage;
+        QuickSave.IsEnabled = page?.CanSave ?? false;
+        QuickUndo.IsEnabled = page?.CanUndo ?? false;
+        QuickRedo.IsEnabled = page?.CanRedo ?? false;
     }
 
     /// <summary>
