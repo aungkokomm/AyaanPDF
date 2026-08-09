@@ -21,3 +21,7 @@ testrun/
 # The user's own stamp images, created beside the exe at runtime. Data, not
 # source, and never part of the installer payload either.
 Stamps/
+
+# Intermediate from rc.exe when rebuilding the cursor resource DLL. The DLL
+# itself IS checked in; this is just the step between.
+PdfEditorApp/Assets/Cursors/cursors.res

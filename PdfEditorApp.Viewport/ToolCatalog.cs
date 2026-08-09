@@ -55,9 +55,10 @@ public enum ToolOptions
 /// <param name="Glyph">Segoe MDL2 Assets code point.</param>
 /// <param name="Shortcut">Single key that selects this tool, uppercase.</param>
 /// <param name="PathData">
-/// Optional SVG path, in a 32x32 box, drawn instead of <paramref name="Glyph"/>.
-/// For the few tools where no icon-font glyph reads right; the rail falls back
-/// to the glyph when this is null.
+/// Optional SVG path drawn instead of <paramref name="Glyph"/>, for the few
+/// tools where no icon-font glyph reads right; the rail falls back to the glyph
+/// when this is null. The authoring box does not matter, since the rail scales
+/// the path to fit its own.
 /// </param>
 public sealed record ToolDefinition(
     ToolMode Mode,
@@ -83,7 +84,7 @@ public static class ToolCatalog
     /// </summary>
     public static IReadOnlyList<ToolDefinition> All { get; } =
     [
-        new(ToolMode.Hand, "Hand", "", 'H', ToolOptions.None),
+        new(ToolMode.Hand, "Hand", "", 'H', ToolOptions.None, HandIcon),
         new(ToolMode.Select, "Select", "", 'V', ToolOptions.None),
         new(ToolMode.Highlight, "Highlight", "", 'U', ToolOptions.Color),
         new(ToolMode.Draw, "Draw", "", 'D', ToolOptions.Color | ToolOptions.Width),
@@ -92,6 +93,27 @@ public static class ToolCatalog
         new(ToolMode.Note, "Note", "", 'N', ToolOptions.None),
         new(ToolMode.Stamp, "Stamp", "", 'S', ToolOptions.Stamp, StampIcon),
     ];
+
+    /// <summary>
+    /// The hand icon: an open palm, four fingers, thumb out to the left. Same
+    /// hand the pan CURSOR shows, from hand-paper.svg in the repo root.
+    ///
+    /// FILLED, not stroked, and it still reads as an outline: the second
+    /// subpath traces the inside of the hand and the default even-odd rule
+    /// cuts it out. That is why there is no "F1" prefix here, unlike the other
+    /// path icon - nonzero winding would fill the hole back in.
+    ///
+    /// Coordinates are the source file's 512 box; the rail scales to fit.
+    /// </summary>
+    private const string HandIcon =
+        "M386.6,130v-9.5c0-38.3-35.6-67.4-73-57.6c-22.5-43.5-82.7-41.7-103.7,0.7c-36.3-9.3-72.4,18.4-72.4,57.1" +
+        "v110.9c-17.5-6.5-38.1-4.5-54.6,7.8c-25.8,19.2-31.5,55.7-12.8,81.9l105.4,148c5.3,7.4,13.8,11.8,22.9,11.8" +
+        "h195.9c13.1,0,24.5-9,27.4-21.8l26.5-115.1c3-13.2,4.6-26.6,4.6-40.1V188.3C452.9,152.6,421.7,125.1,386.6,130" +
+        "z M410.7,304c0,10.3-1.2,20.6-3.5,30.7l-24,104.2H205.7L104.5,296.7c-12.7-17.8,13.2-37.6,25.8-19.9" +
+        "l23.8,33.5c7.9,11.1,25.5,5.5,25.5-8.2V120.6c0-22.5,32.1-21.8,32.1,0.6V256c0,7.8,6.3,14.1,14.1,14.1" +
+        "h6c7.8,0,14.1-6.3,14.1-14.1V89.9c0-22.6,32.1-21.8,32.1,0.6V256c0,7.8,6.3,14.1,14.1,14.1h6c7.8,0,14.1-6.3,14.1-14.1" +
+        "V119.9c0-22.6,32.1-21.8,32.1,0.6V256c0,7.8,6.3,14.1,14.1,14.1h6c7.8,0,14.1-6.3,14.1-14.1v-67.1" +
+        "c0-23.1,32.1-22.5,32.1-0.6L410.7,304L410.7,304z";
 
     /// <summary>
     /// The stamp icon, as an SVG path in a 32x32 box. A drawn rubber stamp,

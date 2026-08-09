@@ -11,6 +11,7 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Shapes;
+using PdfEditorApp.Controls;
 using PdfEditorApp.ViewModels;
 using PdfEditorApp.Viewport;
 using Windows.Foundation;
@@ -31,6 +32,9 @@ public sealed partial class MainPage : Page
     public ViewportViewModel ViewModel { get; } = new();
 
     private bool _isSpaceHandActive;
+
+    /// <summary>The enum the currently applied cursor was chosen from; see Apply.</summary>
+    private object? _appliedCursorKey;
     private bool _isCtrlDown;
     private bool _isSelectingText;
     private bool _isDrawing;
@@ -2665,6 +2669,11 @@ public sealed partial class MainPage : Page
         _isSelectingText = false;
         _isDrawing = false;
 
+        // The pan flag above drives which hand is showing, and capture can be
+        // lost without a release - a flyout opening, the window deactivating
+        // mid-drag. Without this the fist stays closed over a page that is no
+        // longer being dragged.
+        UpdateCursor();
         UpdateObjectToolbar();
     }
 
@@ -3693,8 +3702,11 @@ public sealed partial class MainPage : Page
     /// </summary>
     private InputSystemCursorShape? HoverCursor(PointerRoutedEventArgs e)
     {
-        // Space-hand overrides everything - never override the pan cursor.
-        if (_isSpaceHandActive) { return null; }
+        // The hand overrides everything - never override the pan cursor. This
+        // covers the Hand TOOL as well as Space, because press routing below
+        // does: with the hand armed a drag pans, so offering a resize or
+        // guide-move cursor would advertise a gesture that cannot happen.
+        if (!ToolWantsPointer) { return null; }
 
         var content = ContentPoint(e);
         double nx = content.X / ViewModel.OverlayScale;
@@ -3739,24 +3751,37 @@ public sealed partial class MainPage : Page
     {
         if (e is not null && HoverCursor(e) is InputSystemCursorShape hover)
         {
-            ViewportHost.SetCursorShape(hover);
+            Apply(hover, () => InputSystemCursor.Create(hover));
             return;
         }
 
-        var shape = (_isSpaceHandActive, ViewModel.ActiveTool) switch
+        var wanted = CursorPolicy.Resolve(ViewModel.ActiveTool, _isSpaceHandActive, _isPanning);
+        Apply(wanted, () => AppCursors.Create(wanted));
+    }
+
+    /// <summary>
+    /// Assigns the cursor only when it actually changes.
+    ///
+    /// UpdateCursor runs on every PointerMoved, so without this the viewport
+    /// built and handed over a cursor object dozens of times a second. The key
+    /// is the boxed enum the cursor was chosen from - either a
+    /// <see cref="ViewportCursor"/> or an <see cref="InputSystemCursorShape"/>,
+    /// which never collide because they are different types.
+    ///
+    /// Reusing one cursor INSTANCE instead would look like the obvious saving
+    /// and is the thing to avoid: assigning to ProtectedCursor hands a
+    /// disposable object to the framework, and the hand tool showed nothing at
+    /// all until every assignment got a freshly made cursor.
+    /// </summary>
+    private void Apply(object key, Func<InputCursor> make)
+    {
+        if (Equals(_appliedCursorKey, key))
         {
-            (true, _) => InputSystemCursorShape.SizeAll,
-            (_, ToolMode.Hand) => InputSystemCursorShape.SizeAll,
-            (_, ToolMode.Select) => InputSystemCursorShape.IBeam,
-            (_, ToolMode.Highlight) => InputSystemCursorShape.IBeam,
-            (_, ToolMode.Draw) => InputSystemCursorShape.Cross,
-            (_, ToolMode.Shape) => InputSystemCursorShape.Cross,
-            (_, ToolMode.Text) => InputSystemCursorShape.IBeam,
-            (_, ToolMode.Note) => InputSystemCursorShape.Cross,
-            (_, ToolMode.Stamp) => InputSystemCursorShape.Cross,
-            _ => InputSystemCursorShape.Arrow,
-        };
-        ViewportHost.SetCursorShape(shape);
+            return;
+        }
+
+        _appliedCursorKey = key;
+        ViewportHost.SetCursor(make());
     }
 
     // ---------------- Tool gestures ----------------
@@ -3919,6 +3944,10 @@ public sealed partial class MainPage : Page
             _panLastPoint = e.GetCurrentPoint(PageScroller).Position;
             _panTarget = new Point(PageScroller.HorizontalOffset, PageScroller.VerticalOffset);
             ViewportHost.CapturePointer(e.Pointer);
+            // Close the hand. Nothing else recomputes the cursor between here
+            // and the release: PointerMoved deliberately skips it while a drag
+            // is running, so without this the hand never shuts.
+            UpdateCursor();
             e.Handled = true;
             return;
         }
@@ -4205,6 +4234,7 @@ public sealed partial class MainPage : Page
         {
             _isPanning = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);
+            UpdateCursor();   // and open it again
             e.Handled = true;
         }
         else if (_isMovingAnnotation)

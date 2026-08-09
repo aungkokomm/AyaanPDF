@@ -11,5 +11,5 @@ namespace PdfEditorApp.Controls;
 /// </summary>
 public sealed class CursorGrid : Grid
 {
-    public void SetCursorShape(InputSystemCursorShape shape) => ProtectedCursor = InputSystemCursor.Create(shape);
+    public void SetCursor(InputCursor cursor) => ProtectedCursor = cursor;
 }

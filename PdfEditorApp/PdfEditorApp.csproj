@@ -115,6 +115,15 @@
       <Link>pdfium.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!--
+      Resource-only DLL holding the open/closed hand cursors. Built once from
+      Assets\Cursors\cursors.rc; see tools\CursorGen for the art. Must sit
+      beside the exe, since AppCursors loads it by name from the app folder.
+    -->
+    <Content Include="Assets\Cursors\AyaanCursors.dll">
+      <Link>AyaanCursors.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <!-- Same 20-page fixture render_core's own tests use; stands in for real document loading until a file-open flow exists. Multi-page so the phase 2 thumbnail sidebar / page navigation has something to show. -->
     <Content Include="..\render_core\tests\fixtures\sample_20pages.pdf" Condition="Exists('..\render_core\tests\fixtures\sample_20pages.pdf')">
       <Link>sample.pdf</Link>

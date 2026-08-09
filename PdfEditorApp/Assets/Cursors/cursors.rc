@@ -1,0 +1,13 @@
+// Resource script for AyaanCursors.dll, a resource-only DLL holding nothing but
+// the two hand cursors.
+//
+// Why a DLL at all: Microsoft.UI.Input.InputDesktopResourceCursor can only load
+// a cursor that lives as a Win32 resource inside some module, and a .NET app's
+// apphost cannot be given extra resources without hand-authoring the whole
+// resource script for the exe (icon and manifest included). A tiny satellite
+// module sidesteps that entirely.
+//
+// IDs must match CursorResource in PdfEditorApp/Controls/AppCursors.cs.
+
+1 CURSOR "hand_open.cur"
+2 CURSOR "hand_closed.cur"
