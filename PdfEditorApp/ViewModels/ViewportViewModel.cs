@@ -3964,7 +3964,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Writes a finished drag through to the document.</summary>
-    private void CommitLoadedMove()
+    private void CommitLoadedMove() => RunCommand(CommitLoadedMoveCore);
+
+    private void CommitLoadedMoveCore()
     {
         if (_loadedDrag is not (_, _, LoadedSelection start) || _selectedLoaded is not LoadedSelection now)
         {
@@ -4435,6 +4437,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// intermittent bug ("aligns now and next it don't") was actually indices
     /// pointing at slid-down neighbours.</summary>
     private void CommitAlignedOrDistributed(LoadedSelection oldAnchor,
+        LoadedSelection newAnchor, List<LoadedSelection> newExtras)
+        => RunCommand(() => CommitAlignedOrDistributedCore(oldAnchor, newAnchor, newExtras));
+
+    private void CommitAlignedOrDistributedCore(LoadedSelection oldAnchor,
         LoadedSelection newAnchor, List<LoadedSelection> newExtras)
     {
         const int CaptureWidth = 1000;
@@ -4936,6 +4942,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// stack to reorder within.
     /// </summary>
     private bool Reorder(
+        Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>> plan, string label)
+        => RunCommand(() => ReorderCore(plan, label));
+
+    private bool ReorderCore(
         Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>> plan, string label)
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor) { return false; }
@@ -5725,22 +5735,97 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void InvalidateLoadedPage(int pageIndex)
     {
+        // The cache always goes NOW: the very next line of the caller may look
+        // an annotation up by Id and must not see pre-write indices. Only the
+        // repaint is deferrable, and only inside a command.
+        InvalidateAnnotationCache(pageIndex);
+        if (_repaints.Mark(pageIndex))
+        {
+            RedrawPage(pageIndex);
+        }
+    }
+
+    private readonly RepaintQueue _repaints = new();
+
+    /// <summary>
+    /// Runs one user command, repainting each touched page once at the end
+    /// instead of once per write.
+    ///
+    /// Wrapping a command is the whole fix: the call sites inside it are left
+    /// alone and still call InvalidateLoadedPage, but their repaints collect in
+    /// the queue rather than each throwing away the page bitmap. A five-member
+    /// group move went from five repaints to one without a single line inside
+    /// the move changing.
+    ///
+    /// try/finally because these methods return early on every failure path,
+    /// and a command that never flushed would leave the page showing the state
+    /// before the edit.
+    /// </summary>
+    private void RunCommand(Action body) => RunCommand<object?>(() => { body(); return null; });
+
+    private T RunCommand<T>(Func<T> body)
+    {
+        _repaints.Begin();
+        try
+        {
+            return body();
+        }
+        finally
+        {
+            foreach (int page in _repaints.End())
+            {
+                RedrawPage(page);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops the cached annotation list for a page, and the model built from
+    /// it. Cheap: two dictionary removals, no rendering.
+    ///
+    /// This is the half an operation needs when it is only re-resolving
+    /// indices. Every write is a delete and re-add, so the indices shift under
+    /// anything still queued, and the fix is to look the annotation up by its
+    /// stable Id against fresh data. That needs the cache gone; it does not
+    /// need the page repainted.
+    /// </summary>
+    private void InvalidateAnnotationCache(int pageIndex)
+    {
         _loadedByPage.Remove(pageIndex);
         // The model is a projection of the annotation cache, so it is dropped
         // with it and can never be staler than the data everything else already
         // trusts. Giving it a lifetime of its own is how a second source of
         // truth starts.
         _pageModelByPage.Remove(pageIndex);
-
-        var slot = SlotFor(pageIndex);
-        if (slot is not null)
-        {
-            slot.ClearTiles();
-            slot.ReleaseBitmap();
-            RenderBaseTier(slot);
-            ScheduleSharpenPass();
-        }
     }
+
+    /// <summary>
+    /// Throws away the page's bitmap and tiles and renders it again. Expensive,
+    /// and the reason a five-member group move used to cost five repaints.
+    ///
+    /// Marks are part of the page bitmap, so a change stays invisible until
+    /// this runs; it just does not have to run once per write.
+    /// </summary>
+    private void RedrawPage(int pageIndex)
+    {
+        var slot = SlotFor(pageIndex);
+        if (slot is null)
+        {
+            return;
+        }
+
+        slot.ClearTiles();
+        slot.ReleaseBitmap();
+        RenderBaseTier(slot);
+        ScheduleSharpenPass();
+        // One line per repaint. This is the cost the whole command batching
+        // exists to control, so it stays visible: a group move that logs more
+        // than one of these per page has escaped its command.
+        Diag.Log($"repaint p{pageIndex} (#{++_repaintCount})");
+    }
+
+    /// <summary>Repaints since the document opened, for the log line above.</summary>
+    private int _repaintCount;
 
     /// <summary>Half a grip's on-screen size, in slot DIPs.</summary>
     private const double GripHalf = 4.5;
@@ -7520,7 +7605,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// entry holds; an asymmetry between the two directions is not expressible
     /// because neither has its own restore code.
     /// </summary>
+    // One repaint for a whole undo or redo. This is the outermost of the
+    // history calls: ApplyRecords, ApplyBoundsRecord, ApplyOrder, ApplyTagRecord,
+    // ApplyExistenceRecord and RecreateFromTag all sit underneath it, and the
+    // queue's nesting means none of them flushes on its own.
     private void ApplyHistoryEntry(HistoryEntry entry, bool backwards)
+        => RunCommand(() => ApplyHistoryEntryCore(entry, backwards));
+
+    private void ApplyHistoryEntryCore(HistoryEntry entry, bool backwards)
     {
         // Record entries describe their own reversal, so they take the shared
         // walker rather than any of the snapshot restores below.
