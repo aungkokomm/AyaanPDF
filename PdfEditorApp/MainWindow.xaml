@@ -24,7 +24,14 @@
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
             <FontIcon Glyph="&#xE8A5;" FontSize="14" Margin="12,0,8,0" />
-            <TextBlock Grid.Column="1" Text="Ayaan PDF" VerticalAlignment="Center" Style="{StaticResource CaptionTextBlockStyle}" />
+            <!--
+                Named and set from code rather than bound: the title bar lives
+                in the Window and the document lives in the page inside the
+                Frame, so there is no binding path between them.
+            -->
+            <TextBlock x:Name="TitleText" Grid.Column="1" Text="Ayaan PDF"
+                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                       Style="{StaticResource CaptionTextBlockStyle}" />
         </Grid>
 
         <!--

@@ -788,6 +788,12 @@
                                     <KeyboardAccelerator Modifiers="Control" Key="O" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Save" Click="Save_Click"
+                                            IsEnabled="{x:Bind ViewModel.HasDocumentPath, Mode=OneWay}">
+                                <MenuFlyoutItem.Icon>
+                                    <FontIcon Glyph="&#xE74E;" />
+                                </MenuFlyoutItem.Icon>
+                            </MenuFlyoutItem>
                             <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click">
                                 <MenuFlyoutItem.KeyboardAccelerators>
                                     <KeyboardAccelerator Modifiers="Control" Key="S" />

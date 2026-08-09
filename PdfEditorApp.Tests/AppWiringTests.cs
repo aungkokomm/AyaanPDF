@@ -182,7 +182,11 @@ public class AppWiringTests
     [InlineData(KeyboardCommands.KeyG, false, EditorCommand.Group)]
     [InlineData(KeyboardCommands.KeyG, true, EditorCommand.Ungroup)]
     [InlineData(KeyboardCommands.KeyO, false, EditorCommand.Open)]
-    [InlineData(KeyboardCommands.KeyS, false, EditorCommand.SaveAs)]
+    // Ctrl+S saves the open file, Ctrl+Shift+S saves a copy. It used to open
+    // the Save As picker either way, so the commonest keystroke in any editor
+    // could not save the file you already had open.
+    [InlineData(KeyboardCommands.KeyS, false, EditorCommand.Save)]
+    [InlineData(KeyboardCommands.KeyS, true, EditorCommand.SaveAs)]
     [InlineData(KeyboardCommands.KeyR, false, EditorCommand.ToggleRulers)]
     public void every_menu_chord_resolves_to_its_command(int key, bool shift, EditorCommand expected)
     {

@@ -424,6 +424,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         _documentHandle = RenderCoreNative.open_document(path);
         _currentDocumentPath = path;
+        NotifyDocumentTitleChanged();
 
         Thumbnails.Clear();
         if (!preserveAnnotations)
@@ -1086,9 +1087,47 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // moment the document closed.
         PersistGroups();
 
-        bool saved = RenderCoreNative.save_document(_documentHandle, path) == RenderStatus.OkPdfium;
+        // Writing over the file we have OPEN destroys it, silently.
+        //
+        // open_document uses load_pdf_from_file and PDFium streams page content
+        // lazily from that file, so saving back over it pulls the source out
+        // from under the writer: the structure is rewritten, the content
+        // streams are not, and every page comes out blank. save_document still
+        // returns OK and the page count is still right, so nothing looks wrong
+        // until the file is reopened. Proved in
+        // saving_over_the_open_file_is_what_plain_save_has_to_do.
+        //
+        // So an in-place save goes to a temp file first, and the original is
+        // only replaced once the document has been closed and PDFium has let go
+        // of it. This covers Save, and equally a Save As where the user picks
+        // the file that is already open.
+        bool inPlace = _currentDocumentPath is { } current && SamePath(current, path);
+        string writePath = inPlace ? path + ".ayaan-saving" : path;
 
-        if (burned && saved)
+        bool saved = RenderCoreNative.save_document(_documentHandle, writePath) == RenderStatus.OkPdfium;
+
+        if (inPlace && saved)
+        {
+            CloseCurrentDocument();
+            try
+            {
+                File.Move(writePath, path, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                // The original is untouched and the saved copy is intact under
+                // the temp name. Say where it is rather than deleting it: a
+                // failed replace must never be able to lose both.
+                Diag.Log($"save: could not replace the original: {ex.Message}");
+                Status = $"Could not replace the original. Your saved copy is at {writePath}";
+                OpenDocument(path, preserveAnnotations: false);
+                return false;
+            }
+        }
+
+        // An in-place save MUST reload as well, because the document was closed
+        // above to release the file.
+        if (saved && (burned || inPlace))
         {
             // Reopen the file we just wrote, with the overlay lists cleared.
             //
@@ -1114,10 +1153,73 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // this on the burn path; this covers a save with no burnable marks
             // (e.g. only page rotations/deletes).
             IsDirty = false;
+
+            // The working document becomes the file just written, which is what
+            // every editor does after a Save As and what makes a following Save
+            // go to the right place. Only the reload paths above set this via
+            // OpenDocument, so a save with nothing to burn used to leave the
+            // app still pointing at the file it was opened from.
+            _currentDocumentPath = path;
+            NotifyDocumentTitleChanged();
         }
 
         return saved;
     }
+
+    /// <summary>
+    /// Saves back over the file this document came from. False when there is
+    /// nowhere to save to yet, which is the caller's cue to run Save As.
+    /// </summary>
+    public bool SaveDocument()
+    {
+        if (_documentHandle == 0 || _currentDocumentPath is not { } path)
+        {
+            return false;
+        }
+        return SaveDocumentAs(path, flatten: false);
+    }
+
+    /// <summary>
+    /// Whether two paths name the same file, so an in-place save is recognised
+    /// however the picker spelled it.
+    /// </summary>
+    private static bool SamePath(string a, string b)
+    {
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // An unparseable path is not worth throwing over: treat it as a
+            // different file, which takes the safe direct-write branch.
+            return false;
+        }
+    }
+
+    /// <summary>The open file's name, or a placeholder before it has one.</summary>
+    public string DocumentTitle =>
+        _currentDocumentPath is { } p ? Path.GetFileName(p) : "Untitled";
+
+    /// <summary>True once there is a path to Save to without asking.</summary>
+    public bool HasDocumentPath => _currentDocumentPath is not null;
+
+    /// <summary>
+    /// What the title bar shows. The bullet is the unsaved marker, the same
+    /// convention as every editor, so the window itself says whether there is
+    /// work that would be lost.
+    /// </summary>
+    public string WindowTitle =>
+        $"{(IsDirty ? "• " : string.Empty)}{DocumentTitle} - Ayaan PDF";
+
+    private void NotifyDocumentTitleChanged()
+    {
+        OnPropertyChanged(nameof(DocumentTitle));
+        OnPropertyChanged(nameof(HasDocumentPath));
+        OnPropertyChanged(nameof(WindowTitle));
+    }
+
 
     /// <summary>
     /// Writes notes into the document as PDF text annotations.
@@ -7340,8 +7442,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public Visibility DirtyIndicatorVisibility =>
         IsDirty ? Visibility.Visible : Visibility.Collapsed;
 
-    partial void OnIsDirtyChanged(bool value) =>
+    partial void OnIsDirtyChanged(bool value)
+    {
         OnPropertyChanged(nameof(DirtyIndicatorVisibility));
+        // The title carries the unsaved marker too, so it follows the same flag.
+        OnPropertyChanged(nameof(WindowTitle));
+    }
 
     private void NotifyHistoryChanged()
     {

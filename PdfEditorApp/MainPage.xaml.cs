@@ -91,6 +91,11 @@ public sealed partial class MainPage : Page
             {
                 UpdateToolRail();
             }
+
+            if (args.PropertyName == nameof(ViewModel.WindowTitle))
+            {
+                PushWindowTitle();
+            }
         };
         Loaded += (_, _) =>
         {
@@ -98,6 +103,7 @@ public sealed partial class MainPage : Page
             InitializePenPickers();
             UpdateToolRail();
             UpdateCursor();
+            PushWindowTitle();
         };
 
         // Lets the app be driven headlessly for diagnosis: set
@@ -2864,6 +2870,39 @@ public sealed partial class MainPage : Page
         Debug.WriteLine($"[MainPage] Opened \"{file.Path}\"");
     }
 
+    /// <summary>
+    /// Copies the view model's title onto the window. The title bar belongs to
+    /// the Window and the document to this page, with a Frame in between and no
+    /// binding path across it.
+    /// </summary>
+    private void PushWindowTitle()
+    {
+        if (App.Window is MainWindow w)
+        {
+            w.SetDocumentTitle(ViewModel.WindowTitle);
+        }
+    }
+
+    private async void Save_Click(object sender, RoutedEventArgs e) => await SaveAsync();
+
+    /// <summary>
+    /// Save, falling back to Save As when the document has no path yet, which
+    /// is what a blank document started from scratch is. Ctrl+S therefore
+    /// always does something rather than silently failing.
+    /// </summary>
+    private async Task<bool> SaveAsync()
+    {
+        if (!ViewModel.HasDocumentPath)
+        {
+            return await SaveAsAsync();
+        }
+
+        bool saved = ViewModel.SaveDocument();
+        if (saved) { ViewModel.SaveGuidesToSidecar(); }
+        Debug.WriteLine($"[MainPage] Save -> {(saved ? "ok" : "failed")}");
+        return saved;
+    }
+
     private async void SaveAs_Click(object sender, RoutedEventArgs e) => await SaveAsAsync();
 
     /// <summary>
@@ -3450,6 +3489,7 @@ public sealed partial class MainPage : Page
         switch (command)
         {
             case EditorCommand.Open: OpenFile_Click(this, null!); break;
+            case EditorCommand.Save: Save_Click(this, null!); break;
             case EditorCommand.SaveAs: SaveAs_Click(this, null!); break;
             case EditorCommand.Undo: ViewModel.Undo(); break;
             case EditorCommand.Redo: ViewModel.Redo(); break;

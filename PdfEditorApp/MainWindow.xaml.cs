@@ -31,6 +31,20 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
+    /// Shows which file is open, and whether it has unsaved work.
+    ///
+    /// Both the strip in the extended title bar and the real Window.Title, so
+    /// the taskbar and Alt+Tab say it too. Before this the window said only
+    /// "Ayaan PDF" and there was no way to tell which of two open documents
+    /// you were looking at, or that either had unsaved edits.
+    /// </summary>
+    public void SetDocumentTitle(string title)
+    {
+        TitleText.Text = title;
+        Title = title;
+    }
+
+    /// <summary>
     /// Intercepts window close to offer saving unsaved edits. A Closing
     /// handler cannot await, so it cancels the close, awaits the prompt, and
     /// re-issues Close() only if the user chose to proceed.

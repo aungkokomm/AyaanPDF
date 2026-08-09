@@ -7169,6 +7169,58 @@ mod tests {
     }
 
     #[test]
+    fn saving_over_the_open_file_is_what_plain_save_has_to_do() {
+        // Save As always writes somewhere new. Save writes back to the path the
+        // document was loaded FROM, and open_document uses load_pdf_from_file,
+        // which reads lazily and therefore keeps that file open. Whether the
+        // write succeeds decides the design: write in place, or write a temp
+        // file beside it and replace.
+        //
+        // Answering this in a test rather than in the app matters because the
+        // failure mode is losing the user's file.
+        let mut path = std::env::temp_dir();
+        path.push(format!("render_core_save_in_place_{}_{}.pdf", std::process::id(), line!()));
+        std::fs::copy("tests/fixtures/sample_20pages.pdf", &path).unwrap();
+        let path_str = path.to_str().unwrap().to_owned();
+
+        let handle = open_fixture_named(&path_str);
+        assert_eq!(delete_page(handle, 0), STATUS_OK_PDFIUM);
+
+        let c_path = std::ffi::CString::new(path_str.clone()).unwrap();
+        let status = save_document(handle, c_path.as_ptr());
+        close_document(handle);
+
+        // It reports success, and the page count is right.
+        assert_eq!(status, STATUS_OK_PDFIUM);
+
+        let reopened = open_fixture_named(&path_str);
+        assert_eq!(get_page_count(reopened), 19);
+
+        // And the page is EMPTY. This is the whole point of the test.
+        //
+        // PDFium streams page content from the file it still has open, so
+        // writing the document back over that same file pulls the source out
+        // from under the writer: the structure is rewritten, the content
+        // streams are not, and every page comes out blank. Nothing reports an
+        // error, and a corrupted file looks fine until you open it.
+        //
+        // So Save CANNOT be SaveDocumentAs(current_path). It has to write a
+        // temp file beside the target, close the document to release the file,
+        // then replace and reopen. This test asserts the hazard rather than the
+        // fix, so that anyone who later "simplifies" Save into a direct
+        // overwrite is stopped here instead of in a user's documents.
+        assert_eq!(
+            page_text(reopened, 0),
+            "",
+            "in-place save no longer destroys page content; \
+             re-check whether Save still needs the temp-file dance"
+        );
+
+        close_document(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn save_document_rejects_invalid_handle() {
         let path = std::ffi::CString::new("wherever.pdf").unwrap();
         assert_eq!(save_document(0, path.as_ptr()), STATUS_INVALID_INPUT);
