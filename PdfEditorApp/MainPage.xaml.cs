@@ -95,6 +95,12 @@ public sealed partial class MainPage : Page
             if (args.PropertyName == nameof(ViewModel.WindowTitle))
             {
                 PushWindowTitle();
+                RefreshRecentMenu();
+            }
+
+            if (args.PropertyName == nameof(ViewModel.CurrentPageIndex))
+            {
+                SyncPageJumpBox();
             }
         };
         Loaded += (_, _) =>
@@ -104,6 +110,8 @@ public sealed partial class MainPage : Page
             UpdateToolRail();
             UpdateCursor();
             PushWindowTitle();
+            RefreshRecentMenu();
+            SyncPageJumpBox();
         };
 
         // Lets the app be driven headlessly for diagnosis: set
@@ -2930,6 +2938,78 @@ public sealed partial class MainPage : Page
     public string DocumentTitle => ViewModel.WindowTitle;
 
     private void PushWindowTitle() => DocumentTitleChanged?.Invoke(this);
+
+    // ---------------- Go to page ----------------
+
+    /// <summary>
+    /// Jumps to a typed page number. Enter commits; anything unparseable or out
+    /// of range simply restores the current page rather than complaining, since
+    /// the box is showing that number the rest of the time anyway.
+    /// </summary>
+    private void PageJumpBox_KeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs e)
+    {
+        if (e.Key != VirtualKey.Enter)
+        {
+            return;
+        }
+
+        if (int.TryParse(PageJumpBox.Text, out int oneBased) && ViewModel.PageCount > 0)
+        {
+            ViewModel.GoToPage(Math.Clamp(oneBased - 1, 0, ViewModel.PageCount - 1));
+        }
+
+        SyncPageJumpBox();
+        RootGrid.Focus(FocusState.Programmatic);
+        e.Handled = true;
+    }
+
+    private void PageJumpBox_LostFocus(object sender, RoutedEventArgs e) => SyncPageJumpBox();
+
+    /// <summary>
+    /// Puts the current page back in the box. Skipped while it has focus, or
+    /// scrolling would rewrite the number under someone mid-type.
+    /// </summary>
+    private void SyncPageJumpBox()
+    {
+        if (PageJumpBox.FocusState == FocusState.Unfocused)
+        {
+            PageJumpBox.Text = (ViewModel.CurrentPageIndex + 1).ToString();
+        }
+    }
+
+    // ---------------- Recent files ----------------
+
+    /// <summary>
+    /// Rebuilds the Recent files submenu.
+    ///
+    /// Rebuilt rather than bound, because the list is read from disk and pruned
+    /// of files that have gone, so what it contains is only known at the moment
+    /// it is asked for.
+    /// </summary>
+    private void RefreshRecentMenu()
+    {
+        RecentMenu.Items.Clear();
+        var recent = RecentFilesStore.Load();
+
+        if (recent.Count == 0)
+        {
+            RecentMenu.Items.Add(new MenuFlyoutItem { Text = "None yet", IsEnabled = false });
+            return;
+        }
+
+        foreach (string path in recent)
+        {
+            // The file name is what identifies it at a glance; the full path
+            // goes in the tooltip for two files sharing a name.
+            var item = new MenuFlyoutItem { Text = System.IO.Path.GetFileName(path) };
+            ToolTipService.SetToolTip(item, path);
+            item.Click += (_, _) =>
+            {
+                if (App.Window is MainWindow w) { w.AddDocumentTab(path); }
+            };
+            RecentMenu.Items.Add(item);
+        }
+    }
 
     private Printing.DocumentPrinter? _printer;
 

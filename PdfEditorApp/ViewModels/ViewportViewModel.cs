@@ -426,6 +426,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _currentDocumentPath = path;
         NotifyDocumentTitleChanged();
 
+        // Recorded here rather than at the picker, so a file reaches the recent
+        // list however it was opened: the picker, the recent menu itself, or a
+        // reload after saving.
+        //
+        // Anything inside the install folder is the app's own furniture, the
+        // blank template and the bundled sample, never something the user
+        // chose. Without this the recent list fills with blank.pdf, since every
+        // new document loads it.
+        if (_documentHandle != 0 && !IsAppOwnFile(path))
+        {
+            RecentFilesStore.Add(path);
+        }
+
         Thumbnails.Clear();
         if (!preserveAnnotations)
         {
@@ -1194,6 +1207,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
         return SaveDocumentAs(path, flatten: false);
+    }
+
+    /// <summary>True for files shipped with the app rather than opened by the user.</summary>
+    private static bool IsAppOwnFile(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path)
+                .StartsWith(Path.GetFullPath(AppContext.BaseDirectory), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>

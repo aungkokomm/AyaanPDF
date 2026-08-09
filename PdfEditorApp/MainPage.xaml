@@ -788,6 +788,7 @@
                                     <KeyboardAccelerator Modifiers="Control" Key="N" />
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
+                            <MenuFlyoutSubItem x:Name="RecentMenu" Text="Recent files" />
                             <MenuFlyoutItem Text="Open..." Click="OpenFile_Click">
                                 <MenuFlyoutItem.KeyboardAccelerators>
                                     <KeyboardAccelerator Modifiers="Control" Key="O" />
@@ -1675,10 +1676,27 @@
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="Pages" VerticalAlignment="Center"
                                Style="{StaticResource BodyStrongTextBlockStyle}" />
-                    <TextBlock Grid.Column="2" VerticalAlignment="Center"
-                               Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <!--
+                        Type a page number and press Enter. Navigation was
+                        Home/End/PageUp/PageDown and clicking thumbnails, which
+                        is unusable in a document of any length.
+                    -->
+                    <StackPanel Grid.Column="2" Orientation="Horizontal"
+                                Spacing="4" VerticalAlignment="Center">
+                        <TextBox x:Name="PageJumpBox" Width="48" Height="28"
+                                 Padding="6,2,6,2" TextAlignment="Center"
+                                 InputScope="Number"
+                                 KeyDown="PageJumpBox_KeyDown"
+                                 LostFocus="PageJumpBox_LostFocus"
+                                 ToolTipService.ToolTip="Go to page" />
+                        <TextBlock Text="/" VerticalAlignment="Center"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{x:Bind ViewModel.PageCount, Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                    </StackPanel>
                 </Grid>
 
                 <ListView
