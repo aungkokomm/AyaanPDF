@@ -53,7 +53,11 @@ internal static class Theming
     public static Brush CanvasBrush(AppTheme theme) => new SolidColorBrush(theme switch
     {
         AppTheme.Sepia => Rgb(0x4A, 0x40, 0x30),      // warm, to match the paper
-        AppTheme.DarkBlue => Rgb(0x0C, 0x12, 0x1F),   // deep navy
+        // Slate blue rather than near-black. The first attempt was 0C121F,
+        // which read as "black with a hint of blue" and lost the point of
+        // having the theme at all: it needs to be recognisably BLUE while
+        // still sitting clearly darker than a white page.
+        AppTheme.DarkBlue => Rgb(0x22, 0x30, 0x4D),
         _ => Rgb(0x3A, 0x3A, 0x3D),                   // the neutral default
     });
 

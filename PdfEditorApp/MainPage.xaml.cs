@@ -435,10 +435,16 @@ public sealed partial class MainPage : Page
     private static Microsoft.UI.Xaml.Shapes.Path BuildPath(string data)
     {
         const string ns = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+
+        // Fill declared as a ThemeResource IN the markup rather than assigned
+        // afterwards. An assigned brush is resolved once and keeps the colour
+        // the app happened to start in, which left the hand and stamp icons
+        // black on every dark theme while the font-glyph tools beside them
+        // followed along. A ThemeResource reference re-evaluates when the
+        // element's theme changes, which is what themes now require.
         var path = (Microsoft.UI.Xaml.Shapes.Path)Microsoft.UI.Xaml.Markup.XamlReader.Load(
-            $"<Path xmlns=\"{ns}\" Data=\"{data}\" />");
-        path.Fill = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
-        path.Stretch = Stretch.Uniform;
+            $"<Path xmlns=\"{ns}\" Data=\"{data}\" " +
+            "Fill=\"{ThemeResource TextFillColorPrimaryBrush}\" Stretch=\"Uniform\" />");
         return path;
     }
 
