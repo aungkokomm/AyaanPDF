@@ -926,8 +926,11 @@ public sealed partial class MainPage : Page
         canvas.Children.Clear();
         if (viewportSpan <= 0 || majorDips <= 0) { return; }
 
-        var stroke = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
-        var text = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+        // ActualTheme, not the app dictionary: the theme lives on the root
+        // element, and Application.Current.Resources does not know about it.
+        bool dark = canvas.ActualTheme == ElementTheme.Dark;
+        var stroke = Theming.RulerTickBrush(dark);
+        var text = Theming.RulerTextBrush(dark);
 
         // Walk minor-tick indices covering the visible span with one on each
         // side for safety. Compute unit value from index rather than accumulating
@@ -3064,6 +3067,10 @@ public sealed partial class MainPage : Page
         }
 
         RulerUnit_Click(new MenuFlyoutItem { Tag = s.RulerUnit }, null!);
+
+        // The ticks are drawn shapes, not themed controls, so they keep the
+        // colours they were painted with until something repaints them.
+        RedrawRulers();
     }
 
     /// <summary>The saved default view, applied once a document has pages to fit.</summary>

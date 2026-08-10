@@ -1904,14 +1904,27 @@
                 -->
                 <StackPanel Orientation="Horizontal" Spacing="4"
                             VerticalAlignment="Center" Margin="10,0,6,0">
-                    <TextBox x:Name="PageJumpBox" Width="44" Height="26"
-                             Padding="4,1,4,1" TextAlignment="Center"
+                    <!--
+                        MinHeight="0" is the load-bearing attribute. A WinUI
+                        TextBox defaults to MinHeight 32, which beats Height 26
+                        and made the box taller than the row it sits in, so it
+                        rode up while the "/ 1" beside it sat centred. That is
+                        the misalignment, not a margin.
+
+                        28 to match every button on this bar, and both
+                        alignments centred so the number sits on the same line
+                        as the text next to it.
+                    -->
+                    <TextBox x:Name="PageJumpBox" Width="46" Height="28" MinHeight="0"
+                             VerticalAlignment="Center" VerticalContentAlignment="Center"
+                             Padding="4,0,4,0" TextAlignment="Center"
                              FontSize="12" InputScope="Number"
                              KeyDown="PageJumpBox_KeyDown"
                              LostFocus="PageJumpBox_LostFocus"
                              ToolTipService.ToolTip="Go to page" />
                     <TextBlock VerticalAlignment="Center"
                                Text="{x:Bind ViewModel.PageCountSuffix, Mode=OneWay}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                Style="{StaticResource CaptionTextBlockStyle}" />
                 </StackPanel>
                 <!-- Says why text selection is unavailable, instead of the

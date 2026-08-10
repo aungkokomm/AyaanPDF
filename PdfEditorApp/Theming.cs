@@ -61,5 +61,22 @@ internal static class Theming
         _ => Rgb(0x3A, 0x3A, 0x3D),                   // the neutral default
     });
 
+    /// <summary>
+    /// Tick marks on the rulers.
+    ///
+    /// Chosen here rather than pulled from Application.Current.Resources,
+    /// which is the APP dictionary and does not follow a theme set on the root
+    /// element. Reading TextFillColorSecondaryBrush from it in dark mode
+    /// returned the LIGHT theme's dark grey and drew near-black ticks on a dark
+    /// ruler. Callers pass the element's ActualTheme, which resolves System to
+    /// a real answer.
+    /// </summary>
+    public static Brush RulerTickBrush(bool dark) =>
+        new SolidColorBrush(dark ? Rgb(0xA8, 0xA8, 0xAE) : Rgb(0x5A, 0x5A, 0x60));
+
+    /// <summary>Ruler numbers, brighter than the ticks so they stay readable at 11px.</summary>
+    public static Brush RulerTextBrush(bool dark) =>
+        new SolidColorBrush(dark ? Rgb(0xE8, 0xE8, 0xED) : Rgb(0x20, 0x20, 0x24));
+
     private static Color Rgb(byte r, byte g, byte b) => Color.FromArgb(0xFF, r, g, b);
 }
