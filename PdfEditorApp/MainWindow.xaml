@@ -12,7 +12,11 @@
         <MicaBackdrop />
     </Window.SystemBackdrop>
 
-    <Grid>
+    <!--
+        Named so the themes can paint it. The tab strip takes its colour from
+        here rather than from the TabView, whose Background does not reach it.
+    -->
+    <Grid x:Name="Shell">
         <Grid.RowDefinitions>
             <RowDefinition Height="34" />
             <RowDefinition Height="*" />
@@ -100,6 +104,19 @@
                 document editor is looked at far more than its tabs are.
             -->
             <TabView.Resources>
+                <!--
+                    Declared HERE, as brush objects, and recoloured in place
+                    when the theme changes. Assigning a NEW brush into this
+                    dictionary at runtime does nothing: a ThemeResource is
+                    resolved once, when the template expands, and the tab then
+                    holds the brush object it found. That is why the tab kept
+                    the colour of whichever theme was active at startup while
+                    everything around it changed. Mutating .Color on the object
+                    the tab is already holding reaches it.
+                -->
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundSelected" Color="Transparent" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackground" Color="Transparent" />
+
                 <x:Double x:Key="TabViewItemMinHeight">30</x:Double>
                 <x:Double x:Key="TabViewItemHeaderMinHeight">30</x:Double>
                 <x:Double x:Key="TabViewItemHeaderFontSize">12</x:Double>

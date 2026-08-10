@@ -62,6 +62,16 @@ public sealed record AppSettings
     /// </summary>
     public DefaultView DefaultView { get; init; } = DefaultView.FitPage;
 
+    /// <summary>
+    /// How light or dark the theme's own colours are pushed, from -50 to +50,
+    /// with 0 meaning exactly the colours the theme ships with.
+    ///
+    /// A shift applied on top of a theme rather than a set of extra themes:
+    /// every surface moves by the same amount, so the relationships between
+    /// them, which are what the theme actually is, survive the adjustment.
+    /// </summary>
+    public int ColorIntensity { get; init; }
+
     public bool ShowRulers { get; init; } = true;
 
     /// <summary>Matches the RulerUnit tags the menu already uses.</summary>
@@ -105,6 +115,7 @@ public sealed record AppSettings
     {
         Theme = Enum.IsDefined(Theme) ? Theme : AppTheme.System,
         DefaultView = Enum.IsDefined(DefaultView) ? DefaultView : DefaultView.FitPage,
+        ColorIntensity = Math.Clamp(ColorIntensity, MinIntensity, MaxIntensity),
         RulerUnit = IsKnownUnit(RulerUnit) ? RulerUnit : "Inches",
         RecentLimit = Math.Clamp(RecentLimit, 1, 50),
         StatusBarDock = Enum.IsDefined(StatusBarDock) ? StatusBarDock : BarDock.BottomCentre,
@@ -112,6 +123,12 @@ public sealed record AppSettings
 
     private static bool IsKnownUnit(string unit) => unit is
         "Inches" or "Centimeters" or "Millimeters" or "Points" or "Picas";
+
+    /// <summary>Full darkening of the theme's colours.</summary>
+    public const int MinIntensity = -50;
+
+    /// <summary>Full lightening of the theme's colours.</summary>
+    public const int MaxIntensity = 50;
 
     /// <summary>
     /// Whether this theme is a dark one, which decides the base the custom

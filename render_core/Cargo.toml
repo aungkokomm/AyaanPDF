@@ -21,6 +21,12 @@ lru = "0.12"
 # Arabic) into glyph indices, which are then drawn as real PDF text via the
 # forked FPDFText_SetCharcodes path. No C dependency.
 rustybuzz = "0.20"
+# PDF object-graph editing (MIT), used for ONE thing PDFium cannot do at all:
+# writing a document outline. PDFium's public API can read bookmarks
+# (FPDFBookmark_*) but has no call to create one, so the /Outlines tree has to
+# be built as PDF objects directly. Not used for anything else: rendering,
+# annotations and saving all stay on PDFium.
+lopdf = "0.44"
 
 [profile.dev]
 panic = "unwind"

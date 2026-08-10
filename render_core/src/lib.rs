@@ -30,6 +30,11 @@
 //! (rather than one whole-page call) is the fix — natural follow-on work
 //! once page virtualization (phase 2) exists.
 
+/// Writing the document outline. Its own module because it is the one feature
+/// that does not go through PDFium at all: PDFium can read bookmarks but has no
+/// API to create them, so the /Outlines tree is built as PDF objects directly.
+pub mod outline;
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::num::NonZeroUsize;
@@ -655,6 +660,178 @@ pub extern "C" fn save_document(doc_handle: u64, path: *const c_char) -> i32 {
         return STATUS_INVALID_INPUT;
     }
     panic::catch_unwind(|| save_document_inner(doc_handle, path)).unwrap_or(STATUS_PANIC)
+}
+
+/// Rewrites the searchable text layer for the given pages.
+///
+/// Our text boxes draw SHAPED GLYPHS inside a stamp annotation. That is what
+/// makes Burmese and Devanagari come out right, and it is also why the words
+/// cannot be found: a page's text layer is its content stream, and an
+/// annotation's appearance stream is not part of it. Measured, not assumed: a
+/// page carrying one of our Burmese boxes extracts as "Page 1 of 20" and
+/// nothing else, while the font's /ToUnicode sits there correct and unused.
+///
+/// So the words are written a SECOND time, into the page content, in text
+/// render mode 3: no fill, no stroke, nothing drawn. The visible glyphs are
+/// untouched, and the page renders byte for byte identically. The invisible
+/// copy carries the ORIGINAL characters rather than the shaped glyphs, so it
+/// extracts in logical order and needs no CMap of its own.
+///
+/// This is how a scanned document's OCR layer works, for the same reason.
+fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let mut doc_guard = lock(&doc);
+    let page_count = doc_guard.pages().len() as i32;
+
+    for &page_index in pages {
+        if page_index < 0 || page_index >= page_count {
+            continue;
+        }
+
+        // What to write, gathered BEFORE anything is mutated: the words of each
+        // text box and the rect to sit them in.
+        let mut runs: Vec<(String, f32, f32, f32, Option<String>)> = Vec::new();
+        let existing_text;
+        {
+            let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+                continue;
+            };
+
+            // Read through the page we already hold, NOT through get_page_chars.
+            // That entry point takes CALL_LOCK, which this function is already
+            // holding, and the second acquisition deadlocks: the test run hung
+            // rather than failing.
+            existing_text = page.text().map(|t| t.all()).unwrap_or_default();
+            for annotation in page.annotations().iter() {
+                let Some(tag) = annotation_tag(&annotation) else {
+                    continue;
+                };
+                let Some(parsed) = parse_textbox_tag_full(&tag) else {
+                    continue;
+                };
+                if parsed.text.trim().is_empty() {
+                    continue;
+                }
+                let Ok(bounds) = annotation.bounds() else {
+                    continue;
+                };
+                runs.push((
+                    parsed.text,
+                    parsed.size_px,
+                    bounds.left().value,
+                    bounds.top().value,
+                    parsed.font_path,
+                ));
+            }
+        }
+
+        // Fonts are loaded against the DOCUMENT, so they are resolved before
+        // the page is borrowed mutably below.
+        let mut tokens: Vec<PdfFontToken> = Vec::with_capacity(runs.len());
+        for (_, _, _, _, font_path) in &runs {
+            tokens.push(resolve_text_font(&mut doc_guard, font_path.as_deref()));
+        }
+
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            continue;
+        };
+
+        // NOTHING IS REMOVED, and the layer is not allowed to duplicate
+        // instead.
+        //
+        // The obvious design was to mark our runs and delete the previous ones
+        // on each save. Both orderings of that crash PDFium from safe Rust
+        // (STATUS_ILLEGAL_INSTRUCTION, then STATUS_ACCESS_VIOLATION): removing
+        // a page object through the wrapper while the collection is being
+        // walked is not sound, and the raw FPDFPage_RemoveObject call needs a
+        // page handle the crate keeps pub(crate).
+        //
+        // So duplication is prevented at the source: a line whose words are
+        // ALREADY in the page's text does not get a second copy. Idempotent
+        // however many times it runs, and it frees nothing.
+        let mut wrote = false;
+        for ((text, size_px, left, top, _), token) in runs.iter().zip(tokens.iter()) {
+            let Some(font) = doc_guard.fonts().get(*token) else {
+                continue;
+            };
+            let size = PdfPoints::new(*size_px);
+
+            // One run per line, stepping down the box, so a search hit
+            // highlights near the line it is on rather than over the whole box.
+            for (i, line) in text.split('\n').enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Already findable: this page was synced before, or the
+                // document's own content happens to say the same thing. Either
+                // way a second copy makes search report two hits for one word.
+                if existing_text.contains(line.trim()) {
+                    continue;
+                }
+                let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, line, font, size) else {
+                    continue;
+                };
+                if obj.set_render_mode(PdfPageTextRenderMode::Invisible).is_err() {
+                    // Without this the words would be DRAWN over the shaped
+                    // ones. Better to write nothing than to double-print.
+                    continue;
+                }
+                let baseline = top - size_px * (1.2 * i as f32 + 1.0);
+                if obj
+                    .translate(PdfPoints::new(*left), PdfPoints::new(baseline))
+                    .is_err()
+                {
+                    continue;
+                }
+                if page.objects_mut().add_text_object(obj).is_ok() {
+                    wrote = true;
+                }
+            }
+        }
+
+        // Only when something actually changed: regenerating rewrites the whole
+        // content stream, which is not free on a big page.
+        if wrote && page.regenerate_content().is_err() {
+            return STATUS_UNSUPPORTED;
+        }
+    }
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
+/// Rewrites the searchable text layer on the given pages. Call before saving.
+///
+/// Takes explicit page indices rather than walking the document: asking a page
+/// for its annotations LOADS and parses it, and doing that for all 3352 pages
+/// of a book to find the two that have text boxes is exactly the mistake that
+/// cost 34 seconds on the form-field path.
+///
+/// # Safety
+/// `pages` must point to at least `page_count` readable i32 values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sync_text_layer(
+    doc_handle: u64,
+    pages: *const i32,
+    page_count: usize,
+) -> i32 {
+    if doc_handle == 0 || (pages.is_null() && page_count != 0) {
+        return STATUS_INVALID_INPUT;
+    }
+    let list = if page_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(pages, page_count) }.to_vec()
+    };
+    panic::catch_unwind(move || sync_text_layer_inner(doc_handle, &list))
+        .unwrap_or(STATUS_PANIC)
 }
 
 fn save_document_inner(doc_handle: u64, path: *const c_char) -> i32 {
@@ -2244,6 +2421,13 @@ struct ShapedGlyph {
     x_advance: f32,
     x_offset: f32,
     y_offset: f32,
+    /// Byte offset into the source string of the characters this glyph came
+    /// from. Several glyphs can share one cluster (a character that shaped into
+    /// a base plus marks), and one glyph can cover several characters (a
+    /// conjunct or ligature). Kept because it is the ONLY link back from a
+    /// drawn glyph to the text it means, and `/ToUnicode` cannot be built
+    /// without it.
+    cluster: u32,
 }
 
 /// Shapes one run of text in the given font with rustybuzz (a HarfBuzz port),
@@ -2277,9 +2461,131 @@ fn shape_run(font_bytes: &[u8], text: &str, size_pts: f32) -> Option<Vec<ShapedG
             x_advance: pos.x_advance as f32 * scale,
             x_offset: pos.x_offset as f32 * scale,
             y_offset: pos.y_offset as f32 * scale,
+            cluster: info.cluster,
         })
         .collect();
     Some(glyphs)
+}
+
+/// What each shaped glyph MEANS, as the text it came from.
+///
+/// The link a `/ToUnicode` CMap needs, and the reason the app's text is drawn
+/// correctly yet cannot be selected or searched: a glyph index is a number
+/// inside one font subset, and nothing in the file says which characters
+/// produced it.
+///
+/// Shaping is not one-to-one in either direction, so neither is this:
+///
+///   * ONE character can become SEVERAL glyphs (a base plus its marks). The
+///     cluster's text is given to the FIRST glyph only; the rest map to
+///     nothing. Giving it to each would make a copy of the text repeat every
+///     mark's worth of characters.
+///   * SEVERAL characters can become ONE glyph (a Burmese stack, a Devanagari
+///     conjunct, an fi ligature). That glyph maps to the whole cluster, which
+///     is why the CMap needs multi-character destinations rather than a plain
+///     one-to-one table.
+///
+/// Clusters are BYTE offsets into the source, and they run backwards for a
+/// right-to-left script, so the extent of a cluster is found from the sorted
+/// set of boundaries rather than from the glyph order.
+fn glyph_text_map(glyphs: &[ShapedGlyph], source: &str) -> Vec<(u32, String)> {
+    if glyphs.is_empty() || source.is_empty() {
+        return Vec::new();
+    }
+
+    // Every distinct cluster start, in ascending order, so each one's text runs
+    // to the next boundary. Works for right-to-left runs too, where the glyphs
+    // themselves arrive in the opposite order.
+    let mut starts: Vec<usize> = glyphs.iter().map(|g| g.cluster as usize).collect();
+    starts.sort_unstable();
+    starts.dedup();
+
+    let extent = |start: usize| -> &str {
+        let end = starts
+            .iter()
+            .copied()
+            .find(|&s| s > start)
+            .unwrap_or(source.len());
+        // A cluster value that does not land on a character boundary is a
+        // malformed run rather than something to panic over.
+        if start > source.len() || end > source.len()
+            || !source.is_char_boundary(start) || !source.is_char_boundary(end)
+        {
+            return "";
+        }
+        &source[start..end]
+    };
+
+    let mut seen: Vec<u32> = Vec::new();
+    let mut out = Vec::with_capacity(glyphs.len());
+
+    for glyph in glyphs {
+        if seen.contains(&glyph.cluster) {
+            // A later glyph of a cluster already accounted for: it carries no
+            // text of its own.
+            continue;
+        }
+        seen.push(glyph.cluster);
+
+        let text = extent(glyph.cluster as usize);
+        if !text.is_empty() {
+            out.push((glyph.id, text.to_string()));
+        }
+    }
+
+    out
+}
+
+/// Builds a `/ToUnicode` CMap for a set of glyph-to-text mappings.
+///
+/// The stream a PDF reader consults to answer "what does this glyph say". With
+/// it, our shaped text becomes selectable, searchable and copyable in Acrobat
+/// and everything else; without it the glyphs draw perfectly and mean nothing.
+///
+/// Codes are two bytes because the font is Identity-encoded: the code written
+/// into the content stream IS the glyph index. Destinations are UTF-16BE, which
+/// is what a `bfchar` destination is defined to be, and is also why one glyph
+/// can map to several characters.
+///
+/// `bfchar` throughout rather than `bfrange`. Ranges only pay when consecutive
+/// glyph ids carry consecutive characters, which shaped complex script almost
+/// never produces, and getting a range subtly wrong corrupts a span of text
+/// rather than one glyph.
+fn build_tounicode_cmap(mappings: &[(u32, String)]) -> String {
+    let mut sorted: Vec<&(u32, String)> = mappings.iter().collect();
+    sorted.sort_by_key(|(id, _)| *id);
+    sorted.dedup_by_key(|(id, _)| *id);
+
+    let mut out = String::with_capacity(sorted.len() * 32 + 512);
+    out.push_str(
+        "/CIDInit /ProcSet findresource begin\n\
+         12 dict begin\n\
+         begincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n\
+         /CMapType 2 def\n\
+         1 begincodespacerange\n\
+         <0000> <FFFF>\n\
+         endcodespacerange\n",
+    );
+
+    // A bfchar section may hold at most 100 entries, per the spec. Longer runs
+    // are split rather than emitted as one oversized section, which some
+    // readers reject outright.
+    for chunk in sorted.chunks(100) {
+        out.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for (id, text) in chunk {
+            out.push_str(&format!("<{:04X}> <", id));
+            for unit in text.encode_utf16() {
+                out.push_str(&format!("{:04X}", unit));
+            }
+            out.push_str(">\n");
+        }
+        out.push_str("endbfchar\n");
+    }
+
+    out.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    out
 }
 
 /// The total advance width of a shaped run, in points.
@@ -2850,6 +3156,18 @@ pub extern "C" fn get_annotation_group_id(doc_handle: u64, page_index: i32, inde
 
 /// Writes the app's tag to the private key and clears `/Contents`, so the
 /// annotation carries no reader-visible comment.
+///
+/// `/Contents` STAYS EMPTY, including for text boxes. Putting a text box's
+/// words there was tried, so that other readers could at least see the text
+/// our shaped glyphs are unreadable as. It works, and the cost is worse than
+/// the problem: `/Contents` on a markup annotation IS a comment, so Acrobat
+/// draws a sticky-note icon on the page and opens a reply popup over the text.
+/// No annotation flag keeps the text and suppresses the bubble, because from
+/// the format's point of view there is nothing to suppress: a stamp with
+/// contents is a comment.
+///
+/// Making the glyphs themselves readable needs a `/ToUnicode` CMap on the
+/// embedded font, which costs nothing visually and is the real fix.
 fn set_annotation_tag<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
     annotation: &mut A,
     tag: &str,
@@ -2862,8 +3180,8 @@ fn set_annotation_tag<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
         TAG_KEY,
         utf16.as_ptr(),
     ) != 0;
-    // Clear the comment whether or not the private write succeeded; a stale
-    // tag left in /Contents would still be shown to the reader.
+    // Cleared whether or not the private write succeeded; a stale tag left in
+    // /Contents would still be shown to the reader.
     let _ = annotation.set_contents("");
     ok
 }
@@ -2894,7 +3212,24 @@ fn annotation_tag<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
         }
     }
 
-    annotation.contents().filter(|s| !s.is_empty())
+    // Legacy fallback, for documents written before the private key existed.
+    //
+    // Only accepted when it LOOKS like one of our tags. /Contents is a
+    // COMMENT: on any annotation this app did not write, it holds whatever a
+    // person typed. An unfiltered fallback hands that prose to the tag parsers
+    // as though this app had written it. They reject it today, but every
+    // parser sees it on every read, and one with a looser prefix would start
+    // claiming the user's own words.
+    annotation
+        .contents()
+        .filter(|s| looks_like_tag(s))
+}
+
+/// Whether a string is one of our tags rather than a person's words. Every tag
+/// this app has ever written starts with an id prefix or with `Ayaan`.
+fn looks_like_tag(s: &str) -> bool {
+    let body = strip_id_prefix(s).1;
+    body.starts_with("Ayaan")
 }
 
 const ID_PREFIX: &str = "ID:";
@@ -5888,6 +6223,124 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
             count += 1;
         }
     }
+
+    out[0..4].copy_from_slice(&count.to_le_bytes());
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+// ---------------------------------------------------------------------
+// Bookmarks (the document's own outline)
+//
+// Serialized into one ByteBuffer, little-endian:
+//   u32 count
+//   per entry: i32 depth, i32 page_index, u32 title_len, title bytes (UTF-8)
+//
+// FLAT, with a depth on each entry, rather than a nested structure. The panel
+// wants a list it can virtualize and indent, the FFI boundary has no cheap way
+// to express a tree, and pre-order plus depth is enough to rebuild one if it is
+// ever needed.
+//
+// page_index is -1 when the outline entry does not resolve to a page: an entry
+// can carry a remote or URI action, or a named destination the file never
+// defines. Those still SHOW, because they are part of the author's outline and
+// hiding them would silently rewrite the document's structure; they just do not
+// go anywhere when clicked.
+// ---------------------------------------------------------------------
+
+/// A malformed outline can be a cycle, and PDFium will happily walk one for
+/// ever. The walk is bounded rather than tracking visited handles, which are
+/// pub(crate) in the vendored crate and not reachable from here.
+const MAX_BOOKMARKS: u32 = 20_000;
+const MAX_BOOKMARK_DEPTH: i32 = 32;
+
+/// The document's outline, flattened in reading order. A document without one
+/// is a successful EMPTY result (count 0), not an error. Invalid handle ->
+/// STATUS_INVALID_INPUT; panic -> STATUS_PANIC.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_bookmarks(doc_handle: u64) -> ByteBuffer {
+    if doc_handle == 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_bookmarks_inner(doc_handle))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_bookmarks_inner(doc_handle: u64) -> ByteBuffer {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&0u32.to_le_bytes()); // count placeholder, backfilled below
+    let mut count: u32 = 0;
+
+    // Every call here is catalog-level: titles and destinations live in the
+    // outline dictionary, and FPDFDest_GetDestPageIndex answers from the page
+    // tree. Nothing in this walk LOADS a page, which is what keeps a 3352-page
+    // book's outline cheap.
+    fn walk(
+        node: Option<PdfBookmark<'_>>,
+        depth: i32,
+        out: &mut Vec<u8>,
+        count: &mut u32,
+    ) {
+        let mut current = node;
+        while let Some(bookmark) = current {
+            if *count >= MAX_BOOKMARKS {
+                return;
+            }
+
+            let title = bookmark.title().unwrap_or_default();
+
+            // A destination directly, or the one inside a GoTo action. Plenty
+            // of real files use the action form, and an outline that lost half
+            // its targets to reading only the first would look broken.
+            //
+            // The action is bound to a local rather than chained: the
+            // destination inside it BORROWS from the action, so a chained
+            // temporary would be dropped while still borrowed.
+            let page_index = if let Some(dest) = bookmark.destination() {
+                dest.page_index().map(|i| i as i32).unwrap_or(-1)
+            } else if let Some(action) = bookmark.action() {
+                action
+                    .as_local_destination_action()
+                    .and_then(|a| a.destination().ok())
+                    .and_then(|d| d.page_index().ok())
+                    .map(|i| i as i32)
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+
+            out.extend_from_slice(&depth.to_le_bytes());
+            out.extend_from_slice(&page_index.to_le_bytes());
+            out.extend_from_slice(&(title.len() as u32).to_le_bytes());
+            out.extend_from_slice(title.as_bytes());
+            *count += 1;
+
+            if depth < MAX_BOOKMARK_DEPTH {
+                walk(bookmark.first_child(), depth + 1, out, count);
+            }
+
+            current = bookmark.next_sibling();
+        }
+    }
+
+    walk(doc_guard.bookmarks().root(), 0, &mut out, &mut count);
 
     out[0..4].copy_from_slice(&count.to_le_bytes());
 
@@ -9019,6 +9472,278 @@ mod tests {
         annotation_tag(&annotation)
     }
 
+    fn glyph(id: u32, cluster: u32) -> ShapedGlyph {
+        ShapedGlyph { id, x_advance: 10.0, x_offset: 0.0, y_offset: 0.0, cluster }
+    }
+
+    #[test]
+    fn one_character_per_glyph_maps_straight_across() {
+        // The simple case, and the baseline the harder ones are judged against.
+        let glyphs = [glyph(40, 0), glyph(41, 1), glyph(42, 2)];
+        assert_eq!(
+            glyph_text_map(&glyphs, "abc"),
+            vec![(40, "a".into()), (41, "b".into()), (42, "c".into())]
+        );
+    }
+
+    #[test]
+    fn several_glyphs_from_one_character_do_not_repeat_its_text() {
+        // A base plus its marks: three glyphs, all cluster 0. Giving the text
+        // to each would make copying the line repeat that character three
+        // times, which is the classic broken-ToUnicode symptom.
+        let glyphs = [glyph(40, 0), glyph(300, 0), glyph(301, 0), glyph(41, 3)];
+        assert_eq!(
+            glyph_text_map(&glyphs, "\u{1000}b"),
+            vec![(40, "\u{1000}".into()), (41, "b".into())]
+        );
+    }
+
+    #[test]
+    fn one_glyph_from_several_characters_carries_all_of_them() {
+        // A Burmese stack: MA, SIGN VIRAMA, TA shaped into a single glyph. The
+        // whole cluster has to come back or the text is silently truncated on
+        // copy. This is exactly why the CMap needs multi-character
+        // destinations rather than a one-to-one table.
+        let source = "\u{1019}\u{1039}\u{1010}";
+        let glyphs = [glyph(500, 0)];
+        assert_eq!(glyph_text_map(&glyphs, source), vec![(500, source.to_string())]);
+    }
+
+    #[test]
+    fn a_right_to_left_run_still_reports_the_right_text() {
+        // Arabic shapes into visual order, so the glyphs arrive with DECREASING
+        // clusters. Taking each cluster's extent from glyph order rather than
+        // from the sorted boundaries would give every glyph the wrong span.
+        let source = "\u{0627}\u{0644}\u{0645}"; // alef lam meem
+        let glyphs = [glyph(70, 4), glyph(71, 2), glyph(72, 0)];
+
+        let mut got = glyph_text_map(&glyphs, source);
+        got.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            got,
+            vec![
+                (70, "\u{0645}".into()),
+                (71, "\u{0644}".into()),
+                (72, "\u{0627}".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cluster_landing_mid_character_is_dropped_rather_than_panicking() {
+        // Byte offsets come from the shaper. A malformed run must not index a
+        // String at a non-boundary, which panics.
+        let glyphs = [glyph(40, 1)];
+        assert!(glyph_text_map(&glyphs, "\u{1019}").is_empty());
+    }
+
+    #[test]
+    fn the_cmap_declares_two_byte_codes_and_utf16_destinations() {
+        let cmap = build_tounicode_cmap(&[(0x1F, "a".into())]);
+
+        // Identity encoding means the code IS the glyph index, two bytes wide.
+        assert!(cmap.contains("<0000> <FFFF>"), "codespace missing: {cmap}");
+        assert!(cmap.contains("<001F> <0061>"), "mapping missing: {cmap}");
+        assert!(cmap.contains("begincmap") && cmap.contains("endcmap"));
+        assert!(cmap.contains("/CMapType 2 def"));
+    }
+
+    #[test]
+    fn a_multi_character_destination_is_written_as_consecutive_utf16_units() {
+        // The Burmese stack again, this time through the serializer. Three
+        // characters behind one glyph, so the destination is three UTF-16 units
+        // end to end.
+        let cmap = build_tounicode_cmap(&[(500, "\u{1019}\u{1039}\u{1010}".into())]);
+        assert!(cmap.contains("<01F4> <101910391010>"), "{cmap}");
+    }
+
+    #[test]
+    fn a_destination_outside_the_basic_plane_becomes_a_surrogate_pair() {
+        // Emoji and rare CJK live above U+FFFF, and a bfchar destination is
+        // UTF-16, so they must come out as two units rather than one truncated
+        // one.
+        let cmap = build_tounicode_cmap(&[(9, "\u{1F600}".into())]);
+        assert!(cmap.contains("<0009> <D83DDE00>"), "{cmap}");
+    }
+
+    #[test]
+    fn long_runs_are_split_into_sections_of_at_most_a_hundred() {
+        // The spec's limit on a bfchar section. Some readers reject a longer
+        // one outright, which would lose the whole document's text rather than
+        // one glyph's.
+        let mappings: Vec<(u32, String)> =
+            (0..250u32).map(|i| (i, char::from(b'a' + (i % 26) as u8).to_string())).collect();
+        let cmap = build_tounicode_cmap(&mappings);
+
+        assert_eq!(cmap.matches("beginbfchar").count(), 3);
+        assert_eq!(cmap.matches("endbfchar").count(), 3);
+        assert!(cmap.contains("100 beginbfchar"));
+        assert!(cmap.contains("50 beginbfchar"));
+    }
+
+    #[test]
+    fn a_glyph_mapped_twice_appears_once() {
+        // The same glyph is drawn wherever its characters recur, so the
+        // accumulated list has duplicates. A CMap with a repeated code is
+        // malformed.
+        let cmap = build_tounicode_cmap(&[(7, "a".into()), (7, "a".into()), (8, "b".into())]);
+        assert_eq!(cmap.matches("<0007>").count(), 1, "{cmap}");
+        assert!(cmap.contains("2 beginbfchar"));
+    }
+
+    /// A text box on a page, written the way the app writes one.
+    fn page_with_text_box(words: &str, font_path: Option<&str>) -> u64 {
+        let bytes = words.as_bytes();
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let (fp, fl) = match font_path {
+            Some(p) => (p.as_ptr(), p.len()),
+            None => (std::ptr::null(), 0),
+        };
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 200.0,
+                bytes.as_ptr(), bytes.len(), 28.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0, 0, 0.0, fp, fl, 0, 0),
+            STATUS_OK_PDFIUM);
+        h
+    }
+
+    fn text_after_round_trip(handle: u64) -> String {
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        let text = page_text(reopened, 0);
+        close_document(reopened);
+        free_byte_buffer(saved);
+        text
+    }
+
+    #[test]
+    fn a_text_box_is_not_searchable_until_the_layer_is_written() {
+        // The starting state, asserted so the next test is measuring something.
+        // Our text boxes draw shaped glyphs inside a stamp annotation, and a
+        // page's text layer is its CONTENT stream, so the words are simply not
+        // there to be found.
+        let h = page_with_text_box("Findable Words", None);
+        assert!(
+            !text_after_round_trip(h).contains("Findable Words"),
+            "a text box was searchable before the layer existed, so this test proves nothing");
+        close_document(h);
+    }
+
+    #[test]
+    fn writing_the_layer_makes_a_text_box_searchable() {
+        let h = page_with_text_box("Findable Words", None);
+        let pages = [0i32];
+        assert_eq!(
+            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+            STATUS_OK_PDFIUM);
+
+        assert!(
+            text_after_round_trip(h).contains("Findable Words"),
+            "the words are still not in the page's text");
+        close_document(h);
+    }
+
+    #[test]
+    fn saving_twice_does_not_find_the_same_words_twice() {
+        // THE trap. The layer is regenerated on every save, so without finding
+        // and removing the previous one, a document saved five times contains
+        // five invisible copies of every text box and search reports five hits
+        // for one word.
+        let h = page_with_text_box("Once Only", None);
+        let pages = [0i32];
+
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+                STATUS_OK_PDFIUM);
+        }
+
+        let text = text_after_round_trip(h);
+        assert_eq!(
+            text.matches("Once Only").count(),
+            1,
+            "expected exactly one copy after three syncs, got: {text:?}");
+        close_document(h);
+    }
+
+    #[test]
+    fn the_layer_changes_no_pixels() {
+        // The whole promise. Two weeks of shaping work sits in the visible
+        // glyphs, and the searchable copy must not touch a single one of them.
+        let h = page_with_text_box("Invisible Please", None);
+
+        let before = render_low_res(h, 0, 900);
+        let before_pixels =
+            unsafe { std::slice::from_raw_parts(before.buffer, before.len as usize) }.to_vec();
+        free_render_result(before);
+
+        let pages = [0i32];
+        assert_eq!(
+            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+            STATUS_OK_PDFIUM);
+
+        let after = render_low_res(h, 0, 900);
+        let after_pixels =
+            unsafe { std::slice::from_raw_parts(after.buffer, after.len as usize) }.to_vec();
+        free_render_result(after);
+
+        assert_eq!(before_pixels, after_pixels, "the searchable layer was drawn");
+        close_document(h);
+    }
+
+    #[test]
+    fn the_text_box_is_still_an_editable_object_afterwards() {
+        // The other promise. The layer is a second copy in the page content;
+        // the annotation and its tag have to come back untouched or the box
+        // stops being re-editable in the app.
+        let h = page_with_text_box("Still Mine", None);
+        let pages = [0i32];
+        assert_eq!(
+            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+            STATUS_OK_PDFIUM);
+
+        let saved = snapshot_document(h);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        let tag = contents_of(reopened, 0, 0).expect("the annotation is gone");
+        assert_eq!(parse_textbox_tag(&tag).map(|t| t.5), Some("Still Mine".to_string()));
+
+        close_document(reopened);
+        close_document(h);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn sync_text_layer_rejects_bad_input() {
+        assert_eq!(
+            unsafe { sync_text_layer(0, std::ptr::null(), 0) },
+            STATUS_INVALID_INPUT);
+        assert_eq!(
+            unsafe { sync_text_layer(999_999, std::ptr::null(), 0) },
+            STATUS_INVALID_INPUT);
+
+        // A page index that does not exist is skipped, not an error: the caller
+        // may be working from a stale list after pages were deleted.
+        let h = page_with_text_box("x", None);
+        let pages = [0i32, 9999, -1];
+        assert_eq!(
+            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+            STATUS_OK_PDFIUM);
+        close_document(h);
+    }
+
+    #[test]
+    fn a_persons_own_words_are_never_mistaken_for_a_tag() {
+        // The legacy fallback reads /Contents when the private key is missing,
+        // and /Contents is a comment: on a foreign annotation it holds whatever
+        // a person typed. Without this guard that prose is handed to the tag
+        // parsers as though this app had written it.
+        assert!(looks_like_tag("AyaanShape:1:2"));
+        assert!(looks_like_tag("ID:0123456789abcdef0123456789abcdef|AyaanText:12:000000FF:aGk="));
+        assert!(!looks_like_tag("Please review this paragraph"));
+        assert!(!looks_like_tag("မေတ္တာ သစ္စာ"));
+        assert!(!looks_like_tag(""));
+    }
+
     #[test]
     fn a_shapes_kind_and_style_survive_a_save_and_reopen() {
         // The whole point of the tag. Written as ink, a reopened shape is
@@ -11425,6 +12150,622 @@ mod tests {
 
         let choice = fields.iter().find(|f| f.name == "Country").unwrap();
         assert_eq!(choice.kind, FIELD_COMBO);
+
+        close_document(handle);
+    }
+
+    #[derive(Debug)]
+    struct ParsedBookmark {
+        depth: i32,
+        page_index: i32,
+        title: String,
+    }
+
+    fn parse_bookmarks(buf: &ByteBuffer) -> Vec<ParsedBookmark> {
+        assert_eq!(buf.status, STATUS_OK_PDFIUM, "get_bookmarks failed");
+        let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
+        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+
+        let mut out = Vec::with_capacity(count);
+        let mut p = 4usize;
+        for _ in 0..count {
+            let depth = i32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+            let page_index = i32::from_le_bytes(bytes[p + 4..p + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(bytes[p + 8..p + 12].try_into().unwrap()) as usize;
+            let title = String::from_utf8(bytes[p + 12..p + 12 + len].to_vec()).unwrap();
+            p += 12 + len;
+            out.push(ParsedBookmark { depth, page_index, title });
+        }
+        assert_eq!(p, buf.len, "trailing bytes: the entries did not fill the buffer");
+        out
+    }
+
+    #[test]
+    fn get_bookmarks_reads_the_outline_in_reading_order_with_its_nesting() {
+        let handle = open_fixture_named("tests/fixtures/sample_outline.pdf");
+        let buf = get_bookmarks(handle);
+        let marks = parse_bookmarks(&buf);
+        free_byte_buffer(buf);
+
+        // PRE-ORDER: a child comes directly after its parent, not after the
+        // parent's siblings. That is what lets the panel render the list top to
+        // bottom and indent by depth without rebuilding a tree.
+        let shape: Vec<(&str, i32, i32)> = marks
+            .iter()
+            .map(|m| (m.title.as_str(), m.depth, m.page_index))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Chapter One", 0, 0),
+                ("Section 1.1", 1, 1),
+                // Target given as a GoTo ACTION rather than a /Dest. Real files
+                // use both, and reading only /Dest loses these silently.
+                ("Chapter Two", 0, 2),
+                // No target at all. It is still part of the author's outline,
+                // so it is listed, with -1 saying it goes nowhere.
+                ("Nowhere", 0, -1),
+            ]
+        );
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn get_bookmarks_rejects_bad_input_and_is_empty_for_a_document_without_an_outline() {
+        assert_eq!(get_bookmarks(0).status, STATUS_INVALID_INPUT);
+        assert_eq!(get_bookmarks(999_999).status, STATUS_INVALID_INPUT);
+
+        // No outline is a successful EMPTY answer, not a failure: most PDFs
+        // have none, and the panel needs to tell "nothing to show" apart from
+        // "could not read it".
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let buf = get_bookmarks(handle);
+        let marks = parse_bookmarks(&buf);
+        free_byte_buffer(buf);
+        assert!(marks.is_empty(), "expected no bookmarks, got {marks:?}");
+
+        close_document(handle);
+    }
+
+    /// Serializes entries in the layout write_outline expects, which is the
+    /// same one get_bookmarks produces.
+    fn outline_buffer(entries: &[(i32, i32, &str)]) -> Vec<u8> {
+        let mut out = (entries.len() as u32).to_le_bytes().to_vec();
+        for (depth, page, title) in entries {
+            out.extend_from_slice(&depth.to_le_bytes());
+            out.extend_from_slice(&page.to_le_bytes());
+            out.extend_from_slice(&(title.len() as u32).to_le_bytes());
+            out.extend_from_slice(title.as_bytes());
+        }
+        out
+    }
+
+    fn write_outline_to(src: &str, dst: &std::path::Path, entries: &[(i32, i32, &str)]) -> i32 {
+        let buf = outline_buffer(entries);
+        let c_src = std::ffi::CString::new(src).unwrap();
+        let c_dst = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+        unsafe {
+            crate::outline::write_outline(c_src.as_ptr(), c_dst.as_ptr(), buf.as_ptr(), buf.len())
+        }
+    }
+
+    fn read_back(path: &std::path::Path) -> Vec<ParsedBookmark> {
+        let handle = open_fixture_named(path.to_str().unwrap());
+        assert_ne!(handle, 0, "could not reopen the written file");
+        let buf = get_bookmarks(handle);
+        let marks = parse_bookmarks(&buf);
+        free_byte_buffer(buf);
+        close_document(handle);
+        marks
+    }
+
+    #[test]
+    fn an_outline_written_by_lopdf_is_read_back_by_pdfium() {
+        // The real proof that the writer works: two independent libraries, one
+        // writing the /Outlines tree as raw PDF objects and the other reading
+        // it through its own parser, have to agree about the result. A test
+        // that only read the file back with lopdf would mostly be checking that
+        // lopdf can parse its own output.
+        let out = std::env::temp_dir().join("ayaan_outline_roundtrip.pdf");
+        let status = write_outline_to(
+            "tests/fixtures/sample_20pages.pdf",
+            &out,
+            &[
+                (0, 0, "Chapter One"),
+                (1, 3, "Section 1.1"),
+                (2, 4, "Detail 1.1.1"),
+                (0, 9, "Chapter Two"),
+            ],
+        );
+        assert_eq!(status, STATUS_OK_PDFIUM);
+
+        let marks = read_back(&out);
+        let shape: Vec<(&str, i32, i32)> = marks
+            .iter()
+            .map(|m| (m.title.as_str(), m.depth, m.page_index))
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec![
+                ("Chapter One", 0, 0),
+                ("Section 1.1", 1, 3),
+                ("Detail 1.1.1", 2, 4),
+                ("Chapter Two", 0, 9),
+            ]
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_title_in_devanagari_or_burmese_survives_the_write() {
+        // PDFDocEncoding cannot represent these at all, so the title has to go
+        // out as UTF-16BE behind a byte-order mark. Writing the raw UTF-8 bytes
+        // would come back as mojibake, and this is the user's own alphabet.
+        let out = std::env::temp_dir().join("ayaan_outline_unicode.pdf");
+        let status = write_outline_to(
+            "tests/fixtures/sample_20pages.pdf",
+            &out,
+            &[(0, 0, "अध्याय एक"), (0, 1, "နောက်ဆုံး"), (0, 2, "Plain ASCII")],
+        );
+        assert_eq!(status, STATUS_OK_PDFIUM);
+
+        let titles: Vec<String> = read_back(&out).into_iter().map(|m| m.title).collect();
+        assert_eq!(titles, vec!["अध्याय एक", "နောက်ဆုံး", "Plain ASCII"]);
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn an_entry_with_no_page_is_written_and_comes_back_targetless() {
+        let out = std::env::temp_dir().join("ayaan_outline_notarget.pdf");
+        let status = write_outline_to(
+            "tests/fixtures/sample_20pages.pdf",
+            &out,
+            &[(0, -1, "Preface"), (0, 2, "Real page")],
+        );
+        assert_eq!(status, STATUS_OK_PDFIUM);
+
+        let marks = read_back(&out);
+        assert_eq!(marks[0].page_index, -1, "no destination was written");
+        assert_eq!(marks[1].page_index, 2);
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_depth_that_skips_a_generation_is_still_written_as_a_tree() {
+        // An outline entry with no parent cannot be expressed in a PDF at all,
+        // so a depth deeper than the tree has reached is pulled up rather than
+        // producing a broken file.
+        let out = std::env::temp_dir().join("ayaan_outline_gap.pdf");
+        let status = write_outline_to(
+            "tests/fixtures/sample_20pages.pdf",
+            &out,
+            &[(3, 0, "Starts deep"), (7, 1, "Deeper still")],
+        );
+        assert_eq!(status, STATUS_OK_PDFIUM);
+
+        let marks = read_back(&out);
+        assert_eq!(marks[0].depth, 0, "first entry must be top level");
+        assert_eq!(marks[1].depth, 1, "a child may only be one deeper");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn regenerating_replaces_the_previous_outline_instead_of_stacking_on_it() {
+        // Running auto-bookmark twice must not leave the first outline in the
+        // file, as unreferenced objects that grow it on every run.
+        let first = std::env::temp_dir().join("ayaan_outline_first.pdf");
+        let second = std::env::temp_dir().join("ayaan_outline_second.pdf");
+
+        assert_eq!(
+            write_outline_to("tests/fixtures/sample_20pages.pdf", &first,
+                &[(0, 0, "Old One"), (0, 1, "Old Two")]),
+            STATUS_OK_PDFIUM
+        );
+        assert_eq!(
+            write_outline_to(first.to_str().unwrap(), &second, &[(0, 5, "New Only")]),
+            STATUS_OK_PDFIUM
+        );
+
+        let titles: Vec<String> = read_back(&second).into_iter().map(|m| m.title).collect();
+        assert_eq!(titles, vec!["New Only"], "the old outline is gone, not appended to");
+
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+    }
+
+    #[test]
+    fn an_empty_list_removes_the_outline() {
+        let out = std::env::temp_dir().join("ayaan_outline_cleared.pdf");
+        assert_eq!(
+            write_outline_to("tests/fixtures/sample_outline.pdf", &out, &[]),
+            STATUS_OK_PDFIUM
+        );
+
+        assert!(read_back(&out).is_empty(), "clearing must leave no bookmarks");
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn write_outline_rejects_bad_input_without_writing_anything() {
+        let out = std::env::temp_dir().join("ayaan_outline_never.pdf");
+        let _ = std::fs::remove_file(&out);
+
+        let buf = outline_buffer(&[(0, 0, "One")]);
+        let c_out = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+
+        // Null paths.
+        assert_eq!(
+            unsafe { crate::outline::write_outline(std::ptr::null(), c_out.as_ptr(), buf.as_ptr(), buf.len()) },
+            STATUS_INVALID_INPUT
+        );
+
+        // A count that promises more entries than the buffer holds. Reading it
+        // would run off the end of memory the caller owns.
+        let mut lying = buf.clone();
+        lying[0..4].copy_from_slice(&99u32.to_le_bytes());
+        let c_src = std::ffi::CString::new("tests/fixtures/sample_20pages.pdf").unwrap();
+        assert_eq!(
+            unsafe { crate::outline::write_outline(c_src.as_ptr(), c_out.as_ptr(), lying.as_ptr(), lying.len()) },
+            STATUS_INVALID_INPUT
+        );
+
+        // A source that is not a PDF at all.
+        let c_bad = std::ffi::CString::new("tests/fixtures/does_not_exist.pdf").unwrap();
+        assert_eq!(
+            unsafe { crate::outline::write_outline(c_bad.as_ptr(), c_out.as_ptr(), buf.as_ptr(), buf.len()) },
+            STATUS_UNSUPPORTED
+        );
+
+        assert!(!out.exists(), "a rejected call must not have written a file");
+    }
+
+    /// Writes a Burmese text box to a real file, so what a FOREIGN reader sees
+    /// can be checked in the bytes rather than inferred. Ignored by default:
+    ///   set TEXTBOX_OUT=C:\path\to\out.pdf
+    ///   cargo test dump_text_box_contents -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_text_box_contents_to_a_file() {
+        let Ok(out) = std::env::var("TEXTBOX_OUT") else {
+            eprintln!("set TEXTBOX_OUT to a destination path");
+            return;
+        };
+
+        let words = "မေတ္တာ သစ္စာ အတို့အမြှုပ်";
+        let bytes = words.as_bytes();
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 200.0,
+                bytes.as_ptr(), bytes.len(), 28.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0, 0, 0.0, std::ptr::null(), 0, 0, 0),
+            STATUS_OK_PDFIUM);
+
+        let c_out = std::ffi::CString::new(out.clone()).unwrap();
+        assert_eq!(unsafe { save_document(h, c_out.as_ptr()) }, STATUS_OK_PDFIUM);
+        println!("wrote {out}");
+        close_document(h);
+    }
+
+    /// Does PDFium embed the font bytes we hand it verbatim, or subset them?
+    /// The answer decides how our font is identified in the saved file when the
+    /// /ToUnicode CMap is attached. Ignored by default:
+    ///   cargo test dump_embedded_font_bytes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_embedded_font_bytes() {
+        let font_path = r"C:\Windows\Fonts\mmrtext.ttf";
+        let Ok(source) = std::fs::read(font_path) else {
+            eprintln!("no {font_path}");
+            return;
+        };
+        println!("source font: {} bytes", source.len());
+
+        let words = "မေတ္တာ".as_bytes();
+        let font_utf8 = font_path.as_bytes();
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 200.0,
+                words.as_ptr(), words.len(), 28.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0, 0, 0.0, font_utf8.as_ptr(), font_utf8.len(), 0, 0),
+            STATUS_OK_PDFIUM);
+
+        let out = std::env::temp_dir().join("ayaan_font_probe.pdf");
+        let c_out = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { save_document(h, c_out.as_ptr()) }, STATUS_OK_PDFIUM);
+        close_document(h);
+
+        // Read the saved file back with lopdf and describe every font in it.
+        let doc = lopdf::Document::load(&out).unwrap();
+        for (id, obj) in doc.objects.iter() {
+            let lopdf::Object::Dictionary(d) = obj else { continue };
+            if d.get(b"Type").and_then(|o| o.as_name()).ok() != Some(b"Font") {
+                continue;
+            }
+            let subtype = d.get(b"Subtype").and_then(|o| o.as_name()).ok()
+                .map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
+            let base = d.get(b"BaseFont").and_then(|o| o.as_name()).ok()
+                .map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
+            let enc = d.get(b"Encoding").and_then(|o| o.as_name()).ok()
+                .map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
+            let has_tu = d.has(b"ToUnicode");
+            println!("{id:?} {subtype} base={base} enc={enc} ToUnicode={has_tu}");
+        }
+
+        // And every embedded font file, with its size next to the source's.
+        for (id, obj) in doc.objects.iter() {
+            let lopdf::Object::Stream(s) = obj else { continue };
+            if !s.dict.has(b"Length1") && !s.dict.has(b"Subtype") {
+                continue;
+            }
+            if let Ok(data) = s.decompressed_content() {
+                println!(
+                    "stream {id:?}: {} bytes, identical to source = {}",
+                    data.len(),
+                    data == source
+                );
+            }
+        }
+
+        // And the ToUnicode CMap PDFium wrote by itself, if any.
+        for (id, obj) in doc.objects.iter() {
+            let lopdf::Object::Dictionary(d) = obj else { continue };
+            if d.get(b"Type").and_then(|o| o.as_name()).ok() != Some(b"Font") { continue; }
+            if let Ok(lopdf::Object::Reference(tu)) = d.get(b"ToUnicode") {
+                if let Ok(lopdf::Object::Stream(s)) = doc.get_object(*tu) {
+                    let body = s.decompressed_content().unwrap_or_default();
+                    println!("--- ToUnicode of {id:?} ({} bytes) ---", body.len());
+                    println!("{}", String::from_utf8_lossy(&body));
+                }
+            }
+        }
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// SPIKE: does an invisible text run in the PAGE CONTENT make our words
+    /// searchable without changing a single pixel? Ignored by default:
+    ///   cargo test dump_invisible_text_layer -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_invisible_text_layer() {
+        use pdfium_render::prelude::*;
+
+        let font_path = r"C:\Windows\Fonts\mmrtext.ttf";
+        let Ok(font_bytes) = std::fs::read(font_path) else {
+            eprintln!("no {font_path}");
+            return;
+        };
+        let words = "\u{1019}\u{1031}\u{1010}\u{1039}\u{1010}\u{102c}";
+        let bytes = words.as_bytes();
+        let font_utf8 = font_path.as_bytes();
+
+        // A page with our text box on it, exactly as the app writes one.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 200.0,
+                bytes.as_ptr(), bytes.len(), 28.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0, 0, 0.0, font_utf8.as_ptr(), font_utf8.len(), 0, 0),
+            STATUS_OK_PDFIUM);
+
+        let before = render_low_res(h, 0, 900);
+        let before_pixels =
+            unsafe { std::slice::from_raw_parts(before.buffer, before.len as usize) }.to_vec();
+        free_render_result(before);
+
+        // Now add the SAME words as an invisible run straight into the page.
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&h).cloned().unwrap();
+            let mut doc_guard = lock(&doc);
+            let token = doc_guard
+                .fonts_mut()
+                .load_true_type_from_bytes(&font_bytes, true)
+                .expect("font load failed");
+            let font = doc_guard.fonts().get(token).expect("font token lookup failed");
+            let mut page = doc_guard.pages().get(0).unwrap();
+            let mut obj = PdfPageTextObject::new(
+                &doc_guard, words, font, PdfPoints::new(28.0)).expect("text object failed");
+            obj.set_render_mode(PdfPageTextRenderMode::Invisible).expect("render mode failed");
+            obj.translate(PdfPoints::new(100.0), PdfPoints::new(600.0)).unwrap();
+            page.objects_mut().add_text_object(obj).expect("add failed");
+            page.regenerate_content().expect("regenerate failed");
+        }
+        evict_all_cache_for_doc(h);
+
+        let saved = snapshot_document(h);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+
+        let text = page_text(reopened, 0);
+        println!("expected words   : {words:?}");
+        println!("extracted        : {text:?}");
+        println!("SEARCHABLE       : {}", text.contains(words));
+
+        let after = render_low_res(reopened, 0, 900);
+        let after_pixels =
+            unsafe { std::slice::from_raw_parts(after.buffer, after.len as usize) }.to_vec();
+        free_render_result(after);
+        println!(
+            "PIXELS UNCHANGED : {} ({} vs {} bytes)",
+            before_pixels == after_pixels, before_pixels.len(), after_pixels.len());
+
+        close_document(reopened);
+        close_document(h);
+        free_byte_buffer(saved);
+    }
+
+    /// Can PDFium's own extractor read our text back? Ignored by default:
+    ///   cargo test dump_is_our_text_extractable -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_is_our_text_extractable() {
+        let font_path = r"C:\Windows\Fonts\mmrtext.ttf";
+        if std::fs::metadata(font_path).is_err() {
+            eprintln!("no {font_path}");
+            return;
+        }
+        let font_utf8 = font_path.as_bytes();
+        let words = "\u{1019}\u{1031}\u{1010}\u{1039}\u{1010}\u{102c}";
+        let bytes = words.as_bytes();
+
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(
+            add_text_box_annotation_styled(h, 0, 1000, 100.0, 100.0, 700.0, 200.0,
+                bytes.as_ptr(), bytes.len(), 28.0, 0, 0, 0, 255,
+                ALIGN_LEFT, 0, 0, 0.0, font_utf8.as_ptr(), font_utf8.len(), 0, 0),
+            STATUS_OK_PDFIUM);
+
+        let saved = snapshot_document(h);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        let text = page_text(reopened, 0);
+
+        println!("expected page text : {words:?}");
+        println!("extracted page text: {text:?}");
+        println!("contains our words : {}", text.contains(words));
+
+        close_document(reopened);
+        close_document(h);
+        free_byte_buffer(saved);
+    }
+
+    /// Renders a page of any document to raw BGRA, for looking at a real file
+    /// rather than reasoning about it. Ignored by default; run with
+    ///   set RENDER_PDF=C:\path\to\file.pdf   (optionally RENDER_PAGE, RENDER_W)
+    ///   cargo test dump_render_page -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_render_page_of_a_real_document() {
+        let Ok(path) = std::env::var("RENDER_PDF") else {
+            eprintln!("set RENDER_PDF to a file path");
+            return;
+        };
+        let page: i32 = std::env::var("RENDER_PAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let width: i32 = std::env::var("RENDER_W").ok().and_then(|v| v.parse().ok()).unwrap_or(1400);
+
+        let handle = open_fixture_named(&path);
+        assert_ne!(handle, 0, "could not open {path}");
+        println!("pages: {}", get_page_count(handle));
+
+        let r = render_low_res(handle, page, width);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(r.buffer, r.len as usize) };
+        let out = std::env::var("RENDER_OUT").unwrap_or_else(|_| "page.raw".to_string());
+        std::fs::write(&out, bytes).unwrap();
+        println!("DUMP {out} {}x{}", r.width, r.height);
+
+        free_render_result(r);
+        close_document(handle);
+    }
+
+    /// Writes an outline into a real book, to check the writer against a file
+    /// size the fixtures cannot stand in for. Ignored by default; run with
+    ///   set OUTLINE_PDF=C:\path\to\book.pdf
+    ///   cargo test dump_write_outline -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_write_outline_into_a_real_document() {
+        let Ok(path) = std::env::var("OUTLINE_PDF") else {
+            eprintln!("set OUTLINE_PDF to a file path");
+            return;
+        };
+
+        let out = std::env::temp_dir().join("ayaan_outline_big.pdf");
+        let entries: Vec<(i32, i32, String)> = (0..18)
+            .map(|i| (if i % 3 == 0 { 0 } else { 1 }, i * 150, format!("अध्याय {}", i + 1)))
+            .collect();
+        let borrowed: Vec<(i32, i32, &str)> =
+            entries.iter().map(|(d, p, t)| (*d, *p, t.as_str())).collect();
+
+        let started = std::time::Instant::now();
+        let status = write_outline_to(&path, &out, &borrowed);
+        let elapsed = started.elapsed();
+        assert_eq!(status, STATUS_OK_PDFIUM, "write failed");
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        let after = std::fs::metadata(&out).unwrap().len();
+        println!(
+            "wrote in {elapsed:?}; {:.1} MB -> {:.1} MB",
+            before as f64 / 1e6,
+            after as f64 / 1e6
+        );
+
+        let marks = read_back(&out);
+        println!("read back {} bookmarks", marks.len());
+        for m in marks.iter().take(4) {
+            println!("{}[p{}] {}", "    ".repeat(m.depth as usize), m.page_index + 1, m.title);
+        }
+        assert_eq!(marks.len(), 18);
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Dumps every page's text, one page per record separated by a form feed,
+    /// so the heading detector on the C# side can be checked against a real
+    /// document without that document having to live in the repository.
+    ///   set TEXT_PDF=C:\path\to\file.pdf
+    ///   set TEXT_OUT=C:\path\to\dump.txt
+    ///   cargo test dump_page_text -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_page_text_of_a_real_document() {
+        let (Ok(path), Ok(out)) = (std::env::var("TEXT_PDF"), std::env::var("TEXT_OUT")) else {
+            eprintln!("set TEXT_PDF and TEXT_OUT");
+            return;
+        };
+
+        let handle = open_fixture_named(&path);
+        assert_ne!(handle, 0, "could not open {path}");
+
+        let pages = get_page_count(handle);
+        let mut dump = String::new();
+        for i in 0..pages {
+            if i > 0 {
+                dump.push('\u{000C}');
+            }
+            dump.push_str(&page_text(handle, i));
+        }
+
+        std::fs::write(&out, dump).unwrap();
+        println!("wrote {pages} pages of text to {out}");
+        close_document(handle);
+    }
+
+    /// Prints the outline of a real book, for checking the reader against a
+    /// file the fixtures cannot stand in for. Ignored by default; run with
+    ///   set BOOKMARK_PDF=C:\path\to\book.pdf
+    ///   cargo test dump_bookmarks -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_bookmarks_of_a_real_document() {
+        let Ok(path) = std::env::var("BOOKMARK_PDF") else {
+            eprintln!("set BOOKMARK_PDF to a file path");
+            return;
+        };
+
+        let handle = open_fixture_named(&path);
+        assert_ne!(handle, 0, "could not open {path}");
+
+        let started = std::time::Instant::now();
+        let buf = get_bookmarks(handle);
+        let elapsed = started.elapsed();
+        let marks = parse_bookmarks(&buf);
+        free_byte_buffer(buf);
+
+        println!(
+            "{} pages, {} bookmarks, read in {:?}",
+            get_page_count(handle),
+            marks.len(),
+            elapsed
+        );
+        for m in marks.iter().take(15) {
+            println!("{}[p{}] {}", "    ".repeat(m.depth as usize), m.page_index + 1, m.title);
+        }
 
         close_document(handle);
     }

@@ -526,13 +526,18 @@ public sealed partial class MainPage : Page
         DispatcherQueue.TryEnqueue(() => ScrollToPage(pageIndex, animate));
 
     /// <summary>
-    /// Brings a page to the top of the viewport, animated by default.
+    /// Brings a page to the top of the viewport, animated over short distances.
     ///
     /// The page top is in SLOT space (unzoomed DIPs), and the ScrollView wants
     /// a zoomed offset, so it is multiplied by the zoom factor. The host's top
     /// padding is part of the content, so it is included; a small lead-in is
     /// subtracted so the page does not sit flush against the top edge, which
     /// looks like it has been cut off rather than scrolled to.
+    ///
+    /// Whether it glides or jumps is decided by DISTANCE, not by the caller
+    /// alone. An animated scroll's duration grows with how far it travels and
+    /// every frame is rendered, so a bookmark 1500 pages away took nearly half
+    /// a minute to arrive at. See <see cref="ScrollAnimation"/>.
     /// </summary>
     private void ScrollToPage(int pageIndex, bool animate)
     {
@@ -543,13 +548,18 @@ public sealed partial class MainPage : Page
         double target = (slotTop + ViewportHost.Padding.Top) * zoom - LeadIn;
         target = Math.Max(0, target);
 
-        Diag.Log($"scrollToPage {pageIndex}: from {PageScroller.VerticalOffset:F0} to {target:F0} animate={animate}");
+        double from = PageScroller.VerticalOffset;
+        bool glide = ScrollAnimation.ShouldAnimate(from, target, PageScroller.ViewportHeight, animate);
+
+        Diag.Log(
+            $"scrollToPage {pageIndex}: from {from:F0} to {target:F0} " +
+            $"asked={animate} glide={glide} viewport={PageScroller.ViewportHeight:F0}");
 
         PageScroller.ScrollTo(
             PageScroller.HorizontalOffset,
             target,
             new ScrollingScrollOptions(
-                animate ? ScrollingAnimationMode.Enabled : ScrollingAnimationMode.Disabled,
+                glide ? ScrollingAnimationMode.Enabled : ScrollingAnimationMode.Disabled,
                 ScrollingSnapPointsMode.Ignore));
     }
 
@@ -3065,15 +3075,26 @@ public sealed partial class MainPage : Page
         // Every surface takes the tint, not only the canvas. Painting one and
         // leaving the rail, the property bar and the status bar in Fluent's own
         // greys is what made Dark blue read as "grey app with a blue hole in
-        // it" rather than a blue app. Null means the theme keeps Fluent's own
-        // materials, so Light and Dark are untouched.
-        if (Theming.ChromeBrush(s.Theme) is { } chrome)
-        {
-            ToolRail.Background = chrome;
-            PropertyBar.Background = chrome;
-            StatusBar.Background = chrome;
-            ThumbnailPanel.Background = chrome;
-        }
+        // it" rather than a blue app.
+        //
+        // EVERY theme paints, including Light and Dark. There is no case that
+        // leaves a surface alone, because both ways of leaving one alone have
+        // already gone wrong: skipping the assignment kept the last theme's
+        // paint, and putting back a brush captured at startup put back the
+        // startup theme's paint.
+        var chrome = Theming.ChromeBrush(s.Theme);
+        ToolRail.Background = chrome;
+        PropertyBar.Background = chrome;
+        StatusBar.Background = chrome;
+        ThumbnailPanel.Background = chrome;
+        BookmarkPanel.Background = chrome;
+
+        // The rulers count as chrome too. They were on Fluent's own white,
+        // which in Sepia put a white strip between a cream rail and a brown
+        // canvas: three different surfaces where there should have been two.
+        TopRuler.Background = chrome;
+        LeftRuler.Background = chrome;
+        RulerCorner.Background = chrome;
 
         ApplyStatusBarDock(s.StatusBarDock);
 
@@ -3184,6 +3205,33 @@ public sealed partial class MainPage : Page
             }
         };
         panel.Children.Add(themes);
+
+        // Lighter or darker than the theme ships, without inventing more
+        // themes. 0 is what the theme is; the ends reach half way to white and
+        // half way to black. Every surface moves together, so no position on
+        // the slider can produce a combination the theme would not.
+        var intensity = new Slider
+        {
+            Header = "Color intensity",
+            Width = 220,
+            Minimum = AppSettings.MinIntensity,
+            Maximum = AppSettings.MaxIntensity,
+            Value = SettingsStore.Current.ColorIntensity,
+            StepFrequency = 5,
+            TickFrequency = 25,
+            TickPlacement = Microsoft.UI.Xaml.Controls.Primitives.TickPlacement.Outside,
+            SnapsTo = SliderSnapsTo.StepValues,
+        };
+        intensity.ValueChanged += (_, _) =>
+        {
+            SettingsStore.Update(s => s with { ColorIntensity = (int)intensity.Value });
+            ApplySettings();
+        };
+        panel.Children.Add(intensity);
+
+        var reset = new HyperlinkButton { Content = "Reset to the theme's own colours" };
+        reset.Click += (_, _) => intensity.Value = 0;
+        panel.Children.Add(reset);
 
         var view = new ComboBox { Header = "When a document opens", Width = 220 };
         var viewValues = new[]
@@ -3707,9 +3755,180 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private void ToggleThumbnails() =>
-        ThumbnailPanel.Visibility =
-            ThumbnailPanel.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+    private void ToggleThumbnails()
+    {
+        bool show = ThumbnailPanel.Visibility != Visibility.Visible;
+        ThumbnailPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+
+        // The two panels share one grid column, so showing both would stack
+        // them in the same space. Opening one closes the other.
+        if (show)
+        {
+            BookmarkPanel.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void ToggleBookmarks_Click(object sender, RoutedEventArgs e) => ToggleBookmarks();
+
+    private void ToggleBookmarks()
+    {
+        bool show = BookmarkPanel.Visibility != Visibility.Visible;
+        BookmarkPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        if (show)
+        {
+            ThumbnailPanel.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void BookmarkList_ItemClick(object sender, ItemClickEventArgs e)
+    {
+        if (e.ClickedItem is BookmarkItem item)
+        {
+            ViewModel.GoToBookmark(item);
+        }
+    }
+
+    // ---------------- Auto bookmarks ----------------
+
+    /// <summary>
+    /// The patterns behind the presets, in the order the combo lists them.
+    ///
+    /// Presets rather than a bare regex box: the numbered one is what the tool
+    /// this was ported from offered, and it only suits papers and manuals.
+    /// A book of chapters matches nothing under it, which looks like a broken
+    /// feature rather than a mismatched pattern.
+    /// </summary>
+    private static readonly string[] AutoBookmarkPatterns =
+    [
+        HeadingDetector.NumberedPattern,
+
+        // Chapter/Section/Part, numbered in digits or Roman numerals. No
+        // hierarchy group, so these come out as one flat level, which is what a
+        // list of chapters is.
+        @"^\s*(Chapter|Section|Part|Adhyay|Adhyaya)\s+([0-9]+|[IVXLC]+)\b.*",
+
+        // A whole line in capitals, four characters or more. Catches the
+        // headings in documents that mark them by case alone.
+        @"^[\p{Lu}][\p{Lu}\s\d\p{P}]{3,}$",
+    ];
+
+    private List<DetectedHeading> _autoBookmarkFound = [];
+    private CancellationTokenSource? _autoBookmarkScan;
+
+    private async void AutoBookmarks_Click(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.HasDocumentPath)
+        {
+            await ShowMessage(
+                "Save first",
+                "Bookmarks are written into the PDF, so the document needs a file to be written to. Save it and try again.");
+            return;
+        }
+
+        _autoBookmarkFound = [];
+        AutoBookmarkPreview.ItemsSource = null;
+        AutoBookmarkDialog.IsPrimaryButtonEnabled = false;
+        AutoBookmarkSummary.Text = "Scan to see which headings this finds.";
+        if (AutoBookmarkPattern.Text.Length == 0)
+        {
+            AutoBookmarkPattern.Text = AutoBookmarkPatterns[0];
+        }
+
+        AutoBookmarkDialog.XamlRoot = XamlRoot;
+        if (await AutoBookmarkDialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            ApplyAutoBookmarks();
+        }
+
+        // A scan left running would keep parsing pages nobody is waiting for.
+        _autoBookmarkScan?.Cancel();
+    }
+
+    private void AutoBookmarkPreset_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        // The last entry is "Custom", which leaves whatever is in the box alone.
+        int i = AutoBookmarkPreset.SelectedIndex;
+        if (i >= 0 && i < AutoBookmarkPatterns.Length && AutoBookmarkPattern is not null)
+        {
+            AutoBookmarkPattern.Text = AutoBookmarkPatterns[i];
+        }
+    }
+
+    private void AutoBookmarkPattern_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        // Editing the pattern invalidates the preview under it: offering to add
+        // bookmarks that no longer match what the box says would be a lie.
+        _autoBookmarkFound = [];
+        AutoBookmarkPreview.ItemsSource = null;
+        AutoBookmarkDialog.IsPrimaryButtonEnabled = false;
+    }
+
+    private async void AutoBookmarkScan_Click(object sender, RoutedEventArgs e)
+    {
+        _autoBookmarkScan?.Cancel();
+        var cts = new CancellationTokenSource();
+        _autoBookmarkScan = cts;
+
+        AutoBookmarkScan.IsEnabled = false;
+        AutoBookmarkProgress.Visibility = Visibility.Visible;
+        AutoBookmarkProgress.Value = 0;
+        AutoBookmarkSummary.Text = $"Reading {ViewModel.PageCount} pages...";
+
+        var progress = new Progress<double>(v => AutoBookmarkProgress.Value = v);
+
+        try
+        {
+            var found = await ViewModel.ScanForHeadingsAsync(
+                AutoBookmarkPattern.Text, progress, cts.Token);
+
+            _autoBookmarkFound = [.. found];
+            AutoBookmarkPreview.ItemsSource = found
+                .Select(h => new BookmarkItem(new Bookmark(h.Level - 1, h.PageIndex, h.Title)))
+                .ToList();
+
+            AutoBookmarkSummary.Text = found.Count == 0
+                ? "No headings matched. Try another pattern, or edit it above."
+                : $"Found {found.Count} headings.";
+            AutoBookmarkDialog.IsPrimaryButtonEnabled = found.Count > 0;
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer scan, or the dialog closed. Nothing to say.
+        }
+        catch (ArgumentException ex)
+        {
+            // A pattern typed by hand, so an unbalanced bracket is ordinary.
+            AutoBookmarkSummary.Text = ex.Message;
+        }
+        finally
+        {
+            AutoBookmarkScan.IsEnabled = true;
+            AutoBookmarkProgress.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private async void ApplyAutoBookmarks()
+    {
+        if (ViewModel.ApplyOutline(_autoBookmarkFound) is { } problem)
+        {
+            await ShowMessage("Could not add bookmarks", problem);
+            return;
+        }
+
+        BookmarkPanel.Visibility = Visibility.Visible;
+        ThumbnailPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private async Task ShowMessage(string title, string message)
+    {
+        await new ContentDialog
+        {
+            Title = title,
+            Content = message,
+            CloseButtonText = "OK",
+            XamlRoot = XamlRoot,
+        }.ShowAsync();
+    }
 
     private void DeleteNote_Click(object sender, RoutedEventArgs e)
     {
@@ -4153,6 +4372,11 @@ public sealed partial class MainPage : Page
             // how the pages panel came to be open on launch.
             case VirtualKey.F4:
                 ToggleThumbnails();
+                e.Handled = true;
+                break;
+
+            case VirtualKey.F6:
+                ToggleBookmarks();
                 e.Handled = true;
                 break;
 

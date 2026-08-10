@@ -806,6 +806,11 @@
                     <FontIcon Glyph="&#xE8A9;" FontSize="16" />
                 </Button>
 
+                <Button Click="ToggleBookmarks_Click" ToolTipService.ToolTip="Bookmarks (F6)"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE8A4;" FontSize="16" />
+                </Button>
+
                 <!-- Only shown when the open document actually has fillable fields. -->
                 <ToggleButton x:Name="FillFormButton"
                               ToolTipService.ToolTip="Fill form fields"
@@ -1815,6 +1820,165 @@
         </Border>
 
         <!--
+            The document's own outline. Shares the slot with the pages panel
+            rather than taking a second one: both are ways of navigating the
+            same document, only one is wanted at a time, and two side by side
+            would leave the page itself squeezed into what is left.
+        -->
+        <Border x:Name="BookmarkPanel" Visibility="Collapsed"
+                Grid.Column="1" Margin="0,12,12,12" Width="260"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <Grid Padding="14,10,10,8" ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Bookmarks" VerticalAlignment="Center"
+                               Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <TextBlock Grid.Column="1" VerticalAlignment="Center" Margin="6,0,0,0"
+                               Text="{x:Bind ViewModel.Bookmarks.Count, Mode=OneWay}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <Button Grid.Column="2" Click="AutoBookmarks_Click"
+                            Width="28" Height="28" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            ToolTipService.ToolTip="Create bookmarks from headings">
+                        <FontIcon Glyph="&#xE8FD;" FontSize="14" />
+                    </Button>
+                </Grid>
+
+                <!--
+                    Says so when the file has no outline. An empty list would
+                    look like a panel that failed to load, and most PDFs have no
+                    outline at all, so this is the common case rather than an
+                    edge one.
+                -->
+                <TextBlock Grid.Row="1" Margin="14,4,14,14" TextWrapping="Wrap"
+                           Visibility="{x:Bind ViewModel.NoBookmarksVisibility, Mode=OneWay}"
+                           Text="This document has no bookmarks. Bookmarks are an outline the document's author saves into the file."
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+
+                <ListView Grid.Row="1" x:Name="BookmarkList"
+                          Padding="4,0,4,8"
+                          ItemsSource="{x:Bind ViewModel.Bookmarks}"
+                          IsItemClickEnabled="True"
+                          ItemClick="BookmarkList_ItemClick"
+                          SelectionMode="Single">
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="MinHeight" Value="0" />
+                            <Setter Property="Padding" Value="8,4" />
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="viewmodels:BookmarkItem">
+                            <!--
+                                The nesting is an INDENT, not nested controls:
+                                the list arrives flat with a depth per row, so
+                                one ListView virtualizes the whole outline
+                                however deep it goes.
+                            -->
+                            <Grid Margin="{x:Bind Indent}" ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{x:Bind Title}" TextTrimming="CharacterEllipsis"
+                                           ToolTipService.ToolTip="{x:Bind Title}"
+                                           VerticalAlignment="Center" FontSize="13" />
+                                <TextBlock Grid.Column="1" Text="{x:Bind PageLabel}"
+                                           VerticalAlignment="Center" FontSize="11"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+            </Grid>
+        </Border>
+
+        <!--
+            Auto bookmarks. Scans the document's text for headings and turns
+            them into a real outline.
+
+            The preview is not decoration. Whether a pattern fits a given
+            document is not knowable in advance, and writing bookmarks rewrites
+            the file, so the answer has to be visible BEFORE anything is
+            committed.
+        -->
+        <ContentDialog x:Name="AutoBookmarkDialog" Title="Create bookmarks"
+                       PrimaryButtonText="Add bookmarks" CloseButtonText="Cancel"
+                       DefaultButton="Primary" IsPrimaryButtonEnabled="False">
+            <StackPanel Spacing="12" Width="460">
+                <ComboBox x:Name="AutoBookmarkPreset" Header="Headings look like"
+                          HorizontalAlignment="Stretch"
+                          SelectionChanged="AutoBookmarkPreset_SelectionChanged">
+                    <ComboBoxItem Content="Numbered: 1.  1.1.  1.2.1." IsSelected="True" />
+                    <ComboBoxItem Content="Chapter / Section / Part" />
+                    <ComboBoxItem Content="ALL CAPS lines" />
+                    <ComboBoxItem Content="Custom pattern" />
+                </ComboBox>
+
+                <TextBox x:Name="AutoBookmarkPattern" Header="Pattern"
+                         FontFamily="Consolas" IsSpellCheckEnabled="False"
+                         TextChanged="AutoBookmarkPattern_TextChanged" />
+
+                <Button x:Name="AutoBookmarkScan" Content="Scan the document"
+                        Click="AutoBookmarkScan_Click" />
+
+                <ProgressBar x:Name="AutoBookmarkProgress" Visibility="Collapsed"
+                             Minimum="0" Maximum="1" />
+
+                <TextBlock x:Name="AutoBookmarkSummary" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Text="Scan to see which headings this finds." />
+
+                <ListView x:Name="AutoBookmarkPreview" Height="220"
+                          SelectionMode="None"
+                          BorderThickness="1" CornerRadius="4"
+                          BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="MinHeight" Value="0" />
+                            <Setter Property="Padding" Value="8,3" />
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="viewmodels:BookmarkItem">
+                            <Grid Margin="{x:Bind Indent}" ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{x:Bind Title}" FontSize="12"
+                                           TextTrimming="CharacterEllipsis" />
+                                <TextBlock Grid.Column="1" Text="{x:Bind PageLabel}" FontSize="11"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <TextBlock TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Text="Bookmarks are written into the PDF, replacing any it already has. The file is saved as part of this." />
+            </StackPanel>
+        </ContentDialog>
+
+        <!--
             Rotate Pages dialog. The quick right-click "Rotate 90" is one page,
             one click; this is for rotating many at once, by a chosen amount,
             filtered by range, odd/even and orientation. Laid out here but only
@@ -1920,41 +2084,45 @@
                     panel is Collapsed by default, so the box was invisible
                     until someone opened the panel.
                 -->
-                <StackPanel Orientation="Horizontal" Spacing="4"
-                            VerticalAlignment="Center" Margin="10,0,6,0">
-                    <!--
-                        The field and the total are ONE unit inside a single
-                        border, rather than a bordered TextBox sitting next to
-                        loose text.
+                <!--
+                    The field and the total are ONE unit inside a single border,
+                    rather than a bordered TextBox sitting next to loose text.
 
-                        Fighting the TextBox template was the wrong approach: it
-                        brings a MinHeight of 32, its own border and a thicker
-                        underline, and all three have to be beaten back before
-                        it can share a baseline with a caption beside it. The
-                        chrome is dropped instead and the surrounding Border
-                        provides the field, so the two are laid out in the same
-                        box and cannot drift apart.
-                    -->
-                    <Border VerticalAlignment="Center" Height="26" Padding="6,0"
-                            CornerRadius="4"
-                            Background="{ThemeResource ControlFillColorDefaultBrush}"
-                            BorderThickness="1"
-                            BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
-                        <StackPanel Orientation="Horizontal" Spacing="3" VerticalAlignment="Center">
-                            <TextBox x:Name="PageJumpBox" Width="28" MinHeight="0" MinWidth="0"
-                                     VerticalAlignment="Center" VerticalContentAlignment="Center"
-                                     BorderThickness="0" Background="Transparent" Padding="0"
-                                     TextAlignment="Right" FontSize="12" InputScope="Number"
-                                     KeyDown="PageJumpBox_KeyDown"
-                                     LostFocus="PageJumpBox_LostFocus"
-                                     ToolTipService.ToolTip="Go to page" />
-                            <TextBlock VerticalAlignment="Center"
-                                       Text="{x:Bind ViewModel.PageCountSuffix, Mode=OneWay}"
-                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                       Style="{StaticResource CaptionTextBlockStyle}" />
-                        </StackPanel>
-                    </Border>
-                </StackPanel>
+                    A TextBox will NOT centre next to a TextBlock by setting
+                    properties on the TextBox. MinHeight="0" sets the control,
+                    while the template's own content element carries
+                    MinHeight="{ThemeResource TextControlThemeMinHeight}" = 32
+                    and TextControlThemePadding = 10,5,6,6, neither of which any
+                    property on the control can reach. That inner 32 against an
+                    outer 26 is the whole of the misalignment: the text sits
+                    where a 32px box would put it. Overriding the two resources
+                    in the TextBox's own scope is what actually moves it, and
+                    the scope keeps the override off every other TextBox.
+                -->
+                <Border VerticalAlignment="Center" Height="26" Padding="6,0"
+                        Margin="6,0,4,0" CornerRadius="4"
+                        Background="{ThemeResource ControlFillColorDefaultBrush}"
+                        BorderThickness="1"
+                        BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
+                    <StackPanel Orientation="Horizontal" Spacing="3"
+                                VerticalAlignment="Center">
+                        <TextBox x:Name="PageJumpBox" Width="26" MinWidth="0"
+                                 VerticalAlignment="Center" VerticalContentAlignment="Center"
+                                 BorderThickness="0" Background="Transparent"
+                                 TextAlignment="Right" FontSize="12" InputScope="Number"
+                                 KeyDown="PageJumpBox_KeyDown"
+                                 LostFocus="PageJumpBox_LostFocus"
+                                 ToolTipService.ToolTip="Go to page">
+                            <TextBox.Resources>
+                                <x:Double x:Key="TextControlThemeMinHeight">0</x:Double>
+                                <Thickness x:Key="TextControlThemePadding">0</Thickness>
+                            </TextBox.Resources>
+                        </TextBox>
+                        <TextBlock VerticalAlignment="Center" FontSize="12"
+                                   Text="{x:Bind ViewModel.PageCountSuffix, Mode=OneWay}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </Border>
                 <!-- Says why text selection is unavailable, instead of the
                      tool silently doing nothing on a scanned page. -->
                 <TextBlock Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
@@ -1963,10 +2131,10 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
                 <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
                 <Button Content="&#xE949;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomOut_Click"
-                        Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom out" />
                 <!-- Zoom readout doubles as a preset menu. -->
-                <Button x:Name="ZoomMenuButton" Width="52" Height="28" Padding="0"
+                <Button x:Name="ZoomMenuButton" Width="52" Height="26" Padding="0"
                         Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom presets">
                     <TextBlock x:Name="ZoomPercentText" Text="100%" TextAlignment="Center"
@@ -1984,26 +2152,34 @@
                     </Button.Flyout>
                 </Button>
                 <Button Content="&#xE948;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomIn_Click"
-                        Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom in" />
                 <Button Content="&#xE9A6;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ResetZoom_Click"
-                        Width="28" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Fit width" />
                 <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
                 <TextBox x:Name="SearchBox" Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                         PlaceholderText="Find" Width="120" Height="28" Margin="2,0,0,0"
-                         VerticalAlignment="Center" BorderThickness="0" Background="Transparent"
-                         KeyDown="SearchBox_KeyDown" />
+                         PlaceholderText="Find" Width="120" Height="26" Margin="2,0,0,0"
+                         VerticalAlignment="Center" VerticalContentAlignment="Center"
+                         FontSize="12" BorderThickness="0" Background="Transparent"
+                         KeyDown="SearchBox_KeyDown">
+                    <!-- Same template floor as the page field: without this the
+                         search text sits low against the buttons beside it. -->
+                    <TextBox.Resources>
+                        <x:Double x:Key="TextControlThemeMinHeight">0</x:Double>
+                        <Thickness x:Key="TextControlThemePadding">0</Thickness>
+                    </TextBox.Resources>
+                </TextBox>
                 <TextBlock Text="{x:Bind ViewModel.SearchStatus, Mode=OneWay}" VerticalAlignment="Center"
                            MinWidth="52" TextAlignment="Center"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
                 <Button Content="&#xE70E;" FontFamily="Segoe MDL2 Assets" FontSize="10" Click="SearchPrev_Click"
-                        Width="24" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        Width="24" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         IsEnabled="{x:Bind ViewModel.HasSearchMatches, Mode=OneWay}"
                         ToolTipService.ToolTip="Previous match (Shift+Enter)" />
                 <Button Content="&#xE70D;" FontFamily="Segoe MDL2 Assets" FontSize="10" Click="SearchNext_Click"
-                        Width="24" Height="28" Padding="0" Background="Transparent" BorderThickness="0"
+                        Width="24" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         IsEnabled="{x:Bind ViewModel.HasSearchMatches, Mode=OneWay}"
                         ToolTipService.ToolTip="Next match (Enter)" />
                 <TextBlock Text="&#9679;" Foreground="{ThemeResource SystemFillColorCautionBrush}"

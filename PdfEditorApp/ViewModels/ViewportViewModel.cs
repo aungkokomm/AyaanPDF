@@ -218,6 +218,195 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial bool FormFillMode { get; set; }
 
+    // ---------------- Bookmarks (the document's own outline) ----------------
+
+    /// <summary>The document's outline, flat and in reading order, indented by depth.</summary>
+    public ObservableCollection<BookmarkItem> Bookmarks { get; } = new();
+
+    /// <summary>
+    /// Whether this document has an outline at all. Most PDFs do not, and the
+    /// panel needs to say "this file has no bookmarks" rather than show an
+    /// empty box that looks like a failure to load.
+    /// </summary>
+    [ObservableProperty]
+    public partial bool HasBookmarks { get; set; }
+
+    /// <summary>The "no bookmarks" explanation, shown only when there are none.</summary>
+    public Visibility NoBookmarksVisibility =>
+        HasBookmarks ? Visibility.Collapsed : Visibility.Visible;
+
+    partial void OnHasBookmarksChanged(bool value) =>
+        OnPropertyChanged(nameof(NoBookmarksVisibility));
+
+    /// <summary>
+    /// Reads the document's outline.
+    ///
+    /// Cheap even on a very large book: titles and destinations come from the
+    /// catalog and the page tree, so nothing here LOADS a page. That is worth
+    /// stating because the same assumption was wrong for form fields and cost
+    /// 34 seconds on a 3352-page document.
+    /// </summary>
+    private void LoadBookmarks()
+    {
+        Bookmarks.Clear();
+        HasBookmarks = false;
+        if (_documentHandle == 0)
+        {
+            return;
+        }
+
+        var buf = RenderCoreNative.get_bookmarks(_documentHandle);
+        try
+        {
+            if (buf.Status == (int)RenderStatus.OkPdfium && buf.Data != IntPtr.Zero && buf.Len > 0)
+            {
+                byte[] bytes = new byte[(int)buf.Len];
+                Marshal.Copy(buf.Data, bytes, 0, bytes.Length);
+                foreach (var mark in BookmarkReader.Parse(bytes))
+                {
+                    Bookmarks.Add(new BookmarkItem(mark));
+                }
+            }
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buf);
+        }
+
+        HasBookmarks = Bookmarks.Count > 0;
+    }
+
+    /// <summary>
+    /// Jumps to a bookmark's page. Ignores an entry with no target rather than
+    /// jumping somewhere arbitrary.
+    /// </summary>
+    public void GoToBookmark(BookmarkItem item)
+    {
+        if (item.Mark.HasTarget)
+        {
+            GoToPage(item.PageIndex);
+        }
+    }
+
+    // ---------------- Auto bookmarks ----------------
+
+    /// <summary>
+    /// Scans the document's text for headings.
+    ///
+    /// Runs off the UI thread and reports progress, because reading a page's
+    /// text LOADS and parses that page: on a 3352-page book this is thousands
+    /// of parses and takes real time however it is written. The text layers are
+    /// deliberately NOT cached here the way <see cref="TextLayerFor"/> caches
+    /// them, since holding every glyph of every page would cost far more memory
+    /// than the scan is worth.
+    /// </summary>
+    public Task<IReadOnlyList<DetectedHeading>> ScanForHeadingsAsync(
+        string pattern, IProgress<double>? progress, CancellationToken token)
+    {
+        ulong handle = _documentHandle;
+        int pages = PageCount;
+        int width = (int)SlotLayoutWidth;
+
+        if (handle == 0 || pages <= 0)
+        {
+            return Task.FromResult<IReadOnlyList<DetectedHeading>>(Array.Empty<DetectedHeading>());
+        }
+
+        return Task.Run<IReadOnlyList<DetectedHeading>>(() =>
+        {
+            var texts = new List<string>(pages);
+            for (int i = 0; i < pages; i++)
+            {
+                token.ThrowIfCancellationRequested();
+                texts.Add(TextLayerLoader.Load(handle, i, width).Text);
+
+                // Every 16 pages rather than every page: on a long book the
+                // progress callback marshals to the UI thread, and doing that
+                // 3352 times costs more than the scan it is reporting on.
+                if ((i & 0xF) == 0)
+                {
+                    progress?.Report((double)i / pages);
+                }
+            }
+
+            progress?.Report(1.0);
+            return HeadingDetector.Detect(texts, pattern);
+        }, token);
+    }
+
+    /// <summary>
+    /// Writes an outline into the document, replacing whatever it had.
+    ///
+    /// The file has to be on disk and closed for this, because the outline is
+    /// written by a PDF object-graph library rather than by PDFium, which has
+    /// no API to create bookmarks at all. So: save any pending edits, close the
+    /// document, rewrite the file, and reopen it. The same
+    /// temp-then-replace-then-reopen dance the in-place save already does, and
+    /// for the same reason.
+    /// </summary>
+    /// <returns>Null on success, or a message saying what stopped it.</returns>
+    public string? ApplyOutline(IReadOnlyList<DetectedHeading> headings)
+    {
+        if (_documentHandle == 0)
+        {
+            return "No document is open.";
+        }
+        if (_currentDocumentPath is not { } path)
+        {
+            return "Save the document first: bookmarks are written into the file.";
+        }
+
+        // Pending marks would be lost by the close/reopen below, so they go to
+        // the file first. This also means the outline is written into a file
+        // that already matches what is on screen.
+        if (IsDirty && !SaveDocument())
+        {
+            return "Could not save the document, so the bookmarks were not written.";
+        }
+
+        byte[] buffer = BookmarkWriter.Serialise(headings);
+        string temp = path + ".ayaan-outline";
+
+        // Closed BEFORE the write, not after: PDFium streams page content from
+        // the open file, and the writer is about to replace it.
+        int restoreTo = CurrentPageIndex;
+        CloseCurrentDocument();
+
+        try
+        {
+            var status = RenderCoreNative.write_outline(path, temp, buffer, (nuint)buffer.Length);
+            if (status != RenderStatus.OkPdfium)
+            {
+                Diag.Log($"write_outline failed: {status}");
+                return status == RenderStatus.Unsupported
+                    ? "This PDF could not be rewritten. Encrypted files cannot take bookmarks."
+                    : "Something went wrong writing the bookmarks.";
+            }
+
+            File.Move(temp, path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            // The original is untouched either way. Say where the rewritten
+            // copy is rather than deleting it: a failed replace must never be
+            // able to lose both.
+            Diag.Log($"write_outline: could not replace the original: {ex.Message}");
+            return File.Exists(temp)
+                ? $"Could not replace the original. The bookmarked copy is at {temp}"
+                : "Could not write the bookmarks.";
+        }
+        finally
+        {
+            OpenDocument(path, preserveAnnotations: false);
+            GoToPage(Math.Min(restoreTo, Math.Max(0, PageCount - 1)), animate: false);
+        }
+
+        Status = headings.Count == 0
+            ? "Bookmarks removed."
+            : $"Added {headings.Count} bookmarks.";
+        return null;
+    }
+
     /// <summary>Reads the document's form fields. Cheap; called on open and after page-structure changes.</summary>
     private void LoadFormFields()
     {
@@ -488,6 +677,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RenderCurrentPage();
         ReportExistingAnnotations();
         LoadFormFields();
+        LoadBookmarks();
         LoadGuidesFromSidecar();
     }
 
@@ -1055,6 +1245,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // them, so re-read from the (rebuilt) document rather than remap.
         LoadFormFields();
         DistributeFormOutlines();
+
+        // Outline destinations point at page OBJECTS, so PDFium resolves them
+        // to the new indices after a reorder. Re-reading gets that for free;
+        // remapping the numbers ourselves would get it wrong.
+        LoadBookmarks();
     }
 
     /// <summary>

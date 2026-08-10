@@ -324,6 +324,35 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_form_fields(ulong docHandle);
 
     /// <summary>
+    /// The document's own outline, flattened into reading order as a
+    /// self-describing byte buffer (depth, page index, title per entry). Parsed
+    /// by <see cref="Viewport.BookmarkReader"/>. A document without an outline
+    /// is a successful EMPTY result, not an error. Free the result with
+    /// <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_bookmarks(ulong docHandle);
+
+    /// <summary>
+    /// Replaces the document's outline, reading <paramref name="srcPath"/> and
+    /// writing to <paramref name="dstPath"/>.
+    ///
+    /// Does NOT go through PDFium and does NOT take a document handle: PDFium
+    /// can read bookmarks but has no API to create them, so this works on the
+    /// file with a PDF object-graph library instead. The source is left
+    /// untouched; the caller swaps the files.
+    ///
+    /// An empty buffer removes the outline. Returns Ok, InvalidInput,
+    /// Unsupported (unparseable or encrypted), or Panic.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int write_outline(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string srcPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string dstPath,
+        byte[] data,
+        nuint len);
+
+    /// <summary>
     /// Deletes the widget(s) for a named form field, so PDFium's form layer
     /// stops painting the field box on top of the text the app draws to fill it.
     /// A no-op (still Ok) when no field matches.

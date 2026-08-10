@@ -163,11 +163,26 @@ public sealed partial class MainWindow : Window
     {
         var brush = Theming.WindowBrush(theme);
 
-        // Null means this theme keeps Fluent's own material, so the backdrop
-        // has to come back: leaving a painted brush behind would freeze Light
-        // and Dark on the last tint that was applied.
-        AppTitleBar.Background = brush ?? new SolidColorBrush(Colors.Transparent);
-        Tabs.Background = brush;
+        // The strip behind the tabs is painted on the ROOT, not on the TabView:
+        // TabView.Background does not reach its tab strip, which is why the
+        // tabs stayed grey in a blue window. Everything above it is left
+        // transparent so this one brush shows through the lot.
+        Shell.Background = brush;
+        AppTitleBar.Background = new SolidColorBrush(Colors.Transparent);
+        Tabs.Background = new SolidColorBrush(Colors.Transparent);
+
+        // The tab in front is a raised surface on the strip, so it takes the
+        // CHROME colour, the same one the tool rail and the rulers use. The
+        // ones behind stay transparent and let the strip through.
+        //
+        // RECOLOURED, not replaced. Putting a new brush in the dictionary left
+        // the tab showing the previous theme's colour, because the tab is
+        // holding the brush object its template resolved at expansion time and
+        // never looks the key up again.
+        if (Tabs.Resources["TabViewItemHeaderBackgroundSelected"] is SolidColorBrush selected)
+        {
+            selected.Color = Theming.TabColor(theme);
+        }
     }
 
     // ---------------- Quick actions ----------------
