@@ -1890,11 +1890,29 @@
             Status pill: page position, zoom, fit and find. Floats bottom
             centre and stays out of the way, replacing a full-width status bar.
         -->
-        <Border Grid.Column="2" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
+        <Border x:Name="StatusBar" Grid.Column="2"
+                HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="18" Padding="6,3">
             <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                <!--
+                    Drag handle. Like the tool rail's, this DOCKS to the nearest
+                    corner or edge rather than leaving the bar anywhere: a bar
+                    dropped mid-canvas would cover the page, and a remembered
+                    free position would need re-checking against every window
+                    size. Six anchors cover what anyone actually wants.
+                -->
+                <Border x:Name="StatusGrip" Width="14" Background="Transparent"
+                        ToolTipService.ToolTip="Drag to move this bar"
+                        PointerPressed="StatusGrip_PointerPressed"
+                        PointerMoved="StatusGrip_PointerMoved"
+                        PointerReleased="StatusGrip_PointerReleased"
+                        PointerCaptureLost="StatusGrip_PointerReleased">
+                    <Rectangle Width="3" Height="16" RadiusX="2" RadiusY="2"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                               Fill="{ThemeResource TextFillColorTertiaryBrush}" />
+                </Border>
                 <!--
                     The page readout is editable: type a number, press Enter.
                     It lives HERE, in the always-visible status bar, and not in
@@ -1905,27 +1923,37 @@
                 <StackPanel Orientation="Horizontal" Spacing="4"
                             VerticalAlignment="Center" Margin="10,0,6,0">
                     <!--
-                        MinHeight="0" is the load-bearing attribute. A WinUI
-                        TextBox defaults to MinHeight 32, which beats Height 26
-                        and made the box taller than the row it sits in, so it
-                        rode up while the "/ 1" beside it sat centred. That is
-                        the misalignment, not a margin.
+                        The field and the total are ONE unit inside a single
+                        border, rather than a bordered TextBox sitting next to
+                        loose text.
 
-                        28 to match every button on this bar, and both
-                        alignments centred so the number sits on the same line
-                        as the text next to it.
+                        Fighting the TextBox template was the wrong approach: it
+                        brings a MinHeight of 32, its own border and a thicker
+                        underline, and all three have to be beaten back before
+                        it can share a baseline with a caption beside it. The
+                        chrome is dropped instead and the surrounding Border
+                        provides the field, so the two are laid out in the same
+                        box and cannot drift apart.
                     -->
-                    <TextBox x:Name="PageJumpBox" Width="46" Height="28" MinHeight="0"
-                             VerticalAlignment="Center" VerticalContentAlignment="Center"
-                             Padding="4,0,4,0" TextAlignment="Center"
-                             FontSize="12" InputScope="Number"
-                             KeyDown="PageJumpBox_KeyDown"
-                             LostFocus="PageJumpBox_LostFocus"
-                             ToolTipService.ToolTip="Go to page" />
-                    <TextBlock VerticalAlignment="Center"
-                               Text="{x:Bind ViewModel.PageCountSuffix, Mode=OneWay}"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <Border VerticalAlignment="Center" Height="26" Padding="6,0"
+                            CornerRadius="4"
+                            Background="{ThemeResource ControlFillColorDefaultBrush}"
+                            BorderThickness="1"
+                            BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
+                        <StackPanel Orientation="Horizontal" Spacing="3" VerticalAlignment="Center">
+                            <TextBox x:Name="PageJumpBox" Width="28" MinHeight="0" MinWidth="0"
+                                     VerticalAlignment="Center" VerticalContentAlignment="Center"
+                                     BorderThickness="0" Background="Transparent" Padding="0"
+                                     TextAlignment="Right" FontSize="12" InputScope="Number"
+                                     KeyDown="PageJumpBox_KeyDown"
+                                     LostFocus="PageJumpBox_LostFocus"
+                                     ToolTipService.ToolTip="Go to page" />
+                            <TextBlock VerticalAlignment="Center"
+                                       Text="{x:Bind ViewModel.PageCountSuffix, Mode=OneWay}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                       Style="{StaticResource CaptionTextBlockStyle}" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
                 <!-- Says why text selection is unavailable, instead of the
                      tool silently doing nothing on a scanned page. -->

@@ -1,7 +1,9 @@
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 
 // To learn more about WinUI, the WinUI project structure,
 // and more about our project templates, see: http://aka.ms/winui-project-info.
@@ -148,6 +150,25 @@ public sealed partial class MainWindow : Window
     /// says nothing new.
     /// </summary>
     public void SetDocumentTitle(string title) => Title = title;
+
+    /// <summary>
+    /// Tints the title strip and the tab row.
+    ///
+    /// The window owns these, and the theme is chosen inside a page, so the
+    /// page calls in. Without it the invented themes coloured the document
+    /// area and left the whole top of the app in Fluent's default grey, which
+    /// is what made them look half-applied.
+    /// </summary>
+    public void ApplyThemeChrome(PdfEditorApp.Viewport.AppTheme theme)
+    {
+        var brush = Theming.WindowBrush(theme);
+
+        // Null means this theme keeps Fluent's own material, so the backdrop
+        // has to come back: leaving a painted brush behind would freeze Light
+        // and Dark on the last tint that was applied.
+        AppTitleBar.Background = brush ?? new SolidColorBrush(Colors.Transparent);
+        Tabs.Background = brush;
+    }
 
     // ---------------- Quick actions ----------------
 

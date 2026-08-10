@@ -3054,11 +3054,28 @@ public sealed partial class MainPage : Page
     {
         var s = SettingsStore.Current;
 
-        if (App.Window is { } window)
+        if (App.Window is MainWindow window)
         {
             Theming.Apply(window, s.Theme);
+            window.ApplyThemeChrome(s.Theme);
         }
+
         RootGrid.Background = Theming.CanvasBrush(s.Theme);
+
+        // Every surface takes the tint, not only the canvas. Painting one and
+        // leaving the rail, the property bar and the status bar in Fluent's own
+        // greys is what made Dark blue read as "grey app with a blue hole in
+        // it" rather than a blue app. Null means the theme keeps Fluent's own
+        // materials, so Light and Dark are untouched.
+        if (Theming.ChromeBrush(s.Theme) is { } chrome)
+        {
+            ToolRail.Background = chrome;
+            PropertyBar.Background = chrome;
+            StatusBar.Background = chrome;
+            ThumbnailPanel.Background = chrome;
+        }
+
+        ApplyStatusBarDock(s.StatusBarDock);
 
         if (RulersToggle.IsChecked != s.ShowRulers)
         {
@@ -3071,6 +3088,60 @@ public sealed partial class MainPage : Page
         // The ticks are drawn shapes, not themed controls, so they keep the
         // colours they were painted with until something repaints them.
         RedrawRulers();
+    }
+
+    // ---------------- Moving the status bar ----------------
+
+    private bool _draggingStatusBar;
+
+    private void StatusGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        _draggingStatusBar = true;
+        StatusGrip.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Re-anchors live while dragging, rather than moving the bar with the
+    /// pointer and snapping on release. The bar jumping to each anchor as you
+    /// cross into it SHOWS where it will land, so there is no guessing about
+    /// what letting go will do.
+    /// </summary>
+    private void StatusGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_draggingStatusBar) { return; }
+
+        var p = e.GetCurrentPoint(RootGrid).Position;
+        var dock = AppSettings.NearestDock(p.X, p.Y, RootGrid.ActualWidth, RootGrid.ActualHeight);
+        if (dock != SettingsStore.Current.StatusBarDock)
+        {
+            SettingsStore.Update(s => s with { StatusBarDock = dock });
+            ApplyStatusBarDock(dock);
+        }
+        e.Handled = true;
+    }
+
+    private void StatusGrip_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        _draggingStatusBar = false;
+        StatusGrip.ReleasePointerCapture(e.Pointer);
+    }
+
+    private void ApplyStatusBarDock(BarDock dock)
+    {
+        StatusBar.HorizontalAlignment = dock switch
+        {
+            BarDock.BottomLeft or BarDock.TopLeft => HorizontalAlignment.Left,
+            BarDock.BottomRight or BarDock.TopRight => HorizontalAlignment.Right,
+            _ => HorizontalAlignment.Center,
+        };
+
+        bool top = dock is BarDock.TopCentre or BarDock.TopLeft or BarDock.TopRight;
+        StatusBar.VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+
+        // Kept off the edge on whichever side it is now on, and clear of the
+        // rulers when it sits at the top.
+        StatusBar.Margin = new Thickness(16, top ? 16 : 0, 16, top ? 0 : 16);
     }
 
     /// <summary>The saved default view, applied once a document has pages to fit.</summary>

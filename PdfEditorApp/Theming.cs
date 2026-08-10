@@ -52,14 +52,32 @@ internal static class Theming
     /// </summary>
     public static Brush CanvasBrush(AppTheme theme) => new SolidColorBrush(theme switch
     {
-        AppTheme.Sepia => Rgb(0x4A, 0x40, 0x30),      // warm, to match the paper
-        // Slate blue rather than near-black. The first attempt was 0C121F,
-        // which read as "black with a hint of blue" and lost the point of
-        // having the theme at all: it needs to be recognisably BLUE while
-        // still sitting clearly darker than a white page.
-        AppTheme.DarkBlue => Rgb(0x22, 0x30, 0x4D),
-        _ => Rgb(0x3A, 0x3A, 0x3D),                   // the neutral default
+        AppTheme.Sepia => Rgb(0x5C, 0x4B, 0x33),
+        AppTheme.DarkBlue => Rgb(0x1B, 0x3A, 0x78),
+        _ => Rgb(0x3A, 0x3A, 0x3D),
     });
+
+    /// <summary>
+    /// Panels and bars: the tool rail, the property bar, the floating status
+    /// bar. Slightly lighter than the window so they read as surfaces sitting
+    /// on it.
+    /// </summary>
+    public static Brush? ChromeBrush(AppTheme theme) => theme switch
+    {
+        AppTheme.Sepia => new SolidColorBrush(Rgb(0xF2, 0xE8, 0xD2)),
+        AppTheme.DarkBlue => new SolidColorBrush(Rgb(0x14, 0x28, 0x59)),
+        // Light and Dark keep Fluent's own materials, including the acrylic
+        // the rail uses. Only the invented themes need painting by hand.
+        _ => null,
+    };
+
+    /// <summary>The title strip and tab row, the deepest surface of the three.</summary>
+    public static Brush? WindowBrush(AppTheme theme) => theme switch
+    {
+        AppTheme.Sepia => new SolidColorBrush(Rgb(0xE4, 0xD5, 0xB4)),
+        AppTheme.DarkBlue => new SolidColorBrush(Rgb(0x0D, 0x1C, 0x40)),
+        _ => null,
+    };
 
     /// <summary>
     /// Tick marks on the rulers.

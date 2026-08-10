@@ -15,6 +15,23 @@ public enum AppTheme
     DarkBlue,
 }
 
+/// <summary>
+/// Where the floating status bar sits.
+///
+/// A fixed set of anchors rather than a free position: a bar dropped in the
+/// middle of the canvas would cover the page, and a remembered pixel position
+/// would have to be re-validated against every window size and monitor change.
+/// </summary>
+public enum BarDock
+{
+    BottomCentre,
+    BottomLeft,
+    BottomRight,
+    TopCentre,
+    TopLeft,
+    TopRight,
+}
+
 /// <summary>What the view does when a document opens.</summary>
 public enum DefaultView
 {
@@ -53,6 +70,30 @@ public sealed record AppSettings
     /// <summary>Entries kept in the recent-files list.</summary>
     public int RecentLimit { get; init; } = 10;
 
+    public BarDock StatusBarDock { get; init; } = BarDock.BottomCentre;
+
+    /// <summary>
+    /// Which anchor a point in the viewport is nearest, for dropping the bar.
+    ///
+    /// Thirds horizontally and halves vertically: the middle third is wide
+    /// enough that "centre" is easy to hit deliberately, which is where the bar
+    /// belongs by default.
+    /// </summary>
+    public static BarDock NearestDock(double x, double y, double width, double height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return BarDock.BottomCentre;
+        }
+
+        bool top = y < height / 2;
+        double third = width / 3;
+
+        if (x < third) { return top ? BarDock.TopLeft : BarDock.BottomLeft; }
+        if (x > third * 2) { return top ? BarDock.TopRight : BarDock.BottomRight; }
+        return top ? BarDock.TopCentre : BarDock.BottomCentre;
+    }
+
     /// <summary>
     /// Brings anything unrecognised back to a sane value.
     ///
@@ -66,6 +107,7 @@ public sealed record AppSettings
         DefaultView = Enum.IsDefined(DefaultView) ? DefaultView : DefaultView.FitPage,
         RulerUnit = IsKnownUnit(RulerUnit) ? RulerUnit : "Inches",
         RecentLimit = Math.Clamp(RecentLimit, 1, 50),
+        StatusBarDock = Enum.IsDefined(StatusBarDock) ? StatusBarDock : BarDock.BottomCentre,
     };
 
     private static bool IsKnownUnit(string unit) => unit is
