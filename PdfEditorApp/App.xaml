@@ -10,7 +10,17 @@
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
                 <!-- Other merged dictionaries here -->
             </ResourceDictionary.MergedDictionaries>
-            <!-- Other app resources here -->
+            <!--
+                The surface the pages sit on. Named rather than inline so the
+                Sepia and Dark blue themes can retint it: it is the largest
+                area on screen and the one that decides whether long reading is
+                comfortable.
+
+                Deliberately dark by default in BOTH light and dark themes,
+                because a white page has to sit on something clearly darker
+                than itself to read as a sheet rather than as the background.
+            -->
+            <SolidColorBrush x:Key="AyaanCanvasBackgroundBrush" Color="#3A3A3D" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>

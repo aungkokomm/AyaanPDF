@@ -121,6 +121,7 @@ public sealed partial class MainPage : Page
             RefreshRecentMenu();
             RefreshSignatureMenu();
             SyncPageJumpBox();
+            ApplySettings();
         };
 
         // Lets the app be driven headlessly for diagnosis: set
@@ -3035,9 +3036,91 @@ public sealed partial class MainPage : Page
         }.ShowAsync();
     }
 
+    /// <summary>
+    /// Puts the saved settings into effect. Called once the page is loaded,
+    /// and again whenever a setting changes, so there is one path from stored
+    /// state to visible state rather than two that can disagree.
+    /// </summary>
+    private void ApplySettings()
+    {
+        var s = SettingsStore.Current;
+
+        if (App.Window is { } window)
+        {
+            Theming.Apply(window, s.Theme);
+        }
+        RootGrid.Background = Theming.CanvasBrush(s.Theme);
+
+        if (RulersToggle.IsChecked != s.ShowRulers)
+        {
+            RulersToggle.IsChecked = s.ShowRulers;
+            RulersToggle_Click(RulersToggle, null!);
+        }
+
+        RulerUnit_Click(new MenuFlyoutItem { Tag = s.RulerUnit }, null!);
+    }
+
+    /// <summary>The saved default view, applied once a document has pages to fit.</summary>
+    private void ApplyDefaultView()
+    {
+        switch (SettingsStore.Current.DefaultView)
+        {
+            case DefaultView.FitWidth: ZoomFitWidth_Click(this, null!); break;
+            // Through the same handler the 100% menu item uses, so there is one
+            // definition of what "actual size" does.
+            case DefaultView.ActualSize:
+                ZoomPreset_Click(new MenuFlyoutItem { Tag = "1.0" }, null!);
+                break;
+            default: ZoomFitPage_Click(this, null!); break;
+        }
+    }
+
     private UIElement BuildViewSettings()
     {
         var panel = new StackPanel { Spacing = 14, Margin = new Thickness(0, 12, 0, 0) };
+
+        // Theme first: it is the one people come to this dialog for.
+        var themes = new ComboBox { Header = "Theme", Width = 220 };
+        var themeValues = new[]
+        {
+            (AppTheme.System, "Use system setting"),
+            (AppTheme.Light, "Light"),
+            (AppTheme.Dark, "Dark"),
+            (AppTheme.Sepia, "Sepia"),
+            (AppTheme.DarkBlue, "Dark blue"),
+        };
+        foreach (var (_, label) in themeValues) { themes.Items.Add(label); }
+        themes.SelectedIndex = Array.FindIndex(themeValues, t => t.Item1 == SettingsStore.Current.Theme);
+        themes.SelectionChanged += (_, _) =>
+        {
+            if (themes.SelectedIndex >= 0)
+            {
+                SettingsStore.Update(s => s with { Theme = themeValues[themes.SelectedIndex].Item1 });
+                ApplySettings();
+            }
+        };
+        panel.Children.Add(themes);
+
+        var view = new ComboBox { Header = "When a document opens", Width = 220 };
+        var viewValues = new[]
+        {
+            (DefaultView.FitPage, "Fit the whole page"),
+            (DefaultView.FitWidth, "Fit the width"),
+            (DefaultView.ActualSize, "Actual size (100%)"),
+        };
+        foreach (var (_, label) in viewValues) { view.Items.Add(label); }
+        view.SelectedIndex = Array.FindIndex(viewValues, v => v.Item1 == SettingsStore.Current.DefaultView);
+        view.SelectionChanged += (_, _) =>
+        {
+            if (view.SelectedIndex >= 0)
+            {
+                // Applied now as well as saved, so the choice can be SEEN
+                // being made rather than only taking effect next time.
+                SettingsStore.Update(s => s with { DefaultView = viewValues[view.SelectedIndex].Item1 });
+                ApplyDefaultView();
+            }
+        };
+        panel.Children.Add(view);
 
         var rulers = new ToggleSwitch
         {
@@ -3050,6 +3133,7 @@ public sealed partial class MainPage : Page
         {
             RulersToggle.IsChecked = rulers.IsOn;
             RulersToggle_Click(RulersToggle, null!);
+            SettingsStore.Update(s => s with { ShowRulers = rulers.IsOn });
         };
         panel.Children.Add(rulers);
 
@@ -3064,6 +3148,7 @@ public sealed partial class MainPage : Page
             if (units.SelectedItem is string tag)
             {
                 RulerUnit_Click(new MenuFlyoutItem { Tag = tag }, null!);
+                SettingsStore.Update(s => s with { RulerUnit = tag });
             }
         };
         panel.Children.Add(units);

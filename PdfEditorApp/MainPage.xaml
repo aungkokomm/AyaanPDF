@@ -50,6 +50,13 @@
             on something clearly darker than itself in BOTH themes, which is
             exactly the case for not deferring to the theme here.
         -->
+        <!--
+            The default surface. Sepia and Dark blue retint it from code rather
+            than through ThemeResource: the tint arrives as a merged dictionary
+            swapped in at runtime, and a ThemeResource reference is not
+            guaranteed to re-evaluate when that happens. Assigning the brush is
+            certain.
+        -->
         <Grid.Background>
             <SolidColorBrush Color="#3A3A3D" />
         </Grid.Background>
