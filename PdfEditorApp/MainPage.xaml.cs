@@ -3006,6 +3006,119 @@ public sealed partial class MainPage : Page
         }
     }
 
+    // ---------------- Settings ----------------
+
+    /// <summary>
+    /// Settings, built in code rather than as XAML.
+    ///
+    /// Every control here reflects state that already lives somewhere else, so
+    /// building it fresh each time is what keeps it honest: a XAML dialog would
+    /// need its own copy of each value and a way to push changes back, and the
+    /// two would drift.
+    ///
+    /// Nothing here persists between runs yet. That needs a settings store in
+    /// the same per-user folder as stamps and signatures, and is the next piece
+    /// rather than something to fake with a half-written file.
+    /// </summary>
+    private async void Settings_Click(object sender, RoutedEventArgs e)
+    {
+        var tabs = new Pivot { Margin = new Thickness(0, 8, 0, 0) };
+        tabs.Items.Add(new PivotItem { Header = "View", Content = BuildViewSettings() });
+        tabs.Items.Add(new PivotItem { Header = "About", Content = BuildAboutPane() });
+
+        await new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Settings",
+            Content = new Grid { Width = 420, Height = 320, Children = { tabs } },
+            CloseButtonText = "Close",
+        }.ShowAsync();
+    }
+
+    private UIElement BuildViewSettings()
+    {
+        var panel = new StackPanel { Spacing = 14, Margin = new Thickness(0, 12, 0, 0) };
+
+        var rulers = new ToggleSwitch
+        {
+            Header = "Rulers",
+            IsOn = RulersToggle.IsChecked == true,
+        };
+        // Driven through the existing command rather than setting state here,
+        // so the menu item, the Ctrl+R chord and this switch cannot disagree.
+        rulers.Toggled += (_, _) =>
+        {
+            RulersToggle.IsChecked = rulers.IsOn;
+            RulersToggle_Click(RulersToggle, null!);
+        };
+        panel.Children.Add(rulers);
+
+        var units = new ComboBox { Header = "Ruler units", Width = 200 };
+        foreach (var name in new[] { "Inches", "Centimeters", "Millimeters", "Points", "Picas" })
+        {
+            units.Items.Add(name);
+        }
+        units.SelectedItem = CheckedRulerUnitName();
+        units.SelectionChanged += (_, _) =>
+        {
+            if (units.SelectedItem is string tag)
+            {
+                RulerUnit_Click(new MenuFlyoutItem { Tag = tag }, null!);
+            }
+        };
+        panel.Children.Add(units);
+
+        var thumbs = new Button { Content = "Toggle the pages panel (F4)" };
+        thumbs.Click += (_, _) => ToggleThumbnails_Click(this, null!);
+        panel.Children.Add(thumbs);
+
+        return panel;
+    }
+
+    private string CheckedRulerUnitName() =>
+        UnitCentimeters.IsChecked ? "Centimeters"
+        : UnitMillimeters.IsChecked ? "Millimeters"
+        : UnitPoints.IsChecked ? "Points"
+        : UnitPicas.IsChecked ? "Picas"
+        : "Inches";
+
+    private UIElement BuildAboutPane()
+    {
+        var panel = new StackPanel { Spacing = 10, Margin = new Thickness(0, 12, 0, 0) };
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = AppInfo.Name,
+            Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"],
+        });
+        panel.Children.Add(new TextBlock { Text = $"Version {AppInfo.Version}" });
+
+        // The third-party notices are owed, not decorative: PDFium and the
+        // vendored pdfium-render both carry licences that require attribution.
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Renders with PDFium. Text shaping by rustybuzz. "
+                   + "PDF access through a patched copy of pdfium-render.",
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+        });
+
+        // The log is where every question we have had today was answered, so
+        // it is worth one click rather than a path to type.
+        var log = new HyperlinkButton { Content = "Open the diagnostic log" };
+        log.Click += (_, _) =>
+        {
+            string path = System.IO.Path.Combine(AppContext.BaseDirectory, "diag.log");
+            if (System.IO.File.Exists(path))
+            {
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            }
+        };
+        panel.Children.Add(log);
+
+        return panel;
+    }
+
     // ---------------- Signatures ----------------
 
     /// <summary>

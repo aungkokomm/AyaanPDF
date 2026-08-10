@@ -699,11 +699,23 @@
             stay a glanceable column the way a canvas app expects, and cost a
             fixed 44px of overlay instead of a full toolbar row of height.
         -->
-        <Border x:Name="ToolRail" Grid.Column="0" VerticalAlignment="Center" Margin="12,0,12,0"
+        <!--
+            Docked flush to the window edge, full height, rather than floating
+            centred with a margin either side. A floating pill spent width on
+            gaps on both sides and left the tools bobbing in the middle of the
+            window with nothing to align to; docked, the rail has an edge to sit
+            against and the settings button has a bottom to sit at.
+        -->
+        <Border x:Name="ToolRail" Grid.Column="0" VerticalAlignment="Stretch" Margin="0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                BorderThickness="1" CornerRadius="10" Padding="4">
-            <StackPanel Orientation="Vertical" Spacing="2">
+                BorderThickness="0,0,1,0" CornerRadius="0" Padding="4,4,4,4">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <!--
                     Drag handle. Dragging the rail DOCKS it to the nearer side
                     rather than leaving it floating anywhere: a floating rail
@@ -733,7 +745,7 @@
                     assigning brushes, which is what made the previous rail look
                     hand-made.
                 -->
-                <ListView x:Name="ToolRailList"
+                <ListView x:Name="ToolRailList" Grid.Row="1" VerticalAlignment="Top"
                           ItemsSource="{x:Bind viewport:ToolCatalog.All}"
                           SelectionMode="Single"
                           SelectionChanged="ToolRail_SelectionChanged"
@@ -774,6 +786,12 @@
                     </ListView.ItemTemplate>
                 </ListView>
 
+                <!--
+                    Pinned to the bottom of the rail, which is what the docked
+                    full-height shape buys: these are about the app rather than
+                    about a mark on the page, so they sit apart from the tools.
+                -->
+                <StackPanel Grid.Row="2" Orientation="Vertical" Spacing="2" VerticalAlignment="Bottom">
                 <Rectangle Height="1" Margin="6,4" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
 
                 <Button Click="ToggleThumbnails_Click" ToolTipService.ToolTip="Pages (F4)"
@@ -930,7 +948,13 @@
                         </MenuFlyout>
                     </Button.Flyout>
                 </Button>
-            </StackPanel>
+
+                <Button Click="Settings_Click" ToolTipService.ToolTip="Settings"
+                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
+                    <FontIcon Glyph="&#xE713;" FontSize="16" />
+                </Button>
+                </StackPanel>
+            </Grid>
         </Border>
 
         <!--
