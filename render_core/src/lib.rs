@@ -703,11 +703,25 @@ fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
                 continue;
             };
 
-            // Read through the page we already hold, NOT through get_page_chars.
-            // That entry point takes CALL_LOCK, which this function is already
-            // holding, and the second acquisition deadlocks: the test run hung
-            // rather than failing.
-            existing_text = page.text().map(|t| t.all()).unwrap_or_default();
+            // Read through the page we already hold, NOT through get_page_chars:
+            // that entry point takes CALL_LOCK, which this function already
+            // holds, and the second acquisition DEADLOCKS (the test run hung
+            // rather than failing).
+            //
+            // Character by character, NOT PdfPageText::all(), which TRUNCATES.
+            // Measured: a page carrying "Countable Words" came back as
+            // "Countable Wor", so every `contains` check was false and the
+            // guard below silently did nothing while the page collected a
+            // fresh copy of the layer on every save.
+            existing_text = page
+                .text()
+                .map(|t| {
+                    t.chars()
+                        .iter()
+                        .filter_map(|c| char::from_u32(c.unicode_value()))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
             for annotation in page.annotations().iter() {
                 let Some(tag) = annotation_tag(&annotation) else {
                     continue;
@@ -9644,13 +9658,26 @@ mod tests {
     }
 
     #[test]
-    fn saving_twice_does_not_find_the_same_words_twice() {
-        // THE trap. The layer is regenerated on every save, so without finding
-        // and removing the previous one, a document saved five times contains
-        // five invisible copies of every text box and search reports five hits
-        // for one word.
-        let h = page_with_text_box("Once Only", None);
+    fn syncing_repeatedly_adds_the_layer_exactly_once() {
+        // THE trap, and the assertion had to change to catch it.
+        //
+        // This first counted MATCHES in the extracted text, and passed even
+        // with the guard disabled: PDFium collapses identical runs drawn on
+        // top of each other, so three copies still read as one hit. The test
+        // was measuring the extractor, not this code. Counting PAGE OBJECTS
+        // discriminates, and caught that every sync really was adding a copy.
+        // The phrase is LONG on purpose. PdfPageText::all() truncates by a
+        // couple of characters, and a short phrase survives that intact, so a
+        // short one here would pass even with the truncating reader restored.
+        let h = page_with_text_box("Countable Words In A Row", None);
         let pages = [0i32];
+
+        let before = page_object_count(h, 0);
+        assert_eq!(
+            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+            STATUS_OK_PDFIUM);
+        let after_first = page_object_count(h, 0);
+        assert_eq!(after_first, before + 1, "the first sync should add one run");
 
         for _ in 0..3 {
             assert_eq!(
@@ -9658,11 +9685,11 @@ mod tests {
                 STATUS_OK_PDFIUM);
         }
 
-        let text = text_after_round_trip(h);
         assert_eq!(
-            text.matches("Once Only").count(),
-            1,
-            "expected exactly one copy after three syncs, got: {text:?}");
+            page_object_count(h, 0),
+            after_first,
+            "a repeated sync added another copy of the layer");
+        assert!(text_after_round_trip(h).contains("Countable Words In A Row"));
         close_document(h);
     }
 
@@ -12598,6 +12625,41 @@ mod tests {
         close_document(reopened);
         close_document(h);
         free_byte_buffer(saved);
+    }
+
+    /// STEP 1 PROBE: why does disabling the duplicate guard not make
+    /// saving_twice_does_not_find_the_same_words_twice fail?
+    ///
+    /// Counts page objects after each sync, alongside what the extractor
+    /// reports. Ignored by default:
+    ///   cargo test dump_text_layer_object_counts -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_text_layer_object_counts() {
+        let words = "Countable Words";
+        let h = page_with_text_box(words, None);
+        let pages = [0i32];
+
+        println!("objects before any sync : {}", page_object_count(h, 0));
+
+        for n in 1..=3 {
+            let status = unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) };
+            let text = {
+                let saved = snapshot_document(h);
+                let reopened = open_document_from_bytes(saved.data, saved.len);
+                let t = page_text(reopened, 0);
+                close_document(reopened);
+                free_byte_buffer(saved);
+                t
+            };
+            println!(
+                "after sync {n}: status={status} objects={} matches={}",
+                page_object_count(h, 0),
+                text.matches(words).count()
+            );
+        }
+
+        close_document(h);
     }
 
     /// Can PDFium's own extractor read our text back? Ignored by default:

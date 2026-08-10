@@ -1295,6 +1295,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // moment the document closed.
         PersistGroups();
 
+        // And this is where a text box's words become findable. Must run AFTER
+        // the annotations are written, because the layer is built from their
+        // tags.
+        SyncSearchableText();
+
         // Writing over the file we have OPEN destroys it, silently.
         //
         // open_document uses load_pdf_from_file and PDFium streams page content
@@ -1402,6 +1407,35 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
         return SaveDocumentAs(path, flatten: false);
+    }
+
+    /// <summary>
+    /// Makes the text boxes on the pages we have touched findable.
+    ///
+    /// Only the pages in <c>_loadedByPage</c>, which is the set the user has
+    /// actually visited. A page never visited cannot hold a box created this
+    /// session, and sweeping the whole document to find out would mean loading
+    /// and parsing every page of it. The core no-ops a page with no text boxes,
+    /// so passing a few extra costs nothing.
+    /// </summary>
+    private void SyncSearchableText()
+    {
+        if (_documentHandle == 0 || _loadedByPage.Count == 0)
+        {
+            return;
+        }
+
+        int[] pages = _loadedByPage.Keys.ToArray();
+        int status = RenderCoreNative.sync_text_layer(
+            _documentHandle, pages, (nuint)pages.Length);
+
+        // Never fail a save over this. The document and its marks are intact
+        // either way; the only loss is that the words are not searchable, which
+        // is exactly where things stood before this existed.
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"sync_text_layer returned {status} for {pages.Length} pages");
+        }
     }
 
     /// <summary>True for files shipped with the app rather than opened by the user.</summary>

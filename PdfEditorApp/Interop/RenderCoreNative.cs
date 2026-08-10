@@ -334,6 +334,22 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_bookmarks(ulong docHandle);
 
     /// <summary>
+    /// Rewrites the searchable text layer on the given pages.
+    ///
+    /// Our text boxes draw their glyphs inside a stamp annotation, and a page's
+    /// text layer is its CONTENT stream, so the words cannot be found by any
+    /// reader, ours included. This writes them a second time into the page
+    /// content in an invisible render mode: nothing is drawn, the page renders
+    /// byte for byte identically, and the words become searchable.
+    ///
+    /// Takes explicit page indices because asking a page for its annotations
+    /// LOADS it, and sweeping all 3352 pages of a book to find the two with
+    /// text boxes is the mistake that cost 34 seconds on the form-field path.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int sync_text_layer(ulong docHandle, int[] pages, nuint pageCount);
+
+    /// <summary>
     /// Replaces the document's outline, reading <paramref name="srcPath"/> and
     /// writing to <paramref name="dstPath"/>.
     ///
