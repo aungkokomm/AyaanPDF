@@ -21,6 +21,16 @@ namespace PdfEditorApp.Viewport;
 /// <paramref name="StrokeWidthPts"/> and <paramref name="CornerRadiusPts"/> are
 /// in PDF points, as stored. Converting them to normalized units needs the page
 /// width, which a tag does not carry.
+///
+/// <paramref name="BoxWidthPts"/> and <paramref name="BoxHeightPts"/> are the
+/// shape's own UPRIGHT size, in points, and are written only by a shape that is
+/// turned or rounded. Zero means "not recorded". They matter because a rotated
+/// shape's /Rect is the axis-aligned box of the TURNED content: bigger than the
+/// shape in both axes, and not invertible at 45 degrees, where infinitely many
+/// boxes share one AABB. The centre of /Rect is exact at any angle, so centre
+/// plus this size reconstructs the shape precisely. render_core writes both
+/// fields and reads them back in <c>parse_shape_tag</c>; this reader used to
+/// stop at the radius and drop them on the floor.
 /// </summary>
 public readonly record struct ShapeTag(
     ShapeKind Kind,
@@ -30,13 +40,15 @@ public readonly record struct ShapeTag(
     bool FlipY,
     double RotationDeg,
     string? FillHex,
-    double CornerRadiusPts);
+    double CornerRadiusPts,
+    double BoxWidthPts = 0,
+    double BoxHeightPts = 0);
 
 /// <summary>
 /// Reads the tag a shape stores, the C# side of <c>parse_shape_tag</c> in
 /// render_core.
 ///
-/// Format: <c>AyaanShape:kind:RRGGBBAA:widthPts:fx:fy[:rot[:fillAARRGGBB[:radiusPts]]]</c>
+/// Format: <c>AyaanShape:kind:RRGGBBAA:widthPts:fx:fy[:rot[:fillAARRGGBB[:radiusPts[:boxWPts:boxHPts]]]]</c>
 ///
 /// The trailing fields were appended over time and are absent from older tags,
 /// so every one of them reads as its historic default rather than failing the
@@ -126,7 +138,9 @@ public static class ShapeTagReader
             FlipY: parts[4] == "1",
             RotationDeg: OptionalNumber(parts, 5),
             FillHex: OptionalFill(parts, 6),
-            CornerRadiusPts: Math.Max(0, OptionalNumber(parts, 7)));
+            CornerRadiusPts: Math.Max(0, OptionalNumber(parts, 7)),
+            BoxWidthPts: OptionalPositive(parts, 8),
+            BoxHeightPts: OptionalPositive(parts, 9));
         return true;
     }
 
@@ -157,6 +171,19 @@ public static class ShapeTagReader
                && double.IsFinite(v)
             ? v
             : 0;
+    }
+
+    /// <summary>
+    /// A trailing field that is only meaningful when it is POSITIVE, so absent,
+    /// unparseable, zero and negative all read the same: not recorded. Mirrors
+    /// the <c>filter(|v| v.is_finite() &amp;&amp; *v &gt; 0.0)</c> guard the Rust
+    /// reader applies to the same two fields, so a shape either has a usable
+    /// upright box or has none, with no third state to handle downstream.
+    /// </summary>
+    private static double OptionalPositive(string[] parts, int at)
+    {
+        double v = OptionalNumber(parts, at);
+        return v > 0 ? v : 0;
     }
 
     private static bool IsHex(string s)

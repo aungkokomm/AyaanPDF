@@ -71,6 +71,23 @@ public class DocumentModelInteropTests
         public int Status;
     }
 
+    /// <summary>Mirrors render_core::PageSize.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PageSize
+    {
+        public float Width;
+        public float Height;
+    }
+
+    /// <summary>Mirrors render_core::PageSizeArray.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PageSizeArray
+    {
+        public IntPtr Sizes;
+        public nuint Len;
+        public int Status;
+    }
+
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern ulong open_document([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
@@ -95,6 +112,12 @@ public class DocumentModelInteropTests
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern void free_byte_buffer(ByteBuffer buffer);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern PageSizeArray get_page_sizes(ulong docHandle);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern void free_page_size_array(PageSizeArray array);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern ByteBuffer snapshot_document(ulong docHandle);
@@ -137,12 +160,43 @@ public class DocumentModelInteropTests
     }
 
     /// <summary>
+    /// The page's width in PDF points, read the way the app reads it. Mirrors
+    /// ViewportViewModel.PagePointsFor, which is what feeds the real model.
+    /// </summary>
+    private static double PageWidthPts(ulong handle, int pageIndex)
+    {
+        var array = get_page_sizes(handle);
+        try
+        {
+            Assert.Equal(OkPdfium, array.Status);
+            Assert.True(pageIndex < (int)array.Len, $"page {pageIndex} is past the end");
+
+            int stride = Marshal.SizeOf<PageSize>();
+            var size = Marshal.PtrToStructure<PageSize>(array.Sizes + (pageIndex * stride));
+            Assert.True(size.Width > 0, "the page reported no width");
+            return size.Width;
+        }
+        finally
+        {
+            free_page_size_array(array);
+        }
+    }
+
+    /// <summary>
     /// Reads a page out of the document exactly the way the app does and builds
     /// the model from it: annotation bounds and subtype from get_annotations,
-    /// the tag from get_annotation_contents, identity from get_annotation_id.
+    /// the tag from get_annotation_contents, identity from get_annotation_id,
+    /// and the page width from get_page_sizes.
+    ///
+    /// The page width is what lets the model undo the writer's additions: the
+    /// tags record stroke width, corner radius and a turned shape's upright size
+    /// in POINTS, and nothing else here is in points. Building without it
+    /// exercises only the fallback, which is not the path the app takes.
     /// </summary>
     private static PageModel ModelOf(ulong handle, int pageIndex)
     {
+        double pageWidthPts = PageWidthPts(handle, pageIndex);
+
         var array = get_annotations(handle, pageIndex);
         try
         {
@@ -166,7 +220,7 @@ public class DocumentModelInteropTests
                     Text(get_annotation_contents(handle, pageIndex, native.Index)));
             }
 
-            return DocumentModelBuilder.BuildPage(pageIndex, snapshots);
+            return DocumentModelBuilder.BuildPage(pageIndex, snapshots, pageWidthPts);
         }
         finally
         {
@@ -280,6 +334,133 @@ public class DocumentModelInteropTests
         finally
         {
             close_document(handle);
+        }
+    }
+
+    // ---------------- Reconstructing the shape from what the writer produced ----------------
+    //
+    // These two are the round trip that the hand-written tag fixtures cannot
+    // provide. The model undoes two things the writer does, and it has to undo
+    // exactly what the writer did rather than what this side believes it did.
+    // A fixture proves the reader parses a string; only the real writer proves
+    // the string is the one it emits, and only the real page proves the points
+    // convert back at the right scale.
+    //
+    // Both work in fractions of the page WIDTH, so neither depends on the size
+    // of the fixture's pages: a shape drawn between capture x 200 and 400 out of
+    // 1000 is 0.2 of the page width whatever the page measures.
+
+    [Fact]
+    public void the_stroke_pad_the_writer_added_is_taken_back_off_a_real_shape()
+    {
+        // The writer grows /Rect by width/2 + 1 POINTS on every side so PDFium
+        // will not clip the stroke. The model insets by the same amount, which
+        // it can only do with the page width in hand.
+        ulong handle = OpenFixture();
+        try
+        {
+            // Drawn from (0.1,0.1) to (0.5,0.3) of the page width.
+            var specs = new[] { Spec(ShapeKind.Rectangle, 100, 100, 500, 300) };
+            Assert.Equal(OkPdfium, add_shape_annotations(handle, Cap, specs, 1));
+
+            var shape = ModelOf(handle, 0).Shapes.Single();
+
+            Assert.Equal(0.1, shape.UprightBounds.Left, 4);
+            Assert.Equal(0.1, shape.UprightBounds.Top, 4);
+            Assert.Equal(0.5, shape.UprightBounds.Right, 4);
+            Assert.Equal(0.3, shape.UprightBounds.Bottom, 4);
+
+            // /Rect is bigger on every side, which is the thing being undone.
+            // Without this the assertions above would also pass if the model
+            // simply handed back /Rect on a page that happened to be padded by
+            // nothing.
+            Assert.True(shape.Bounds.Left < shape.UprightBounds.Left);
+            Assert.True(shape.Bounds.Top < shape.UprightBounds.Top);
+            Assert.True(shape.Bounds.Right > shape.UprightBounds.Right);
+            Assert.True(shape.Bounds.Bottom > shape.UprightBounds.Bottom);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void a_real_rotated_shape_is_rebuilt_at_the_size_it_was_drawn()
+    {
+        // The case that cannot be worked out from /Rect at all. A turned shape's
+        // /Rect is the axis-aligned box of the ROTATED content, larger than the
+        // shape in both axes; at 45 degrees infinitely many boxes share one, so
+        // it is not merely lossy but non-invertible. The writer records the
+        // upright size on the tag for exactly this reason, and until now the C#
+        // reader parsed past those two fields and dropped them.
+        ulong handle = OpenFixture();
+        try
+        {
+            // 0.2 wide by 0.1 tall, centred on (0.3, 0.35), turned 45 degrees.
+            var specs = new[] { Spec(ShapeKind.Rectangle, 200, 300, 400, 400, rotation: 45f) };
+            Assert.Equal(OkPdfium, add_shape_annotations(handle, Cap, specs, 1));
+
+            var shape = ModelOf(handle, 0).Shapes.Single();
+            Assert.Equal(45, shape.RotationDeg, 2);
+
+            // The tag carried the upright size through the real writer.
+            Assert.True(shape.UprightBounds.Width > 0, "no upright size came back");
+
+            Assert.Equal(0.2, shape.UprightBounds.Width, 3);
+            Assert.Equal(0.1, shape.UprightBounds.Height, 3);
+            Assert.Equal(0.3, (shape.UprightBounds.Left + shape.UprightBounds.Right) / 2, 3);
+            Assert.Equal(0.35, (shape.UprightBounds.Top + shape.UprightBounds.Bottom) / 2, 3);
+
+            // And what /Rect says instead: a near-square box about 0.22 on each
+            // side, both wider AND more than twice as tall as the shape. This is
+            // what every hit test in the app is measuring against today.
+            Assert.True(shape.Bounds.Width > 0.21, $"/Rect width was {shape.Bounds.Width}");
+            Assert.True(shape.Bounds.Height > 0.21, $"/Rect height was {shape.Bounds.Height}");
+            Assert.True(shape.Bounds.Height > shape.UprightBounds.Height * 2);
+
+            // The drag direction survives the rebuild, so an arrow turned 45
+            // degrees still points where it was drawn rather than back at itself.
+            Assert.Equal(shape.UprightBounds.Left, shape.UprightGeometry.X1, 6);
+            Assert.Equal(shape.UprightBounds.Right, shape.UprightGeometry.X2, 6);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void a_rotated_shapes_upright_size_survives_a_save_and_reopen()
+    {
+        // The upright size lives on the tag, so it is only as durable as the
+        // tag is. A shape that reconstructed correctly in the session and came
+        // back as its own bounding box after a reopen would be a hit test that
+        // silently degrades the moment a file is closed.
+        ulong handle = OpenFixture();
+        var specs = new[] { Spec(ShapeKind.Arrow, 200, 300, 400, 400, rotation: 30f) };
+        Assert.Equal(OkPdfium, add_shape_annotations(handle, Cap, specs, 1));
+
+        var before = ModelOf(handle, 0).Shapes.Single();
+        var saved = snapshot_document(handle);
+        close_document(handle);
+        Assert.Equal(OkPdfium, saved.Status);
+
+        ulong reopened = open_document_from_bytes(saved.Data, saved.Len);
+        Assert.NotEqual(0UL, reopened);
+        try
+        {
+            var after = ModelOf(reopened, 0).Shapes.Single();
+
+            Assert.Equal(before.RotationDeg, after.RotationDeg, 3);
+            Assert.Equal(before.UprightBounds.Width, after.UprightBounds.Width, 4);
+            Assert.Equal(before.UprightBounds.Height, after.UprightBounds.Height, 4);
+            Assert.Equal(0.2, after.UprightBounds.Width, 3);
+            Assert.Equal(0.1, after.UprightBounds.Height, 3);
+        }
+        finally
+        {
+            close_document(reopened);
         }
     }
 

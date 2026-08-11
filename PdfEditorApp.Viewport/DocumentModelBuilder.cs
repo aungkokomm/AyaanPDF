@@ -40,40 +40,60 @@ public static class DocumentModelBuilder
     /// Builds one page's model. Annotations are ordered by their index, which
     /// is the page's paint order, so the model's list is back to front.
     /// </summary>
-    public static PageModel BuildPage(int pageIndex, IReadOnlyList<AnnotationSnapshot> annotations)
+    /// <param name="pageWidthPts">
+    /// The page's width in PDF points, which is the scale between the tags'
+    /// points-valued fields (stroke width, corner radius, upright size) and the
+    /// normalized units everything else is in. A page property, so it is passed
+    /// once here rather than repeated on every snapshot.
+    ///
+    /// Zero is allowed and means "unknown": every derivation that needs the
+    /// scale then falls back to the annotation's own /Rect, which is exactly
+    /// what the model did before it had this at all.
+    /// </param>
+    public static PageModel BuildPage(
+        int pageIndex, IReadOnlyList<AnnotationSnapshot> annotations, double pageWidthPts = 0)
     {
         var objects = new List<DocumentObject>(annotations?.Count ?? 0);
 
         foreach (var a in (annotations ?? []).OrderBy(a => a.Index))
         {
-            objects.Add(BuildObject(pageIndex, a));
+            objects.Add(BuildObject(pageIndex, a, pageWidthPts));
         }
 
-        return new PageModel { PageIndex = pageIndex, Objects = objects };
+        return new PageModel
+        {
+            PageIndex = pageIndex,
+            WidthPts = pageWidthPts,
+            Objects = objects,
+        };
     }
 
     /// <summary>Assembles pages into a document snapshot, page order preserved.</summary>
     public static DocumentModel Build(IEnumerable<PageModel> pages) =>
         new() { Pages = (pages ?? []).OrderBy(p => p.PageIndex).ToList() };
 
-    private static DocumentObject BuildObject(int pageIndex, AnnotationSnapshot a)
+    private static DocumentObject BuildObject(int pageIndex, AnnotationSnapshot a, double pageWidthPts)
     {
         var bounds = new TextRect(a.Left, a.Top, a.Right, a.Bottom);
 
         if (ShapeTagReader.TryParse(a.Contents, out ShapeTag tag))
         {
+            var upright = UprightBoundsFor(tag, bounds, pageWidthPts);
             return new ShapeObject
             {
                 Id = a.Id,
                 PageIndex = pageIndex,
                 ZOrder = a.Index,
                 Bounds = bounds,
+                PageWidthPts = pageWidthPts,
+                UprightBounds = upright,
                 Opacity = a.Opacity,
                 RawTag = a.Contents,
                 GroupId = a.GroupId,
                 Kind = DocumentObjectKind.Shape,
                 ShapeKind = tag.Kind,
                 Geometry = GeometryFrom(tag, bounds),
+                UprightGeometry = GeometryFrom(tag, upright),
                 StrokeHex = tag.StrokeHex,
                 StrokeWidthPts = tag.StrokeWidthPts,
                 FillHex = tag.FillHex,
@@ -82,18 +102,129 @@ public static class DocumentModelBuilder
             };
         }
 
+        var kind = ClassifyOpaque(a);
+        var (rotation, uprightBounds) = OpaqueFrameFor(kind, a.Contents, bounds);
+        var (inkPoints, inkWidth) = InkFor(kind, a.Contents);
+
         return new OpaqueObject
         {
             Id = a.Id,
             PageIndex = pageIndex,
             ZOrder = a.Index,
             Bounds = bounds,
+            PageWidthPts = pageWidthPts,
+            UprightBounds = uprightBounds,
+            RotationDeg = rotation,
             Opacity = a.Opacity,
             RawTag = a.Contents,
             GroupId = a.GroupId,
-            Kind = ClassifyOpaque(a),
+            Kind = kind,
             Subtype = a.Subtype,
+            InkPoints = inkPoints,
+            InkStrokeWidth = inkWidth,
         };
+    }
+
+    /// <summary>
+    /// Half a capture pixel, normalized: the floor a de-padding inset may not
+    /// cross. Mirrors the <c>- 0.5</c> in render_core's resize path, which works
+    /// in capture-space pixels. Without a floor, insetting a hairline shape by
+    /// its own pad turns the box inside out.
+    /// </summary>
+    private const double MinHalfExtent = 0.5 / 1000.0;
+
+    /// <summary>
+    /// The shape's own upright box: /Rect with the writer's additions taken back
+    /// off.
+    ///
+    /// This mirrors <c>resize_shape_annotation_inner</c> in render_core, which
+    /// is the code that already has to undo the same two things in order to
+    /// redraw a shape at a new size. Doing it identically here is what makes the
+    /// model agree with what is on the page; doing it differently is how the
+    /// model and the document start to disagree.
+    ///
+    /// Two cases, and they are not symmetrical:
+    ///
+    /// TURNED: /Rect is the axis-aligned box of the rotated content, so it
+    /// cannot be inverted at all. At 45 degrees infinitely many boxes share one
+    /// AABB. The CENTRE of /Rect is exact at every angle though, so centre plus
+    /// the size the tag recorded reconstructs the shape precisely.
+    ///
+    /// UPRIGHT: /Rect is the drag's extent grown by width/2 + 1 on every side,
+    /// so PDFium would not clip the stroke. That is invertible, and insetting by
+    /// the same amount recovers the drag.
+    ///
+    /// Anything else, a turned shape written before the upright size was
+    /// recorded, or a page whose width is unknown, keeps the padded /Rect. That
+    /// is the fallback the core uses too, and it is no worse than what the model
+    /// reported before.
+    /// </summary>
+    private static TextRect UprightBoundsFor(ShapeTag tag, TextRect bounds, double pageWidthPts)
+    {
+        if (pageWidthPts <= 0) { return bounds; }
+
+        if (tag.RotationDeg != 0)
+        {
+            if (tag.BoxWidthPts <= 0 || tag.BoxHeightPts <= 0) { return bounds; }
+
+            double cx = (bounds.Left + bounds.Right) / 2;
+            double cy = (bounds.Top + bounds.Bottom) / 2;
+            double halfW = tag.BoxWidthPts / pageWidthPts / 2;
+            double halfH = tag.BoxHeightPts / pageWidthPts / 2;
+            return new TextRect(cx - halfW, cy - halfH, cx + halfW, cy + halfH);
+        }
+
+        double pad = (tag.StrokeWidthPts / 2 + 1) / pageWidthPts;
+        double maxInset = Math.Max(
+            0, Math.Min(bounds.Right - bounds.Left, bounds.Bottom - bounds.Top) / 2 - MinHalfExtent);
+        double inset = Math.Min(pad, maxInset);
+
+        return new TextRect(
+            bounds.Left + inset, bounds.Top + inset,
+            bounds.Right - inset, bounds.Bottom - inset);
+    }
+
+    /// <summary>
+    /// A non-shape object's angle and upright box.
+    ///
+    /// Text boxes and image stamps both turn, and both record their own upright
+    /// rectangle for the same reason a rotated shape does: their /Rect grows to
+    /// contain the turned content, so it is not the object. Everything else has
+    /// no angle to report and no better box than the one it already has.
+    /// </summary>
+    private static (double RotationDeg, TextRect Upright) OpaqueFrameFor(
+        DocumentObjectKind kind, string? contents, TextRect bounds)
+    {
+        if (kind == DocumentObjectKind.TextBox && TextBoxTagReader.TryParse(contents, out var text))
+        {
+            return (text.RotationDeg,
+                    text.HasBoxRect
+                        ? new TextRect(text.BoxLeft, text.BoxTop, text.BoxRight, text.BoxBottom)
+                        : bounds);
+        }
+
+        if (kind == DocumentObjectKind.Stamp && StampTagReader.TryParse(contents, out var stamp))
+        {
+            return (stamp.RotationDeg, stamp.Bounds);
+        }
+
+        return (0, bounds);
+    }
+
+    /// <summary>
+    /// A freehand stroke's points, recovered from its tag.
+    ///
+    /// Only our own ink carries one. A stroke from another editor comes back
+    /// empty and is left to its bounding box, which is all anyone knows about it.
+    /// </summary>
+    private static (IReadOnlyList<(double X, double Y)> Points, double Width) InkFor(
+        DocumentObjectKind kind, string? contents)
+    {
+        if (kind != DocumentObjectKind.Ink) { return ([], 0); }
+
+        return InkTag.TryParse(contents, out _, out double width, out var control)
+            ? (control, width)
+            : ([], 0);
     }
 
     /// <summary>

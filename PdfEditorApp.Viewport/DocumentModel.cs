@@ -81,6 +81,48 @@ public abstract record DocumentObject
 
     public TextRect Bounds { get; init; }
 
+    /// <summary>
+    /// The page's width in PDF points, or 0 when it was not supplied.
+    ///
+    /// Carried on the object because the tags store stroke width, corner radius
+    /// and upright size in POINTS while everything else here is normalized, and
+    /// the page width is the only bridge between the two. Zero means "unknown",
+    /// and every derivation that needs it falls back to the untouched /Rect
+    /// rather than guessing at a scale.
+    /// </summary>
+    public double PageWidthPts { get; init; }
+
+    /// <summary>Clockwise rotation about the object's own centre, in screen
+    /// degrees. Zero for anything upright and for anything whose kind does not
+    /// record an angle.</summary>
+    public double RotationDeg { get; init; }
+
+    /// <summary>
+    /// The object's own UPRIGHT box, normalized: what it would occupy at zero
+    /// degrees, with no stroke padding.
+    ///
+    /// <see cref="Bounds"/> is the annotation's /Rect, and /Rect is not the
+    /// object. For a shape it is inflated by the stroke pad the writer added so
+    /// PDFium would not clip the stroke; for anything TURNED it is the
+    /// axis-aligned box of the rotated content, which is larger in both axes.
+    /// Hit-testing against /Rect is therefore hit-testing against something
+    /// bigger than what the user can see, which is the whole reason this
+    /// property exists.
+    ///
+    /// Falls back to <see cref="Bounds"/> whenever the object does not record
+    /// enough to do better, so it is always safe to read.
+    /// </summary>
+    public TextRect UprightBounds
+    {
+        // Backed by a nullable so the fallback is structural. An init-only
+        // property left unset would report an empty rect at the origin, and a
+        // hit test against that is not a degraded answer, it is a wrong one.
+        get => _uprightBounds ?? Bounds;
+        init => _uprightBounds = value;
+    }
+
+    private readonly TextRect? _uprightBounds;
+
     /// <summary>The annotation-level opacity PDFium reports. Note that a shape
     /// also carries alpha inside its stroke and fill colours, which is where
     /// the app's own opacity controls actually write.</summary>
@@ -132,8 +174,31 @@ public sealed record ShapeObject : DocumentObject
     /// rather than a parallel type. Carries the drag DIRECTION, restored from
     /// the tag's flip flags, so an arrow in the model points the way it points
     /// on the page.
+    ///
+    /// Spans the annotation's /Rect, so it INCLUDES the stroke pad and, for a
+    /// turned shape, the enlargement rotation caused. That is the same rectangle
+    /// the move and resize paths operate on, which is why it is kept as it is.
+    /// Anything measuring the shape itself wants <see cref="UprightGeometry"/>.
     /// </summary>
     public ShapeDraft Geometry { get; init; }
+
+    /// <summary>
+    /// The same drag, spanning <see cref="DocumentObject.UprightBounds"/>: the
+    /// shape as DRAWN, with the stroke pad removed and any rotation undone.
+    ///
+    /// This is the geometry to measure against. Rotate it back about the centre
+    /// of <see cref="DocumentObject.Bounds"/> by
+    /// <see cref="DocumentObject.RotationDeg"/> to get where it sits on the page.
+    /// Equal to <see cref="Geometry"/> when the page width was not supplied, so
+    /// a caller that has no scale is no worse off than before.
+    /// </summary>
+    public ShapeDraft UprightGeometry
+    {
+        get => _uprightGeometry ?? Geometry;
+        init => _uprightGeometry = value;
+    }
+
+    private readonly ShapeDraft? _uprightGeometry;
 
     /// <summary>Stroke colour as "#AARRGGBB", alpha included.</summary>
     public string StrokeHex { get; init; } = string.Empty;
@@ -143,9 +208,6 @@ public sealed record ShapeObject : DocumentObject
 
     /// <summary>Fill as "#AARRGGBB", or null for a stroke-only shape.</summary>
     public string? FillHex { get; init; }
-
-    /// <summary>Clockwise rotation about the shape's centre, in screen degrees.</summary>
-    public double RotationDeg { get; init; }
 
     /// <summary>Corner radius in PDF points. Zero for every kind but a rounded
     /// rectangle, and for a rounded rectangle drawn square.</summary>
@@ -166,12 +228,39 @@ public sealed record OpaqueObject : DocumentObject
     /// <summary>The PDFium subtype, for callers that need to tell one opaque
     /// object from another without re-reading the document.</summary>
     public int Subtype { get; init; }
+
+    /// <summary>
+    /// A freehand stroke's CONTROL points, normalized, in drawing order. Empty
+    /// for every other kind, and for ink this app did not write.
+    ///
+    /// These are the thinned points the tag stores, not the fitted curve that is
+    /// drawn from them. The fit passes through every one of them and the gaps
+    /// are short by construction, so measuring distance to this polyline agrees
+    /// with the drawn stroke to well inside the stroke's own width. Storing the
+    /// fitted curve instead would multiply the point count on a model that is
+    /// rebuilt after every edit, to move an answer that is already inside the
+    /// tolerance.
+    ///
+    /// An ink stroke is the one object whose shape is genuinely a point cloud,
+    /// so this is the only way to know where it actually is. Its /Rect says
+    /// nothing: a diagonal scribble fills very little of its own box.
+    /// </summary>
+    public IReadOnlyList<(double X, double Y)> InkPoints { get; init; } = [];
+
+    /// <summary>The stroke's width in normalized units, as its tag records it.
+    /// Zero for anything that is not our ink.</summary>
+    public double InkStrokeWidth { get; init; }
 }
 
 /// <summary>One page's objects, in paint order.</summary>
 public sealed record PageModel
 {
     public int PageIndex { get; init; }
+
+    /// <summary>The page's width in PDF points, or 0 when it was not supplied.
+    /// The scale every points-valued field on this page's objects is converted
+    /// through.</summary>
+    public double WidthPts { get; init; }
 
     /// <summary>Ordered back to front: the last entry is on top.</summary>
     public IReadOnlyList<DocumentObject> Objects { get; init; } = [];

@@ -5837,7 +5837,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 a.Index, a.Subtype, a.Left, a.Top, a.Right, a.Bottom,
                 a.Opacity, a.Id, ReadAnnotationContents(pageIndex, a.Index), a.GroupId));
         }
-        return DocumentModelBuilder.BuildPage(pageIndex, snapshots);
+        // The page width, so the model can convert the tags' points-valued
+        // fields (stroke width, corner radius, a turned shape's upright size)
+        // into the normalized units everything else is in. One FFI per model
+        // build, which is once per page load, not once per object.
+        var (pageWidthPts, _) = PagePointsFor(pageIndex);
+        return DocumentModelBuilder.BuildPage(pageIndex, snapshots, pageWidthPts);
     }
 
     /// <summary>
