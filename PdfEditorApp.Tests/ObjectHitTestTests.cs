@@ -349,6 +349,34 @@ public class ObjectHitTestTests
         Assert.False(ObjectHitTest.Hit(null, 0.5, 0.5));
     }
 
+    // ---------------- Why the grip check has to come first ----------------
+
+    [Fact]
+    public void a_resize_grip_can_sit_where_the_object_itself_is_not()
+    {
+        // Grips are drawn on the corners of the annotation's /Rect, and a
+        // diagonal arrow does not reach two of those corners. So the handle and
+        // the object disagree about the very same point, and SelectAnnotationAt
+        // must keep testing the SELECTED object's grips BEFORE it picks by
+        // geometry, or a selected arrow could never be resized: the click would
+        // fall through to the geometry test, miss the arrow, and deselect it.
+        //
+        // This pins the conflict rather than the ordering, which lives in the
+        // view model where a test assembly cannot reach it. Anyone who later
+        // decides the grip pre-check looks redundant has to explain this.
+        var arrow = One(FatArrow, Padded(0.1, 0.1, 0.5, 0.5, 20));
+        var box = new AnnotationBox(
+            0, arrow.Bounds.Left, arrow.Bounds.Top, arrow.Bounds.Right, arrow.Bounds.Bottom);
+
+        // The top-right corner of the box: a resize grip lives there.
+        Assert.Equal(
+            LoadedAnnotationPicker.Grip.TopRight,
+            LoadedAnnotationPicker.GripAt(box, arrow.Bounds.Right, arrow.Bounds.Top));
+
+        // And the arrow is nowhere near it.
+        Assert.False(ObjectHitTest.Hit(arrow, arrow.Bounds.Right, arrow.Bounds.Top));
+    }
+
     // ---------------- Tolerance ----------------
 
     [Fact]

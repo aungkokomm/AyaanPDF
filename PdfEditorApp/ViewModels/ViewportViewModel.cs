@@ -3393,16 +3393,48 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// The topmost OBJECT under a point, asked of the document model.
+    ///
+    /// This used to test each annotation's /Rect, and /Rect is not the object:
+    /// it is the drag's extent grown by the stroke pad, and for anything turned
+    /// it is the axis-aligned box of the rotated content. A diagonal arrow could
+    /// therefore be selected anywhere inside a box it barely touches, which is
+    /// the bug this replaces.
+    ///
+    /// Handed back as an <see cref="AnnotationBox"/> so everything downstream is
+    /// unchanged. The three fields callers use all mean exactly what they meant
+    /// before: <c>Index</c> is the annotation's position on the page (the model's
+    /// ZOrder IS that index), the rectangle is the annotation's own /Rect, which
+    /// the move, resize and frame-drawing paths are all threaded on, and the Id
+    /// is the same stable identity. Only WHICH object comes back has changed.
+    ///
+    /// PageModelFor reads through LoadedFor, so the group absorption that used
+    /// to happen here still happens, and the model shares the annotation cache's
+    /// lifetime so it can never be staler than the data it replaces.
+    /// </summary>
+    private AnnotationBox? PickLoadedAt(int pageIndex, double normX, double normY)
+    {
+        var picked = ObjectHitTest.PickTopmost(
+            PageModelFor(pageIndex), normX, normY, AnnotationHitTester.DefaultTolerance);
+
+        if (picked is null)
+        {
+            return null;
+        }
+
+        return new AnnotationBox(
+            picked.ZOrder,
+            picked.Bounds.Left, picked.Bounds.Top, picked.Bounds.Right, picked.Bounds.Bottom,
+            picked.Id);
+    }
+
+    /// <summary>
     /// Picks the topmost annotation already in the file under a point.
     /// Later entries are drawn on top, so the search runs backwards.
     /// </summary>
     private bool SelectLoadedAt(int pageIndex, double normX, double normY)
     {
-        var boxes = LoadedFor(pageIndex)
-            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id))
-            .ToList();
-
-        if (LoadedAnnotationPicker.PickTopmost(boxes, normX, normY) is not AnnotationBox hit)
+        if (PickLoadedAt(pageIndex, normX, normY) is not AnnotationBox hit)
         {
             return false;
         }
@@ -6354,12 +6386,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return GripForPoint(sel, normX, normY);
     }
 
-    /// <summary>Whether a point is inside the current selection, so it can be dragged.</summary>
+    /// <summary>
+    /// Whether a point is on the current selection, so it can be dragged.
+    ///
+    /// Asked of the object, not of its rectangle, because this drives the move
+    /// cursor and the cursor has to agree with what a click will actually do.
+    /// A SizeAll shown over the empty corner of a diagonal arrow's bounding box
+    /// promises a drag that would in fact deselect.
+    ///
+    /// Falls back to the selection's own rectangle when the object cannot be
+    /// resolved, which is the behaviour this had before: a mark with no stable
+    /// identity yet, or one whose page has been invalidated out from under the
+    /// selection, is still draggable rather than suddenly inert.
+    /// </summary>
     public bool IsOverSelection(int pageIndex, double normX, double normY)
     {
         if (_selectedLoaded is not LoadedSelection sel || sel.PageIndex != pageIndex)
         {
             return false;
+        }
+
+        if (sel.Id != Guid.Empty && PageModelFor(pageIndex).ById(sel.Id) is { } obj)
+        {
+            return ObjectHitTest.Hit(obj, normX, normY, AnnotationHitTester.DefaultTolerance);
         }
 
         return normX >= sel.Left && normX <= sel.Right
@@ -7727,11 +7776,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return null;
         }
 
-        var boxes = LoadedFor(pageIndex)
-            .Select(a => new AnnotationBox(a.Index, a.Left, a.Top, a.Right, a.Bottom, a.Id))
-            .ToList();
-
-        if (LoadedAnnotationPicker.PickTopmost(boxes, normX, normY) is not AnnotationBox hit)
+        // Same pick as a single click, so a double-click opens the editor on the
+        // box a click would have selected. Two pickers here would mean a box you
+        // could select but not edit, or the reverse.
+        if (PickLoadedAt(pageIndex, normX, normY) is not AnnotationBox hit)
         {
             return null;
         }
