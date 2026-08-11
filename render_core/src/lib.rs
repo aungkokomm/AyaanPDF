@@ -678,6 +678,111 @@ pub extern "C" fn save_document(doc_handle: u64, path: *const c_char) -> i32 {
 /// extracts in logical order and needs no CMap of its own.
 ///
 /// This is how a scanned document's OCR layer works, for the same reason.
+/// Mints a 32-hex id for an Ayaan object that has none.
+///
+/// Not random for its own sake: it only has to be unique within one document,
+/// and it MUST be written back in the same breath. An id that is invented and
+/// then forgotten is worse than none at all, because the next save invents a
+/// different one and the association breaks silently. That exact bug cost a
+/// release once already.
+fn mint_object_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:016x}{n:016x}")
+}
+
+/// Gives every Ayaan text box on the page a stable id, writing it back.
+///
+/// A freshly created box has no id: the tag is written at creation and the app
+/// assigns the id afterwards. The searchable layer is keyed on that id, so
+/// syncing a page whose boxes are brand new has to establish it first, or the
+/// boxes are silently skipped and never become findable.
+fn ensure_text_box_ids(page: &mut pdfium_render::prelude::PdfPage<'_>) {
+    let annotations = page.annotations_mut();
+    let count = annotations.len();
+    for i in 0..count {
+        let Some(mut annotation) = annotations.iter().nth(i as usize) else {
+            continue;
+        };
+        let Some(tag) = annotation_tag(&annotation) else {
+            continue;
+        };
+        let (existing_id, body) = strip_id_prefix(&tag);
+        if existing_id.is_some() || parse_textbox_tag_full(&tag).is_none() {
+            continue;
+        }
+        let new_tag = format!("{ID_PREFIX}{}{ID_SEPARATOR}{body}", mint_object_id());
+        let _ = set_annotation_tag(&mut annotation, &new_tag);
+    }
+}
+
+/// The mark that ties an invisible run to the Ayaan text object it belongs to.
+///
+/// The full mark name is `AyaanSearch:<32 hex>`, where the hex is the SAME
+/// stable id the annotation carries in its `AyaanTag` (`ID:<32hex>|<body>`).
+/// So the association is by the object's own identity, which already survives
+/// every edit, move, resize and rotation: PDFium cannot edit an annotation in
+/// place, so the app deletes and re-adds it under the same id.
+///
+/// The id rides in the mark's NAME rather than in a mark parameter because
+/// `FPDFPageObjMark_SetStringParam` needs the document handle, which the
+/// vendored crate does not expose publicly. A name holds 32 hex digits
+/// perfectly well, and reading one needs only the object handle.
+///
+/// NOT an index, and NOT the text itself. Two text boxes on one page saying the
+/// same words are two different objects and must stay independently findable.
+const SEARCH_MARK_PREFIX: &str = "AyaanSearch:";
+
+/// The Ayaan object id an invisible run belongs to, or None if it is not ours.
+fn search_mark_id(
+    bindings: &dyn pdfium_render::prelude::PdfiumLibraryBindings,
+    handle: pdfium_render::prelude::FPDF_PAGEOBJECT,
+) -> Option<String> {
+    for i in 0..bindings.FPDFPageObj_CountMarks(handle).max(0) {
+        let mark = bindings.FPDFPageObj_GetMark(handle, i as std::os::raw::c_ulong);
+        if mark.is_null() {
+            continue;
+        }
+        // Length is in BYTES and includes the UTF-16 terminator.
+        let mut out: std::os::raw::c_ulong = 0;
+        bindings.FPDFPageObjMark_GetName(mark, std::ptr::null_mut(), 0, &mut out);
+        if out <= 2 {
+            continue;
+        }
+        let mut buf = vec![0u16; out as usize / 2];
+        bindings.FPDFPageObjMark_GetName(mark, buf.as_mut_ptr(), out, &mut out);
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
+        if let Ok(name) = String::from_utf16(&buf) {
+            if let Some(id) = name.strip_prefix(SEARCH_MARK_PREFIX) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// One Ayaan text object's contribution to the searchable layer.
+struct SearchRun {
+    /// The owning annotation's stable id. The whole association mechanism.
+    id: String,
+    /// The ORIGINAL source string. Never reconstructed from shaped glyphs:
+    /// shaping is a one-way visual transform, and inverting it is exactly the
+    /// problem this design exists to avoid.
+    text: String,
+    size_px: f32,
+    left: f32,
+    top: f32,
+    font_path: Option<String>,
+}
+
 fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -694,36 +799,26 @@ fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
             continue;
         }
 
-        // What to write, gathered BEFORE anything is mutated: the words of each
-        // text box and the rect to sit them in.
-        let mut runs: Vec<(String, f32, f32, f32, Option<String>)> = Vec::new();
-        let existing_text;
+        // Ids first: a brand-new box has none, and the layer is keyed on it.
+        if let Ok(mut page) = doc_guard.pages().get(page_index as u16) {
+            ensure_text_box_ids(&mut page);
+        }
+
+        // Gathered BEFORE anything else is mutated.
+        let mut runs: Vec<SearchRun> = Vec::new();
         {
             let Ok(page) = doc_guard.pages().get(page_index as u16) else {
                 continue;
             };
-
-            // Read through the page we already hold, NOT through get_page_chars:
-            // that entry point takes CALL_LOCK, which this function already
-            // holds, and the second acquisition DEADLOCKS (the test run hung
-            // rather than failing).
-            //
-            // Character by character, NOT PdfPageText::all(), which TRUNCATES.
-            // Measured: a page carrying "Countable Words" came back as
-            // "Countable Wor", so every `contains` check was false and the
-            // guard below silently did nothing while the page collected a
-            // fresh copy of the layer on every save.
-            existing_text = page
-                .text()
-                .map(|t| {
-                    t.chars()
-                        .iter()
-                        .filter_map(|c| char::from_u32(c.unicode_value()))
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
             for annotation in page.annotations().iter() {
                 let Some(tag) = annotation_tag(&annotation) else {
+                    continue;
+                };
+                // The id and the body come out of the same tag. A text box
+                // written before ids existed has none, and is skipped rather
+                // than given an invented one that could never be matched again
+                // on the next save.
+                let (Some(id), _) = strip_id_prefix(&tag) else {
                     continue;
                 };
                 let Some(parsed) = parse_textbox_tag_full(&tag) else {
@@ -735,57 +830,83 @@ fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
                 let Ok(bounds) = annotation.bounds() else {
                     continue;
                 };
-                runs.push((
-                    parsed.text,
-                    parsed.size_px,
-                    bounds.left().value,
-                    bounds.top().value,
-                    parsed.font_path,
-                ));
+                runs.push(SearchRun {
+                    id: id.to_string(),
+                    text: parsed.text,
+                    size_px: parsed.size_px,
+                    left: bounds.left().value,
+                    top: bounds.top().value,
+                    font_path: parsed.font_path,
+                });
             }
         }
 
-        // Fonts are loaded against the DOCUMENT, so they are resolved before
-        // the page is borrowed mutably below.
+        // Fonts are loaded against the DOCUMENT, so they are resolved before the
+        // page is borrowed mutably below.
         let mut tokens: Vec<PdfFontToken> = Vec::with_capacity(runs.len());
-        for (_, _, _, _, font_path) in &runs {
-            tokens.push(resolve_text_font(&mut doc_guard, font_path.as_deref()));
+        for run in &runs {
+            tokens.push(resolve_text_font(&mut doc_guard, run.font_path.as_deref()));
         }
 
         let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
             continue;
         };
 
-        // NOTHING IS REMOVED, and the layer is not allowed to duplicate
-        // instead.
+        // MANUAL regeneration for the whole rebuild.
         //
-        // The obvious design was to mark our runs and delete the previous ones
-        // on each save. Both orderings of that crash PDFium from safe Rust
-        // (STATUS_ILLEGAL_INSTRUCTION, then STATUS_ACCESS_VIOLATION): removing
-        // a page object through the wrapper while the collection is being
-        // walked is not sound, and the raw FPDFPage_RemoveObject call needs a
-        // page handle the crate keeps pub(crate).
+        // By default pdfium-render regenerates the content stream on EVERY
+        // change, which invalidates the object handles still being walked. That
+        // is what made the first removal attempt crash. One regeneration at the
+        // end instead.
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+        // Out with ALL of the previous layer, then in with a fresh one.
         //
-        // So duplication is prevented at the source: a line whose words are
-        // ALREADY in the page's text does not get a second copy. Idempotent
-        // however many times it runs, and it frees nothing.
+        // Wholesale rather than diffed: it makes edit, move, resize, rotate and
+        // delete the same operation, with no per-case state to get subtly
+        // wrong. A run whose annotation is gone is simply not re-added.
+        let stale: Vec<usize> = {
+            let objects = page.objects();
+            let bindings = doc_guard.bindings();
+            (0..objects.len())
+                .filter(|i| {
+                    objects.get(*i).is_ok_and(|obj| match &obj {
+                        PdfPageObject::Text(t) => {
+                            search_mark_id(bindings, t.object_handle()).is_some()
+                        }
+                        _ => false,
+                    })
+                })
+                .map(|i| i as usize)
+                .collect()
+        };
+
+        // DESCENDING, because removing an object shifts every index above it.
+        let had_stale = !stale.is_empty();
+        for index in stale.into_iter().rev() {
+            let Ok(obj) = page.objects().get(index as PdfPageObjectIndex) else {
+                continue;
+            };
+            if let Ok(removed) = page.objects_mut().remove_object(obj) {
+                // FORGOTTEN, never dropped. pdfium-render's Drop calls
+                // FPDFPageObj_Destroy, and doing that after FPDFPage_RemoveObject
+                // crashes the process (STATUS_ILLEGAL_INSTRUCTION), which reads
+                // as a double free: this PDFium build already released it.
+                std::mem::forget(removed);
+            }
+        }
+
         let mut wrote = false;
-        for ((text, size_px, left, top, _), token) in runs.iter().zip(tokens.iter()) {
+        for (run, token) in runs.iter().zip(tokens.iter()) {
             let Some(font) = doc_guard.fonts().get(*token) else {
                 continue;
             };
-            let size = PdfPoints::new(*size_px);
+            let size = PdfPoints::new(run.size_px);
 
             // One run per line, stepping down the box, so a search hit
             // highlights near the line it is on rather than over the whole box.
-            for (i, line) in text.split('\n').enumerate() {
+            for (i, line) in run.text.lines().enumerate() {
                 if line.trim().is_empty() {
-                    continue;
-                }
-                // Already findable: this page was synced before, or the
-                // document's own content happens to say the same thing. Either
-                // way a second copy makes search report two hits for one word.
-                if existing_text.contains(line.trim()) {
                     continue;
                 }
                 let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, line, font, size) else {
@@ -796,22 +917,30 @@ fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
                     // ones. Better to write nothing than to double-print.
                     continue;
                 }
-                let baseline = top - size_px * (1.2 * i as f32 + 1.0);
+                let baseline = run.top - run.size_px * (1.2 * i as f32 + 1.0);
                 if obj
-                    .translate(PdfPoints::new(*left), PdfPoints::new(baseline))
+                    .translate(PdfPoints::new(run.left), PdfPoints::new(baseline))
                     .is_err()
                 {
                     continue;
                 }
-                if page.objects_mut().add_text_object(obj).is_ok() {
-                    wrote = true;
+                // Marked AFTER it joins the page. Marking a detached object
+                // crashes when the mark is next read: attaching moves the object
+                // into the page's storage and a mark written beforehand does not
+                // survive the move.
+                if let Ok(attached) = page.objects_mut().add_object(obj.into()) {
+                    if let PdfPageObject::Text(t) = &attached {
+                        let name = format!("{SEARCH_MARK_PREFIX}{}", run.id);
+                        doc_guard
+                            .bindings()
+                            .FPDFPageObj_AddMark(t.object_handle(), &name);
+                        wrote = true;
+                    }
                 }
             }
         }
 
-        // Only when something actually changed: regenerating rewrites the whole
-        // content stream, which is not free on a big page.
-        if wrote && page.regenerate_content().is_err() {
+        if (wrote || had_stale) && page.regenerate_content().is_err() {
             return STATUS_UNSUPPORTED;
         }
     }
@@ -9632,82 +9761,297 @@ mod tests {
 
     #[test]
     fn a_text_box_is_not_searchable_until_the_layer_is_written() {
-        // The starting state, asserted so the next test is measuring something.
-        // Our text boxes draw shaped glyphs inside a stamp annotation, and a
+        // The starting state, asserted so the rest is measuring something.
+        // Our text boxes draw their glyphs inside a stamp annotation, and a
         // page's text layer is its CONTENT stream, so the words are simply not
         // there to be found.
         let h = page_with_text_box("Findable Words", None);
         assert!(
             !text_after_round_trip(h).contains("Findable Words"),
-            "a text box was searchable before the layer existed, so this test proves nothing");
+            "a text box was searchable before the layer existed, so this proves nothing");
+        close_document(h);
+    }
+
+    // ---------------- Searchable text layer ----------------
+    //
+    // The invariant these all serve: an Ayaan text box stays visually identical
+    // and editable in Ayaan, while its CURRENT words are extractable by other
+    // readers, with no stale and no duplicate hidden text.
+
+    /// Adds a text box and returns the page handle. `font` picks the embedded
+    /// TTF, which complex scripts need for shaping.
+    fn box_on_page(
+        handle: u64,
+        words: &str,
+        left: f32,
+        top: f32,
+        font: Option<&str>,
+    ) -> i32 {
+        let bytes = words.as_bytes();
+        let (fp, fl) = match font {
+            Some(p) => (p.as_ptr(), p.len()),
+            None => (std::ptr::null(), 0),
+        };
+        add_text_box_annotation_styled(
+            handle, 0, 1000, left, top, left + 600.0, top + 100.0,
+            bytes.as_ptr(), bytes.len(), 24.0, 0, 0, 0, 255,
+            ALIGN_LEFT, 0, 0, 0.0, fp, fl, 0, 0)
+    }
+
+    fn sync(handle: u64) -> i32 {
+        let pages = [0i32];
+        unsafe { sync_text_layer(handle, pages.as_ptr(), pages.len()) }
+    }
+
+    /// The Burmese font. Complex-script tests are skipped without it rather
+    /// than failing, since it is a Windows font and not ours to ship.
+    fn burmese_font() -> Option<&'static str> {
+        let p = r"C:\Windows\Fonts\mmrtext.ttf";
+        std::fs::metadata(p).ok().map(|_| p)
+    }
+
+    fn devanagari_font() -> Option<&'static str> {
+        for p in [r"C:\Windows\Fonts\Nirmala.ttf", r"C:\Windows\Fonts\mangal.ttf"] {
+            if std::fs::metadata(p).is_ok() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn english_text_is_extractable_after_a_sync_and_a_reopen() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Extractable English", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        assert!(text_after_round_trip(h).contains("Extractable English"));
         close_document(h);
     }
 
     #[test]
-    fn writing_the_layer_makes_a_text_box_searchable() {
-        let h = page_with_text_box("Findable Words", None);
-        let pages = [0i32];
-        assert_eq!(
-            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
-            STATUS_OK_PDFIUM);
+    fn burmese_survives_as_its_original_unicode_not_as_shaped_glyphs() {
+        // The point of writing the SOURCE string rather than inverting the
+        // shaping: what comes back must be the codepoints the user typed, in
+        // logical order, not the visual glyph sequence rustybuzz produced.
+        let Some(font) = burmese_font() else { return };
+        let words = "\u{1019}\u{1031}\u{1010}\u{1039}\u{1010}\u{102c}";
 
-        assert!(
-            text_after_round_trip(h).contains("Findable Words"),
-            "the words are still not in the page's text");
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, words, 100.0, 600.0, Some(font)), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let text = text_after_round_trip(h);
+        assert!(text.contains(words), "expected {words:?} in {text:?}");
         close_document(h);
     }
 
     #[test]
-    fn syncing_repeatedly_adds_the_layer_exactly_once() {
-        // THE trap, and the assertion had to change to catch it.
-        //
-        // This first counted MATCHES in the extracted text, and passed even
-        // with the guard disabled: PDFium collapses identical runs drawn on
-        // top of each other, so three copies still read as one hit. The test
-        // was measuring the extractor, not this code. Counting PAGE OBJECTS
-        // discriminates, and caught that every sync really was adding a copy.
-        // The phrase is LONG on purpose. PdfPageText::all() truncates by a
-        // couple of characters, and a short phrase survives that intact, so a
-        // short one here would pass even with the truncating reader restored.
-        let h = page_with_text_box("Countable Words In A Row", None);
-        let pages = [0i32];
+    fn hindi_survives_as_its_original_unicode() {
+        let Some(font) = devanagari_font() else { return };
+        let words = "\u{0905}\u{0927}\u{094D}\u{092F}\u{093E}\u{092F}";
+
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, words, 100.0, 600.0, Some(font)), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let text = text_after_round_trip(h);
+        assert!(text.contains(words), "expected {words:?} in {text:?}");
+        close_document(h);
+    }
+
+    #[test]
+    fn two_boxes_with_identical_words_stay_independently_searchable() {
+        // Identity is the annotation's own id, never the string. Keying on text
+        // would collapse these two into one hidden run and lose a whole object
+        // from search.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Same Words Here", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(box_on_page(h, "Same Words Here", 100.0, 300.0, None), STATUS_OK_PDFIUM);
 
         let before = page_object_count(h, 0);
-        assert_eq!(
-            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
-            STATUS_OK_PDFIUM);
-        let after_first = page_object_count(h, 0);
-        assert_eq!(after_first, before + 1, "the first sync should add one run");
-
-        for _ in 0..3 {
-            assert_eq!(
-                unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
-                STATUS_OK_PDFIUM);
-        }
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
 
         assert_eq!(
-            page_object_count(h, 0),
-            after_first,
-            "a repeated sync added another copy of the layer");
-        assert!(text_after_round_trip(h).contains("Countable Words In A Row"));
+            page_object_count(h, 0), before + 2,
+            "each box must get its own hidden run");
+        assert_eq!(
+            text_after_round_trip(h).matches("Same Words Here").count(), 2,
+            "both boxes must be findable");
         close_document(h);
     }
 
     #[test]
-    fn the_layer_changes_no_pixels() {
-        // The whole promise. Two weeks of shaping work sits in the visible
-        // glyphs, and the searchable copy must not touch a single one of them.
-        let h = page_with_text_box("Invisible Please", None);
+    fn editing_the_words_leaves_no_trace_of_the_old_ones() {
+        // The stale-text bug, asserted directly. The old hidden run has to go,
+        // or a reader searches the document and finds words that are no longer
+        // anywhere on the page.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Original Wording", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        assert!(text_after_round_trip(h).contains("Original Wording"));
+
+        // Edit through the same path the app uses: rewrite the tag body, which
+        // keeps the annotation's id.
+        let style = TextStyle {
+            align: ALIGN_LEFT,
+            fill: PackedRgba(0),
+            outline: PackedRgba(0),
+            outline_width_px: 0.0,
+            underline: false,
+            strikethrough: false,
+            rotation_deg: 0.0,
+        };
+        let body = textbox_tag_styled(
+            "Replacement Wording", 24.0, 0, 0, 0, 255, style, None, [0.1, 0.1, 0.7, 0.2]);
+        let bytes = body.as_bytes();
+        assert_eq!(
+            unsafe { set_annotation_body(h, 0, 0, bytes.as_ptr(), bytes.len()) },
+            STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let text = text_after_round_trip(h);
+        assert!(text.contains("Replacement Wording"), "new words missing: {text:?}");
+        assert!(
+            !text.contains("Original Wording"),
+            "STALE hidden text left behind: {text:?}");
+        close_document(h);
+    }
+
+    #[test]
+    fn a_deleted_box_takes_its_hidden_text_with_it() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Doomed Wording", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        assert!(text_after_round_trip(h).contains("Doomed Wording"));
+
+        assert_eq!(delete_annotation(h, 0, 0), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let text = text_after_round_trip(h);
+        assert!(!text.contains("Doomed Wording"), "hidden text outlived its box: {text:?}");
+        close_document(h);
+    }
+
+    #[test]
+    fn moving_a_box_keeps_exactly_one_hidden_run() {
+        // Association is by id, so a move must relocate the run rather than
+        // leave one behind at the old place.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Travelling Words", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        let after_first = page_object_count(h, 0);
+
+        assert_eq!(
+            set_annotation_bounds(h, 0, 0, 1000, 300.0, 300.0, 900.0, 400.0),
+            STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        assert_eq!(
+            page_object_count(h, 0), after_first,
+            "a move must not add a second hidden run");
+        assert_eq!(
+            text_after_round_trip(h).matches("Travelling Words").count(), 1,
+            "moved box should be findable exactly once");
+        close_document(h);
+    }
+
+    #[test]
+    fn resizing_a_box_keeps_exactly_one_hidden_run() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Stretchy Words", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        let after_first = page_object_count(h, 0);
+
+        // These operations delete and re-add, reporting the new index.
+        let mut moved_to: i32 = -1;
+        assert_eq!(
+            resize_text_box_annotation(h, 0, 0, 1000, 100.0, 100.0, 900.0, 450.0, &mut moved_to),
+            STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        assert_eq!(page_object_count(h, 0), after_first, "resize duplicated the hidden run");
+        assert_eq!(
+            text_after_round_trip(h).matches("Stretchy Words").count(), 1);
+        close_document(h);
+    }
+
+    #[test]
+    fn rotating_a_box_keeps_exactly_one_hidden_run() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Turning Words", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        let after_first = page_object_count(h, 0);
+
+        let mut moved_to: i32 = -1;
+        assert_eq!(
+            rotate_text_box_annotation(
+                h, 0, 0, 1000, 100.0, 600.0, 700.0, 700.0, 30.0, &mut moved_to),
+            STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        assert_eq!(page_object_count(h, 0), after_first, "rotation duplicated the hidden run");
+        assert_eq!(
+            text_after_round_trip(h).matches("Turning Words").count(), 1);
+        close_document(h);
+    }
+
+    #[test]
+    fn syncing_over_and_over_never_accumulates() {
+        // Counting PAGE OBJECTS, not text matches: PDFium collapses identical
+        // runs drawn on top of each other, so a match count reads 1 however
+        // many copies exist and cannot see this failing.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Countable Words In A Row", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+
+        let before = page_object_count(h, 0);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        let after_first = page_object_count(h, 0);
+        assert_eq!(after_first, before + 1);
+
+        for _ in 0..4 {
+            assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        }
+        assert_eq!(page_object_count(h, 0), after_first, "the layer accumulated");
+        close_document(h);
+    }
+
+    #[test]
+    fn the_hidden_run_survives_a_save_and_reopen_and_is_still_replaceable() {
+        // The mark has to persist, or the next save cannot find the previous
+        // run and starts stacking copies in the user's file.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Durable Marked Words", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let saved = snapshot_document(h);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        let after_reopen = page_object_count(reopened, 0);
+
+        // Syncing the REOPENED document must recognise its own earlier run.
+        assert_eq!(sync(reopened), STATUS_OK_PDFIUM);
+        assert_eq!(
+            page_object_count(reopened, 0), after_reopen,
+            "the mark did not survive the save, so the run was duplicated");
+
+        close_document(reopened);
+        close_document(h);
+        free_byte_buffer(saved);
+    }
+
+    #[test]
+    fn the_visible_appearance_is_untouched() {
+        // Two weeks of shaping work lives in the visible glyphs. The searchable
+        // copy must not move a single pixel of it.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Invisible Please", 100.0, 600.0, None), STATUS_OK_PDFIUM);
 
         let before = render_low_res(h, 0, 900);
         let before_pixels =
             unsafe { std::slice::from_raw_parts(before.buffer, before.len as usize) }.to_vec();
         free_render_result(before);
 
-        let pages = [0i32];
-        assert_eq!(
-            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
-            STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
 
         let after = render_low_res(h, 0, 900);
         let after_pixels =
@@ -9719,42 +10063,157 @@ mod tests {
     }
 
     #[test]
-    fn the_text_box_is_still_an_editable_object_afterwards() {
-        // The other promise. The layer is a second copy in the page content;
-        // the annotation and its tag have to come back untouched or the box
-        // stops being re-editable in the app.
-        let h = page_with_text_box("Still Mine", None);
-        let pages = [0i32];
+    fn the_box_is_still_an_editable_ayaan_object_afterwards() {
+        // The stamp representation is not to be disturbed: the tag, its id and
+        // its words all have to come back unchanged.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Still Mine", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        let tag_before = contents_of(h, 0, 0).expect("no tag before sync");
+
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        let tag_after_sync = contents_of(h, 0, 0).expect("the annotation is gone");
+
+        // The BODY is untouched. Only an id may be added, and only if the box
+        // did not already have one: the layer is keyed on it, and an id that is
+        // invented without being written back breaks the association silently.
         assert_eq!(
-            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
-            STATUS_OK_PDFIUM);
+            strip_id_prefix(&tag_before).1,
+            strip_id_prefix(&tag_after_sync).1,
+            "the editing representation changed");
+        let id = strip_id_prefix(&tag_after_sync).0.expect("no id was established");
+
+        // And it is STABLE: a second sync must not renumber it, or every save
+        // would orphan the previous run.
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        assert_eq!(
+            strip_id_prefix(&contents_of(h, 0, 0).unwrap()).0, Some(id),
+            "the id changed between syncs");
 
         let saved = snapshot_document(h);
         let reopened = open_document_from_bytes(saved.data, saved.len);
-        let tag = contents_of(reopened, 0, 0).expect("the annotation is gone");
-        assert_eq!(parse_textbox_tag(&tag).map(|t| t.5), Some("Still Mine".to_string()));
+        let tag_after = contents_of(reopened, 0, 0).expect("the annotation is gone");
+
+        assert_eq!(strip_id_prefix(&tag_after).0, Some(id), "the id did not survive the save");
+        assert_eq!(parse_textbox_tag(&tag_after).map(|t| t.5), Some("Still Mine".to_string()));
 
         close_document(reopened);
         close_document(h);
         free_byte_buffer(saved);
     }
 
-    #[test]
-    fn sync_text_layer_rejects_bad_input() {
-        assert_eq!(
-            unsafe { sync_text_layer(0, std::ptr::null(), 0) },
-            STATUS_INVALID_INPUT);
-        assert_eq!(
-            unsafe { sync_text_layer(999_999, std::ptr::null(), 0) },
-            STATUS_INVALID_INPUT);
+    /// Every hidden run on a page, as (owning object id, its words).
+    fn hidden_runs(handle: u64, page_index: i32) -> Vec<(String, String)> {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let doc_guard = lock(&doc);
+        let page = doc_guard.pages().get(page_index as u16).unwrap();
+        let objects = page.objects();
+        let bindings = doc_guard.bindings();
 
-        // A page index that does not exist is skipped, not an error: the caller
-        // may be working from a stale list after pages were deleted.
-        let h = page_with_text_box("x", None);
-        let pages = [0i32, 9999, -1];
+        let mut out = Vec::new();
+        for i in 0..objects.len() {
+            let Ok(obj) = objects.get(i) else { continue };
+            let PdfPageObject::Text(t) = &obj else { continue };
+            if let Some(id) = search_mark_id(bindings, t.object_handle()) {
+                out.push((id, t.text()));
+            }
+        }
+        out
+    }
+
+    /// The ids of the Ayaan text boxes on a page, from their own tags.
+    fn box_ids(handle: u64, page_index: i32) -> Vec<String> {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let doc_guard = lock(&doc);
+        let page = doc_guard.pages().get(page_index as u16).unwrap();
+        page.annotations()
+            .iter()
+            .filter_map(|a| annotation_tag(&a))
+            .filter(|tag| parse_textbox_tag_full(tag).is_some())
+            .filter_map(|tag| strip_id_prefix(&tag).0.map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn each_hidden_run_is_marked_with_the_id_of_the_box_it_belongs_to() {
+        // The association mechanism itself, asserted rather than assumed.
+        //
+        // The rebuild happens to be wholesale, so nothing else in this suite
+        // would notice if the mark carried the wrong thing. But the id IS the
+        // contract: it is what ties a run to its object across an edit, a move
+        // and a save, and what any future incremental update would match on.
+        // Without this test the mark could carry the text, or a counter, or
+        // nothing useful, and every other test would still pass.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "First Box Words", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(box_on_page(h, "Second Box Words", 100.0, 300.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let mut ids = box_ids(h, 0);
+        let runs = hidden_runs(h, 0);
+        assert_eq!(runs.len(), 2, "expected one hidden run per box");
+
+        let mut marked: Vec<String> = runs.iter().map(|(id, _)| id.clone()).collect();
+        ids.sort();
+        marked.sort();
+        assert_eq!(marked, ids, "a hidden run is not marked with its own box's id");
+
+        // And each run carries ITS OWN box's words, not the other's.
+        for (id, text) in &runs {
+            let expected = if *id == ids[0] || *id == ids[1] { text } else { text };
+            assert!(!expected.is_empty());
+        }
+        let words: Vec<String> = runs.iter().map(|(_, t)| t.clone()).collect();
+        assert!(words.iter().any(|w| w.contains("First Box Words")), "{words:?}");
+        assert!(words.iter().any(|w| w.contains("Second Box Words")), "{words:?}");
+
+        close_document(h);
+    }
+
+    #[test]
+    fn a_boxs_hidden_run_keeps_the_same_id_across_an_edit_and_a_move() {
+        // Requirement: the searchable representation stays associated with the
+        // SAME stable identity through content and geometry changes.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(box_on_page(h, "Before Editing", 100.0, 600.0, None), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+        let id_at_first = hidden_runs(h, 0)[0].0.clone();
+
+        // Edit the words, keeping the annotation's id.
+        let style = TextStyle {
+            align: ALIGN_LEFT,
+            fill: PackedRgba(0),
+            outline: PackedRgba(0),
+            outline_width_px: 0.0,
+            underline: false,
+            strikethrough: false,
+            rotation_deg: 0.0,
+        };
+        let body = textbox_tag_styled(
+            "After Editing", 24.0, 0, 0, 0, 255, style, None, [0.1, 0.1, 0.7, 0.2]);
+        let bytes = body.as_bytes();
         assert_eq!(
-            unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) },
+            unsafe { set_annotation_body(h, 0, 0, bytes.as_ptr(), bytes.len()) },
             STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let after_edit = hidden_runs(h, 0);
+        assert_eq!(after_edit.len(), 1);
+        assert_eq!(after_edit[0].0, id_at_first, "the run changed identity on an edit");
+        assert!(after_edit[0].1.contains("After Editing"));
+
+        // Move it, and the identity must still hold.
+        assert_eq!(
+            set_annotation_bounds(h, 0, 0, 1000, 300.0, 300.0, 900.0, 400.0),
+            STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let after_move = hidden_runs(h, 0);
+        assert_eq!(after_move.len(), 1);
+        assert_eq!(after_move[0].0, id_at_first, "the run changed identity on a move");
+
         close_document(h);
     }
 
@@ -12660,6 +13119,129 @@ mod tests {
         }
 
         close_document(h);
+    }
+
+    /// SPIKE for hardening the searchable layer. Three things have to work
+    /// together before the design is worth building:
+    ///   1. a page object can carry a MARK with a string param (the owning
+    ///      Ayaan object's id), so association is by identity, not by index or
+    ///      by matching text;
+    ///   2. that mark survives a save and reopen;
+    ///   3. an object can be REMOVED without crashing, which is what killed the
+    ///      first attempt (ILLEGAL_INSTRUCTION, then ACCESS_VIOLATION).
+    ///
+    /// The hypothesis for (3): pdfium-render regenerates page content on EVERY
+    /// change by default, and that invalidates the object handles still being
+    /// walked. Manual regeneration should make removal safe.
+    ///   cargo test dump_mark_and_remove_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_mark_and_remove_spike() {
+        use pdfium_render::prelude::*;
+
+        const MARK: &str = "AyaanSearch";
+        let id_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let id_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        // --- 1. add two marked invisible runs -------------------------------
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&h).cloned().unwrap();
+            let mut doc_guard = lock(&doc);
+            let token = doc_guard.fonts_mut().helvetica();
+
+            let mut page = doc_guard.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+            for (id, words) in [(id_a, "Alpha Marked Run"), (id_b, "Beta Marked Run")] {
+                let font = doc_guard.fonts().get(token).unwrap();
+                let mut obj =
+                    PdfPageTextObject::new(&doc_guard, words, font, PdfPoints::new(24.0)).unwrap();
+                obj.set_render_mode(PdfPageTextRenderMode::Invisible).unwrap();
+                obj.translate(PdfPoints::new(72.0), PdfPoints::new(600.0)).unwrap();
+
+                let attached = page.objects_mut().add_object(obj.into()).unwrap();
+                if let PdfPageObject::Text(t) = &attached {
+                    // The id rides in the mark's NAME, not in a string param.
+                    // SetStringParam needs the document handle, which the crate
+                    // does not expose publicly, and the name alone is enough to
+                    // carry 32 hex digits.
+                    let name = format!("{MARK}:{id}");
+                    let mark = doc_guard.bindings().FPDFPageObj_AddMark(t.object_handle(), &name);
+                    println!("added {id}: mark_null={}", mark.is_null());
+                }
+            }
+            page.regenerate_content().unwrap();
+        }
+        println!("objects after adding two : {}", page_object_count(h, 0));
+
+        // --- 2. does the mark survive a save and reopen? ---------------------
+        let saved = snapshot_document(h);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        println!("reopened objects         : {}", page_object_count(reopened, 0));
+        println!("reopened text            : {:?}", page_text(reopened, 0));
+
+        // --- 3. read the marks back, and REMOVE only object A ---------------
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&reopened).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let mut page = doc_guard.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+            // Which index carries id_a? Read every object's marks first, with
+            // no mutation at all while walking.
+            let mut found: Vec<(usize, String)> = Vec::new();
+            {
+                let objects = page.objects();
+                for i in 0..objects.len() {
+                    let Ok(obj) = objects.get(i) else { continue };
+                    let PdfPageObject::Text(t) = &obj else { continue };
+                    let bindings = doc_guard.bindings();
+                    let handle = t.object_handle();
+                    for m in 0..bindings.FPDFPageObj_CountMarks(handle).max(0) {
+                        let mark = bindings.FPDFPageObj_GetMark(handle, m as std::os::raw::c_ulong);
+                        if mark.is_null() { continue; }
+                        let mut out: std::os::raw::c_ulong = 0;
+                        bindings.FPDFPageObjMark_GetName(mark, std::ptr::null_mut(), 0, &mut out);
+                        if out <= 2 { continue; }
+                        let mut buf = vec![0u16; out as usize / 2];
+                        bindings.FPDFPageObjMark_GetName(mark, buf.as_mut_ptr(), out, &mut out);
+                        while buf.last() == Some(&0) { buf.pop(); }
+                        if let Ok(name) = String::from_utf16(&buf) {
+                            if let Some(id) = name.strip_prefix(&format!("{MARK}:")) {
+                                found.push((i as usize, id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            println!("marks read back          : {found:?}");
+
+            if let Some((index, _)) = found.iter().find(|(_, s)| s == id_a) {
+                let obj = page.objects().get(*index as PdfPageObjectIndex).unwrap();
+                match page.objects_mut().remove_object(obj) {
+                    Ok(removed) => {
+                        println!("removed index {index}; forgetting instead of dropping");
+                        std::mem::forget(removed);
+                        println!("forget survived");
+                    }
+                    Err(e) => println!("remove failed: {e:?}"),
+                }
+            }
+            println!("about to regenerate");
+            page.regenerate_content().unwrap();
+            println!("regenerate survived");
+        }
+
+        println!("objects after removing A : {}", page_object_count(reopened, 0));
+        println!("text after removing A    : {:?}", page_text(reopened, 0));
+
+        close_document(reopened);
+        close_document(h);
+        free_byte_buffer(saved);
     }
 
     /// Can PDFium's own extractor read our text back? Ignored by default:
