@@ -4411,6 +4411,55 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return edge1 + bestOff;  // fallback: the moved edge after snap
     }
 
+    /// <summary>
+    /// The unpadded upright rectangle to redraw a TURNED shape into after a
+    /// resize, or null to leave it on the existing move path.
+    ///
+    /// The shape's own size comes off its tag, in points, which is the only
+    /// exact record of it once the shape is turned; the drag supplies the RATIO
+    /// to scale it by. Null whenever anything needed is missing, so a shape
+    /// whose tag predates the upright-size field keeps behaving exactly as it
+    /// does today rather than being given a size nobody chose.
+    /// </summary>
+    private TextRect? UprightResizeTarget(LoadedSelection start, LoadedSelection now)
+    {
+        if (!ShapeTagReader.TryParse(ReadAnnotationContents(now.PageIndex, now.Index), out var tag))
+        {
+            return null;
+        }
+
+        var (pageWidthPts, _) = PagePointsFor(now.PageIndex);
+        if (pageWidthPts <= 0)
+        {
+            return null;
+        }
+
+        return ShapeResize.UprightTargetFor(
+            new TextRect(start.Left, start.Top, start.Right, start.Bottom),
+            new TextRect(now.Left, now.Top, now.Right, now.Bottom),
+            tag.BoxWidthPts / pageWidthPts,
+            tag.BoxHeightPts / pageWidthPts);
+    }
+
+    /// <summary>
+    /// The annotation's own /Rect as the document reports it NOW, or null when
+    /// it cannot be found. Read after a write that rebuilt the annotation, for
+    /// the cases where the rectangle asked for and the rectangle produced are
+    /// not the same thing.
+    /// </summary>
+    private TextRect? FreshBoundsOf(int pageIndex, int index)
+    {
+        var page = LoadedFor(pageIndex);
+        int at = page.FindIndex(a => a.Index == index);
+        if (at < 0)
+        {
+            return null;
+        }
+
+        var a2 = page[at];
+        return new TextRect(a2.Left, a2.Top, a2.Right, a2.Bottom);
+    }
+
     /// <summary>Writes a finished drag through to the document.</summary>
     private void CommitLoadedMove() => RunCommand(CommitLoadedMoveCore);
 
@@ -4501,6 +4550,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         int status = RenderStatus.Unsupported;
         int newIndex = now.Index;
 
+        // Whether the shape branch below redrew a TURNED shape at a new upright
+        // size. Its resulting /Rect is the axis-aligned box of the newly sized
+        // rotated content, which is NOT the rectangle that was dragged unless
+        // both axes happened to scale by the same factor, so the selection has
+        // to be re-read afterwards rather than assumed.
+        bool shapeUprightResized = false;
+
         // A text box ALWAYS goes through its own re-layout: on a resize it re-wraps
         // to the new width, and on a MOVE it keeps its angle (the generic path
         // resizes the annotation's rect without turning the content, which clipped
@@ -4524,8 +4580,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // the shape yet, which is why moving a group behaved differently
             // from one attempt to the next. Anchor and extras now take the
             // same path for the same operation.
-            status = RenderCoreNative.move_shape_annotation(
-                _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
+            // A RESIZE of a TURNED shape cannot take the move path.
+            //
+            // move_shape_annotation says "these bounds are the padded /Rect",
+            // and for a turned shape that tells the core to rebuild from the
+            // upright size recorded on the tag, because a turned /Rect is the
+            // axis-aligned box of the rotated content and cannot be de-padded
+            // or inverted. That is exactly right for a move and throws away the
+            // whole gesture for a resize: the shape was re-centred at its
+            // original size, so the corner handles appeared to do nothing.
+            //
+            // Resizing instead sends the UNPADDED upright rectangle the drag
+            // works out to, which resize_shape_annotation takes at face value.
+            // An unrotated shape is deliberately left on the move path, where
+            // the pad de-pads exactly and resizing has always worked.
+            TextRect? upright = resizing && _selectedRotationDeg != 0
+                ? UprightResizeTarget(start, now)
+                : null;
+            shapeUprightResized = upright is not null;
+
+            status = upright is TextRect box
+                ? RenderCoreNative.resize_shape_annotation(
+                    _documentHandle, now.PageIndex, now.Index, CaptureWidth,
+                    (float)(box.Left * CaptureWidth), (float)(box.Top * CaptureWidth),
+                    (float)(box.Right * CaptureWidth), (float)(box.Bottom * CaptureWidth),
+                    out newIndex)
+                : RenderCoreNative.move_shape_annotation(
+                    _documentHandle, now.PageIndex, now.Index, CaptureWidth, l, t, r, b, out newIndex);
         }
 
         // A stroke takes the same route as a shape, and for the same reason:
@@ -4583,6 +4664,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedRotationDeg = tag.RotationDeg;
             _selectedLoaded = new LoadedSelection(
                 now.PageIndex, newIndex, tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom, start.Id);
+        }
+        else if (shapeUprightResized && FreshBoundsOf(now.PageIndex, newIndex) is TextRect grown)
+        {
+            // A turned shape that was just redrawn at a new size: its /Rect is
+            // the axis-aligned box of the rotated content, so stretching one
+            // axis produces a rectangle nothing like the drag. Keeping the
+            // dragged one would draw the frame in the wrong place and, worse,
+            // hand the next resize a wrong starting size to take its ratio
+            // against, which compounds. The document knows; ask it.
+            _selectedLoaded = new LoadedSelection(
+                now.PageIndex, newIndex, grown.Left, grown.Top, grown.Right, grown.Bottom, start.Id);
         }
         else
         {
