@@ -2850,6 +2850,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// one placed before stamps were tagged, no tag at all).</summary>
     private bool _selectedIsStamp;
 
+    /// <summary>True when the selection is one of OUR freehand strokes, i.e. one
+    /// carrying an InkTag and therefore rebuildable at a new size. A stroke from
+    /// another editor has no such description and is not this.</summary>
+    private bool _selectedIsInk;
+
+    /// <summary>
+    /// Whether the anchor can be redrawn at a new size, decided once when the
+    /// selection changes rather than on every pointer move.
+    ///
+    /// The rule itself lives in <see cref="AnnotationResize"/> where it is
+    /// tested; this only caches its answer. It depends solely on the object's
+    /// subtype and tag, neither of which a move, resize or rebuild changes, so
+    /// the cached value stays valid for as long as the same object is selected.
+    /// </summary>
+    private bool _selectedCanResize;
+
     /// <summary>The anchor's angle when a rotate drag began. The DELTA between
     /// this and the live angle is what the rest of a multi-selection turns by;
     /// the live angle alone is the anchor's absolute heading and means nothing
@@ -3641,6 +3657,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedRotationDeg = ParseStampRotation(contents);
         }
 
+        // One of our strokes, and therefore whether it can be resized at all.
+        // Decided HERE, where the tag has already been read, so the hover and
+        // drag paths never pay an FFI for it. Both are set before the text-box
+        // parse below, which returns early for everything that is not one.
+        _selectedIsInk = InkTag.TryParse(contents, out _, out _, out _);
+        _selectedCanResize = AnnotationResize.CanResize(SubtypeOf(pageIndex, index), contents);
+
         if (_selectedIsShape)
         {
             // Pull the shape's rotation out of its tag. The rest of the shape
@@ -4076,9 +4099,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             return LoadedAnnotationPicker.Grip.Rotate;
         }
-        // Shapes are free-resize (edge handles) too; text boxes always are.
+        // Shapes are free-resize (edge handles) too; text boxes always are, and
+        // so is a stroke, which has no aspect to protect. Ink is listed here
+        // because AddGrips DRAWS its eight handles (AspectToPreserve returns 0
+        // for it), and a handle that is drawn but not grabbable is worse than
+        // one that was never offered.
         return LoadedAnnotationPicker.GripAt(box, lx, ly,
-            edges: _selectedIsTextBox || _selectedIsShape);
+            edges: _selectedIsTextBox || _selectedIsShape || _selectedIsInk);
     }
 
     /// <summary>Turns a screen-space point back into a box's own upright frame,
@@ -6537,29 +6564,34 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Whether this annotation can be resized at all.
+    /// Whether the current selection can be resized at all.
     ///
-    /// Ink cannot: its shape is a path, and PDFium will neither scale it nor
-    /// let it be rebuilt from the outside. Everything else either scales in
-    /// place or can be rebuilt from its own image.
+    /// The rule lives in <see cref="AnnotationResize"/>, where it is tested;
+    /// this hands back the answer worked out when the selection was made. It
+    /// used to be decided here, and refused every stroke on the grounds that
+    /// PDFium will not scale a path. That stopped being the whole story once
+    /// strokes carried an InkTag: one of ours records its control points and is
+    /// rebuilt into the dragged rectangle exactly as a shape is. A stroke from
+    /// another editor still has nothing to rebuild from and is still refused.
     /// </summary>
-    private bool CanResize(LoadedSelection sel)
-    {
-        // Our shapes are stored as ink annotations underneath (create_ink_annotation
-        // in the core) but they CAN be resized and rotated through their tag, so
-        // the plain "ink is unresizable" rule does not apply to them. This was
-        // why a selected shape got no grips at all - not the eight resize handles
-        // AND not the rotate handle - even though the rotation stack is wired.
-        if (_selectedIsShape) { return true; }
+    /// <param name="sel">
+    /// The selection being asked about. Ignored: every caller passes the
+    /// ANCHOR, and the answer was cached from that same anchor's subtype and
+    /// tag. Kept in the signature so the call sites still read as a question
+    /// about a specific object rather than about hidden state.
+    /// </param>
+    private bool CanResize(LoadedSelection sel) => _selectedCanResize;
 
-        foreach (var a in LoadedFor(sel.PageIndex))
+    /// <summary>The annotation's PDFium subtype, from the page's loaded cache.
+    /// Zero-cost next to an FFI read, and the cache is always warm here because
+    /// the caller has just read the same annotation's tag.</summary>
+    private int SubtypeOf(int pageIndex, int index)
+    {
+        foreach (var a in LoadedFor(pageIndex))
         {
-            if (a.Index == sel.Index)
-            {
-                return a.Subtype != Interop.AnnotSubtype.Ink;
-            }
+            if (a.Index == index) { return a.Subtype; }
         }
-        return true;
+        return Interop.AnnotSubtype.Other;
     }
 
     private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges, bool rotate, double insetDips = 0)
