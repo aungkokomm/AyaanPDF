@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace PdfEditorApp.Viewport;
 
@@ -12,7 +12,7 @@ public enum AppTheme
     /// <summary>Warm paper, easier for long reading than white.</summary>
     Sepia,
     /// <summary>Dark, but blue rather than neutral grey.</summary>
-    DarkBlue,
+    MidnightBlue,
 }
 
 /// <summary>
@@ -149,5 +149,5 @@ public sealed record AppSettings
     /// tints are built on: Sepia is a light theme with warm paper, Dark blue is
     /// a dark theme with a blue cast.
     /// </summary>
-    public static bool IsDark(AppTheme theme) => theme is AppTheme.Dark or AppTheme.DarkBlue;
+    public static bool IsDark(AppTheme theme) => theme is AppTheme.Dark or AppTheme.MidnightBlue;
 }

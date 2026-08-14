@@ -35,8 +35,18 @@ public readonly record struct SurfaceColors(
 /// </summary>
 public static class ThemePalette
 {
-    /// <summary>The Dark blue the user chose, #060866. Every other blue derives from it.</summary>
-    public static readonly ThemeColor DarkBlueBase = new(0x06, 0x08, 0x66);
+    /// <summary>
+    /// Midnight blue, #0F1A3C. Every other blue in the theme derives from it.
+    ///
+    /// Was #060866, which is an electric indigo: almost no red or green against
+    /// a lot of blue, so a full window of it glowed rather than receded. This
+    /// is darker overall and much less saturated, which is what "midnight"
+    /// means and what a surface a page sits on has to do.
+    ///
+    /// Deliberately not CSS's named midnightblue (#191970), which is lighter
+    /// and more violet than the colour it is named after.
+    /// </summary>
+    public static readonly ThemeColor MidnightBlueBase = new(0x0F, 0x1A, 0x3C);
 
     /// <summary>
     /// The surfaces for a theme.
@@ -94,10 +104,10 @@ public static class ThemePalette
 
         // One family, generated from the base, so the three cannot drift apart
         // and changing the base moves all of them together.
-        AppTheme.DarkBlue => new SurfaceColors(
-            Canvas: DarkBlueBase,
-            Chrome: Lighten(DarkBlueBase, 0.14),
-            Window: Darken(DarkBlueBase, 0.35)),
+        AppTheme.MidnightBlue => new SurfaceColors(
+            Canvas: MidnightBlueBase,
+            Chrome: Lighten(MidnightBlueBase, 0.14),
+            Window: Darken(MidnightBlueBase, 0.35)),
 
         _ => IsDark(theme, systemIsDark)
             ? new SurfaceColors(

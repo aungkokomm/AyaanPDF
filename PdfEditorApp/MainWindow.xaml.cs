@@ -1,6 +1,7 @@
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.UI;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
@@ -35,6 +36,15 @@ public sealed partial class MainWindow : Window
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AppWindow.Closing += OnClosing;
 
+        // Open maximized. A document editor is used full screen, and the
+        // default restored size is small enough that the first thing anyone did
+        // was resize it. Guarded on the presenter type because a window can be
+        // full-screen or compact-overlay, and neither of those can be maximized.
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
+        {
+            presenter.Maximize();
+        }
+
         AddDocumentTab(null);
     }
 
@@ -42,15 +52,35 @@ public sealed partial class MainWindow : Window
     public MainPage? ActivePage => (Tabs.SelectedItem as TabViewItem)?.Content as MainPage;
 
     /// <summary>
-    /// Opens a document in a new tab, or a blank one when the path is null.
+    /// Ctrl+Q quits.
+    ///
+    /// Goes through Close(), so the unsaved-changes prompt in OnClosing is the
+    /// same one every other route to quitting gets. Nothing here decides
+    /// whether it is safe to leave.
+    /// </summary>
+    private void Quit_Invoked(
+        Microsoft.UI.Xaml.Input.KeyboardAccelerator sender,
+        Microsoft.UI.Xaml.Input.KeyboardAcceleratorInvokedEventArgs args)
+    {
+        args.Handled = true;
+        Close();
+    }
+
+    /// <summary>
+    /// Opens a document in a new tab.
+    ///
+    /// A null path means no document: the tab shows the empty state, which is
+    /// where launching and the + button both land. <paramref name="startBlank"/>
+    /// is the one exception, for File > New, which is an explicit request for a
+    /// document to draw on.
     ///
     /// The page is created here rather than navigated to, because a Page hosted
     /// in a Frame gets recycled by navigation and each tab needs its own live
     /// instance for as long as its tab exists.
     /// </summary>
-    public MainPage AddDocumentTab(string? path)
+    public MainPage AddDocumentTab(string? path, bool startBlank = false)
     {
-        var page = new MainPage { InitialDocumentPath = path };
+        var page = new MainPage { InitialDocumentPath = path, StartBlank = startBlank };
         var item = new TabViewItem
         {
             Content = page,
@@ -106,8 +136,8 @@ public sealed partial class MainWindow : Window
 
         Tabs.TabItems.Remove(item);
 
-        // Never leave an empty window: closing the last document lands on a
-        // blank page, the same state the app starts in, rather than a grey void
+        // Never leave an empty window: closing the last document lands on the
+        // empty state, the same place the app starts, rather than a grey void
         // with a menu bar over it.
         if (Tabs.TabItems.Count == 0)
         {

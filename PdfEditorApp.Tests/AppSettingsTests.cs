@@ -1,4 +1,4 @@
-using PdfEditorApp.Viewport;
+﻿using PdfEditorApp.Viewport;
 using Xunit;
 
 namespace PdfEditorApp.Tests;
@@ -139,7 +139,7 @@ public class AppSettingsTests
 
     [Theory]
     [InlineData(AppTheme.Dark, true)]
-    [InlineData(AppTheme.DarkBlue, true)]
+    [InlineData(AppTheme.MidnightBlue, true)]
     [InlineData(AppTheme.Light, false)]
     [InlineData(AppTheme.Sepia, false)]
     public void the_tinted_themes_know_which_base_they_sit_on(AppTheme theme, bool dark)

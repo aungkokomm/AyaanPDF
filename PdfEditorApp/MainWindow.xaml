@@ -16,7 +16,33 @@
         Named so the themes can paint it. The tab strip takes its colour from
         here rather than from the TabView, whose Background does not reach it.
     -->
-    <Grid x:Name="Shell">
+    <!--
+        KeyboardAcceleratorPlacementMode=Hidden for the same reason MainPage's
+        RootGrid sets it: WinUI advertises an accelerator by floating a tooltip
+        naming its chord over the owning element. On a menu item that is useful.
+        Here the owner is the entire window, so "Ctrl+Q" appeared over the app
+        at startup and sat there.
+    -->
+    <Grid x:Name="Shell" KeyboardAcceleratorPlacementMode="Hidden">
+        <!--
+            Quit, from anywhere.
+
+            An ACCELERATOR on the window's root, not a case in the page's key
+            handler: that handler ignores every key while a text field has
+            focus, so a canvas-only chord would die the moment the caret was in
+            the find box or the page-jump field. An accelerator is offered to
+            the tree before the focused element routes the key, so it fires
+            wherever focus happens to be.
+
+            Not declared on the Exit menu item either. A MenuFlyoutItem's
+            accelerator is dead until its flyout has been opened once, which is
+            the trap that left Ctrl+Z unimplemented for months; the item carries
+            the text only, to print the chord beside it.
+        -->
+        <Grid.KeyboardAccelerators>
+            <KeyboardAccelerator Modifiers="Control" Key="Q" Invoked="Quit_Invoked" />
+        </Grid.KeyboardAccelerators>
+
         <Grid.RowDefinitions>
             <RowDefinition Height="34" />
             <RowDefinition Height="*" />
@@ -91,7 +117,17 @@
             path, page slots, selection, history and groups are already
             per-page: tabs needed no change to the view model at all.
         -->
+        <!--
+            VerticalAlignment is set EXPLICITLY because WinUI's own TabView
+            style sets it to Top. A Top-aligned TabView takes only the height it
+            needs, which is its tab strip plus whatever the page inside happens
+            to want, so the document stopped short of the bottom of the window
+            and the Shell's own colour showed through underneath as a band of
+            dead space. Measured: in a 680-tall window the TabView came out 523
+            and left 123 blank. A local value beats the style setter.
+        -->
         <TabView x:Name="Tabs" Grid.Row="1"
+                 VerticalAlignment="Stretch"
                  TabWidthMode="SizeToContent"
                  IsAddTabButtonVisible="True"
                  AddTabButtonClick="Tabs_AddTabButtonClick"

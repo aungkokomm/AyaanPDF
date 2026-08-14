@@ -705,22 +705,40 @@
         </Border>
 
         <!--
-            Empty state. Without it a fresh launch is an unexplained grey void
-            with no indication that anything works or what to do next.
+            Empty state: what the app shows before anything is open.
+
+            Now the FIRST thing anyone sees, because launching no longer
+            conjures a blank document. So it has to name the action rather than
+            describe the absence: a button that opens the picker, and the drop
+            target spelled out, since nothing about a canvas says you can drop
+            on it.
+
+            THEME BRUSHES, not the hardcoded whites this used to carry. Those
+            were invisible against a light canvas, and nobody noticed for
+            months because a blank document always covered this up.
+
+            Still double-tappable, which is the gesture people try on an empty
+            canvas, and it is the same handler as the button.
         -->
-        <!--
-            Empty state. Hit-testable and double-tappable, so the obvious
-            gesture on a blank canvas actually opens a file.
-        -->
-        <Border Grid.Column="2" Background="Transparent"
+        <Border x:Name="EmptyState" Grid.Column="2" Background="Transparent"
+                AllowDrop="True"
+                DragOver="EmptyState_DragOver"
+                Drop="EmptyState_Drop"
                 DoubleTapped="EmptyState_DoubleTapped"
                 Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
-            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10">
-                <FontIcon Glyph="&#xEA90;" FontSize="40" Foreground="#8AFFFFFF" HorizontalAlignment="Center" />
-                <TextBlock Text="No document open" Foreground="#C8FFFFFF" HorizontalAlignment="Center"
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
+                <FontIcon Glyph="&#xEA90;" FontSize="40" HorizontalAlignment="Center"
+                          Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                <TextBlock Text="No document open" HorizontalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            Style="{StaticResource SubtitleTextBlockStyle}" />
-                <TextBlock Text="Double-click here, or press Ctrl+O" Foreground="#8AFFFFFF"
-                           HorizontalAlignment="Center" Style="{StaticResource BodyTextBlockStyle}" />
+                <Button x:Name="EmptyStateOpen" Content="Open a PDF"
+                        Click="EmptyStateOpen_Click"
+                        HorizontalAlignment="Center" Padding="18,7" Margin="0,4,0,0"
+                        Style="{StaticResource AccentButtonStyle}" />
+                <TextBlock Text="Drag and drop a PDF here to open" HorizontalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
         </Border>
 
@@ -979,7 +997,12 @@
                                 </MenuFlyoutItem.KeyboardAccelerators>
                             </MenuFlyoutItem>
                             <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
-                            <MenuFlyoutItem Text="Exit" Click="Exit_Click" />
+                            <!-- Text only. The chord itself is an accelerator on
+                                 the window's root grid, so it fires wherever
+                                 focus is; an accelerator declared here would be
+                                 dead until this flyout had been opened once. -->
+                            <MenuFlyoutItem Text="Exit" Click="Exit_Click"
+                                            KeyboardAcceleratorTextOverride="Ctrl+Q" />
                         </MenuFlyout>
                     </Button.Flyout>
                 </Button>

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -103,6 +103,12 @@ public sealed partial class MainPage : Page
                 SyncPageJumpBox();
             }
 
+            // A document arriving or leaving decides which chrome makes sense.
+            if (args.PropertyName == nameof(ViewModel.PageCount))
+            {
+                UpdateChromeForDocument();
+            }
+
             if (args.PropertyName is nameof(ViewModel.CanUndo)
                 or nameof(ViewModel.CanRedo)
                 or nameof(ViewModel.HasDocumentPath)
@@ -143,19 +149,25 @@ public sealed partial class MainPage : Page
             {
                 ViewModel.OpenDocument(probe);
             }
-            else
+            else if (StartBlank)
             {
-                // Otherwise start on a blank page rather than an empty canvas,
-                // so a drawing tool can be used the moment the app is up. It
-                // is a real one-page document, so every tool, the rulers and
-                // the save path all behave exactly as they do for a file the
-                // user opened; File>Open still replaces it.
-                // OpenBlankDocument, not OpenDocument: the startup page must not
+                // File > New asked for a document, so make one. It is a real
+                // one-page document, so every tool, the rulers and the save
+                // path behave exactly as they do for a file the user opened.
+                //
+                // OpenBlankDocument, not OpenDocument: this page must not
                 // remember the template's path inside the install folder, or
-                // Ctrl+S on a freshly started app would write over the blank
-                // every new document is made from.
+                // Ctrl+S would write over the blank every new document is made
+                // from.
                 ViewModel.OpenBlankDocument();
             }
+
+            // Otherwise nothing is opened, and the empty state shows.
+            //
+            // Launching used to conjure a blank one-page document nobody asked
+            // for. It made the app look like it had opened something, put an
+            // untitled document in front of a user who wanted to open a file,
+            // and meant the empty state below could never be seen.
 
             // Places a stamp straight after opening, so the decode-and-place
             // path can be checked without a mouse. Done inline rather than on
@@ -787,7 +799,40 @@ public sealed partial class MainPage : Page
 
     private void RulersToggle_Click(object sender, RoutedEventArgs e)
     {
-        SetRulersVisible(RulersToggle.IsChecked);
+        ApplyRulerVisibility();
+    }
+
+    /// <summary>
+    /// Rulers show when they are switched on AND there is something to measure.
+    ///
+    /// Two conditions, one place. The toggle is the user's preference and
+    /// survives a document being closed; whether a ruler is on screen right now
+    /// also depends on whether a page exists to rule.
+    /// </summary>
+    private void ApplyRulerVisibility() =>
+        SetRulersVisible(RulersToggle.IsChecked && ViewModel.PageCount > 0);
+
+    /// <summary>
+    /// Shows or hides the chrome that only means something with a document
+    /// open.
+    ///
+    /// With nothing open, the rulers measured nothing, the status pill reported
+    /// page 1 of a document that did not exist and offered to search it, and
+    /// every drawing tool was lit with no page to draw on. The empty state was
+    /// telling the user there was no document while the rest of the window
+    /// carried on as though there were.
+    /// </summary>
+    private void UpdateChromeForDocument()
+    {
+        bool hasDocument = ViewModel.PageCount > 0;
+
+        StatusBar.Visibility = hasDocument ? Visibility.Visible : Visibility.Collapsed;
+
+        // The rail's own menu and settings button stay live: they are how you
+        // open a file from here. Only the TOOLS go dim.
+        ToolRailList.IsEnabled = hasDocument;
+
+        ApplyRulerVisibility();
     }
 
     private void RulersHide_Click(object sender, RoutedEventArgs e)
@@ -2938,7 +2983,10 @@ public sealed partial class MainPage : Page
     {
         // A new TAB, not a replacement. Nothing is discarded, so there is
         // nothing to prompt about.
-        if (App.Window is MainWindow w) { w.AddDocumentTab(null); }
+        //
+        // startBlank: New means "give me a document", which is the one path
+        // that still makes one. Launching and + show the empty state instead.
+        if (App.Window is MainWindow w) { w.AddDocumentTab(null, startBlank: true); }
     }
 
     /// <summary>
@@ -2963,29 +3011,97 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // Opens in its own TAB, so the document you were working on is still
-        // there. Before tabs this replaced it, and originally did so without
-        // even offering to save.
-        //
-        // The exception is an untouched blank page: opening a file from a
-        // freshly started app should use the tab that is already there rather
-        // than leave an empty one behind.
+        OpenPickedFile(file.Path);
+    }
+
+    /// <summary>
+    /// Puts a chosen file on screen, wherever it came from.
+    ///
+    /// Shared by the picker, the empty state's button and a dropped file, so
+    /// all three land in the same place and cannot drift apart.
+    ///
+    /// Opens in its own TAB, so the document you were working on is still
+    /// there. Before tabs this replaced it, and originally did so without even
+    /// offering to save. The exception is a tab with nothing in it: opening
+    /// from the empty state should use the tab already in front rather than
+    /// leave an empty one behind it.
+    /// </summary>
+    private void OpenPickedFile(string path)
+    {
         if (App.Window is MainWindow w && (ViewModel.HasDocumentPath || ViewModel.IsDirty))
         {
-            w.AddDocumentTab(file.Path);
+            w.AddDocumentTab(path);
         }
         else
         {
-            ViewModel.OpenDocument(file.Path);
+            ViewModel.OpenDocument(path);
         }
-        Debug.WriteLine($"[MainPage] Opened \"{file.Path}\"");
+        Debug.WriteLine($"[MainPage] Opened \"{path}\"");
+    }
+
+    /// <summary>
+    /// Accepts a dragged PDF, and says so while it hovers.
+    ///
+    /// Without setting AcceptedOperation the cursor shows the "no" symbol and
+    /// the drop never fires, so a drop target that looks inert is the default
+    /// rather than something you have to break.
+    /// </summary>
+    private void EmptyState_DragOver(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems))
+        {
+            return;
+        }
+
+        e.AcceptedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+        e.DragUIOverride.Caption = "Open";
+        e.DragUIOverride.IsCaptionVisible = true;
+    }
+
+    /// <summary>
+    /// Opens the first PDF among the dropped files, through the same path the
+    /// picker uses.
+    ///
+    /// Filtered by extension rather than trusting the drop: a folder, an image
+    /// or a Word file can all be dropped here, and handing any of them to
+    /// PDFium would be an error dialog rather than an answer.
+    /// </summary>
+    private async void EmptyState_Drop(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems))
+        {
+            return;
+        }
+
+        var items = await e.DataView.GetStorageItemsAsync();
+        foreach (var item in items)
+        {
+            if (item is Windows.Storage.StorageFile file
+                && file.FileType.Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+            {
+                OpenPickedFile(file.Path);
+                return;
+            }
+        }
+
+        Diag.Log("drop: nothing among the dropped items was a PDF");
     }
 
     /// <summary>
     /// The file this page should open once it loads, set by the window when it
-    /// creates a tab for a specific document. Null means a blank page.
+    /// creates a tab for a specific document. Null means no document, which
+    /// shows the empty state.
     /// </summary>
     public string? InitialDocumentPath { get; set; }
+
+    /// <summary>
+    /// Whether this page should make a blank document for itself on load.
+    ///
+    /// Only File > New sets it. Launching and the tab strip's + button both
+    /// land on the empty state instead, because neither is a request for a
+    /// document: one is starting the app and the other is making room for one.
+    /// </summary>
+    public bool StartBlank { get; set; }
 
     /// <summary>
     /// Raised whenever this document's title changes, so the window can retitle
@@ -3108,7 +3224,7 @@ public sealed partial class MainPage : Page
 
         // Every surface takes the tint, not only the canvas. Painting one and
         // leaving the rail, the property bar and the status bar in Fluent's own
-        // greys is what made Dark blue read as "grey app with a blue hole in
+        // greys is what made Midnight blue read as "grey app with a blue hole in
         // it" rather than a blue app.
         //
         // EVERY theme paints, including Light and Dark. There is no case that
@@ -3135,8 +3251,11 @@ public sealed partial class MainPage : Page
         if (RulersToggle.IsChecked != s.ShowRulers)
         {
             RulersToggle.IsChecked = s.ShowRulers;
-            RulersToggle_Click(RulersToggle, null!);
         }
+
+        // Unconditionally, not only when the toggle changed: this also runs on
+        // load, when the chrome has never been decided at all.
+        UpdateChromeForDocument();
 
         // How the user searches, restored onto the view model. The toggles read
         // these back through their two-way bindings, so the menu shows the
@@ -3234,7 +3353,7 @@ public sealed partial class MainPage : Page
             (AppTheme.Light, "Light"),
             (AppTheme.Dark, "Dark"),
             (AppTheme.Sepia, "Sepia"),
-            (AppTheme.DarkBlue, "Dark blue"),
+            (AppTheme.MidnightBlue, "Midnight blue"),
         };
         foreach (var (_, label) in themeValues) { themes.Items.Add(label); }
         themes.SelectedIndex = Array.FindIndex(themeValues, t => t.Item1 == SettingsStore.Current.Theme);
@@ -3612,6 +3731,12 @@ public sealed partial class MainPage : Page
     }
 
     private void EmptyState_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e) =>
+        OpenFile_Click(this, null!);
+
+    /// <summary>The empty state's own Open button. Its own handler rather than
+    /// the menu's, the way the double-tap above already has one: the picker is
+    /// shared, the control is not.</summary>
+    private void EmptyStateOpen_Click(object sender, RoutedEventArgs e) =>
         OpenFile_Click(this, null!);
 
     private void Exit_Click(object sender, RoutedEventArgs e) => App.Window.Close();

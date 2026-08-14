@@ -1,4 +1,4 @@
-using Microsoft.UI;
+﻿using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
 using PdfEditorApp.Viewport;
@@ -39,7 +39,7 @@ internal static class Theming
     public static ElementTheme BaseTheme(AppTheme theme) => theme switch
     {
         AppTheme.Light or AppTheme.Sepia => ElementTheme.Light,
-        AppTheme.Dark or AppTheme.DarkBlue => ElementTheme.Dark,
+        AppTheme.Dark or AppTheme.MidnightBlue => ElementTheme.Dark,
         _ => ElementTheme.Default,
     };
 

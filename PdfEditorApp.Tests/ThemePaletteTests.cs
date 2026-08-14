@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Linq;
 using PdfEditorApp.Viewport;
 using Xunit;
@@ -136,12 +136,25 @@ public class ThemePaletteTests
     }
 
     [Fact]
-    public void dark_blue_is_the_colour_the_user_picked()
+    public void midnight_blue_is_a_midnight_rather_than_an_electric_blue()
     {
-        // #060866, from the colour picker in the screenshot. Asserted so that
-        // tuning the derived surfaces later cannot quietly move the base.
-        var s = ThemePalette.For(AppTheme.DarkBlue, systemIsDark: false);
-        Assert.Equal(new ThemeColor(0x06, 0x08, 0x66), s.Canvas);
+        // #0F1A3C. Was #060866, an electric indigo: nearly no red or green
+        // against a lot of blue, so a full window of it glowed instead of
+        // receding behind the page. Asserted so that tuning the derived
+        // surfaces later cannot quietly move the base.
+        var s = ThemePalette.For(AppTheme.MidnightBlue, systemIsDark: false);
+        Assert.Equal(new ThemeColor(0x0F, 0x1A, 0x3C), s.Canvas);
+    }
+
+    [Fact]
+    public void midnight_blue_is_dark_enough_to_sit_a_white_page_on()
+    {
+        // The canvas exists to give a white page an edge. A base that drifted
+        // light would take that away, and the page would stop reading as a
+        // sheet.
+        var canvas = ThemePalette.For(AppTheme.MidnightBlue, systemIsDark: false).Canvas;
+
+        Assert.True(canvas.R + canvas.G + canvas.B < 0x50 * 3, "the canvas has drifted too light for a white page");
     }
 
     [Fact]
@@ -150,7 +163,7 @@ public class ThemePaletteTests
         // Deriving from one base is what keeps the three surfaces a family. If
         // any of them stopped being dominated by blue, the theme would have
         // drifted into grey, which is the complaint that started this.
-        var s = ThemePalette.For(AppTheme.DarkBlue, systemIsDark: false);
+        var s = ThemePalette.For(AppTheme.MidnightBlue, systemIsDark: false);
         foreach (var c in new[] { s.Canvas, s.Chrome, s.Window })
         {
             Assert.True(c.B > c.R && c.B > c.G, $"{c} is not a blue");
