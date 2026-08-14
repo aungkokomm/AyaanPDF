@@ -4937,6 +4937,28 @@ public sealed partial class MainPage : Page
 
     private void ViewportHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
+        // A click on the page hands the keyboard back to the canvas.
+        //
+        // RootGrid_KeyDown drops every key while a text field has focus, which
+        // is what stops Backspace deleting an annotation while someone corrects
+        // a typo. The find box is a text field, and nothing ever took focus off
+        // it: not Enter, which steps through matches and has to stay repeatable,
+        // and not clicking the page. So after using Find, Ctrl+C, Ctrl+V and
+        // Delete were all silently dead on the canvas until the user happened to
+        // press Escape, which the key handler documents as the only way out.
+        //
+        // Clicking the page is the unambiguous signal that they have moved on
+        // from the box. The page-jump field gets the same treatment for free,
+        // since the condition is about text focus rather than about Find.
+        //
+        // NOT while an in-place text editor is open: that editor IS the text
+        // field in use, and taking its focus would commit the edit on the very
+        // click meant to place the caret in it.
+        if (_textEditor is null && IsTextInputFocused)
+        {
+            RootGrid.Focus(FocusState.Programmatic);
+        }
+
         var current = e.GetCurrentPoint(ViewportHost);
         if (e.Pointer.PointerDeviceType != Microsoft.UI.Input.PointerDeviceType.Mouse)
         {
