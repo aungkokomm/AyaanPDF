@@ -4679,6 +4679,25 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        if (OpenTextBoxEditor(target))
+        {
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// Opens the editor on a text box that has already been hit-tested.
+    ///
+    /// Shared by the double-click gesture and by the context menu's Edit text,
+    /// which are one operation reached two ways. The dozen lines below are the
+    /// ones that make a re-edit faithful rather than approximate - the font is
+    /// re-embedded, the decorations survive, the box comes off the page before
+    /// the editor goes over it - and a second copy of them would have drifted
+    /// from this one within a release.
+    /// </summary>
+    /// <returns>True when the editor actually opened.</returns>
+    private bool OpenTextBoxEditor(ViewportViewModel.TextBoxEditTarget target)
+    {
         // The preceding clicks may have started a select-and-move; abandon it,
         // and drop the marquee, so the box is edited rather than dragged.
         ResetPointerInteraction();
@@ -4716,12 +4735,152 @@ public sealed partial class MainPage : Page
         // "two layers" the edit showed.
         if (!ViewModel.BeginLoadedTextBoxEdit(target.PageIndex, target.Index))
         {
-            return;
+            return false;
         }
 
         BeginTextEdit(target.PageIndex, target.Left, target.Top, target.Right, target.Bottom,
                       initialText: target.Text, editing: target);
+        return true;
+    }
+
+    // ---------------- Right-click menu ----------------
+
+    /// <summary>Where the last right-click landed, in normalized page-local
+    /// coordinates. Edit text needs it after the fact: the command runs once
+    /// the menu has closed, and the box it opens is the one that was under the
+    /// cursor when the menu was asked for, not whatever is under it now.</summary>
+    private (int Page, double X, double Y) _contextPoint;
+
+    /// <summary>
+    /// Right-click: select what is under the pointer, then offer what applies
+    /// to it.
+    ///
+    /// Under EVERY tool, not just Select. Right-click is not a drawing gesture
+    /// in any of them, so there is nothing to conflict with, and the moment a
+    /// user most wants to delete the stroke they just drew is while the pen is
+    /// still armed.
+    /// </summary>
+    private void ViewportHost_RightTapped(object sender, RightTappedRoutedEventArgs e)
+    {
+        // Nothing to talk about with no document, and nothing to interrupt a
+        // gesture already in flight or a text box mid-edit: a menu appearing
+        // over either would act on a selection that is still being changed.
+        if (ViewModel.PageCount == 0 || _textEditor is not null
+            || _isPanning || _isMovingAnnotation || _isMarqueeing || _isSelectingText
+            || _isDrawing || _isDrawingShape || _isSizingText)
+        {
+            return;
+        }
+
+        var content = ContentPointAt(e.GetPosition(ViewportHost));
+        double nx = content.X / ViewModel.OverlayScale;
+        double ny = content.Y / ViewModel.OverlayScale;
+        _contextPoint = (content.Page, nx, ny);
+
+        // A right-click ON the selection leaves it alone; anywhere else re-picks
+        // what is under the pointer. That is the convention every editor uses,
+        // and the reason for the first half is Group: without it, right-clicking
+        // one of three selected objects would collapse the selection to that one
+        // and then offer a greyed-out Group.
+        bool onObject = ViewModel.IsOverSelectedObject(content.Page, nx, ny)
+                     || ViewModel.SelectAnnotationAt(content.Page, nx, ny);
+
+        var items = ContextMenuModel.For(new ContextTarget
+        {
+            DocumentOpen = true,
+            OnObject = onObject,
+            SelectionCount = ViewModel.SelectionCount,
+            CanUngroup = ViewModel.CanUngroupSelection,
+            IsTextBox = ViewModel.HasSelectedTextBox,
+            ClipboardHasContent = ViewModel.HasClipboardContent,
+        });
+
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        var flyout = new MenuFlyout();
+        foreach (var item in items)
+        {
+            if (item.IsSeparator)
+            {
+                flyout.Items.Add(new MenuFlyoutSeparator());
+                continue;
+            }
+
+            var row = new MenuFlyoutItem { Text = item.Label, IsEnabled = item.Enabled };
+            if (item.Accelerator.Length > 0)
+            {
+                // Text only. A real KeyboardAccelerator here would be dead
+                // weight: accelerators declared on flyout items are not live
+                // until the flyout is open, which is the trap that left Ctrl+Z
+                // unimplemented for months. The window's key handler owns these
+                // chords, and ContextMenuModel's tests hold this column to what
+                // that handler really listens for.
+                row.KeyboardAcceleratorTextOverride = item.Accelerator;
+            }
+
+            var command = item.Command;
+            row.Click += (_, _) => RunContextCommand(command);
+            flyout.Items.Add(row);
+        }
+
+        // The floating object toolbar is anchored to the selection, which is
+        // exactly where this menu opens, so it would sit under it. Hide it for
+        // as long as the menu is up.
+        _objectToolbarSuppressed = true;
+        UpdateObjectToolbar();
+        flyout.Closed += (_, _) =>
+        {
+            _objectToolbarSuppressed = false;
+            UpdateObjectToolbar();
+        };
+
+        // Anchored to the SCROLLER, not to the content under the pointer. The
+        // content is panned and zoomed by the compositor, so a position measured
+        // in its space is a position in a frame that moves independently of the
+        // window; the scroller's own space is the viewport, one pixel per pixel,
+        // whatever the page is doing inside it.
+        flyout.ShowAt(PageScroller, new FlyoutShowOptions { Position = e.GetPosition(PageScroller) });
         e.Handled = true;
+    }
+
+    /// <summary>
+    /// Runs a menu row. Every arm calls the same method the toolbar button or
+    /// the keyboard chord calls, so the menu is a second door onto the existing
+    /// commands rather than a second implementation of them.
+    /// </summary>
+    private void RunContextCommand(ContextCommand command)
+    {
+        switch (command)
+        {
+            case ContextCommand.EditText:
+                if (ViewModel.HitLoadedTextBox(_contextPoint.Page, _contextPoint.X, _contextPoint.Y)
+                    is ViewportViewModel.TextBoxEditTarget target)
+                {
+                    OpenTextBoxEditor(target);
+                }
+                break;
+
+            case ContextCommand.Cut: ViewModel.CutSelectedAnnotations(); break;
+            case ContextCommand.Copy: ViewModel.CopySelectedAnnotations(); break;
+            case ContextCommand.Paste: ViewModel.PasteAnnotations(); break;
+            case ContextCommand.Delete: ViewModel.DeleteSelectedAnnotation(); break;
+
+            case ContextCommand.BringToFront: ViewModel.BringSelectedToFront(); break;
+            case ContextCommand.BringForward: ViewModel.BringSelectedForward(); break;
+            case ContextCommand.SendBackward: ViewModel.SendSelectedBackward(); break;
+            case ContextCommand.SendToBack: ViewModel.SendSelectedToBack(); break;
+
+            case ContextCommand.Group: ViewModel.GroupSelected(); break;
+            case ContextCommand.Ungroup: ViewModel.UngroupSelected(); break;
+
+            case ContextCommand.SelectAllOnPage: ViewModel.SelectAllOnPage(); break;
+            case ContextCommand.RotatePage: ViewModel.RotateCurrentPage(90); break;
+        }
+
+        UpdateObjectToolbar();
     }
 
     private bool ToolWantsPointer =>

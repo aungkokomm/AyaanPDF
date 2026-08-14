@@ -6710,14 +6710,43 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// A SizeAll shown over the empty corner of a diagonal arrow's bounding box
     /// promises a drag that would in fact deselect.
     ///
-    /// Falls back to the selection's own rectangle when the object cannot be
-    /// resolved, which is the behaviour this had before: a mark with no stable
-    /// identity yet, or one whose page has been invalidated out from under the
-    /// selection, is still draggable rather than suddenly inert.
+    /// The ANCHOR only, which is what a drag moves from. Right-click wants
+    /// <see cref="IsOverSelectedObject"/>.
     /// </summary>
-    public bool IsOverSelection(int pageIndex, double normX, double normY)
+    public bool IsOverSelection(int pageIndex, double normX, double normY) =>
+        _selectedLoaded is LoadedSelection sel && Covers(sel, pageIndex, normX, normY);
+
+    /// <summary>
+    /// Whether a point is on ANY member of the selection, extras included.
+    ///
+    /// <see cref="IsOverSelection"/> asks only about the anchor, which is right
+    /// for the move cursor: a drag is anchored. A right-click is not. Asking the
+    /// anchor there would mean right-clicking the second of three selected
+    /// objects reported "not on the selection", re-picked that one alone, and
+    /// offered a greyed-out Group - at the exact moment the user was reaching
+    /// for it.
+    /// </summary>
+    public bool IsOverSelectedObject(int pageIndex, double normX, double normY)
     {
-        if (_selectedLoaded is not LoadedSelection sel || sel.PageIndex != pageIndex)
+        if (IsOverSelection(pageIndex, normX, normY)) { return true; }
+
+        foreach (var ex in _extraSelected)
+        {
+            if (Covers(ex, pageIndex, normX, normY)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Whether one selected mark covers a point, asked of the OBJECT where the
+    /// model can resolve it and of its rectangle where it cannot. The fallback
+    /// is the behaviour this had before the model existed: a mark with no stable
+    /// identity yet, or one whose page has been invalidated out from under the
+    /// selection, stays draggable rather than turning suddenly inert.
+    /// </summary>
+    private bool Covers(LoadedSelection sel, int pageIndex, double normX, double normY)
+    {
+        if (sel.PageIndex != pageIndex)
         {
             return false;
         }

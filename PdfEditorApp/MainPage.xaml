@@ -219,7 +219,9 @@
                 PointerCanceled="ViewportHost_PointerReleased"
                 PointerCaptureLost="ViewportHost_PointerCaptureLost"
                 DoubleTapped="ViewportHost_DoubleTapped"
-                IsDoubleTapEnabled="True">
+                RightTapped="ViewportHost_RightTapped"
+                IsDoubleTapEnabled="True"
+                IsRightTapEnabled="True">
 
                 <!--
                     Continuous page stack.
