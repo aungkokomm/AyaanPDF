@@ -176,6 +176,74 @@ public static class Geometry2D
     }
 
     /// <summary>
+    /// Turns a point CLOCKWISE by <paramref name="deg"/> about
+    /// (<paramref name="cx"/>, <paramref name="cy"/>) on screen, where y runs
+    /// DOWN. The forward direction of <see cref="InverseRotate"/>, and the one
+    /// that puts an object's own geometry where it is drawn.
+    /// </summary>
+    public static (double X, double Y) Rotate(
+        double x, double y, double cx, double cy, double deg)
+    {
+        if (deg == 0) { return (x, y); }
+
+        double rad = deg * Math.PI / 180.0;
+        double cos = Math.Cos(rad);
+        double sin = Math.Sin(rad);
+        double dx = x - cx;
+        double dy = y - cy;
+        return (cx + (dx * cos) - (dy * sin), cy + (dx * sin) + (dy * cos));
+    }
+
+    /// <summary>
+    /// Every point turned clockwise about an explicit centre. Empty in, empty
+    /// out. This one round-trips: turning by -deg about the SAME centre undoes
+    /// it exactly.
+    /// </summary>
+    public static List<(double X, double Y)> Rotate(
+        IReadOnlyList<(double X, double Y)> points, double cx, double cy, double deg)
+    {
+        var turned = new List<(double X, double Y)>(points?.Count ?? 0);
+        if (points is null) { return turned; }
+
+        foreach (var (x, y) in points)
+        {
+            turned.Add(Rotate(x, y, cx, cy, deg));
+        }
+
+        return turned;
+    }
+
+    /// <summary>
+    /// Every point turned clockwise about the centre of the list's OWN bounding
+    /// box, which is the point the rotate handle spins a stroke about on screen.
+    ///
+    /// ⚠️ NOT its own inverse. Turning a point cloud moves its bounding box, so
+    /// the centre this computes from the RESULT is a different point from the
+    /// one it turned about, and turning back by -deg lands somewhere else. That
+    /// is why a stroke stores its UPRIGHT points and an absolute angle and is
+    /// turned from upright every time, rather than being nudged from wherever it
+    /// currently is. Anything needing a round trip wants the explicit-centre
+    /// overload above.
+    /// </summary>
+    public static List<(double X, double Y)> RotateAboutCentre(
+        IReadOnlyList<(double X, double Y)> points, double deg)
+    {
+        if (points is null || points.Count == 0) { return []; }
+
+        double minX = double.MaxValue, minY = double.MaxValue;
+        double maxX = double.MinValue, maxY = double.MinValue;
+        foreach (var (x, y) in points)
+        {
+            if (x < minX) { minX = x; }
+            if (y < minY) { minY = y; }
+            if (x > maxX) { maxX = x; }
+            if (y > maxY) { maxY = y; }
+        }
+
+        return Rotate(points, (minX + maxX) / 2, (minY + maxY) / 2, deg);
+    }
+
+    /// <summary>
     /// Turns a point back into an upright frame that has been rotated
     /// <paramref name="deg"/> CLOCKWISE about (<paramref name="cx"/>,
     /// <paramref name="cy"/>) on screen, where y runs DOWN.

@@ -163,10 +163,39 @@ public class InkResizeInteropTests
         return index;
     }
 
-    private static void WriteTag(ulong handle, int index, IReadOnlyList<(double X, double Y)> control)
+    private static void WriteTag(
+        ulong handle, int index, IReadOnlyList<(double X, double Y)> control, double rotationDeg = 0)
     {
-        byte[] body = System.Text.Encoding.UTF8.GetBytes(InkTag.Write("FFFF0000", 0.004, control));
+        byte[] body = System.Text.Encoding.UTF8.GetBytes(
+            InkTag.Write("FFFF0000", 0.004, control, rotationDeg));
         Assert.Equal(OkPdfium, set_annotation_body(handle, 0, index, body, (nuint)body.Length));
+    }
+
+    /// <summary>The app's rotation commit: rewrite the stroke from its UPRIGHT
+    /// points at a new absolute angle, turning them on the way to the page.</summary>
+    private static int Rotate(ulong handle, int index, double deg)
+    {
+        Assert.True(InkTag.TryParse(Tag(handle, 0, index), out _, out _, out var control, out _));
+
+        Assert.Equal(OkPdfium, delete_annotation(handle, 0, index));
+        var curve = StrokeSmoothing.Fit(Geometry2D.RotateAboutCentre(control, deg));
+        var pts = curve.Select(p => new BurnPoint { X = (float)(p.X * Cap), Y = (float)(p.Y * Cap) }).ToArray();
+        var stroke = new BurnStroke
+        {
+            PageIndex = 0, PointOffset = 0, PointCount = (uint)pts.Length,
+            WidthPx = 4f, R = 255, G = 0, B = 0, A = 255,
+        };
+        Assert.Equal(OkPdfium, add_ink_annotations(handle, Cap, [stroke], 1, pts, (nuint)pts.Length));
+
+        int newIndex = AnnotationCount(handle, 0) - 1;
+        WriteTag(handle, newIndex, control, deg);   // UPRIGHT points, plus the angle
+        return newIndex;
+    }
+
+    private static double AngleOf(ulong handle, int index)
+    {
+        Assert.True(InkTag.TryParse(Tag(handle, 0, index), out _, out _, out _, out double deg));
+        return deg;
     }
 
     /// <summary>The app's rebuild: scale, delete, re-add, re-tag.</summary>
@@ -302,6 +331,137 @@ public class InkResizeInteropTests
         finally
         {
             close_document(handle);
+        }
+    }
+
+    // ---------------- Rotation ----------------
+
+    [Theory]
+    [InlineData(30.0)]
+    [InlineData(45.0)]
+    [InlineData(90.0)]
+    [InlineData(180.0)]
+    [InlineData(270.0)]
+    public void a_turned_stroke_keeps_its_upright_points_and_records_its_angle(double deg)
+    {
+        ulong handle = OpenFixture();
+        try
+        {
+            int index = AddStroke(handle, Squiggle);
+            var before = PointsOf(handle, index).ToList();
+
+            int turned = Rotate(handle, index, deg);
+
+            Assert.Equal(deg, AngleOf(handle, turned), 2);
+
+            // The POINTS are untouched: what is stored is what was drawn, and
+            // the angle is applied on the way to the page. If the turned points
+            // had been stored, this box would have changed.
+            var after = PointsOf(handle, turned);
+            Assert.Equal(before.Count, after.Count);
+            for (int i = 0; i < before.Count; i++)
+            {
+                Assert.Equal(before[i].X, after[i].X, 3);
+                Assert.Equal(before[i].Y, after[i].Y, 3);
+            }
+
+            Assert.Equal(1, AnnotationCount(handle, 0));
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void turning_a_stroke_repeatedly_does_not_let_it_drift_or_grow()
+    {
+        // Every rotation is applied to the UPRIGHT points at an ABSOLUTE angle,
+        // so there is nothing to accumulate. Nudging the stroke from wherever it
+        // currently sits would drift, because turning a point cloud moves its
+        // bounding box.
+        ulong handle = OpenFixture();
+        try
+        {
+            int index = AddStroke(handle, Squiggle);
+            var before = PointsOf(handle, index).ToList();
+
+            foreach (double deg in new[] { 15.0, 40.0, 90.0, 200.0, 355.0 })
+            {
+                index = Rotate(handle, index, deg);
+            }
+            index = Rotate(handle, index, 0);
+
+            var after = PointsOf(handle, index);
+            Assert.Equal(0, AngleOf(handle, index), 3);
+            for (int i = 0; i < before.Count; i++)
+            {
+                Assert.Equal(before[i].X, after[i].X, 3);
+                Assert.Equal(before[i].Y, after[i].Y, 3);
+            }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void a_turned_stroke_can_still_be_resized_without_shearing()
+    {
+        // Rotate, then resize: the upright points scale and the angle rides
+        // through, so the drawing comes back wider rather than skewed.
+        ulong handle = OpenFixture();
+        try
+        {
+            int index = AddStroke(handle, Squiggle);
+            int turned = Rotate(handle, index, 45);
+
+            Assert.True(InkTag.TryParse(Tag(handle, 0, turned), out _, out _, out var control, out double deg));
+            Assert.Equal(45, deg, 2);
+
+            var widened = InkTag.ScaleTo(control, 0.1, 0.1, 0.9, 0.3);
+            Assert.Equal(0.8, BoxOf(widened).W, 3);
+            Assert.Equal(0.2, BoxOf(widened).H, 3);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Theory]
+    [InlineData(30.0)]
+    [InlineData(45.0)]
+    [InlineData(135.0)]
+    public void a_turned_stroke_survives_a_save_and_reopen(double deg)
+    {
+        ulong handle = OpenFixture();
+        int index = AddStroke(handle, Squiggle);
+        int turned = Rotate(handle, index, deg);
+        var before = PointsOf(handle, turned).ToList();
+
+        var saved = snapshot_document(handle);
+        close_document(handle);
+        Assert.Equal(OkPdfium, saved.Status);
+
+        ulong reopened = open_document_from_bytes(saved.Data, saved.Len);
+        Assert.NotEqual(0UL, reopened);
+        try
+        {
+            Assert.Equal(deg, AngleOf(reopened, 0), 2);
+
+            var after = PointsOf(reopened, 0);
+            Assert.Equal(before.Count, after.Count);
+            for (int i = 0; i < before.Count; i++)
+            {
+                Assert.Equal(before[i].X, after[i].X, 4);
+                Assert.Equal(before[i].Y, after[i].Y, 4);
+            }
+        }
+        finally
+        {
+            close_document(reopened);
         }
     }
 

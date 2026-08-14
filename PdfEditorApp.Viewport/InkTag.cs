@@ -33,7 +33,23 @@ public static class InkTag
     /// <summary>Four decimals is a tenth of a pixel on a 900px-wide render.</summary>
     private const string Format = "0.####";
 
-    public static string Write(string colorRgba, double strokeWidth, IReadOnlyList<(double X, double Y)> control)
+    /// <param name="rotationDeg">
+    /// Clockwise rotation about the stroke's own centre, in screen degrees.
+    ///
+    /// The points stored are the UPRIGHT ones, exactly as drawn, and this is the
+    /// angle they are turned by when the stroke is written to the page. Baking
+    /// the rotation into the points instead would look identical until the next
+    /// resize: a later drag scales a point cloud along the PAGE's axes, so a
+    /// stroke turned 45 degrees and then stretched sideways would come out
+    /// sheared rather than wider. Keeping the upright geometry and an angle is
+    /// what makes a shape immune to that, and it is the same answer here.
+    ///
+    /// Emitted only when there IS one, so every stroke written before rotation
+    /// existed stays byte-identical and no diff appears where nothing changed.
+    /// </param>
+    public static string Write(
+        string colorRgba, double strokeWidth, IReadOnlyList<(double X, double Y)> control,
+        double rotationDeg = 0)
     {
         var sb = new StringBuilder(Prefix);
         sb.Append(colorRgba).Append(':');
@@ -45,6 +61,12 @@ public static class InkTag
             sb.Append(',');
             sb.Append(control[i].Y.ToString(Format, CultureInfo.InvariantCulture));
         }
+
+        if (rotationDeg != 0)
+        {
+            sb.Append(':').Append(rotationDeg.ToString("0.##", CultureInfo.InvariantCulture));
+        }
+
         return sb.ToString();
     }
 
@@ -57,7 +79,22 @@ public static class InkTag
         out string colorRgba,
         out double strokeWidth,
         out List<(double X, double Y)> control)
+        => TryParse(tag, out colorRgba, out strokeWidth, out control, out _);
+
+    /// <summary>
+    /// As above, and also reports the stroke's own rotation.
+    ///
+    /// Absent on every stroke written before rotation existed, which reads as
+    /// upright: that is what those strokes are, so nothing has to be migrated.
+    /// </summary>
+    public static bool TryParse(
+        string? tag,
+        out string colorRgba,
+        out double strokeWidth,
+        out List<(double X, double Y)> control,
+        out double rotationDeg)
     {
+        rotationDeg = 0;
         colorRgba = "000000FF";
         strokeWidth = 0;
         control = new List<(double X, double Y)>();
@@ -71,12 +108,21 @@ public static class InkTag
             return false;
         }
 
-        // Split into exactly three fields: the point list contains no colons,
-        // so a plain split is safe and stays safe as points are added.
+        // The point list contains no colons, so a plain split is safe and stays
+        // safe as points are added. A FOURTH field, the rotation, is appended
+        // after the points by a stroke that has one; older tags simply stop at
+        // three and read as upright.
         string[] parts = body.Substring(Prefix.Length).Split(':');
         if (parts.Length < 3)
         {
             return false;
+        }
+
+        if (parts.Length > 3
+            && double.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out double deg)
+            && double.IsFinite(deg))
+        {
+            rotationDeg = deg;
         }
 
         colorRgba = parts[0];

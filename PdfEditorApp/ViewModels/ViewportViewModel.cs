@@ -2826,7 +2826,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // Mirrors the condition RefreshSelectionOutline draws the handle under.
         bool hasRotateHandle =
-            (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp) && CanResize(anchor);
+            (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk) && CanResize(anchor);
         if (hasRotateHandle)
         {
             top -= LoadedAnnotationPicker.RotateHandleGap + LoadedAnnotationPicker.GripReach;
@@ -3170,7 +3170,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // framed at its real angle.
             if (slot is not null)
             {
-                slot.SelectionRotation = (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp) ? _selectedRotationDeg : 0;
+                slot.SelectionRotation = (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk) ? _selectedRotationDeg : 0;
                 slot.SelectionCenterX = (sel.Left + sel.Right) / 2 * SlotLayoutWidth;
                 slot.SelectionCenterY = (sel.Top + sel.Bottom) / 2 * SlotLayoutWidth;
             }
@@ -3185,7 +3185,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // rotate handle above its top edge. Grips inset by the same
                 // shape-pad amount so they sit ON the frame, not outside it.
                 AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0,
-                         rotate: _selectedIsTextBox || _selectedIsShape || _selectedIsStamp,
+                         rotate: _selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk,
                          insetDips: p);
             }
 
@@ -3661,8 +3661,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Decided HERE, where the tag has already been read, so the hover and
         // drag paths never pay an FFI for it. Both are set before the text-box
         // parse below, which returns early for everything that is not one.
-        _selectedIsInk = InkTag.TryParse(contents, out _, out _, out _);
+        _selectedIsInk = InkTag.TryParse(contents, out _, out _, out _, out double inkAngle);
         _selectedCanResize = AnnotationResize.CanResize(SubtypeOf(pageIndex, index), contents);
+        if (_selectedIsInk)
+        {
+            _selectedRotationDeg = inkAngle;
+        }
 
         if (_selectedIsShape)
         {
@@ -4084,6 +4088,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (tag.StartsWith("AyaanShape:", StringComparison.Ordinal)) { return ParseShapeRotation(tag); }
         if (tag.StartsWith("AyaanStamp:", StringComparison.Ordinal)) { return ParseStampRotation(tag); }
+        if (InkTag.TryParse(tag, out _, out _, out _, out double inkDeg)) { return inkDeg; }
         return TextBoxTagReader.TryParse(tag, out var box) ? box.RotationDeg : 0;
     }
 
@@ -4094,7 +4099,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         var box = new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom);
         var (lx, ly) = InverseRotate(nx, ny, box, _selectedRotationDeg);
-        if ((_selectedIsTextBox || _selectedIsShape || _selectedIsStamp)
+        if ((_selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk)
             && LoadedAnnotationPicker.IsRotateHandle(box, lx, ly))
         {
             return LoadedAnnotationPicker.Grip.Rotate;
@@ -4644,11 +4649,50 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // has to be deleted and drawn again to be adjusted.
         if (status != RenderStatus.OkPdfium
             && InkTag.TryParse(ReadAnnotationContents(now.PageIndex, now.Index),
-                               out string inkColor, out double inkWidth, out var inkControl))
+                               out string inkColor, out double inkWidth, out var inkControl,
+                               out double inkAngle))
         {
+            // A TURNED stroke resizes the way a turned shape does. Its /Rect is
+            // the box containing the turned ink, so the dragged rectangle is not
+            // the stroke's own size; scaling the upright points straight onto it
+            // would stretch the drawing rather than resize it. Take the RATIO
+            // the frame changed by and apply it to the upright box instead.
+            //
+            // An upright stroke keeps the existing path exactly: its /Rect and
+            // its own box are the same thing, and resizing has worked that way
+            // since it was switched on.
+            var inkBox = UprightBoxOf(inkControl);
+            TextRect target = new(now.Left, now.Top, now.Right, now.Bottom);
+
+            if (resizing && inkAngle != 0
+                && ShapeResize.UprightTargetFor(
+                       new TextRect(start.Left, start.Top, start.Right, start.Bottom),
+                       target,
+                       inkBox.Right - inkBox.Left,
+                       inkBox.Bottom - inkBox.Top) is TextRect scaledBox)
+            {
+                target = scaledBox;
+            }
+            else if (inkAngle != 0)
+            {
+                // A MOVE of a turned stroke: same size, new place. Re-centre the
+                // upright box on where the drag put the rectangle rather than
+                // adopting the enlarged rectangle as the stroke's own size.
+                double cx = (target.Left + target.Right) / 2;
+                double cy = (target.Top + target.Bottom) / 2;
+                double halfW = (inkBox.Right - inkBox.Left) / 2;
+                double halfH = (inkBox.Bottom - inkBox.Top) / 2;
+                target = new TextRect(cx - halfW, cy - halfH, cx + halfW, cy + halfH);
+            }
+
             status = RebuildInkAt(
                 now.PageIndex, now.Index, CaptureWidth, inkColor, inkWidth, inkControl,
-                now.Left, now.Top, now.Right, now.Bottom, now.Id, out newIndex);
+                target.Left, target.Top, target.Right, target.Bottom, now.Id, out newIndex,
+                inkAngle);
+
+            // Same reason a turned shape re-reads: the rectangle that lands is
+            // the box containing the turned ink, not the one that was dragged.
+            shapeUprightResized = inkAngle != 0;
         }
 
         if (status != RenderStatus.OkPdfium)
@@ -6133,6 +6177,51 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        if (_selectedIsInk
+            && InkTag.TryParse(ReadAnnotationContents(start.PageIndex, start.Index),
+                               out string inkColor, out double inkWidth, out var inkControl))
+        {
+            // A stroke is turned by rewriting it from its UPRIGHT points at the
+            // new angle, not by nudging where it currently sits. Turning a point
+            // cloud moves its bounding box, so an incremental rotation would
+            // drift a little on every drag; from upright there is nothing to
+            // accumulate. The tag keeps the upright points either way, so a
+            // later resize still scales the stroke instead of shearing it.
+            PushHistory(HistoryScope.Document, "Rotate drawing");
+
+            // The stroke's OWN upright box, taken from the points themselves.
+            // NOT `start`, which is the rectangle it occupies right now: for a
+            // stroke that is already turned that is the enlarged box containing
+            // the turned ink, and scaling the upright points onto it would
+            // stretch the drawing a little further on every rotation.
+            var box = UprightBoxOf(inkControl);
+            int inkStatus = RebuildInkAt(
+                start.PageIndex, start.Index, CaptureWidth, inkColor, inkWidth, inkControl,
+                box.Left, box.Top, box.Right, box.Bottom, start.Id, out int inkNewIndex,
+                _selectedRotationDeg);
+
+            if (inkStatus != RenderStatus.OkPdfium)
+            {
+                _selectedLoaded = start;
+                RefreshSelectionOutline();
+                Status = "Could not rotate that drawing.";
+                return;
+            }
+
+            IsDirty = true;
+            InvalidateLoadedPage(start.PageIndex);
+
+            // Re-read: a turned stroke's rectangle is the box that CONTAINS the
+            // turned ink, which is not the one it had upright.
+            _selectedLoaded = FreshBoundsOf(start.PageIndex, inkNewIndex) is TextRect turned
+                ? new LoadedSelection(start.PageIndex, inkNewIndex,
+                                      turned.Left, turned.Top, turned.Right, turned.Bottom, start.Id)
+                : start with { Index = inkNewIndex };
+            StampSelectedIds();
+            RefreshSelectionOutline();
+            return;
+        }
+
         if (_selectedIsShape)
         {
             PushHistory(HistoryScope.Document, "Rotate shape");
@@ -6581,6 +6670,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// about a specific object rather than about hidden state.
     /// </param>
     private bool CanResize(LoadedSelection sel) => _selectedCanResize;
+
+    /// <summary>
+    /// The box a set of stroke points occupies, which for the UPRIGHT points on
+    /// a stroke's tag is the stroke's own upright box. Rebuilding into it is a
+    /// no-op scale, which is what a rotation wants: turn the drawing, do not
+    /// resize it.
+    /// </summary>
+    private static TextRect UprightBoxOf(IReadOnlyList<(double X, double Y)> points)
+    {
+        if (points.Count == 0) { return new TextRect(0, 0, 0, 0); }
+
+        double minX = double.MaxValue, minY = double.MaxValue;
+        double maxX = double.MinValue, maxY = double.MinValue;
+        foreach (var (x, y) in points)
+        {
+            if (x < minX) { minX = x; }
+            if (y < minY) { minY = y; }
+            if (x > maxX) { maxX = x; }
+            if (y > maxY) { maxY = y; }
+        }
+
+        return new TextRect(minX, minY, maxX, maxY);
+    }
 
     /// <summary>The annotation's PDFium subtype, from the page's loaded cache.
     /// Zero-cost next to an FFI read, and the cache is always warm here because
@@ -7362,12 +7474,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// fit first and write the bare control points, which would put a visibly
     /// angular stroke in the document next to a smooth preview.
     /// </summary>
+    /// <param name="rotationDeg">
+    /// The stroke's own angle. The points handed in are UPRIGHT, as drawn, and
+    /// are turned here on the way to the page: the tag keeps the upright ones so
+    /// a later resize scales the stroke rather than shearing it.
+    /// </param>
     private bool AddInkFromControl(
         int page, int captureWidth, string colorHex, double width,
-        IReadOnlyList<(double X, double Y)> control, out int index)
+        IReadOnlyList<(double X, double Y)> control, out int index, double rotationDeg = 0)
     {
         index = -1;
-        var curve = StrokeSmoothing.Fit(control);
+
+        // Turned BEFORE the fit rather than after. A rotation is rigid, so the
+        // two agree, and there are far fewer control points than fitted ones.
+        var placed = rotationDeg == 0
+            ? control
+            : Geometry2D.RotateAboutCentre(control, rotationDeg);
+        var curve = StrokeSmoothing.Fit(placed);
         if (curve.Count < 2 || _documentHandle == 0)
         {
             return false;
@@ -7416,10 +7539,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// in place; that is the same churn every other edit in this app pays, and
     /// the reason the Id is stamped back afterwards.
     /// </summary>
+    /// <param name="rotationDeg">The stroke's angle, carried through the rebuild
+    /// so a turned drawing stays turned. The bounds are its UPRIGHT box; the
+    /// scaled points are turned by this on the way to the page.</param>
     private int RebuildInkAt(
         int page, int index, int captureWidth, string colorHex, double width,
         IReadOnlyList<(double X, double Y)> control,
-        double left, double top, double right, double bottom, Guid id, out int newIndex)
+        double left, double top, double right, double bottom, Guid id, out int newIndex,
+        double rotationDeg = 0)
     {
         newIndex = index;
         var scaled = InkTag.ScaleTo(control, left, top, right, bottom);
@@ -7430,7 +7557,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         InvalidateAnnotationCache(page);
 
-        if (!AddInkFromControl(page, captureWidth, colorHex, width, scaled, out int added))
+        if (!AddInkFromControl(page, captureWidth, colorHex, width, scaled, out int added, rotationDeg))
         {
             return RenderStatus.Unsupported;
         }
@@ -7438,7 +7565,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Description first, then identity: WriteId reads the tag body and puts
         // the ID in front of it, so stamping the Id before the body would have
         // the body overwrite it.
-        WriteInkTag(page, added, colorHex, width, scaled);
+        WriteInkTag(page, added, colorHex, width, scaled, rotationDeg);
         if (id != Guid.Empty)
         {
             Interop.AnnotationLoader.WriteId(_documentHandle, page, added, id);
@@ -7582,13 +7709,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>Stamps a stroke's description onto the annotation at an index.</summary>
     private void WriteInkTag(
-        int page, int index, string colorHex, double width, IReadOnlyList<(double X, double Y)> control)
+        int page, int index, string colorHex, double width,
+        IReadOnlyList<(double X, double Y)> control, double rotationDeg = 0)
     {
         // AARRGGBB, alpha FIRST, because that is the order ParseHex reads an
         // eight-character colour back in. Writing RRGGBBAA here round-trips a
         // stroke with its red and alpha swapped.
         var (r, g, b, a) = ParseHex(colorHex, defaultAlpha: 0xFF);
-        string body = InkTag.Write($"{a:X2}{r:X2}{g:X2}{b:X2}", width, control);
+        string body = InkTag.Write($"{a:X2}{r:X2}{g:X2}{b:X2}", width, control, rotationDeg);
         byte[] bytes = System.Text.Encoding.UTF8.GetBytes(body);
         int status = RenderCoreNative.set_annotation_body(
             _documentHandle, page, index, bytes, (nuint)bytes.Length);
