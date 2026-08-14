@@ -25,6 +25,21 @@ public static class ObjectToolbarPlacement
     public const double EdgeMargin = 6;
 
     /// <summary>
+    /// How far the toolbar is lifted out of the page, in composition depth.
+    ///
+    /// The pages are raised by their own shadow, so a toolbar left at ground
+    /// level is drawn BEHIND the paper it floats over and survives only in the
+    /// margins. Canvas.ZIndex cannot fix that: it orders siblings inside one
+    /// panel's render pass and does not reach across depth.
+    ///
+    /// The caller must apply this through <c>UIElement.Translation</c> and
+    /// position the toolbar through the SAME property. A RenderTransform drives
+    /// the very same composition visual and wins, taking this Z with it, which
+    /// is precisely how the first attempt at the fix appeared to do nothing.
+    /// </summary>
+    public const float Elevation = 32f;
+
+    /// <summary>
     /// Above the selection and horizontally centred on it, which is where every
     /// editor puts this control and where it covers the least of what you are
     /// working on. Falls BELOW when there is no room above, and is clamped so it

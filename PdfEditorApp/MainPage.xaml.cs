@@ -741,8 +741,16 @@ public sealed partial class MainPage : Page
             PageScroller.ViewportWidth, PageScroller.ViewportHeight,
             Math.Max(0, topInset));
 
-        ObjectToolbarOffset.X = place.Left;
-        ObjectToolbarOffset.Y = place.Top;
+        // Position AND elevation through the one property.
+        //
+        // This used to move the toolbar with a RenderTransform, which drives the
+        // same composition visual as Translation and overrides it, Z included.
+        // The toolbar therefore sat at ground level however much elevation it
+        // was given, and was drawn behind every page it floated over: the first
+        // attempt at this fix set Translation in the XAML and appeared to change
+        // nothing at all, because the transform was quietly winning.
+        ObjectToolbar.Translation = new System.Numerics.Vector3(
+            (float)place.Left, (float)place.Top, ObjectToolbarPlacement.Elevation);
 
         ObjToolGroup.IsEnabled = ViewModel.CanGroupSelection;
         ObjToolUngroup.IsEnabled = ViewModel.CanUngroupSelection;
