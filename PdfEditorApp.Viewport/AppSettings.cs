@@ -83,6 +83,20 @@ public sealed record AppSettings
     public BarDock StatusBarDock { get; init; } = BarDock.BottomCentre;
 
     /// <summary>
+    /// Whether find distinguishes upper from lower case.
+    ///
+    /// Remembered because it is a property of how someone searches rather than
+    /// of the document they are searching: a person looking for code or names
+    /// wants it on every time, and having to set it again per session is the
+    /// kind of small friction that makes an option not worth having.
+    /// </summary>
+    public bool SearchMatchCase { get; init; }
+
+    /// <summary>Whether find requires the query to stand alone as a word.
+    /// Remembered for the same reason.</summary>
+    public bool SearchWholeWord { get; init; }
+
+    /// <summary>
     /// Which anchor a point in the viewport is nearest, for dropping the bar.
     ///
     /// Thirds horizontally and halves vertically: the middle third is wide

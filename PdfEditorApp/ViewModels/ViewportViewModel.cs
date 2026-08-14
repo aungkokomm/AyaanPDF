@@ -149,11 +149,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial string SearchQuery { get; set; } = string.Empty;
 
+    /// <summary>Whether search distinguishes upper from lower case.</summary>
+    [ObservableProperty]
+    public partial bool SearchMatchCase { get; set; }
+
+    /// <summary>Whether search requires the query to stand alone as a word.</summary>
+    [ObservableProperty]
+    public partial bool SearchWholeWord { get; set; }
+
     /// <summary>Selection rects for the current page, normalized. The per-slot copies are what the cards draw.</summary>
     public ObservableCollection<TextRect> SelectionRects { get; } = new();
-
-    /// <summary>Highlight rects for every match of <see cref="SearchQuery"/> on the current page.</summary>
-    public ObservableCollection<TextRect> SearchMatchRects { get; } = new();
 
     [ObservableProperty]
     public partial ToolMode ActiveTool { get; set; } = ToolMode.Select;
@@ -645,8 +650,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Shapes.Clear();
 
         // Layers are keyed by page index, so carrying them across a document
-        // switch would hand the new document the old one's text.
+        // switch would hand the new document the old one's text. Any search in
+        // flight is reading those same page indices, so it goes too.
         _textLayers.Clear();
+        RestartSearch();
         ClearLoadedAnnotations();
 
         // A fresh document has no history and no unsaved edits. A reload after
@@ -806,17 +813,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>Navigates to a page (e.g. a thumbnail click).</summary>
     /// <summary>
-    /// Asks the view to bring a page into view. Carries the page index and
-    /// whether the move should be animated.
+    /// Asks the view to bring a page into view. Carries the page index,
+    /// whether the move should be animated, and optionally a band WITHIN the
+    /// page that has to end up on screen.
     ///
     /// The view model cannot scroll: the ScrollView owns the scroll position
     /// and runs the animation on the compositor. So navigation is a REQUEST
     /// the view fulfils, which also keeps the slot-space to scroll-offset
     /// conversion in the one place that already does it.
+    ///
+    /// The band is null for every kind of navigation but search. A bookmark or
+    /// a page jump means the page, and puts its top on screen; a search match
+    /// means a line somewhere inside it.
     /// </summary>
-    public event Action<int, bool>? ScrollToPageRequested;
+    public event Action<int, bool, PageBand?>? ScrollToPageRequested;
 
-    public void GoToPage(int pageIndex, bool animate = true)
+    public void GoToPage(int pageIndex, bool animate = true, PageBand? reveal = null)
     {
         if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount)
         {
@@ -829,7 +841,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // it; bailing out early is why clicking a thumbnail could do nothing.
         CurrentPageIndex = pageIndex;
         RenderCurrentPage();
-        ScrollToPageRequested?.Invoke(pageIndex, animate);
+        ScrollToPageRequested?.Invoke(pageIndex, animate, reveal);
     }
 
     // ---------------- Page operations ----------------
@@ -876,8 +888,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         PageCount--;
 
         // Every page after the deleted one shifted down, so layers cached by
-        // index now describe the wrong pages.
+        // index now describe the wrong pages, and so do a running search's
+        // results.
         _textLayers.Clear();
+        RestartSearch();
         ClearSelection();
 
         // Later pages all shifted down one, so cached thumbnails (rendered at
@@ -1210,6 +1224,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void ReloadAfterPageStructureChange()
     {
         _textLayers.Clear();
+        RestartSearch();
         ClearLoadedAnnotations();
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
         OnPropertyChanged(nameof(HasSelectedAnnotation));
@@ -2652,7 +2667,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.Shapes.Clear();
             slot.Notes.Clear();
             slot.SelectionRects.Clear();
-            slot.SearchMatchRects.Clear();
+
+            // NOT SearchMatchRects. Search owns its own highlight now and
+            // refreshes it only when the selected match moves. This ran on
+            // every page change while scrolling, and used to be harmless
+            // because the search was recomputed in the same breath; without
+            // that, clearing here wipes the highlight and nothing puts it back.
         }
 
         foreach (var h in _allHighlights)
@@ -6892,13 +6912,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     ///
     /// This deliberately does NOT clear the selection. A selection can span
     /// pages, and extending one to a page below necessarily scrolls, so
-    /// discarding it here would make a cross-page drag impossible. Search
-    /// results are re-centred on the new page instead.
+    /// discarding it here would make a cross-page drag impossible.
+    ///
+    /// Search used to be recomputed here as well, because its results only
+    /// covered the forty pages nearest the viewport and had to be re-centred
+    /// every time the viewport moved. That made scrolling with a query in the
+    /// box re-extract and re-scan up to forty text layers, on the UI thread,
+    /// at every page boundary crossed. The index now covers the whole document
+    /// and there is nothing to re-centre.
     /// </summary>
     private void OnCurrentPageChangedByScroll()
     {
         RefreshAnnotationsForCurrentPage();
-        RecomputeSearchMatches();
     }
 
     // ---------------- Thumbnails ----------------
@@ -9020,135 +9045,342 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     // ---------------- Search ----------------
+    //
+    // Search used to cover the forty pages nearest the viewport, on the UI
+    // thread, and report the answer as "3 of 12 pages" as though it had covered
+    // the document. On a 3352-page book that is about one per cent of it,
+    // presented in a form that reads like a complete result. It now reads every
+    // page, off the UI thread, and counts matches rather than pages.
 
-    partial void OnSearchQueryChanged(string value) => RecomputeSearchMatches();
+    /// <summary>Pages read between one batch of results and the next. Small
+    /// enough that the count starts climbing almost at once, large enough that a
+    /// long book does not marshal thousands of times to the UI thread.</summary>
+    private const int SearchBatchPages = 32;
 
-    /// <summary>
-    /// Highlights every match across the pages currently laid out, not just
-    /// the current one.
-    ///
-    /// With a continuous view several pages are on screen at once, so a
-    /// per-page search would leave visible matches unmarked. Search is capped
-    /// at <see cref="SearchPageBudget"/> pages so a query on a 300-page
-    /// document does not extract every text layer on the UI thread; pages
-    /// nearest the viewport are searched first, since those are the ones whose
-    /// highlights the user can actually see.
-    /// </summary>
-    private const int SearchPageBudget = 40;
-
-    /// <summary>Pages holding at least one match, ascending, for step navigation.</summary>
-    private readonly List<int> _matchPages = new();
-
-    private int _currentMatch = -1;
-
-    /// <summary>"3 of 12 pages", or empty when there is no active search.</summary>
-    public string SearchStatus =>
-        string.IsNullOrEmpty(SearchQuery) ? string.Empty
-        : _matchPages.Count == 0 ? "No matches"
-        : $"{Math.Max(0, _currentMatch) + 1} of {_matchPages.Count}";
-
-    public bool HasSearchMatches => _matchPages.Count > 0;
+    /// <summary>Quiet time after a keystroke before the sweep starts, so typing
+    /// "cat" starts one search and not three.</summary>
+    private const int SearchDebounceMs = 250;
 
     /// <summary>
-    /// Moves to the next or previous page containing a match and asks the view
-    /// to scroll there, wrapping at the ends.
+    /// The results of the current search, or null when there is no search.
     ///
-    /// Search previously highlighted matches but could not navigate to them,
-    /// so a hit on a page you were not already looking at was invisible.
+    /// Holds match POSITIONS (page, offset, length), never rectangles. A book
+    /// can produce thousands of matches and this is rebuilt whenever the query
+    /// changes; rectangles are derived from one page's text layer at a time,
+    /// only for what is actually drawn.
     /// </summary>
-    public void StepSearchMatch(int direction)
+    private SearchIndex? _searchIndex;
+
+    private CancellationTokenSource? _searchCts;
+    private DispatcherQueueTimer? _searchDebounce;
+
+    /// <summary>
+    /// Which search a background batch belongs to.
+    ///
+    /// The token stops the sweep, but a batch already in flight to the UI thread
+    /// cannot be recalled, and it carries page indices that a page delete or a
+    /// document switch may already have invalidated. Comparing generations on
+    /// arrival is what makes a late batch harmless rather than a set of results
+    /// pointing into a document that no longer exists.
+    /// </summary>
+    private int _searchGeneration;
+
+    /// <summary>"12 of 431", "No matches", or empty.</summary>
+    public string SearchStatus => _searchIndex?.Status ?? string.Empty;
+
+    public bool HasSearchMatches => _searchIndex is { Total: > 0 };
+
+    /// <summary>True while the sweep is still reading pages, so the view can
+    /// show that the total is still climbing without putting a marker in the
+    /// count itself.</summary>
+    public bool IsSearching => _searchIndex is { Complete: false };
+
+    private void NotifySearchChanged()
     {
-        if (_matchPages.Count == 0)
-        {
-            return;
-        }
-
-        _currentMatch = _currentMatch < 0
-            ? (direction >= 0 ? 0 : _matchPages.Count - 1)
-            : (_currentMatch + direction + _matchPages.Count) % _matchPages.Count;
-
         OnPropertyChanged(nameof(SearchStatus));
-        GoToPage(_matchPages[_currentMatch]);
+        OnPropertyChanged(nameof(HasSearchMatches));
+        OnPropertyChanged(nameof(IsSearching));
     }
 
-    private void RecomputeSearchMatches()
+    /// <summary>
+    /// The page whose slot currently holds search rectangles, or -1.
+    ///
+    /// Remembered so that moving the selection clears exactly one slot instead
+    /// of walking all of them. On a 3352-page book that is the difference
+    /// between touching one collection per keystroke and touching 3352.
+    /// </summary>
+    private int _highlightedSearchPage = -1;
+
+    /// <summary>
+    /// Draws the matches on the page holding the selected match, and clears
+    /// every other page.
+    ///
+    /// ONE page's worth of rectangles exists at a time. A search over a book can
+    /// find thousands of matches and each rectangle is a laid-out element; the
+    /// reader can only look at one page, so that is the only page drawn. The
+    /// index keeps positions, not rectangles, precisely so that this can be
+    /// derived on demand and thrown away again.
+    /// </summary>
+    private void RefreshSearchHighlights()
     {
-        SearchMatchRects.Clear();
-        foreach (var slot in PageSlots)
+        int page = _searchIndex?.Current?.PageIndex ?? -1;
+
+        if (_highlightedSearchPage >= 0 && _highlightedSearchPage != page)
         {
-            slot.SearchMatchRects.Clear();
+            SlotFor(_highlightedSearchPage)?.SearchMatchRects.Clear();
+            _highlightedSearchPage = -1;
         }
 
-        _matchPages.Clear();
-        _currentMatch = -1;
-
-        if (string.IsNullOrEmpty(SearchQuery) || PageSlots.Count == 0)
+        if (page < 0 || _searchIndex is not { } index || SlotFor(page) is not { } slot)
         {
-            OnPropertyChanged(nameof(SearchStatus));
-            OnPropertyChanged(nameof(HasSearchMatches));
             return;
         }
 
-        // Nearest-first ordering: walk outwards from the current page.
-        var order = new List<int> { CurrentPageIndex };
-        for (int d = 1; order.Count < Math.Min(SearchPageBudget, PageSlots.Count); d++)
+        // Rebuilt rather than patched even when the page has not changed: the
+        // selection moving within a page changes which rectangle is the strong
+        // colour, and a page's matches are a handful of rects.
+        slot.SearchMatchRects.Clear();
+        _highlightedSearchPage = page;
+
+        foreach (var (rect, hex) in
+                 SearchHighlight.RectsFor(TextLayerFor(page), index.OnPage(page), index.Current))
         {
-            if (CurrentPageIndex - d >= 0)
+            var scaled = ScaledRect.From(NormRect(rect), SlotLayoutWidth, hex);
+            if (scaled.IsVisible)
             {
-                order.Add(CurrentPageIndex - d);
-            }
-            if (CurrentPageIndex + d < PageSlots.Count)
-            {
-                order.Add(CurrentPageIndex + d);
-            }
-            if (CurrentPageIndex - d < 0 && CurrentPageIndex + d >= PageSlots.Count)
-            {
-                break;
+                slot.SearchMatchRects.Add(scaled);
             }
         }
+    }
 
-        foreach (int page in order)
+    partial void OnSearchQueryChanged(string value) => RestartSearch();
+
+    partial void OnSearchMatchCaseChanged(bool value) => RestartSearch();
+
+    partial void OnSearchWholeWordChanged(bool value) => RestartSearch();
+
+    /// <summary>
+    /// Abandons the running search and schedules a fresh one.
+    ///
+    /// Scheduled rather than started, for two reasons. It debounces typing, and
+    /// it means the document lifecycle can call this from the middle of opening
+    /// a file: by the time the timer ticks, PageCount and CurrentPageIndex
+    /// describe the document that is actually open.
+    /// </summary>
+    private void RestartSearch()
+    {
+        CancelSearch();
+
+        _searchDebounce ??= CreateSearchDebounceTimer();
+        _searchDebounce.Stop();
+
+        if (string.IsNullOrEmpty(SearchQuery))
         {
-            var layer = TextLayerFor(page);
-            if (layer is null)
-            {
-                continue;
-            }
+            return;
+        }
 
-            var slot = SlotFor(page);
-            bool pageHasMatch = false;
+        _searchDebounce.Start();
+    }
 
-            foreach (var (start, length) in layer.FindMatches(SearchQuery))
+    private DispatcherQueueTimer CreateSearchDebounceTimer()
+    {
+        var timer = _dispatcherQueue.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(SearchDebounceMs);
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) => StartSearchSweep();
+        return timer;
+    }
+
+    /// <summary>
+    /// Stops the running search and drops its results.
+    ///
+    /// The generation bump matters as much as the token: it is what a batch
+    /// already on its way to the UI thread is checked against.
+    /// </summary>
+    private void CancelSearch()
+    {
+        _searchDebounce?.Stop();
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        _searchCts = null;
+        _searchGeneration++;
+
+        if (_searchIndex is not null)
+        {
+            _searchIndex = null;
+            RefreshSearchHighlights();
+            NotifySearchChanged();
+        }
+    }
+
+    /// <summary>
+    /// Reads every page of the document for the query, off the UI thread,
+    /// publishing what it finds as it goes.
+    ///
+    /// Reading a page's text LOADS and parses that page, so a long book takes
+    /// real time however this is written; the answer is to stream rather than to
+    /// wait. Pages are read from the one being viewed, forward, then round to
+    /// the start, so the first results to appear are the ones nearest the reader
+    /// and in the direction Next travels.
+    ///
+    /// Everything the background task touches is captured by value here. It
+    /// never reads a property and never touches <see cref="_textLayers"/>, which
+    /// is a plain Dictionary belonging to the UI thread.
+    /// </summary>
+    private void StartSearchSweep()
+    {
+        CancelSearch();
+
+        string query = SearchQuery;
+        ulong handle = _documentHandle;
+        int pages = PageCount;
+        int startPage = CurrentPageIndex;
+        int width = (int)SlotLayoutWidth;
+        var options = new SearchOptions(SearchMatchCase, SearchWholeWord);
+
+        if (handle == 0 || pages <= 0 || string.IsNullOrEmpty(query))
+        {
+            return;
+        }
+
+        int generation = ++_searchGeneration;
+        _searchIndex = new SearchIndex(startPage);
+        NotifySearchChanged();
+
+        var cts = new CancellationTokenSource();
+        _searchCts = cts;
+        var token = cts.Token;
+
+        var sw = Stopwatch.StartNew();
+
+        _ = Task.Run(() =>
+        {
+            var batch = new List<SearchMatch>();
+            int readSincePublish = 0;
+
+            foreach (int page in SearchSweepOrder.PagesFrom(startPage, pages))
             {
-                pageHasMatch = true;
-                foreach (var rect in layer.GetRangeRects(start, length))
+                if (token.IsCancellationRequested)
                 {
-                    var normalized = NormRect(rect);
-                    var mr = ScaledRect.From(normalized, SlotLayoutWidth);
-                    if (mr.IsVisible)
+                    return;
+                }
+
+                // Not TextLayerFor: that caches into a Dictionary owned by the
+                // UI thread. A sweep's layers are read once and dropped.
+                var layer = TextLayerLoader.Load(handle, page, width);
+                if (layer is not null)
+                {
+                    foreach (var (start, length) in layer.FindMatches(query, options))
                     {
-                        slot?.SearchMatchRects.Add(mr);
+                        batch.Add(new SearchMatch(page, start, length));
                     }
-                    if (page == CurrentPageIndex)
-                    {
-                        SearchMatchRects.Add(normalized);
-                    }
+                }
+
+                if (++readSincePublish >= SearchBatchPages)
+                {
+                    PublishSearchBatch(batch, generation, complete: false);
+                    batch = new List<SearchMatch>();
+                    readSincePublish = 0;
                 }
             }
 
-            if (pageHasMatch)
-            {
-                _matchPages.Add(page);
-            }
+            Diag.Log($"search '{query}' swept {pages} pages in {sw.ElapsedMilliseconds}ms");
+            PublishSearchBatch(batch, generation, complete: true);
+        }, token);
+    }
+
+    /// <summary>
+    /// Hands a batch of matches back to the UI thread, dropping it if the search
+    /// it belongs to has been superseded.
+    /// </summary>
+    private void PublishSearchBatch(List<SearchMatch> batch, int generation, bool complete)
+    {
+        if (batch.Count == 0 && !complete)
+        {
+            return;
         }
 
-        // Pages were visited nearest-first for responsiveness, but stepping
-        // through matches has to run in document order or Next would jump
-        // backwards and forwards unpredictably.
-        _matchPages.Sort();
+        _dispatcherQueue.TryEnqueue(() =>
+        {
+            if (generation != _searchGeneration || _searchIndex is not { } index)
+            {
+                return;
+            }
 
-        OnPropertyChanged(nameof(SearchStatus));
-        OnPropertyChanged(nameof(HasSearchMatches));
+            // Whether this batch is the one that gives the search its first
+            // result. The reader is taken there, which is what makes the first
+            // Enter go to the SECOND match rather than skipping the first.
+            bool hadSelection = index.Current is not null;
+
+            if (batch.Count > 0)
+            {
+                index.Add(batch);
+            }
+            if (complete)
+            {
+                index.MarkComplete();
+            }
+
+            if (!hadSelection && index.Current is { } first)
+            {
+                // The batch that gives the search its first result is also the
+                // only batch that can change what is drawn: a page is read
+                // entirely within one batch, so no later one can add matches to
+                // the page already being shown.
+                RefreshSearchHighlights();
+                GoToPage(first.PageIndex, animate: true, BandFor(first));
+            }
+
+            NotifySearchChanged();
+        });
+    }
+
+    /// <summary>
+    /// Moves to the next or previous MATCH, wrapping at the ends.
+    ///
+    /// Match by match, not page by page. Stepping by page meant a page holding
+    /// six hits counted once and five of them could not be reached at all.
+    /// </summary>
+    public void StepSearchMatch(int direction)
+    {
+        if (_searchIndex is not { Total: > 0 } index)
+        {
+            return;
+        }
+
+        var match = direction >= 0 ? index.Next() : index.Previous();
+        RefreshSearchHighlights();
+        NotifySearchChanged();
+
+        if (match is { } m)
+        {
+            GoToPage(m.PageIndex, animate: true, BandFor(m));
+        }
+    }
+
+    /// <summary>
+    /// The vertical band a match occupies on its page, in slot-space DIPs, or
+    /// null when the page has no text to measure against.
+    ///
+    /// The layer is extracted at the slot width, so its rectangles are already
+    /// in slot space and need no conversion. A match wrapping across a line
+    /// break produces several rectangles; the band spans all of them, so the
+    /// whole hit is what gets shown rather than its first line.
+    /// </summary>
+    private PageBand? BandFor(SearchMatch match)
+    {
+        if (TextLayerFor(match.PageIndex) is not { } layer)
+        {
+            return null;
+        }
+
+        var rects = layer.GetRangeRects(match.Start, match.Length);
+        if (rects.Count == 0)
+        {
+            return null;
+        }
+
+        return new PageBand(rects.Min(r => r.Top), rects.Max(r => r.Bottom));
     }
 
     /// <summary>
@@ -9184,15 +9416,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return layer;
     }
 
-    /// <summary>Loads the current page's layer and refreshes its search hits.</summary>
-    private void EnsureTextLayer()
-    {
-        if (TextLayerFor(CurrentPageIndex) is not null)
-        {
-            RecomputeSearchMatches();
-        }
-    }
-
     // ---------------- Rendering ----------------
 
     /// <summary>
@@ -9208,7 +9431,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void RenderCurrentPage()
     {
         ClearSelection();
-        SearchMatchRects.Clear();
         RefreshAnnotationsForCurrentPage();
     }
 
@@ -9220,7 +9442,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private void CloseCurrentDocument()
     {
-        // The sharpen pass is the only timer this pipeline still owns.
+        // A sweep in flight is reading pages out of the document about to be
+        // closed. The handle it holds stops resolving the moment this returns,
+        // which render_core answers safely, but there is no reason to let it
+        // keep asking.
+        CancelSearch();
+
         _sharpenTimer?.Stop();
 
         if (_documentHandle != 0)

@@ -338,7 +338,12 @@
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate x:DataType="viewport:ScaledRect">
-                                                    <Rectangle Fill="#66FFA500" Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                    <!-- Fill comes from the rect, not from here: the SELECTED
+                                                         match is drawn in a stronger colour than the others on
+                                                         the page, which is what says which of the 431 you are
+                                                         on. SearchHighlight decides both colours. -->
+                                                    <Rectangle Fill="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
                                                 </DataTemplate>
@@ -2195,10 +2200,47 @@
                         <Thickness x:Key="TextControlThemePadding">0</Thickness>
                     </TextBox.Resources>
                 </TextBox>
+                <!--
+                    Find options. A flyout rather than two more buttons in the
+                    strip: they are set rarely and read never, so they do not
+                    earn permanent width beside a control people use constantly.
+                -->
+                <Button x:Name="SearchOptionsButton" Content="&#xE712;"
+                        FontFamily="Segoe MDL2 Assets" FontSize="10"
+                        Width="24" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Find options">
+                    <Button.Flyout>
+                        <MenuFlyout>
+                            <ToggleMenuFlyoutItem x:Name="MatchCaseToggle" Text="Match case"
+                                                  IsChecked="{x:Bind ViewModel.SearchMatchCase, Mode=TwoWay}"
+                                                  Click="SearchOption_Click" />
+                            <ToggleMenuFlyoutItem x:Name="WholeWordToggle" Text="Whole word"
+                                                  IsChecked="{x:Bind ViewModel.SearchWholeWord, Mode=TwoWay}"
+                                                  Click="SearchOption_Click" />
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
+                <!--
+                    Wide enough for "12345 of 67890" so the buttons beside it do
+                    not shuffle sideways as the total climbs during a sweep. The
+                    count is the one part of this strip that changes on its own.
+                -->
                 <TextBlock Text="{x:Bind ViewModel.SearchStatus, Mode=OneWay}" VerticalAlignment="Center"
-                           MinWidth="52" TextAlignment="Center"
+                           MinWidth="84" TextAlignment="Center"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
+                <!--
+                    Says the total is still climbing, so the count itself can
+                    stay a plain "12 of 431" rather than "12 of 431+".
+
+                    Always present and always the same size, with only IsActive
+                    bound: collapsing it would move every control to its right
+                    the moment a search started and again when it finished.
+                -->
+                <ProgressRing IsActive="{x:Bind ViewModel.IsSearching, Mode=OneWay}"
+                              Width="12" Height="12" Margin="0,0,2,0"
+                              VerticalAlignment="Center"
+                              ToolTipService.ToolTip="Searching the rest of the document" />
                 <Button Content="&#xE70E;" FontFamily="Segoe MDL2 Assets" FontSize="10" Click="SearchPrev_Click"
                         Width="24" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         IsEnabled="{x:Bind ViewModel.HasSearchMatches, Mode=OneWay}"

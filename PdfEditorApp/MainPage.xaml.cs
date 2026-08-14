@@ -522,8 +522,8 @@ public sealed partial class MainPage : Page
     private double AvailableContentWidth =>
         PageScroller.ViewportWidth - ViewportHost.Padding.Left - ViewportHost.Padding.Right;
 
-    private void OnScrollToPageRequested(int pageIndex, bool animate) =>
-        DispatcherQueue.TryEnqueue(() => ScrollToPage(pageIndex, animate));
+    private void OnScrollToPageRequested(int pageIndex, bool animate, PageBand? reveal) =>
+        DispatcherQueue.TryEnqueue(() => ScrollToPage(pageIndex, animate, reveal));
 
     /// <summary>
     /// Brings a page to the top of the viewport, animated over short distances.
@@ -538,8 +538,15 @@ public sealed partial class MainPage : Page
     /// alone. An animated scroll's duration grows with how far it travels and
     /// every frame is rendered, so a bookmark 1500 pages away took nearly half
     /// a minute to arrive at. See <see cref="ScrollAnimation"/>.
+    ///
+    /// <paramref name="reveal"/> names a band inside the page that has to end
+    /// up on screen, which is how a search match is navigated to: the page top
+    /// is the right answer for a bookmark and the wrong one for a hit two
+    /// thirds of the way down. When the band is already comfortably in view the
+    /// scroll is skipped entirely, so stepping between two matches on the same
+    /// screen does not jolt the page.
     /// </summary>
-    private void ScrollToPage(int pageIndex, bool animate)
+    private void ScrollToPage(int pageIndex, bool animate, PageBand? reveal = null)
     {
         double slotTop = ViewModel.SlotTopOf(pageIndex);
         double zoom = PageScroller.ZoomFactor;
@@ -547,6 +554,25 @@ public sealed partial class MainPage : Page
         const double LeadIn = 12;
         double target = (slotTop + ViewportHost.Padding.Top) * zoom - LeadIn;
         target = Math.Max(0, target);
+
+        if (reveal is { } band)
+        {
+            // Into slot space, where the band is measured, and back out again.
+            // Content Y is (slotY + padding) * zoom, so slotY is its inverse.
+            double viewTopSlot = (PageScroller.VerticalOffset / zoom) - ViewportHost.Padding.Top;
+            double viewportSlotHeight = PageScroller.ViewportHeight / zoom;
+
+            double? revealed = MatchReveal.OffsetFor(
+                slotTop + band.Top, slotTop + band.Bottom, viewTopSlot, viewportSlotHeight);
+
+            if (revealed is null)
+            {
+                Diag.Log($"scrollToPage {pageIndex}: match already in view, not scrolling");
+                return;
+            }
+
+            target = Math.Max(0, (revealed.Value + ViewportHost.Padding.Top) * zoom);
+        }
 
         double from = PageScroller.VerticalOffset;
         bool glide = ScrollAnimation.ShouldAnimate(from, target, PageScroller.ViewportHeight, animate);
@@ -3112,6 +3138,14 @@ public sealed partial class MainPage : Page
             RulersToggle_Click(RulersToggle, null!);
         }
 
+        // How the user searches, restored onto the view model. The toggles read
+        // these back through their two-way bindings, so the menu shows the
+        // stored state without being set separately. Assigning the same value
+        // raises nothing, so this cannot restart a search that is already
+        // running when some other setting changes.
+        ViewModel.SearchMatchCase = s.SearchMatchCase;
+        ViewModel.SearchWholeWord = s.SearchWholeWord;
+
         RulerUnit_Click(new MenuFlyoutItem { Tag = s.RulerUnit }, null!);
 
         // The ticks are drawn shapes, not themed controls, so they keep the
@@ -3949,6 +3983,21 @@ public sealed partial class MainPage : Page
     private void SearchNext_Click(object sender, RoutedEventArgs e) => ViewModel.StepSearchMatch(1);
 
     private void SearchPrev_Click(object sender, RoutedEventArgs e) => ViewModel.StepSearchMatch(-1);
+
+    /// <summary>
+    /// Stores how the user searches. The toggles are bound two-way, so the view
+    /// model already has the new value and has restarted the search; this only
+    /// has to make it outlast the session.
+    ///
+    /// Read off the toggles rather than off the view model, so it cannot depend
+    /// on whether the binding has pushed the change through yet.
+    /// </summary>
+    private void SearchOption_Click(object sender, RoutedEventArgs e) =>
+        SettingsStore.Update(s => s with
+        {
+            SearchMatchCase = MatchCaseToggle.IsChecked,
+            SearchWholeWord = WholeWordToggle.IsChecked,
+        });
 
     /// <summary>
     /// Enter steps to the next match, Shift+Enter to the previous, which is

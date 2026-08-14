@@ -33,7 +33,15 @@ public sealed class PageTextLayer
     }
 
     /// <summary>Every case-insensitive occurrence of <paramref name="query"/>, allowing overlaps. Empty for a null/empty query or no matches.</summary>
-    public IReadOnlyList<(int Start, int Length)> FindMatches(string query)
+    public IReadOnlyList<(int Start, int Length)> FindMatches(string query) =>
+        FindMatches(query, new SearchOptions());
+
+    /// <summary>
+    /// Every occurrence of <paramref name="query"/> under
+    /// <paramref name="options"/>, allowing overlaps. Empty for a null/empty
+    /// query or no matches.
+    /// </summary>
+    public IReadOnlyList<(int Start, int Length)> FindMatches(string query, SearchOptions options)
     {
         var matches = new List<(int, int)>();
         if (string.IsNullOrEmpty(query) || _chars.Length == 0)
@@ -44,17 +52,48 @@ public sealed class PageTextLayer
         int searchFrom = 0;
         while (searchFrom <= Text.Length - query.Length)
         {
-            int index = Text.IndexOf(query, searchFrom, StringComparison.OrdinalIgnoreCase);
+            int index = Text.IndexOf(query, searchFrom, options.Comparison);
             if (index < 0)
             {
                 break;
             }
 
-            matches.Add((index, query.Length));
+            if (!options.WholeWord || IsWholeWordAt(index, query.Length))
+            {
+                matches.Add((index, query.Length));
+            }
+
+            // Advances past the START of the hit, not past its end, which is
+            // what allows overlaps. It is also why a rejected whole-word
+            // candidate cannot end the scan: "cat" inside "concatenate" has to
+            // be stepped over so the real one later on the page is still found.
             searchFrom = index + 1;
         }
 
         return matches;
+    }
+
+    /// <summary>
+    /// Whether the range at <paramref name="start"/> stands alone as a word.
+    ///
+    /// A boundary is anything that is not a letter or a digit, and the ends of
+    /// the page count as boundaries too, or the first and last words on every
+    /// page would be unfindable.
+    ///
+    /// Note that an underscore reads as a boundary, since it is neither a
+    /// letter nor a digit. In prose, which is what this searches, the case
+    /// barely arises; a hand-rolled word-character class would be a larger
+    /// thing to be wrong about than this is.
+    /// </summary>
+    private bool IsWholeWordAt(int start, int length)
+    {
+        if (start > 0 && char.IsLetterOrDigit(Text[start - 1]))
+        {
+            return false;
+        }
+
+        int after = start + length;
+        return after >= Text.Length || !char.IsLetterOrDigit(Text[after]);
     }
 
     /// <summary>Index of the character containing (x, y), or the nearest one if none does exactly. -1 if there are no characters.</summary>
