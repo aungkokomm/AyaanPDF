@@ -4862,11 +4862,32 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // already re-resolves each target by Id at the top of the next
                 // iteration, which is what that invalidate is for.
                 if (extStatus != RenderStatus.OkPdfium
-                    && InkTag.TryParse(extContents, out string exInkColor, out double exInkWidth, out var exInkControl))
+                    && InkTag.TryParse(extContents, out string exInkColor, out double exInkWidth,
+                                       out var exInkControl, out double exInkAngle))
                 {
+                    // The ANGLE goes through too. Without it a turned stroke was
+                    // rewritten upright the moment its group was moved: the
+                    // anchor's branch carried the rotation and this one silently
+                    // defaulted it to zero. CommitLoadedMove dispatches TWICE,
+                    // once here and once for the anchor, with separate branch
+                    // lists, and teaching only one of them is the standing trap
+                    // of this method.
+                    //
+                    // The extras only ever MOVE (the loop is gated on !resizing),
+                    // so the stroke keeps its own size: its upright box is
+                    // re-centred on where the drag put it rather than being
+                    // stretched onto the enlarged rectangle a turned stroke
+                    // reports.
+                    var exBox = UprightBoxOf(exInkControl);
+                    double exHalfW = (exBox.Right - exBox.Left) / 2;
+                    double exHalfH = (exBox.Bottom - exBox.Top) / 2;
+                    double exCx = (target.Left + target.Right) / 2;
+                    double exCy = (target.Top + target.Bottom) / 2;
+
                     extStatus = RebuildInkAt(
                         target.PageIndex, target.Index, CaptureWidth, exInkColor, exInkWidth, exInkControl,
-                        target.Left, target.Top, target.Right, target.Bottom, target.Id, out extNewIndex);
+                        exCx - exHalfW, exCy - exHalfH, exCx + exHalfW, exCy + exHalfH,
+                        target.Id, out extNewIndex, exInkAngle);
                 }
 
                 if (extStatus != RenderStatus.OkPdfium)
@@ -5201,6 +5222,38 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 _documentHandle, oldSel.PageIndex, oldSel.Index, captureWidth,
                 l, t, r, b, out newIndex);
         }
+
+        // A stroke, re-drawn from its own control points.
+        //
+        // Without this branch ink fell through to resize_annotation, which
+        // answers Unsupported for it, so this returned -1 and the caller did
+        // nothing at all. That is what made UNDO of a drawing's move or resize
+        // silently do nothing: the history record was written and replayed
+        // correctly and the write at the end of it was refused. The rotation
+        // path never showed it because it takes a document snapshot instead.
+        //
+        // A turned stroke keeps its own SIZE here: the rectangle it is being
+        // put back to is the box containing the turned ink, so its upright box
+        // is re-centred on that rather than stretched onto it.
+        if (status != RenderStatus.OkPdfium
+            && InkTag.TryParse(contents, out string inkColor, out double inkWidth,
+                               out var inkControl, out double inkAngle))
+        {
+            var box = UprightBoxOf(inkControl);
+            double halfW = (box.Right - box.Left) / 2;
+            double halfH = (box.Bottom - box.Top) / 2;
+            double cx = (target.Left + target.Right) / 2;
+            double cy = (target.Top + target.Bottom) / 2;
+
+            var into = inkAngle != 0
+                ? new TextRect(cx - halfW, cy - halfH, cx + halfW, cy + halfH)
+                : new TextRect(target.Left, target.Top, target.Right, target.Bottom);
+
+            status = RebuildInkAt(
+                oldSel.PageIndex, oldSel.Index, captureWidth, inkColor, inkWidth, inkControl,
+                into.Left, into.Top, into.Right, into.Bottom, oldSel.Id, out newIndex, inkAngle);
+        }
+
         if (status != RenderStatus.OkPdfium)
         {
             status = RenderCoreNative.resize_annotation(
@@ -5293,6 +5346,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 if (RenderCoreNative.add_shape_annotations(
                         _documentHandle, CaptureWidth, new[] { spec }, 1)
                     == RenderStatus.OkPdfium) { emitted++; }
+            }
+            else if (InkTag.TryParse(e.Contents, out string inkColor, out double inkWidth,
+                                     out var inkControl, out double inkAngle))
+            {
+                // A drawing pastes like anything else now: its control points
+                // are its description, so it can be re-drawn at the offset the
+                // paste chose. Copy already put the tag on the clipboard, and
+                // this branch was simply missing, so a copied drawing was
+                // silently dropped and the paste reported nothing to show for it.
+                var placed = InkTag.ScaleTo(
+                    inkControl, pasted.Left, pasted.Top, pasted.Right, pasted.Bottom);
+
+                if (AddInkFromControl(page, CaptureWidth, inkColor, inkWidth, placed,
+                                      out int inkIndex, inkAngle))
+                {
+                    WriteInkTag(page, inkIndex, inkColor, inkWidth, placed, inkAngle);
+                    emitted++;
+                }
             }
             else if (TextBoxTagReader.TryParse(e.Contents, out var tag))
             {
@@ -5752,6 +5823,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             status = RenderCoreNative.resize_text_box_annotation(
                 _documentHandle, livePage, liveIndex, CaptureWidth, tl, tt, tr, tb, out newIndex);
         }
+        else if (InkTag.TryParse(contents, out string inkColor, out double inkWidth,
+                                 out var inkControl, out double inkAngle))
+        {
+            // A stroke raises by being re-drawn from its own control points,
+            // which appends it and so puts it on top. Ink used to fall into the
+            // stamp branch below, which is the wrong call for an /Ink
+            // annotation, so a drawing could not be reordered at all.
+            //
+            // Geometry-neutral for the same reason the shape branch avoids
+            // passing /Rect back: the stroke is rebuilt into its OWN upright
+            // box, taken from the points themselves, which makes ScaleTo an
+            // identity and repeated raises a fixed point. Feeding the
+            // annotation's rectangle in would re-fit the stroke to the padded
+            // box and grow it a little on every raise.
+            var box = UprightBoxOf(inkControl);
+            status = RebuildInkAt(
+                livePage, liveIndex, CaptureWidth, inkColor, inkWidth, inkControl,
+                box.Left, box.Top, box.Right, box.Bottom, id, out newIndex, inkAngle);
+        }
         else
         {
             float l = (float)(item.Left * CaptureWidth);
@@ -5821,6 +5911,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 _documentHandle, CaptureWidth, new[] { spec }, 1);
             if (status != RenderStatus.OkPdfium) { return false; }
             newIndex = LoadedFor(sel.PageIndex).Count; // will resolve after invalidate
+        }
+        else if (_selectedIsInk
+                 && InkTag.TryParse(contents, out string inkColor, out double inkWidth,
+                                    out var inkControl, out double inkAngle))
+        {
+            // A second stroke at the SAME place, angle included; the drag that
+            // follows slides the clone off the original. Ink used to reach the
+            // end of this method and return false, so Ctrl+drag on a drawing
+            // quietly moved the original instead of copying it, which is the
+            // one outcome a copy gesture must never produce.
+            if (!AddInkFromControl(sel.PageIndex, CaptureWidth, inkColor, inkWidth, inkControl,
+                                   out int inkIndex, inkAngle))
+            {
+                return false;
+            }
+            WriteInkTag(sel.PageIndex, inkIndex, inkColor, inkWidth, inkControl, inkAngle);
+            status = RenderStatus.OkPdfium;
+            newIndex = inkIndex;
         }
         else if (_selectedIsTextBox
                  && TextBoxTagReader.TryParse(contents, out var tag))

@@ -198,14 +198,23 @@ public class InkResizeInteropTests
         return deg;
     }
 
-    /// <summary>The app's rebuild: scale, delete, re-add, re-tag.</summary>
+    /// <summary>
+    /// The app's rebuild: scale the UPRIGHT points onto the target box, delete,
+    /// re-add the turned curve, re-tag with the upright points and the angle.
+    ///
+    /// The angle is carried deliberately. An earlier version of this helper
+    /// dropped it and a test caught it, which is the same mistake the extras
+    /// loop made in the app: every rebuild path has to carry the rotation or the
+    /// stroke springs upright.
+    /// </summary>
     private static int Resize(ulong handle, int index, double l, double t, double r, double b)
     {
-        Assert.True(InkTag.TryParse(Tag(handle, 0, index), out _, out _, out var control));
+        Assert.True(InkTag.TryParse(Tag(handle, 0, index), out _, out _, out var control, out double deg));
         var scaled = InkTag.ScaleTo(control, l, t, r, b);
 
         Assert.Equal(OkPdfium, delete_annotation(handle, 0, index));
-        var curve = StrokeSmoothing.Fit(scaled);
+        var curve = StrokeSmoothing.Fit(
+            deg == 0 ? scaled : Geometry2D.RotateAboutCentre(scaled, deg));
         var pts = curve.Select(p => new BurnPoint { X = (float)(p.X * Cap), Y = (float)(p.Y * Cap) }).ToArray();
         var stroke = new BurnStroke
         {
@@ -215,7 +224,7 @@ public class InkResizeInteropTests
         Assert.Equal(OkPdfium, add_ink_annotations(handle, Cap, [stroke], 1, pts, (nuint)pts.Length));
 
         int newIndex = AnnotationCount(handle, 0) - 1;
-        WriteTag(handle, newIndex, scaled);
+        WriteTag(handle, newIndex, scaled, deg);
         return newIndex;
     }
 
@@ -327,6 +336,80 @@ public class InkResizeInteropTests
                 Assert.Equal(before[i].Y, after[i].Y, 3);
             }
             Assert.Equal(1, AnnotationCount(handle, 0));
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    // ---------------- Raising, which is how z-order moves a stroke ----------------
+
+    [Fact]
+    public void raising_a_stroke_repeatedly_does_not_grow_or_move_it()
+    {
+        // A raise appends, which is what puts an object on top, and it must
+        // touch nothing else. Rebuilding into the stroke's OWN upright box makes
+        // the scale an identity; feeding the annotation's rectangle back in
+        // would re-fit the stroke to a padded box and fatten it a little every
+        // time, which is exactly what shapes had to be protected from.
+        ulong handle = OpenFixture();
+        try
+        {
+            int index = AddStroke(handle, Squiggle);
+            var before = PointsOf(handle, index).ToList();
+
+            for (int i = 0; i < 5; i++)
+            {
+                var box = BoxOf(PointsOf(handle, index));
+                var pts = PointsOf(handle, index);
+                double l = pts.Min(p => p.X), t = pts.Min(p => p.Y);
+                index = Resize(handle, index, l, t, l + box.W, t + box.H);
+            }
+
+            var after = PointsOf(handle, index);
+            Assert.Equal(before.Count, after.Count);
+            for (int i = 0; i < before.Count; i++)
+            {
+                Assert.Equal(before[i].X, after[i].X, 3);
+                Assert.Equal(before[i].Y, after[i].Y, 3);
+            }
+            Assert.Equal(1, AnnotationCount(handle, 0));
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void a_turned_stroke_put_back_where_it_was_keeps_its_size_and_angle()
+    {
+        // What undo of a MOVE amounts to for a turned stroke: same size, same
+        // angle, new centre. Re-fitting it onto the rectangle it is being
+        // returned to would stretch it, because a turned stroke's rectangle is
+        // the box containing the turned ink rather than its own box.
+        ulong handle = OpenFixture();
+        try
+        {
+            int index = AddStroke(handle, Squiggle);
+            int turned = Rotate(handle, index, 45);
+            var before = PointsOf(handle, turned).ToList();
+            var beforeBox = BoxOf(before);
+
+            // Move: re-centre the upright box, keeping its size.
+            var pts = PointsOf(handle, turned);
+            double cx = 0.6, cy = 0.6;
+            int moved = Resize(handle, turned,
+                cx - (beforeBox.W / 2), cy - (beforeBox.H / 2),
+                cx + (beforeBox.W / 2), cy + (beforeBox.H / 2));
+
+            var after = PointsOf(handle, moved);
+            var afterBox = BoxOf(after);
+
+            Assert.Equal(beforeBox.W, afterBox.W, 3);
+            Assert.Equal(beforeBox.H, afterBox.H, 3);
+            Assert.Equal(45, AngleOf(handle, moved), 2);
         }
         finally
         {

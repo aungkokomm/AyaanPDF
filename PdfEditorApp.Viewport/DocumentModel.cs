@@ -148,11 +148,13 @@ public abstract record DocumentObject
     /// only ordering primitive PDFium has, so an object that cannot be rebuilt
     /// cannot be reordered past either: the operation would destroy it. A shape
     /// and a text box are fully described by their tags, and a stamp carries its
-    /// own pixels, which the core can read back out. An ink stroke is an
-    /// arbitrary point cloud with no such description, and a mark from another
-    /// editor would come back as something else or not at all.
+    /// own pixels, which the core can read back out. A mark from another editor
+    /// would come back as something else or not at all.
+    ///
+    /// Ink is decided by <see cref="OpaqueObject"/>, which is the only thing
+    /// that knows whether a given stroke carries its own points.
     /// </summary>
-    public bool IsRebuildable => Kind
+    public virtual bool IsRebuildable => Kind
         is DocumentObjectKind.Shape
         or DocumentObjectKind.TextBox
         or DocumentObjectKind.Stamp;
@@ -250,6 +252,21 @@ public sealed record OpaqueObject : DocumentObject
     /// <summary>The stroke's width in normalized units, as its tag records it.
     /// Zero for anything that is not our ink.</summary>
     public double InkStrokeWidth { get; init; }
+
+    /// <summary>
+    /// A stroke this app drew CAN be rebuilt, and so can be reordered.
+    ///
+    /// Its control points are its complete description, which is the same basis
+    /// on which a shape qualifies. The base rule predates that: it was written
+    /// when a stroke really was an opaque point cloud, and refusing meant a page
+    /// with any drawing on it could not have its z-order changed at all, with a
+    /// message blaming a mark this app did not create.
+    ///
+    /// Ink from another editor genuinely has nothing to rebuild from, and its
+    /// refusal stands: <see cref="InkPoints"/> is empty for exactly those.
+    /// </summary>
+    public override bool IsRebuildable =>
+        base.IsRebuildable || (Kind == DocumentObjectKind.Ink && InkPoints.Count > 0);
 }
 
 /// <summary>One page's objects, in paint order.</summary>

@@ -212,9 +212,24 @@ public static class DocumentModelBuilder
     }
 
     /// <summary>
-    /// A freehand stroke's points, recovered from its tag.
+    /// A freehand stroke's points, recovered from its tag, AS DRAWN ON THE PAGE.
     ///
-    /// Only our own ink carries one. A stroke from another editor comes back
+    /// The tag stores the UPRIGHT points and an angle, because that is what lets
+    /// a turned stroke be resized without shearing. What anyone measuring
+    /// against the stroke needs is where it actually is, so the angle is applied
+    /// here, once, and the model reports placed points.
+    ///
+    /// Handing the upright ones over instead is precisely the bug this replaced:
+    /// a turned drawing could not be picked by clicking on it, while clicking
+    /// empty page where it would have been unturned picked it up.
+    ///
+    /// Note the object deliberately reports NO rotation of its own. Rotating a
+    /// point cloud moves its bounding box, so the centre of a stroke's /Rect is
+    /// NOT the point it was turned about, and inverse-rotating a pointer about
+    /// that centre would not undo the rotation. Placing the points here means
+    /// nothing downstream has to know the angle at all.
+    ///
+    /// Only our own ink carries a tag. A stroke from another editor comes back
     /// empty and is left to its bounding box, which is all anyone knows about it.
     /// </summary>
     private static (IReadOnlyList<(double X, double Y)> Points, double Width) InkFor(
@@ -222,9 +237,12 @@ public static class DocumentModelBuilder
     {
         if (kind != DocumentObjectKind.Ink) { return ([], 0); }
 
-        return InkTag.TryParse(contents, out _, out double width, out var control)
-            ? (control, width)
-            : ([], 0);
+        if (!InkTag.TryParse(contents, out _, out double width, out var control, out double deg))
+        {
+            return ([], 0);
+        }
+
+        return (deg == 0 ? control : Geometry2D.RotateAboutCentre(control, deg), width);
     }
 
     /// <summary>
