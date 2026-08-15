@@ -201,6 +201,96 @@ public class ContinuousLayoutTests
         Assert.Equal(2.0, layout.FitWidthZoom(1600), 6);
     }
 
+    // ---------------- Single-page view ----------------
+
+    [Fact]
+    public void single_page_view_lays_out_one_page()
+    {
+        // Not every page with the rest hidden: the stack's height IS the scroll
+        // range, so leaving them in would let the reader scroll through a
+        // document's worth of nothing below the page they are on.
+        var layout = new ContinuousLayout(pageGap: 12);
+        layout.Rebuild(Uniform(10, 100, 200), layoutWidth: 100, viewRotation: 0, onlyPage: 4);
+
+        Assert.Equal(1, layout.PageCount);
+        Assert.Equal(200, layout.TotalHeight, 6);
+
+        // No trailing gap, and the page starts at the top.
+        Assert.Equal(0, layout.Slots[0].Top, 6);
+    }
+
+    [Fact]
+    public void the_one_slot_knows_which_page_it_is()
+    {
+        // THE thing that breaks if this is got wrong. The card's position in
+        // the list is no longer its page number, so anything that treats the
+        // two as the same shows page 5's annotations on page 40.
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(10, 100, 200), layoutWidth: 100, onlyPage: 7);
+
+        Assert.Equal(7, layout.Slots[0].PageIndex);
+        Assert.Equal(7, layout.DominantPage(0, 200));
+    }
+
+    [Fact]
+    public void lookups_are_by_page_number_not_by_position()
+    {
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(10, 100, 200), layoutWidth: 100, onlyPage: 7);
+
+        // The page being shown answers; the others are simply not there.
+        Assert.Equal(200, layout.HeightOf(7), 6);
+        Assert.Equal(0, layout.TopOf(7), 6);
+        Assert.NotNull(layout.SlotForPage(7));
+
+        Assert.Equal(0, layout.HeightOf(0), 6);
+        Assert.Null(layout.SlotForPage(0));
+        Assert.Null(layout.SlotForPage(9));
+    }
+
+    [Fact]
+    public void continuous_view_still_answers_by_page_the_same_way()
+    {
+        // The lookups changed from position-based to page-based. In continuous
+        // view they must give exactly the answers they always did.
+        var layout = new ContinuousLayout(pageGap: 5);
+        layout.Rebuild(Uniform(4, 100, 200), layoutWidth: 100);
+
+        for (int page = 0; page < 4; page++)
+        {
+            Assert.Equal(page * 205, layout.TopOf(page), 6);
+            Assert.Equal(200, layout.HeightOf(page), 6);
+            Assert.Equal(page, layout.SlotForPage(page)!.Value.PageIndex);
+        }
+
+        Assert.Null(layout.SlotForPage(4));
+        Assert.Null(layout.SlotForPage(-1));
+    }
+
+    [Fact]
+    public void a_single_page_can_also_be_turned()
+    {
+        // The two modes are independent, and both change the card's shape.
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(10, 100, 200), layoutWidth: 100, viewRotation: 90, onlyPage: 3);
+
+        Assert.Equal(1, layout.PageCount);
+        Assert.Equal(3, layout.Slots[0].PageIndex);
+        Assert.Equal(50, layout.Slots[0].Height, 6);
+        Assert.Equal(90, layout.Slots[0].Transform.Rotation);
+    }
+
+    [Fact]
+    public void an_out_of_range_page_shows_nothing_rather_than_the_wrong_page()
+    {
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(3, 100, 200), layoutWidth: 100, onlyPage: 99);
+
+        Assert.Equal(0, layout.PageCount);
+        Assert.Equal(0, layout.TotalHeight, 6);
+        Assert.Equal((-1, -1), layout.VisibleRange(0, 100));
+    }
+
     [Fact]
     public void a_turned_page_still_carries_its_own_content_box()
     {

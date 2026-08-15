@@ -118,6 +118,17 @@ public sealed record AppSettings
     public bool NightMode { get; init; }
 
     /// <summary>
+    /// Whether the viewport shows the whole document as one scrolling stack or
+    /// one page at a time.
+    ///
+    /// Continuous by default, which is what most PDFs are read as. Remembered
+    /// because it describes how someone reads rather than which document they
+    /// opened: a person who reads slides one at a time wants that next time
+    /// too.
+    /// </summary>
+    public PageViewMode PageViewMode { get; init; } = PageViewMode.Continuous;
+
+    /// <summary>
     /// Where reading was left in each document, keyed by upper-cased full path.
     ///
     /// A SEPARATE map rather than fields added to the recent-files list, which
@@ -165,6 +176,7 @@ public sealed record AppSettings
         RulerUnit = IsKnownUnit(RulerUnit) ? RulerUnit : "Inches",
         RecentLimit = Math.Clamp(RecentLimit, 1, 50),
         StatusBarDock = Enum.IsDefined(StatusBarDock) ? StatusBarDock : BarDock.BottomCentre,
+        PageViewMode = Enum.IsDefined(PageViewMode) ? PageViewMode : PageViewMode.Continuous,
     };
 
     private static bool IsKnownUnit(string unit) => unit is

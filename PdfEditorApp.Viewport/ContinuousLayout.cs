@@ -73,7 +73,11 @@ public sealed class ContinuousLayout
     /// the scrollbar and which page a scroll offset lands on, all follow from
     /// the cards.
     /// </summary>
-    public void Rebuild(IReadOnlyList<PageSizePoints> pageSizes, double layoutWidth, int viewRotation = 0)
+    public void Rebuild(
+        IReadOnlyList<PageSizePoints> pageSizes,
+        double layoutWidth,
+        int viewRotation = 0,
+        int onlyPage = -1)
     {
         _slots.Clear();
         LayoutWidth = Math.Max(1.0, layoutWidth);
@@ -82,6 +86,14 @@ public sealed class ContinuousLayout
         double top = 0;
         for (int i = 0; i < pageSizes.Count; i++)
         {
+            // Single-page view lays out ONE page. Not every page with the rest
+            // hidden: the stack's height is the scroll range, so leaving them in
+            // would let the reader scroll through a document's worth of nothing.
+            if (onlyPage >= 0 && i != onlyPage)
+            {
+                continue;
+            }
+
             var size = pageSizes[i];
             double aspect = size.Width > 0 && size.Height > 0 ? size.Height / size.Width : 1.0;
 
@@ -154,12 +166,51 @@ public sealed class ContinuousLayout
             }
         }
 
-        return best;
+        // The PAGE, not the slot's position in the stack. Single-page view lays
+        // out one slot, and it is page 40 rather than page 0.
+        return _slots[best].PageIndex;
     }
 
-    /// <summary>Slot-space top of a page, for scroll-to-page.</summary>
-    public double TopOf(int pageIndex) =>
-        pageIndex >= 0 && pageIndex < _slots.Count ? _slots[pageIndex].Top : 0;
+    /// <summary>
+    /// Slot-space top of a PAGE, for scroll-to-page. Zero for a page the
+    /// current view mode is not showing.
+    ///
+    /// By page number rather than by position in the stack, because those stop
+    /// being the same thing the moment a mode lays out fewer pages than the
+    /// document has. They were already being conflated: one caller passed a
+    /// page and another passed a stack position, and in continuous view both
+    /// happened to be right.
+    /// </summary>
+    public double TopOf(int pageIndex) => SlotForPage(pageIndex)?.Top ?? 0;
+
+    /// <summary>Slot-space height of a PAGE, or 0 if it is not laid out.</summary>
+    public double HeightOf(int pageIndex) => SlotForPage(pageIndex)?.Height ?? 0;
+
+    /// <summary>The box for a page, or null when the mode is not showing it.</summary>
+    public PageSlotBox? SlotForPage(int pageIndex)
+    {
+        if (pageIndex < 0)
+        {
+            return null;
+        }
+
+        // Continuous view is the overwhelmingly common case and its stack is
+        // page-ordered from zero, so try the direct hit before walking.
+        if (pageIndex < _slots.Count && _slots[pageIndex].PageIndex == pageIndex)
+        {
+            return _slots[pageIndex];
+        }
+
+        foreach (var slot in _slots)
+        {
+            if (slot.PageIndex == pageIndex)
+            {
+                return slot;
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// The zoom factor that makes a page exactly fill the viewport width.

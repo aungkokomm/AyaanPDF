@@ -72,7 +72,9 @@ public class ViewRotationWiringTests
         // asks the document about pages one at a time.
         string body = MethodBody(ViewModel(), "private void SetViewRotation");
 
-        Assert.Contains("RebuildContinuousLayout()", body, StringComparison.Ordinal);
+        // pagesUnchanged, so it does not even re-read the page sizes: turning
+        // the view rearranges cards whose shapes are already known.
+        Assert.Contains("RebuildContinuousLayout(pagesUnchanged: true)", body, StringComparison.Ordinal);
         Assert.DoesNotContain("RenderCoreNative.", body, StringComparison.Ordinal);
     }
 
@@ -81,9 +83,9 @@ public class ViewRotationWiringTests
     {
         // Both Rebuild calls, including the empty one: a rebuild that dropped
         // the rotation would put upright cards under turned content.
-        string body = MethodBody(ViewModel(), "private void RebuildContinuousLayout");
+        string body = MethodBody(ViewModel(), "private void RebuildContinuousLayoutCore");
 
-        Assert.Equal(2, Regex.Matches(body, @"_layout\.Rebuild\([^)]*ViewRotation\)").Count);
+        Assert.Equal(2, Regex.Matches(body, @"_layout\.Rebuild\([^)]*ViewRotation").Count);
     }
 
     [Fact]
@@ -93,7 +95,7 @@ public class ViewRotationWiringTests
         // worked out is how the card and its content end up disagreeing.
         Assert.Contains(
             "new PageSlot(slot.PageIndex, slot.Transform)",
-            MethodBody(ViewModel(), "private void RebuildContinuousLayout"),
+            MethodBody(ViewModel(), "private void RebuildContinuousLayoutCore"),
             StringComparison.Ordinal);
     }
 

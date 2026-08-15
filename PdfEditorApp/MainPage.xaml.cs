@@ -911,6 +911,18 @@ public sealed partial class MainPage : Page
 
     private void ResetViewRotation_Click(object sender, RoutedEventArgs e) => ViewModel.ResetViewRotation();
 
+    private void ContinuousView_Click(object sender, RoutedEventArgs e) =>
+        ApplyPageViewMode(PageViewMode.Continuous);
+
+    private void SinglePageView_Click(object sender, RoutedEventArgs e) =>
+        ApplyPageViewMode(PageViewMode.SinglePage);
+
+    private void ApplyPageViewMode(PageViewMode mode)
+    {
+        ViewModel.SetPageViewMode(mode);
+        SettingsStore.Update(s => s with { PageViewMode = mode });
+    }
+
     /// <summary>
     /// Puts the reader back on the page they were reading after a view
     /// rotation, and keeps the reset item in step.
@@ -3672,6 +3684,10 @@ public sealed partial class MainPage : Page
         NightModeToggle.IsChecked = s.NightMode;
         ViewModel.IsNightMode = s.NightMode;
         ApplyPageSheet(s.NightMode);
+
+        SinglePageViewItem.IsChecked = s.PageViewMode == PageViewMode.SinglePage;
+        ContinuousViewItem.IsChecked = s.PageViewMode == PageViewMode.Continuous;
+        ViewModel.SetPageViewMode(s.PageViewMode);
 
         // Unconditionally, not only when the toggle changed: this also runs on
         // load, when the chrome has never been decided at all.

@@ -577,12 +577,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         foreach (var f in _formFields)
         {
-            if (!f.IsFillable || f.PageIndex < 0 || f.PageIndex >= PageSlots.Count)
+            // Null once single-page view can be on: the field is on a page that
+            // is not currently laid out, so there is no card to outline it on.
+            if (!f.IsFillable || SlotFor(f.PageIndex) is not { } slot)
             {
                 continue;
             }
 
-            var slot = PageSlots[f.PageIndex];
             var rect = new TextRect(f.Left, f.Top, f.Right, f.Bottom);
             var scaled = ScaledRect.From(rect, slot.OverlayScale);
             if (scaled.IsVisible)
@@ -1244,9 +1245,65 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// distance they report is out by this factor.
     /// </summary>
     public double CurrentViewScale =>
-        CurrentPageIndex >= 0 && CurrentPageIndex < PageSlots.Count
-            ? PageSlots[CurrentPageIndex].ViewScale
-            : 1.0;
+        SlotFor(CurrentPageIndex)?.ViewScale ?? 1.0;
+
+    /// <summary>
+    /// How many pages the viewport shows at once.
+    ///
+    /// Changing it rebuilds the stack, because the stack IS the difference:
+    /// continuous view lays out every page, single-page view lays out one. It
+    /// does not touch the document, so like the view rotation there is nothing
+    /// to save and nothing to undo.
+    /// </summary>
+    public PageViewMode PageViewMode { get; private set; } = PageViewMode.Continuous;
+
+    public bool IsSinglePageView => PageViewMode == PageViewMode.SinglePage;
+
+    public void SetPageViewMode(PageViewMode mode)
+    {
+        if (mode == PageViewMode)
+        {
+            return;
+        }
+
+        int wasOn = CurrentPageIndex;
+        PageViewMode = mode;
+        OnPropertyChanged(nameof(PageViewMode));
+        OnPropertyChanged(nameof(IsSinglePageView));
+
+        RebuildContinuousLayout(pagesUnchanged: true);
+        Diag.Log($"page view mode {mode}, on page {wasOn}");
+
+        // Reuses the rotation signal: both rearrange the stack under a reader
+        // who is part-way through a document and both have to put them back
+        // where they were. A second event carrying the same payload to the same
+        // handler would be two ways to say one thing.
+        ViewRotated?.Invoke(wasOn);
+    }
+
+    /// <summary>
+    /// Brings the layout onto a new current page when only one page is shown.
+    ///
+    /// In continuous view every page is already laid out and moving between
+    /// them is a scroll. In single-page view the stack IS the current page, so
+    /// turning a page is a rebuild.
+    /// </summary>
+    private void RelayoutForPageTurn(int page)
+    {
+        // _rebuildingLayout: opening a document sets the page to 0 and then
+        // lays out, and other paths lay out and then correct the page. Without
+        // the guard each of those would build the stack twice, and on a page
+        // turn the second one would be re-entrant.
+        if (PageViewMode != PageViewMode.SinglePage || _documentHandle == 0 || _rebuildingLayout)
+        {
+            return;
+        }
+
+        RebuildContinuousLayout(pagesUnchanged: true);
+        ViewRotated?.Invoke(page);
+    }
+
+    private bool _rebuildingLayout;
 
     /// <summary>Turns the view a quarter clockwise.</summary>
     public void RotateViewClockwise() => SetViewRotation(ViewRotation + 90);
@@ -1278,7 +1335,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(ViewRotation));
         OnPropertyChanged(nameof(IsViewRotated));
 
-        RebuildContinuousLayout();
+        RebuildContinuousLayout(pagesUnchanged: true);
 
         // The panel follows the page. No re-render: the bitmaps are unchanged,
         // it is only how they are shown that turns, so this is a transform on
@@ -2150,16 +2207,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// are known before any rendering, so each card occupies its final space
     /// immediately and nothing shifts as bitmaps stream in.
     /// </summary>
-    private void RebuildContinuousLayout()
-    {
-        PageSlots.Clear();
-        _layout.Rebuild([], SlotLayoutWidth, ViewRotation);
+    /// <summary>
+    /// Every page's intrinsic size, read once per document.
+    ///
+    /// Cached because single-page view rebuilds the layout on every page turn,
+    /// and asking the document again each time would be an FFI call and a
+    /// marshalled array of a few thousand structs to move forward one page.
+    /// Cleared when the page set changes, which is the only thing that can
+    /// invalidate it.
+    /// </summary>
+    private List<PageSizePoints>? _pageSizes;
 
-        if (_documentHandle == 0)
+    private List<PageSizePoints> PageSizes()
+    {
+        if (_pageSizes is not null)
         {
-            OnPropertyChanged(nameof(ContentWidth));
-            OnPropertyChanged(nameof(ContentHeight));
-            return;
+            return _pageSizes;
         }
 
         var sizes = new List<PageSizePoints>();
@@ -2182,14 +2245,75 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RenderCoreNative.free_page_size_array(array);
         }
 
-        _layout.Rebuild(sizes, SlotLayoutWidth, ViewRotation);
+        _pageSizes = sizes;
+        return sizes;
+    }
+
+    /// <summary>
+    /// Rebuilds the stack of page cards.
+    ///
+    /// <paramref name="pagesUnchanged"/> keeps the cached page sizes, and is
+    /// for the rebuilds that change only how pages are ARRANGED: turning the
+    /// view, switching view mode, and moving to the next page in single-page
+    /// view. Everything else re-reads them.
+    ///
+    /// Defaulting to re-reading is deliberate. A stale cache lays the document
+    /// out at the shapes it used to have, and the ways to change the pages are
+    /// many (insert, delete, duplicate, reorder, rotate, undo any of those,
+    /// reload after save) while the ways to merely rearrange them are three.
+    /// Getting the safe answer by saying nothing is the right way round.
+    /// </summary>
+    private void RebuildContinuousLayout(bool pagesUnchanged = false)
+    {
+        if (!pagesUnchanged)
+        {
+            _pageSizes = null;
+        }
+
+        bool outermost = !_rebuildingLayout;
+        _rebuildingLayout = true;
+        try
+        {
+            RebuildContinuousLayoutCore();
+        }
+        finally
+        {
+            if (outermost)
+            {
+                _rebuildingLayout = false;
+            }
+        }
+    }
+
+    private void RebuildContinuousLayoutCore()
+    {
+        PageSlots.Clear();
+        _layout.Rebuild([], SlotLayoutWidth, ViewRotation);
+
+        if (_documentHandle == 0)
+        {
+            OnPropertyChanged(nameof(ContentWidth));
+            OnPropertyChanged(nameof(ContentHeight));
+            return;
+        }
+
+        var sizes = PageSizes();
+
+        // Single-page view lays out the page being read and nothing else, so
+        // the scroll range is that page. The slots are therefore NOT one per
+        // page any more, which is why every lookup here goes through a page
+        // number rather than a position in the list.
+        int only = PageViewMode == PageViewMode.SinglePage ? CurrentPageIndex : -1;
+
+        _layout.Rebuild(sizes, SlotLayoutWidth, ViewRotation, only);
         foreach (var slot in _layout.Slots)
         {
             PageSlots.Add(new PageSlot(slot.PageIndex, slot.Transform));
         }
 
         Diag.Log($"layout: {PageSlots.Count} slots, content {ContentWidth:F0}x{ContentHeight:F0}" +
-                 (ViewRotation != 0 ? $", view rotated {ViewRotation}" : string.Empty));
+                 (ViewRotation != 0 ? $", view rotated {ViewRotation}" : string.Empty) +
+                 (only >= 0 ? $", single page {only}" : string.Empty));
 
         DistributeAnnotationsToSlots();
         OnPropertyChanged(nameof(ContentWidth));
@@ -2244,10 +2368,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// "part-way down page N" needs the height of that particular page rather
     /// than an average.
     /// </summary>
-    public double SlotHeightOf(int pageIndex) =>
-        pageIndex >= 0 && pageIndex < _layout.Slots.Count
-            ? _layout.Slots[pageIndex].Height
-            : 0;
+    public double SlotHeightOf(int pageIndex) => _layout.HeightOf(pageIndex);
 
     /// <summary>Which page contains the given Y in slot-space (ViewportHost's
     /// content minus Padding.Top), or -1 if the Y is above the first page or
@@ -2255,11 +2376,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// have a few hundred pages at most and this only fires on a ruler drop.</summary>
     public int PageAt(double slotY)
     {
-        for (int i = 0; i < PageSlots.Count; i++)
+        // Walks the CARDS and asks each one which page it is, rather than
+        // treating its position in the list as its page number. Those stopped
+        // being the same thing when single-page view began laying out one card.
+        foreach (var slot in PageSlots)
         {
-            double top = _layout.TopOf(i);
-            double bottom = top + PageSlots[i].SlotHeight;
-            if (slotY >= top && slotY < bottom) { return i; }
+            double top = _layout.TopOf(slot.PageIndex);
+            double bottom = top + slot.SlotHeight;
+            if (slotY >= top && slotY < bottom) { return slot.PageIndex; }
         }
         return -1;
     }
@@ -2529,6 +2653,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         OnPropertyChanged(nameof(PagePositionLabel));
         OnPropertyChanged(nameof(TextAvailabilityLabel));
+
+        // In single-page view the stack IS this page, so turning a page has to
+        // build a new one. In continuous view the page changes constantly as
+        // the reader scrolls and there is nothing to do.
+        RelayoutForPageTurn(value);
     }
 
     partial void OnPageCountChanged(int value)
@@ -2958,7 +3087,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (h.PageIndex >= 0 && h.PageIndex < PageSlots.Count)
             {
-                PageSlots[h.PageIndex].Highlights.Add(h);
+                SlotFor(h.PageIndex)?.Highlights.Add(h);
             }
         }
 
@@ -2971,7 +3100,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (sh.PageIndex >= 0 && sh.PageIndex < PageSlots.Count)
             {
-                PageSlots[sh.PageIndex].Shapes.Add(sh);
+                SlotFor(sh.PageIndex)?.Shapes.Add(sh);
             }
         }
 
@@ -2979,7 +3108,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (s.PageIndex >= 0 && s.PageIndex < PageSlots.Count)
             {
-                PageSlots[s.PageIndex].InkStrokes.Add(s);
+                SlotFor(s.PageIndex)?.InkStrokes.Add(s);
             }
         }
 
@@ -2987,7 +3116,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (n.PageIndex >= 0 && n.PageIndex < PageSlots.Count)
             {
-                PageSlots[n.PageIndex].Notes.Add(n);
+                SlotFor(n.PageIndex)?.Notes.Add(n);
             }
         }
 
@@ -7186,9 +7315,38 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>The card owning a page, or null if the index is out of range.</summary>
-    private PageSlot? SlotFor(int pageIndex) =>
-        pageIndex >= 0 && pageIndex < PageSlots.Count ? PageSlots[pageIndex] : null;
+    /// <summary>
+    /// The card showing a page, or null if the current view mode is not
+    /// showing it.
+    ///
+    /// By PAGE NUMBER, not by position in the list. Those were the same thing
+    /// while every page had a card; single-page view lays out one card, and it
+    /// is page 40 rather than page 0.
+    /// </summary>
+    private PageSlot? SlotFor(int pageIndex)
+    {
+        if (pageIndex < 0)
+        {
+            return null;
+        }
+
+        // Continuous view is the common case and its list is page-ordered from
+        // zero, so try the direct hit before walking.
+        if (pageIndex < PageSlots.Count && PageSlots[pageIndex].PageIndex == pageIndex)
+        {
+            return PageSlots[pageIndex];
+        }
+
+        foreach (var slot in PageSlots)
+        {
+            if (slot.PageIndex == pageIndex)
+            {
+                return slot;
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Scrolling changed which page is current.

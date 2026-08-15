@@ -1170,6 +1170,19 @@
                                 <MenuFlyoutItem x:Name="ResetViewRotationItem" Text="Reset view rotation"
                                                 Click="ResetViewRotation_Click" IsEnabled="False" />
                                 <MenuFlyoutSeparator />
+                                <!--
+                                    How many pages are on screen. A radio pair
+                                    rather than a toggle, because "Single page"
+                                    unchecked does not say what you get
+                                    instead, and the two names together do.
+                                -->
+                                <RadioMenuFlyoutItem x:Name="ContinuousViewItem" Text="Continuous scrolling"
+                                                     GroupName="pageViewMode" IsChecked="True"
+                                                     Click="ContinuousView_Click" />
+                                <RadioMenuFlyoutItem x:Name="SinglePageViewItem" Text="Single page"
+                                                     GroupName="pageViewMode"
+                                                     Click="SinglePageView_Click" />
+                                <MenuFlyoutSeparator />
                                 <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
                                                       IsChecked="True" Click="RulersToggle_Click">
                                     <ToggleMenuFlyoutItem.KeyboardAccelerators>
