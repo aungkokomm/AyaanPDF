@@ -14,6 +14,9 @@ public enum EditorCommand
     Group,
     Ungroup,
     ToggleRulers,
+    /// <summary>Turns the VIEW a quarter clockwise. Does not touch the document.</summary>
+    RotateViewClockwise,
+    RotateViewCounterClockwise,
 }
 
 /// <summary>
@@ -42,6 +45,13 @@ public static class KeyboardCommands
     public const int KeyP = 0x50;
     public const int KeyZ = 0x5A;
 
+    // Plus and minus, from the main row and the numeric keypad. Both, because
+    // which one a laptop sends is not something the user should have to know.
+    public const int KeyOemPlus = 0xBB;
+    public const int KeyOemMinus = 0xBD;
+    public const int KeyAdd = 0x6B;
+    public const int KeySubtract = 0x6D;
+
     /// <summary>
     /// The command for a chord, or <see cref="EditorCommand.None"/>.
     ///
@@ -68,6 +78,14 @@ public static class KeyboardCommands
             KeyG => shift ? EditorCommand.Ungroup : EditorCommand.Group,
             KeyZ => shift ? EditorCommand.Redo : EditorCommand.Undo,
             KeyY when !shift => EditorCommand.Redo,
+
+            // Shift+Ctrl+plus and Shift+Ctrl+minus, which is what every other
+            // reader uses to turn the view. SHIFT IS REQUIRED: Ctrl+plus and
+            // Ctrl+minus are zoom everywhere, and claiming them unshifted would
+            // turn the page when the reader meant to make it bigger.
+            KeyOemPlus or KeyAdd when shift => EditorCommand.RotateViewClockwise,
+            KeyOemMinus or KeySubtract when shift => EditorCommand.RotateViewCounterClockwise,
+
             _ => EditorCommand.None,
         };
     }

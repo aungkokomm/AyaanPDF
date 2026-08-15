@@ -141,4 +141,79 @@ public class ContinuousLayoutTests
         Assert.Equal(0, layout.TopOf(-1), 3);
         Assert.Equal(0, layout.TopOf(99), 3);
     }
+
+    // ---------------- View rotation ----------------
+
+    [Fact]
+    public void a_turned_view_gives_every_card_the_other_shape()
+    {
+        // Tall pages laid on their side make short wide cards, and the stack
+        // gets shorter with them. If the cards did not change shape the pages
+        // would be drawn turned inside upright boxes, overhanging their
+        // neighbours.
+        var layout = new ContinuousLayout(pageGap: 0);
+        layout.Rebuild(Uniform(3, 100, 200), layoutWidth: 100, viewRotation: 90);
+
+        foreach (var slot in layout.Slots)
+        {
+            Assert.Equal(100, slot.Width, 6);
+            Assert.Equal(50, slot.Height, 6);
+        }
+
+        Assert.Equal(150, layout.TotalHeight, 6);
+    }
+
+    [Fact]
+    public void the_stack_is_untouched_when_nothing_is_turned()
+    {
+        // The safety property for every document nobody rotates.
+        var upright = new ContinuousLayout(pageGap: 5);
+        upright.Rebuild(Uniform(4, 100, 200), layoutWidth: 100);
+
+        var explicitly = new ContinuousLayout(pageGap: 5);
+        explicitly.Rebuild(Uniform(4, 100, 200), layoutWidth: 100, viewRotation: 0);
+
+        Assert.Equal(upright.TotalHeight, explicitly.TotalHeight, 6);
+        Assert.Equal(200, upright.Slots[0].Height, 6);
+    }
+
+    [Fact]
+    public void half_a_turn_leaves_the_stack_the_same_height()
+    {
+        var half = new ContinuousLayout(pageGap: 5);
+        half.Rebuild(Uniform(4, 100, 200), layoutWidth: 100, viewRotation: 180);
+
+        Assert.Equal(200, half.Slots[0].Height, 6);
+        Assert.Equal(180, half.ViewRotation);
+    }
+
+    [Fact]
+    public void fit_width_still_answers_when_the_view_is_turned()
+    {
+        // Fit-width is a pure function of the ONE fixed layout width. Cards
+        // that came out wider than it when turned would silently break it for
+        // the whole document, so every card keeps the layout width.
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(3, 100, 200), layoutWidth: 800, viewRotation: 270);
+
+        Assert.Equal(800, layout.LayoutWidth, 6);
+        Assert.All(layout.Slots, s => Assert.Equal(800, s.Width, 6));
+        Assert.Equal(2.0, layout.FitWidthZoom(1600), 6);
+    }
+
+    [Fact]
+    public void a_turned_page_still_carries_its_own_content_box()
+    {
+        // The content box is what every rect on the page is measured against,
+        // and it must NOT change with rotation or every overlay in the app
+        // would be laid out against the wrong scale.
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(1, 100, 200), layoutWidth: 800, viewRotation: 90);
+
+        var t = layout.Slots[0].Transform;
+
+        Assert.Equal(800, t.ContentWidth, 6);
+        Assert.Equal(1600, t.ContentHeight, 6);
+        Assert.Equal(90, t.Rotation);
+    }
 }

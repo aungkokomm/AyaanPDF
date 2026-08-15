@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -762,6 +762,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RestartSearch();
         ClearLoadedAnnotations();
 
+        // A view rotation belongs to the reading session, not to the file, so
+        // it does not follow the reader into the next document. Set directly
+        // rather than through SetViewRotation: the layout is about to be built
+        // from scratch anyway, and there is no page to return to yet.
+        if (ViewRotation != 0)
+        {
+            ViewRotation = 0;
+            OnPropertyChanged(nameof(ViewRotation));
+            OnPropertyChanged(nameof(IsViewRotated));
+        }
+
         // A fresh document has no history and no unsaved edits. A reload after
         // a burn/save (preserveAnnotations) is also a clean slate: those marks
         // are now baked into the page content, so there is nothing to undo.
@@ -1184,6 +1195,92 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Deletes a page by index. Refuses to remove the last remaining page.</summary>
     public bool DeletePage(int index) =>
         PageCount > 1 && RebuildPages(PageReorder.Delete(PageCount, index));
+
+    /// <summary>
+    /// The quarter turn the whole view is shown at.
+    ///
+    /// Deliberately NOT the same thing as <see cref="RotatePage"/>, which edits
+    /// the document. This turns what is on screen: nothing is written, no undo
+    /// step is recorded, the file is not made dirty, and closing forgets it. It
+    /// is what a sideways scan needs from a reader, and it works on a document
+    /// that cannot be written to at all.
+    ///
+    /// It is also the only one of the two that can be applied to a whole book
+    /// at once. Rotating three thousand pages for real means parsing three
+    /// thousand pages, which takes over a minute; this is a rebuild of the
+    /// layout and nothing else.
+    /// </summary>
+    public int ViewRotation { get; private set; }
+
+    /// <summary>Whether the view is turned, for a menu tick and the status bar.</summary>
+    public bool IsViewRotated => ViewRotation != 0;
+
+    /// <summary>
+    /// How much the current page's content is scaled down to fit its card, on
+    /// top of the zoom.
+    ///
+    /// One number for both axes: the scale is uniform and the rotations are
+    /// quarter turns, so the on-screen size of a page point is the same
+    /// horizontally and vertically whichever way the view is turned. The rulers
+    /// need it, or they measure the page at its unturned size and every
+    /// distance they report is out by this factor.
+    /// </summary>
+    public double CurrentViewScale =>
+        CurrentPageIndex >= 0 && CurrentPageIndex < PageSlots.Count
+            ? PageSlots[CurrentPageIndex].ViewScale
+            : 1.0;
+
+    /// <summary>Turns the view a quarter clockwise.</summary>
+    public void RotateViewClockwise() => SetViewRotation(ViewRotation + 90);
+
+    /// <summary>Turns the view a quarter anticlockwise.</summary>
+    public void RotateViewCounterClockwise() => SetViewRotation(ViewRotation - 90);
+
+    /// <summary>Puts the view back upright.</summary>
+    public void ResetViewRotation() => SetViewRotation(0);
+
+    /// <summary>
+    /// Applies a view rotation and puts the reader back on the page they were
+    /// reading.
+    ///
+    /// The page has to be restored explicitly. Every card changes shape, so
+    /// every offset below the current one moves, and keeping the raw scroll
+    /// offset would land somewhere unrelated in a long document.
+    /// </summary>
+    private void SetViewRotation(int degrees)
+    {
+        int next = PageTransform.Normalize(degrees);
+        if (next == ViewRotation)
+        {
+            return;
+        }
+
+        int wasOn = CurrentPageIndex;
+        ViewRotation = next;
+        OnPropertyChanged(nameof(ViewRotation));
+        OnPropertyChanged(nameof(IsViewRotated));
+
+        RebuildContinuousLayout();
+
+        // The panel follows the page. No re-render: the bitmaps are unchanged,
+        // it is only how they are shown that turns, so this is a transform on
+        // a few realized cards rather than work per page.
+        foreach (var thumbnail in Thumbnails)
+        {
+            thumbnail.ViewRotation = next;
+        }
+
+        Diag.Log($"view rotation {next}, back to page {wasOn}");
+
+        ViewRotated?.Invoke(wasOn);
+    }
+
+    /// <summary>
+    /// Raised after a view rotation has rebuilt the layout, with the page that
+    /// was being read. The page host owns scrolling, so it restores the
+    /// position; the view model does not reach into the scroller.
+    /// </summary>
+    public event Action<int>? ViewRotated;
 
     /// <summary>Rotates one page by degrees, updating its thumbnail and the view if it is current.</summary>
     public void RotatePage(int index, int degrees)
@@ -2038,7 +2135,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void RebuildContinuousLayout()
     {
         PageSlots.Clear();
-        _layout.Rebuild([], SlotLayoutWidth);
+        _layout.Rebuild([], SlotLayoutWidth, ViewRotation);
 
         if (_documentHandle == 0)
         {
@@ -2067,13 +2164,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RenderCoreNative.free_page_size_array(array);
         }
 
-        _layout.Rebuild(sizes, SlotLayoutWidth);
+        _layout.Rebuild(sizes, SlotLayoutWidth, ViewRotation);
         foreach (var slot in _layout.Slots)
         {
-            PageSlots.Add(new PageSlot(slot.PageIndex, slot.Width, slot.Height));
+            PageSlots.Add(new PageSlot(slot.PageIndex, slot.Transform));
         }
 
-        Diag.Log($"layout: {PageSlots.Count} slots, content {ContentWidth:F0}x{ContentHeight:F0}");
+        Diag.Log($"layout: {PageSlots.Count} slots, content {ContentWidth:F0}x{ContentHeight:F0}" +
+                 (ViewRotation != 0 ? $", view rotated {ViewRotation}" : string.Empty));
 
         DistributeAnnotationsToSlots();
         OnPropertyChanged(nameof(ContentWidth));
@@ -2640,7 +2738,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         for (int i = from; i <= to; i++)
         {
             var slot = PageSlots[i];
-            double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
+
+            // The CONTENT box, not the card, because that is what is rendered.
+            // Turned a quarter, the card has the other shape entirely, and
+            // sizing a render from it asks for a bitmap of the wrong aspect.
+            double aspect = slot.ContentWidth > 0 ? slot.ContentHeight / slot.ContentWidth : 1.0;
+
+            // A page turned on its side is scaled down to fit the card, so it
+            // is drawn smaller than its own coordinates say. Folding that into
+            // the zoom is what keeps the render matched to the pixels actually
+            // on screen instead of over- or under-shooting by the scale.
+            double zoom = slot.View.EffectiveZoom(_currentZoomFactor);
 
             // Past the point where a whole-page render has to be capped, the
             // full-page tier can no longer keep up with the screen, so the
@@ -2649,7 +2757,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // expensive and blurrier than the tiles covering it, and the cheap
             // base bitmap is a better stand-in for the moment before a tile
             // lands.
-            if (_budget.NeedsTiles(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect))
+            if (_budget.NeedsTiles(slot.ContentWidth, zoom, RasterizationScale, aspect))
             {
                 slot.DropSharpRender();
                 RenderVisibleTiles(slot);
@@ -2658,7 +2766,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             slot.ClearTiles();
 
-            int desired = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
+            int desired = _budget.SharpWidthFor(slot.ContentWidth, zoom, RasterizationScale, aspect);
             if (_budget.ShouldResharpen(slot.RenderedWidth, desired))
             {
                 SharpenSlot(slot, desired);
@@ -2682,24 +2790,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         double top = _layout.TopOf(slot.PageIndex);
 
-        // Viewport intersected with this page, in page-local slot DIPs.
+        // Viewport intersected with this page's CARD, in card-local slot DIPs.
         double left = Math.Max(0, _lastViewLeft);
         double right = Math.Min(slot.SlotWidth, _lastViewRight);
-        double pageTop = Math.Max(0, _lastViewTop - top);
-        double pageBottom = Math.Min(slot.SlotHeight, _lastViewBottom - top);
+        double cardTop = Math.Max(0, _lastViewTop - top);
+        double cardBottom = Math.Min(slot.SlotHeight, _lastViewBottom - top);
 
-        if (right - left < 1 || pageBottom - pageTop < 1)
+        if (right - left < 1 || cardBottom - cardTop < 1)
         {
             slot.ClearTiles();
             return;
         }
 
-        // Level from what the screen actually needs across the whole page.
+        // Tiles are addressed on the page, so the visible part of the card has
+        // to be asked for in page coordinates. Turned a quarter, the strip
+        // along the top of the screen is one SIDE of the page, and asking for
+        // the top of the page instead would fetch tiles nobody can see while
+        // leaving the visible ones blank. Quarter turns, so this is exact.
+        var (pageLeft, pageTop, pageRight, pageBottom) =
+            slot.View.ContentBounds(left, cardTop, right, cardBottom);
+
+        // Level from what the screen actually needs across the whole page, at
+        // the size the page is really drawn.
         int level = TileGrid.LevelForWidth(
-            slot.SlotWidth * _currentZoomFactor * Math.Max(1.0, RasterizationScale));
+            slot.ContentWidth * slot.View.EffectiveZoom(_currentZoomFactor) * Math.Max(1.0, RasterizationScale));
 
         var wanted = TileGrid.VisibleTiles(
-            slot.SlotWidth, slot.SlotHeight, level, left, pageTop, right, pageBottom);
+            slot.ContentWidth, slot.ContentHeight, level, pageLeft, pageTop, pageRight, pageBottom);
 
         var added = slot.SyncTiles(wanted, level);
 
@@ -2776,7 +2893,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // while it is in flight, and applying it would show a bitmap at
             // the wrong resolution until the next pass replaced it.
             double aspect = slot.SlotWidth > 0 ? slot.SlotHeight / slot.SlotWidth : 1.0;
-            int wantedNow = _budget.SharpWidthFor(slot.SlotWidth, _currentZoomFactor, RasterizationScale, aspect);
+            int wantedNow = _budget.SharpWidthFor(slot.ContentWidth, _currentZoomFactor, RasterizationScale, aspect);
             if (_budget.ShouldResharpen(targetWidth, wantedNow))
             {
                 return;
@@ -2902,8 +3019,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         pageIndex = best;
-        localX = slotX;
-        localY = slotY - slots[best].Top;
+
+        // Card coordinates so far. Everything above this call works in CONTENT
+        // coordinates, which are the same whichever way the view is turned, so
+        // the mapping happens here and nowhere else. Upright it is the
+        // identity.
+        (localX, localY) = slots[best].Transform.ToContent(slotX, slotY - slots[best].Top);
         return true;
     }
 

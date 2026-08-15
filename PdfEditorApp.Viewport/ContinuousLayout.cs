@@ -6,8 +6,17 @@ namespace PdfEditorApp.Viewport;
 /// <summary>A page's intrinsic size in PDF points.</summary>
 public readonly record struct PageSizePoints(double Width, double Height);
 
-/// <summary>Where one page sits in slot space, and how big its slot is.</summary>
-public readonly record struct PageSlotBox(int PageIndex, double Top, double Width, double Height);
+/// <summary>
+/// Where one page sits in slot space, how big its slot is, and how its content
+/// is turned inside it.
+///
+/// Width and Height are the CARD, which is what the stack is made of. The
+/// transform carries the content box, which is what everything drawn on the
+/// page is measured against, and is the same whether or not the view is
+/// rotated.
+/// </summary>
+public readonly record struct PageSlotBox(
+    int PageIndex, double Top, double Width, double Height, PageTransform Transform);
 
 /// <summary>
 /// Lays pages out as a vertical stack of slots and maps scroll offsets to
@@ -48,25 +57,40 @@ public sealed class ContinuousLayout
     public IReadOnlyList<PageSlotBox> Slots => _slots;
 
     /// <summary>
+    /// The quarter turn the whole view is shown at. Not a property of the
+    /// document: it is never saved, and reopening a file shows it upright.
+    /// </summary>
+    public int ViewRotation { get; private set; }
+
+    /// <summary>
     /// Rebuilds the stack for the given page sizes at the given width. Pages
     /// keep their aspect ratio; a page that reports a non-positive size gets a
     /// square slot so it still occupies a predictable, non-zero space rather
     /// than collapsing and shifting everything below it.
+    ///
+    /// A rotated view changes the SHAPE of every card, so it comes through here
+    /// rather than being applied afterwards: the stack's heights, and with them
+    /// the scrollbar and which page a scroll offset lands on, all follow from
+    /// the cards.
     /// </summary>
-    public void Rebuild(IReadOnlyList<PageSizePoints> pageSizes, double layoutWidth)
+    public void Rebuild(IReadOnlyList<PageSizePoints> pageSizes, double layoutWidth, int viewRotation = 0)
     {
         _slots.Clear();
         LayoutWidth = Math.Max(1.0, layoutWidth);
+        ViewRotation = PageTransform.Normalize(viewRotation);
 
         double top = 0;
         for (int i = 0; i < pageSizes.Count; i++)
         {
             var size = pageSizes[i];
             double aspect = size.Width > 0 && size.Height > 0 ? size.Height / size.Width : 1.0;
-            double height = LayoutWidth * aspect;
 
-            _slots.Add(new PageSlotBox(i, top, LayoutWidth, height));
-            top += height + PageGap;
+            // The content box is what it has always been, the layout width by
+            // the page's aspect. Only the card it sits in changes.
+            var transform = PageTransform.For(LayoutWidth, LayoutWidth * aspect, ViewRotation, LayoutWidth);
+
+            _slots.Add(new PageSlotBox(i, top, transform.CardWidth, transform.CardHeight, transform));
+            top += transform.CardHeight + PageGap;
         }
 
         // No trailing gap after the last page.

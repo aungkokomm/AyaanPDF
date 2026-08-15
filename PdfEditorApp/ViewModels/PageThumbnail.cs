@@ -28,7 +28,39 @@ public partial class PageThumbnail : ObservableObject
 
     public double CardHeight => CardWidth * (11.0 / 8.5);
 
-    partial void OnCardWidthChanged(double value) => OnPropertyChanged(nameof(CardHeight));
+    partial void OnCardWidthChanged(double value)
+    {
+        OnPropertyChanged(nameof(CardHeight));
+        OnPropertyChanged(nameof(ImageWidth));
+        OnPropertyChanged(nameof(ImageHeight));
+    }
+
+    /// <summary>
+    /// The quarter turn the view is shown at, so the panel matches the page.
+    ///
+    /// A dark strip of upright thumbnails beside a page lying on its side makes
+    /// the panel useless for finding your place, which is the only thing it is
+    /// for.
+    /// </summary>
+    [ObservableProperty]
+    public partial double ViewRotation { get; set; }
+
+    partial void OnViewRotationChanged(double value)
+    {
+        OnPropertyChanged(nameof(ImageWidth));
+        OnPropertyChanged(nameof(ImageHeight));
+    }
+
+    /// <summary>
+    /// The image is measured BEFORE it is turned, so on a quarter turn its
+    /// width and height are swapped: turned about its centre it then lands back
+    /// inside the card instead of hanging over the edges.
+    /// </summary>
+    public double ImageWidth => Turned ? CardHeight : CardWidth;
+
+    public double ImageHeight => Turned ? CardWidth : CardHeight;
+
+    private bool Turned => ViewRotation is 90 or 270;
 
     private bool _isRendering;
 

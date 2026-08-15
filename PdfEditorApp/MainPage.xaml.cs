@@ -74,6 +74,7 @@ public sealed partial class MainPage : Page
         // it: the drag preview vanished on mouse-up and left an empty page.
         ViewModel.Shapes.CollectionChanged += OnInkStrokesCollectionChanged;
         ViewModel.LayoutRebuilt += OnLayoutRebuilt;
+        ViewModel.ViewRotated += OnViewRotated;
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
         // Drag-reorder in the thumbnail list moves an item in this collection;
         // that is the signal to rebuild the document in the new order.
@@ -228,6 +229,7 @@ public sealed partial class MainPage : Page
             ViewModel.InkStrokes.CollectionChanged -= OnInkStrokesCollectionChanged;
             ViewModel.Shapes.CollectionChanged -= OnInkStrokesCollectionChanged;
             ViewModel.LayoutRebuilt -= OnLayoutRebuilt;
+            ViewModel.ViewRotated -= OnViewRotated;
             ViewModel.ScrollToPageRequested -= OnScrollToPageRequested;
             ViewModel.Dispose();
         };
@@ -903,6 +905,31 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private void RotateViewCw_Click(object sender, RoutedEventArgs e) => ViewModel.RotateViewClockwise();
+
+    private void RotateViewCcw_Click(object sender, RoutedEventArgs e) => ViewModel.RotateViewCounterClockwise();
+
+    private void ResetViewRotation_Click(object sender, RoutedEventArgs e) => ViewModel.ResetViewRotation();
+
+    /// <summary>
+    /// Puts the reader back on the page they were reading after a view
+    /// rotation, and keeps the reset item in step.
+    ///
+    /// Queued rather than run straight away. Rebuilding the layout has already
+    /// queued its own continuation, which decides the zoom for the new page
+    /// shape; scrolling before that runs would be undone by it. The queue is in
+    /// order, so being second here means running second.
+    /// </summary>
+    private void OnViewRotated(int page)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            ResetViewRotationItem.IsEnabled = ViewModel.IsViewRotated;
+            ScrollToPage(page, animate: false);
+            PushVisibleWindow();
+        });
+    }
+
 
     /// <summary>
     /// What this page was showing before it went full screen, or null when it
@@ -1103,7 +1130,12 @@ public sealed partial class MainPage : Page
 
         double layoutW = ViewportHost.ActualWidth > 0 ? ViewportHost.ActualWidth : 800;
         double zoom = PageScroller.ZoomFactor;
-        double dipsPerPoint = (layoutW / pageWpt) * zoom;
+
+        // A turned page is scaled down to fit its card, so a page point covers
+        // fewer screen DIPs than the zoom alone says. One factor serves both
+        // rulers: the scale is uniform and the turns are quarters, so a point
+        // is the same size on screen along either axis.
+        double dipsPerPoint = (layoutW / pageWpt) * zoom * ViewModel.CurrentViewScale;
         if (dipsPerPoint <= 0) { return; }
 
         // Convert to selected unit. Ticks and labels operate in unit-space so
@@ -4983,6 +5015,8 @@ public sealed partial class MainPage : Page
                 RulersToggle.IsChecked = !RulersToggle.IsChecked;
                 SetRulersVisible(RulersToggle.IsChecked);
                 break;
+            case EditorCommand.RotateViewClockwise: ViewModel.RotateViewClockwise(); break;
+            case EditorCommand.RotateViewCounterClockwise: ViewModel.RotateViewCounterClockwise(); break;
         }
     }
 

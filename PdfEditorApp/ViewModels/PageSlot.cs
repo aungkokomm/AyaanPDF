@@ -22,10 +22,38 @@ public partial class PageSlot : ObservableObject
     /// <summary>1-based, for display.</summary>
     public int DisplayNumber => PageIndex + 1;
 
-    /// <summary>Slot-space size in unzoomed DIPs. Fixed for the document's lifetime.</summary>
+    /// <summary>
+    /// The CARD's slot-space size in unzoomed DIPs. Fixed for as long as the
+    /// layout stands; a view rotation rebuilds the layout and every slot in it.
+    /// </summary>
     public double SlotWidth { get; }
 
     public double SlotHeight { get; }
+
+    /// <summary>
+    /// How this page's content sits inside its card.
+    ///
+    /// Upright this is the identity and the content box IS the card. Turned, it
+    /// is the one thing that knows the difference: the markup binds the four
+    /// numbers below onto a CompositeTransform, and hit testing and the tile
+    /// pass map through it. Nothing else in the app needs to know, because the
+    /// content box keeps its coordinates either way.
+    /// </summary>
+    public PageTransform View { get; }
+
+    /// <summary>Width of the content box, which every rect on the page is measured against.</summary>
+    public double ContentWidth => View.ContentWidth;
+
+    public double ContentHeight => View.ContentHeight;
+
+    // Bound directly by the page card's CompositeTransform.
+    public double ViewScale => View.Scale;
+
+    public double ViewRotation => View.Rotation;
+
+    public double ViewTranslateX => View.TranslateX;
+
+    public double ViewTranslateY => View.TranslateY;
 
     /// <summary>
     /// Null while this page is outside the render window. The card keeps its
@@ -292,10 +320,16 @@ public partial class PageSlot : ObservableObject
     public void EndSharpen() => _isSharpening = false;
 
     public PageSlot(int pageIndex, double slotWidth, double slotHeight)
+        : this(pageIndex, PageTransform.For(slotWidth, slotHeight, 0, slotWidth))
+    {
+    }
+
+    public PageSlot(int pageIndex, PageTransform view)
     {
         PageIndex = pageIndex;
-        SlotWidth = slotWidth;
-        SlotHeight = slotHeight;
+        SlotWidth = view.CardWidth;
+        SlotHeight = view.CardHeight;
+        View = view;
     }
 
     /// <summary>

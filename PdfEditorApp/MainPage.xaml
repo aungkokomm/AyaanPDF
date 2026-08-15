@@ -306,7 +306,41 @@
                                 <Border.Shadow>
                                     <ThemeShadow />
                                 </Border.Shadow>
-                                <Grid>
+                                <!--
+                                    The content box, and the one place view
+                                    rotation happens.
+
+                                    Everything below is positioned in content
+                                    coordinates, so turning this Grid turns the
+                                    page, its tiles, its highlights, its
+                                    annotations and its selection together, in
+                                    step, with no per-layer maths. The card
+                                    around it has already been given the turned
+                                    shape by the layout.
+
+                                    A rotate transform is safe here where the
+                                    scale transform described below was not.
+                                    The objection there was that a transform
+                                    runs AFTER layout, so normalized rects laid
+                                    out at sub-pixel sizes and had no geometry
+                                    to scale up. These children lay out at their
+                                    real slot-DIP sizes first and are turned
+                                    afterwards, which is exactly what the
+                                    ScrollView's own zoom already does to them.
+
+                                    Left/Top alignment, not the default stretch:
+                                    a stretched child would be re-measured to
+                                    the card's turned shape and squash the page.
+                                -->
+                                <Grid Width="{x:Bind ContentWidth}" Height="{x:Bind ContentHeight}"
+                                      HorizontalAlignment="Left" VerticalAlignment="Top">
+                                    <Grid.RenderTransform>
+                                        <CompositeTransform ScaleX="{x:Bind ViewScale}"
+                                                            ScaleY="{x:Bind ViewScale}"
+                                                            Rotation="{x:Bind ViewRotation}"
+                                                            TranslateX="{x:Bind ViewTranslateX}"
+                                                            TranslateY="{x:Bind ViewTranslateY}" />
+                                    </Grid.RenderTransform>
                                     <Image Source="{x:Bind Bitmap, Mode=OneWay}" Stretch="Fill" />
 
                                     <!--
@@ -1116,6 +1150,25 @@
                                                 KeyboardAcceleratorTextOverride="F11" />
                                 <ToggleMenuFlyoutItem x:Name="NightModeToggle" Text="Night mode"
                                                       Click="NightModeToggle_Click" />
+                                <MenuFlyoutSeparator />
+                                <!--
+                                    Turning the VIEW, which is not the same as
+                                    the Rotate page commands under Pages: this
+                                    changes nothing in the file, needs no save,
+                                    and is forgotten when the document closes.
+                                    Worded as "view" for exactly that reason.
+
+                                    Accelerator TEXT only, no accelerator: a
+                                    MenuFlyoutItem's accelerator is dead until
+                                    its flyout has been opened. The chords are
+                                    live through KeyboardCommands instead.
+                                -->
+                                <MenuFlyoutItem Text="Rotate view clockwise" Click="RotateViewCw_Click"
+                                                KeyboardAcceleratorTextOverride="Ctrl+Shift++" />
+                                <MenuFlyoutItem Text="Rotate view anticlockwise" Click="RotateViewCcw_Click"
+                                                KeyboardAcceleratorTextOverride="Ctrl+Shift+-" />
+                                <MenuFlyoutItem x:Name="ResetViewRotationItem" Text="Reset view rotation"
+                                                Click="ResetViewRotation_Click" IsEnabled="False" />
                                 <MenuFlyoutSeparator />
                                 <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
                                                       IsChecked="True" Click="RulersToggle_Click">
@@ -2069,8 +2122,13 @@
                                     <Image
                                         Source="{x:Bind Bitmap, Mode=OneWay}"
                                         Stretch="Uniform"
-                                        Width="{x:Bind CardWidth, Mode=OneWay}"
-                                        Height="{x:Bind CardHeight, Mode=OneWay}" />
+                                        RenderTransformOrigin="0.5,0.5"
+                                        Width="{x:Bind ImageWidth, Mode=OneWay}"
+                                        Height="{x:Bind ImageHeight, Mode=OneWay}">
+                                        <Image.RenderTransform>
+                                            <RotateTransform Angle="{x:Bind ViewRotation, Mode=OneWay}" />
+                                        </Image.RenderTransform>
+                                    </Image>
                                 </Border>
                                 <Border HorizontalAlignment="Right" VerticalAlignment="Bottom"
                                         Margin="0,0,4,4" CornerRadius="8" Padding="6,1"
