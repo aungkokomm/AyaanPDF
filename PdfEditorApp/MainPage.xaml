@@ -1685,18 +1685,78 @@
                     </Button>
                 </StackPanel>
 
-                <!-- Stamps -->
+                <!--
+                    Stamps, in two labelled rows.
+
+                    The built-ins and the user's own PNGs are different kinds of
+                    thing: one set is always there and cannot be deleted, the
+                    other is a folder they control. A single merged strip gave
+                    no way to tell at a glance which was which, or which the
+                    Add and Open-folder buttons act on.
+                -->
                 <StackPanel x:Name="StampSection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">
                     <Rectangle Width="1" Height="18" VerticalAlignment="Center"
                                Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                    <StackPanel Orientation="Vertical" Spacing="2" VerticalAlignment="Center">
+
+                    <!-- Built-in -->
+                    <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                        <TextBlock Text="Built-in" Width="58" VerticalAlignment="Center"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <ListView x:Name="BuiltInStampChoices" SelectionMode="Single"
+                                  SelectionChanged="BuiltInStampChoice_SelectionChanged"
+                                  Padding="0" BorderThickness="0" Background="Transparent"
+                                  AutomationProperties.Name="Built-in stamp"
+                                  ScrollViewer.VerticalScrollMode="Disabled"
+                                  ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                                  ScrollViewer.HorizontalScrollMode="Enabled"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ListView.ItemsPanel>
+                            <ListView.ItemContainerStyle>
+                                <!-- Wider than the PNG tiles because a stamp is
+                                     wide: at 40px APPROVED would be a smear. -->
+                                <Style TargetType="ListViewItem">
+                                    <Setter Property="MinWidth" Value="0" />
+                                    <Setter Property="MinHeight" Value="0" />
+                                    <Setter Property="Width" Value="96" />
+                                    <Setter Property="Height" Value="42" />
+                                    <Setter Property="Padding" Value="0" />
+                                    <Setter Property="Margin" Value="1,0" />
+                                    <Setter Property="CornerRadius" Value="6" />
+                                    <Setter Property="HorizontalContentAlignment" Value="Center" />
+                                    <Setter Property="VerticalContentAlignment" Value="Center" />
+                                </Style>
+                            </ListView.ItemContainerStyle>
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="viewport:BuiltInStamp">
+                                    <Image Width="90" Height="36" Stretch="Uniform"
+                                           ToolTipService.ToolTip="{x:Bind Label}"
+                                           AutomationProperties.Name="{x:Bind Id}"
+                                           Source="{x:Bind local:MainPage.BuiltInStampThumbnail(Id)}" />
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </StackPanel>
+
+                    <!-- The user's own -->
+                    <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Text="My stamps" Width="58" VerticalAlignment="Center"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
                     <TextBlock x:Name="StampEmptyHint" Text="No stamps yet"
                                VerticalAlignment="Center"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                Style="{StaticResource CaptionTextBlockStyle}" />
                     <ListView x:Name="StampChoices" SelectionMode="Single"
                               SelectionChanged="StampChoice_SelectionChanged"
-                              MaxWidth="320" Padding="0" BorderThickness="0" Background="Transparent"
+                              Padding="0" BorderThickness="0" Background="Transparent"
                               AutomationProperties.Name="Stamp"
                               ScrollViewer.VerticalScrollMode="Disabled"
                               ScrollViewer.VerticalScrollBarVisibility="Disabled"
@@ -1711,8 +1771,8 @@
                             <Style TargetType="ListViewItem">
                                 <Setter Property="MinWidth" Value="0" />
                                 <Setter Property="MinHeight" Value="0" />
-                                <Setter Property="Width" Value="40" />
-                                <Setter Property="Height" Value="34" />
+                                <Setter Property="Width" Value="52" />
+                                <Setter Property="Height" Value="42" />
                                 <Setter Property="Padding" Value="0" />
                                 <Setter Property="Margin" Value="1,0" />
                                 <Setter Property="CornerRadius" Value="6" />
@@ -1722,7 +1782,7 @@
                         </ListView.ItemContainerStyle>
                         <ListView.ItemTemplate>
                             <DataTemplate x:DataType="local:StampEntry">
-                                <Image Width="30" Height="26" Stretch="Uniform"
+                                <Image Width="44" Height="36" Stretch="Uniform"
                                        ToolTipService.ToolTip="{x:Bind Name}"
                                        AutomationProperties.Name="{x:Bind Name}"
                                        Source="{x:Bind local:MainPage.StampThumbnail(Path)}" />
@@ -1741,6 +1801,9 @@
                             ToolTipService.ToolTip="Open the stamp folder">
                         <FontIcon Glyph="&#xE838;" FontSize="13" />
                     </Button>
+                    </StackPanel>
+
+                    </StackPanel>
                 </StackPanel>
 
             </StackPanel>

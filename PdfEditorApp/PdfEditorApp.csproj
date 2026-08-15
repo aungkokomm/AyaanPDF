@@ -81,6 +81,20 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
+
+    <!--
+      The typeface the built-in stamps are lettered in, and the notices that
+      have to travel with it. The font is loaded by ms-appx URI at runtime, so
+      it must be beside the exe or every generated stamp silently falls back to
+      whatever DirectWrite substitutes.
+
+      OFL.txt and THIRD-PARTY-NOTICES.txt are not optional extras: the Open
+      Font Licence requires the licence to accompany the font, and MIT requires
+      Tabler's notice to ship with the icon paths.
+    -->
+    <Content Include="Assets\Fonts\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>
@@ -171,6 +185,14 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools.WinApp" Version="0.5.0" />
+    <!--
+      Draws the built-in stamps, and nothing else. A stamp is a rounded box, a
+      word in a bundled font, and sometimes an SVG mark, rasterised at the size
+      it is being placed so it stays sharp at 8x zoom where a shipped PNG would
+      not. The pixels then go down the same add_stamp_annotation path a user's
+      own PNG does, so no other part of the app knows this package exists.
+    -->
+    <PackageReference Include="Microsoft.Graphics.Win2D" Version="1.4.0" />
   </ItemGroup>
 
   <!--

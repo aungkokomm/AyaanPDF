@@ -175,18 +175,43 @@ internal static class StampLibrary
     /// </summary>
     private static string LastUsedPath => Path.Combine(FolderPath, ".last-used");
 
-    public static void RememberLastUsed(StampEntry entry)
+    public static void RememberLastUsed(StampEntry entry) =>
+        // The NAME, not the full path, so the library still works after the
+        // folder is moved or the app is installed somewhere else.
+        RememberLastUsedId(Path.GetFileName(entry.Path));
+
+    /// <summary>
+    /// Remembers a stamp of either kind.
+    ///
+    /// Takes a plain string so a BUILT-IN can be remembered here too. Those are
+    /// written as "builtin:approved", and a colon is illegal in a Windows file
+    /// name, so the two kinds can share this one file without a built-in ever
+    /// being mistaken for a PNG or the other way round.
+    /// </summary>
+    public static void RememberLastUsedId(string entryId)
     {
         try
         {
-            // The NAME, not the full path, so the library still works after
-            // the folder is moved or the app is installed somewhere else.
-            File.WriteAllText(LastUsedPath, Path.GetFileName(entry.Path));
+            File.WriteAllText(LastUsedPath, entryId);
         }
         catch (Exception ex)
         {
             // Never worth interrupting anyone over.
             Diag.Log($"could not remember the last stamp: {ex.Message}");
+        }
+    }
+
+    /// <summary>What was last used, as written: a file name or a built-in id.</summary>
+    public static string LastUsedId()
+    {
+        try
+        {
+            return File.Exists(LastUsedPath) ? File.ReadAllText(LastUsedPath).Trim() : "";
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"could not read the last stamp: {ex.Message}");
+            return "";
         }
     }
 

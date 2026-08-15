@@ -56,6 +56,17 @@ foreach ($native in 'render_core.dll', 'pdfium.dll', 'sample.pdf') {
     if (-not (Test-Path (Join-Path $publishDir $native))) { throw "$native missing from publish output." }
 }
 
+# The bundled typeface and the notices that must legally travel with it. The
+# .iss recurses the whole publish folder, so these ride along on their own, but
+# a missing font is a silent fallback to whatever DirectWrite substitutes and a
+# missing licence is a licence breach. Neither shows up by looking at the app,
+# so both are checked here rather than trusted.
+foreach ($asset in 'Oswald-Bold.ttf', 'OFL.txt', 'THIRD-PARTY-NOTICES.txt') {
+    if (-not (Test-Path (Join-Path $publishDir "Assets\Fonts\$asset"))) {
+        throw "Assets\Fonts\$asset missing from publish output."
+    }
+}
+
 Write-Host "==> Compiling installer with Inno Setup..." -ForegroundColor Cyan
 & $iscc (Join-Path $root 'installer\PdfEditor.iss')
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed (exit $LASTEXITCODE)." }

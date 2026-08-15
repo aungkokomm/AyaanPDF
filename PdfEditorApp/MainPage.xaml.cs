@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -187,6 +187,16 @@ public sealed partial class MainPage : Page
                                                        ViewModel.OverlayScale / 2, pixels);
                     Diag.Log($"autostamp: placed={placed}");
                 }
+            }
+
+            // DIAGNOSTIC (temporary): draws every built-in stamp to one PNG so
+            // the result can be looked at rather than inferred from a green
+            // build.
+            string sheet = Environment.GetEnvironmentVariable("PDFEDITOR_STAMPSHEET") ?? "";
+            if (sheet.Length > 0)
+            {
+                await StampRenderer.DumpContactSheet(
+                    sheet, StampTheme.Default, System.Globalization.CultureInfo.CurrentCulture);
             }
 
             // Exercises the page-organising reload path without a mouse: a
@@ -650,6 +660,8 @@ public sealed partial class MainPage : Page
         {
             ViewModel.RasterizationScale = XamlRoot.RasterizationScale;
         }
+
+        ResizeStampStrip();
 
         if (_autoFit)
         {
@@ -1607,6 +1619,26 @@ public sealed partial class MainPage : Page
     private StampEntry? _selectedStamp;
 
     /// <summary>
+    /// The built-in a click will place, or null.
+    ///
+    /// Exactly one of this and <see cref="_selectedStamp"/> is ever set:
+    /// choosing in either row clears the other. Two armed stamps would leave
+    /// the next click's result down to which branch was read first.
+    /// </summary>
+    private BuiltInStamp? _selectedBuiltIn;
+
+    /// <summary>
+    /// A preview tile for a built-in, drawn by the code that draws the stamp.
+    ///
+    /// Static and by ID, matching StampThumbnail, because that is what an
+    /// x:Bind function in the item template can call.
+    /// </summary>
+    public static Microsoft.UI.Xaml.Media.ImageSource? BuiltInStampThumbnail(string id) =>
+        BuiltInStamps.ById(id) is { } stamp
+            ? StampRenderer.Thumbnail(stamp, StampTheme.Default, 240)
+            : null;
+
+    /// <summary>
     /// A thumbnail for the stamp picker.
     ///
     /// Explicit rather than binding the path string straight to Image.Source:
@@ -1662,21 +1694,38 @@ public sealed partial class MainPage : Page
         {
             StampChoices.ItemsSource = stamps;
 
+            // The built-ins never change, so they are bound once. Rebinding
+            // would throw away every rendered tile and redraw all seventeen on
+            // each arming of the tool.
+            BuiltInStampChoices.ItemsSource ??= BuiltInStamps.All;
+
+            // The tool can be armed before the viewport has ever resized, so
+            // the strip would keep XAML's unbounded default until the window
+            // was touched.
+            ResizeStampStrip();
+
             StampChoices.Visibility = stamps.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
             StampEmptyHint.Visibility = stamps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
 
             // Preselect: this session's choice if there is one, otherwise the
             // one remembered from last time. Someone who keeps a single
-            // signature should never have to pick it twice.
-            var wanted = _selectedStamp is not null
-                ? stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path)
-                : StampLibrary.LastUsed(stamps);
-
-            if (wanted is not null)
+            // signature should never have to pick it twice. A built-in and a
+            // PNG are both candidates, and whichever wins clears the other row.
+            if (_selectedBuiltIn is null && _selectedStamp is null)
             {
-                StampChoices.SelectedItem = wanted;
-                _selectedStamp = wanted;
+                _selectedBuiltIn = BuiltInStamps.FromEntryId(StampLibrary.LastUsedId());
             }
+
+            var wanted = _selectedBuiltIn is not null
+                ? null
+                : _selectedStamp is not null
+                    ? stamps.FirstOrDefault(s => s.Path == _selectedStamp.Path)
+                    : StampLibrary.LastUsed(stamps);
+
+            StampChoices.SelectedItem = wanted;
+            _selectedStamp = wanted;
+
+            BuiltInStampChoices.SelectedItem = _selectedBuiltIn;
         }
         finally
         {
@@ -1696,11 +1745,79 @@ public sealed partial class MainPage : Page
         if (StampChoices.SelectedItem is StampEntry entry)
         {
             _selectedStamp = entry;
+
+            // Only one stamp is armed at a time, so choosing here un-chooses
+            // the built-in row.
+            _selectedBuiltIn = null;
+            ClearOtherStampRow(BuiltInStampChoices);
+
             StampLibrary.RememberLastUsed(entry);
             // Choosing a stamp arms the tool: picking one and then having to
             // find the tool button as well would be a pointless second step.
             SetActiveTool(ToolMode.Stamp);
             ReturnFocusAfterPointerUse();
+        }
+    }
+
+    private void BuiltInStampChoice_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressStampSelection)
+        {
+            return;
+        }
+
+        if (BuiltInStampChoices.SelectedItem is BuiltInStamp stamp)
+        {
+            _selectedBuiltIn = stamp;
+
+            _selectedStamp = null;
+            ClearOtherStampRow(StampChoices);
+
+            StampLibrary.RememberLastUsedId(BuiltInStamps.EntryId(stamp));
+            SetActiveTool(ToolMode.Stamp);
+            ReturnFocusAfterPointerUse();
+        }
+    }
+
+    /// <summary>
+    /// Lets the stamp rows use whatever width the window has.
+    ///
+    /// They used to be pinned at 320 DIP, which is about four tiles. Seventeen
+    /// built-ins want roughly 1300, so the strip scrolled constantly even on a
+    /// maximised window while most of the bar sat empty beside it. Removing the
+    /// cap entirely is not the answer either: the property bar sizes to its
+    /// content, so an uncapped strip would push the bar wider than the window
+    /// and carry its own labels off the edge.
+    ///
+    /// So the cap follows the viewport. The arithmetic is in BuiltInStamps
+    /// where it can be tested.
+    /// </summary>
+    private void ResizeStampStrip()
+    {
+        double available = BuiltInStamps.StripMaxWidth(PageScroller.ViewportWidth);
+
+        BuiltInStampChoices.MaxWidth = available;
+        StampChoices.MaxWidth = available;
+    }
+
+    /// <summary>
+    /// Deselects the other row without letting it re-enter this handler.
+    ///
+    /// The guard matters: clearing a ListView's selection raises
+    /// SelectionChanged, and without it choosing a built-in would immediately
+    /// run the PNG handler with a null selection, which is the same re-entry
+    /// trap RefreshStamps already documents.
+    /// </summary>
+    private void ClearOtherStampRow(ListView other)
+    {
+        _suppressStampSelection = true;
+        try
+        {
+            other.SelectedItem = null;
+        }
+        finally
+        {
+            _suppressStampSelection = false;
         }
     }
 
@@ -1751,16 +1868,33 @@ public sealed partial class MainPage : Page
     /// <summary>Decodes the armed stamp and places it at a page point.</summary>
     private async Task PlaceSelectedStampAsync(int pageIndex, double x, double y)
     {
-        if (_selectedStamp is null)
+        if (_selectedBuiltIn is null && _selectedStamp is null)
         {
             ViewModel.Status = "Choose a stamp first.";
             return;
         }
 
-        var pixels = await StampLibrary.DecodeAsync(_selectedStamp.Path);
+        // A built-in is drawn NOW, at the size it is being placed and with
+        // today's date if it carries one, rather than decoded from a file. From
+        // here down the two kinds are the same buffer of pixels.
+        StampPixels? pixels;
+        string name;
+
+        if (_selectedBuiltIn is { } builtIn)
+        {
+            name = builtIn.Label.Length > 0 ? builtIn.Label : builtIn.Id;
+            pixels = StampRenderer.Render(
+                builtIn, StampTheme.Default, System.Globalization.CultureInfo.CurrentCulture);
+        }
+        else
+        {
+            name = _selectedStamp!.Name;
+            pixels = await StampLibrary.DecodeAsync(_selectedStamp.Path);
+        }
+
         if (pixels is null)
         {
-            ViewModel.Status = $"Could not read {_selectedStamp.Name}.";
+            ViewModel.Status = $"Could not read {name}.";
             return;
         }
 
