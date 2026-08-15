@@ -2309,6 +2309,28 @@
             filtered by range, odd/even and orientation. Laid out here but only
             shown via ShowAsync, so it costs nothing until opened.
         -->
+        <!--
+            Password prompt for an encrypted document.
+
+            A PasswordBox, not a TextBox, so the characters are masked and
+            Windows keeps the field out of the usual text services. Nothing
+            typed here is stored, remembered between documents, or written to
+            the trace.
+        -->
+        <ContentDialog x:Name="PasswordDialog" Title="Password required"
+                       PrimaryButtonText="Open" CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <StackPanel Spacing="12" Width="320">
+                <TextBlock x:Name="PasswordPrompt" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <PasswordBox x:Name="PasswordEntry" PlaceholderText="Password"
+                             HorizontalAlignment="Stretch" />
+                <TextBlock x:Name="PasswordError" Text="That password did not open the document."
+                           Visibility="Collapsed" TextWrapping="Wrap"
+                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
+            </StackPanel>
+        </ContentDialog>
+
         <ContentDialog x:Name="RotatePagesDialog" Title="Rotate pages"
                        PrimaryButtonText="Rotate" CloseButtonText="Cancel"
                        DefaultButton="Primary">

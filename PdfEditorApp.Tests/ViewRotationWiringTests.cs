@@ -142,7 +142,7 @@ public class ViewRotationWiringTests
     {
         // A rotation belongs to the reading session. Carrying it into the next
         // file would show an upright document on its side with no clue why.
-        string body = MethodBody(ViewModel(), "public void OpenDocument");
+        string body = MethodBody(ViewModel(), "public DocumentOpenOutcome OpenDocument");
 
         Assert.Contains("ViewRotation = 0", body, StringComparison.Ordinal);
     }

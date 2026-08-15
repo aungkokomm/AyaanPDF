@@ -45,7 +45,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use lru::LruCache;
-use pdfium_render::prelude::{Pdfium, PdfDocument};
+// The error types come from the prelude, not from pdfium_render::error, which
+// is a private module. The vendored crate carries exactly one patch and this is
+// not worth being the second.
+use pdfium_render::prelude::{Pdfium, PdfDocument, PdfiumError, PdfiumInternalError};
 
 // ---------------------------------------------------------------------
 // FFI result type
@@ -75,6 +78,15 @@ pub const STATUS_OK_PLACEHOLDER: i32 = 3;
 /// Distinct from STATUS_INVALID_INPUT so a caller can tell "you asked wrongly"
 /// from "ask a different way", and fall back rather than surface an error.
 pub const STATUS_UNSUPPORTED: i32 = 4;
+
+/// The file is a real PDF but is encrypted, and the password given (if any)
+/// did not open it.
+///
+/// Distinct from every other failure because it is the one the user can do
+/// something about. Reported the same way for "no password supplied" and
+/// "wrong password supplied": PDFium does not distinguish them, and neither
+/// does any reader's prompt.
+pub const STATUS_NEEDS_PASSWORD: i32 = 5;
 
 pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
@@ -278,28 +290,85 @@ pub extern "C" fn open_document(path: *const c_char) -> u64 {
 }
 
 fn open_document_inner(path: *const c_char) -> u64 {
+    open_protected_inner(path, std::ptr::null()).handle
+}
+
+/// The outcome of trying to open a document: the handle, and why not.
+#[repr(C)]
+pub struct OpenResult {
+    /// Non-zero on success. Zero on every failure.
+    pub handle: u64,
+    /// STATUS_OK_PDFIUM, STATUS_NEEDS_PASSWORD, or STATUS_INVALID_INPUT.
+    pub status: i32,
+}
+
+/// Opens a document, optionally with a password.
+///
+/// Separate from `open_document` because a caller has to be able to tell an
+/// encrypted file from a broken one: the first is a prompt, the second is an
+/// error message, and returning zero for both meant every protected PDF in the
+/// world looked to this app like a corrupt file.
+///
+/// A null or empty password means "try without one", which is also what opens
+/// a document that is encrypted but carries an empty user password, the common
+/// case where a PDF restricts printing or editing but not reading.
+///
+/// # Safety
+/// `path` and `password` must be null or valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn open_document_protected(
+    path: *const c_char,
+    password: *const c_char,
+) -> OpenResult {
+    panic::catch_unwind(|| open_protected_inner(path, password)).unwrap_or(OpenResult {
+        handle: 0,
+        status: STATUS_PANIC,
+    })
+}
+
+fn open_protected_inner(path: *const c_char, password: *const c_char) -> OpenResult {
+    let failed = |status| OpenResult { handle: 0, status };
+
     if path.is_null() {
-        return 0;
+        return failed(STATUS_INVALID_INPUT);
     }
     let Ok(path_str) = (unsafe { CStr::from_ptr(path) }).to_str() else {
-        return 0;
+        return failed(STATUS_INVALID_INPUT);
+    };
+
+    // An empty password is the same as none. Passing "" through to PDFium is
+    // not: it treats it as an attempt and fails a document that would have
+    // opened unprotected.
+    let password_str = if password.is_null() {
+        None
+    } else {
+        match (unsafe { CStr::from_ptr(password) }).to_str() {
+            Ok("") => None,
+            Ok(text) => Some(text),
+            Err(_) => return failed(STATUS_INVALID_INPUT),
+        }
     };
 
     let document = {
         let _guard = lock(&CALL_LOCK);
         let Some(pdfium) = pdfium() else {
-            return 0;
+            return failed(STATUS_INVALID_INPUT);
         };
-        let Ok(document) = pdfium.load_pdf_from_file(path_str, None) else {
-            return 0;
-        };
-        document
+
+        match pdfium.load_pdf_from_file(path_str, password_str) {
+            Ok(document) => document,
+            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
+                return failed(STATUS_NEEDS_PASSWORD);
+            }
+            Err(_) => return failed(STATUS_INVALID_INPUT),
+        }
     };
 
     let core = core();
     let id = core.next_doc_id.fetch_add(1, Ordering::Relaxed);
     lock(&core.documents).insert(id, Arc::new(Mutex::new(document)));
-    id
+
+    OpenResult { handle: id, status: STATUS_OK_PDFIUM }
 }
 
 /// Closes a document opened by `open_document` and evicts any cached tiles
@@ -14739,6 +14808,161 @@ mod tests {
             bbox.0,
             bbox.2
         );
+    }
+
+    // ---------------- Encrypted documents ----------------
+
+    /// The password on the generated fixture. Not a secret: it is checked in.
+    const FIXTURE_PASSWORD: &str = "hunter2";
+
+    /// Builds an encrypted PDF beside the other fixtures, if it is not there.
+    ///
+    /// Generated rather than committed as an opaque blob, so what makes it
+    /// encrypted is readable, and so it can be rebuilt if it is ever lost. RC4
+    /// 128-bit: it is what most protected PDFs in the wild actually use, and
+    /// the point is to exercise PDFium's password path, not a cipher.
+    fn encrypted_fixture() -> String {
+        use lopdf::encryption::{EncryptionState, EncryptionVersion};
+        use lopdf::Permissions;
+
+        let path = "tests/fixtures/sample_encrypted.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        let mut doc = lopdf::Document::load("tests/fixtures/sample.pdf")
+            .expect("the plain fixture must be there to encrypt");
+
+        // The standard security handler mixes the file's /ID into the key, so a
+        // document without one cannot be encrypted at all. The plain fixture
+        // has no /ID, so give it a fixed one: fixed rather than random, so
+        // rebuilding the fixture produces the same bytes.
+        let id: Vec<u8> = (0u8..16).collect();
+        doc.trailer.set(
+            "ID",
+            lopdf::Object::Array(vec![
+                lopdf::Object::String(id.clone(), lopdf::StringFormat::Hexadecimal),
+                lopdf::Object::String(id, lopdf::StringFormat::Hexadecimal),
+            ]),
+        );
+
+        let version = EncryptionVersion::V2 {
+            document: &doc,
+            owner_password: "owner-of-the-fixture",
+            user_password: FIXTURE_PASSWORD,
+            // BITS, not bytes: this is written straight into /Length, which the
+            // spec defines in bits. 16 produced a document PDFium would not
+            // open with the correct password.
+            key_length: 128,
+            permissions: Permissions::all(),
+        };
+
+        let state = EncryptionState::try_from(version).expect("failed to build encryption state");
+        doc.encrypt(&state).expect("failed to encrypt the fixture");
+
+        // Written aside and renamed into place. Tests run in parallel and every
+        // one of them wants this file, so writing directly would let one read a
+        // half-written PDF and fail for a reason that has nothing to do with
+        // what it is testing.
+        let staging = std::env::temp_dir().join(format!("enc_fixture_{}.pdf", std::process::id()));
+        doc.save(&staging).expect("failed to write the encrypted fixture");
+        let _ = std::fs::rename(&staging, &path);
+
+        path
+    }
+
+    fn open_protected(path: &str, password: Option<&str>) -> OpenResult {
+        let c_path = std::ffi::CString::new(path).unwrap();
+        match password {
+            Some(text) => {
+                let c_pw = std::ffi::CString::new(text).unwrap();
+                open_document_protected(c_path.as_ptr(), c_pw.as_ptr())
+            }
+            None => open_document_protected(c_path.as_ptr(), std::ptr::null()),
+        }
+    }
+
+    #[test]
+    fn an_encrypted_document_asks_for_a_password_rather_than_looking_broken() {
+        // The whole point of the new status. Before this, a protected PDF and a
+        // corrupt one were both a zero handle, so every protected PDF in the
+        // world looked to the app like a damaged file.
+        let result = open_protected(&encrypted_fixture(), None);
+
+        assert_eq!(result.handle, 0);
+        assert_eq!(
+            result.status, STATUS_NEEDS_PASSWORD,
+            "an encrypted document must be distinguishable from a broken one"
+        );
+    }
+
+    #[test]
+    fn the_right_password_opens_the_document() {
+        let result = open_protected(&encrypted_fixture(), Some(FIXTURE_PASSWORD));
+
+        assert_eq!(result.status, STATUS_OK_PDFIUM);
+        assert_ne!(result.handle, 0);
+
+        // Really open, not merely accepted: it renders.
+        let page = render_low_res(result.handle, 0, 120);
+        assert_eq!(page.status, STATUS_OK_PDFIUM);
+        free_render_result(page);
+
+        close_document(result.handle);
+    }
+
+    #[test]
+    fn a_wrong_password_asks_again_rather_than_failing_hard() {
+        // Reported the same way as no password at all, because that is what the
+        // prompt does with it: ask again.
+        let result = open_protected(&encrypted_fixture(), Some("not-the-password"));
+
+        assert_eq!(result.handle, 0);
+        assert_eq!(result.status, STATUS_NEEDS_PASSWORD);
+    }
+
+    #[test]
+    fn a_corrupt_file_is_not_reported_as_needing_a_password() {
+        // The other half of the distinction. Prompting for a password on a file
+        // that is simply not a PDF would send the user hunting for a password
+        // that does not exist.
+        let junk = std::env::temp_dir().join("render_core_not_a_pdf.pdf");
+        std::fs::write(&junk, b"this is not a PDF at all").unwrap();
+
+        let result = open_protected(junk.to_str().unwrap(), None);
+
+        assert_eq!(result.handle, 0);
+        assert_eq!(result.status, STATUS_INVALID_INPUT);
+
+        let _ = std::fs::remove_file(&junk);
+    }
+
+    #[test]
+    fn an_unprotected_document_is_unaffected_by_the_new_path() {
+        // Every document anyone opens goes through this now, so the ordinary
+        // case has to be exactly what it was.
+        let plain = open_protected("tests/fixtures/sample.pdf", None);
+        assert_eq!(plain.status, STATUS_OK_PDFIUM);
+        assert_ne!(plain.handle, 0);
+        close_document(plain.handle);
+
+        // An empty password means "none", not "try the empty string", which
+        // PDFium would treat as a failed attempt on an unprotected file.
+        let empty = open_protected("tests/fixtures/sample.pdf", Some(""));
+        assert_eq!(empty.status, STATUS_OK_PDFIUM);
+        assert_ne!(empty.handle, 0);
+        close_document(empty.handle);
+    }
+
+    #[test]
+    fn the_old_entry_point_still_behaves() {
+        // open_document is now a thin call onto the protected path. It must
+        // keep returning a bare handle, and zero for a document it cannot open.
+        let handle = open_fixture_named("tests/fixtures/sample.pdf");
+        close_document(handle);
+
+        let c_path = std::ffi::CString::new(encrypted_fixture()).unwrap();
+        assert_eq!(open_document(c_path.as_ptr()), 0);
     }
 }
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 
 namespace PdfEditorApp.Interop;
@@ -238,6 +238,17 @@ internal struct BurnNote
 }
 
 /// <summary>Mirrors render_core::{STATUS_*} (src/lib.rs).</summary>
+/// <summary>Mirrors render_core::OpenResult (src/lib.rs).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeOpenResult
+{
+    /// <summary>Non-zero on success, zero on every failure.</summary>
+    public ulong Handle;
+
+    /// <summary>One of <see cref="RenderStatus"/>.</summary>
+    public int Status;
+}
+
 internal static class RenderStatus
 {
     public const int OkPdfium = 0;
@@ -252,6 +263,15 @@ internal static class RenderStatus
     /// which has to be done by deleting and re-adding at the new size.
     /// </summary>
     public const int Unsupported = 4;
+
+    /// <summary>
+    /// A real PDF, but encrypted, and the password given (if any) did not open
+    /// it. The one failure the user can do something about, which is why it is
+    /// distinct: reported for both "no password yet" and "wrong password",
+    /// because PDFium does not tell them apart and the prompt does the same
+    /// thing either way.
+    /// </summary>
+    public const int NeedsPassword = 5;
 }
 
 /// <summary>Mirrors render_core::{POLL_*} (src/lib.rs).</summary>
@@ -274,6 +294,18 @@ internal static partial class RenderCoreNative
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong open_document([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>
+    /// Opens a document, optionally with a password, and says why not.
+    ///
+    /// Pass null for the password to try without one. That is also what opens a
+    /// document carrying an empty user password, which is the common case where
+    /// a PDF restricts printing or editing but not reading.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern NativeOpenResult open_document_protected(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? password);
 
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern void close_document(ulong docHandle);

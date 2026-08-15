@@ -144,11 +144,11 @@ public sealed partial class MainPage : Page
                 // A tab opened for a specific file. Set before this page is
                 // shown, because a Page has no constructor the window can pass
                 // arguments to.
-                ViewModel.OpenDocument(wanted);
+                await LoadDocumentAsync(wanted);
             }
             else if (probe.Length > 0 && System.IO.File.Exists(probe))
             {
-                ViewModel.OpenDocument(probe);
+                await LoadDocumentAsync(probe);
             }
             else if (StartBlank)
             {
@@ -3347,7 +3347,7 @@ public sealed partial class MainPage : Page
     /// from the empty state should use the tab already in front rather than
     /// leave an empty one behind it.
     /// </summary>
-    private void OpenPickedFile(string path)
+    private async void OpenPickedFile(string path)
     {
         if (App.Window is MainWindow w && (ViewModel.HasDocumentPath || ViewModel.IsDirty))
         {
@@ -3355,9 +3355,80 @@ public sealed partial class MainPage : Page
         }
         else
         {
-            ViewModel.OpenDocument(path);
+            await LoadDocumentAsync(path);
         }
         Debug.WriteLine($"[MainPage] Opened \"{path}\"");
+    }
+
+    /// <summary>
+    /// Opens a document into THIS page, asking for a password if it needs one.
+    ///
+    /// The single way a file reaches this page's view model. An encrypted PDF
+    /// is not a broken one, and the difference is only useful if every entry
+    /// point acts on it: the picker, a dropped file, the recent list, the
+    /// welcome screen, a tab opened for a path and the headless auto-open all
+    /// come through here.
+    ///
+    /// Nothing typed into the prompt is kept. It is not stored, not carried to
+    /// the next document, and not written to the trace; it exists for the
+    /// length of one call and is overwritten before the box is shown again.
+    /// </summary>
+    private async System.Threading.Tasks.Task<DocumentOpenOutcome> LoadDocumentAsync(string path)
+    {
+        var outcome = ViewModel.OpenDocument(path);
+        if (outcome != DocumentOpenOutcome.NeedsPassword)
+        {
+            return outcome;
+        }
+
+        PasswordPrompt.Text =
+            $"“{System.IO.Path.GetFileName(path)}” is protected. Enter its password to open it.";
+        PasswordError.Visibility = Visibility.Collapsed;
+        PasswordEntry.Password = string.Empty;
+        PasswordDialog.XamlRoot = XamlRoot;
+
+        // Keeps asking, the way every other reader does. There is no attempt
+        // limit: PDFium does not impose one, the document is local, and locking
+        // someone out of their own file after three tries would only mean
+        // reopening it to try again.
+        while (true)
+        {
+            ContentDialogResult answer;
+            try
+            {
+                answer = await PasswordDialog.ShowAsync();
+            }
+            catch (Exception ex)
+            {
+                // ShowAsync throws if another ContentDialog is already open on
+                // this root, which two tabs both auto-opening protected files
+                // would do. Two of the callers here are async void, so an
+                // escaping exception is raised where nothing observes it and
+                // takes the process down with no message. Treated as a cancel.
+                Diag.Log($"password prompt could not be shown: {ex.GetType().Name}");
+                ViewModel.AbandonOpen();
+                return DocumentOpenOutcome.NeedsPassword;
+            }
+
+            if (answer != ContentDialogResult.Primary)
+            {
+                // Cancelled. The tab is left empty rather than named after a
+                // document it does not have, and the file is not in the recent
+                // list because it never opened.
+                ViewModel.AbandonOpen();
+                return DocumentOpenOutcome.NeedsPassword;
+            }
+
+            outcome = ViewModel.OpenDocument(path, password: PasswordEntry.Password);
+            PasswordEntry.Password = string.Empty;
+
+            if (outcome != DocumentOpenOutcome.NeedsPassword)
+            {
+                return outcome;
+            }
+
+            PasswordError.Visibility = Visibility.Visible;
+        }
     }
 
     /// <summary>

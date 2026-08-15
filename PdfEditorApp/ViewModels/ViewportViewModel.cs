@@ -717,12 +717,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// Opens a PDF. <paramref name="preserveAnnotations"/> is only set by the
     /// save path, which reloads the SAME file to discard a burned copy and
     /// must keep the overlays that are still pending.
+    ///
+    /// <paramref name="password"/> is null on the first try. A caller that gets
+    /// back <see cref="DocumentOpenOutcome.NeedsPassword"/> asks the user and
+    /// calls again with what they typed.
     /// </summary>
-    public void OpenDocument(string path, bool preserveAnnotations = false)
+    public DocumentOpenOutcome OpenDocument(
+        string path, bool preserveAnnotations = false, string? password = null)
     {
         CloseCurrentDocument();
 
-        _documentHandle = RenderCoreNative.open_document(path);
+        var opened = RenderCoreNative.open_document_protected(path, password);
+        _documentHandle = opened.Handle;
         _currentDocumentPath = path;
         NotifyDocumentTitleChanged();
 
@@ -786,8 +792,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_documentHandle == 0)
         {
             PageCount = 0;
+
+            // The path the file is ON is never logged with the attempt, and the
+            // password never is at all. A trace the user might send on is not
+            // the place for either.
+            if (opened.Status == RenderStatus.NeedsPassword)
+            {
+                Status = $"{Path.GetFileName(path)} is password protected";
+                Diag.Log("open refused: document is encrypted");
+                return DocumentOpenOutcome.NeedsPassword;
+            }
+
             Status = $"Failed to open {Path.GetFileName(path)}";
-            return;
+            return DocumentOpenOutcome.Failed;
         }
 
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
@@ -803,6 +820,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         LoadFormFields();
         LoadBookmarks();
         LoadGuidesFromSidecar();
+        return DocumentOpenOutcome.Opened;
     }
 
     // ---------------- Guide persistence (sidecar JSON) ----------------
@@ -9721,6 +9739,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RenderCoreNative.close_document(_documentHandle);
             _documentHandle = 0;
         }
+    }
+
+    /// <summary>
+    /// Gives up on a document that was never opened, leaving an empty tab.
+    ///
+    /// A refused password is the only caller. OpenDocument records the path
+    /// before it knows whether the file will open, so without this the tab
+    /// would sit there named after a document it does not have, offering to
+    /// save it.
+    /// </summary>
+    public void AbandonOpen()
+    {
+        CloseCurrentDocument();
+
+        _currentDocumentPath = null;
+        PageCount = 0;
+        Thumbnails.Clear();
+        PageSlots.Clear();
+        IsDirty = false;
+        NotifyDocumentTitleChanged();
+        RebuildContinuousLayout();
     }
 
     public void Dispose() => CloseCurrentDocument();
