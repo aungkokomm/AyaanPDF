@@ -175,7 +175,11 @@ internal static class StampRenderer
         }
 
         await sheet.SaveAsync(path, CanvasBitmapFileFormat.Png);
-        Diag.Log($"stamp contact sheet written to {path}");
+        // The NAME, not the path. Whoever set PDFEDITOR_STAMPSHEET already knows
+        // where they pointed it, and a full path here puts the account name and
+        // whatever folder it happened to be run from into a log the About dialog
+        // offers to open.
+        Diag.Log($"stamp contact sheet written: {Path.GetFileName(path)}");
     }
 
     /// <summary>Draws a stamp and returns its PREMULTIPLIED pixels.</summary>

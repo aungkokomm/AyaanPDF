@@ -1664,7 +1664,7 @@ public sealed partial class MainPage : Page
         {
             // A stamp that cannot be shown must not take the picker down with
             // it; it simply appears blank and the rest still work.
-            Diag.Log($"stamp thumbnail failed for {path}: {ex.Message}");
+            Diag.Log($"stamp thumbnail failed for {System.IO.Path.GetFileName(path)}: {ex.Message}");
         }
 
         return image;

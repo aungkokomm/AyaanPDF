@@ -295,7 +295,7 @@ internal static class StampLibrary
         }
         catch (Exception ex)
         {
-            Diag.Log($"stamp decode failed for {path}: {ex.Message}");
+            Diag.Log($"stamp decode failed for {Path.GetFileName(path)}: {ex.Message}");
             return null;
         }
     }
