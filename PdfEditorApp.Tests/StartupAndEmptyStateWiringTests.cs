@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using Xunit;
 
@@ -111,12 +112,31 @@ public class StartupAndEmptyStateWiringTests
         Assert.DoesNotContain("startBlank", body, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The whole welcome Border, bounded by its own closing tag.
+    ///
+    /// Not a character count. The block grew from a four-line empty state into
+    /// a welcome screen with a recent list, and a fixed window silently stopped
+    /// covering the part that mattered, which is the third time that has caught
+    /// a test in this file out.
+    /// </summary>
+    private static string WelcomeBlock()
+    {
+        string xaml = MainPageXaml();
+        int at = xaml.IndexOf("x:Name=\"EmptyState\"", StringComparison.Ordinal);
+        Assert.True(at >= 0, "the welcome state is gone; this test needs rewriting to match");
+
+        int end = xaml.IndexOf("</Border>", at, StringComparison.Ordinal);
+        Assert.True(end > at, "the welcome Border is never closed");
+        return xaml[at..end];
+    }
+
     // ---------------- The empty state ----------------
 
     [Fact]
     public void the_empty_state_offers_to_open_a_pdf()
     {
-        string block = Section(MainPageXaml(), "x:Name=\"EmptyState\"", 1800);
+        string block = WelcomeBlock();
 
         Assert.Contains("Open a PDF", block, StringComparison.Ordinal);
         Assert.Contains("Click=\"EmptyStateOpen_Click\"", block, StringComparison.Ordinal);
@@ -133,11 +153,11 @@ public class StartupAndEmptyStateWiringTests
     public void the_empty_state_says_a_pdf_can_be_dropped_on_it()
     {
         // Nothing about a blank canvas suggests it is a drop target, so the
-        // affordance has to be words.
-        Assert.Contains(
-            "Drag and drop a PDF here to open",
-            Section(MainPageXaml(), "x:Name=\"EmptyState\"", 1800),
-            StringComparison.Ordinal);
+        // affordance has to be words. The exact wording is free to change; that
+        // it says "drop" and says "PDF" is not.
+        string block = WelcomeBlock();
+
+        Assert.Contains("drop a PDF", block, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -146,7 +166,7 @@ public class StartupAndEmptyStateWiringTests
         // Saying so and doing so are separate: without AllowDrop and a DragOver
         // that sets AcceptedOperation, the cursor shows "no" and Drop never
         // fires.
-        string block = Section(MainPageXaml(), "x:Name=\"EmptyState\"", 1800);
+        string block = WelcomeBlock();
 
         Assert.Contains("AllowDrop=\"True\"", block, StringComparison.Ordinal);
         Assert.Contains("DragOver=\"EmptyState_DragOver\"", block, StringComparison.Ordinal);
@@ -184,14 +204,23 @@ public class StartupAndEmptyStateWiringTests
     [Fact]
     public void the_empty_state_is_themed_rather_than_painted_white()
     {
-        // It carried #8AFFFFFF and #C8FFFFFF, which is near-white text on a
-        // canvas that is white in Light and Sepia. Invisible, and invisible for
-        // months because a blank document always covered it.
-        string block = Section(MainPageXaml(), "x:Name=\"EmptyState\"", 1800);
+        // This test used to say the opposite, and it was WRONG.
+        //
+        // It claimed the canvas is white in Light and Sepia and therefore
+        // demanded ThemeResource TextFillColor. The canvas is not white in any
+        // theme: it is #3A3A3D in Light, #4E3F2A in Sepia, #252528 in Dark and
+        // #0F1A3C in Midnight, deliberately, because a white page only reads as
+        // a sheet against something darker than itself. ThemeResource follows
+        // the APP theme, so in Light and Sepia it resolved to near black and
+        // put dark text on a dark canvas. The welcome screen shipped unreadable
+        // and this test held it that way.
+        //
+        // What is actually required: text on the canvas uses the fixed light
+        // OnCanvas brushes, which work against all four canvas colours.
+        string block = WelcomeBlock();
 
-        Assert.DoesNotContain("#8AFFFFFF", block, StringComparison.Ordinal);
-        Assert.DoesNotContain("#C8FFFFFF", block, StringComparison.Ordinal);
-        Assert.Contains("ThemeResource TextFillColor", block, StringComparison.Ordinal);
+        Assert.Contains("OnCanvas", block, StringComparison.Ordinal);
+        Assert.DoesNotContain("ThemeResource TextFillColor", block, StringComparison.Ordinal);
     }
 
     // ---------------- The page fills the window ----------------
@@ -211,6 +240,112 @@ public class StartupAndEmptyStateWiringTests
         string block = Section(MainWindowXaml(), "<TabView x:Name=\"Tabs\"", 400);
 
         Assert.Contains("VerticalAlignment=\"Stretch\"", block, StringComparison.Ordinal);
+    }
+
+    // ---------------- The welcome screen ----------------
+
+    [Fact]
+    public void the_tab_with_no_document_is_called_welcome()
+    {
+        // "Untitled" described it accurately and said nothing: it is not an
+        // untitled document, it is not a document. This is the first word a new
+        // user reads.
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int at = vm.IndexOf("public string TabTitle", StringComparison.Ordinal);
+        Assert.True(at >= 0, "TabTitle is gone; this test needs rewriting to match");
+
+        string body = vm[at..Math.Min(vm.Length, at + 600)];
+
+        Assert.Contains("\"Welcome\"", body, StringComparison.Ordinal);
+
+        // Only when there is no document at all. File > New makes a real blank
+        // document, which is genuinely untitled.
+        Assert.Contains("PageCount == 0", body, StringComparison.Ordinal);
+        Assert.Contains("HasDocumentPath", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_welcome_screen_lists_recent_documents()
+    {
+        string block = WelcomeBlock();
+
+        Assert.Contains("x:Name=\"WelcomeRecent\"", block, StringComparison.Ordinal);
+        Assert.Contains("Click=\"WelcomeRecent_Click\"", block, StringComparison.Ordinal);
+
+        // Bound to the tested builder rather than assembling rows in the view.
+        Assert.Contains(
+            "WelcomeList.Build(",
+            Section(MainPageCode(), "private void RefreshWelcome", 500),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_recent_rows_say_where_reading_stopped()
+    {
+        // The reason this beats a plain recent-files menu, and the reason the
+        // reading-position work is worth having on this screen.
+        Assert.Contains("{x:Bind Resume}", WelcomeBlock(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_recent_row_that_no_longer_exists_is_not_offered()
+    {
+        // A row that fails when clicked is a worse first impression than a
+        // shorter list. File.Exists is passed in so the rule stays testable.
+        Assert.Contains(
+            "File.Exists",
+            Section(MainPageCode(), "private void RefreshWelcome", 500),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_recent_list_is_rebuilt_rather_than_cached()
+    {
+        // Files move and get deleted between runs, and closing the last
+        // document lands back on this screen mid-session.
+        Assert.Contains(
+            "RefreshWelcome()",
+            Section(MainPageCode(), "private void UpdateChromeForDocument", 400),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_recent_heading_is_hidden_when_there_is_nothing_to_show()
+    {
+        // A first run should be a clean two-button screen, not an empty heading
+        // over an empty box.
+        string body = Section(MainPageCode(), "private void RefreshWelcome", 700);
+
+        Assert.Contains("WelcomeRecentSection.Visibility", body, StringComparison.Ordinal);
+        Assert.Contains("rows.Count > 0", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void opening_a_recent_document_uses_the_same_path_as_everything_else()
+    {
+        // Three copies of "new tab or this one?" is how they drift.
+        Assert.Contains(
+            "OpenPickedFile(",
+            Section(MainPageCode(), "private void WelcomeRecent_Click", 300),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_welcome_icon_comes_from_a_high_resolution_bitmap()
+    {
+        // An earlier version of this test demanded a DecodePixelWidth on the
+        // .ico instead, and that was wrong: it made the title-bar copy visibly
+        // worse, because forcing a large frame down into 27 real pixels is not
+        // the same as picking the right frame.
+        //
+        // The rule that actually holds: an .ico is ten frames and a guess about
+        // which to use, so anything rendered LARGE takes the 300px PNG, which
+        // is one bitmap scaling down. The title bar's 18 DIP copy keeps the
+        // .ico, where a small frame renders at close to native size.
+        string block = WelcomeBlock();
+
+        Assert.Contains("Square150x150Logo.scale-200.png", block, StringComparison.Ordinal);
+        Assert.DoesNotContain("AppIcon.ico", block, StringComparison.Ordinal);
     }
 
     // ---------------- Ctrl+Q ----------------

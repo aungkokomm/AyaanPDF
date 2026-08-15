@@ -1494,6 +1494,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public bool HasDocumentPath => _currentDocumentPath is not null;
 
     /// <summary>
+    /// The open file's path, or null for a document that has never been saved.
+    ///
+    /// Exposed so the reading position can be keyed against it. Read-only: the
+    /// path is set by opening and saving, and nothing else may move it.
+    /// </summary>
+    public string? DocumentPath => _currentDocumentPath;
+
+    /// <summary>
     /// What the title bar shows. The bullet is the unsaved marker, the same
     /// convention as every editor, so the window itself says whether there is
     /// work that would be lost.
@@ -1501,11 +1509,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public string WindowTitle =>
         $"{(IsDirty ? "• " : string.Empty)}{DocumentTitle} - Ayaan PDF";
 
+    /// <summary>
+    /// What a TAB says: the file name, and a dot if it has unsaved work.
+    ///
+    /// Not WindowTitle, which the tabs were using. That appends " - Ayaan PDF",
+    /// which is right above the taskbar and absurd on a tab inside the app that
+    /// already says so: every tab read "something - Ayaan PDF" in a window
+    /// titled Ayaan PDF.
+    /// </summary>
+    public string TabTitle =>
+        // "Welcome" for a tab holding no document at all, which is the first
+        // thing a new user reads. "Untitled" described it accurately and said
+        // nothing: it is not an untitled document, it is not a document.
+        // File > New still produces a real blank document and keeps "Untitled".
+        PageCount == 0 && !HasDocumentPath
+            ? "Welcome"
+            : $"{(IsDirty ? "• " : string.Empty)}{DocumentTitle}";
+
     private void NotifyDocumentTitleChanged()
     {
         OnPropertyChanged(nameof(DocumentTitle));
         OnPropertyChanged(nameof(HasDocumentPath));
         OnPropertyChanged(nameof(WindowTitle));
+        OnPropertyChanged(nameof(TabTitle));
     }
 
 
@@ -1988,6 +2014,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>Slot-space top of a page, for scroll-to-page.</summary>
     public double SlotTopOf(int pageIndex) => _layout.TopOf(pageIndex);
+
+    /// <summary>
+    /// Slot-space height of a page, or 0 if there is no such page.
+    ///
+    /// Pages are not all the same height, so remembering a reading position as
+    /// "part-way down page N" needs the height of that particular page rather
+    /// than an average.
+    /// </summary>
+    public double SlotHeightOf(int pageIndex) =>
+        pageIndex >= 0 && pageIndex < _layout.Slots.Count
+            ? _layout.Slots[pageIndex].Height
+            : 0;
 
     /// <summary>Which page contains the given Y in slot-space (ViewportHost's
     /// content minus Padding.Top), or -1 if the Y is above the first page or
@@ -8394,6 +8432,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(DirtyIndicatorVisibility));
         // The title carries the unsaved marker too, so it follows the same flag.
         OnPropertyChanged(nameof(WindowTitle));
+        OnPropertyChanged(nameof(TabTitle));
     }
 
     private void NotifyHistoryChanged()

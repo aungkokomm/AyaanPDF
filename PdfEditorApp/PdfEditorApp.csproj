@@ -65,7 +65,18 @@
   <ItemGroup>
     <Content Include="Assets\SplashScreen.scale-200.png" />
     <Content Include="Assets\LockScreenLogo.scale-200.png" />
-    <Content Include="Assets\Square150x150Logo.scale-200.png" />
+    <!--
+      COPIED, unlike its neighbours, because the welcome screen loads it by
+      ms-appx at runtime rather than only being packaged from it.
+
+      An unpackaged app resolves ms-appx to the folder beside the exe, so an
+      asset that is Content but not copied simply is not there: the Image
+      renders nothing, silently, with no error anywhere. AppIcon.ico above
+      carries the same directive for exactly the same reason.
+    -->
+    <Content Include="Assets\Square150x150Logo.scale-200.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="Assets\Square44x44Logo.scale-200.png" />
     <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
     <Content Include="Assets\Square44x44Logo.targetsize-48_altform-lightunplated.png" />

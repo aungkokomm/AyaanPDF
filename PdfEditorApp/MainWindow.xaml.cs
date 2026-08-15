@@ -84,7 +84,8 @@ public sealed partial class MainWindow : Window
         var item = new TabViewItem
         {
             Content = page,
-            Header = System.IO.Path.GetFileName(path) ?? "Untitled",
+            // A tab with no document is the welcome screen, and says so.
+            Header = System.IO.Path.GetFileName(path) ?? "Welcome",
             IconSource = new SymbolIconSource { Symbol = Symbol.Document },
         };
 
@@ -93,7 +94,10 @@ public sealed partial class MainWindow : Window
         // window.
         page.DocumentTitleChanged += p =>
         {
-            item.Header = p.DocumentTitle;
+            // The TAB gets the file name; the WINDOW gets the full title. They
+            // used to share one string, so every tab read "name - Ayaan PDF"
+            // inside a window already called Ayaan PDF.
+            item.Header = p.TabTitle;
             if (ReferenceEquals(ActivePage, p))
             {
                 SetDocumentTitle(p.DocumentTitle);

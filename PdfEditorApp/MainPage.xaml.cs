@@ -535,10 +535,44 @@ public sealed partial class MainPage : Page
         _autoFit = true;
         DispatcherQueue.TryEnqueue(() =>
         {
-            FitToWidth();
+            // This is the only moment a position can be restored: the pages now
+            // have sizes, so there is somewhere to scroll TO.
+            //
+            // Guarded on the PATH rather than run every time, because this also
+            // fires when a page is inserted, deleted or reordered, and yanking
+            // the view back to where reading was left in the middle of editing
+            // would be worse than never restoring at all.
+            bool firstForThisFile =
+                ViewModel.DocumentPath is { Length: > 0 } path
+                && !string.Equals(path, _restoredForPath, StringComparison.OrdinalIgnoreCase);
+
+            if (firstForThisFile)
+            {
+                _restoredForPath = ViewModel.DocumentPath;
+            }
+
+            // A remembered place wins. Failing that, the SAVED DEFAULT VIEW
+            // decides, which it did not before: this called FitToWidth outright,
+            // so Fit page and Actual size were only ever applied at the moment
+            // they were chosen in the settings dialog and never on opening a
+            // document.
+            if (!firstForThisFile || !RestoreReadingPosition())
+            {
+                ApplyDefaultView();
+            }
+
             PushVisibleWindow();
         });
     }
+
+    /// <summary>
+    /// The file whose position has already been restored in this page.
+    ///
+    /// Reopening the same document in the same tab has to restore again, so
+    /// this is cleared when a document closes rather than kept for the life of
+    /// the page.
+    /// </summary>
+    private string? _restoredForPath;
 
     /// <summary>Available content width in DIPs, excluding the canvas padding.</summary>
     private double AvailableContentWidth =>
@@ -614,6 +648,10 @@ public sealed partial class MainPage : Page
     private void PageScroller_ViewChanged(ScrollView sender, object args)
     {
         UpdateZoomReadout();
+
+        // Debounced, because this fires continuously through a pan and the
+        // save writes the settings file.
+        QueueReadingPositionSave();
 
         // Anchored to a page position, so every scroll and zoom moves it.
         UpdateObjectToolbar();
@@ -837,6 +875,13 @@ public sealed partial class MainPage : Page
     private void UpdateChromeForDocument()
     {
         bool hasDocument = ViewModel.PageCount > 0;
+
+        // Closing the last document lands back here, and the list must be
+        // right for what is on disk NOW, not for what it was at launch.
+        if (!hasDocument)
+        {
+            RefreshWelcome();
+        }
 
         StatusBar.Visibility = hasDocument ? Visibility.Visible : Visibility.Collapsed;
 
@@ -3250,6 +3295,9 @@ public sealed partial class MainPage : Page
     /// <summary>Title for the tab and the window, unsaved marker included.</summary>
     public string DocumentTitle => ViewModel.WindowTitle;
 
+    /// <summary>What this document's TAB says: the file name, not the window title.</summary>
+    public string TabTitle => ViewModel.TabTitle;
+
     /// <summary>
     /// Raised when a quick-action's availability changes, so the title bar can
     /// grey its buttons for the document actually in front.
@@ -3327,17 +3375,35 @@ public sealed partial class MainPage : Page
     private async void Settings_Click(object sender, RoutedEventArgs e)
     {
         var tabs = new Pivot { Margin = new Thickness(0, 8, 0, 0) };
-        tabs.Items.Add(new PivotItem { Header = "View", Content = BuildViewSettings() });
-        tabs.Items.Add(new PivotItem { Header = "About", Content = BuildAboutPane() });
+        tabs.Items.Add(new PivotItem { Header = "View", Content = Scrollable(BuildViewSettings()) });
+        tabs.Items.Add(new PivotItem { Header = "About", Content = Scrollable(BuildAboutPane()) });
 
         await new ContentDialog
         {
             XamlRoot = XamlRoot,
             Title = "Settings",
-            Content = new Grid { Width = 420, Height = 320, Children = { tabs } },
+            Content = new Grid { Width = 420, Height = 400, Children = { tabs } },
             CloseButtonText = "Close",
         }.ShowAsync();
     }
+
+    /// <summary>
+    /// Lets a settings pane be taller than the dialog.
+    ///
+    /// Without this the panes are a plain StackPanel in a fixed-height Grid,
+    /// so anything past the bottom edge is not merely hard to reach, it is
+    /// invisible and unreachable. The View pane had already grown past it: the
+    /// "remember where I stopped reading" switch was added, built, deployed,
+    /// and could not be found, because it was below the fold of a container
+    /// that does not scroll.
+    /// </summary>
+    private static ScrollViewer Scrollable(UIElement content) => new()
+    {
+        Content = content,
+        VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+        HorizontalScrollMode = ScrollMode.Disabled,
+        HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+    };
 
     /// <summary>
     /// Puts the saved settings into effect. Called once the page is loaded,
@@ -3460,9 +3526,194 @@ public sealed partial class MainPage : Page
         StatusBar.Margin = new Thickness(16, top ? 16 : 0, 16, top ? 0 : 16);
     }
 
+    // ---------------- Reading position ----------------
+
+    /// <summary>
+    /// Coalesces position saves. Scrolling raises ViewChanged continuously, and
+    /// writing the settings file on every frame would put a disk write in the
+    /// middle of a pan.
+    /// </summary>
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _positionSaveTimer;
+
+    private const int PositionSaveDelayMs = 1200;
+
+    /// <summary>
+    /// Where the reader is right now, or null if there is nothing to remember.
+    ///
+    /// Expressed as a page and a fraction into that page rather than a scroll
+    /// offset, because an offset only means something at the zoom and window
+    /// size it was taken at, and pages are not all the same height.
+    /// </summary>
+    private ReadingPosition? CurrentReadingPosition()
+    {
+        if (ViewModel.PageCount == 0 || PageScroller.ZoomFactor <= 0)
+        {
+            return null;
+        }
+
+        int page = ViewModel.CurrentPageIndex;
+        double height = ViewModel.SlotHeightOf(page);
+        if (height <= 0)
+        {
+            return null;
+        }
+
+        // The ScrollView reports a ZOOMED offset; slot space is unzoomed.
+        double slotY = PageScroller.VerticalOffset / PageScroller.ZoomFactor;
+        double fraction = (slotY - ViewModel.SlotTopOf(page)) / height;
+
+        return new ReadingPosition(
+            page, Math.Clamp(fraction, 0, 1), PageScroller.ZoomFactor, 0, ViewModel.PageCount);
+    }
+
+    /// <summary>
+    /// Fills the welcome screen's recent list.
+    ///
+    /// Rebuilt every time the screen appears rather than cached: files get
+    /// moved and deleted between runs, and a row that fails when clicked is a
+    /// worse first impression than a shorter list.
+    /// </summary>
+    private void RefreshWelcome()
+    {
+        var rows = WelcomeList.Build(
+            RecentFilesStore.Load(),
+            SettingsStore.Current.ReadingPositions,
+            System.IO.File.Exists);
+
+        WelcomeRecent.ItemsSource = rows;
+        WelcomeRecentSection.Visibility = rows.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        // The subtitle carries the one useful fact rather than repeating the
+        // buttons underneath it.
+        WelcomeSubtitle.Text = rows.Count > 0
+            ? "Continue reading, or open something new"
+            : "Open a document to begin";
+    }
+
+    private void WelcomeRecent_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string path } && path.Length > 0)
+        {
+            OpenPickedFile(path);
+        }
+    }
+
+    private void WelcomeNew_Click(object sender, RoutedEventArgs e) => New_Click(sender, e);
+
+    /// <summary>Stores where the reader is, against the open file's path.</summary>
+    private void SaveReadingPosition()
+    {
+        // Switched off means nothing is recorded, not merely nothing restored.
+        if (!SettingsStore.Current.RememberReadingPosition)
+        {
+            return;
+        }
+
+        // An unsaved document has no path to be remembered against, and a
+        // document with no position is one we would restore to the top anyway.
+        if (!ViewModel.HasDocumentPath
+            || ViewModel.DocumentPath is not { Length: > 0 } path
+            || CurrentReadingPosition() is not { } position)
+        {
+            return;
+        }
+
+        SettingsStore.Update(s => s with
+        {
+            ReadingPositions = ReadingPositions.Remember(
+                s.ReadingPositions, path, position, DateTime.UtcNow),
+        });
+
+        Diag.Log($"reading position saved: page {position.PageIndex} " +
+                 $"+{position.PageFraction:F2} zoom {position.Zoom:F2}");
+    }
+
+    /// <summary>Queues a save, restarting the wait so a continuous scroll writes once.</summary>
+    private void QueueReadingPositionSave()
+    {
+        if (_positionSaveTimer is null)
+        {
+            // Same shape as the search debounce: one non-repeating timer,
+            // stopped and restarted, so a scroll that never settles never
+            // writes and a scroll that stops writes exactly once.
+            _positionSaveTimer = DispatcherQueue.CreateTimer();
+            _positionSaveTimer.IsRepeating = false;
+            _positionSaveTimer.Interval = TimeSpan.FromMilliseconds(PositionSaveDelayMs);
+            _positionSaveTimer.Tick += (_, _) => SaveReadingPosition();
+        }
+
+        _positionSaveTimer.Stop();
+        _positionSaveTimer.Start();
+    }
+
+    /// <summary>
+    /// Puts the reader back where they were, if we have seen this file before.
+    ///
+    /// Takes precedence over the default-view setting, which is about how a
+    /// document you have never opened should appear. Once you have read to page
+    /// 180, "fit page on page 1" is no longer the right answer.
+    /// </summary>
+    /// <returns>True if a position was restored.</returns>
+    private bool RestoreReadingPosition()
+    {
+        if (!SettingsStore.Current.RememberReadingPosition)
+        {
+            return false;
+        }
+
+        if (ViewModel.DocumentPath is not { Length: > 0 } path)
+        {
+            return false;
+        }
+
+        if (ReadingPositions.For(SettingsStore.Current.ReadingPositions, path)
+            is not { } position)
+        {
+            Diag.Log("reading position: none stored for this document");
+            return false;
+        }
+
+        if (position.PageIndex >= ViewModel.PageCount)
+        {
+            // The file has been edited elsewhere since it was last read.
+            Diag.Log($"reading position: page {position.PageIndex} is past the end " +
+                     $"({ViewModel.PageCount} pages), ignoring");
+            return false;
+        }
+
+        // The zoom is restored even when the place is not, because reading at
+        // 150% is a preference about the document, not about the page.
+        if (position.Zoom > 0)
+        {
+            PageScroller.ZoomTo((float)position.Zoom, null,
+                new ScrollingZoomOptions(ScrollingAnimationMode.Disabled,
+                                         ScrollingSnapPointsMode.Ignore));
+        }
+
+        if (!ReadingPositions.IsWorthRestoring(position))
+        {
+            return position.Zoom > 0;
+        }
+
+        double slotY = ViewModel.SlotTopOf(position.PageIndex)
+                       + (position.PageFraction * ViewModel.SlotHeightOf(position.PageIndex));
+
+        double zoom = position.Zoom > 0 ? position.Zoom : PageScroller.ZoomFactor;
+        PageScroller.ScrollTo(
+            PageScroller.HorizontalOffset,
+            slotY * zoom,
+            new ScrollingScrollOptions(ScrollingAnimationMode.Disabled,
+                                       ScrollingSnapPointsMode.Ignore));
+
+        ViewModel.Status = $"Resumed at page {position.PageIndex + 1}.";
+        Diag.Log($"reading position restored: page {position.PageIndex} +{position.PageFraction:F2} zoom {zoom:F2}");
+        return true;
+    }
+
     /// <summary>The saved default view, applied once a document has pages to fit.</summary>
     private void ApplyDefaultView()
     {
+
         switch (SettingsStore.Current.DefaultView)
         {
             case DefaultView.FitWidth: ZoomFitWidth_Click(this, null!); break;
@@ -3548,6 +3799,28 @@ public sealed partial class MainPage : Page
             }
         };
         panel.Children.Add(view);
+
+        var resume = new ToggleSwitch
+        {
+            Header = "Remember where I stopped reading",
+            IsOn = SettingsStore.Current.RememberReadingPosition,
+        };
+        resume.Toggled += (_, _) =>
+        {
+            SettingsStore.Update(s => s with { RememberReadingPosition = resume.IsOn });
+
+            // Turning it off forgets what was already stored, rather than
+            // keeping a list of everywhere you have read against a setting that
+            // says not to. Turning it back on starts collecting again.
+            if (!resume.IsOn)
+            {
+                SettingsStore.Update(s => s with
+                {
+                    ReadingPositions = new Dictionary<string, ReadingPosition>(),
+                });
+            }
+        };
+        panel.Children.Add(resume);
 
         var rulers = new ToggleSwitch
         {
@@ -3934,6 +4207,11 @@ public sealed partial class MainPage : Page
     /// </summary>
     public async Task<bool> ConfirmCloseAsync()
     {
+        // Written now rather than left to the debounce, which will not fire if
+        // the window is closing. Closing a book is exactly when where you got
+        // to matters most.
+        SaveReadingPosition();
+
         if (!ViewModel.IsDirty)
         {
             return true;

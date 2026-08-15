@@ -136,6 +136,31 @@ public class ThemePaletteTests
     }
 
     [Fact]
+    public void the_canvas_is_dark_in_every_theme_including_the_light_ones()
+    {
+        // The invariant the welcome screen's text colours depend on, and it was
+        // not written down anywhere. A white page only reads as a sheet against
+        // something darker than itself, so even Light and Sepia keep a dark
+        // surround. Anything drawn straight onto the canvas can therefore use
+        // fixed LIGHT text in all five themes.
+        //
+        // If this ever stops being true, the OnCanvas brushes in MainPage.xaml
+        // become unreadable and this test is the warning.
+        foreach (var theme in AllThemes)
+        {
+            foreach (var systemIsDark in new[] { false, true })
+            {
+                var canvas = ThemePalette.For(theme, systemIsDark).Canvas;
+
+                Assert.True(
+                    canvas.Luminance < 96,
+                    $"{theme} (systemIsDark={systemIsDark}): canvas {canvas} is too light "
+                    + "for the fixed light text drawn on it");
+            }
+        }
+    }
+
+    [Fact]
     public void midnight_blue_is_a_midnight_rather_than_an_electric_blue()
     {
         // #0F1A3C. Was #060866, an electric indigo: nearly no red or green

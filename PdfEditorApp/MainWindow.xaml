@@ -73,6 +73,11 @@
             -->
             <StackPanel Orientation="Horizontal" Spacing="8" Margin="12,0,14,0"
                         VerticalAlignment="Center">
+                <!-- Left as a plain .ico source on purpose. At 18 DIP the
+                     decoder picks a small frame and renders it at close to its
+                     native size, which is sharp. Adding a DecodePixelWidth here
+                     forced a large frame to be squeezed into 27 real pixels and
+                     made it visibly WORSE, so this one is better left alone. -->
                 <Image Source="ms-appx:///Assets/AppIcon.ico" Width="18" Height="18" />
                 <TextBlock x:Name="TitleText" Text="Ayaan PDF" VerticalAlignment="Center"
                            Style="{StaticResource CaptionTextBlockStyle}" />

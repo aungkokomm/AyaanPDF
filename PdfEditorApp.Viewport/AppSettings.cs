@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 
 namespace PdfEditorApp.Viewport;
 
@@ -95,6 +96,28 @@ public sealed record AppSettings
     /// <summary>Whether find requires the query to stand alone as a word.
     /// Remembered for the same reason.</summary>
     public bool SearchWholeWord { get; init; }
+
+    /// <summary>
+    /// Whether reopening a document returns you to where you stopped reading.
+    ///
+    /// On by default, because that is what every reader does and being returned
+    /// to page 1 of a book you are half way through is the behaviour this was
+    /// added to remove. Off is for anyone who wants every document to open the
+    /// same way, and it stops positions being recorded at all rather than
+    /// merely ignoring them.
+    /// </summary>
+    public bool RememberReadingPosition { get; init; } = true;
+
+    /// <summary>
+    /// Where reading was left in each document, keyed by upper-cased full path.
+    ///
+    /// A SEPARATE map rather than fields added to the recent-files list, which
+    /// is a plain list of strings on disk. Changing that shape would mean
+    /// migrating every existing settings file; an additional property simply
+    /// deserialises to empty on one written by an older build, and an older
+    /// build ignores it.
+    /// </summary>
+    public Dictionary<string, ReadingPosition> ReadingPositions { get; init; } = new();
 
     /// <summary>
     /// Which anchor a point in the viewport is nearest, for dropping the bar.

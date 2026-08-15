@@ -31,6 +31,27 @@
          item that is helpful; on this Grid, whose owner is the whole editor,
          it parks a label in the middle of the canvas on top of the user's
          drawing and stays there. The menu entries still show their shortcuts. -->
+    <Page.Resources>
+        <!--
+            Text that sits directly on the CANVAS, not on app chrome.
+
+            These are fixed light values rather than ThemeResource, and that is
+            deliberate. The canvas is dark in every theme by design, including
+            the light ones: #3A3A3D in Light, #4E3F2A in Sepia, #252528 in Dark,
+            #0F1A3C in Midnight, because a white page only reads as a sheet
+            against something darker than itself. ThemeResource TextFillColor
+            follows the APP theme, so in Light and Sepia it resolves to near
+            black and puts dark text on a dark canvas. The welcome screen
+            shipped exactly that way and was unreadable.
+
+            Anything drawn on chrome (the rail, the property bar, dialogs) must
+            keep using ThemeResource. These are only for the canvas.
+        -->
+        <SolidColorBrush x:Key="OnCanvasStrong" Color="#F4F6FA" />
+        <SolidColorBrush x:Key="OnCanvasBody" Color="#C3C9D4" />
+        <SolidColorBrush x:Key="OnCanvasMuted" Color="#8B93A1" />
+    </Page.Resources>
+
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
           KeyboardAcceleratorPlacementMode="Hidden">
         <!-- Ctrl chords are NOT declared as accelerators on this Grid, and the
@@ -726,20 +747,123 @@
                 Drop="EmptyState_Drop"
                 DoubleTapped="EmptyState_DoubleTapped"
                 Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
-            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12">
-                <FontIcon Glyph="&#xEA90;" FontSize="40" HorizontalAlignment="Center"
-                          Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
-                <TextBlock Text="No document open" HorizontalAlignment="Center"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                           Style="{StaticResource SubtitleTextBlockStyle}" />
-                <Button x:Name="EmptyStateOpen" Content="Open a PDF"
-                        Click="EmptyStateOpen_Click"
-                        HorizontalAlignment="Center" Padding="18,7" Margin="0,4,0,0"
-                        Style="{StaticResource AccentButtonStyle}" />
-                <TextBlock Text="Drag and drop a PDF here to open" HorizontalAlignment="Center"
-                           Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+            <!--
+                The welcome screen, and the first thing anyone sees.
+
+                Built around CONTINUING rather than starting: the recent rows
+                carry where reading stopped, so the common case is one click
+                back into the book you were half way through. A plain
+                recent-files list would say what you opened; this says where
+                you left off, which is the question you actually have.
+            -->
+            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollMode="Disabled"
+                          HorizontalScrollBarVisibility="Disabled">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center"
+                        MaxWidth="460" Margin="24,32" Spacing="6">
+
+                <!--
+                    The PNG, not the .ico.
+
+                    An .ico holds ten frames and the decoder guesses which one
+                    to use; asking it for a size only moves the guess. The
+                    300px PNG is one unambiguous bitmap that scales DOWN to
+                    whatever this display needs, which is the direction that
+                    stays sharp. Same artwork, no guessing.
+                -->
+                <Image Source="ms-appx:///Assets/Square150x150Logo.scale-200.png"
+                       Width="56" Height="56" HorizontalAlignment="Center" />
+
+                <TextBlock Text="Ayaan PDF" HorizontalAlignment="Center" Margin="0,10,0,0"
+                           Foreground="{StaticResource OnCanvasStrong}"
+                           Style="{StaticResource TitleTextBlockStyle}" />
+
+                <TextBlock x:Name="WelcomeSubtitle" Text="Open a document to begin"
+                           HorizontalAlignment="Center"
+                           Foreground="{StaticResource OnCanvasBody}"
+                           Style="{StaticResource BodyTextBlockStyle}" />
+
+                <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,14,0,0"
+                            HorizontalAlignment="Center">
+                    <Button x:Name="EmptyStateOpen" Click="EmptyStateOpen_Click"
+                            Padding="18,7" Style="{StaticResource AccentButtonStyle}">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <FontIcon Glyph="&#xE8E5;" FontSize="14" />
+                            <TextBlock Text="Open a PDF" />
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="WelcomeNew" Click="WelcomeNew_Click" Padding="18,7">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <FontIcon Glyph="&#xE7C3;" FontSize="14" />
+                            <TextBlock Text="New document" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+
+                <!--
+                    Collapsed until there is something to show, so a first run
+                    is a clean two-button screen rather than an empty heading
+                    over an empty box.
+                -->
+                <StackPanel x:Name="WelcomeRecentSection" Visibility="Collapsed"
+                            Margin="0,26,0,0" Spacing="6">
+                    <TextBlock Text="PICK UP WHERE YOU LEFT OFF"
+                               Foreground="{StaticResource OnCanvasMuted}"
+                               CharacterSpacing="80"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+
+                    <ItemsControl x:Name="WelcomeRecent">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="viewport:WelcomeEntry">
+                                <!--
+                                    A button, not a list item: it is one click
+                                    that does one thing, and it gets focus and
+                                    keyboard activation for free.
+                                -->
+                                <Button Click="WelcomeRecent_Click" Tag="{x:Bind Path}"
+                                        HorizontalAlignment="Stretch"
+                                        HorizontalContentAlignment="Left"
+                                        Background="Transparent" BorderThickness="0"
+                                        Padding="10,8" Margin="0,1"
+                                        ToolTipService.ToolTip="{x:Bind Path}"
+                                        AutomationProperties.Name="{x:Bind Name}">
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <FontIcon Glyph="&#xEA90;" FontSize="16"
+                                                  VerticalAlignment="Center"
+                                                  Foreground="{StaticResource OnCanvasMuted}" />
+
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="{x:Bind Name}" TextTrimming="CharacterEllipsis"
+                                                       Foreground="{StaticResource OnCanvasStrong}"
+                                                       Style="{StaticResource BodyTextBlockStyle}" />
+                                            <TextBlock Text="{x:Bind Folder}" TextTrimming="CharacterEllipsis"
+                                                       Foreground="{StaticResource OnCanvasMuted}"
+                                                       Style="{StaticResource CaptionTextBlockStyle}" />
+                                        </StackPanel>
+
+                                        <TextBlock Grid.Column="2" Text="{x:Bind Resume}"
+                                                   VerticalAlignment="Center"
+                                                   Foreground="{StaticResource OnCanvasBody}"
+                                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                                    </Grid>
+                                </Button>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+
+                <TextBlock Text="or drop a PDF anywhere in this window"
+                           HorizontalAlignment="Center" Margin="0,26,0,0"
+                           Foreground="{StaticResource OnCanvasMuted}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
+            </ScrollViewer>
         </Border>
 
         <!--
