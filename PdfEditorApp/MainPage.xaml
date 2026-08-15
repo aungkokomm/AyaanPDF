@@ -1090,6 +1090,15 @@
                                 </MenuFlyoutItem>
                             </MenuFlyoutSubItem>
                             <MenuFlyoutSubItem Text="View">
+                                <!-- The chord is live in RootGrid_KeyDown, via
+                                     PresentationKeys. The text here only prints
+                                     it beside the entry; a MenuFlyoutItem's own
+                                     accelerator is dead until its flyout has
+                                     been opened, which is the trap this menu
+                                     documents at the top of the file. -->
+                                <MenuFlyoutItem Text="Full screen" Click="FullScreen_Click"
+                                                KeyboardAcceleratorTextOverride="F11" />
+                                <MenuFlyoutSeparator />
                                 <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
                                                       IsChecked="True" Click="RulersToggle_Click">
                                     <ToggleMenuFlyoutItem.KeyboardAccelerators>

@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.UI;
@@ -50,6 +51,103 @@ public sealed partial class MainWindow : Window
 
     /// <summary>The document the user is looking at, or null before the first tab exists.</summary>
     public MainPage? ActivePage => (Tabs.SelectedItem as TabViewItem)?.Content as MainPage;
+
+    /// <summary>Whether the window is presenting, with all chrome stripped.</summary>
+    public bool IsFullScreen =>
+        AppWindow.Presenter.Kind == AppWindowPresenterKind.FullScreen;
+
+    /// <summary>
+    /// Enters or leaves full screen.
+    ///
+    /// The presenter takes the system caption and the taskbar; everything else
+    /// on screen is our own content and has to be hidden by hand. The title
+    /// strip and the tab row belong to the window, and the tools and panels
+    /// belong to the page, so both are told.
+    ///
+    /// ExtendsContentIntoTitleBar stays ON throughout. Turning it off here
+    /// would hand the window back a system title bar underneath the full-screen
+    /// presenter and leave a strip of it behind on the way out.
+    /// </summary>
+    public void SetFullScreen(bool full)
+    {
+        if (full == IsFullScreen)
+        {
+            return;
+        }
+
+        AppWindow.SetPresenter(full
+            ? AppWindowPresenterKind.FullScreen
+            : AppWindowPresenterKind.Overlapped);
+
+        // The ROW, not just its content. Shell's first row is a fixed 34 DIP,
+        // so collapsing AppTitleBar alone left a 34-pixel band of window
+        // showing above the page.
+        AppTitleBar.Visibility = full ? Visibility.Collapsed : Visibility.Visible;
+        Shell.RowDefinitions[0].Height = full ? new GridLength(0) : new GridLength(TitleBarHeight);
+
+        // The tab STRIP lives inside the TabView's template, so the control
+        // itself cannot be hidden without taking the document with it.
+        //
+        // Reached by finding the template part, NOT by writing to
+        // Tabs.Resources. This file already records why: a ThemeResource is
+        // resolved once when the template expands, so assigning into that
+        // dictionary at runtime does nothing at all. The first attempt at this
+        // did exactly that and the tabs stayed put.
+        if (FindDescendant(Tabs, "TabContainerGrid") is { } strip)
+        {
+            strip.Visibility = full ? Visibility.Collapsed : Visibility.Visible;
+        }
+        else
+        {
+            Diag.Log("full screen: TabContainerGrid not found, tab strip will stay visible");
+        }
+
+        Tabs.IsAddTabButtonVisible = !full;
+
+        ActivePage?.SetPresenting(full);
+
+        // Leaving must restore the presenter BEFORE the window is measured
+        // again, or the restored size is computed against the full-screen
+        // bounds and the window comes back the size of the display.
+        if (!full && AppWindow.Presenter is OverlappedPresenter presenter)
+        {
+            presenter.Maximize();
+        }
+    }
+
+    public void ToggleFullScreen() => SetFullScreen(!IsFullScreen);
+
+    /// <summary>Must match the first RowDefinition in MainWindow.xaml.</summary>
+    private const double TitleBarHeight = 34;
+
+    /// <summary>
+    /// Finds a named element inside an expanded control template.
+    ///
+    /// The only way to reach a template part from outside: it is not a field,
+    /// and the theme-resource route does not work because those are resolved
+    /// when the template expands and never looked up again.
+    /// </summary>
+    private static FrameworkElement? FindDescendant(DependencyObject root, string name)
+    {
+        int count = VisualTreeHelper.GetChildrenCount(root);
+        for (int i = 0; i < count; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+
+            if (child is FrameworkElement element
+                && string.Equals(element.Name, name, StringComparison.Ordinal))
+            {
+                return element;
+            }
+
+            if (FindDescendant(child, name) is { } found)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Ctrl+Q quits.

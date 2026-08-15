@@ -859,6 +859,82 @@ public sealed partial class MainPage : Page
     /// survives a document being closed; whether a ruler is on screen right now
     /// also depends on whether a page exists to rule.
     /// </summary>
+    // ---------------- Full screen ----------------
+
+    private void FullScreen_Click(object sender, RoutedEventArgs e)
+    {
+        if (App.Window is MainWindow window)
+        {
+            window.ToggleFullScreen();
+        }
+    }
+
+
+    /// <summary>
+    /// What this page was showing before it went full screen, or null when it
+    /// is not presenting.
+    ///
+    /// Captured rather than assumed, so leaving puts back exactly what was
+    /// there: restoring a fixed set would turn the rulers on for someone who
+    /// had them off and reopen a panel they had closed.
+    /// </summary>
+    private ChromeState? _chromeBeforePresenting;
+
+    public bool IsPresenting => _chromeBeforePresenting is not null;
+
+    /// <summary>
+    /// Strips the page down to the document, or puts the chrome back.
+    ///
+    /// The window hides its own title strip and tabs; this handles everything
+    /// that belongs to the page. Reading is the whole point of the mode, so the
+    /// tools go too, not just the panels.
+    /// </summary>
+    public void SetPresenting(bool presenting)
+    {
+        if (presenting == IsPresenting)
+        {
+            return;
+        }
+
+        if (presenting)
+        {
+            _chromeBeforePresenting = new ChromeState(
+                Rulers: RulersToggle.IsChecked,
+                Thumbnails: ThumbnailPanel.Visibility == Visibility.Visible,
+                Bookmarks: BookmarkPanel.Visibility == Visibility.Visible);
+
+            Apply(ChromeState.Hidden);
+        }
+        else
+        {
+            var before = _chromeBeforePresenting ?? ChromeState.Hidden;
+            _chromeBeforePresenting = null;
+            Apply(before);
+        }
+
+        ToolRail.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
+        PropertyBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
+        StatusBar.Visibility = presenting || ViewModel.PageCount == 0
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+
+        if (presenting)
+        {
+            ViewModel.Status = "Full screen. Press Esc or F11 to leave.";
+        }
+
+        // The canvas has to own the keyboard or F11 and Escape go nowhere.
+        RootGrid.Focus(FocusState.Programmatic);
+
+        void Apply(ChromeState state)
+        {
+            RulersToggle.IsChecked = state.Rulers;
+            ApplyRulerVisibility();
+            ThumbnailPanel.Visibility = state.Thumbnails ? Visibility.Visible : Visibility.Collapsed;
+            BookmarkPanel.Visibility = state.Bookmarks ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+
     private void ApplyRulerVisibility() =>
         SetRulersVisible(RulersToggle.IsChecked && ViewModel.PageCount > 0);
 
@@ -4901,6 +4977,23 @@ public sealed partial class MainPage : Page
             }
 
             return;
+        }
+
+        // Full screen first, because Escape is shared. PresentationKeys only
+        // claims Escape while already presenting, so every other time it falls
+        // straight through to the canvas below and still cancels a drag,
+        // dismisses the editor and clears the selection.
+        if (App.Window is MainWindow window)
+        {
+            var presentation = PresentationKeys.Resolve(
+                (int)e.Key, window.IsFullScreen, IsTextInputFocused);
+
+            if (presentation != PresentationAction.None)
+            {
+                window.SetFullScreen(presentation == PresentationAction.Enter);
+                e.Handled = true;
+                return;
+            }
         }
 
         // The menu-command chords resolve through KeyboardCommands, which is
