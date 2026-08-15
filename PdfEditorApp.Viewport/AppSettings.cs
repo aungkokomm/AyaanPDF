@@ -109,6 +109,15 @@ public sealed record AppSettings
     public bool RememberReadingPosition { get; init; } = true;
 
     /// <summary>
+    /// Renders pages dark for night reading.
+    ///
+    /// Off by default: it changes how every document looks, and a reader who
+    /// has not asked for it should see the page the way it was written. It is
+    /// remembered because someone who reads at night reads at night.
+    /// </summary>
+    public bool NightMode { get; init; }
+
+    /// <summary>
     /// Where reading was left in each document, keyed by upper-cased full path.
     ///
     /// A SEPARATE map rather than fields added to the recent-files list, which

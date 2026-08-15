@@ -861,6 +861,40 @@ public sealed partial class MainPage : Page
     /// </summary>
     // ---------------- Full screen ----------------
 
+    /// <summary>
+    /// Turns night reading on or off, and remembers the choice.
+    ///
+    /// The view model does the re-rendering; this only records the decision, so
+    /// the menu, the setting and what is on screen cannot drift apart.
+    /// </summary>
+    private void NightModeToggle_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.IsNightMode = NightModeToggle.IsChecked;
+        ApplyPageSheet(NightModeToggle.IsChecked);
+        SettingsStore.Update(s => s with { NightMode = NightModeToggle.IsChecked });
+    }
+
+    /// <summary>
+    /// Repaints the sheet every page card is drawn on.
+    ///
+    /// The card is not merely a backdrop for an opaque bitmap: a slot shows it
+    /// bare while its render is in flight, and after a toggle every slot is in
+    /// exactly that state at once. Left white it produced the reported fault,
+    /// a white page under a dark theme.
+    ///
+    /// NightMode.Floor rather than a colour picked here, so the sheet is the
+    /// same value a white page transforms to and the card cannot show as a rim
+    /// of a different shade around the bitmap.
+    /// </summary>
+    private void ApplyPageSheet(bool night)
+    {
+        if (Resources["PageSheetBrush"] is SolidColorBrush sheet)
+        {
+            byte v = NightMode.Floor;
+            sheet.Color = night ? Color.FromArgb(255, v, v, v) : Colors.White;
+        }
+    }
+
     private void FullScreen_Click(object sender, RoutedEventArgs e)
     {
         if (App.Window is MainWindow window)
@@ -3528,6 +3562,13 @@ public sealed partial class MainPage : Page
         {
             RulersToggle.IsChecked = s.ShowRulers;
         }
+
+        // Outside the rulers check, which it was wrongly nested inside: night
+        // mode was then only restored when the rulers setting also happened to
+        // differ, so a saved dark session came back light.
+        NightModeToggle.IsChecked = s.NightMode;
+        ViewModel.IsNightMode = s.NightMode;
+        ApplyPageSheet(s.NightMode);
 
         // Unconditionally, not only when the toggle changed: this also runs on
         // load, when the chrome has never been decided at all.

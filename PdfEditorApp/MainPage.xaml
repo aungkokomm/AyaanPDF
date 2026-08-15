@@ -50,6 +50,22 @@
         <SolidColorBrush x:Key="OnCanvasStrong" Color="#F4F6FA" />
         <SolidColorBrush x:Key="OnCanvasBody" Color="#C3C9D4" />
         <SolidColorBrush x:Key="OnCanvasMuted" Color="#8B93A1" />
+
+        <!--
+            The sheet the page bitmap is painted onto.
+
+            A brush INSTANCE that night mode mutates, not a key that gets
+            swapped. StaticResource resolves once when the template expands, so
+            replacing the entry in this dictionary at runtime changes nothing,
+            the same trap MainWindow.xaml documents for ThemeResource. Setting
+            .Color on the resolved brush does propagate, to every page card at
+            once, which is what is wanted here.
+
+            It matters because the card is visible on its own: a slot releases
+            its bitmap while re-rendering, and a white rectangle where a dark
+            page should be is exactly the flash night mode is meant to remove.
+        -->
+        <SolidColorBrush x:Key="PageSheetBrush" Color="White" />
     </Page.Resources>
 
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
@@ -281,9 +297,9 @@
                     </ItemsRepeater.Layout>
                     <ItemsRepeater.ItemTemplate>
                         <DataTemplate x:DataType="viewmodels:PageSlot">
-                            <!-- The page card: white sheet, thin border, drop shadow. -->
+                            <!-- The page card: the sheet, a thin border, a drop shadow. -->
                             <Border Width="{x:Bind SlotWidth}" Height="{x:Bind SlotHeight}"
-                                    Background="White"
+                                    Background="{StaticResource PageSheetBrush}"
                                     BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                                     BorderThickness="1"
                                     HorizontalAlignment="Center">
@@ -1098,6 +1114,8 @@
                                      documents at the top of the file. -->
                                 <MenuFlyoutItem Text="Full screen" Click="FullScreen_Click"
                                                 KeyboardAcceleratorTextOverride="F11" />
+                                <ToggleMenuFlyoutItem x:Name="NightModeToggle" Text="Night mode"
+                                                      Click="NightModeToggle_Click" />
                                 <MenuFlyoutSeparator />
                                 <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
                                                       IsChecked="True" Click="RulersToggle_Click">
@@ -2044,7 +2062,7 @@
                             <Grid>
                                 <Border CornerRadius="4" BorderThickness="1"
                                         BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                                        Background="White">
+                                        Background="{StaticResource PageSheetBrush}">
                                     <Border.Shadow>
                                         <ThemeShadow />
                                     </Border.Shadow>

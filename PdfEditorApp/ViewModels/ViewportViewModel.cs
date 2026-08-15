@@ -134,6 +134,112 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial WriteableBitmap? PageBitmap { get; set; }
 
+    /// <summary>
+    /// Renders pages dark for night reading.
+    ///
+    /// Applied to the rendered PIXELS, never to the document, so nothing is
+    /// written back and turning it off simply re-renders. Deliberately not
+    /// applied to print output, which is the one thing that must come out the
+    /// way the document actually looks.
+    /// </summary>
+    [ObservableProperty]
+    public partial bool IsNightMode { get; set; }
+
+    partial void OnIsNightModeChanged(bool value)
+    {
+        // Every cached bitmap has the old treatment baked in, and the transform
+        // is not its own inverse, so none of them can be fixed up: they have to
+        // be dropped and re-rendered from source.
+        foreach (var slot in PageSlots)
+        {
+            slot.ClearTiles();
+            slot.ReleaseBitmap();
+        }
+
+        // Re-render through the render WINDOW, not by walking every slot.
+        //
+        // Walking them was the first version and it was badly wrong: on a
+        // 3,352-page book one toggle queued hundreds of base renders, the page
+        // actually on screen sat behind all of them showing white, and the
+        // sharpen pass was starved so what did appear stayed at low resolution.
+        // Both reported symptoms, one cause. The window knows which handful of
+        // pages are worth rendering; this asks it.
+        RepaintVisibleWindow();
+        ScheduleSharpenPass();
+        RefreshThumbnailsForNightMode();
+        Diag.Log($"night mode {(value ? "on" : "off")}, visible window re-rendered");
+    }
+
+    /// <summary>
+    /// Applies the night treatment to a fresh render, if it is on.
+    ///
+    /// Called in the RAW phase, which runs off the UI thread, so the per-pixel
+    /// pass never lands in the middle of a scroll.
+    /// </summary>
+    private RawPageRender ForReading(RawPageRender raw)
+    {
+        if (IsNightMode && raw.Bgra is not null)
+        {
+            NightMode.Apply(raw.Bgra);
+        }
+
+        return raw;
+    }
+
+    /// <summary>
+    /// One thumbnail, treated the same way the page is.
+    ///
+    /// Thumbnails follow night mode rather than staying bright. A strip of
+    /// white panels down the side of a dark page is the thing the mode exists
+    /// to avoid looking at.
+    /// </summary>
+    private PageRenderResult RenderThumbnail(int pageIndex) =>
+        PageRenderer.ToBitmap(ForReading(
+            PageRenderer.RenderLowResRaw(_documentHandle, pageIndex, ThumbnailPixelWidth)));
+
+    /// <summary>
+    /// Re-renders the thumbnails already built, after the mode changes.
+    ///
+    /// Only the ones that actually have a bitmap: the panel is virtualized, so
+    /// that is the realized handful rather than one per page. The count is
+    /// logged because this runs on the UI thread, and if it ever stops being a
+    /// handful the log will say so before anyone has to guess.
+    /// </summary>
+    private void RefreshThumbnailsForNightMode()
+    {
+        int redrawn = 0;
+
+        for (int i = 0; i < Thumbnails.Count; i++)
+        {
+            if (Thumbnails[i].Bitmap is not null)
+            {
+                Thumbnails[i].Bitmap = RenderThumbnail(i).Bitmap;
+                redrawn++;
+            }
+        }
+
+        Diag.Log($"night mode: {redrawn} thumbnails re-rendered");
+    }
+
+    /// <summary>
+    /// Re-runs the render window over the view that is already on screen.
+    ///
+    /// The pump takes ZOOMED offsets and the stored view bounds are unzoomed,
+    /// so they are multiplied back. Used when the pixels have to be rebuilt
+    /// without the view having moved.
+    /// </summary>
+    private void RepaintVisibleWindow()
+    {
+        double zoom = Math.Max(0.01, _currentZoomFactor);
+
+        UpdateVisibleWindow(
+            _lastViewTop * zoom,
+            (_lastViewBottom - _lastViewTop) * zoom,
+            zoom,
+            _lastViewLeft * zoom,
+            (_lastViewRight - _lastViewLeft) * zoom);
+    }
+
     [ObservableProperty]
     public partial string Status { get; set; } = "Opening document...";
 
@@ -863,7 +969,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         IsDirty = true;
 
-        var thumb = PageRenderer.RenderLowRes(_documentHandle, CurrentPageIndex, ThumbnailPixelWidth);
+        var thumb = RenderThumbnail(CurrentPageIndex);
         Thumbnails[CurrentPageIndex].Bitmap = thumb.Bitmap;
         RenderCurrentPage();
     }
@@ -1100,7 +1206,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // out again, not just re-rendered in place.
         RebuildContinuousLayout();
 
-        var thumb = PageRenderer.RenderLowRes(_documentHandle, index, ThumbnailPixelWidth);
+        var thumb = RenderThumbnail(index);
         if (index < Thumbnails.Count)
         {
             Thumbnails[index].Bitmap = thumb.Bitmap;
@@ -1141,7 +1247,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (i >= 0 && i < Thumbnails.Count && Thumbnails[i].Bitmap is not null)
             {
-                Thumbnails[i].Bitmap = PageRenderer.RenderLowRes(_documentHandle, i, ThumbnailPixelWidth).Bitmap;
+                Thumbnails[i].Bitmap = RenderThumbnail(i).Bitmap;
             }
         }
 
@@ -2442,7 +2548,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             int pageIndex = slot.PageIndex;
             int width = _budget.BaseWidth;
 
-            var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, width));
+            var raw = ForReading(await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, width)));
 
             // The document can be closed or replaced while a render is in flight.
             if (handle != _documentHandle)
@@ -2621,8 +2727,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             int pageIndex = slot.PageIndex;
             var addr = tile.Address;
 
-            var raw = await Task.Run(() =>
-                PageRenderer.RenderTileRaw(handle, pageIndex, addr.Level, addr.Col, addr.Row));
+            var raw = ForReading(await Task.Run(() =>
+                PageRenderer.RenderTileRaw(handle, pageIndex, addr.Level, addr.Col, addr.Row)));
 
             // The document can close, or the tile can be scrolled away and
             // discarded, while its render is in flight.
@@ -2658,7 +2764,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             ulong handle = _documentHandle;
             int pageIndex = slot.PageIndex;
 
-            var raw = await Task.Run(() => PageRenderer.RenderUncachedRaw(handle, pageIndex, targetWidth));
+            var raw = ForReading(await Task.Run(() => PageRenderer.RenderUncachedRaw(handle, pageIndex, targetWidth)));
 
             if (handle != _documentHandle)
             {
@@ -6987,7 +7093,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // PDFium rasterization is tens of ms per page and sidebar scrolling
         // realizes containers in bursts, so this must not run inline.
-        var raw = await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, ThumbnailPixelWidth));
+        var raw = ForReading(await Task.Run(() => PageRenderer.RenderLowResRaw(handle, pageIndex, ThumbnailPixelWidth)));
 
         if (handle != _documentHandle)
         {
