@@ -197,7 +197,11 @@ public class ShapeRenderListTests
         // live in the rendering project only; the day one appears in a shared
         // signature is the day the coordinate system starts migrating by
         // accident.
-        foreach (string file in new[] { "ShapeRenderItem.cs", "OverlayProjection.cs" })
+        foreach (string file in new[]
+        {
+            "ShapeRenderItem.cs", "OverlayProjection.cs",
+            "ViewportProjection.cs", "ShapeCulling.cs",
+        })
         {
             string source = ReadSource("PdfEditorApp.Viewport", file);
             Assert.DoesNotContain("SkiaSharp", source, StringComparison.Ordinal);

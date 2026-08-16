@@ -709,21 +709,6 @@
                 -->
                 <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
 
-                <!--
-                    Candidate Skia shape layer, sibling of the ink overlay and
-                    COLLAPSED unless AppSettings.UseSkiaShapeLayer is set. The
-                    two are never both visible: exactly one renderer draws, and
-                    turning the flag off restores the one that always has.
-
-                    Left/Top aligned with a size set in code rather than
-                    stretched: unlike a Canvas, an SKXamlCanvas allocates a
-                    surface the size of itself, and a stack-sized one would
-                    allocate the whole document every frame.
-                -->
-                <rendering:SkiaShapeLayer x:Name="SkiaShapeCanvas"
-                                          HorizontalAlignment="Left"
-                                          VerticalAlignment="Top"
-                                          Visibility="Collapsed" />
 
                 <!--
                     Isolated text-editing layer, ABOVE the ink canvas.
@@ -750,6 +735,28 @@
 
             </controls:CursorGrid>
         </ScrollView>
+
+        <!--
+            Candidate Skia shape layer. COLLAPSED unless
+            AppSettings.UseSkiaShapeLayer is set; exactly one of this and
+            InkCanvas ever draws, and turning the flag off restores the
+            renderer that always has.
+
+            OUTSIDE the ScrollView, for the same reason the object toolbar is,
+            plus one of its own. Inside, ZoomFactor is a compositor scale: it
+            keeps the overlay's vector children crisp but would magnify a Skia
+            BITMAP into blur as you zoom in. Out here the surface is the size
+            of the viewport, is rasterised at final device resolution every
+            frame, and takes zoom and scroll as numbers instead.
+
+            Margin mirrors PageScroller's so its origin is the viewport's
+            top-left, and SetRulersVisible keeps the two in step.
+        -->
+        <rendering:SkiaShapeLayer x:Name="SkiaShapeCanvas"
+                                  Grid.Column="2"
+                                  Margin="22,22,0,0"
+                                  IsHitTestVisible="False"
+                                  Visibility="Collapsed" />
 
         <!--
             Contextual object toolbar. Floats over the viewport and follows the

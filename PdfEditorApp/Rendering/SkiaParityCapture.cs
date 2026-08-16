@@ -118,7 +118,16 @@ internal static class SkiaParityCapture
         host.Children.Add(frame);
         try
         {
-            layer.Show(ShapeRenderList.From([], [Subject]), Scale, _ => 0);
+            // Identity projection: no zoom, no scroll, and the device scale
+            // read from the surface, so this capture measures the renderer and
+            // not the viewport plumbing. That plumbing has its own tests.
+            layer.Show(
+                ShapeRenderList.From([], [Subject]), Scale, _ => 0,
+                new ViewportProjection(
+                    Zoom: 1,
+                    DeviceScale: layer.XamlRoot?.RasterizationScale ?? 1.0,
+                    OriginXDips: 0,
+                    OriginYDips: 0));
             await SettleAsync(frame);
             await WriteAsync(frame, IOPath.Combine(directory, "skia.png"));
             return $"skia.png written ({Width}x{Height})";

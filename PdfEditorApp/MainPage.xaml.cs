@@ -784,6 +784,12 @@ public sealed partial class MainPage : Page
     {
         UpdateZoomReadout();
 
+        // The Skia layer is outside the scroller, so nothing moves it for free:
+        // scroll and zoom reach it only by being read back and repainted. A
+        // no-op while its flag is off. Added as another consumer of a handler
+        // that already exists; the scrolling logic above and below is untouched.
+        RefreshSkiaShapeLayer();
+
         // Debounced, because this fires continuously through a pan and the
         // save writes the settings file.
         QueueReadingPositionSave();
@@ -1663,6 +1669,9 @@ public sealed partial class MainPage : Page
         // so its origin has to move with the scroller's or it lands 22px out
         // whenever the rulers are toggled.
         ObjectToolbar.Margin = PageScroller.Margin;
+        // Same reason, same space: the Skia layer's origin is the viewport's
+        // top-left too.
+        SkiaShapeCanvas.Margin = PageScroller.Margin;
         if (on) { RedrawRulers(); }
     }
 
@@ -5671,10 +5680,10 @@ public sealed partial class MainPage : Page
     /// Exactly one renderer is visible. With the flag off the ink overlay draws
     /// as it always has and this returns immediately, which is the rollback.
     ///
-    /// Stage 2 bounds the surface to the first page. An SKXamlCanvas allocates
-    /// pixels for its own size, unlike the Canvas it sits beside, so a
-    /// stack-sized one would allocate the whole document every frame. Anchoring
-    /// a viewport-sized surface to the scroll offset is a later stage.
+    /// The surface covers the VIEWPORT, never the document. It sits outside the
+    /// scroller and stretches to it, so its size is bounded by the window
+    /// rather than by how long the file is, and zoom and scroll arrive as
+    /// numbers in a ViewportProjection instead of as a compositor transform.
     /// </summary>
     private void RefreshSkiaShapeLayer()
     {
@@ -5683,25 +5692,38 @@ public sealed partial class MainPage : Page
         SkiaShapeCanvas.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
         InkCanvas.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
 
-        if (!on)
+        if (!on || ViewModel.OverlayScale <= 0)
         {
             return;
         }
-
-        double width = ViewModel.OverlayScale;
-        double height = ViewModel.SlotHeightOf(0);
-        if (width <= 0 || height <= 0)
-        {
-            return;
-        }
-
-        SkiaShapeCanvas.Width = width;
-        SkiaShapeCanvas.Height = height;
 
         SkiaShapeCanvas.Show(
             ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes),
             ViewModel.OverlayScale,
-            ViewModel.SlotTopOf);
+            ViewModel.SlotTopOf,
+            CurrentViewportProjection());
+    }
+
+    /// <summary>
+    /// Where slot space currently sits on the viewport, as plain numbers.
+    ///
+    /// The origin comes from asking InkCanvas where its own (0,0) has ended up
+    /// relative to the scroller, because InkCanvas IS slot space: its children
+    /// are placed at slot DIPs and nothing transforms it. That one question
+    /// answers scroll offset, zoom, centring and padding together, and it
+    /// cannot drift from the overlay because it is measured from the overlay.
+    /// Nothing is written back, so this changes no layout and no scrolling.
+    /// </summary>
+    private ViewportProjection CurrentViewportProjection()
+    {
+        double zoom = PageScroller.ZoomFactor;
+        double device = XamlRoot?.RasterizationScale ?? 1.0;
+
+        var origin = InkCanvas
+            .TransformToVisual(PageScroller)
+            .TransformPoint(new Windows.Foundation.Point(0, 0));
+
+        return new ViewportProjection(zoom, device, origin.X, origin.Y);
     }
 
     private void RebuildInkCanvas()

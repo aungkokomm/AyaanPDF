@@ -19,6 +19,42 @@ namespace PdfEditorApp.Rendering.Skia;
 public static class ShapeSkiaPainter
 {
     /// <summary>
+    /// Slot DIPs to device pixels, as one matrix.
+    ///
+    /// Composed to agree with <see cref="ViewportProjection.SlotToDevice"/>
+    /// exactly, and pinned to it by test: zoom applies in DIP space where the
+    /// content lives, then the origin, then the display scale over everything.
+    /// Swapping the first two agrees whenever the origin is zero, which is the
+    /// state a window is in before anybody scrolls.
+    ///
+    /// This is the ONLY place Skia touches the coordinate chain. Normalized
+    /// page-local remains canonical, slot DIPs remain the app's working space,
+    /// and this is the last step before pixels.
+    /// </summary>
+    public static SKMatrix MatrixFor(ViewportProjection p) =>
+        SKMatrix.CreateScale((float)p.DeviceScale, (float)p.DeviceScale)
+            .PreConcat(SKMatrix.CreateTranslation((float)p.OriginXDips, (float)p.OriginYDips))
+            .PreConcat(SKMatrix.CreateScale((float)p.Zoom, (float)p.Zoom));
+
+    /// <summary>
+    /// Paints a frame onto a viewport-sized surface: the matrix above, then the
+    /// slot-space painter below, which is unchanged and does not know a
+    /// viewport exists.
+    /// </summary>
+    public static void PaintViewport(
+        SKCanvas canvas,
+        IReadOnlyList<ShapeRenderItem> items,
+        double scale,
+        Func<int, double> pageTop,
+        ViewportProjection projection)
+    {
+        int saved = canvas.Save();
+        canvas.Concat(MatrixFor(projection));
+        Paint(canvas, items, scale, pageTop);
+        canvas.RestoreToCount(saved);
+    }
+
+    /// <summary>
     /// Paints every stroked item in the frame, in list order, so later items
     /// land on top exactly as they do on the overlay.
     /// </summary>

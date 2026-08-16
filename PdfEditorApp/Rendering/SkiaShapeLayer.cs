@@ -15,19 +15,33 @@ namespace PdfEditorApp.Rendering;
 /// itself lives in PdfEditorApp.Rendering.Skia, which has no WinUI in it. This
 /// class exists to put a Skia surface in the visual tree and hand it a list.
 ///
-/// SIZE IS DELIBERATELY BOUNDED. The XAML ink overlay is a Canvas spanning the
-/// whole document stack, which costs nothing because a Canvas allocates no
-/// pixels for its own size. An SKXamlCanvas is the opposite: its surface IS its
-/// size, so a stack-sized one on a long document would try to allocate hundreds
-/// of megabytes every frame. Stage 2 therefore sizes this to one page to prove
-/// the host works. Anchoring a viewport-sized surface to the scroll offset is
-/// the real design and is a later stage.
+/// SIZE IS BOUNDED BY THE VIEWPORT. The XAML ink overlay is a Canvas spanning
+/// the whole document stack, which costs nothing because a Canvas allocates no
+/// pixels for its own size, and the scroller's compositor zoom scales its
+/// vector children while keeping them crisp. A Skia surface is the opposite on
+/// both counts: it allocates every pixel it covers, and it rasterises once, so
+/// a stack-sized one would allocate the whole document and one inside the
+/// scroller would be magnified into blur as you zoom in.
+///
+/// So this sits OUTSIDE the scroller, covers only the visible viewport, and
+/// receives zoom and scroll as numbers in a <see cref="ViewportProjection"/>
+/// rather than as a compositor transform. Rasterising at final device
+/// resolution every frame is what keeps it sharp at any zoom.
+///
+/// NO VIEW ROTATION, on purpose. The XAML overlay does not rotate with the
+/// view: the rotation transform is bound inside each page card, and the ink
+/// layer is a sibling of the page stack that nothing ever turns. Matching that
+/// is the only option that keeps rendering the single variable. Making Skia
+/// rotate would be a behaviour change and would also make it disagree with the
+/// renderer it is being measured against. Left undecided rather than called
+/// passed or failed.
 /// </summary>
 internal sealed partial class SkiaShapeLayer : SKXamlCanvas
 {
     private IReadOnlyList<ShapeRenderItem> _items = [];
     private double _scale;
     private Func<int, double> _pageTop = _ => 0;
+    private ViewportProjection _projection = new(1, 1, 0, 0);
 
     public SkiaShapeLayer()
     {
@@ -42,14 +56,25 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
         IgnorePixelScaling = false;
     }
 
+    /// <summary>How far outside the surface a mark is still worth drawing.</summary>
+    private const double CullPadSlotDips = 64;
+
     /// <summary>Hands over one frame and asks for a repaint.</summary>
-    public void Show(IReadOnlyList<ShapeRenderItem> items, double scale, Func<int, double> pageTop)
+    public void Show(
+        IReadOnlyList<ShapeRenderItem> items,
+        double scale,
+        Func<int, double> pageTop,
+        ViewportProjection projection)
     {
         _items = items;
         _scale = scale;
         _pageTop = pageTop;
+        _projection = projection;
         Invalidate();
     }
+
+    /// <summary>How many of the last frame's items survived culling.</summary>
+    public int LastDrawnCount { get; private set; }
 
     protected override void OnPaintSurface(SKPaintSurfaceEventArgs e)
     {
@@ -58,30 +83,28 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
         // Transparent, not a colour: this sits over the rendered page and must
         // not paint out what PDFium drew.
         canvas.Clear(SKColors.Transparent);
+        LastDrawnCount = 0;
 
         if (_items.Count == 0 || _scale <= 0)
         {
             return;
         }
 
-        canvas.Save();
-        canvas.Scale((float)DeviceScale(e.Info.Width));
-        ShapeSkiaPainter.Paint(canvas, _items, _scale, _pageTop);
-        canvas.Restore();
-    }
+        var visible = ShapeCulling.Visible(
+            _items,
+            _projection.VisibleSlotBounds(e.Info.Width, e.Info.Height, CullPadSlotDips),
+            _scale,
+            _pageTop);
 
-    /// <summary>
-    /// Device pixels per DIP, taken from the surface actually handed over
-    /// rather than from a DPI reported elsewhere, so the scale and the bitmap
-    /// can never disagree by a rounding.
-    /// </summary>
-    private double DeviceScale(int surfaceWidthPx)
-    {
-        if (ActualWidth > 0)
+        LastDrawnCount = visible.Count;
+        if (visible.Count == 0)
         {
-            return surfaceWidthPx / ActualWidth;
+            return;
         }
 
-        return XamlRoot?.RasterizationScale ?? 1.0;
+        // The matrix and the painting both live in the rendering project, where
+        // they are covered by tests this host cannot be. Nothing is computed
+        // here.
+        ShapeSkiaPainter.PaintViewport(canvas, visible, _scale, _pageTop, _projection);
     }
 }
