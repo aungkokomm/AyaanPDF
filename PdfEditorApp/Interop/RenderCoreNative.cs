@@ -366,6 +366,20 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_bookmarks(ulong docHandle);
 
     /// <summary>
+    /// Every stretch of text on a page that shares a font, a size and a colour,
+    /// as a self-describing byte buffer. Parsed by
+    /// <see cref="Viewport.StyledRunReader"/>. Free with
+    /// <see cref="free_byte_buffer"/>.
+    ///
+    /// This is what bookmarking by style needs and
+    /// <see cref="get_page_chars"/> cannot answer: that reports where each
+    /// character IS, never what it is set in. A page with no text layer is a
+    /// successful EMPTY result, not an error.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_page_text_runs(ulong docHandle, int pageIndex);
+
+    /// <summary>
     /// Rewrites the searchable text layer on the given pages.
     ///
     /// Our text boxes draw their glyphs inside a stamp annotation, and a page's

@@ -32,6 +32,8 @@ public enum EditorCommand
     /// <summary>Back to where the reader was before the last jump.</summary>
     NavigateBack,
     NavigateForward,
+    /// <summary>Bookmarks the current page, named after any selected text.</summary>
+    AddBookmark,
 }
 
 /// <summary>
@@ -67,6 +69,7 @@ public static class KeyboardCommands
     public const int KeyAdd = 0x6B;
     public const int KeySubtract = 0x6D;
 
+    public const int KeyB = 0x42;
     public const int KeyN = 0x4E;
     public const int KeyW = 0x57;
     public const int KeyTab = 0x09;
@@ -172,6 +175,12 @@ public static class KeyboardCommands
             KeyN => shift ? EditorCommand.GoToPage : EditorCommand.New,
 
             KeyW when !shift => EditorCommand.CloseDocument,
+
+            // Ctrl+B bookmarks the page, which is what it does in every reader
+            // and every browser. It is bold in a word processor, and this app
+            // has no bold: a text box's weight comes from the font it is set
+            // in, chosen from the picker.
+            KeyB when !shift => EditorCommand.AddBookmark,
 
             // Ctrl+Tab only. PLAIN Tab must stay the focus-traversal key: it
             // was bound once before and keyboard users could not move focus

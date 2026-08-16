@@ -6942,6 +6942,188 @@ fn extract_char_infos(doc: &PdfDocument<'static>, page_index: i32, target_width:
     Some(infos)
 }
 
+/// How many styled runs one page may contribute.
+///
+/// A page whose every character is styled differently would otherwise produce a
+/// run per character, and the caller is looking for headings.
+const MAX_TEXT_RUNS: u32 = 4_000;
+
+/// Every run of characters on a page that shares a font, a size and a colour.
+///
+/// This is what "bookmark everything that looks like this heading" needs and
+/// `get_page_chars` cannot answer: that reports where each character IS, not
+/// what it is set in.
+///
+/// Little-endian, and shaped like `get_bookmarks`: a run count, then the number
+/// of characters the page held ALTOGETHER, then per run a character start and
+/// length, the font size in points, the fill colour packed as 0x00RRGGBB, and
+/// two length-prefixed UTF-8 strings, the font name and the run's text.
+///
+/// That second number is the difference between "this page is a scan" and
+/// "this page has text nothing can read". Both come back as zero runs, and they
+/// need opposite advice: one can be OCR'd, the other cannot be helped by
+/// anybody, because a font with no /ToUnicode map defeats every reader's search
+/// as well as ours.
+///
+/// Runs break at a change of any of the three, and at a line ending, so a run
+/// is at most one line. Joining lines back up is the caller's decision to make,
+/// because a two-line heading and two one-line headings are indistinguishable
+/// here and only the user knows which their document has.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_page_text_runs(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_page_text_runs_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_page_text_runs_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+    let runs = collect_text_runs(&doc_guard, page_index);
+    drop(doc_guard);
+    drop(doc);
+
+    let Some(out) = runs else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Caller must hold `CALL_LOCK`. `None` means the page could not be reached;
+/// a page with no text layer is an ordinary empty result.
+fn collect_text_runs(doc: &PdfDocument<'static>, page_index: i32) -> Option<Vec<u8>> {
+    struct Run {
+        start: i32,
+        count: i32,
+        /// Which line of the page this run sits on.
+        ///
+        /// Counted from the line breaks, not from coordinates, so it is exact.
+        /// The caller needs it to tell "the next word on this line" from "the
+        /// first word of the next one": documents exist that set every word as
+        /// its own text object in its own font, and without this every word
+        /// looks like a separate piece of text.
+        line: u32,
+        size: f32,
+        color: u32,
+        font: String,
+        text: String,
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&0u32.to_le_bytes()); // run count, backfilled below
+    out.extend_from_slice(&0u32.to_le_bytes()); // characters on the page, likewise
+    let mut count: u32 = 0;
+
+    fn flush(out: &mut Vec<u8>, count: &mut u32, run: Option<Run>) {
+        let Some(run) = run else { return };
+
+        // Whitespace carries no style a user could have pointed at, and a page
+        // is full of it between the parts that do.
+        if run.text.trim().is_empty() {
+            return;
+        }
+
+        out.extend_from_slice(&run.start.to_le_bytes());
+        out.extend_from_slice(&run.count.to_le_bytes());
+        out.extend_from_slice(&run.line.to_le_bytes());
+        out.extend_from_slice(&run.size.to_le_bytes());
+        out.extend_from_slice(&run.color.to_le_bytes());
+        out.extend_from_slice(&(run.font.len() as u32).to_le_bytes());
+        out.extend_from_slice(run.font.as_bytes());
+        out.extend_from_slice(&(run.text.len() as u32).to_le_bytes());
+        out.extend_from_slice(run.text.as_bytes());
+        *count += 1;
+    }
+
+    let page = doc.pages().get(page_index as u16).ok()?;
+    let Ok(text) = page.text() else {
+        // No text layer at all, which is what a scanned page looks like.
+        return Some(out);
+    };
+
+    let mut current: Option<Run> = None;
+    let mut chars_on_page: u32 = 0;
+    let mut line: u32 = 0;
+
+    for c in text.chars().iter() {
+        chars_on_page += 1;
+        if count >= MAX_TEXT_RUNS {
+            break;
+        }
+
+        let Some(ch) = c.unicode_char() else { continue };
+
+        if ch == '\r' || ch == '\n' {
+            flush(&mut out, &mut count, current.take());
+
+            // A "\r\n" counts twice, which costs nothing: the number only has
+            // to DIFFER between lines, never to be the line's ordinal.
+            line += 1;
+            continue;
+        }
+
+        // Scaled, not unscaled: this is the size the text is SET at on the
+        // page, after the text matrix, which is the number a reader would
+        // read off it and the one that has to match the sample they picked.
+        let size = c.scaled_font_size().value;
+        let font = c.font_name();
+        let color = c
+            .fill_color()
+            .map(|f| ((f.red() as u32) << 16) | ((f.green() as u32) << 8) | f.blue() as u32)
+            .unwrap_or(0);
+
+        // Quantised, because a size is a float that arrives from a matrix
+        // multiply: two characters set in the same 12pt heading can report
+        // 11.999998 and 12.000001, and comparing those exactly would break a
+        // heading into a run per character.
+        let same = match &current {
+            Some(run) => {
+                (run.size - size).abs() < 0.01 && run.color == color && run.font == font
+            }
+            None => false,
+        };
+
+        if !same {
+            flush(&mut out, &mut count, current.take());
+            current = Some(Run {
+                start: c.index() as i32,
+                count: 0,
+                line,
+                size,
+                color,
+                font,
+                text: String::new(),
+            });
+        }
+
+        if let Some(run) = current.as_mut() {
+            run.text.push(ch);
+            run.count += 1;
+        }
+    }
+
+    flush(&mut out, &mut count, current.take());
+    out[0..4].copy_from_slice(&count.to_le_bytes());
+    out[4..8].copy_from_slice(&chars_on_page.to_le_bytes());
+    Some(out)
+}
+
 /// Frees an array returned by `get_page_chars`. Safe to call on a
 /// zeroed/failed array (null pointer is a no-op).
 #[unsafe(no_mangle)]
@@ -14963,6 +15145,521 @@ mod tests {
 
         let c_path = std::ffi::CString::new(encrypted_fixture()).unwrap();
         assert_eq!(open_document(c_path.as_ptr()), 0);
+    }
+
+    // ---------------- Styled text runs ----------------
+
+    #[derive(Debug)]
+    struct ParsedRun {
+        start: i32,
+        count: i32,
+        line: u32,
+        size: f32,
+        color: u32,
+        font: String,
+        text: String,
+    }
+
+    /// Reads back what `get_page_text_runs` wrote, so the tests assert on the
+    /// wire format the C# side will actually parse rather than on internals.
+    fn parse_runs(buffer: &ByteBuffer) -> Vec<ParsedRun> {
+        parse_runs_and_chars(buffer).0
+    }
+
+    fn parse_runs_and_chars(buffer: &ByteBuffer) -> (Vec<ParsedRun>, u32) {
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM);
+        if buffer.data.is_null() {
+            return (Vec::new(), 0);
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) };
+        let mut p = 0usize;
+
+        let mut u32_at = |p: &mut usize| {
+            let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+
+        let count = u32_at(&mut p);
+        let chars_on_page = u32_at(&mut p);
+        let mut runs = Vec::new();
+
+        for _ in 0..count {
+            let start = u32_at(&mut p) as i32;
+            let char_count = u32_at(&mut p) as i32;
+            let line = u32_at(&mut p);
+            let size = f32::from_le_bytes((u32_at(&mut p)).to_le_bytes());
+            let color = u32_at(&mut p);
+
+            let font_len = u32_at(&mut p) as usize;
+            let font = String::from_utf8(bytes[p..p + font_len].to_vec()).unwrap();
+            p += font_len;
+
+            let text_len = u32_at(&mut p) as usize;
+            let text = String::from_utf8(bytes[p..p + text_len].to_vec()).unwrap();
+            p += text_len;
+
+            runs.push(ParsedRun { start, count: char_count, line, size, color, font, text });
+        }
+
+        assert_eq!(p, buffer.len, "the buffer had bytes nobody claimed");
+        (runs, chars_on_page)
+    }
+
+    /// A page with a red 18pt bold heading over 10pt body text, built rather
+    /// than committed so what makes it a useful fixture is readable.
+    fn styled_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let path = "tests/fixtures/sample_styled.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let bold = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica-Bold",
+        });
+        let plain = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources = doc.add_object(dictionary! {
+            "Font" => dictionary! { "FH" => bold, "FB" => plain },
+        });
+
+        let content = Content {
+            operations: vec![
+                // The heading: bold, 18pt, red.
+                Operation::new("BT", vec![]),
+                Operation::new("rg", vec![1.into(), 0.into(), 0.into()]),
+                Operation::new("Tf", vec!["FH".into(), 18.into()]),
+                Operation::new("Td", vec![72.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal("Chapter One")]),
+                Operation::new("ET", vec![]),
+                // The body: plain, 10pt, black.
+                Operation::new("BT", vec![]),
+                Operation::new("rg", vec![0.into(), 0.into(), 0.into()]),
+                Operation::new("Tf", vec!["FB".into(), 10.into()]),
+                Operation::new("Td", vec![72.into(), 660.into()]),
+                Operation::new("Tj", vec![Object::string_literal("Ordinary body text.")]),
+                Operation::new("ET", vec![]),
+                // A style change with NO line break across it, which is the
+                // only case that proves runs split on style at all: without
+                // this, the heading and the body are told apart by the newline
+                // between them and the comparison could be deleted outright
+                // with every test still passing.
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["FB".into(), 10.into()]),
+                Operation::new("Td", vec![72.into(), 620.into()]),
+                Operation::new("Tj", vec![Object::string_literal("Same line: ")]),
+                Operation::new("Tf", vec!["FH".into(), 14.into()]),
+                Operation::new("Tj", vec![Object::string_literal("louder")]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }));
+
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        // Staged and renamed, because these tests run in parallel and every one
+        // of them wants this file: writing straight to it would let one test
+        // read a half-written PDF and fail for a reason unrelated to what it
+        // tests.
+        //
+        // Staged BESIDE the target rather than in the temp directory. A rename
+        // across volumes fails on Windows, and the temp directory is on C:
+        // while the fixtures are on E:, so the file was written and then went
+        // nowhere. Same directory also makes the rename atomic.
+        let staging = format!("tests/fixtures/.styled_fixture_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the styled fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the styled fixture into place");
+
+        path
+    }
+
+    #[test]
+    fn text_runs_tell_a_heading_from_the_body_under_it() {
+        // The whole point of the feature: two pieces of text that get_page_chars
+        // reports identically, told apart by what they are SET in.
+        let handle = open_fixture_named(&styled_fixture());
+        let buffer = get_page_text_runs(handle, 0);
+        let runs = parse_runs(&buffer);
+        free_byte_buffer(buffer);
+
+        let heading = runs
+            .iter()
+            .find(|r| r.text.contains("Chapter One"))
+            .expect("the heading was not reported at all");
+        let body = runs
+            .iter()
+            .find(|r| r.text.contains("Ordinary body"))
+            .expect("the body was not reported at all");
+
+        assert!((heading.size - 18.0).abs() < 0.01, "heading size was {}", heading.size);
+        assert!((body.size - 10.0).abs() < 0.01, "body size was {}", body.size);
+        assert_ne!(heading.font, body.font, "both were reported in the same font");
+        assert!(heading.font.contains("Bold"), "heading font was {}", heading.font);
+
+        // Packed 0x00RRGGBB, so a red heading is 0xFF0000 and black body is 0.
+        assert_eq!(heading.color, 0xFF_00_00);
+        assert_eq!(body.color, 0);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn runs_on_one_line_share_a_line_number_and_the_next_line_does_not() {
+        // What tells "the next word on this line" from "the first word of the
+        // next one". Documents exist that set every word as its own text object
+        // in its own font, and without this every word looks like a separate
+        // piece of text; measured on a real book, 4765 runs across seven pages
+        // with a median length of three characters.
+        let handle = open_fixture_named(&styled_fixture());
+        let buffer = get_page_text_runs(handle, 0);
+        let runs = parse_runs(&buffer);
+        free_byte_buffer(buffer);
+        close_document(handle);
+
+        let lead = runs.iter().find(|r| r.text.contains("Same line")).unwrap();
+        let loud = runs.iter().find(|r| r.text.contains("louder")).unwrap();
+        let heading = runs.iter().find(|r| r.text.contains("Chapter One")).unwrap();
+
+        assert_eq!(lead.line, loud.line, "two runs on one line got different line numbers");
+        assert_ne!(
+            heading.line, lead.line,
+            "a run on another line got the same line number");
+    }
+
+    #[test]
+    fn a_style_change_splits_a_run_without_a_line_break_to_help() {
+        // The case that actually tests the comparison. Deliberately breaking
+        // the split so every run merged left the test above passing, because
+        // the heading and the body are on different LINES and a line ending
+        // ends a run on its own.
+        let handle = open_fixture_named(&styled_fixture());
+        let buffer = get_page_text_runs(handle, 0);
+        let runs = parse_runs(&buffer);
+        free_byte_buffer(buffer);
+
+        let lead = runs
+            .iter()
+            .find(|r| r.text.contains("Same line"))
+            .expect("the mixed line was not reported");
+        let loud = runs
+            .iter()
+            .find(|r| r.text.contains("louder"))
+            .expect("the mixed line came back as one run, so style is not splitting it");
+
+        assert!((lead.size - 10.0).abs() < 0.01, "lead size was {}", lead.size);
+        assert!((loud.size - 14.0).abs() < 0.01, "loud size was {}", loud.size);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_run_says_which_characters_it_covers() {
+        // The sample is captured from a text SELECTION, which the app knows
+        // only as a character range, so a run has to be locatable by one.
+        let handle = open_fixture_named(&styled_fixture());
+        let buffer = get_page_text_runs(handle, 0);
+        let runs = parse_runs(&buffer);
+        free_byte_buffer(buffer);
+
+        for run in &runs {
+            assert!(run.start >= 0, "run started at {}", run.start);
+            assert_eq!(
+                run.count,
+                run.text.chars().count() as i32,
+                "run {:?} claims {} characters", run.text, run.count);
+        }
+
+        // And they do not overlap, so a character index picks out one run.
+        for pair in runs.windows(2) {
+            assert!(
+                pair[1].start >= pair[0].start + pair[0].count,
+                "runs {:?} and {:?} overlap", pair[0].text, pair[1].text);
+        }
+
+        close_document(handle);
+    }
+
+    /// What a whole-book scan costs, since the dialog has to wait for one.
+    ///
+    /// Ignored by default like the other measurements here: it reports a number
+    /// rather than asserting one, and a timing assertion on a shared machine
+    /// fails for reasons that have nothing to do with the code.
+    ///
+    /// A hundred pages of DENSE text: forty lines a page, a heading on each.
+    ///
+    /// The committed 300-page fixture carries one line per page, which measures
+    /// the per-page cost and hides the per-character one. Every character here
+    /// is asked for its font and its colour, so a page of real text is the only
+    /// honest thing to time.
+    fn dense_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let path = "tests/fixtures/.dense_timing.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let bold = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica-Bold",
+        });
+        let plain = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources = doc.add_object(dictionary! {
+            "Font" => dictionary! { "FH" => bold, "FB" => plain },
+        });
+
+        let mut kids = Vec::new();
+        for page in 0..100 {
+            let mut ops = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["FH".into(), 18.into()]),
+                Operation::new("Td", vec![50.into(), 760.into()]),
+                Operation::new("Tj", vec![Object::string_literal(format!("Section {page}"))]),
+                Operation::new("ET", vec![]),
+            ];
+
+            for line in 0..40 {
+                ops.push(Operation::new("BT", vec![]));
+                ops.push(Operation::new("Tf", vec!["FB".into(), 10.into()]));
+                ops.push(Operation::new("Td", vec![50.into(), (730 - line * 18).into()]));
+                ops.push(Operation::new("Tj", vec![Object::string_literal(
+                    "The quick brown fox jumps over the lazy dog again and again.")]));
+                ops.push(Operation::new("ET", vec![]));
+            }
+
+            let content_id = doc.add_object(Stream::new(
+                dictionary! {}, Content { operations: ops }.encode().unwrap()));
+            kids.push(Object::Reference(doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => resources,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            })));
+        }
+
+        let count = kids.len() as i64;
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => kids, "Count" => count,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&path).expect("failed to write the dense fixture");
+
+        path
+    }
+
+    /// Run with: cargo test --release scan_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scan_cost_per_page() {
+        let handle = open_fixture_named(&dense_fixture());
+        let pages = get_page_count(handle);
+
+        let started = std::time::Instant::now();
+        let mut runs = 0usize;
+        for page in 0..pages {
+            let buffer = get_page_text_runs(handle, page);
+            runs += parse_runs(&buffer).len();
+            free_byte_buffer(buffer);
+        }
+        let elapsed = started.elapsed();
+
+        println!(
+            "{pages} pages, {runs} runs, {:.0}ms total, {:.2}ms/page",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0 / pages as f64);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_with_no_text_reports_no_runs_rather_than_failing() {
+        // A scanned page is an ordinary thing to run this over, and it must be
+        // an empty answer rather than an error the scan stops on.
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        let buffer = get_page_text_runs(handle, 0);
+
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM);
+        let (runs, chars) = parse_runs_and_chars(&buffer);
+        assert!(runs.is_empty());
+
+        // And it says the page held no characters, which is what separates a
+        // scan from a page whose text nothing can read. Both give no runs.
+        assert_eq!(chars, 0);
+
+        free_byte_buffer(buffer);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_reports_how_many_characters_it_held_altogether() {
+        // Including the ones no run kept: the whitespace between things, and
+        // any character PDFium could not map to Unicode. A page with plenty of
+        // characters and no runs is a document whose fonts carry no /ToUnicode
+        // map, which defeats every reader's search and not only ours.
+        let handle = open_fixture_named(&styled_fixture());
+        let buffer = get_page_text_runs(handle, 0);
+        let (runs, chars) = parse_runs_and_chars(&buffer);
+        free_byte_buffer(buffer);
+        close_document(handle);
+
+        let in_runs: i32 = runs.iter().map(|r| r.count).sum();
+        assert!(chars > 0, "the page reported no characters at all");
+        assert!(
+            chars >= in_runs as u32,
+            "{chars} characters on the page but {in_runs} in runs, which cannot be");
+    }
+
+    /// Adds a text box at a chosen size, so a page can carry two styles.
+    fn sized_box(handle: u64, words: &str, top: f32, size: f32, font: Option<&str>) -> i32 {
+        let bytes = words.as_bytes();
+        let (fp, fl) = match font {
+            Some(p) => (p.as_ptr(), p.len()),
+            None => (std::ptr::null(), 0),
+        };
+        add_text_box_annotation_styled(
+            handle, 0, 1000, 60.0, top, 560.0, top + 80.0,
+            bytes.as_ptr(), bytes.len(), size, 0, 0, 0, 255,
+            ALIGN_LEFT, 0, 0, 0.0, fp, fl, 0, 0)
+    }
+
+    /// The runs on page 0 after a save and reopen, as (font, size, text).
+    fn runs_after_round_trip(handle: u64) -> Vec<ParsedRun> {
+        let saved = snapshot_document(handle);
+        let reopened = open_document_from_bytes(saved.data, saved.len);
+        let buffer = get_page_text_runs(reopened, 0);
+        let runs = parse_runs(&buffer);
+        free_byte_buffer(buffer);
+        close_document(reopened);
+        free_byte_buffer(saved);
+        runs
+    }
+
+    #[test]
+    fn devanagari_comes_back_as_its_own_characters_not_as_shaped_glyphs() {
+        // The question a Hindi or Burmese document raises: a heading is drawn
+        // as SHAPED glyphs, where "कि" is one glyph and its vowel sits to the
+        // LEFT of the consonant it follows. If a run reported that, every
+        // bookmark title in the document would be scrambled, and the title
+        // would not match the text anyone searched for.
+        let Some(font) = devanagari_font() else {
+            eprintln!("no Devanagari font on this machine; skipping");
+            return;
+        };
+
+        const HEADING: &str = "अध्याय एक";
+
+        let h = open_fixture_named("tests/fixtures/blank.pdf");
+        assert_eq!(sized_box(h, HEADING, 600.0, 24.0, Some(font)), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let runs = runs_after_round_trip(h);
+        close_document(h);
+
+        assert!(
+            runs.iter().any(|r| r.text.contains(HEADING)),
+            "the heading did not come back intact; runs were {:?}",
+            runs.iter().map(|r| &r.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_complex_script_page_still_separates_a_heading_from_its_body() {
+        // The feature itself, in Devanagari: two sizes on one page have to come
+        // back as two styles, or there is nothing to tick.
+        let Some(font) = devanagari_font() else {
+            eprintln!("no Devanagari font on this machine; skipping");
+            return;
+        };
+
+        const HEADING: &str = "पहला अध्याय";
+        const BODY: &str = "यह सामान्य पाठ है";
+
+        let h = open_fixture_named("tests/fixtures/blank.pdf");
+        assert_eq!(sized_box(h, HEADING, 640.0, 24.0, Some(font)), STATUS_OK_PDFIUM);
+        assert_eq!(sized_box(h, BODY, 400.0, 11.0, Some(font)), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let runs = runs_after_round_trip(h);
+        close_document(h);
+
+        let heading = runs.iter().find(|r| r.text.contains(HEADING));
+        let body = runs.iter().find(|r| r.text.contains(BODY));
+
+        let (Some(heading), Some(body)) = (heading, body) else {
+            panic!("one of the two did not come back; runs were {:?}",
+                   runs.iter().map(|r| (&r.text, r.size)).collect::<Vec<_>>());
+        };
+
+        assert!(
+            heading.size > body.size,
+            "the heading reported {}pt and the body {}pt, so nothing separates them",
+            heading.size, body.size);
+    }
+
+    #[test]
+    fn burmese_comes_back_as_its_own_characters_too() {
+        // Burmese stacks SEVERAL characters into one glyph, which is the other
+        // half of the same worry: a run must report what was typed, not what
+        // was drawn.
+        let Some(font) = burmese_font() else {
+            eprintln!("no Burmese font on this machine; skipping");
+            return;
+        };
+
+        const HEADING: &str = "အခန်း တစ်";
+
+        let h = open_fixture_named("tests/fixtures/blank.pdf");
+        assert_eq!(sized_box(h, HEADING, 600.0, 24.0, Some(font)), STATUS_OK_PDFIUM);
+        assert_eq!(sync(h), STATUS_OK_PDFIUM);
+
+        let runs = runs_after_round_trip(h);
+        close_document(h);
+
+        assert!(
+            runs.iter().any(|r| r.text.contains(HEADING)),
+            "the heading did not come back intact; runs were {:?}",
+            runs.iter().map(|r| &r.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn text_runs_refuse_a_handle_or_page_that_is_not_there() {
+        let handle = open_fixture_named(&styled_fixture());
+
+        assert_eq!(get_page_text_runs(0, 0).status, STATUS_INVALID_INPUT);
+        assert_eq!(get_page_text_runs(handle, -1).status, STATUS_INVALID_INPUT);
+        assert_eq!(get_page_text_runs(handle, 9_999).status, STATUS_INVALID_INPUT);
+
+        close_document(handle);
     }
 }
 

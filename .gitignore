@@ -25,3 +25,7 @@ Stamps/
 # Intermediate from rc.exe when rebuilding the cursor resource DLL. The DLL
 # itself IS checked in; this is just the step between.
 PdfEditorApp/Assets/Cursors/cursors.res
+
+# Built by the ignored scan_cost measurement, not a fixture any test asserts
+# on. 380KB of filler text, regenerated on demand by the test that wants it.
+render_core/tests/fixtures/.dense_timing.pdf

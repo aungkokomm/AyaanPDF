@@ -5307,34 +5307,20 @@ public sealed partial class MainPage : Page
         }
     }
 
-    // ---------------- Auto bookmarks ----------------
+    /// <summary>The bookmark builder, while it is open.</summary>
+    private BookmarkWindow? _bookmarkWindow;
 
     /// <summary>
-    /// The patterns behind the presets, in the order the combo lists them.
+    /// Opens the bookmark builder, or brings back the one already open.
     ///
-    /// Presets rather than a bare regex box: the numbered one is what the tool
-    /// this was ported from offered, and it only suits papers and manuals.
-    /// A book of chapters matches nothing under it, which looks like a broken
-    /// feature rather than a mismatched pattern.
+    /// A WINDOW rather than a dialog. A ContentDialog will not grow past its
+    /// ContentDialogMaxWidth of 548, so the two-column layout was clipped: the
+    /// preview, half the options and the closing note fell off the right-hand
+    /// edge. It being modeless is the second win, not a side effect: the
+    /// document stays reachable, so a style can be picked by selecting a
+    /// heading on the page while the window is open.
     /// </summary>
-    private static readonly string[] AutoBookmarkPatterns =
-    [
-        HeadingDetector.NumberedPattern,
-
-        // Chapter/Section/Part, numbered in digits or Roman numerals. No
-        // hierarchy group, so these come out as one flat level, which is what a
-        // list of chapters is.
-        @"^\s*(Chapter|Section|Part|Adhyay|Adhyaya)\s+([0-9]+|[IVXLC]+)\b.*",
-
-        // A whole line in capitals, four characters or more. Catches the
-        // headings in documents that mark them by case alone.
-        @"^[\p{Lu}][\p{Lu}\s\d\p{P}]{3,}$",
-    ];
-
-    private List<DetectedHeading> _autoBookmarkFound = [];
-    private CancellationTokenSource? _autoBookmarkScan;
-
-    private async void AutoBookmarks_Click(object sender, RoutedEventArgs e)
+    private async void StyleBookmarks_Click(object sender, RoutedEventArgs e)
     {
         if (!ViewModel.HasDocumentPath)
         {
@@ -5344,98 +5330,155 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        _autoBookmarkFound = [];
-        AutoBookmarkPreview.ItemsSource = null;
-        AutoBookmarkDialog.IsPrimaryButtonEnabled = false;
-        AutoBookmarkSummary.Text = "Scan to see which headings this finds.";
-        if (AutoBookmarkPattern.Text.Length == 0)
+        if (_bookmarkWindow is not null)
         {
-            AutoBookmarkPattern.Text = AutoBookmarkPatterns[0];
+            _bookmarkWindow.Activate();
+            return;
         }
 
-        AutoBookmarkDialog.XamlRoot = XamlRoot;
-        if (await AutoBookmarkDialog.ShowAsync() == ContentDialogResult.Primary)
+        var window = new BookmarkWindow(ViewModel, () =>
         {
-            ApplyAutoBookmarks();
-        }
+            BookmarkPanel.Visibility = Visibility.Visible;
+            ThumbnailPanel.Visibility = Visibility.Collapsed;
+        });
 
-        // A scan left running would keep parsing pages nobody is waiting for.
-        _autoBookmarkScan?.Cancel();
+        window.Closed += (_, _) => _bookmarkWindow = null;
+        _bookmarkWindow = window;
+        window.Activate();
     }
 
-    private void AutoBookmarkPreset_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    // ---------------- One bookmark at a time ----------------
+    //
+    // The two bulk features build an outline from scratch and replace whatever
+    // the document had. This is the half a reader reaches for first: mark the
+    // page in front of them, fix a title that came out wrong, drop one that did
+    // not belong.
+
+    /// <summary>
+    /// Bookmarks the current page, named after the selected text.
+    ///
+    /// With nothing selected it asks for a name, pre-filled with the page it
+    /// would mark, rather than refusing: wanting to mark a page you are looking
+    /// at is at least as common as wanting to mark a heading you can select.
+    /// </summary>
+    private async void AddBookmark_Click(object sender, RoutedEventArgs e) => await AddBookmarkHere();
+
+    private async Task AddBookmarkHere()
     {
-        // The last entry is "Custom", which leaves whatever is in the box alone.
-        int i = AutoBookmarkPreset.SelectedIndex;
-        if (i >= 0 && i < AutoBookmarkPatterns.Length && AutoBookmarkPattern is not null)
+        if (!ViewModel.HasDocumentPath)
         {
-            AutoBookmarkPattern.Text = AutoBookmarkPatterns[i];
+            await ShowMessage(
+                "Save first",
+                "Bookmarks are written into the PDF, so the document needs a file to be written to. Save it and try again.");
+            return;
         }
-    }
 
-    private void AutoBookmarkPattern_TextChanged(object sender, TextChangedEventArgs e)
-    {
-        // Editing the pattern invalidates the preview under it: offering to add
-        // bookmarks that no longer match what the box says would be a lie.
-        _autoBookmarkFound = [];
-        AutoBookmarkPreview.ItemsSource = null;
-        AutoBookmarkDialog.IsPrimaryButtonEnabled = false;
-    }
+        // The page the SELECTION is on, not the one in view: a reader who
+        // selected a heading and then scrolled means the heading.
+        int page = ViewModel.SelectionStart?.Page ?? ViewModel.CurrentPageIndex;
+        string title = OutlineEdits.TitleFrom(ViewModel.GetSelectedText(), page);
 
-    private async void AutoBookmarkScan_Click(object sender, RoutedEventArgs e)
-    {
-        _autoBookmarkScan?.Cancel();
-        var cts = new CancellationTokenSource();
-        _autoBookmarkScan = cts;
-
-        AutoBookmarkScan.IsEnabled = false;
-        AutoBookmarkProgress.Visibility = Visibility.Visible;
-        AutoBookmarkProgress.Value = 0;
-        AutoBookmarkSummary.Text = $"Reading {ViewModel.PageCount} pages...";
-
-        var progress = new Progress<double>(v => AutoBookmarkProgress.Value = v);
-
-        try
+        if (ViewModel.GetSelectedText() is null or "")
         {
-            var found = await ViewModel.ScanForHeadingsAsync(
-                AutoBookmarkPattern.Text, progress, cts.Token);
-
-            _autoBookmarkFound = [.. found];
-            AutoBookmarkPreview.ItemsSource = found
-                .Select(h => new BookmarkItem(new Bookmark(h.Level - 1, h.PageIndex, h.Title)))
-                .ToList();
-
-            AutoBookmarkSummary.Text = found.Count == 0
-                ? "No headings matched. Try another pattern, or edit it above."
-                : $"Found {found.Count} headings.";
-            AutoBookmarkDialog.IsPrimaryButtonEnabled = found.Count > 0;
+            if (await AskForBookmarkName(title, page) is not { } named)
+            {
+                return;
+            }
+            title = named;
         }
-        catch (OperationCanceledException)
-        {
-            // Superseded by a newer scan, or the dialog closed. Nothing to say.
-        }
-        catch (ArgumentException ex)
-        {
-            // A pattern typed by hand, so an unbalanced bracket is ordinary.
-            AutoBookmarkSummary.Text = ex.Message;
-        }
-        finally
-        {
-            AutoBookmarkScan.IsEnabled = true;
-            AutoBookmarkProgress.Visibility = Visibility.Collapsed;
-        }
-    }
 
-    private async void ApplyAutoBookmarks()
-    {
-        if (ViewModel.ApplyOutline(_autoBookmarkFound) is { } problem)
+        if (ViewModel.AddBookmark(title, page) is { } problem)
         {
-            await ShowMessage("Could not add bookmarks", problem);
+            await ShowMessage("Could not add the bookmark", problem);
             return;
         }
 
         BookmarkPanel.Visibility = Visibility.Visible;
         ThumbnailPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private async void RenameBookmark_Click(object sender, RoutedEventArgs e)
+    {
+        if (BookmarkOf(sender) is not (int index, BookmarkItem item))
+        {
+            return;
+        }
+
+        if (await AskForBookmarkName(item.Title, item.PageIndex) is not { } named)
+        {
+            return;
+        }
+
+        if (ViewModel.RenameBookmark(index, named) is { } problem)
+        {
+            await ShowMessage("Could not rename the bookmark", problem);
+        }
+    }
+
+    private async void DeleteBookmark_Click(object sender, RoutedEventArgs e)
+    {
+        if (BookmarkOf(sender) is not (int index, BookmarkItem _))
+        {
+            return;
+        }
+
+        // No confirmation. One entry is a small loss, undoing it is one more
+        // bookmark, and a prompt on every delete is what makes people stop
+        // reading prompts.
+        if (ViewModel.DeleteBookmark(index) is { } problem)
+        {
+            await ShowMessage("Could not delete the bookmark", problem);
+        }
+    }
+
+    /// <summary>
+    /// Which row a context-menu item belongs to.
+    ///
+    /// By IDENTITY in the list rather than by the list's selection: a
+    /// right-click opens the flyout without selecting the row, so the selection
+    /// is whatever was clicked last and would rename the wrong entry.
+    /// </summary>
+    private (int Index, BookmarkItem Item)? BookmarkOf(object sender)
+    {
+        if (sender is not FrameworkElement { DataContext: BookmarkItem item })
+        {
+            return null;
+        }
+
+        int index = ViewModel.Bookmarks.IndexOf(item);
+        return index >= 0 ? (index, item) : null;
+    }
+
+    /// <summary>The name the reader typed, or null if they cancelled.</summary>
+    private async Task<string?> AskForBookmarkName(string current, int pageIndex)
+    {
+        BookmarkNameBox.Text = current;
+        BookmarkNamePage.Text = $"Goes to page {pageIndex + 1}.";
+        BookmarkNameDialog.XamlRoot = XamlRoot;
+
+        // Selected, not just focused, so typing replaces the suggestion rather
+        // than running on from it.
+        BookmarkNameDialog.Opened += SelectBookmarkName;
+        try
+        {
+            if (await BookmarkNameDialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                return null;
+            }
+        }
+        finally
+        {
+            BookmarkNameDialog.Opened -= SelectBookmarkName;
+        }
+
+        string typed = BookmarkNameBox.Text.Trim();
+        return typed.Length > 0 ? typed : null;
+
+        void SelectBookmarkName(ContentDialog _, ContentDialogOpenedEventArgs __)
+        {
+            BookmarkNameBox.Focus(FocusState.Programmatic);
+            BookmarkNameBox.SelectAll();
+        }
     }
 
     private async Task ShowMessage(string title, string message)
@@ -5852,6 +5895,10 @@ public sealed partial class MainPage : Page
 
             case EditorCommand.NavigateBack: GoBackInHistory(); break;
             case EditorCommand.NavigateForward: GoForwardInHistory(); break;
+
+            // Not awaited: this switch is called from a key handler, and the
+            // handler has to return so the key is marked handled.
+            case EditorCommand.AddBookmark: _ = AddBookmarkHere(); break;
         }
     }
 

@@ -130,7 +130,13 @@ public static class HeadingDetector
     /// Consecutive duplicates go at the same time: a running header repeats the
     /// section title on every page of it.
     /// </summary>
-    private static IReadOnlyList<DetectedHeading> Repair(List<DetectedHeading> found)
+    /// <remarks>
+    /// Public because <see cref="StyleBookmarker"/> needs exactly this. Both
+    /// detectors produce a level per heading and both can produce a sequence a
+    /// PDF outline cannot express; the rule for fixing that belongs in one
+    /// place, not copied into the second one.
+    /// </remarks>
+    public static IReadOnlyList<DetectedHeading> Repair(List<DetectedHeading> found)
     {
         var repaired = new List<DetectedHeading>(found.Count);
         int previousLevel = 0;

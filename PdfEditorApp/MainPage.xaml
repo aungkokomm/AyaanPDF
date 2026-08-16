@@ -33,6 +33,38 @@
          drawing and stays there. The menu entries still show their shortcuts. -->
     <Page.Resources>
         <!--
+            The bookmark ribbon, drawn rather than looked up.
+
+            Segoe Fluent Icons has no bookmark glyph. E8A4, which this app used
+            for the Bookmarks panel, is a BULLETED LIST, near enough identical
+            to the list icon on the button beside it, so the panel and the
+            "make bookmarks from headings" button looked like the same thing.
+
+            A ring rather than a solid, to sit with the line-art icons around
+            it, and F0 for the even-odd fill that makes the hole. PathIcon FILLS
+            its geometry: an outline has to be described as one.
+
+            ⚠️ Two things a PathIcon will not do for you, both of which this got
+            wrong first time round:
+
+              * It does NOT scale the geometry to the Width and Height given.
+                Those CLIP it. So the path starts at 0,0 and the box it is given
+                is a little larger than the path's own extent, rather than the
+                other way about. The first version ran to x=17 in a 15-wide box
+                and lost its right-hand edge.
+              * Its wall is a real distance, not a stroke that thins with size.
+                1.15 against a 15-tall glyph matches what Segoe Fluent draws at
+                16px, checked side by side; the first version was half again as
+                heavy as its neighbours.
+        -->
+        <x:String x:Key="BookmarkRibbonPath">F0 M0,0 L11,0 L11,15 L5.5,11 L0,15 Z M1.15,1.15 L9.85,1.15 L9.85,12.7 L5.5,9.55 L1.15,12.7 Z</x:String>
+
+        <!-- The same ribbon, smaller, with a plus beside it. The plus is solid
+             because it is a badge rather than an object, which is how Fluent
+             draws its own. -->
+        <x:String x:Key="BookmarkAddPath">F0 M0,0 L9,0 L9,13 L4.5,9.5 L0,13 Z M1.1,1.1 L7.9,1.1 L7.9,10.9 L4.5,8.2 L1.1,10.9 Z M13.4,3 L14.6,3 L14.6,5.9 L17.5,5.9 L17.5,7.1 L14.6,7.1 L14.6,10 L13.4,10 L13.4,7.1 L10.5,7.1 L10.5,5.9 L13.4,5.9 Z</x:String>
+
+        <!--
             Text that sits directly on the CANVAS, not on app chrome.
 
             These are fixed light values rather than ThemeResource, and that is
@@ -1023,7 +1055,8 @@
 
                 <Button Click="ToggleBookmarks_Click" ToolTipService.ToolTip="Bookmarks (F6)"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE8A4;" FontSize="16" />
+                    <!-- Roomier than the path's 11x15, because the box clips. -->
+                    <PathIcon Data="{StaticResource BookmarkRibbonPath}" Width="12" Height="16" />
                 </Button>
 
                 <!-- Only shown when the open document actually has fillable fields. -->
@@ -2206,12 +2239,35 @@
                                Text="{x:Bind ViewModel.Bookmarks.Count, Mode=OneWay}"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                Style="{StaticResource CaptionTextBlockStyle}" />
-                    <Button Grid.Column="2" Click="AutoBookmarks_Click"
-                            Width="28" Height="28" Padding="0"
-                            Background="Transparent" BorderThickness="0"
-                            ToolTipService.ToolTip="Create bookmarks from headings">
-                        <FontIcon Glyph="&#xE8FD;" FontSize="14" />
-                    </Button>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="2">
+                        <!--
+                            The one a reader reaches for first: mark the page in
+                            front of them. It was the gap under the two bulk
+                            features, which can only build an outline from
+                            scratch and replace whatever was there.
+                        -->
+                        <Button Click="AddBookmark_Click"
+                                Width="28" Height="28" Padding="0"
+                                Background="Transparent" BorderThickness="0"
+                                ToolTipService.ToolTip="Add a bookmark here, named after the selected text (Ctrl+B)">
+                            <!-- Roomier than the path's 17.5x13, because the box clips. -->
+                            <PathIcon Data="{StaticResource BookmarkAddPath}" Width="19" Height="14" />
+                        </Button>
+                        <!--
+                            One button, because there is one question: make me
+                            an outline. HOW to describe a heading is a choice
+                            inside the dialog, not a choice of which dialog to
+                            open. Two buttons that looked alike and answered the
+                            same question meant whichever you picked, you had to
+                            close it to try the other.
+                        -->
+                        <Button Click="StyleBookmarks_Click"
+                                Width="28" Height="28" Padding="0"
+                                Background="Transparent" BorderThickness="0"
+                                ToolTipService.ToolTip="Create bookmarks from the document's headings">
+                            <FontIcon Glyph="&#xE8D2;" FontSize="14" />
+                        </Button>
+                    </StackPanel>
                 </Grid>
 
                 <!--
@@ -2248,6 +2304,17 @@
                                 however deep it goes.
                             -->
                             <Grid Margin="{x:Bind Indent}" ColumnSpacing="8">
+                                <!--
+                                    Rename and delete live here rather than as
+                                    buttons on every row: they are done rarely,
+                                    and a row is a click target for GOING there.
+                                -->
+                                <Grid.ContextFlyout>
+                                    <MenuFlyout>
+                                        <MenuFlyoutItem Text="Rename" Click="RenameBookmark_Click" />
+                                        <MenuFlyoutItem Text="Delete" Click="DeleteBookmark_Click" />
+                                    </MenuFlyout>
+                                </Grid.ContextFlyout>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
@@ -2266,75 +2333,22 @@
         </Border>
 
         <!--
-            Auto bookmarks. Scans the document's text for headings and turns
-            them into a real outline.
-
-            The preview is not decoration. Whether a pattern fits a given
-            document is not knowable in advance, and writing bookmarks rewrites
-            the file, so the answer has to be visible BEFORE anything is
-            committed.
+            Naming a bookmark. Used for renaming one, and for adding one where
+            no text was selected to name it after.
         -->
-        <ContentDialog x:Name="AutoBookmarkDialog" Title="Create bookmarks"
-                       PrimaryButtonText="Add bookmarks" CloseButtonText="Cancel"
-                       DefaultButton="Primary" IsPrimaryButtonEnabled="False">
-            <StackPanel Spacing="12" Width="460">
-                <ComboBox x:Name="AutoBookmarkPreset" Header="Headings look like"
-                          HorizontalAlignment="Stretch"
-                          SelectionChanged="AutoBookmarkPreset_SelectionChanged">
-                    <ComboBoxItem Content="Numbered: 1.  1.1.  1.2.1." IsSelected="True" />
-                    <ComboBoxItem Content="Chapter / Section / Part" />
-                    <ComboBoxItem Content="ALL CAPS lines" />
-                    <ComboBoxItem Content="Custom pattern" />
-                </ComboBox>
-
-                <TextBox x:Name="AutoBookmarkPattern" Header="Pattern"
-                         FontFamily="Consolas" IsSpellCheckEnabled="False"
-                         TextChanged="AutoBookmarkPattern_TextChanged" />
-
-                <Button x:Name="AutoBookmarkScan" Content="Scan the document"
-                        Click="AutoBookmarkScan_Click" />
-
-                <ProgressBar x:Name="AutoBookmarkProgress" Visibility="Collapsed"
-                             Minimum="0" Maximum="1" />
-
-                <TextBlock x:Name="AutoBookmarkSummary" TextWrapping="Wrap"
+        <ContentDialog x:Name="BookmarkNameDialog" Title="Bookmark name"
+                       PrimaryButtonText="Save" CloseButtonText="Cancel"
+                       DefaultButton="Primary">
+            <StackPanel Spacing="8" Width="360">
+                <!-- Enter accepts it: a single-line TextBox does not handle the
+                     key, so the dialog's default button takes it. -->
+                <TextBox x:Name="BookmarkNameBox" Header="Name" />
+                <TextBlock x:Name="BookmarkNamePage"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                           Style="{StaticResource CaptionTextBlockStyle}"
-                           Text="Scan to see which headings this finds." />
-
-                <ListView x:Name="AutoBookmarkPreview" Height="220"
-                          SelectionMode="None"
-                          BorderThickness="1" CornerRadius="4"
-                          BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
-                    <ListView.ItemContainerStyle>
-                        <Style TargetType="ListViewItem">
-                            <Setter Property="MinHeight" Value="0" />
-                            <Setter Property="Padding" Value="8,3" />
-                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                        </Style>
-                    </ListView.ItemContainerStyle>
-                    <ListView.ItemTemplate>
-                        <DataTemplate x:DataType="viewmodels:BookmarkItem">
-                            <Grid Margin="{x:Bind Indent}" ColumnSpacing="8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="{x:Bind Title}" FontSize="12"
-                                           TextTrimming="CharacterEllipsis" />
-                                <TextBlock Grid.Column="1" Text="{x:Bind PageLabel}" FontSize="11"
-                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                            </Grid>
-                        </DataTemplate>
-                    </ListView.ItemTemplate>
-                </ListView>
-
-                <TextBlock TextWrapping="Wrap"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                           Style="{StaticResource CaptionTextBlockStyle}"
-                           Text="Bookmarks are written into the PDF, replacing any it already has. The file is saved as part of this." />
+                           Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
         </ContentDialog>
+
 
         <!--
             Rotate Pages dialog. The quick right-click "Rotate 90" is one page,

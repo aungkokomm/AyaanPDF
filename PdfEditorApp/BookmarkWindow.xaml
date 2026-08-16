@@ -1,0 +1,301 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Bookmark building, as a real window rather than a dialog.
+
+    It was a ContentDialog, and a ContentDialog will not grow: its own
+    ContentDialogMaxWidth theme resource is 548, so setting the content wider
+    just CLIPPED it. The preview column, half the options row and the closing
+    note all disappeared off the right-hand edge, and no amount of sizing the
+    content could bring them back.
+
+    A window also fixes something the dialog could not: it is modeless, so the
+    document is still there behind it. Selecting a heading on the page and
+    pressing "Tick the style of the text I selected" now works while this is
+    open, where before the selection had to be made first and remembered.
+-->
+<Window
+    x:Class="PdfEditorApp.BookmarkWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:viewmodels="using:PdfEditorApp.ViewModels"
+    Title="Create bookmarks">
+
+    <Grid x:Name="Root" Padding="20,16,20,16" RowSpacing="12" ColumnSpacing="16"
+          Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="3*" MinWidth="380" />
+            <ColumnDefinition Width="2*" MinWidth="240" />
+        </Grid.ColumnDefinitions>
+
+        <!--
+            Two ways of describing a heading, one window. They were separate
+            dialogs behind two buttons that looked alike and answered the same
+            question, so whichever you opened you had to close it to try the
+            other.
+
+            The PREVIEW is shared and stays put across the tabs. That is the
+            point of putting them together: the question is always "which
+            bookmarks would this make", and the answer belongs in the same place
+            whichever way you asked.
+        -->
+        <SelectorBar x:Name="BookmarkTabs" Grid.ColumnSpan="2"
+                     SelectionChanged="BookmarkTab_Changed">
+            <SelectorBarItem x:Name="LookTab" Text="By how they look" IsSelected="True" />
+            <SelectorBarItem x:Name="WordingTab" Text="By what they say" />
+        </SelectorBar>
+
+        <Grid x:Name="LookPanel" Grid.Row="1" RowSpacing="8">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                <Button x:Name="StyleScanButton" Content="Scan the document"
+                        Click="StyleScan_Click" />
+                <ProgressBar x:Name="StyleScanProgress" Width="160" Visibility="Collapsed"
+                             Minimum="0" Maximum="1" VerticalAlignment="Center" />
+            </StackPanel>
+
+            <TextBlock x:Name="StyleScanSummary" Grid.Row="1" TextWrapping="Wrap"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Text="Scan to see which styles this document is set in." />
+
+            <Grid Grid.Row="2" RowSpacing="4">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Text="Styles in this document"
+                           Style="{StaticResource BodyStrongTextBlockStyle}" />
+                <ListView Grid.Row="1" x:Name="StyleList" SelectionMode="None"
+                          BorderThickness="1" CornerRadius="4"
+                          BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
+                    <ListView.ItemContainerStyle>
+                        <Style TargetType="ListViewItem">
+                            <Setter Property="MinHeight" Value="0" />
+                            <Setter Property="Padding" Value="6,4" />
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        </Style>
+                    </ListView.ItemContainerStyle>
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="viewmodels:StyleChoice">
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <CheckBox IsChecked="{x:Bind IsChosen, Mode=TwoWay}"
+                                          MinWidth="0" Padding="0" Margin="0"
+                                          VerticalAlignment="Center"
+                                          Checked="StyleChoice_Changed"
+                                          Unchecked="StyleChoice_Changed" />
+
+                                <StackPanel Grid.Column="1">
+                                    <!-- The document's own words, at its own size,
+                                         weight and colour. The FONT cannot be
+                                         honoured: it is very often not installed
+                                         here, and substituting one silently would
+                                         show a sample that misrepresents the page. -->
+                                    <TextBlock Text="{x:Bind Sample}"
+                                               FontSize="{x:Bind PreviewSize}"
+                                               FontWeight="{x:Bind PreviewWeight}"
+                                               Foreground="{x:Bind PreviewBrush}"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <TextBlock FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}">
+                                        <Run Text="{x:Bind Describe}" />
+                                        <Run Text="  ·  " />
+                                        <Run Text="{x:Bind Reach}" />
+                                    </TextBlock>
+                                </StackPanel>
+
+                                <!-- Enabled only once the style is ticked: a level
+                                     on a style that makes no bookmarks is a setting
+                                     for nothing. -->
+                                <ComboBox Grid.Column="2" Width="86" VerticalAlignment="Center"
+                                          IsEnabled="{x:Bind IsChosen, Mode=OneWay}"
+                                          SelectedIndex="{x:Bind LevelIndex, Mode=TwoWay}"
+                                          SelectionChanged="StyleLevel_Changed"
+                                          ToolTipService.ToolTip="How deep this style's bookmarks sit">
+                                    <ComboBoxItem Content="Level 1" />
+                                    <ComboBoxItem Content="Level 2" />
+                                    <ComboBoxItem Content="Level 3" />
+                                    <ComboBoxItem Content="Level 4" />
+                                    <ComboBoxItem Content="Level 5" />
+                                    <ComboBoxItem Content="Level 6" />
+                                </ComboBox>
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <!--
+                    Always offered, because this window is modeless: the document
+                    is still there behind it, so the selection can be made NOW.
+                    It ticks a row in the list rather than adding a second kind
+                    of entry: two routes to one place, not two places.
+                -->
+                <Button Grid.Row="2" x:Name="StyleFromSelectionButton" Margin="0,4,0,0"
+                        Click="StyleFromSelection_Click"
+                        Content="Tick the style of the text I selected" />
+            </Grid>
+
+            <StackPanel Grid.Row="3" Spacing="8">
+                <StackPanel Orientation="Horizontal" Spacing="16" VerticalAlignment="Center">
+                    <TextBlock Text="Count as the same style:" VerticalAlignment="Center" />
+                    <CheckBox x:Name="StyleUseFont" Content="Font" IsChecked="True"
+                              Checked="StyleOption_Changed" Unchecked="StyleOption_Changed" />
+                    <CheckBox x:Name="StyleUseSize" Content="Size" IsChecked="True"
+                              Checked="StyleOption_Changed" Unchecked="StyleOption_Changed" />
+                    <!-- Off by default. Most documents print their headings in the
+                         same black as everything else, so requiring it rules
+                         nothing out; a document that DOES colour them is exactly
+                         where it is the only thing separating a heading from a
+                         same-sized run-in. -->
+                    <CheckBox x:Name="StyleUseColor" Content="Colour"
+                              Checked="StyleOption_Changed" Unchecked="StyleOption_Changed" />
+                </StackPanel>
+
+                <!-- Wrapping, so a narrow window stacks these rather than losing
+                     the right-hand end of them, which is what the dialog did. -->
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="Only titles that" VerticalAlignment="Center" />
+                    <ComboBox x:Name="StyleFilterKind" Width="150" SelectedIndex="0"
+                              SelectionChanged="StyleOption_Changed">
+                        <ComboBoxItem Content="(no restriction)" />
+                        <ComboBoxItem Content="contain" />
+                        <ComboBoxItem Content="start with" />
+                        <ComboBoxItem Content="do not contain" />
+                        <ComboBoxItem Content="match the pattern" />
+                    </ComboBox>
+                    <TextBox x:Name="StyleFilterText" MinWidth="140"
+                             IsSpellCheckEnabled="False"
+                             TextChanged="StyleFilterText_Changed" />
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="Pages" VerticalAlignment="Center" />
+                    <ComboBox x:Name="StylePageRange" Width="130" SelectedIndex="0"
+                              SelectionChanged="StyleOption_Changed">
+                        <ComboBoxItem Content="All" />
+                        <ComboBoxItem Content="This page on" />
+                        <ComboBoxItem Content="This page only" />
+                    </ComboBox>
+
+                    <!-- A heading that wrapped is one heading. A list of one-line
+                         headings set the same way is not, which is why this is a
+                         choice and not a rule. -->
+                    <CheckBox x:Name="StyleJoinWrapped" IsChecked="True" Margin="8,0,0,0"
+                              Content="Join headings that wrap onto a second line"
+                              Checked="StyleOption_Changed" Unchecked="StyleOption_Changed" />
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+
+        <!--
+            The other way of describing a heading: by what it SAYS. Reads whole
+            page text rather than styled runs, which is why it stays its own
+            engine rather than becoming a filter on the other one, and why it
+            still suits a document whose headings are numbered but set no
+            differently from the body.
+        -->
+        <Grid x:Name="WordingPanel" Grid.Row="1" RowSpacing="10" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <ComboBox x:Name="AutoBookmarkPreset" Header="Headings read like"
+                      HorizontalAlignment="Stretch"
+                      SelectionChanged="AutoBookmarkPreset_SelectionChanged">
+                <ComboBoxItem Content="Numbered: 1.  1.1.  1.2.1." IsSelected="True" />
+                <ComboBoxItem Content="Chapter / Section / Part" />
+                <ComboBoxItem Content="ALL CAPS lines" />
+                <ComboBoxItem Content="Custom pattern" />
+            </ComboBox>
+
+            <TextBox x:Name="AutoBookmarkPattern" Grid.Row="1" Header="Pattern"
+                     FontFamily="Consolas" IsSpellCheckEnabled="False"
+                     TextChanged="AutoBookmarkPattern_TextChanged" />
+
+            <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="10">
+                <Button x:Name="AutoBookmarkScan" Content="Scan the document"
+                        Click="AutoBookmarkScan_Click" />
+                <ProgressBar x:Name="AutoBookmarkProgress" Width="160" Visibility="Collapsed"
+                             Minimum="0" Maximum="1" VerticalAlignment="Center" />
+            </StackPanel>
+
+            <TextBlock x:Name="AutoBookmarkSummary" Grid.Row="3" TextWrapping="Wrap"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Text="Scan to see which headings this finds." />
+        </Grid>
+
+        <!-- Shared. Whichever tab asked the question, this is the answer, and
+             it does not move when the tab changes. -->
+        <Grid Grid.Row="1" Grid.Column="1" RowSpacing="4">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <TextBlock x:Name="StylePreviewHeader" Text="Bookmarks this makes"
+                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+            <ListView Grid.Row="1" x:Name="StylePreview" SelectionMode="None"
+                      BorderThickness="1" CornerRadius="4"
+                      BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
+                <ListView.ItemContainerStyle>
+                    <Style TargetType="ListViewItem">
+                        <Setter Property="MinHeight" Value="0" />
+                        <Setter Property="Padding" Value="8,3" />
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </Style>
+                </ListView.ItemContainerStyle>
+                <ListView.ItemTemplate>
+                    <DataTemplate x:DataType="viewmodels:BookmarkItem">
+                        <Grid Margin="{x:Bind Indent}" ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{x:Bind Title}" FontSize="12"
+                                       TextTrimming="CharacterEllipsis"
+                                       ToolTipService.ToolTip="{x:Bind Title}" />
+                            <TextBlock Grid.Column="1" Text="{x:Bind PageLabel}" FontSize="11"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+        </Grid>
+
+        <TextBlock Grid.Row="2" Grid.ColumnSpan="2" TextWrapping="Wrap"
+                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                   Style="{StaticResource CaptionTextBlockStyle}"
+                   Text="Bookmarks are written into the PDF, replacing any it already has. The file is saved as part of this." />
+
+        <StackPanel Grid.Row="3" Grid.ColumnSpan="2" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="8">
+            <Button x:Name="AddButton" Content="Add bookmarks" IsEnabled="False"
+                    Style="{StaticResource AccentButtonStyle}" Click="Add_Click" />
+            <Button Content="Close" Click="Close_Click" />
+        </StackPanel>
+    </Grid>
+</Window>

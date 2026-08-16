@@ -361,6 +361,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         Bookmarks.Clear();
         HasBookmarks = false;
+
+        // Whatever was pending belonged to the outline that was on screen a
+        // moment ago. This is the file's own outline being read, so the two
+        // cannot both be true.
+        _pendingOutline = null;
+        OnPropertyChanged(nameof(HasUnsavedOutline));
+
         if (_documentHandle == 0)
         {
             return;
@@ -429,7 +436,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             for (int i = 0; i < pages; i++)
             {
                 token.ThrowIfCancellationRequested();
-                texts.Add(TextLayerLoader.Load(handle, i, width).Text);
+
+                // Repaired for the same reason the styled runs are: a document
+                // that records its text in painting order gives Devanagari with
+                // every short-i sign in front of its consonant, and a heading
+                // pattern would be matching nonsense.
+                texts.Add(DevanagariText.Repair(TextLayerLoader.Load(handle, i, width).Text));
 
                 // Every 16 pages rather than every page: on a long book the
                 // progress callback marshals to the UI thread, and doing that
@@ -445,6 +457,173 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }, token);
     }
 
+    // ---------------- Editing the outline ----------------
+    //
+    // ⚠️ Writing an outline means rewriting the FILE. PDFium cannot create a
+    // bookmark, so the document is closed, the tree is written by lopdf, and it
+    // is reopened: around two seconds on a 54 MB book, measured.
+    //
+    // Doing that per keystroke made Ctrl+B a two-second freeze on exactly the
+    // documents worth bookmarking, and forced a save nobody asked for. So an
+    // edit changes the outline IN MEMORY, shows immediately, and marks the
+    // document dirty; the file is rewritten when the document is saved, along
+    // with everything else. That is what every editor does, and it means the
+    // existing unsaved-changes prompt already covers bookmarks.
+
+    /// <summary>
+    /// The outline as edited, waiting to be written, or null when the file's
+    /// own outline is what is on screen.
+    /// </summary>
+    private List<DetectedHeading>? _pendingOutline;
+
+    /// <summary>Whether a save has bookmarks to write as well.</summary>
+    public bool HasUnsavedOutline => _pendingOutline is not null;
+
+    /// <summary>Adds one bookmark, in memory. Written on the next save.</summary>
+    /// <returns>Null on success, or a message saying what stopped it.</returns>
+    public string? AddBookmark(string title, int pageIndex) =>
+        EditOutline(marks => OutlineEdits.Add(marks, title, pageIndex));
+
+    public string? RenameBookmark(int index, string title) =>
+        EditOutline(marks => OutlineEdits.Rename(marks, index, title));
+
+    public string? DeleteBookmark(int index) =>
+        EditOutline(marks => OutlineEdits.Remove(marks, index));
+
+    private string? EditOutline(Func<IReadOnlyList<Bookmark>, IReadOnlyList<DetectedHeading>> edit)
+    {
+        if (_documentHandle == 0)
+        {
+            return "No document is open.";
+        }
+
+        // Checked HERE rather than at write time, so a reader is told before
+        // they have made a dozen edits that cannot go anywhere.
+        if (_currentDocumentPath is null)
+        {
+            return "Save the document first: bookmarks are written into the file.";
+        }
+
+        var edited = edit([.. Bookmarks.Select(b => b.Mark)]);
+
+        _pendingOutline = [.. edited];
+        ShowOutline(edited);
+
+        // The document now differs from the file, which is what the dirty dot,
+        // the unsaved-changes prompt and Ctrl+S all key off. Nothing else has
+        // to learn that bookmarks exist.
+        IsDirty = true;
+        OnPropertyChanged(nameof(HasUnsavedOutline));
+        return null;
+    }
+
+    /// <summary>
+    /// Puts an edited outline on screen without touching the file.
+    ///
+    /// Depth counts from zero and level from one, which is the only difference
+    /// between what the panel shows and what the writer takes.
+    /// </summary>
+    private void ShowOutline(IReadOnlyList<DetectedHeading> headings)
+    {
+        Bookmarks.Clear();
+        foreach (var heading in headings)
+        {
+            Bookmarks.Add(new BookmarkItem(new Bookmark(heading.Level - 1, heading.PageIndex, heading.Title)));
+        }
+
+        HasBookmarks = Bookmarks.Count > 0;
+    }
+
+    /// <summary>
+    /// Writes the pending outline into the file just saved.
+    ///
+    /// Called at the END of a save, once the document's own bytes are on disk:
+    /// the outline writer works on a CLOSED file, so it has to be the last
+    /// thing that happens.
+    /// </summary>
+    private void FlushPendingOutline()
+    {
+        if (_pendingOutline is not { } outline)
+        {
+            return;
+        }
+
+        // Cleared first. A write that fails must not leave the edits pending
+        // for the next save to try again forever, and ApplyOutline reports its
+        // own failure.
+        _pendingOutline = null;
+        OnPropertyChanged(nameof(HasUnsavedOutline));
+
+        if (ApplyOutline(outline) is { } problem)
+        {
+            Status = problem;
+            Diag.Log($"outline flush failed: {problem}");
+        }
+    }
+
+    /// <summary>
+    /// Reads every styled run in the document, for bookmarking by style.
+    ///
+    /// ONE scan, kept by the caller, and both halves of the dialog work off it:
+    /// the list of styles the document uses, and the matching that turns ticked
+    /// styles into headings. Scanning again for each would double the only slow
+    /// part, and the dialog would have to explain why ticking a box took
+    /// thirty seconds.
+    ///
+    /// Off the UI thread with progress and cancellation for the same reason the
+    /// pattern scan is: reading a page's text LOADS and parses that page, so a
+    /// long book is thousands of parses however this is written.
+    /// </summary>
+    public Task<IReadOnlyList<StyledRunPage>> ScanStyledRunsAsync(
+        IProgress<double>? progress, CancellationToken token)
+    {
+        ulong handle = _documentHandle;
+        int pages = PageCount;
+
+        if (handle == 0 || pages <= 0)
+        {
+            return Task.FromResult<IReadOnlyList<StyledRunPage>>(Array.Empty<StyledRunPage>());
+        }
+
+        return Task.Run<IReadOnlyList<StyledRunPage>>(() =>
+        {
+            var scanned = new List<StyledRunPage>(pages);
+            for (int i = 0; i < pages; i++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                // Per PAGE rather than one flat list of runs, because a page
+                // that gave nothing is itself the finding: it is how the dialog
+                // can say "this document is a scan" instead of "no styles".
+                scanned.Add(StyledRunLoader.Load(handle, i));
+
+                // Every 16 pages, as the pattern scan does: marshalling a
+                // progress report to the UI thread three thousand times costs
+                // more than the scan it is reporting on.
+                if ((i & 0xF) == 0)
+                {
+                    progress?.Report((double)i / pages);
+                }
+            }
+
+            progress?.Report(1.0);
+            return scanned;
+        }, token);
+    }
+
+    /// <summary>
+    /// Where the current text selection starts, or null when nothing is
+    /// selected.
+    ///
+    /// Exposed as a position rather than as a style, because the runs live in
+    /// the dialog that scanned for them and asking the document a second time
+    /// would answer from a different reading of the same page.
+    /// </summary>
+    public (int Page, int CharIndex)? SelectionStart =>
+        _selection is DocumentSelection selection
+            ? (selection.Start.Page, selection.Start.CharIndex)
+            : null;
+
     /// <summary>
     /// Writes an outline into the document, replacing whatever it had.
     ///
@@ -458,6 +637,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <returns>Null on success, or a message saying what stopped it.</returns>
     public string? ApplyOutline(IReadOnlyList<DetectedHeading> headings)
     {
+        // This REPLACES the outline, so any hand edits waiting to be written
+        // have just been overtaken. Leaving them pending would let the next
+        // save quietly put the old outline back over this one.
+        _pendingOutline = null;
+        OnPropertyChanged(nameof(HasUnsavedOutline));
+
         if (_documentHandle == 0)
         {
             return "No document is open.";
@@ -1695,6 +1880,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 RecoveryStore.Discard(path);
             }
             _lastSnapshotUtc = DateTime.UtcNow;
+
+            // Last, because the outline writer works on a CLOSED file and
+            // closes and reopens the document to do it. Everything above has to
+            // have finished with the handle first.
+            //
+            // Safe against recursion: ApplyOutline saves first only when the
+            // document is dirty, and IsDirty was cleared above.
+            FlushPendingOutline();
         }
 
         return saved;
