@@ -6,6 +6,7 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:local="using:PdfEditorApp"
     xmlns:controls="using:PdfEditorApp.Controls"
+    xmlns:rendering="using:PdfEditorApp.Rendering"
     xmlns:viewmodels="using:PdfEditorApp.ViewModels"
     xmlns:viewport="using:PdfEditorApp.Viewport"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -707,6 +708,22 @@
                     along with the pages.
                 -->
                 <Canvas x:Name="InkCanvas" IsHitTestVisible="False" />
+
+                <!--
+                    Candidate Skia shape layer, sibling of the ink overlay and
+                    COLLAPSED unless AppSettings.UseSkiaShapeLayer is set. The
+                    two are never both visible: exactly one renderer draws, and
+                    turning the flag off restores the one that always has.
+
+                    Left/Top aligned with a size set in code rather than
+                    stretched: unlike a Canvas, an SKXamlCanvas allocates a
+                    surface the size of itself, and a stack-sized one would
+                    allocate the whole document every frame.
+                -->
+                <rendering:SkiaShapeLayer x:Name="SkiaShapeCanvas"
+                                          HorizontalAlignment="Left"
+                                          VerticalAlignment="Top"
+                                          Visibility="Collapsed" />
 
                 <!--
                     Isolated text-editing layer, ABOVE the ink canvas.

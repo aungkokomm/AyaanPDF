@@ -114,6 +114,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj" />
+    <ProjectReference Include="..\PdfEditorApp.Rendering.Skia\PdfEditorApp.Rendering.Skia.csproj" />
   </ItemGroup>
 
   <!--
@@ -204,6 +205,13 @@
       own PNG does, so no other part of the app knows this package exists.
     -->
     <PackageReference Include="Microsoft.Graphics.Win2D" Version="1.4.0" />
+    <!--
+      The XAML host for the candidate shape renderer (SKXamlCanvas), plus the
+      native libSkiaSharp it loads. Behind AppSettings.UseSkiaShapeLayer, which
+      is OFF by default: the XAML overlay remains the renderer on screen and
+      this draws nothing until the flag is turned on.
+    -->
+    <PackageReference Include="SkiaSharp.Views.WinUI" Version="3.119.1" />
   </ItemGroup>
 
   <!--

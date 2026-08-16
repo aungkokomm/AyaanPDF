@@ -118,6 +118,20 @@ public sealed record AppSettings
     public bool NightMode { get; init; }
 
     /// <summary>
+    /// Draws editable shapes with the candidate Skia renderer instead of the
+    /// XAML overlay.
+    ///
+    /// OFF, and it stays off until parity has been proved and manually
+    /// verified. Both layers are built and exactly one is shown, so this is the
+    /// rollback: turning it off restores the renderer that has always been on
+    /// screen, with no reload and no change to the document.
+    ///
+    /// Not in any menu on purpose. It is a development switch, set by hand in
+    /// settings.json, and it should not read as a feature until it is one.
+    /// </summary>
+    public bool UseSkiaShapeLayer { get; init; }
+
+    /// <summary>
     /// Whether the viewport shows the whole document as one scrolling stack or
     /// one page at a time.
     ///

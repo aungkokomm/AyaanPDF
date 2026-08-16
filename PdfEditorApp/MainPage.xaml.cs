@@ -153,6 +153,20 @@ public sealed partial class MainPage : Page
         // without this it can only be reached by hand.
         Loaded += async (_, _) =>
         {
+            // Development diagnostic, before anything else touches the window:
+            // draw one rectangle through both renderers, write a PNG of each,
+            // and quit. Guarded by an environment variable, so it cannot fire
+            // for a user, and it runs first so no document or dialog is in the
+            // way of the capture.
+            if (Rendering.SkiaParityCapture.RequestedDirectory is { } captureDir
+                && Content is Panel captureHost)
+            {
+                string report = await Rendering.SkiaParityCapture.RunAsync(captureHost, captureDir);
+                Diag.Log($"skia-capture: {report}");
+                Application.Current.Exit();
+                return;
+            }
+
             // Before anything is opened. A previous run that did not shut down
             // cleanly left its work behind, and the reader should be asked
             // about it before the app puts something else in front of them.
@@ -5641,8 +5655,54 @@ public sealed partial class MainPage : Page
     /// is always drawn from the full set. Stroke counts are small, so a full
     /// rebuild is cheaper than being clever.
     /// </summary>
-    private void OnInkStrokesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
+    private void OnInkStrokesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
         RebuildInkCanvas();
+
+        // The candidate renderer is fed from the same signal, and draws nothing
+        // unless its flag is on. RebuildInkCanvas above is untouched: this is a
+        // second consumer of the change, not a change to the first.
+        RefreshSkiaShapeLayer();
+    }
+
+    /// <summary>
+    /// Hands the Skia layer a frame, or hides it.
+    ///
+    /// Exactly one renderer is visible. With the flag off the ink overlay draws
+    /// as it always has and this returns immediately, which is the rollback.
+    ///
+    /// Stage 2 bounds the surface to the first page. An SKXamlCanvas allocates
+    /// pixels for its own size, unlike the Canvas it sits beside, so a
+    /// stack-sized one would allocate the whole document every frame. Anchoring
+    /// a viewport-sized surface to the scroll offset is a later stage.
+    /// </summary>
+    private void RefreshSkiaShapeLayer()
+    {
+        bool on = SettingsStore.Current.UseSkiaShapeLayer;
+
+        SkiaShapeCanvas.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        InkCanvas.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+
+        if (!on)
+        {
+            return;
+        }
+
+        double width = ViewModel.OverlayScale;
+        double height = ViewModel.SlotHeightOf(0);
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        SkiaShapeCanvas.Width = width;
+        SkiaShapeCanvas.Height = height;
+
+        SkiaShapeCanvas.Show(
+            ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes),
+            ViewModel.OverlayScale,
+            ViewModel.SlotTopOf);
+    }
 
     private void RebuildInkCanvas()
     {
