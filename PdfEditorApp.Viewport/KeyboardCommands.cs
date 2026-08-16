@@ -1,4 +1,4 @@
-namespace PdfEditorApp.Viewport;
+﻿namespace PdfEditorApp.Viewport;
 
 /// <summary>A command the editor can be asked to run from the keyboard.</summary>
 public enum EditorCommand
@@ -17,6 +17,13 @@ public enum EditorCommand
     /// <summary>Turns the VIEW a quarter clockwise. Does not touch the document.</summary>
     RotateViewClockwise,
     RotateViewCounterClockwise,
+    New,
+    CloseDocument,
+    NextTab,
+    PreviousTab,
+    FindNext,
+    FindPrevious,
+    GoToPage,
 }
 
 /// <summary>
@@ -52,6 +59,11 @@ public static class KeyboardCommands
     public const int KeyAdd = 0x6B;
     public const int KeySubtract = 0x6D;
 
+    public const int KeyN = 0x4E;
+    public const int KeyW = 0x57;
+    public const int KeyTab = 0x09;
+    public const int KeyF3 = 0x72;
+
     /// <summary>
     /// The command for a chord, or <see cref="EditorCommand.None"/>.
     ///
@@ -64,6 +76,19 @@ public static class KeyboardCommands
     /// </summary>
     public static EditorCommand Resolve(int keyCode, bool ctrl, bool shift, bool textFocused)
     {
+        // F3 is answered BEFORE the text-focus guard, and deliberately.
+        //
+        // The guard exists because Ctrl+Z in a text box belongs to the text
+        // box. F3 belongs to nothing: it types no character and there is no
+        // field in this app that wants it. More to the point, the field it is
+        // most likely to be pressed in is the FIND box, where "find the next
+        // one" is exactly what is meant, and refusing it there would make the
+        // key useless in the one place it matters most.
+        if (keyCode == KeyF3)
+        {
+            return shift ? EditorCommand.FindPrevious : EditorCommand.FindNext;
+        }
+
         if (!ctrl || textFocused) { return EditorCommand.None; }
 
         return keyCode switch
@@ -85,6 +110,18 @@ public static class KeyboardCommands
             // turn the page when the reader meant to make it bigger.
             KeyOemPlus or KeyAdd when shift => EditorCommand.RotateViewClockwise,
             KeyOemMinus or KeySubtract when shift => EditorCommand.RotateViewCounterClockwise,
+
+            // Ctrl+N new, Ctrl+Shift+N go to page. Not Ctrl+G, which every
+            // other reader uses for it, because Ctrl+G is Group here and this
+            // is an editor first. Acrobat makes the same swap.
+            KeyN => shift ? EditorCommand.GoToPage : EditorCommand.New,
+
+            KeyW when !shift => EditorCommand.CloseDocument,
+
+            // Ctrl+Tab only. PLAIN Tab must stay the focus-traversal key: it
+            // was bound once before and keyboard users could not move focus
+            // anywhere in the app.
+            KeyTab => shift ? EditorCommand.PreviousTab : EditorCommand.NextTab,
 
             _ => EditorCommand.None,
         };

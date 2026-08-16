@@ -38,6 +38,30 @@ public class SearchWiringTests
     private static string Section(string source, int start, int length) =>
         source[start..Math.Min(source.Length, start + length)];
 
+    /// <summary>
+    /// A whole method, bounded by where the next one starts.
+    ///
+    /// Section takes a character count, which is a guess about how long a
+    /// method happens to be today. That guess expired: adding a dozen lines to
+    /// ApplySettings pushed the assertion below past the window and failed a
+    /// test about find options, for a change that had nothing to do with them.
+    /// A window measured in characters fails for the wrong reason eventually.
+    /// </summary>
+    private static string MethodBody(string source, string signature)
+    {
+        int at = source.IndexOf(signature, StringComparison.Ordinal);
+        Assert.True(at >= 0, $"'{signature}' is gone; this test needs rewriting to match");
+
+        int next = source.IndexOf("\n    private ", at + signature.Length, StringComparison.Ordinal);
+        int alt = source.IndexOf("\n    public ", at + signature.Length, StringComparison.Ordinal);
+        if (alt >= 0 && (next < 0 || alt < next))
+        {
+            next = alt;
+        }
+
+        return next > at ? source[at..next] : source[at..];
+    }
+
     /// <summary>The body of StartSearchSweep, which is where the background
     /// work is declared.</summary>
     private static string SweepBody()
@@ -265,11 +289,9 @@ public class SearchWiringTests
         Assert.True(save >= 0, "nothing stores the find options");
         Assert.Contains(property, Section(source, save, 800), StringComparison.Ordinal);
 
-        int apply = source.IndexOf("private void ApplySettings()", StringComparison.Ordinal);
-        Assert.True(apply >= 0);
         Assert.Contains(
             $"ViewModel.{property} = s.{property}",
-            Section(source, apply, 3000),
+            MethodBody(source, "private void ApplySettings()"),
             StringComparison.Ordinal);
     }
 

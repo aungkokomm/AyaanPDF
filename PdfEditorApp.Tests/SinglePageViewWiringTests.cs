@@ -281,6 +281,40 @@ public class SinglePageViewWiringTests
     }
 
     [Fact]
+    public void search_highlights_survive_a_layout_rebuild()
+    {
+        // The regression this exists to prevent, reported as "find next is
+        // broken".
+        //
+        // Stepping to a match computes its rectangles onto the card for that
+        // page and THEN jumps to it. In single-page view the page being jumped
+        // to has no card until it becomes current, so the rectangles were
+        // dropped and the card that replaced it came up empty: Enter moved the
+        // view and highlighted nothing. Every card is a new object after a
+        // rebuild, so anything drawn onto one rather than derived from the
+        // document has to be put back.
+        string body = MethodBody(ViewModel(), "private void RebuildContinuousLayoutCore");
+
+        Assert.Contains("RefreshSearchHighlights()", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void restoring_the_saved_mode_does_not_overwrite_it()
+    {
+        // Ticking a menu item in code raises its Click, and that handler SAVES.
+        // So restoring "single page" wrote "continuous" back over it, and the
+        // app ran in one mode with the other on disk until something re-applied
+        // settings and flipped it.
+        string apply = MethodBody(PageCode(), "private void ApplySettings");
+        Assert.Contains("_applyingSettings = true", apply, StringComparison.Ordinal);
+        Assert.Contains("_applyingSettings = false", apply, StringComparison.Ordinal);
+
+        string setter = MethodBody(PageCode(), "private void ApplyPageViewMode");
+        Assert.Contains("if (!_applyingSettings)", setter, StringComparison.Ordinal);
+        Assert.Contains("SettingsStore.Update", setter, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void an_unreadable_setting_falls_back_to_continuous()
     {
         // The settings file is the user's and may be hand-edited or come from a

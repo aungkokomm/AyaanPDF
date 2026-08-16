@@ -1027,10 +1027,26 @@ public sealed partial class MainPage : Page
     private void SinglePageView_Click(object sender, RoutedEventArgs e) =>
         ApplyPageViewMode(PageViewMode.SinglePage);
 
+    /// <summary>
+    /// True while the menu is being brought into line with the saved settings.
+    ///
+    /// Ticking a menu item in code raises its Click, so restoring a setting ran
+    /// the handler that SAVES it, and the last item ticked won. Restoring
+    /// "single page" therefore wrote "continuous" straight back over it: the
+    /// app came up in the right mode with the wrong setting on disk, and the
+    /// next thing to re-apply settings flipped the mode. The existing rulers
+    /// toggle only avoided this by never assigning an unchanged value.
+    /// </summary>
+    private bool _applyingSettings;
+
     private void ApplyPageViewMode(PageViewMode mode)
     {
         ViewModel.SetPageViewMode(mode);
-        SettingsStore.Update(s => s with { PageViewMode = mode });
+
+        if (!_applyingSettings)
+        {
+            SettingsStore.Update(s => s with { PageViewMode = mode });
+        }
     }
 
     /// <summary>
@@ -3892,8 +3908,21 @@ public sealed partial class MainPage : Page
         ViewModel.IsNightMode = s.NightMode;
         ApplyPageSheet(s.NightMode);
 
-        SinglePageViewItem.IsChecked = s.PageViewMode == PageViewMode.SinglePage;
-        ContinuousViewItem.IsChecked = s.PageViewMode == PageViewMode.Continuous;
+        // Guarded, because ticking these raises Click, and that handler saves.
+        // Without it, restoring the mode overwrites the very setting it just
+        // read. The view model is told directly afterwards, so the menu and the
+        // viewport still agree.
+        _applyingSettings = true;
+        try
+        {
+            SinglePageViewItem.IsChecked = s.PageViewMode == PageViewMode.SinglePage;
+            ContinuousViewItem.IsChecked = s.PageViewMode == PageViewMode.Continuous;
+        }
+        finally
+        {
+            _applyingSettings = false;
+        }
+
         ViewModel.SetPageViewMode(s.PageViewMode);
 
         // Unconditionally, not only when the toggle changed: this also runs on
@@ -5327,7 +5356,42 @@ public sealed partial class MainPage : Page
                 break;
             case EditorCommand.RotateViewClockwise: ViewModel.RotateViewClockwise(); break;
             case EditorCommand.RotateViewCounterClockwise: ViewModel.RotateViewCounterClockwise(); break;
+
+            // Ctrl+N and Ctrl+W were declared as accelerators on their menu
+            // items and nowhere else, so they had never worked: a
+            // MenuFlyoutItem's accelerator is dead until its flyout has been
+            // opened once. The menu keeps them, because that is what prints
+            // the chord beside the entry; this is what runs them.
+            case EditorCommand.New: New_Click(this, null!); break;
+            case EditorCommand.CloseDocument: CloseDocument_Click(this, null!); break;
+
+            case EditorCommand.NextTab: (App.Window as MainWindow)?.StepTab(1); break;
+            case EditorCommand.PreviousTab: (App.Window as MainWindow)?.StepTab(-1); break;
+
+            case EditorCommand.FindNext: ViewModel.StepSearchMatch(1); break;
+            case EditorCommand.FindPrevious: ViewModel.StepSearchMatch(-1); break;
+
+            case EditorCommand.GoToPage: FocusPageJumpBox(); break;
         }
+    }
+
+    /// <summary>
+    /// Puts the caret in the page number box, selected, ready to be typed over.
+    ///
+    /// The box is already there in the status bar and already does the jump;
+    /// what was missing was any way to reach it without the mouse. Selecting
+    /// its contents means the reader types a number rather than clearing one
+    /// first.
+    /// </summary>
+    private void FocusPageJumpBox()
+    {
+        if (ViewModel.PageCount == 0)
+        {
+            return;
+        }
+
+        PageJumpBox.Focus(FocusState.Programmatic);
+        PageJumpBox.SelectAll();
     }
 
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -5358,6 +5422,18 @@ public sealed partial class MainPage : Page
             if (e.Key == VirtualKey.Escape)
             {
                 RootGrid.Focus(FocusState.Programmatic);
+                e.Handled = true;
+                return;
+            }
+
+            // F3 is the exception to this early return, and the find box is
+            // exactly where it will be pressed: the reader has just typed a
+            // query and wants the next hit without leaving the field. It types
+            // no character, so nothing is taken away from the box.
+            var inField = KeyboardCommands.Resolve((int)e.Key, _isCtrlDown, IsShiftDown(), textFocused: false);
+            if (inField is EditorCommand.FindNext or EditorCommand.FindPrevious)
+            {
+                Run(inField);
                 e.Handled = true;
             }
 

@@ -2553,7 +2553,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (_documentHandle == 0)
         {
-            OnPropertyChanged(nameof(ContentWidth));
+            RefreshSearchHighlights();
+
+        OnPropertyChanged(nameof(ContentWidth));
             OnPropertyChanged(nameof(ContentHeight));
             return;
         }
@@ -2577,6 +2579,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                  (only >= 0 ? $", single page {only}" : string.Empty));
 
         DistributeAnnotationsToSlots();
+
+        // The cards are new objects, so anything drawn ONTO a card rather than
+        // derived from the document has to be put back. Search highlights are
+        // the case that matters: single-page view lays out the page being read
+        // and nothing else, so stepping to a match on another page computed its
+        // rectangles against a card that did not exist yet, and the card that
+        // replaced it came up empty. In continuous view every page always had a
+        // card, which is why the order never mattered before.
+        //
+        // Cheap: it derives a handful of rectangles for ONE page, and returns
+        // immediately when nothing is being searched for.
         OnPropertyChanged(nameof(ContentWidth));
         OnPropertyChanged(nameof(ContentHeight));
         LayoutRebuilt?.Invoke();

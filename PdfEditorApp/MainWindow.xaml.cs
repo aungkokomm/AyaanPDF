@@ -284,6 +284,30 @@ public sealed partial class MainWindow : Window
     public void SetDocumentTitle(string title) => Title = title;
 
     /// <summary>
+    /// Moves to the next or previous tab, wrapping at both ends.
+    ///
+    /// Wrapping rather than stopping: with two tabs open, which is the common
+    /// case, Ctrl+Tab that refuses to go past the end would work in one
+    /// direction only and feel broken. Every tabbed application wraps.
+    /// </summary>
+    public void StepTab(int delta)
+    {
+        int count = Tabs.TabItems.Count;
+        if (count < 2)
+        {
+            return;
+        }
+
+        int next = (Tabs.SelectedIndex + delta) % count;
+        if (next < 0)
+        {
+            next += count;
+        }
+
+        Tabs.SelectedIndex = next;
+    }
+
+    /// <summary>
     /// Tints the title strip and the tab row.
     ///
     /// The window owns these, and the theme is chosen inside a page, so the
