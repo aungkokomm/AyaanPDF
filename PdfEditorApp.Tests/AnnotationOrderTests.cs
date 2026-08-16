@@ -204,4 +204,47 @@ public class AnnotationOrderTests
 
         Assert.Equal(2, AnnotationOrder.RewriteFrom(current, target));
     }
+
+    [Fact]
+    public void a_lone_object_on_a_page_cannot_be_reordered_at_all()
+    {
+        // Reported as "z-order is broken": every command, from the toolbar and
+        // from the keyboard, appeared to do nothing. It was doing exactly the
+        // right thing. A page holding one object has nothing to order it
+        // against, so every plan returns the stack unchanged and the reorder
+        // declines with "Already at the front."
+        //
+        // Worth pinning because the symptom is indistinguishable from a real
+        // failure: the command runs, the page repaints, the object does not
+        // move, and the only thing that says why is one line in the status bar.
+        var current = new[] { A };
+
+        foreach (var plan in new Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>>[]
+        {
+            AnnotationOrder.BringToFront,
+            AnnotationOrder.SendToBack,
+            AnnotationOrder.BringForward,
+            AnnotationOrder.SendBackward,
+        })
+        {
+            var target = plan(current, Moving(A));
+
+            Assert.Equal(current, target);
+            Assert.True(
+                AnnotationOrder.RewriteFrom(current, target) >= target.Count,
+                "a lone object must produce no rewrite, so the reorder declines");
+        }
+    }
+
+    [Fact]
+    public void two_objects_are_enough_to_reorder()
+    {
+        // The other half, so the test above cannot pass by the ordering being
+        // broken for everything.
+        var current = new[] { A, B };
+        var target = AnnotationOrder.BringForward(current, Moving(A));
+
+        Assert.Equal(new[] { B, A }, target);
+        Assert.Equal(0, AnnotationOrder.RewriteFrom(current, target));
+    }
 }

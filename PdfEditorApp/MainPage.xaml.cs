@@ -5372,6 +5372,15 @@ public sealed partial class MainPage : Page
             case EditorCommand.FindPrevious: ViewModel.StepSearchMatch(-1); break;
 
             case EditorCommand.GoToPage: FocusPageJumpBox(); break;
+
+            // Z-order and duplicate act on a selection and do nothing without
+            // one, which the view model already guards. The object toolbar
+            // follows, because the selection it is drawn around has moved.
+            case EditorCommand.BringForward: ViewModel.BringSelectedForward(); UpdateObjectToolbar(); break;
+            case EditorCommand.SendBackward: ViewModel.SendSelectedBackward(); UpdateObjectToolbar(); break;
+            case EditorCommand.BringToFront: ViewModel.BringSelectedToFront(); UpdateObjectToolbar(); break;
+            case EditorCommand.SendToBack: ViewModel.SendSelectedToBack(); UpdateObjectToolbar(); break;
+            case EditorCommand.Duplicate: ViewModel.DuplicateSelected(); UpdateObjectToolbar(); break;
         }
     }
 

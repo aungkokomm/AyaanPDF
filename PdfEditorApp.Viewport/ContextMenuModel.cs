@@ -140,10 +140,13 @@ public static class ContextMenuModel
         // works that out and refuses with an explanation when a mark from
         // another editor is in the way. Greying these out on a guess would hide
         // that explanation, which is the only part that says what is wrong.
+        // The bracket chords, as every drawing application binds them. "Bring
+        // to front" advertised Ctrl+Shift+] here long before anything answered
+        // it; the other three now have chords too, so they say so.
         items.Add(new(ContextCommand.BringToFront, "Bring to front", Accelerator: "Ctrl+Shift+]"));
-        items.Add(new(ContextCommand.BringForward, "Bring forward"));
-        items.Add(new(ContextCommand.SendBackward, "Send backward"));
-        items.Add(new(ContextCommand.SendToBack, "Send to back"));
+        items.Add(new(ContextCommand.BringForward, "Bring forward", Accelerator: "Ctrl+]"));
+        items.Add(new(ContextCommand.SendBackward, "Send backward", Accelerator: "Ctrl+["));
+        items.Add(new(ContextCommand.SendToBack, "Send to back", Accelerator: "Ctrl+Shift+["));
         items.Add(Divider);
 
         items.Add(new(ContextCommand.Group, "Group", t.SelectionCount >= 2, "Ctrl+G"));

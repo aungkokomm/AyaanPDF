@@ -24,6 +24,11 @@ public enum EditorCommand
     FindNext,
     FindPrevious,
     GoToPage,
+    BringForward,
+    SendBackward,
+    BringToFront,
+    SendToBack,
+    Duplicate,
 }
 
 /// <summary>
@@ -63,6 +68,14 @@ public static class KeyboardCommands
     public const int KeyW = 0x57;
     public const int KeyTab = 0x09;
     public const int KeyF3 = 0x72;
+    public const int KeyD = 0x44;
+
+    // The bracket keys, as Windows names them: OEM_4 is '[' and OEM_6 is ']'
+    // on a US layout. Layout-dependent, and deliberately so: these are
+    // positional chords, and every drawing application binds the same two
+    // physical keys.
+    public const int KeyOpenBracket = 0xDB;
+    public const int KeyCloseBracket = 0xDD;
 
     /// <summary>
     /// The command for a chord, or <see cref="EditorCommand.None"/>.
@@ -122,6 +135,16 @@ public static class KeyboardCommands
             // was bound once before and keyboard users could not move focus
             // anywhere in the app.
             KeyTab => shift ? EditorCommand.PreviousTab : EditorCommand.NextTab,
+
+            // Z-order, on the brackets, which is where Illustrator, InDesign
+            // and Photoshop all put it. Shift takes it all the way.
+            KeyCloseBracket => shift ? EditorCommand.BringToFront : EditorCommand.BringForward,
+            KeyOpenBracket => shift ? EditorCommand.SendToBack : EditorCommand.SendBackward,
+
+            // Ctrl+D duplicates. Safe here specifically because it does NOT
+            // touch the clipboard, which is why a Duplicate entry was kept off
+            // the context menu: copy-paste would have been clobbered by it.
+            KeyD when !shift => EditorCommand.Duplicate,
 
             _ => EditorCommand.None,
         };

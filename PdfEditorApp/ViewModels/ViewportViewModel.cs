@@ -5757,7 +5757,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// size. Reuses <see cref="CommitAlignedOrDistributed"/> for the actual
     /// write so the last-N index tracking that keeps repeated align/move
     /// consistent covers nudge automatically.</summary>
-    public void NudgeSelected(double dx, double dy)
+    public void NudgeSelected(double dx, double dy) => NudgeSelected(dx, dy, recordHistory: true);
+
+    /// <summary>
+    /// As above, but a caller that has ALREADY pushed a history step for the
+    /// action it is part of can suppress a second one.
+    ///
+    /// Ctrl+D is the case: it duplicates and then offsets the copy, and a
+    /// history step captures the state as it is when pushed, so the single step
+    /// taken before the duplicate already returns to before both. Pushing again
+    /// would make one keystroke cost two undos.
+    /// </summary>
+    private void NudgeSelected(double dx, double dy, bool recordHistory)
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor)
         {
@@ -5765,7 +5776,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         if (dx == 0 && dy == 0) { return; }
 
-        PushHistory(HistoryScope.Document, "Nudge");
+        if (recordHistory)
+        {
+            PushHistory(HistoryScope.Document, "Nudge");
+        }
         LoadedSelection Shift(LoadedSelection s) => s with
         {
             Left = s.Left + dx, Right = s.Right + dx,
@@ -6371,7 +6385,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private bool ReorderCore(
         Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>> plan, string label)
     {
-        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor) { return false; }
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection anchor)
+        {
+            // Logged, because from the outside "nothing selected" and "refused"
+            // and "already there" all look identical: the command runs, the
+            // page repaints, and the object does not move.
+            Diag.Log($"reorder '{label}': NOTHING SELECTED");
+            return false;
+        }
 
         NormalizeExtras(anchor.Id, label);
         int page = anchor.PageIndex;
@@ -6392,10 +6413,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (ex.PageIndex == page && ex.Id != Guid.Empty) { moving.Add(ex.Id); }
         }
-        if (moving.Count == 0) { return false; }
+        if (moving.Count == 0)
+        {
+            Diag.Log($"reorder '{label}': selection has no id on page {page}");
+            return false;
+        }
 
         var target = plan(current, moving);
         int from = AnnotationOrder.RewriteFrom(current, target);
+
+        Diag.Log($"reorder '{label}': page {page} stack={current.Count} moving={moving.Count} rewriteFrom={from}");
 
         if (from >= target.Count)
         {
@@ -6415,6 +6442,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             var obj = stack.FirstOrDefault(o => o.Id == target[i]);
             if (obj is null || !obj.IsRebuildable)
             {
+                Diag.Log($"reorder '{label}': REFUSED at {i}, " +
+                         (obj is null ? "object not in the stack" : $"{obj.Kind} is not rebuildable"));
                 Status = "Cannot reorder here: the page has a mark this app did not create, "
                        + "and moving it would lose it.";
                 return false;
@@ -6585,6 +6614,42 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 _extraSelected[i] = ex with { PageIndex = ep, Index = ei };
             }
         }
+    }
+
+    /// <summary>
+    /// How far a duplicate is offset from its original, in normalized page
+    /// width.
+    ///
+    /// About 10 DIP at the layout width. Enough that the copy is visibly its
+    /// own object rather than appearing to have done nothing, small enough that
+    /// it is obviously related to what it came from. Every drawing tool offsets
+    /// a duplicate for the same reason.
+    /// </summary>
+    private const double DuplicateOffset = 10.0 / 800.0;
+
+    /// <summary>
+    /// Duplicates the selection in place and offsets the copy, leaving it
+    /// selected. The Ctrl+D path.
+    /// </summary>
+    /// <remarks>
+    /// The drag version puts the copy at IDENTICAL bounds, because the drag
+    /// that follows is what separates them. From the keyboard there is no drag,
+    /// so an unoffset copy would sit exactly on top of the original and read as
+    /// nothing having happened.
+    ///
+    /// One history step, not two: DuplicateSelectedForDrag pushes before it
+    /// changes anything, and a step captures the state at the moment it is
+    /// pushed, so it already returns to before both halves.
+    /// </remarks>
+    public bool DuplicateSelected()
+    {
+        if (!DuplicateSelectedForDrag())
+        {
+            return false;
+        }
+
+        NudgeSelected(DuplicateOffset, DuplicateOffset, recordHistory: false);
+        return true;
     }
 
     public bool DuplicateSelectedForDrag()

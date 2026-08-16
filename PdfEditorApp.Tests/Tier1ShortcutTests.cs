@@ -122,6 +122,65 @@ public class Tier1ShortcutTests
         Assert.Equal(EditorCommand.RotateViewCounterClockwise, Resolve(KeyboardCommands.KeyOemMinus, Ctrl, Shift));
     }
 
+    // ---------------- Tier 2: editor muscle memory ----------------
+
+    [Theory]
+    [InlineData(KeyboardCommands.KeyCloseBracket, NoShift, EditorCommand.BringForward)]
+    [InlineData(KeyboardCommands.KeyCloseBracket, Shift, EditorCommand.BringToFront)]
+    [InlineData(KeyboardCommands.KeyOpenBracket, NoShift, EditorCommand.SendBackward)]
+    [InlineData(KeyboardCommands.KeyOpenBracket, Shift, EditorCommand.SendToBack)]
+    public void the_brackets_move_an_object_through_the_stack(int key, bool shift, EditorCommand expected)
+    {
+        // Where Illustrator, InDesign and Photoshop all put z-order, and where
+        // this app's own context menu had been advertising Ctrl+Shift+] since
+        // before anything answered it.
+        Assert.Equal(expected, Resolve(key, Ctrl, shift));
+    }
+
+    [Fact]
+    public void ctrl_d_duplicates()
+    {
+        Assert.Equal(EditorCommand.Duplicate, Resolve(KeyboardCommands.KeyD, Ctrl, NoShift));
+    }
+
+    [Fact]
+    public void the_tier_two_chords_stay_out_of_text_fields_and_need_ctrl()
+    {
+        foreach (int key in new[]
+        {
+            KeyboardCommands.KeyD,
+            KeyboardCommands.KeyOpenBracket,
+            KeyboardCommands.KeyCloseBracket,
+        })
+        {
+            Assert.Equal(EditorCommand.None, Resolve(key, Ctrl, NoShift, InAField));
+            Assert.Equal(EditorCommand.None, Resolve(key, NoCtrl, NoShift));
+        }
+
+        // Plain D is the Draw tool, and a bracket is a character somebody may
+        // want to type into a text box.
+        Assert.Equal(EditorCommand.None, Resolve(KeyboardCommands.KeyD, NoCtrl, NoShift, InAField));
+    }
+
+    [Fact]
+    public void duplicating_offsets_the_copy_and_costs_one_undo()
+    {
+        // The drag version puts the copy at IDENTICAL bounds because the drag
+        // separates them. From the keyboard there is no drag, so an unoffset
+        // copy sits exactly on the original and reads as nothing happening.
+        //
+        // And one history step, not two: a step captures the state when it is
+        // pushed, so the one taken before the duplicate already returns to
+        // before both halves. Two would make one keystroke cost two undos.
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int at = vm.IndexOf("public bool DuplicateSelected()", StringComparison.Ordinal);
+        Assert.True(at >= 0, "DuplicateSelected is gone; this test needs rewriting");
+
+        string body = vm[at..(at + 500)];
+        Assert.Contains("DuplicateSelectedForDrag()", body, StringComparison.Ordinal);
+        Assert.Contains("recordHistory: false", body, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void every_command_that_claims_a_chord_can_be_reached_by_one()
     {

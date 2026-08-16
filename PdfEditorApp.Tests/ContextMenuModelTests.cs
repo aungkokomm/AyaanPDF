@@ -271,14 +271,23 @@ public class ContextMenuModelTests
     }
 
     [Theory]
-    [InlineData(ContextCommand.BringForward)]
-    [InlineData(ContextCommand.SendBackward)]
-    [InlineData(ContextCommand.SendToBack)]
-    public void a_command_with_no_key_advertises_none(ContextCommand command)
+    [InlineData(ContextCommand.BringForward, "Ctrl+]", KeyboardCommands.KeyCloseBracket, false, EditorCommand.BringForward)]
+    [InlineData(ContextCommand.BringToFront, "Ctrl+Shift+]", KeyboardCommands.KeyCloseBracket, true, EditorCommand.BringToFront)]
+    [InlineData(ContextCommand.SendBackward, "Ctrl+[", KeyboardCommands.KeyOpenBracket, false, EditorCommand.SendBackward)]
+    [InlineData(ContextCommand.SendToBack, "Ctrl+Shift+[", KeyboardCommands.KeyOpenBracket, true, EditorCommand.SendToBack)]
+    public void the_z_order_rows_advertise_chords_the_app_really_listens_for(
+        ContextCommand command, string advertised, int key, bool shift, EditorCommand expected)
     {
-        // Only Bring to Front has a chord. The other three were never bound,
-        // and claiming Ctrl+Shift+[ for Send to Back because Illustrator has it
-        // would be inventing a key this app does not listen for.
-        Assert.Equal(string.Empty, Find(OnObject, command).Accelerator);
+        // This replaces a test asserting these three advertised NOTHING, which
+        // was right while nothing was bound: claiming Ctrl+Shift+[ because
+        // Illustrator has it would have been inventing a key. They are bound
+        // now, so the menu says so, and the claim is checked against the
+        // resolver rather than taken on trust. Menu text that promises a chord
+        // nobody implements is the failure this whole file exists to prevent.
+        Assert.Equal(advertised, Find(OnObject, command).Accelerator);
+
+        Assert.Equal(
+            expected,
+            KeyboardCommands.Resolve(key, ctrl: true, shift: shift, textFocused: false));
     }
 }
