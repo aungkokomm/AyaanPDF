@@ -2509,8 +2509,19 @@
                     in the TextBox's own scope is what actually moves it, and
                     the scope keeps the override off every other TextBox.
                 -->
+                <!--
+                    Page stepping, either side of the readout.
+
+                    The box alone meant the only way to move one page was to
+                    click into it and type a number, or know PageUp. A reader
+                    reaches for an arrow.
+                -->
+                <Button Content="&#xE70E;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                        Click="PrevPage_Click" Width="24" Height="26" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Previous page (Page Up)" />
                 <Border VerticalAlignment="Center" Height="26" Padding="6,0"
-                        Margin="6,0,4,0" CornerRadius="4"
+                        Margin="2,0,2,0" CornerRadius="4"
                         Background="{ThemeResource ControlFillColorDefaultBrush}"
                         BorderThickness="1"
                         BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
@@ -2533,6 +2544,21 @@
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
                 </Border>
+                <Button Content="&#xE70D;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                        Click="NextPage_Click" Width="24" Height="26" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Next page (Page Down)" />
+                <!--
+                    Back through where the reader has been. Earns permanent
+                    width because a chord cannot be discovered, and on a
+                    three-thousand page book it is the difference between
+                    returning to where you were and hunting for it again.
+                -->
+                <Button x:Name="NavBackButton" Content="&#xE72B;"
+                        FontFamily="Segoe MDL2 Assets" FontSize="12"
+                        Click="NavBack_Click" Width="26" Height="26" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Back (Alt+Left)" />
                 <!-- Says why text selection is unavailable, instead of the
                      tool silently doing nothing on a scanned page. -->
                 <TextBlock Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
@@ -2544,15 +2570,26 @@
                         Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom out" />
                 <!-- Zoom readout doubles as a preset menu. -->
-                <Button x:Name="ZoomMenuButton" Width="52" Height="26" Padding="0"
+                <Button x:Name="ZoomMenuButton" Width="60" Height="26" Padding="0"
                         Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom presets">
-                    <TextBlock x:Name="ZoomPercentText" Text="100%" TextAlignment="Center"
-                               Style="{StaticResource CaptionTextBlockStyle}" />
+                    <!-- A caret, because the bare percentage read as a label
+                         and nobody clicks a label. -->
+                    <StackPanel Orientation="Horizontal" Spacing="2"
+                                HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <TextBlock x:Name="ZoomPercentText" Text="100%" TextAlignment="Center"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <FontIcon Glyph="&#xE70D;" FontSize="8" VerticalAlignment="Center"
+                                  Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
                     <Button.Flyout>
                         <MenuFlyout Placement="Top">
-                            <MenuFlyoutItem Text="Fit page" Click="ZoomFitPage_Click" />
-                            <MenuFlyoutItem Text="Fit width" Click="ZoomFitWidth_Click" />
+                            <MenuFlyoutItem Text="Fit page" Click="ZoomFitPage_Click"
+                                            KeyboardAcceleratorTextOverride="Ctrl+0" />
+                            <MenuFlyoutItem Text="Fit width" Click="ZoomFitWidth_Click"
+                                            KeyboardAcceleratorTextOverride="Ctrl+2" />
+                            <MenuFlyoutItem Text="Actual size" Click="ZoomActualSize_Click"
+                                            KeyboardAcceleratorTextOverride="Ctrl+1" />
                             <MenuFlyoutSeparator />
                             <MenuFlyoutItem Text="50%" Click="ZoomPreset_Click" Tag="0.5" />
                             <MenuFlyoutItem Text="100%" Click="ZoomPreset_Click" Tag="1.0" />
@@ -2566,8 +2603,92 @@
                         ToolTipService.ToolTip="Zoom in" />
                 <Button Content="&#xE9A6;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ResetZoom_Click"
                         Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="Fit width" />
+                        ToolTipService.ToolTip="Fit width (Ctrl+2)" />
                 <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                <!--
+                    How the page is LOOKED at, as opposed to where you are in it
+                    or how big it is. All of this was reachable only through the
+                    rail's menu button, which is three interactions deep, and in
+                    full screen the title row is collapsed entirely so this bar
+                    is the nearest chrome there is.
+
+                    Toggles rather than menu ticks: night mode being on is a
+                    thing you want to SEE, not something to open a menu to
+                    check. Same for a view that is turned.
+                -->
+                <ToggleButton x:Name="NightModeBarButton" Click="NightModeBar_Click"
+                              Width="28" Height="26" Padding="0" BorderThickness="0"
+                              Background="Transparent"
+                              ToolTipService.ToolTip="Night mode">
+                    <FontIcon Glyph="&#xE708;" FontSize="14" />
+                </ToggleButton>
+                <ToggleButton x:Name="RotateBarButton" Click="RotateBar_Click"
+                              Width="28" Height="26" Padding="0" BorderThickness="0"
+                              Background="Transparent"
+                              ToolTipService.ToolTip="Rotate view clockwise (Ctrl+Shift++)">
+                    <FontIcon Glyph="&#xE7AD;" FontSize="14" />
+                </ToggleButton>
+                <Button Content="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                        Click="FullScreen_Click" Width="28" Height="26" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Full screen (F11)" />
+                <!--
+                    The rest of the View menu, one click from the page instead
+                    of three from the rail. Text items rather than icons: these
+                    are the ones chosen rarely, and a wrong Segoe MDL2 code
+                    renders as an empty box, so only glyphs this app already
+                    proves are used above.
+                -->
+                <Button x:Name="ViewOptionsButton" Content="&#xE712;"
+                        FontFamily="Segoe MDL2 Assets" FontSize="10"
+                        Width="24" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="View options">
+                    <Button.Flyout>
+                        <MenuFlyout Placement="Top">
+                            <RadioMenuFlyoutItem x:Name="BarContinuousItem" Text="Continuous scrolling"
+                                                 GroupName="barPageViewMode" IsChecked="True"
+                                                 Click="ContinuousView_Click" />
+                            <RadioMenuFlyoutItem x:Name="BarSinglePageItem" Text="Single page"
+                                                 GroupName="barPageViewMode"
+                                                 Click="SinglePageView_Click" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Rotate anticlockwise" Click="RotateViewCcw_Click"
+                                            KeyboardAcceleratorTextOverride="Ctrl+Shift+-" />
+                            <MenuFlyoutItem x:Name="BarResetRotationItem" Text="Reset view rotation"
+                                            Click="ResetViewRotation_Click" IsEnabled="False" />
+                            <MenuFlyoutSeparator />
+                            <ToggleMenuFlyoutItem x:Name="BarRulersToggle" Text="Rulers"
+                                                  Click="RulersToggle_Click"
+                                                  KeyboardAcceleratorTextOverride="Ctrl+R" />
+                            <MenuFlyoutSubItem Text="Ruler units">
+                                <MenuFlyoutItem Text="Inches" Click="RulerUnit_Click" Tag="Inches" />
+                                <MenuFlyoutItem Text="Centimeters" Click="RulerUnit_Click" Tag="Centimeters" />
+                                <MenuFlyoutItem Text="Millimeters" Click="RulerUnit_Click" Tag="Millimeters" />
+                                <MenuFlyoutItem Text="Points" Click="RulerUnit_Click" Tag="Points" />
+                                <MenuFlyoutItem Text="Picas" Click="RulerUnit_Click" Tag="Picas" />
+                            </MenuFlyoutSubItem>
+                        </MenuFlyout>
+                    </Button.Flyout>
+                </Button>
+
+                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                <!--
+                    Find, collapsed to a glass until it is wanted.
+
+                    It held about 120 DIP of a bar that floats over the page, to
+                    do a thing done in bursts. That width is what the view
+                    controls above are made of.
+                -->
+                <Button x:Name="FindToggleButton" Content="&#xE721;"
+                        FontFamily="Segoe MDL2 Assets" FontSize="12"
+                        Click="FindToggle_Click" Width="28" Height="26" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Find (Ctrl+F)" />
+
+                <StackPanel x:Name="FindPanel" Orientation="Horizontal" Spacing="4"
+                            VerticalAlignment="Center" Visibility="Collapsed">
                 <TextBox x:Name="SearchBox" Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                          PlaceholderText="Find" Width="120" Height="26" Margin="2,0,0,0"
                          VerticalAlignment="Center" VerticalContentAlignment="Center"
@@ -2629,6 +2750,12 @@
                         Width="24" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         IsEnabled="{x:Bind ViewModel.HasSearchMatches, Mode=OneWay}"
                         ToolTipService.ToolTip="Next match (Enter)" />
+                <Button Content="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                        Click="FindClose_Click" Width="24" Height="26" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Close find (Esc)" />
+                </StackPanel>
+
                 <TextBlock Text="&#9679;" Foreground="{ThemeResource SystemFillColorCautionBrush}"
                            VerticalAlignment="Center" Margin="0,0,10,0" FontSize="14"
                            ToolTipService.ToolTip="Unsaved changes"

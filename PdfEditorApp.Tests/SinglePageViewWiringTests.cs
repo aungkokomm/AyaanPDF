@@ -309,9 +309,17 @@ public class SinglePageViewWiringTests
         Assert.Contains("_applyingSettings = true", apply, StringComparison.Ordinal);
         Assert.Contains("_applyingSettings = false", apply, StringComparison.Ordinal);
 
+        // The invariant, not its shape: the guard has to be consulted BEFORE
+        // anything saves. Asserting on the exact `if` broke when the guard
+        // became an early return, which was a strengthening rather than a
+        // regression.
         string setter = MethodBody(PageCode(), "private void ApplyPageViewMode");
-        Assert.Contains("if (!_applyingSettings)", setter, StringComparison.Ordinal);
-        Assert.Contains("SettingsStore.Update", setter, StringComparison.Ordinal);
+
+        int guard = setter.IndexOf("_applyingSettings", StringComparison.Ordinal);
+        int save = setter.IndexOf("SettingsStore.Update", StringComparison.Ordinal);
+
+        Assert.True(guard >= 0, "ApplyPageViewMode no longer consults the guard");
+        Assert.True(save > guard, "the setting is saved before the guard is consulted");
     }
 
     [Fact]

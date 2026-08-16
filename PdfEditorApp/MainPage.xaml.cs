@@ -966,6 +966,27 @@ public sealed partial class MainPage : Page
 
     private void RulersToggle_Click(object sender, RoutedEventArgs e)
     {
+        // The bar's copy of this toggle and the menu's are kept in step by
+        // assignment, and assigning IsChecked raises Click. Without the guard,
+        // showing the current state would toggle it.
+        if (_applyingSettings)
+        {
+            return;
+        }
+
+        // Whichever was clicked, both agree afterwards.
+        bool on = sender == BarRulersToggle ? BarRulersToggle.IsChecked : RulersToggle.IsChecked;
+        _applyingSettings = true;
+        try
+        {
+            RulersToggle.IsChecked = on;
+            BarRulersToggle.IsChecked = on;
+        }
+        finally
+        {
+            _applyingSettings = false;
+        }
+
         ApplyRulerVisibility();
     }
 
@@ -986,9 +1007,15 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void NightModeToggle_Click(object sender, RoutedEventArgs e)
     {
+        if (_applyingSettings)
+        {
+            return;
+        }
+
         ViewModel.IsNightMode = NightModeToggle.IsChecked;
         ApplyPageSheet(NightModeToggle.IsChecked);
         SettingsStore.Update(s => s with { NightMode = NightModeToggle.IsChecked });
+        SyncBarViewState();
     }
 
     /// <summary>
@@ -1117,6 +1144,91 @@ public sealed partial class MainPage : Page
 
     private void ResetViewRotation_Click(object sender, RoutedEventArgs e) => ViewModel.ResetViewRotation();
 
+    // ---------------- The floating bar's view controls ----------------
+
+    private void PrevPage_Click(object sender, RoutedEventArgs e) =>
+        ViewModel.GoToPage(ViewModel.CurrentPageIndex - 1);
+
+    private void NextPage_Click(object sender, RoutedEventArgs e) =>
+        ViewModel.GoToPage(ViewModel.CurrentPageIndex + 1);
+
+    private void NavBack_Click(object sender, RoutedEventArgs e) => GoBackInHistory();
+
+    private void NightModeBar_Click(object sender, RoutedEventArgs e)
+    {
+        // Routed through the same handler the menu uses, by making the menu
+        // item agree first. One path, so the two can never disagree about what
+        // night mode currently is.
+        NightModeToggle.IsChecked = NightModeBarButton.IsChecked == true;
+        NightModeToggle_Click(sender, e);
+    }
+
+    private void RotateBar_Click(object sender, RoutedEventArgs e)
+    {
+        // A ToggleButton, but not a toggle: it turns the view a quarter each
+        // press and four presses come back round. The checked state is being
+        // used to SHOW that the view is turned, which is the one thing nothing
+        // else tells you, since rotation is session-only and resets on reopen.
+        ViewModel.RotateViewClockwise();
+        SyncBarViewState();
+    }
+
+    private void FindToggle_Click(object sender, RoutedEventArgs e) => SetFindOpen(!IsFindOpen);
+
+    private void FindClose_Click(object sender, RoutedEventArgs e)
+    {
+        SetFindOpen(false);
+        RootGrid.Focus(FocusState.Programmatic);
+    }
+
+    private bool IsFindOpen => FindPanel.Visibility == Visibility.Visible;
+
+    /// <summary>
+    /// Shows or hides the find controls on the bar.
+    ///
+    /// Collapsed by default: they held about 120 DIP of a bar that floats over
+    /// the page, for something done in bursts rather than continuously. The
+    /// query is left alone when it closes, so reopening resumes the same search
+    /// rather than starting from nothing.
+    /// </summary>
+    private void SetFindOpen(bool open)
+    {
+        FindPanel.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
+        FindToggleButton.Visibility = open ? Visibility.Collapsed : Visibility.Visible;
+
+        if (open)
+        {
+            SearchBox.Focus(FocusState.Programmatic);
+            SearchBox.SelectAll();
+        }
+    }
+
+    /// <summary>
+    /// Brings the bar's toggles into line with what the viewport is actually
+    /// doing.
+    ///
+    /// Guarded like the menu, because setting IsChecked raises Click and that
+    /// handler acts: without the guard, showing the current state would change
+    /// it. That trap has already cost this app one bug.
+    /// </summary>
+    private void SyncBarViewState()
+    {
+        _applyingSettings = true;
+        try
+        {
+            NightModeBarButton.IsChecked = ViewModel.IsNightMode;
+            RotateBarButton.IsChecked = ViewModel.IsViewRotated;
+            BarResetRotationItem.IsEnabled = ViewModel.IsViewRotated;
+            BarSinglePageItem.IsChecked = ViewModel.IsSinglePageView;
+            BarContinuousItem.IsChecked = !ViewModel.IsSinglePageView;
+            BarRulersToggle.IsChecked = RulersToggle.IsChecked;
+        }
+        finally
+        {
+            _applyingSettings = false;
+        }
+    }
+
     private void ContinuousView_Click(object sender, RoutedEventArgs e) =>
         ApplyPageViewMode(PageViewMode.Continuous);
 
@@ -1137,12 +1249,14 @@ public sealed partial class MainPage : Page
 
     private void ApplyPageViewMode(PageViewMode mode)
     {
-        ViewModel.SetPageViewMode(mode);
-
-        if (!_applyingSettings)
+        if (_applyingSettings)
         {
-            SettingsStore.Update(s => s with { PageViewMode = mode });
+            return;
         }
+
+        ViewModel.SetPageViewMode(mode);
+        SettingsStore.Update(s => s with { PageViewMode = mode });
+        SyncBarViewState();
     }
 
     /// <summary>
@@ -1159,6 +1273,7 @@ public sealed partial class MainPage : Page
         DispatcherQueue.TryEnqueue(() =>
         {
             ResetViewRotationItem.IsEnabled = ViewModel.IsViewRotated;
+            SyncBarViewState();
             ScrollToPage(page, animate: false);
             PushVisibleWindow();
 
@@ -4030,6 +4145,7 @@ public sealed partial class MainPage : Page
         }
 
         ViewModel.SetPageViewMode(s.PageViewMode);
+        SyncBarViewState();
 
         // Unconditionally, not only when the toggle changed: this also runs on
         // load, when the chrome has never been decided at all.
@@ -5622,14 +5738,17 @@ public sealed partial class MainPage : Page
             case VirtualKey.V when _isCtrlDown:
                 if (ViewModel.PasteAnnotations()) { e.Handled = true; }
                 break;
-            // Ctrl+Shift+] = Bring to Front (Illustrator convention).
-            // VirtualKey for the ] key is Oem6 (\ in some layouts).
-            case (VirtualKey)0xDD when _isCtrlDown && IsShiftDown():
-                if (ViewModel.BringSelectedToFront()) { e.Handled = true; }
-                break;
+            // Ctrl+Shift+] used to be handled here alone. It now resolves
+            // through KeyboardCommands with the other three z-order chords,
+            // which runs above this switch, so this case had become
+            // unreachable. Removed rather than left as a second declaration of
+            // the same key, which is the shape that let Ctrl+Z sit dead for
+            // months.
             case VirtualKey.F when _isCtrlDown:
-                SearchBox.Focus(FocusState.Programmatic);
-                SearchBox.SelectAll();
+                // Opens the find controls first: they are collapsed until
+                // wanted, so focusing the box without showing it would put the
+                // caret somewhere invisible.
+                SetFindOpen(true);
                 e.Handled = true;
                 break;
 
