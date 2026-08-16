@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      The CORE package only. SkiaSharp.Views.WinUI, which carries SKXamlCanvas
+      and the native assets an unpackaged app has to load, is deliberately not
+      here yet: stage 1 renders off screen into a bitmap and has to prove parity
+      before anything is put in front of the user. Nothing references this
+      project from the app, so no Skia binary reaches the shipping output.
+    -->
+    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <ProjectReference Include="..\PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -20,6 +20,12 @@
 
   <ItemGroup>
     <ProjectReference Include="..\PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj" />
+    <!--
+      The Skia renderer is referenced by the TESTS only. The app does not
+      reference it, so no Skia binary reaches the shipping output while parity
+      is still being proved.
+    -->
+    <ProjectReference Include="..\PdfEditorApp.Rendering.Skia\PdfEditorApp.Rendering.Skia.csproj" />
   </ItemGroup>
 
   <!--
