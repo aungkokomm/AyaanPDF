@@ -2344,6 +2344,36 @@
             </StackPanel>
         </ContentDialog>
 
+        <!--
+            Offered when a previous run left work behind.
+
+            Worded as an offer, not an announcement: the snapshot is the app's
+            own copy and the user's file was never touched, so nothing has
+            happened to their document and nothing will unless they say so.
+            "Not now" keeps the snapshot, because deleting somebody's only
+            remaining copy of an afternoon's work must take a deliberate press.
+        -->
+        <ContentDialog x:Name="RecoveryDialog" Title="Recover unsaved work"
+                       PrimaryButtonText="Recover" SecondaryButtonText="Discard"
+                       CloseButtonText="Not now" DefaultButton="Primary">
+            <StackPanel Spacing="12" Width="380">
+                <TextBlock TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Text="Ayaan PDF closed without saving these. Your original files were not changed." />
+                <ListView x:Name="RecoveryList" SelectionMode="Single" MaxHeight="200">
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="local:RecoveryChoice">
+                            <StackPanel Padding="0,6">
+                                <TextBlock Text="{x:Bind Name}" />
+                                <TextBlock Text="{x:Bind Detail}" FontSize="12"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+            </StackPanel>
+        </ContentDialog>
+
         <ContentDialog x:Name="RotatePagesDialog" Title="Rotate pages"
                        PrimaryButtonText="Rotate" CloseButtonText="Cancel"
                        DefaultButton="Primary">

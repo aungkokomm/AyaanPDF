@@ -138,8 +138,20 @@ public sealed partial class MainPage : Page
         // without this it can only be reached by hand.
         Loaded += async (_, _) =>
         {
+            // Before anything is opened. A previous run that did not shut down
+            // cleanly left its work behind, and the reader should be asked
+            // about it before the app puts something else in front of them.
+            bool recovered = await OfferRecoveryAsync();
+
+            ViewModel.StartRecoverySnapshots();
+
             string probe = Environment.GetEnvironmentVariable("PDFEDITOR_AUTOOPEN") ?? "";
-            if (InitialDocumentPath is { } wanted && System.IO.File.Exists(wanted))
+            if (recovered)
+            {
+                // Recovered work is already in this tab. Opening anything else
+                // over it would throw away what the reader just asked for.
+            }
+            else if (InitialDocumentPath is { } wanted && System.IO.File.Exists(wanted))
             {
                 // A tab opened for a specific file. Set before this page is
                 // shown, because a Page has no constructor the window can pass
@@ -3370,6 +3382,93 @@ public sealed partial class MainPage : Page
             await LoadDocumentAsync(path);
         }
         Debug.WriteLine($"[MainPage] Opened \"{path}\"");
+    }
+
+    /// <summary>
+    /// Whether this run has already asked about leftover work.
+    ///
+    /// Static, because the question belongs to the SESSION and not to a page:
+    /// every tab is a MainPage and each one runs the same Loaded handler, so
+    /// without this, opening a second tab would ask again about work the
+    /// reader has already dealt with.
+    /// </summary>
+    private static bool _recoveryOffered;
+
+    /// <summary>
+    /// Offers back whatever a previous run left behind, and says whether
+    /// something was restored.
+    ///
+    /// Anything still in the recovery folder belongs to a run that did not shut
+    /// down cleanly, because a clean shutdown clears its own snapshot.
+    /// </summary>
+    private async System.Threading.Tasks.Task<bool> OfferRecoveryAsync()
+    {
+        if (_recoveryOffered)
+        {
+            return false;
+        }
+
+        _recoveryOffered = true;
+
+        // Snapshot PDFs whose manifest never got written. Nothing will ever
+        // offer them, so they would otherwise pile up a document at a time.
+        RecoveryStore.SweepOrphans();
+
+        var pending = RecoveryStore.Pending();
+        if (pending.Count == 0)
+        {
+            return false;
+        }
+
+        var choices = new List<RecoveryChoice>();
+        foreach (var record in pending)
+        {
+            choices.Add(new RecoveryChoice(
+                CrashRecovery.DescribeDocument(record.OriginalPath),
+                $"{record.PageCount} pages, last saved {CrashRecovery.DescribeAge(record.SavedAtTicks, DateTime.UtcNow)}",
+                record));
+        }
+
+        RecoveryList.ItemsSource = choices;
+        RecoveryList.SelectedIndex = 0;
+        RecoveryDialog.XamlRoot = XamlRoot;
+
+        ContentDialogResult answer;
+        try
+        {
+            answer = await RecoveryDialog.ShowAsync();
+        }
+        catch (Exception ex)
+        {
+            // See LoadDocumentAsync: ShowAsync throws if another dialog is
+            // already open, and this runs from an async void Loaded handler
+            // where an escaping exception would take the process down. The
+            // snapshots are kept, so the offer comes back next launch.
+            Diag.Log($"recovery: prompt could not be shown: {ex.GetType().Name}");
+            return false;
+        }
+
+        if (RecoveryList.SelectedItem is not RecoveryChoice picked)
+        {
+            return false;
+        }
+
+        if (answer == ContentDialogResult.Secondary)
+        {
+            // Explicitly thrown away, which is the only way a snapshot is
+            // deleted without the work first reaching the user's own file.
+            RecoveryStore.Discard(picked.Record);
+            Diag.Log("recovery: discarded at the reader's request");
+            return false;
+        }
+
+        if (answer != ContentDialogResult.Primary)
+        {
+            // Not now. The snapshots stay, and the offer comes back.
+            return false;
+        }
+
+        return ViewModel.RestoreFrom(picked.Record);
     }
 
     /// <summary>

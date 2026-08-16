@@ -377,6 +377,19 @@ public sealed partial class MainWindow : Window
             }
         }
 
+        // Every tab shuts down properly, which is what tells the next run there
+        // was no crash: a snapshot left in the recovery folder means the run
+        // that took it never reached here. Relying on each page's Unloaded
+        // instead would be a false "it crashed" on every ordinary exit that
+        // did not raise it.
+        foreach (var item in Tabs.TabItems.OfType<TabViewItem>().ToList())
+        {
+            if (item.Content is MainPage page)
+            {
+                page.ViewModel.ShutDownCleanly();
+            }
+        }
+
         _closeConfirmed = true;
         Close();
     }

@@ -726,11 +726,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public DocumentOpenOutcome OpenDocument(
         string path, bool preserveAnnotations = false, string? password = null)
     {
+        // The document being left behind is no longer recoverable through this
+        // tab, and by here the reader has already answered the unsaved-changes
+        // guard. Leaving its snapshot would offer it back on the next launch as
+        // though the app had crashed.
+        if (_currentDocumentPath is { } leaving && !SamePath(leaving, path))
+        {
+            RecoveryStore.Discard(leaving);
+        }
+
         CloseCurrentDocument();
 
         var opened = RenderCoreNative.open_document_protected(path, password);
         _documentHandle = opened.Handle;
         _currentDocumentPath = path;
+
+        // The file PDFium is actually streaming this document out of, which is
+        // NOT always the path the document answers to: a recovered document is
+        // opened from a copy but keeps the original's name. Anything that
+        // writes a PDF has to know the difference, because writing over this
+        // one blanks every page.
+        _backingPath = path;
         NotifyDocumentTitleChanged();
 
         // Recorded here rather than at the picker, so a file reaches the recent
@@ -1665,11 +1681,256 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // go to the right place. Only the reload paths above set this via
             // OpenDocument, so a save with nothing to burn used to leave the
             // app still pointing at the file it was opened from.
+            string wasAt = _currentDocumentPath ?? string.Empty;
             _currentDocumentPath = path;
             NotifyDocumentTitleChanged();
+
+            // The work is in the user's own file now, so there is nothing left
+            // to recover. Cleared under the path the snapshot was FILED under,
+            // which after a Save As is where the document used to be rather
+            // than where it now is.
+            RecoveryStore.Discard(wasAt);
+            if (!SamePath(wasAt, path))
+            {
+                RecoveryStore.Discard(path);
+            }
+            _lastSnapshotUtc = DateTime.UtcNow;
         }
 
         return saved;
+    }
+
+    // ---------------- Crash recovery ----------------
+    //
+    // A snapshot of the open document, written to a copy the app owns, so an
+    // afternoon's marks survive a crash. It is NOT an auto-save: nothing here
+    // writes the user's file, because a save that happens without being asked
+    // for is a save that cannot be declined, and committing marks to a document
+    // somebody was only reading is worse than losing them.
+
+    private DateTime _lastEditUtc = DateTime.MinValue;
+    private DateTime _lastSnapshotUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// The file the open document is being streamed out of.
+    ///
+    /// Usually the same as the document's path, and deliberately NOT the same
+    /// after a recovery, where the document is opened from a copy but answers
+    /// to the original's name.
+    /// </summary>
+    private string? _backingPath;
+
+    /// <summary>
+    /// Whether there is work a crash would lose.
+    ///
+    /// Highlights and notes count even when the document itself is clean: they
+    /// live in the app's memory until a save writes them, so they are exactly
+    /// the marks a crash takes.
+    /// </summary>
+    public bool HasUnsavedWork => IsDirty || _allHighlights.Count > 0 || _allNotes.Count > 0;
+
+    /// <summary>
+    /// Takes a snapshot if it is time to, and says whether it did.
+    ///
+    /// Called on a timer. The decision is <see cref="CrashRecovery"/>'s, which
+    /// is pure and tested; this half is the part that touches PDFium and the
+    /// disk.
+    /// </summary>
+    public async System.Threading.Tasks.Task<bool> SnapshotIfDueAsync()
+    {
+        var now = DateTime.UtcNow;
+
+        if (_documentHandle == 0 || _snapshotInFlight)
+        {
+            return false;
+        }
+
+        if (!CrashRecovery.ShouldSnapshot(HasUnsavedWork, now - _lastEditUtc, now - _lastSnapshotUtc))
+        {
+            return false;
+        }
+
+        return await SnapshotNowAsync();
+    }
+
+    private bool _snapshotInFlight;
+
+    private DispatcherQueueTimer? _snapshotTimer;
+
+    /// <summary>
+    /// How often the policy is CONSULTED, which is not how often a snapshot is
+    /// taken: the policy says no on almost every tick, and saying no costs a
+    /// subtraction. Frequent enough that the first snapshot after a burst of
+    /// editing lands promptly rather than up to two minutes late.
+    /// </summary>
+    private static readonly TimeSpan SnapshotPollInterval = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Starts the crash-recovery timer. Idempotent.
+    /// </summary>
+    public void StartRecoverySnapshots()
+    {
+        if (_snapshotTimer is not null)
+        {
+            return;
+        }
+
+        _snapshotTimer = _dispatcherQueue.CreateTimer();
+        _snapshotTimer.Interval = SnapshotPollInterval;
+        _snapshotTimer.IsRepeating = true;
+        _snapshotTimer.Tick += async (_, _) => await SnapshotIfDueAsync();
+        _snapshotTimer.Start();
+    }
+
+    /// <summary>
+    /// Writes the snapshot, whatever the timer thinks.
+    ///
+    /// ⚠️ Does NOT call WriteAnnotationObjects, PersistGroups or
+    /// SyncSearchableText, which is what saving does first. Those MUTATE the
+    /// open document and do not clear what they wrote, which is why the save
+    /// path reopens the file afterwards to avoid writing everything twice.
+    /// Calling them on a timer would duplicate every mark in the document the
+    /// user is still working in, on a two-minute cycle. So the snapshot is a
+    /// pure READ of the document as it stands, and the marks that are not in it
+    /// yet travel beside it in the manifest.
+    /// </summary>
+    private async System.Threading.Tasks.Task<bool> SnapshotNowAsync()
+    {
+        _snapshotInFlight = true;
+        try
+        {
+            ulong handle = _documentHandle;
+            string original = _currentDocumentPath ?? string.Empty;
+            string snapshot = RecoveryStore.PathForSnapshot(original);
+
+            // ⚠️ NEVER write over the file this document is being streamed
+            // from. PDFium reads page content lazily out of it, so an in-place
+            // write returns OK, keeps the page count, and blanks every page.
+            //
+            // RestoreFrom already opens a copy so this cannot line up, but the
+            // consequence is destroying the user's recovered work in the act of
+            // trying to protect it, and that deserves a second lock on the
+            // door rather than a comment saying it cannot happen.
+            if (SamePath(snapshot, _backingPath ?? string.Empty))
+            {
+                Diag.Log("recovery: refusing to snapshot over the open file");
+                return false;
+            }
+
+            // Off the UI thread. Measured at about 0.4ms per page, so the
+            // 3,352-page book takes over a second, and that second must not be
+            // one where the window stops answering.
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            bool ok = await Task.Run(() =>
+                RenderCoreNative.save_document(handle, snapshot) == RenderStatus.OkPdfium);
+
+            if (!ok || handle != _documentHandle)
+            {
+                Diag.Log($"recovery: snapshot not taken (ok={ok})");
+                return false;
+            }
+
+            RecoveryStore.Commit(new RecoveryRecord(original, snapshot, DateTime.UtcNow.Ticks, PageCount)
+            {
+                Highlights = PendingHighlights(),
+                Notes = PendingNotes(),
+            });
+
+            _lastSnapshotUtc = DateTime.UtcNow;
+            Diag.Log($"recovery: snapshot of {PageCount} pages in {clock.ElapsedMilliseconds}ms");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"recovery: snapshot failed: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            _snapshotInFlight = false;
+        }
+    }
+
+    private List<RecoveredHighlight> PendingHighlights()
+    {
+        var list = new List<RecoveredHighlight>();
+        foreach (var h in _allHighlights)
+        {
+            var rects = new List<RecoveredRect>();
+            foreach (var r in h.Rects)
+            {
+                rects.Add(new RecoveredRect(r.Left, r.Top, r.Right, r.Bottom));
+            }
+            list.Add(new RecoveredHighlight(h.PageIndex, h.ColorHex, rects));
+        }
+        return list;
+    }
+
+    private List<RecoveredNote> PendingNotes()
+    {
+        var list = new List<RecoveredNote>();
+        foreach (var n in _allNotes)
+        {
+            list.Add(new RecoveredNote(n.PageIndex, n.X, n.Y, n.Text ?? string.Empty));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Opens a snapshot as the document it was taken from.
+    ///
+    /// The document is loaded from the SNAPSHOT but answers to the ORIGINAL's
+    /// path, so Ctrl+S goes where the reader expects. It stays dirty, because
+    /// the original on disk does not contain any of this yet, and the snapshot
+    /// is discarded only once a real save has happened.
+    /// </summary>
+    public bool RestoreFrom(RecoveryRecord record)
+    {
+        // Opened from a COPY, never from the snapshot itself. The restored
+        // document answers to the original's path, so the next snapshot would
+        // target the very file PDFium is streaming this document out of, and
+        // writing back over that blanks every page while reporting success.
+        if (RecoveryStore.TakeForRestore(record) is not { } working)
+        {
+            return false;
+        }
+
+        if (OpenDocument(working) != DocumentOpenOutcome.Opened)
+        {
+            Diag.Log("recovery: the snapshot itself would not open");
+            return false;
+        }
+
+        foreach (var h in record.Highlights)
+        {
+            var rects = new List<TextRect>();
+            foreach (var r in h.Rects)
+            {
+                rects.Add(new TextRect(r.Left, r.Top, r.Right, r.Bottom));
+            }
+            _allHighlights.Add(new HighlightAnnotation(h.PageIndex, rects, h.ColorHex));
+        }
+
+        foreach (var n in record.Notes)
+        {
+            _allNotes.Add(new NoteAnnotation(n.PageIndex, n.X, n.Y, n.Text));
+        }
+
+        // Answers to the original, not to the snapshot. Without this a save
+        // would write into the app's own recovery folder and the reader would
+        // never find their document again.
+        _currentDocumentPath = string.IsNullOrWhiteSpace(record.OriginalPath) ? null : record.OriginalPath;
+
+        // Nothing here is on disk in the user's file yet.
+        IsDirty = true;
+
+        DistributeAnnotationsToSlots();
+        NotifyDocumentTitleChanged();
+        RenderCurrentPage();
+
+        Status = $"Recovered {CrashRecovery.DescribeDocument(record.OriginalPath)}";
+        Diag.Log($"recovery: restored {record.PageCount} pages");
+        return true;
     }
 
     /// <summary>
@@ -8836,6 +9097,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // The title carries the unsaved marker too, so it follows the same flag.
         OnPropertyChanged(nameof(WindowTitle));
         OnPropertyChanged(nameof(TabTitle));
+
+        // When the last edit happened, for the crash-recovery timer. Hung off
+        // this flag rather than off the thirty-odd places that set it: a new
+        // kind of edit gets it for free, and one that forgot would be invisible
+        // until somebody lost work to it.
+        if (value)
+        {
+            _lastEditUtc = DateTime.UtcNow;
+        }
     }
 
     private void NotifyHistoryChanged()
@@ -9920,5 +10190,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RebuildContinuousLayout();
     }
 
-    public void Dispose() => CloseCurrentDocument();
+    /// <summary>
+    /// Closes down cleanly, which is what tells the next run there was no
+    /// crash.
+    ///
+    /// The absence of a snapshot IS the signal. Anything left in the recovery
+    /// folder belongs to a run that did not get here, which is why there is no
+    /// heartbeat and no "still running" flag: both have to be correct in
+    /// exactly the circumstances where nothing gets a chance to be.
+    /// </summary>
+    public void ShutDownCleanly()
+    {
+        _snapshotTimer?.Stop();
+
+        // Only the snapshot for THIS document. Another tab may still be open
+        // and holding work of its own.
+        RecoveryStore.Discard(_currentDocumentPath ?? string.Empty);
+
+        CloseCurrentDocument();
+    }
+
+    public void Dispose() => ShutDownCleanly();
 }
