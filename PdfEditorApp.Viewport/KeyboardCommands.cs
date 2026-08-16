@@ -29,6 +29,9 @@ public enum EditorCommand
     BringToFront,
     SendToBack,
     Duplicate,
+    /// <summary>Back to where the reader was before the last jump.</summary>
+    NavigateBack,
+    NavigateForward,
 }
 
 /// <summary>
@@ -87,7 +90,46 @@ public static class KeyboardCommands
     /// and F stay in the view because whether they count as handled depends on
     /// what is selected, and that is not a mapping.
     /// </summary>
-    public static EditorCommand Resolve(int keyCode, bool ctrl, bool shift, bool textFocused)
+    public const int KeyLeft = 0x25;
+    public const int KeyRight = 0x27;
+
+    public static EditorCommand Resolve(int keyCode, bool ctrl, bool shift, bool textFocused) =>
+        Resolve(keyCode, ctrl, shift, textFocused, alt: false);
+
+    /// <summary>
+    /// As above, with Alt.
+    ///
+    /// A separate overload rather than a fifth argument on the old one, so the
+    /// dozens of existing call sites and tests keep saying what they mean. Only
+    /// the back and forward chords use it.
+    /// </summary>
+    public static EditorCommand Resolve(int keyCode, bool ctrl, bool shift, bool textFocused, bool alt)
+    {
+        // Alt+Left and Alt+Right, which is back and forward in every browser
+        // and in Acrobat. Checked FIRST because the arrows are otherwise a
+        // nudge or a scroll, and before the text-focus guard for the same
+        // reason as F3: they type nothing, and there is no field that wants
+        // them with Alt held.
+        if (alt && !ctrl)
+        {
+            switch (keyCode)
+            {
+                case KeyLeft: return EditorCommand.NavigateBack;
+                case KeyRight: return EditorCommand.NavigateForward;
+            }
+        }
+
+        // Alt is not a modifier any other chord here takes, so a chord pressed
+        // WITH it held is not that chord. Without this, Alt+S would save.
+        if (alt)
+        {
+            return EditorCommand.None;
+        }
+
+        return ResolveCore(keyCode, ctrl, shift, textFocused);
+    }
+
+    private static EditorCommand ResolveCore(int keyCode, bool ctrl, bool shift, bool textFocused)
     {
         // F3 is answered BEFORE the text-focus guard, and deliberately.
         //

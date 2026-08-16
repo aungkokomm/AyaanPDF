@@ -570,6 +570,11 @@ public sealed partial class MainPage : Page
             if (firstForThisFile)
             {
                 _restoredForPath = ViewModel.DocumentPath;
+
+                // History belongs to a document. Carrying it across would offer
+                // to go "back" into a file that is no longer open.
+                _navHere = new NavigationPoint(ViewModel.CurrentPageIndex, 0);
+                _navigation.Reset(_navHere);
             }
 
             // A remembered place wins. Failing that, the SAVED DEFAULT VIEW
@@ -599,8 +604,89 @@ public sealed partial class MainPage : Page
     private double AvailableContentWidth =>
         PageScroller.ViewportWidth - ViewportHost.Padding.Left - ViewportHost.Padding.Right;
 
-    private void OnScrollToPageRequested(int pageIndex, bool animate, PageBand? reveal) =>
+    /// <summary>
+    /// Where the reader has been in this document, for Alt+Left and Alt+Right.
+    ///
+    /// Lives here rather than on the view model because a place is a page AND
+    /// how far down it, and only the scroller knows the second half.
+    /// </summary>
+    private readonly NavigationHistory _navigation = new();
+
+    /// <summary>
+    /// Where the reader is, kept up to date as they scroll.
+    ///
+    /// Tracked rather than measured at the moment of a jump: GoToPage sets the
+    /// current page BEFORE asking for the scroll, so by the time this hears
+    /// about a jump the "from" page is already gone.
+    /// </summary>
+    private NavigationPoint _navHere;
+
+    /// <summary>True while Alt+Left or Alt+Right is doing the moving, so the
+    /// move it performs is not recorded as a new jump.</summary>
+    private bool _navigatingHistory;
+
+    private void OnScrollToPageRequested(int pageIndex, bool animate, PageBand? reveal)
+    {
+        // Recorded here, which is the choke point every jump passes through:
+        // bookmarks, the page box, thumbnails, search matches and Home/End all
+        // reach the viewport this way.
+        if (!_navigatingHistory && NavigationHistory.IsWorthRecording(_navHere.PageIndex, pageIndex))
+        {
+            _navigation.Record(_navHere, new NavigationPoint(pageIndex, 0));
+            Diag.Log($"nav: recorded jump {_navHere.PageIndex} -> {pageIndex}");
+        }
+
         DispatcherQueue.TryEnqueue(() => ScrollToPage(pageIndex, animate, reveal));
+    }
+
+    private void GoBackInHistory() => ApplyHistoryPoint(_navigation.Back(), "back");
+
+    private void GoForwardInHistory() => ApplyHistoryPoint(_navigation.Forward(), "forward");
+
+    /// <summary>
+    /// Moves to a remembered place without recording the move.
+    ///
+    /// Scrolls directly rather than through GoToPage, because the page's
+    /// FRACTION is the point: landing at the top of page 1500 is not where the
+    /// reader was, and after a long book that is the difference between
+    /// getting back and starting to look again.
+    /// </summary>
+    private void ApplyHistoryPoint(NavigationPoint? point, string direction)
+    {
+        if (point is not { } target)
+        {
+            Diag.Log($"nav: nothing {direction} of here");
+            return;
+        }
+
+        _navigatingHistory = true;
+        try
+        {
+            ViewModel.GoToPage(target.PageIndex, animate: false);
+
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                double slotY = ViewModel.SlotTopOf(target.PageIndex)
+                             + (target.PageFraction * ViewModel.SlotHeightOf(target.PageIndex));
+
+                PageScroller.ScrollTo(
+                    PageScroller.HorizontalOffset,
+                    (slotY + ViewportHost.Padding.Top) * PageScroller.ZoomFactor,
+                    new ScrollingScrollOptions(ScrollingAnimationMode.Disabled,
+                                               ScrollingSnapPointsMode.Ignore));
+
+                _navHere = target;
+                _navigatingHistory = false;
+            });
+
+            Diag.Log($"nav: {direction} to page {target.PageIndex} +{target.PageFraction:F2}");
+        }
+        catch
+        {
+            _navigatingHistory = false;
+            throw;
+        }
+    }
 
     /// <summary>
     /// Brings a page to the top of the viewport, animated over short distances.
@@ -673,6 +759,16 @@ public sealed partial class MainPage : Page
         // Debounced, because this fires continuously through a pan and the
         // save writes the settings file.
         QueueReadingPositionSave();
+
+        // Undebounced, because it is two field writes and no I/O, and because
+        // the value has to be right at the instant a jump happens rather than
+        // 400ms later. Keeps Back returning to where the reader actually got
+        // to, not where they first landed.
+        if (!_navigatingHistory && CurrentReadingPosition() is { } here)
+        {
+            _navHere = new NavigationPoint(here.PageIndex, here.PageFraction);
+            _navigation.NoteCurrent(_navHere);
+        }
 
         // Anchored to a page position, so every scroll and zoom moves it.
         UpdateObjectToolbar();
@@ -2771,6 +2867,16 @@ public sealed partial class MainPage : Page
     private static bool IsShiftDown() =>
         Microsoft.UI.Input.InputKeyboardSource
             .GetKeyStateForCurrentThread(VirtualKey.Shift)
+            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+
+    /// <summary>
+    /// Whether Alt is held. Read live rather than tracked like Ctrl: Alt
+    /// activates the menu bar, so the window can take focus away mid-chord and
+    /// a tracked flag would be left stuck down.
+    /// </summary>
+    private static bool IsAltDown() =>
+        Microsoft.UI.Input.InputKeyboardSource
+            .GetKeyStateForCurrentThread(VirtualKey.Menu)
             .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
 
     /// <summary>
@@ -5381,6 +5487,9 @@ public sealed partial class MainPage : Page
             case EditorCommand.BringToFront: ViewModel.BringSelectedToFront(); UpdateObjectToolbar(); break;
             case EditorCommand.SendToBack: ViewModel.SendSelectedToBack(); UpdateObjectToolbar(); break;
             case EditorCommand.Duplicate: ViewModel.DuplicateSelected(); UpdateObjectToolbar(); break;
+
+            case EditorCommand.NavigateBack: GoBackInHistory(); break;
+            case EditorCommand.NavigateForward: GoForwardInHistory(); break;
         }
     }
 
@@ -5472,8 +5581,11 @@ public sealed partial class MainPage : Page
         // undo had never worked and nothing could tell. The menu items keep
         // their accelerators because that is what prints "Ctrl+Z" beside the
         // entry; this is what actually runs them.
+        // Alt is passed too, and this runs BEFORE the arrow-key cases below:
+        // unmodified the arrows nudge a selection or scroll, so Alt+Left has to
+        // be claimed here or it never reaches the resolver at all.
         var command = KeyboardCommands.Resolve(
-            (int)e.Key, _isCtrlDown, IsShiftDown(), IsTextInputFocused);
+            (int)e.Key, _isCtrlDown, IsShiftDown(), IsTextInputFocused, IsAltDown());
         if (command != EditorCommand.None)
         {
             Run(command);

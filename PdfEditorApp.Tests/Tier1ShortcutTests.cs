@@ -181,6 +181,56 @@ public class Tier1ShortcutTests
         Assert.Contains("recordHistory: false", body, StringComparison.Ordinal);
     }
 
+    // ---------------- Tier 3: back and forward ----------------
+
+    [Fact]
+    public void alt_left_and_alt_right_go_back_and_forward()
+    {
+        Assert.Equal(
+            EditorCommand.NavigateBack,
+            KeyboardCommands.Resolve(KeyboardCommands.KeyLeft, NoCtrl, NoShift, OnTheCanvas, alt: true));
+
+        Assert.Equal(
+            EditorCommand.NavigateForward,
+            KeyboardCommands.Resolve(KeyboardCommands.KeyRight, NoCtrl, NoShift, OnTheCanvas, alt: true));
+    }
+
+    [Fact]
+    public void the_arrows_alone_are_left_to_nudge_and_scroll()
+    {
+        // Unmodified they move a selected object or scroll the page, which is
+        // the behaviour Alt is distinguishing itself from.
+        foreach (int key in new[] { KeyboardCommands.KeyLeft, KeyboardCommands.KeyRight })
+        {
+            Assert.Equal(EditorCommand.None, Resolve(key, NoCtrl, NoShift));
+            Assert.Equal(EditorCommand.None, Resolve(key, Ctrl, NoShift));
+            Assert.Equal(EditorCommand.None, Resolve(key, NoCtrl, Shift));
+        }
+    }
+
+    [Fact]
+    public void holding_alt_does_not_turn_another_chord_into_itself()
+    {
+        // Alt is not a modifier any other chord here takes, so a chord pressed
+        // with it held is not that chord. Without this, Alt+Ctrl+S would save
+        // and Alt+Ctrl+W would close the document.
+        foreach (int key in new[] { KeyboardCommands.KeyS, KeyboardCommands.KeyW, KeyboardCommands.KeyN })
+        {
+            Assert.Equal(
+                EditorCommand.None,
+                KeyboardCommands.Resolve(key, Ctrl, NoShift, OnTheCanvas, alt: true));
+        }
+    }
+
+    [Fact]
+    public void the_four_argument_form_still_means_no_alt()
+    {
+        // Dozens of call sites and tests use it, and it must keep meaning what
+        // it always did.
+        Assert.Equal(EditorCommand.Save, Resolve(KeyboardCommands.KeyS, Ctrl, NoShift));
+        Assert.Equal(EditorCommand.None, Resolve(KeyboardCommands.KeyLeft, NoCtrl, NoShift));
+    }
+
     [Fact]
     public void every_command_that_claims_a_chord_can_be_reached_by_one()
     {
@@ -197,7 +247,10 @@ public class Tier1ShortcutTests
             {
                 foreach (bool shift in new[] { false, true })
                 {
-                    reachable.Add(Resolve(key, ctrl, shift));
+                    foreach (bool alt in new[] { false, true })
+                    {
+                        reachable.Add(KeyboardCommands.Resolve(key, ctrl, shift, OnTheCanvas, alt));
+                    }
                 }
             }
         }
