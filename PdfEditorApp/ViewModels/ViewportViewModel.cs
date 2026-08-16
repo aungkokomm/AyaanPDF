@@ -2923,10 +2923,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public Visibility EmptyStateVisibility =>
         PageCount == 0 ? Visibility.Visible : Visibility.Collapsed;
 
+    /// <summary>
+    /// Whether there is a page before this one, and after it.
+    ///
+    /// The bar's page arrows were always live: on page 1 the back arrow looked
+    /// exactly as it does on page 2 and pressing it did nothing at all. A
+    /// control that offers something it cannot do is worse than one that is
+    /// missing, because the reader is left wondering what they did wrong.
+    /// </summary>
+    public bool CanGoToPreviousPage => PageCount > 0 && CurrentPageIndex > 0;
+
+    public bool CanGoToNextPage => PageCount > 0 && CurrentPageIndex < PageCount - 1;
+
     partial void OnCurrentPageIndexChanged(int value)
     {
         OnPropertyChanged(nameof(PagePositionLabel));
         OnPropertyChanged(nameof(TextAvailabilityLabel));
+        OnPropertyChanged(nameof(CanGoToPreviousPage));
+        OnPropertyChanged(nameof(CanGoToNextPage));
 
         // In single-page view the stack IS this page, so turning a page has to
         // build a new one. In continuous view the page changes constantly as
@@ -2940,6 +2954,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(PageCountSuffix));
         OnPropertyChanged(nameof(EmptyStateVisibility));
         OnPropertyChanged(nameof(TextAvailabilityLabel));
+        OnPropertyChanged(nameof(CanGoToPreviousPage));
+        OnPropertyChanged(nameof(CanGoToNextPage));
     }
 
     /// <summary>

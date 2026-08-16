@@ -132,7 +132,81 @@ public class FullScreenWiringTests
 
         Assert.Contains("ToolRail.Visibility", body, StringComparison.Ordinal);
         Assert.Contains("PropertyBar.Visibility", body, StringComparison.Ordinal);
-        Assert.Contains("StatusBar.Visibility", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_floating_bar_is_not_taken_away_outright()
+    {
+        // It used to be collapsed for the duration, which took away the only
+        // chrome full screen has: night mode, rotation, the page arrows and
+        // the way back out were all keyboard-only in the one mode with no menu
+        // to find them in. It is shown on arrival and then left to fade.
+        string body = MethodBody(PageCode(), "public void SetPresenting");
+
+        Assert.Contains("_barRevealed = presenting;", body, StringComparison.Ordinal);
+        Assert.Contains("UpdateStatusBarVisibility()", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("StatusBar.Visibility = presenting", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void one_place_decides_whether_the_bar_is_on_screen()
+    {
+        // Two callers used to answer this separately, and they disagreed:
+        // leaving full screen with no document open put the bar back over an
+        // empty canvas.
+        string code = PageCode();
+
+        Assert.Contains("private void UpdateStatusBarVisibility() =>", code, StringComparison.Ordinal);
+
+        // Exactly one assignment, and it is the one inside that method.
+        int assignments = 0;
+        for (int at = 0; (at = code.IndexOf("StatusBar.Visibility =", at, StringComparison.Ordinal)) >= 0; at++)
+        {
+            assignments++;
+        }
+
+        Assert.Equal(1, assignments);
+    }
+
+    [Fact]
+    public void moving_the_pointer_brings_the_bar_back()
+    {
+        // The video-player pattern, because a bar that fades and cannot be
+        // recalled is worse than one that was never there.
+        string code = PageCode();
+
+        Assert.Contains("private void RootGrid_PointerMoved", code, StringComparison.Ordinal);
+        Assert.Contains("RevealStatusBar()", code, StringComparison.Ordinal);
+
+        // handledEventsToo, for the same reason the wheel needed it: a drawing
+        // tool marks pointer moves handled while it is tracking, and this must
+        // still run.
+        int at = code.IndexOf("UIElement.PointerMovedEvent", StringComparison.Ordinal);
+        Assert.True(at >= 0, "the reveal handler is no longer registered");
+        Assert.Contains("handledEventsToo: true", code[at..(at + 200)], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_bar_does_not_fade_out_from_under_the_pointer_or_an_open_menu()
+    {
+        // Hiding it while a flyout of its own is open would leave the menu
+        // floating over the page attached to nothing.
+        string body = MethodBody(PageCode(), "private void RestartBarHideTimer");
+
+        Assert.Contains("_pointerOverBar", body, StringComparison.Ordinal);
+        Assert.Contains("AnyBarFlyoutOpen", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_fade_only_applies_to_full_screen()
+    {
+        // Windowed, the bar is permanent chrome. A reveal timer running there
+        // would make it flicker in and out while the reader sat still.
+        string reveal = MethodBody(PageCode(), "private void RevealStatusBar");
+        Assert.Contains("if (!IsPresenting)", reveal, StringComparison.Ordinal);
+
+        string visibility = MethodBody(PageCode(), "private void UpdateStatusBarVisibility");
+        Assert.Contains("!IsPresenting || _barRevealed", visibility, StringComparison.Ordinal);
     }
 
     [Fact]

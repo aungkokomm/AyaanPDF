@@ -203,8 +203,13 @@ public class NightModeWiringTests
     {
         string body = MethodBody(PageCode(), "private void NightModeToggle_Click");
 
-        Assert.Contains("ViewModel.IsNightMode", body, StringComparison.Ordinal);
-        Assert.Contains("NightMode = NightModeToggle.IsChecked", body, StringComparison.Ordinal);
+        // Three controls can set this now, so the handler works out what was
+        // meant ONCE and then uses that one value everywhere. Reading a
+        // control's state again further down is how the two halves of a
+        // setting come to disagree.
+        Assert.Contains("ViewModel.IsNightMode = on;", body, StringComparison.Ordinal);
+        Assert.Contains("ApplyPageSheet(on)", body, StringComparison.Ordinal);
+        Assert.Contains("NightMode = on", body, StringComparison.Ordinal);
     }
 
     [Fact]

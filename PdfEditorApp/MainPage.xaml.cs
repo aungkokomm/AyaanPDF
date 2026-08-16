@@ -82,6 +82,14 @@ public sealed partial class MainPage : Page
             UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(PageScroller_PointerWheelChanged),
             handledEventsToo: true);
+
+        // Same reason: a drawing tool marks pointer moves handled while it is
+        // tracking, and the bar has to come back in full screen whether or not
+        // the reader is in the middle of something. It only ever reads.
+        RootGrid.AddHandler(
+            UIElement.PointerMovedEvent,
+            new PointerEventHandler(RootGrid_PointerMoved),
+            handledEventsToo: true);
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
         // Drag-reorder in the thumbnail list moves an item in this collection;
         // that is the signal to rebuild the document in the new order.
@@ -575,6 +583,7 @@ public sealed partial class MainPage : Page
                 // to go "back" into a file that is no longer open.
                 _navHere = new NavigationPoint(ViewModel.CurrentPageIndex, 0);
                 _navigation.Reset(_navHere);
+                SyncBarNavState();
             }
 
             // A remembered place wins. Failing that, the SAVED DEFAULT VIEW
@@ -634,6 +643,7 @@ public sealed partial class MainPage : Page
         {
             _navigation.Record(_navHere, new NavigationPoint(pageIndex, 0));
             Diag.Log($"nav: recorded jump {_navHere.PageIndex} -> {pageIndex}");
+            SyncBarNavState();
         }
 
         DispatcherQueue.TryEnqueue(() => ScrollToPage(pageIndex, animate, reveal));
@@ -658,6 +668,10 @@ public sealed partial class MainPage : Page
             Diag.Log($"nav: nothing {direction} of here");
             return;
         }
+
+        // The cursor has already moved, so what back and forward can do next
+        // has changed even though the scrolling below has not happened yet.
+        SyncBarNavState();
 
         _navigatingHistory = true;
         try
@@ -826,6 +840,10 @@ public sealed partial class MainPage : Page
         UpdateZoomReadout();
         PushVisibleWindow();
         RedrawRulers();
+
+        // The bar lives in this column, so its room is whatever the canvas has
+        // left after the panels either side of it.
+        ApplyBarOverflow();
     }
 
     // ---------------- Rulers ----------------
@@ -1012,9 +1030,25 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        ViewModel.IsNightMode = NightModeToggle.IsChecked;
-        ApplyPageSheet(NightModeToggle.IsChecked);
-        SettingsStore.Update(s => s with { NightMode = NightModeToggle.IsChecked });
+        // Whichever of the three said so, they all agree afterwards. The bar's
+        // own button mirrors into the menu item before calling this; the
+        // flyout copy is read from the sender, the way the rulers toggle does.
+        bool on = sender == BarNightModeItem ? BarNightModeItem.IsChecked : NightModeToggle.IsChecked;
+
+        ViewModel.IsNightMode = on;
+        ApplyPageSheet(on);
+        SettingsStore.Update(s => s with { NightMode = on });
+
+        _applyingSettings = true;
+        try
+        {
+            NightModeToggle.IsChecked = on;
+        }
+        finally
+        {
+            _applyingSettings = false;
+        }
+
         SyncBarViewState();
     }
 
@@ -1154,6 +1188,28 @@ public sealed partial class MainPage : Page
 
     private void NavBack_Click(object sender, RoutedEventArgs e) => GoBackInHistory();
 
+    private void NavForward_Click(object sender, RoutedEventArgs e) => GoForwardInHistory();
+
+    /// <summary>
+    /// Greys out back and forward when there is nowhere to go.
+    ///
+    /// Separate from <see cref="SyncBarViewState"/> because it runs on every
+    /// jump rather than on a settings change, and because none of it can
+    /// re-enter a Click handler: an IsEnabled assignment raises nothing.
+    /// </summary>
+    private void SyncBarNavState()
+    {
+        NavBackButton.IsEnabled = _navigation.CanGoBack;
+        NavForwardButton.IsEnabled = _navigation.CanGoForward;
+        BarNavBackItem.IsEnabled = _navigation.CanGoBack;
+        BarNavForwardItem.IsEnabled = _navigation.CanGoForward;
+    }
+
+    private void PageModeBar_Click(object sender, RoutedEventArgs e) =>
+        ApplyPageViewMode(ViewModel.IsSinglePageView
+            ? PageViewMode.Continuous
+            : PageViewMode.SinglePage);
+
     private void NightModeBar_Click(object sender, RoutedEventArgs e)
     {
         // Routed through the same handler the menu uses, by making the menu
@@ -1201,6 +1257,81 @@ public sealed partial class MainPage : Page
             SearchBox.Focus(FocusState.Programmatic);
             SearchBox.SelectAll();
         }
+
+        // Find is the single widest thing on the bar, so opening it is the
+        // likeliest moment for the bar to stop fitting. Queued, because the new
+        // widths are not known until this layout pass has run.
+        DispatcherQueue.TryEnqueue(ApplyBarOverflow);
+    }
+
+    // ---------------- Fitting the bar into the canvas ----------------
+
+    /// <summary>The bar's own StackPanel spacing, and the margin it keeps from
+    /// each edge of the canvas. Both are declared in the XAML.</summary>
+    private const double BarSpacing = 4;
+    private const double BarSideMargins = 32;
+
+    /// <summary>
+    /// Natural widths, each recorded while its group was on screen.
+    ///
+    /// Never measured while hidden. A hidden group is zero wide, and deciding
+    /// from that would find that the bar now fits, put the group back, find
+    /// that it does not fit, and take it away again, forever.
+    /// </summary>
+    private double _navGroupWidth, _viewGroupWidth, _findExtraWidth, _barCoreWidth;
+
+    /// <summary>
+    /// Drops as much of the bar as it takes to fit the canvas, and puts it back
+    /// when there is room again. See <see cref="StatusBarOverflow"/> for what
+    /// goes first and why.
+    /// </summary>
+    private void ApplyBarOverflow()
+    {
+        if (StatusContent.ActualWidth <= 0 || PageScroller.ActualWidth <= 0)
+        {
+            return;
+        }
+
+        bool navShown = NavHistoryGroup.Visibility == Visibility.Visible;
+        bool viewShown = ViewModesGroup.Visibility == Visibility.Visible;
+
+        if (navShown && NavHistoryGroup.ActualWidth > 0)
+        {
+            _navGroupWidth = NavHistoryGroup.ActualWidth + BarSpacing;
+        }
+
+        if (viewShown && ViewModesGroup.ActualWidth > 0)
+        {
+            _viewGroupWidth = ViewModesGroup.ActualWidth + BarSpacing;
+        }
+
+        if (IsFindOpen && FindPanel.ActualWidth > 0)
+        {
+            // What find COSTS, which is its own width less the glass it
+            // replaces, since the glass is already counted in the core.
+            _findExtraWidth = FindPanel.ActualWidth - FindToggleButton.Width;
+        }
+
+        // Everything the bar is made of besides the two droppable groups,
+        // recorded only when both are present so the subtraction is honest.
+        if (navShown && viewShown && !IsFindOpen)
+        {
+            _barCoreWidth = StatusContent.ActualWidth - _navGroupWidth - _viewGroupWidth;
+        }
+
+        if (_barCoreWidth <= 0)
+        {
+            return;
+        }
+
+        double natural = _barCoreWidth + _navGroupWidth + _viewGroupWidth
+                       + (IsFindOpen ? _findExtraWidth : 0);
+
+        var fit = StatusBarOverflow.Decide(
+            PageScroller.ActualWidth - BarSideMargins, natural, _viewGroupWidth, _navGroupWidth);
+
+        ViewModesGroup.Visibility = fit.ViewModes ? Visibility.Visible : Visibility.Collapsed;
+        NavHistoryGroup.Visibility = fit.NavHistory ? Visibility.Visible : Visibility.Collapsed;
     }
 
     /// <summary>
@@ -1217,11 +1348,22 @@ public sealed partial class MainPage : Page
         try
         {
             NightModeBarButton.IsChecked = ViewModel.IsNightMode;
+            BarNightModeItem.IsChecked = ViewModel.IsNightMode;
             RotateBarButton.IsChecked = ViewModel.IsViewRotated;
             BarResetRotationItem.IsEnabled = ViewModel.IsViewRotated;
             BarSinglePageItem.IsChecked = ViewModel.IsSinglePageView;
             BarContinuousItem.IsChecked = !ViewModel.IsSinglePageView;
             BarRulersToggle.IsChecked = RulersToggle.IsChecked;
+
+            // A stack of sheets while the document scrolls through, one sheet
+            // when it turns a page at a time. The tooltip names the OTHER mode,
+            // because that is what pressing it gets you.
+            PageModeBarIcon.Glyph = ViewModel.IsSinglePageView ? "\uE7C3" : "\uE81E";
+            ToolTipService.SetToolTip(
+                PageModeBarButton,
+                ViewModel.IsSinglePageView
+                    ? "Single page. Click for continuous scrolling"
+                    : "Continuous scrolling. Click for single page");
         }
         finally
         {
@@ -1329,13 +1471,23 @@ public sealed partial class MainPage : Page
 
         ToolRail.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
         PropertyBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
-        StatusBar.Visibility = presenting || ViewModel.PageCount == 0
-            ? Visibility.Collapsed
-            : Visibility.Visible;
+
+        // Shown on arrival, then left to fade. Full screen used to collapse the
+        // bar outright, which took away the only chrome there was: night mode,
+        // rotation, the page arrows and the way back out were all keyboard-only
+        // in the one mode with no menu to find them in. It comes back on the
+        // first movement of the pointer, the way a video player's controls do.
+        _barRevealed = presenting;
+        UpdateStatusBarVisibility();
 
         if (presenting)
         {
             ViewModel.Status = "Full screen. Press Esc or F11 to leave.";
+            RestartBarHideTimer();
+        }
+        else
+        {
+            _barHideTimer?.Stop();
         }
 
         // The canvas has to own the keyboard or F11 and Escape go nowhere.
@@ -1374,13 +1526,107 @@ public sealed partial class MainPage : Page
             RefreshWelcome();
         }
 
-        StatusBar.Visibility = hasDocument ? Visibility.Visible : Visibility.Collapsed;
+        UpdateStatusBarVisibility();
 
         // The rail's own menu and settings button stay live: they are how you
         // open a file from here. Only the TOOLS go dim.
         ToolRailList.IsEnabled = hasDocument;
 
         ApplyRulerVisibility();
+    }
+
+    // ---------------- The bar in full screen ----------------
+
+    /// <summary>How long the bar stays up after the pointer stops moving.</summary>
+    private static readonly TimeSpan BarRevealFor = TimeSpan.FromSeconds(3);
+
+    /// <summary>Whether the bar is currently being shown over a full screen
+    /// document. Meaningless outside full screen, where it is simply on.</summary>
+    private bool _barRevealed;
+
+    private bool _pointerOverBar;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _barHideTimer;
+
+    /// <summary>
+    /// The one place that decides whether the bar is on screen.
+    ///
+    /// Two callers used to answer this separately and disagree: leaving full
+    /// screen with no document open put the bar back.
+    /// </summary>
+    private void UpdateStatusBarVisibility() =>
+        StatusBar.Visibility = ViewModel.PageCount > 0 && (!IsPresenting || _barRevealed)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+    /// <summary>Brings the bar back during full screen and starts its clock again.</summary>
+    private void RevealStatusBar()
+    {
+        if (!IsPresenting)
+        {
+            return;
+        }
+
+        if (!_barRevealed)
+        {
+            _barRevealed = true;
+            UpdateStatusBarVisibility();
+        }
+
+        RestartBarHideTimer();
+    }
+
+    private void RestartBarHideTimer()
+    {
+        _barHideTimer ??= CreateBarHideTimer();
+        _barHideTimer.Stop();
+
+        // Pinned while the pointer is on it, or while one of its menus is open:
+        // hiding the bar out from under an open flyout would leave the menu
+        // floating over the page attached to nothing.
+        if (IsPresenting && !_pointerOverBar && !AnyBarFlyoutOpen)
+        {
+            _barHideTimer.Start();
+        }
+    }
+
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer CreateBarHideTimer()
+    {
+        var timer = DispatcherQueue.CreateTimer();
+        timer.Interval = BarRevealFor;
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) =>
+        {
+            if (_pointerOverBar || AnyBarFlyoutOpen)
+            {
+                RestartBarHideTimer();
+                return;
+            }
+
+            _barRevealed = false;
+            UpdateStatusBarVisibility();
+        };
+        return timer;
+    }
+
+    private bool AnyBarFlyoutOpen =>
+        ZoomMenuButton.Flyout is { IsOpen: true }
+        || ViewOptionsButton.Flyout is { IsOpen: true }
+        || SearchOptionsButton.Flyout is { IsOpen: true };
+
+    /// <summary>Any movement of the pointer brings the bar back in full screen.
+    /// Does nothing at all otherwise, which is the common case.</summary>
+    private void RootGrid_PointerMoved(object sender, PointerRoutedEventArgs e) => RevealStatusBar();
+
+    private void StatusBar_PointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        _pointerOverBar = true;
+        _barHideTimer?.Stop();
+    }
+
+    private void StatusBar_PointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        _pointerOverBar = false;
+        RestartBarHideTimer();
     }
 
     private void RulersHide_Click(object sender, RoutedEventArgs e)

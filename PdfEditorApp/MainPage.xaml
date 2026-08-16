@@ -2468,8 +2468,10 @@
                 HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                BorderThickness="1" CornerRadius="18" Padding="6,3">
-            <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                BorderThickness="1" CornerRadius="18" Padding="6,3"
+                PointerEntered="StatusBar_PointerEntered"
+                PointerExited="StatusBar_PointerExited">
+            <StackPanel x:Name="StatusContent" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
                 <!--
                     Drag handle. Like the tool rail's, this DOCKS to the nearest
                     corner or edge rather than leaving the bar anywhere: a bar
@@ -2519,6 +2521,7 @@
                 <Button Content="&#xE70E;" FontFamily="Segoe MDL2 Assets" FontSize="10"
                         Click="PrevPage_Click" Width="24" Height="26" Padding="0"
                         Background="Transparent" BorderThickness="0"
+                        IsEnabled="{x:Bind ViewModel.CanGoToPreviousPage, Mode=OneWay}"
                         ToolTipService.ToolTip="Previous page (Page Up)" />
                 <Border VerticalAlignment="Center" Height="26" Padding="6,0"
                         Margin="2,0,2,0" CornerRadius="4"
@@ -2547,18 +2550,36 @@
                 <Button Content="&#xE70D;" FontFamily="Segoe MDL2 Assets" FontSize="10"
                         Click="NextPage_Click" Width="24" Height="26" Padding="0"
                         Background="Transparent" BorderThickness="0"
+                        IsEnabled="{x:Bind ViewModel.CanGoToNextPage, Mode=OneWay}"
                         ToolTipService.ToolTip="Next page (Page Down)" />
                 <!--
-                    Back through where the reader has been. Earns permanent
-                    width because a chord cannot be discovered, and on a
-                    three-thousand page book it is the difference between
-                    returning to where you were and hunting for it again.
+                    Back and forward through where the reader has been. They
+                    earn permanent width because a chord cannot be discovered,
+                    and on a three-thousand page book this is the difference
+                    between returning to where you were and hunting for it.
+                    Both are disabled when there is nowhere to go, which is the
+                    only thing that tells a reader the history is empty.
+
+                    Forward is here because Back without it is a one-way door:
+                    having gone back, the only way to undo that was Alt+Right,
+                    which nothing on screen mentions.
                 -->
-                <Button x:Name="NavBackButton" Content="&#xE72B;"
-                        FontFamily="Segoe MDL2 Assets" FontSize="12"
-                        Click="NavBack_Click" Width="26" Height="26" Padding="0"
-                        Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="Back (Alt+Left)" />
+                <StackPanel x:Name="NavHistoryGroup" Orientation="Horizontal" Spacing="4"
+                            VerticalAlignment="Center">
+                    <!-- Both start off. Nothing has been opened yet, so there is
+                         nowhere to go back to, and SyncBarNavState only runs
+                         once a document has been loaded. -->
+                    <Button x:Name="NavBackButton" Content="&#xE72B;" IsEnabled="False"
+                            FontFamily="Segoe MDL2 Assets" FontSize="12"
+                            Click="NavBack_Click" Width="26" Height="26" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            ToolTipService.ToolTip="Back (Alt+Left)" />
+                    <Button x:Name="NavForwardButton" Content="&#xE72A;" IsEnabled="False"
+                            FontFamily="Segoe MDL2 Assets" FontSize="12"
+                            Click="NavForward_Click" Width="26" Height="26" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            ToolTipService.ToolTip="Forward (Alt+Right)" />
+                </StackPanel>
                 <!-- Says why text selection is unavailable, instead of the
                      tool silently doing nothing on a scanned page. -->
                 <TextBlock Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
@@ -2601,44 +2622,72 @@
                 <Button Content="&#xE948;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomIn_Click"
                         Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom in" />
+                <!-- Toggles between the whole page and the full width, which is
+                     what the handler does; it used to claim to be fit width
+                     alone, so half of its presses looked like a bug. -->
                 <Button Content="&#xE9A6;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ResetZoom_Click"
                         Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="Fit width (Ctrl+2)" />
-                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                        ToolTipService.ToolTip="Fit page or fit width (Ctrl+0, Ctrl+2)" />
 
                 <!--
                     How the page is LOOKED at, as opposed to where you are in it
                     or how big it is. All of this was reachable only through the
                     rail's menu button, which is three interactions deep, and in
-                    full screen the title row is collapsed entirely so this bar
-                    is the nearest chrome there is.
+                    full screen there is no menu at all.
 
                     Toggles rather than menu ticks: night mode being on is a
                     thing you want to SEE, not something to open a menu to
                     check. Same for a view that is turned.
+
+                    Grouped because this is the first thing the bar gives up
+                    when the canvas is too narrow for all of it; see
+                    StatusBarOverflow. Every item here is also a named entry in
+                    the "..." menu next to it, so nothing becomes unreachable.
                 -->
-                <ToggleButton x:Name="NightModeBarButton" Click="NightModeBar_Click"
-                              Width="28" Height="26" Padding="0" BorderThickness="0"
-                              Background="Transparent"
-                              ToolTipService.ToolTip="Night mode">
-                    <FontIcon Glyph="&#xE708;" FontSize="14" />
-                </ToggleButton>
-                <ToggleButton x:Name="RotateBarButton" Click="RotateBar_Click"
-                              Width="28" Height="26" Padding="0" BorderThickness="0"
-                              Background="Transparent"
-                              ToolTipService.ToolTip="Rotate view clockwise (Ctrl+Shift++)">
-                    <FontIcon Glyph="&#xE7AD;" FontSize="14" />
-                </ToggleButton>
-                <Button Content="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="12"
-                        Click="FullScreen_Click" Width="28" Height="26" Padding="0"
-                        Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="Full screen (F11)" />
+                <StackPanel x:Name="ViewModesGroup" Orientation="Horizontal" Spacing="4"
+                            VerticalAlignment="Center">
+                    <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <ToggleButton x:Name="NightModeBarButton" Click="NightModeBar_Click"
+                                  Width="28" Height="26" Padding="0" BorderThickness="0"
+                                  Background="Transparent"
+                                  ToolTipService.ToolTip="Night mode">
+                        <FontIcon Glyph="&#xE708;" FontSize="14" />
+                    </ToggleButton>
+                    <ToggleButton x:Name="RotateBarButton" Click="RotateBar_Click"
+                                  Width="28" Height="26" Padding="0" BorderThickness="0"
+                                  Background="Transparent"
+                                  ToolTipService.ToolTip="Rotate view clockwise (Ctrl+Shift++)">
+                        <FontIcon Glyph="&#xE7AD;" FontSize="14" />
+                    </ToggleButton>
+                    <!--
+                        Which way the document scrolls. A plain button, not a
+                        toggle: it shows the mode you are IN rather than one you
+                        can switch on, so the glyph is a stack of sheets while
+                        scrolling is continuous and a single sheet when it is
+                        not. The tooltip says what pressing it will do, since an
+                        icon that reports state cannot also advertise an action.
+                    -->
+                    <Button x:Name="PageModeBarButton" Click="PageModeBar_Click"
+                            Width="28" Height="26" Padding="0" BorderThickness="0"
+                            Background="Transparent">
+                        <FontIcon x:Name="PageModeBarIcon" Glyph="&#xE81E;" FontSize="14" />
+                    </Button>
+                    <Button Content="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                            Click="FullScreen_Click" Width="28" Height="26" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            ToolTipService.ToolTip="Full screen (F11)" />
+                </StackPanel>
                 <!--
                     The rest of the View menu, one click from the page instead
                     of three from the rail. Text items rather than icons: these
                     are the ones chosen rarely, and a wrong Segoe MDL2 code
                     renders as an empty box, so only glyphs this app already
                     proves are used above.
+
+                    It also NAMES every icon on the bar. An icon can only be
+                    guessed at; this is where a reader finds out that the moon
+                    is night mode, and it is where those commands still live
+                    when the canvas is too narrow to show their buttons.
                 -->
                 <Button x:Name="ViewOptionsButton" Content="&#xE712;"
                         FontFamily="Segoe MDL2 Assets" FontSize="10"
@@ -2646,6 +2695,11 @@
                         ToolTipService.ToolTip="View options">
                     <Button.Flyout>
                         <MenuFlyout Placement="Top">
+                            <MenuFlyoutItem x:Name="BarNavBackItem" Text="Back" Click="NavBack_Click"
+                                            KeyboardAcceleratorTextOverride="Alt+Left" />
+                            <MenuFlyoutItem x:Name="BarNavForwardItem" Text="Forward" Click="NavForward_Click"
+                                            KeyboardAcceleratorTextOverride="Alt+Right" />
+                            <MenuFlyoutSeparator />
                             <RadioMenuFlyoutItem x:Name="BarContinuousItem" Text="Continuous scrolling"
                                                  GroupName="barPageViewMode" IsChecked="True"
                                                  Click="ContinuousView_Click" />
@@ -2653,6 +2707,13 @@
                                                  GroupName="barPageViewMode"
                                                  Click="SinglePageView_Click" />
                             <MenuFlyoutSeparator />
+                            <ToggleMenuFlyoutItem x:Name="BarNightModeItem" Text="Night mode"
+                                                  Click="NightModeToggle_Click" />
+                            <MenuFlyoutItem Text="Full screen" Click="FullScreen_Click"
+                                            KeyboardAcceleratorTextOverride="F11" />
+                            <MenuFlyoutSeparator />
+                            <MenuFlyoutItem Text="Rotate clockwise" Click="RotateViewCw_Click"
+                                            KeyboardAcceleratorTextOverride="Ctrl+Shift++" />
                             <MenuFlyoutItem Text="Rotate anticlockwise" Click="RotateViewCcw_Click"
                                             KeyboardAcceleratorTextOverride="Ctrl+Shift+-" />
                             <MenuFlyoutItem x:Name="BarResetRotationItem" Text="Reset view rotation"

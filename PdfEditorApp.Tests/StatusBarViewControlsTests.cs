@@ -48,6 +48,8 @@ public class StatusBarViewControlsTests
     [InlineData("PrevPage_Click")]
     [InlineData("NextPage_Click")]
     [InlineData("NavBack_Click")]
+    [InlineData("NavForward_Click")]
+    [InlineData("PageModeBar_Click")]
     [InlineData("NightModeBar_Click")]
     [InlineData("RotateBar_Click")]
     [InlineData("FullScreen_Click")]
@@ -172,6 +174,213 @@ public class StatusBarViewControlsTests
         Assert.True(at >= 0);
 
         Assert.Contains("<FontIcon", xaml[at..(at + 900)], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_page_arrows_go_out_at_the_ends_of_the_document()
+    {
+        // They were always live: on page 1 the back arrow looked exactly as it
+        // does on page 2 and pressing it did nothing. Bound rather than set in
+        // a handler, so there is no path that can forget to update it.
+        string xaml = Xaml();
+
+        Assert.Contains(
+            "IsEnabled=\"{x:Bind ViewModel.CanGoToPreviousPage, Mode=OneWay}\"",
+            xaml, StringComparison.Ordinal);
+        Assert.Contains(
+            "IsEnabled=\"{x:Bind ViewModel.CanGoToNextPage, Mode=OneWay}\"",
+            xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_view_model_tells_the_truth_about_the_ends()
+    {
+        // This assembly cannot load the view model, so the properties are read
+        // here instead. Both must be false with nothing open, which is the
+        // state the bar starts in.
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        Assert.Contains(
+            "public bool CanGoToPreviousPage => PageCount > 0 && CurrentPageIndex > 0;",
+            vm, StringComparison.Ordinal);
+        Assert.Contains(
+            "public bool CanGoToNextPage => PageCount > 0 && CurrentPageIndex < PageCount - 1;",
+            vm, StringComparison.Ordinal);
+
+        // Computed properties do not raise anything by themselves. Both the
+        // page and the count have to say so, or the arrows would go grey once
+        // and stay that way.
+        foreach (string hook in new[]
+        {
+            "partial void OnCurrentPageIndexChanged",
+            "partial void OnPageCountChanged",
+        })
+        {
+            string body = MethodBody(vm, hook);
+            Assert.Contains("nameof(CanGoToPreviousPage)", body, StringComparison.Ordinal);
+            Assert.Contains("nameof(CanGoToNextPage)", body, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void back_has_a_forward_to_match()
+    {
+        // Back on its own was a one-way door: having used it, the only way to
+        // undo it was Alt+Right, which nothing on screen mentioned.
+        string xaml = Xaml();
+
+        Assert.Contains("x:Name=\"NavForwardButton\"", xaml, StringComparison.Ordinal);
+
+        // Both start disabled. Nothing is open at launch, so there is nowhere
+        // to go, and the sync only runs once a document has loaded.
+        foreach (string name in new[] { "NavBackButton", "NavForwardButton" })
+        {
+            int at = xaml.IndexOf($"x:Name=\"{name}\"", StringComparison.Ordinal);
+            Assert.True(at >= 0);
+            Assert.Contains("IsEnabled=\"False\"", xaml[at..(at + 120)], StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void the_history_buttons_are_refreshed_wherever_the_history_moves()
+    {
+        // Three places change what back and forward can do: opening a
+        // document, recording a jump, and following one. Miss any of them and
+        // the buttons report a history that has moved on without them.
+        string code = Code();
+
+        foreach (string caller in new[]
+        {
+            "private void ApplyHistoryPoint",
+            "private void OnScrollToPageRequested",
+        })
+        {
+            Assert.Contains("SyncBarNavState()", MethodBody(code, caller), StringComparison.Ordinal);
+        }
+
+        // And on load, where the history is reset to the opened document.
+        int reset = code.IndexOf("_navigation.Reset(_navHere);", StringComparison.Ordinal);
+        Assert.True(reset >= 0, "the history is no longer reset on open");
+        Assert.Contains("SyncBarNavState()", code[reset..(reset + 200)], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_bar_says_which_way_the_document_scrolls()
+    {
+        // It was reachable only inside the "..." menu, so the one thing a
+        // reader would want to see at a glance, whether the wheel scrolls on or
+        // turns a page, was the one thing the bar did not show.
+        string xaml = Xaml();
+        Assert.Contains("x:Name=\"PageModeBarButton\"", xaml, StringComparison.Ordinal);
+
+        // Both glyphs are checked against the font that actually renders them:
+        // E7C3 is a single sheet and E81E is a stack of them. A code that is
+        // not in the font renders as an empty box, silently.
+        string sync = MethodBody(Code(), "private void SyncBarViewState");
+        Assert.Contains("\\uE7C3", sync, StringComparison.Ordinal);
+        Assert.Contains("\\uE81E", sync, StringComparison.Ordinal);
+
+        // An icon that reports the current mode cannot also advertise what
+        // pressing it does, so the tooltip has to, and it has to change with
+        // the mode rather than being fixed in the XAML.
+        Assert.Contains("ToolTipService.SetToolTip(", sync, StringComparison.Ordinal);
+        Assert.Contains("PageModeBarButton", sync, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void every_icon_on_the_bar_is_named_somewhere()
+    {
+        // An icon can only be guessed at. The "..." menu is where a reader
+        // finds out that the moon is night mode, and it is where these
+        // commands still live when the canvas is too narrow for their buttons.
+        string xaml = Xaml();
+        int at = xaml.IndexOf("x:Name=\"ViewOptionsButton\"", StringComparison.Ordinal);
+        Assert.True(at >= 0);
+
+        string flyout = xaml[at..];
+        int end = flyout.IndexOf("</Button.Flyout>", StringComparison.Ordinal);
+        Assert.True(end > 0);
+        flyout = flyout[..end];
+
+        foreach (string named in new[]
+        {
+            "Text=\"Back\"",
+            "Text=\"Forward\"",
+            "Text=\"Night mode\"",
+            "Text=\"Full screen\"",
+            "Text=\"Rotate clockwise\"",
+            "Text=\"Single page\"",
+            "Text=\"Continuous scrolling\"",
+        })
+        {
+            Assert.Contains(named, flyout, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void night_mode_agrees_with_itself_across_three_controls()
+    {
+        // The bar button, the View menu and the bar's own flyout all set it.
+        // The rulers toggle already had to solve this; night mode gained a
+        // third control and would otherwise have read the wrong one's state.
+        string body = MethodBody(Code(), "private void NightModeToggle_Click");
+
+        Assert.Contains("BarNightModeItem", body, StringComparison.Ordinal);
+        Assert.Contains("_applyingSettings", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_fit_button_does_not_claim_to_be_only_one_of_the_two()
+    {
+        // Its handler toggles between fitting the page and filling the width,
+        // so a tooltip naming just one of them made half its presses look like
+        // a fault.
+        string xaml = Xaml();
+        int at = xaml.IndexOf("Click=\"ResetZoom_Click\"", StringComparison.Ordinal);
+        Assert.True(at >= 0);
+
+        string button = xaml[at..(at + 320)];
+        Assert.Contains("Fit page", button, StringComparison.Ordinal);
+        Assert.Contains("fit width", button, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_droppable_groups_are_grouped()
+    {
+        // The overflow works by collapsing whole groups. Loose buttons cannot
+        // be hidden as a unit, and a separator left behind by a hidden group
+        // is a divider between one thing and nothing.
+        string xaml = Xaml();
+
+        Assert.Contains("<StackPanel x:Name=\"NavHistoryGroup\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("<StackPanel x:Name=\"ViewModesGroup\"", xaml, StringComparison.Ordinal);
+
+        int at = xaml.IndexOf("<StackPanel x:Name=\"ViewModesGroup\"", StringComparison.Ordinal);
+        int end = xaml.IndexOf("</StackPanel>", at, StringComparison.Ordinal);
+        string group = xaml[at..end];
+        Assert.Contains("<Rectangle", group, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_overflow_measures_groups_only_while_they_are_showing()
+    {
+        // A hidden group is zero wide. Deciding from that would find that the
+        // bar now fits, put the group back, find that it does not fit, and
+        // take it away again, at the frame rate.
+        string body = MethodBody(Code(), "private void ApplyBarOverflow");
+
+        Assert.Contains("navShown && NavHistoryGroup.ActualWidth > 0", body, StringComparison.Ordinal);
+        Assert.Contains("viewShown && ViewModesGroup.ActualWidth > 0", body, StringComparison.Ordinal);
+        Assert.Contains("StatusBarOverflow.Decide(", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void opening_find_rechecks_the_fit()
+    {
+        // Find is the widest thing on the bar by a distance, so opening it is
+        // the likeliest moment for the bar to stop fitting.
+        Assert.Contains("ApplyBarOverflow", MethodBody(Code(), "private void SetFindOpen"),
+                        StringComparison.Ordinal);
     }
 
     [Fact]
