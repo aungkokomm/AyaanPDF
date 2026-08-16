@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -75,6 +75,13 @@ public sealed partial class MainPage : Page
         ViewModel.Shapes.CollectionChanged += OnInkStrokesCollectionChanged;
         ViewModel.LayoutRebuilt += OnLayoutRebuilt;
         ViewModel.ViewRotated += OnViewRotated;
+
+        // handledEventsToo: the ScrollView marks the wheel handled before this
+        // would bubble, so without the flag the handler never runs at all.
+        PageScroller.AddHandler(
+            UIElement.PointerWheelChangedEvent,
+            new PointerEventHandler(PageScroller_PointerWheelChanged),
+            handledEventsToo: true);
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
         // Drag-reorder in the thumbnail list moves an item in this collection;
         // that is the signal to rebuild the document in the new order.
@@ -917,6 +924,97 @@ public sealed partial class MainPage : Page
         }
     }
 
+    private DateTime _lastPageTurnUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// Turns the page when the wheel reaches the edge of one, in single-page
+    /// view.
+    ///
+    /// Registered with handledEventsToo, because the ScrollView marks the wheel
+    /// handled before this bubbles: without that flag this never runs and the
+    /// reader stays stuck, which is exactly how the mode shipped.
+    ///
+    /// It is only ever a page turn at the edge. Anywhere else the event is left
+    /// alone and the scroller scrolls, so a page taller than the window still
+    /// reads normally.
+    /// </summary>
+    private void PageScroller_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ViewModel.IsSinglePageView || ViewModel.PageCount == 0)
+        {
+            return;
+        }
+
+        // Ctrl+wheel is zoom, which the scroller does itself. Claiming it here
+        // would turn the page every time someone zoomed at the bottom of one.
+        if (_isCtrlDown)
+        {
+            return;
+        }
+
+        double scrollable = PageScroller.ExtentHeight * PageScroller.ZoomFactor - PageScroller.ViewportHeight;
+        int delta = e.GetCurrentPoint(PageScroller).Properties.MouseWheelDelta;
+
+        var step = SinglePageScroll.Resolve(delta, PageScroller.VerticalOffset, scrollable);
+        if (step == PageStep.Scroll)
+        {
+            return;
+        }
+
+        // A flick is several notches, and each one arrives as its own event.
+        if (!SinglePageScroll.MayTurn(DateTime.UtcNow - _lastPageTurnUtc))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        int target = ViewModel.CurrentPageIndex + (step == PageStep.Next ? 1 : -1);
+        if (target < 0 || target >= ViewModel.PageCount)
+        {
+            // The ends of the document. Left unhandled so the scroller can do
+            // its usual bounce, which is the feedback that says "no more".
+            return;
+        }
+
+        _lastPageTurnUtc = DateTime.UtcNow;
+        _pendingLanding = step;
+        ViewModel.GoToPage(target, animate: false);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Which end of the newly laid-out page to land on, or null.
+    ///
+    /// Held across the turn because the page's height is not known until its
+    /// layout has been rebuilt, and landing at the bottom needs that height.
+    /// </summary>
+    private PageStep? _pendingLanding;
+
+    /// <summary>
+    /// Puts the view at the right end of a page just turned to.
+    ///
+    /// Queued behind the layout rebuild for the same reason the rotation
+    /// restore is: the new page's height does not exist until then.
+    /// </summary>
+    private void ApplyPendingLanding()
+    {
+        if (_pendingLanding is not { } step)
+        {
+            return;
+        }
+
+        _pendingLanding = null;
+
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            double scrollable = PageScroller.ExtentHeight * PageScroller.ZoomFactor - PageScroller.ViewportHeight;
+            PageScroller.ScrollTo(
+                PageScroller.HorizontalOffset,
+                SinglePageScroll.LandingOffset(step, scrollable),
+                new ScrollingScrollOptions(ScrollingAnimationMode.Disabled, ScrollingSnapPointsMode.Ignore));
+        });
+    }
+
     private void RotateViewCw_Click(object sender, RoutedEventArgs e) => ViewModel.RotateViewClockwise();
 
     private void RotateViewCcw_Click(object sender, RoutedEventArgs e) => ViewModel.RotateViewCounterClockwise();
@@ -951,6 +1049,11 @@ public sealed partial class MainPage : Page
             ResetViewRotationItem.IsEnabled = ViewModel.IsViewRotated;
             ScrollToPage(page, animate: false);
             PushVisibleWindow();
+
+            // A page turned to by the wheel lands at the end the reader was
+            // heading towards, which needs the new page's height and so cannot
+            // happen until the layout has been rebuilt.
+            ApplyPendingLanding();
         });
     }
 
@@ -3433,6 +3536,11 @@ public sealed partial class MainPage : Page
         RecoveryList.SelectedIndex = 0;
         RecoveryDialog.XamlRoot = XamlRoot;
 
+        // Without this the offer is invisible in a trace, and whether it
+        // appeared is the single thing worth knowing when someone reports that
+        // their work did not come back.
+        Diag.Log($"recovery: offering {choices.Count} document(s)");
+
         ContentDialogResult answer;
         try
         {
@@ -4899,6 +5007,22 @@ public sealed partial class MainPage : Page
         FitToWidth(animate: true);
     }
 
+    /// <summary>
+    /// Back to 100%, where a page point is a screen point.
+    ///
+    /// Extracted from the Ctrl+1 case so the menu entry and the chord are one
+    /// path. Inline in the key handler, it was the one zoom command a menu
+    /// could not offer.
+    /// </summary>
+    private void ZoomActualSize_Click(object sender, RoutedEventArgs e)
+    {
+        // Turns auto-fit OFF, like the other explicit zooms: the user has just
+        // named a zoom, so a window resize must not silently overrule it.
+        _autoFit = false;
+        PageScroller.ZoomTo(1.0f, null,
+            new ScrollingZoomOptions(ScrollingAnimationMode.Enabled, ScrollingSnapPointsMode.Ignore));
+    }
+
     private void ZoomFitWidth_Click(object sender, RoutedEventArgs e)
     {
         _fitMode = FitMode.Width;
@@ -5341,9 +5465,7 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
             case VirtualKey.Number1 when _isCtrlDown:
-                _autoFit = false;
-                PageScroller.ZoomTo(1.0f, null,
-                    new ScrollingZoomOptions(ScrollingAnimationMode.Enabled, ScrollingSnapPointsMode.Ignore));
+                ZoomActualSize_Click(this, null!);
                 e.Handled = true;
                 break;
             case VirtualKey.Number2 when _isCtrlDown:

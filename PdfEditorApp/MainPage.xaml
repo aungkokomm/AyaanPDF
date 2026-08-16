@@ -1146,6 +1146,26 @@
                                      accelerator is dead until its flyout has
                                      been opened, which is the trap this menu
                                      documents at the top of the file. -->
+                                <!--
+                                    Zoom. These already existed as a flyout off
+                                    the status bar's percentage and as toolbar
+                                    buttons, which is fine once you know where
+                                    to look and invisible until then: the View
+                                    menu is where anyone goes first.
+
+                                    Accelerator TEXT only, no accelerator: a
+                                    MenuFlyoutItem's accelerator is dead until
+                                    its flyout has been opened. The chords are
+                                    live in the page's key handler and are
+                                    Acrobat's, so the muscle memory transfers.
+                                -->
+                                <MenuFlyoutItem Text="Fit page" Click="ZoomFitPage_Click"
+                                                KeyboardAcceleratorTextOverride="Ctrl+0" />
+                                <MenuFlyoutItem Text="Fit width" Click="ZoomFitWidth_Click"
+                                                KeyboardAcceleratorTextOverride="Ctrl+2" />
+                                <MenuFlyoutItem Text="Actual size" Click="ZoomActualSize_Click"
+                                                KeyboardAcceleratorTextOverride="Ctrl+1" />
+                                <MenuFlyoutSeparator />
                                 <MenuFlyoutItem Text="Full screen" Click="FullScreen_Click"
                                                 KeyboardAcceleratorTextOverride="F11" />
                                 <ToggleMenuFlyoutItem x:Name="NightModeToggle" Text="Night mode"

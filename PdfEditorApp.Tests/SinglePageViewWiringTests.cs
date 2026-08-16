@@ -200,6 +200,75 @@ public class SinglePageViewWiringTests
     }
 
     [Fact]
+    public void the_wheel_can_still_get_from_one_page_to_the_next()
+    {
+        // The gap that shipped. This app has NO next-page or previous-page
+        // button anywhere: in continuous view you move between pages by
+        // scrolling, so the wheel was the entire navigation model. Laying out
+        // one page left it with nowhere to go and the reader stuck.
+        string body = MethodBody(PageCode(), "private void PageScroller_PointerWheelChanged");
+
+        Assert.Contains("ViewModel.IsSinglePageView", body, StringComparison.Ordinal);
+        Assert.Contains("SinglePageScroll.Resolve(", body, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.GoToPage(target", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_wheel_handler_is_registered_where_it_will_actually_run()
+    {
+        // The ScrollView marks the wheel handled before this would bubble, so
+        // without handledEventsToo the handler never runs and everything above
+        // it is dead code that tests happily.
+        string code = PageCode();
+
+        Assert.Contains("UIElement.PointerWheelChangedEvent", code, StringComparison.Ordinal);
+        Assert.Contains("handledEventsToo: true", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void turning_by_wheel_does_not_steal_zoom_or_run_off_the_ends()
+    {
+        string body = MethodBody(PageCode(), "private void PageScroller_PointerWheelChanged");
+
+        // Ctrl+wheel is zoom, which the scroller does itself.
+        Assert.Contains("_isCtrlDown", body, StringComparison.Ordinal);
+
+        // And the first and last pages must not turn into nothing.
+        Assert.Contains("target < 0 || target >= ViewModel.PageCount", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_flick_of_the_wheel_turns_one_page_not_five()
+    {
+        string body = MethodBody(PageCode(), "private void PageScroller_PointerWheelChanged");
+
+        Assert.Contains("SinglePageScroll.MayTurn(", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_zoom_commands_are_in_the_view_menu()
+    {
+        // They existed only as a flyout off the status bar's percentage and as
+        // toolbar buttons: fine once you know, invisible until then.
+        string xaml = PageXaml();
+
+        Assert.Contains("Text=\"Fit page\" Click=\"ZoomFitPage_Click\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"Fit width\" Click=\"ZoomFitWidth_Click\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"Actual size\" Click=\"ZoomActualSize_Click\"", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_menu_and_the_chord_run_the_same_zoom()
+    {
+        // Actual size lived inline in the key handler, which is why it was the
+        // one zoom a menu could not offer. One path now.
+        string code = PageCode();
+
+        Assert.Contains("case VirtualKey.Number1 when _isCtrlDown:\r\n                ZoomActualSize_Click(this, null!);",
+                        code.Replace("\n", "\r\n").Replace("\r\r", "\r"), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void the_choice_is_remembered_and_restored()
     {
         Assert.Contains("SettingsStore.Update(s => s with { PageViewMode = mode })",
