@@ -167,6 +167,15 @@ public sealed partial class MainPage : Page
                 return;
             }
 
+            if (Rendering.RotationEvidenceCapture.RequestedDirectory is { } rotationDir
+                && Content is Panel rotationHost)
+            {
+                string report = await Rendering.RotationEvidenceCapture.RunAsync(rotationHost, rotationDir);
+                Diag.Log($"rotation-evidence: {report}");
+                Application.Current.Exit();
+                return;
+            }
+
             // Before anything is opened. A previous run that did not shut down
             // cleanly left its work behind, and the reader should be asked
             // about it before the app puts something else in front of them.
