@@ -84,6 +84,15 @@ public static class ShapeSkiaPainter
             double top = pageTop(item.PageIndex);
             var view = pageView(item.PageIndex);
 
+            // UNDERNEATH, and before this item rather than before the whole
+            // frame: a shadow belongs to its own mark, so it goes below that
+            // mark and above whatever was already painted. Shadowing the entire
+            // frame first would put one shape's shadow over another shape.
+            if (item.Effects?.Shadow is { } shadow)
+            {
+                PaintShadow(canvas, item, shadow, scale, top, view);
+            }
+
             if (item.Style == RenderStyle.Filled)
             {
                 PaintFilled(canvas, item, scale, top, view);
@@ -92,6 +101,47 @@ public static class ShapeSkiaPainter
             {
                 PaintStroked(canvas, item, scale, top, view);
             }
+        }
+    }
+
+    /// <summary>
+    /// The item again, shifted and recoloured, painted under it.
+    ///
+    /// The shift is applied to the NORMALIZED points, before the projection, so
+    /// everything downstream is the code that already exists: the page's turn,
+    /// the zoom, the display scale and the page's position in the stack all
+    /// reach the shadow because they reach every point that goes through
+    /// <see cref="OverlayProjection.ToSlot"/>. A shadow offset in device pixels
+    /// would need all four of those handled again, by hand, and would slide out
+    /// from under its shape the moment anybody rotated the page.
+    ///
+    /// Painted through the same two style branches as the mark itself, so an
+    /// arrow's head casts a filled shadow and its shaft a stroked one, at the
+    /// same weights. A shadow drawn as a generic outline would be a different
+    /// shape from the thing casting it.
+    /// </summary>
+    private static void PaintShadow(
+        SKCanvas canvas, ShapeRenderItem item, DropShadow shadow,
+        double scale, double pageTop, PageTransform view)
+    {
+        var shifted = new (double X, double Y)[item.Points.Count];
+        for (int at = 0; at < item.Points.Count; at++)
+        {
+            shifted[at] = (item.Points[at].X + shadow.OffsetX,
+                           item.Points[at].Y + shadow.OffsetY);
+        }
+
+        // Same geometry, same weight, same style: only the position and the
+        // colour differ, and Effects is dropped so the shadow cannot cast one.
+        var ghost = item with { Points = shifted, Color = shadow.Color, Effects = null };
+
+        if (ghost.Style == RenderStyle.Filled)
+        {
+            PaintFilled(canvas, ghost, scale, pageTop, view);
+        }
+        else
+        {
+            PaintStroked(canvas, ghost, scale, pageTop, view);
         }
     }
 

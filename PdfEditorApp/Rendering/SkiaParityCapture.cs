@@ -70,6 +70,28 @@ namespace PdfEditorApp.Rendering;
 /// instead, by PagePlacementParityTests, which asserts that a clipped mark is
 /// cut by the surface and not moved by it, at all four rotations, for all five
 /// placements.
+///
+/// A THREE PIXEL ARTEFACT, recorded so nobody re-investigates it. Since the
+/// effects foundation landed, two of the 144 PNGs differ from the run captured
+/// before it: arrow-000-z100-ref and arrow-180-z100-ref. Both are REFERENCE
+/// images, and no line of the XAML renderer changed.
+///
+/// The whole difference is three pixels, each off by exactly one level in 255:
+/// (382,338) 248 to 249, (361,361) 183 to 184, and (76,52) 183 to 184. All 72
+/// verdicts are identical, and the metrics move by 0.0002%.
+///
+/// It was chased to the end rather than waved through. The arrow's geometry is
+/// BIT-IDENTICAL before and after, dumped at R17 across a stash, so nothing the
+/// renderer is handed changed. The values are stable across runs of one binary
+/// and shift between binaries. So this is a last-ULP rounding flip landing on a
+/// coverage boundary, from JIT codegen changing when ShapeRenderItem grew a
+/// field: every assembly here links PdfEditorApp.Viewport. It is the arrow
+/// because it is the only subject whose head needs trigonometry, and 0 and 180
+/// because ToCard takes a different arithmetic path there than at 90 and 270.
+///
+/// Not to be chased by touching the XAML renderer. A one-level change on three
+/// of 1.7 million pixels is not a defect to fix; it is a reason to compare
+/// verdicts rather than file hashes when the Viewport assembly changes shape.
 /// </summary>
 internal static class SkiaParityCapture
 {

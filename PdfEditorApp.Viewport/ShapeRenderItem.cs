@@ -51,13 +51,28 @@ public enum RenderStyle
 /// anything, and that bakes one page's transform into an item the frame may
 /// outlive. This says what it means instead.
 /// </param>
+/// <param name="Effects">
+/// What is painted around this mark as well as the mark itself, or null when
+/// there is nothing extra, which is the ordinary case and the default.
+///
+/// Last, and optional, so that every existing construction of this type keeps
+/// compiling and keeps producing exactly the pixels it produced before. A frame
+/// of marks with no effects on any of them is byte for byte the frame that was
+/// captured before effects existed, which is what makes the parity evidence
+/// still worth something.
+///
+/// Read by the Skia renderer only. The XAML overlay does not know about this
+/// and is not being taught: it stays the fallback, unchanged, and a mark with
+/// an effect simply draws without it there.
+/// </param>
 public readonly record struct ShapeRenderItem(
     int PageIndex,
     IReadOnlyList<(double X, double Y)> Points,
     RenderColor Color,
     double StrokeWidth,
     RenderStyle Style,
-    double? SlotWidth = null);
+    double? SlotWidth = null,
+    ShapeEffects? Effects = null);
 
 /// <summary>
 /// Turns the marks the view model holds into a frame's worth of render items.
@@ -156,8 +171,13 @@ public static class ShapeRenderList
         {
             var color = ColorOf(shape.ColorHex);
 
+            // The shaft and the head both carry the shape's effects, because
+            // they are two marks describing ONE object: shadowing the shaft and
+            // not the head would leave an arrow whose point floats free of its
+            // own shadow.
             items.Add(new ShapeRenderItem(
-                shape.PageIndex, shape.Outline, color, shape.StrokeWidth, RenderStyle.Stroked));
+                shape.PageIndex, shape.Outline, color, shape.StrokeWidth, RenderStyle.Stroked,
+                Effects: shape.Effects));
 
             // Guarded on the count rather than on the kind, matching the
             // overlay: a shape whose head could not be built is not drawn as a
@@ -166,7 +186,8 @@ public static class ShapeRenderList
             if (head.Count == HeadPointCount)
             {
                 items.Add(new ShapeRenderItem(
-                    shape.PageIndex, head, color, shape.StrokeWidth, RenderStyle.Filled));
+                    shape.PageIndex, head, color, shape.StrokeWidth, RenderStyle.Filled,
+                    Effects: shape.Effects));
             }
         }
     }

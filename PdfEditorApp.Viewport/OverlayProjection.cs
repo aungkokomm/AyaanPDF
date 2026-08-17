@@ -72,8 +72,11 @@ public static class OverlayProjection
     /// or cleared over a smaller area than it was drawn in, are the two bugs
     /// this prevents.
     ///
-    /// It is the CHEAP bound, deliberately: the points' box plus half the width,
-    /// with no stroker consulted. The true inked extent is larger, because
+    /// It covers the item's EFFECTS as well as the item, because a shadow is
+    /// ink and both callers are asking about ink.
+    ///
+    /// It is otherwise the CHEAP bound, deliberately: the points' box plus half
+    /// the width, with no stroker consulted. The true inked extent is larger, because
     /// antialiasing spreads an edge and a mitred join overshoots its vertex, and
     /// the difference is measured rather than assumed. Anything drawing from
     /// this must add that measured pad; culling need not, because keeping a mark
@@ -92,6 +95,27 @@ public static class OverlayProjection
             t = System.Math.Min(t, y);
             r = System.Math.Max(r, x);
             b = System.Math.Max(b, y);
+        }
+
+        // A shadow is ink, and ink outside this box is a mark the culler drops
+        // while it is still visible and the dirty region fails to clear while it
+        // is still on the bitmap. So the offset copy is measured too.
+        //
+        // By projecting the SHIFTED POINTS rather than by widening the finished
+        // box: the offset is normalized and page-local, so a turned page sends
+        // it somewhere a slot-space addition would not. Running it through the
+        // same ToSlot is what makes rotation cost nothing to support.
+        if (item.Effects?.Shadow is { } shadow)
+        {
+            foreach (var (px, py) in item.Points)
+            {
+                var (x, y) = ToSlot(
+                    (px + shadow.OffsetX, py + shadow.OffsetY), scale, pageTop, view);
+                l = System.Math.Min(l, x);
+                t = System.Math.Min(t, y);
+                r = System.Math.Max(r, x);
+                b = System.Math.Max(b, y);
+            }
         }
 
         double reach = WidthOf(item, scale, view) / 2;
