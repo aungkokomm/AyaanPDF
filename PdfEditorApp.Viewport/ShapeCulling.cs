@@ -58,25 +58,16 @@ public static class ShapeCulling
             return false;
         }
 
-        double left = double.MaxValue, top = double.MaxValue;
-        double right = double.MinValue, bottom = double.MinValue;
-
-        foreach (var point in item.Points)
-        {
-            var (x, y) = OverlayProjection.ToSlot(point, scale, pageTop, view);
-            left = Math.Min(left, x);
-            top = Math.Min(top, y);
-            right = Math.Max(right, x);
-            bottom = Math.Max(bottom, y);
-        }
-
         // Half the stroke reaches outside the path on every side, so a mark
-        // tested on its centreline alone vanishes half a stroke early.
-        double reach = OverlayProjection.WidthOf(item, scale, view) / 2;
+        // tested on its centreline alone vanishes half a stroke early. That
+        // opening-out is part of the shared bound rather than repeated here,
+        // so the dirty region cannot come to measure the same mark differently.
+        var (left, top, right, bottom) =
+            OverlayProjection.SlotBoundsOf(item, scale, pageTop, view);
 
-        return left - reach <= bounds.Right
-            && right + reach >= bounds.Left
-            && top - reach <= bounds.Bottom
-            && bottom + reach >= bounds.Top;
+        return left <= bounds.Right
+            && right >= bounds.Left
+            && top <= bounds.Bottom
+            && bottom >= bounds.Top;
     }
 }

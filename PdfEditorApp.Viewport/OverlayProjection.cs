@@ -61,6 +61,45 @@ public static class OverlayProjection
         item.SlotWidth ?? ToSlotThickness(item.StrokeWidth, scale, view);
 
     /// <summary>
+    /// One item's extent in slot DIPs: the box its points span, opened out by
+    /// half its stroke on every side.
+    ///
+    /// The single definition of "how much room does this mark take", extracted
+    /// because two callers need it and a second copy is how they come to
+    /// disagree. Culling asks in order to decide whether a mark reaches the
+    /// surface; the dirty region asks in order to decide which pixels a mark
+    /// can have touched. A mark culled as off-screen but repainted as on-screen,
+    /// or cleared over a smaller area than it was drawn in, are the two bugs
+    /// this prevents.
+    ///
+    /// It is the CHEAP bound, deliberately: the points' box plus half the width,
+    /// with no stroker consulted. The true inked extent is larger, because
+    /// antialiasing spreads an edge and a mitred join overshoots its vertex, and
+    /// the difference is measured rather than assumed. Anything drawing from
+    /// this must add that measured pad; culling need not, because keeping a mark
+    /// a fraction of a pixel too long costs nothing.
+    /// </summary>
+    public static (double L, double T, double R, double B) SlotBoundsOf(
+        ShapeRenderItem item, double scale, double pageTop, PageTransform view)
+    {
+        double l = double.MaxValue, t = double.MaxValue;
+        double r = double.MinValue, b = double.MinValue;
+
+        foreach (var point in item.Points)
+        {
+            var (x, y) = ToSlot(point, scale, pageTop, view);
+            l = System.Math.Min(l, x);
+            t = System.Math.Min(t, y);
+            r = System.Math.Max(r, x);
+            b = System.Math.Max(b, y);
+        }
+
+        double reach = WidthOf(item, scale, view) / 2;
+
+        return (l - reach, t - reach, r + reach, b + reach);
+    }
+
+    /// <summary>
     /// A normalized point in the page's own frame, placed in the continuous
     /// stack: scaled by the overlay scale, then dropped to the page's top.
     ///
