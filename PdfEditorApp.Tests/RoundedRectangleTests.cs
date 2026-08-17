@@ -38,6 +38,14 @@ public class RoundedRectangleTests
         public float RotationDeg;
         public uint FillRgba;
         public float CornerRadiusPx;
+        // ...and a fourth time, for the drop shadow. Adding the fields here is
+        // not optional bookkeeping: a short mirror marshals the ARRAY with the
+        // wrong stride, so every element after the first arrives as garbage and
+        // the core rejects the batch. That is exactly how this one announced
+        // itself, in six batch tests at once.
+        public float ShadowDxPx;
+        public float ShadowDyPx;
+        public uint ShadowRgba;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -166,7 +174,7 @@ public class RoundedRectangleTests
         // Two ints, four floats, four bytes, then width, rotation, fill and
         // radius. Getting this wrong does not error: it silently feeds the
         // native side garbage coordinates.
-        Assert.Equal(44, Marshal.SizeOf<ShapeSpec>());
+        Assert.Equal(56, Marshal.SizeOf<ShapeSpec>());
     }
 
     [Fact]

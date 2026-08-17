@@ -42,6 +42,14 @@ public class ShapeInteropTests
         public float RotationDeg;
         public uint FillRgba;
         public float CornerRadiusPx;
+        // ...and a fourth time, for the drop shadow. Adding the fields here is
+        // not optional bookkeeping: a short mirror marshals the ARRAY with the
+        // wrong stride, so every element after the first arrives as garbage and
+        // the core rejects the batch. That is exactly how this one announced
+        // itself, in six batch tests at once.
+        public float ShadowDxPx;
+        public float ShadowDyPx;
+        public uint ShadowRgba;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -139,10 +147,16 @@ public class ShapeInteropTests
     [Fact]
     public void the_shape_struct_is_the_size_the_native_side_writes()
     {
-        // Two ints, four floats, four bytes, then width, rotation, fill and
-        // corner radius. No padding, because every field is four-byte aligned
-        // or a byte inside a four-byte group.
-        Assert.Equal(44, Marshal.SizeOf<ShapeSpec>());
+        // Two ints, four floats, four bytes, then width, rotation, fill,
+        // corner radius, and the drop shadow's two offsets and colour. No
+        // padding, because every field is four-byte aligned or a byte inside a
+        // four-byte group.
+        //
+        // The number is the point of the test. It is the one assertion that
+        // fails LOUDLY when the native struct grows and a mirror does not, in
+        // place of six batch tests failing obscurely because the array was
+        // marshalled with the wrong stride.
+        Assert.Equal(56, Marshal.SizeOf<ShapeSpec>());
     }
 
     [Fact]

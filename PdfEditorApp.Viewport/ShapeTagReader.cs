@@ -22,6 +22,14 @@ namespace PdfEditorApp.Viewport;
 /// in PDF points, as stored. Converting them to normalized units needs the page
 /// width, which a tag does not carry.
 ///
+/// <paramref name="ShadowHex"/> is null when the shape casts no shadow, which
+/// is every shape written before effects existed and every one that has not
+/// been given one. It is the one field that decides whether there is a shadow
+/// at all, exactly as <paramref name="FillHex"/> decides whether there is a
+/// fill, so the offsets are only meaningful when it is non-null. The offsets
+/// are in POINTS like the other lengths here, and unlike them they may be
+/// NEGATIVE: a shadow cast up and to the left is an ordinary thing to want.
+///
 /// <paramref name="BoxWidthPts"/> and <paramref name="BoxHeightPts"/> are the
 /// shape's own UPRIGHT size, in points, and are written only by a shape that is
 /// turned or rounded. Zero means "not recorded". They matter because a rotated
@@ -42,13 +50,16 @@ public readonly record struct ShapeTag(
     string? FillHex,
     double CornerRadiusPts,
     double BoxWidthPts = 0,
-    double BoxHeightPts = 0);
+    double BoxHeightPts = 0,
+    double ShadowDxPts = 0,
+    double ShadowDyPts = 0,
+    string? ShadowHex = null);
 
 /// <summary>
 /// Reads the tag a shape stores, the C# side of <c>parse_shape_tag</c> in
 /// render_core.
 ///
-/// Format: <c>AyaanShape:kind:RRGGBBAA:widthPts:fx:fy[:rot[:fillAARRGGBB[:radiusPts[:boxWPts:boxHPts]]]]</c>
+/// Format: <c>AyaanShape:kind:RRGGBBAA:widthPts:fx:fy[:rot[:fillAARRGGBB[:radiusPts[:boxWPts:boxHPts[:shadowDxPts:shadowDyPts:shadowAARRGGBB]]]]]</c>
 ///
 /// The trailing fields were appended over time and are absent from older tags,
 /// so every one of them reads as its historic default rather than failing the
@@ -140,7 +151,12 @@ public static class ShapeTagReader
             FillHex: OptionalFill(parts, 6),
             CornerRadiusPts: Math.Max(0, OptionalNumber(parts, 7)),
             BoxWidthPts: OptionalPositive(parts, 8),
-            BoxHeightPts: OptionalPositive(parts, 9));
+            BoxHeightPts: OptionalPositive(parts, 9),
+            // Signed, so OptionalNumber rather than OptionalPositive: a shadow
+            // may be cast in any direction.
+            ShadowDxPts: OptionalNumber(parts, 10),
+            ShadowDyPts: OptionalNumber(parts, 11),
+            ShadowHex: OptionalFill(parts, 12));
         return true;
     }
 

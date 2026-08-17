@@ -2420,6 +2420,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // From the DRAFT, the single definition the live preview also
                 // draws with. Zero for every other kind, which ignores it.
                 CornerRadiusPx = (float)(sh.Draft.CornerRadius * CaptureWidth),
+                // The shadow crosses in the same capture-pixel space as the
+                // rest of the shape, so the core needs no second scale. Absent
+                // effects leave all three zero, which the core reads as none.
+                ShadowDxPx = (float)((sh.Effects?.Shadow?.OffsetX ?? 0) * CaptureWidth),
+                ShadowDyPx = (float)((sh.Effects?.Shadow?.OffsetY ?? 0) * CaptureWidth),
+                ShadowRgba = ShapeEffectsTag.RgbaOf(sh.Effects),
             });
         }
 

@@ -4275,9 +4275,34 @@ fn parse_stamp_tag(contents: &str) -> Option<(f32, f32, f32, f32, f32)> {
 
 const SHAPE_TAG: &str = "AyaanShape:";
 
-fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32, box_w_pts: f32, box_h_pts: f32) -> String {
+fn shape_tag(
+    spec: &ShapeSpec,
+    width_pts: f32,
+    radius_pts: f32,
+    box_w_pts: f32,
+    box_h_pts: f32,
+    shadow_dx_pts: f32,
+    shadow_dy_pts: f32,
+) -> String {
     let fx = u8::from(spec.x2 >= spec.x1);
     let fy = u8::from(spec.y2 >= spec.y1);
+
+    // A SHADOW IS THE NEW LONGEST RUNG, above the box, and it is emitted only
+    // by a shape that has one. Every shape that does not is byte-identical to
+    // what the previous build wrote, which is what keeps existing files and
+    // their diffs unchanged.
+    //
+    // Fields are positional, so a shadow drags everything before it along even
+    // when those are zero. That is the same bargain the box made and the reason
+    // the rungs are ordered by cost rather than by when they were added.
+    if spec.shadow_rgba != 0 {
+        return format!(
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{:08X}",
+            spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts,
+            spec.rotation_deg, spec.fill_rgba, radius_pts, box_w_pts, box_h_pts,
+            shadow_dx_pts, shadow_dy_pts, spec.shadow_rgba
+        );
+    }
     // Rotation and fill are BOTH appended so an older reader that stops after
     // fy still gets kind/colour/width/direction. Emit progressively longer
     // tags: bare when neither is set, +rot when only rotated, +rot+fill when
@@ -4326,7 +4351,9 @@ fn shape_tag(spec: &ShapeSpec, width_pts: f32, radius_pts: f32, box_w_pts: f32, 
 /// on one of our shape annotations, or None if it is not one of ours. Rotation
 /// is 0 and fill is 0 on older tags that predate those fields; the caller does
 /// not need to know which form the tag was in.
-fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32, f32, f32)> {
+fn parse_shape_tag(
+    contents: &str,
+) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32, f32, f32, f32, f32, u32)> {
     let contents = strip_id_prefix(contents).1;
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
@@ -4379,7 +4406,33 @@ fn parse_shape_tag(contents: &str) -> Option<(i32, u8, u8, u8, u8, f32, bool, bo
     let box_w: f32 = parts.next().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0);
     let box_h: f32 = parts.next().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0);
 
-    Some((kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill, radius, box_w, box_h))
+    // The drop shadow, in POINTS, present only on a shape that has one. Absent
+    // from every tag written before effects existed, which is why all three
+    // read as 0 rather than failing the parse: an old file must keep loading,
+    // and it loads with no shadow.
+    //
+    // The offsets are permitted to be negative, unlike every length above them:
+    // a shadow cast up and to the left is an ordinary thing to want. Only the
+    // colour decides whether there is a shadow at all.
+    let shadow_dx: f32 = parts
+        .next()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let shadow_dy: f32 = parts
+        .next()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let shadow_rgba: u32 = parts
+        .next()
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+
+    Some((
+        kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill, radius, box_w,
+        box_h, shadow_dx, shadow_dy, shadow_rgba,
+    ))
 }
 
 /// One shape to add, in render-pixel space.
@@ -4420,6 +4473,20 @@ pub struct ShapeSpec {
     /// rectangle rather than to nothing. APPENDED to the struct for the same
     /// additive-ABI reason as the two fields above.
     pub corner_radius_px: f32,
+    /// Drop shadow offset in capture-space pixels, the same space as
+    /// `width_px`, and its colour as 0xAARRGGBB.
+    ///
+    /// `shadow_rgba == 0` means NO SHADOW, which is the historic behaviour and
+    /// what a zero-initialised struct gets, so the offsets are only read when
+    /// the colour says there is something to draw. Same convention as
+    /// `fill_rgba` above, for the same reason: one field decides whether the
+    /// feature is on, so a caller that knows nothing about it cannot switch it
+    /// on by accident.
+    ///
+    /// APPENDED to the struct for the additive-ABI reason as everything above.
+    pub shadow_dx_px: f32,
+    pub shadow_dy_px: f32,
+    pub shadow_rgba: u32,
 }
 
 /// Half-width of an arrowhead as a fraction of its length, giving the roughly
@@ -4773,7 +4840,12 @@ fn add_shape_annotations_inner(
         let box_w_pts = (x2 - x1).abs();
         let box_h_pts = (y2 - y1).abs();
         let _ = set_annotation_tag(
-            &mut annotation, &shape_tag(spec, width_pts, radius_pts, box_w_pts, box_h_pts));
+            &mut annotation,
+            &shape_tag(
+                spec, width_pts, radius_pts, box_w_pts, box_h_pts,
+                spec.shadow_dx_px * scale, spec.shadow_dy_px * scale,
+            ),
+        );
 
         rotate_object_about!(path, rot, cx, cy);
         if annotation.objects_mut().add_path_object(path).is_err() {
@@ -4998,6 +5070,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     // that is not one of our shapes leaves the page untouched.
     let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, cur_radius_pts,
          cur_box_w_pts, cur_box_h_pts,
+         cur_shadow_dx_pts, cur_shadow_dy_pts, cur_shadow_rgba,
          page_left, page_top, page_w, bounds) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -5013,7 +5086,7 @@ fn restyle_shape_annotation_inner_with_rotation(
         if pw <= 0.0 { return STATUS_INVALID_INPUT; }
         let (page_left, page_top) = page_origin(&page);
         (tag.0, tag.1, tag.2, tag.3, tag.4, tag.5, tag.6, tag.7, tag.8, tag.9, tag.10,
-         tag.11, tag.12,
+         tag.11, tag.12, tag.13, tag.14, tag.15,
          page_left, page_top, pw, bx)
     };
 
@@ -5088,6 +5161,13 @@ fn restyle_shape_annotation_inner_with_rotation(
         // scale the width uses. Restyling colour or fill must never disturb the
         // corners of a rounded rectangle.
         corner_radius_px: radius_override.unwrap_or(cur_radius_pts * scale_cap_per_pt),
+        // Carried straight back off the tag, like the fill and the radius. A
+        // restyle rebuilds the whole shape from its tag, so anything not put
+        // back here is DROPPED: changing a shape's colour would quietly take
+        // its shadow away.
+        shadow_dx_px: cur_shadow_dx_pts * scale_cap_per_pt,
+        shadow_dy_px: cur_shadow_dy_pts * scale_cap_per_pt,
+        shadow_rgba: cur_shadow_rgba,
     };
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
     if status != STATUS_OK_PDFIUM { return status; }
@@ -5146,7 +5226,10 @@ fn resize_shape_annotation_inner(
         }
     };
 
-    let (kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts, box_w_pts, box_h_pts) = tag;
+    let (
+        kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts, box_w_pts, box_h_pts,
+        cur_shadow_dx_pts, cur_shadow_dy_pts, cur_shadow_rgba,
+    ) = tag;
 
     // Undo the stroke pad when the caller's bounds came from the annotation's
     // own /Rect. The writer inflates the extent by width/2 + 1 on every side so
@@ -5219,7 +5302,7 @@ fn resize_shape_annotation_inner(
 
     // Width was stored in PDF points and the spec wants capture-space pixels,
     // so it goes back through the same scale the writer applied.
-    let (width_px, radius_px) = {
+    let (width_px, radius_px, shadow_dx_px, shadow_dy_px) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
@@ -5239,7 +5322,15 @@ fn resize_shape_annotation_inner(
         // than having it grow with the box, which is what a rounded rectangle
         // is expected to do. The draw-time clamp handles a box shrunk below
         // twice the radius.
-        (width_pts * cap_per_pt, radius_pts * cap_per_pt)
+        // The shadow rides through a resize the way the radius does: the
+        // OFFSET is absolute, so a box stretched wider keeps the same shadow
+        // rather than having it stretch with the box.
+        (
+            width_pts * cap_per_pt,
+            radius_pts * cap_per_pt,
+            cur_shadow_dx_pts * cap_per_pt,
+            cur_shadow_dy_pts * cap_per_pt,
+        )
     };
 
     let spec = ShapeSpec {
@@ -5257,6 +5348,9 @@ fn resize_shape_annotation_inner(
         rotation_deg: rot,
         fill_rgba,
         corner_radius_px: radius_px,
+        shadow_dx_px,
+        shadow_dy_px,
+        shadow_rgba: cur_shadow_rgba,
     };
 
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
@@ -8826,6 +8920,7 @@ mod tests {
             width_px: 3.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         }
     }
 
@@ -10503,7 +10598,7 @@ mod tests {
         let contents = contents_of(reopened, 0, 0).expect("the reopened shape has no contents");
         let parsed = parse_shape_tag(&contents);
         assert!(parsed.is_some(), "tag did not parse: {contents}");
-        let (kind, r, g, b, a, width, _, _, _, _, _, _, _) = parsed.unwrap();
+        let (kind, r, g, b, a, width, ..) = parsed.unwrap();
 
         assert_eq!(kind, SHAPE_ELLIPSE);
         assert_eq!((r, g, b, a), (0x12, 0x34, 0x56, 0x78));
@@ -10514,6 +10609,67 @@ mod tests {
         free_byte_buffer(saved);
     }
 
+    // ---------------- effects in the tag ----------------
+
+    #[test]
+    fn a_shape_with_no_shadow_writes_exactly_the_tag_it_always_did() {
+        // The compatibility requirement, stated as bytes. A shape that uses no
+        // effect must produce the tag the previous build produced, so existing
+        // files and any diff taken against them are untouched.
+        let s = shape(SHAPE_RECTANGLE, 10.0, 20.0, 90.0, 80.0);
+
+        assert_eq!(
+            shape_tag(&s, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            format!("{SHAPE_TAG}{}:DC0000FF:2.0000:1:1", SHAPE_RECTANGLE),
+        );
+    }
+
+    #[test]
+    fn an_old_tag_loads_with_no_shadow() {
+        // Every tag ever written before effects existed ends before these
+        // fields, and must still parse, with the shadow reading as absent.
+        let legacy = format!("{SHAPE_TAG}0:FF0000FF:2.0000:1:1");
+        let t = parse_shape_tag(&legacy).expect("a legacy tag must still parse");
+
+        assert_eq!(t.13, 0.0, "dx");
+        assert_eq!(t.14, 0.0, "dy");
+        assert_eq!(t.15, 0, "rgba, and zero is what means no shadow");
+    }
+
+    #[test]
+    fn a_shadow_round_trips_through_the_tag() {
+        let mut s = shape(SHAPE_RECTANGLE, 10.0, 20.0, 90.0, 80.0);
+        s.shadow_rgba = 0x80336699;
+
+        let tag = shape_tag(&s, 2.0, 0.0, 0.0, 0.0, 4.5, -3.25);
+        let t = parse_shape_tag(&tag).expect("a shadow tag must parse");
+
+        assert_eq!(t.13, 4.5, "dx");
+        assert_eq!(t.14, -3.25, "dy, and a NEGATIVE offset is ordinary");
+        assert_eq!(t.15, 0x80336699, "rgba");
+    }
+
+    #[test]
+    fn a_shadow_tag_still_carries_everything_before_it() {
+        // The fields are positional, so a shadow drags the rotation, fill,
+        // radius and box along with it even when they are zero. If it did not,
+        // the shadow would be read out of the radius's slot.
+        let mut s = shape(SHAPE_ELLIPSE, 10.0, 20.0, 90.0, 80.0);
+        s.rotation_deg = 45.0;
+        s.fill_rgba = 0x40FF0000;
+        s.shadow_rgba = 0xFF000000;
+
+        let t = parse_shape_tag(&shape_tag(&s, 2.0, 6.0, 70.0, 50.0, 2.0, 2.0))
+            .expect("tag must parse");
+
+        assert_eq!(t.8, 45.0, "rotation");
+        assert_eq!(t.9, 0x40FF0000, "fill");
+        assert_eq!(t.10, 6.0, "radius");
+        assert_eq!(t.11, 70.0, "box width");
+        assert_eq!(t.12, 50.0, "box height");
+        assert_eq!(t.15, 0xFF000000, "shadow");
+    }
+
     #[test]
     fn the_tag_round_trips_every_kind_and_direction() {
         for kind in [SHAPE_RECTANGLE, SHAPE_ELLIPSE, SHAPE_LINE, SHAPE_ARROW] {
@@ -10521,7 +10677,7 @@ mod tests {
                 for (y1, y2, fy) in [(20.0, 80.0, true), (80.0, 20.0, false)] {
                     let mut s = shape(kind, x1, y1, x2, y2);
                     s.a = 0xC0;
-                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5, 0.0, 0.0, 0.0)).expect("tag did not parse");
+                    let parsed = parse_shape_tag(&shape_tag(&s, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0)).expect("tag did not parse");
 
                     assert_eq!(parsed.0, kind);
                     assert_eq!(parsed.4, 0xC0);
@@ -11131,15 +11287,15 @@ mod tests {
 
         let specs = [
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 100.0, x2: 700.0, y2: 100.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 200.0, x2: 700.0, y2: 320.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
+                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 700.0, y1: 420.0, x2: 80.0, y2: 420.0,
-                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
+                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_RECTANGLE, x1: 80.0, y1: 500.0, x2: 350.0, y2: 640.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_ELLIPSE, x1: 420.0, y1: 500.0, x2: 700.0, y2: 640.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0},
+                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0},
         ];
         assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()), STATUS_OK_PDFIUM);
 
@@ -14158,6 +14314,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14250,6 +14407,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14286,6 +14444,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14324,6 +14483,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14680,6 +14840,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14748,6 +14909,7 @@ mod tests {
             x1, y1, x2, y2,
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         let specs = [
             mk(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0),
@@ -14798,6 +14960,7 @@ mod tests {
             x2: 0.40 * CAP as f32, y2: 0.50 * CAP as f32,
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14869,6 +15032,7 @@ mod tests {
                 width_px: 4.0,
                 rotation_deg: 0.0,
                 fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
             };
             assert_eq!(
                 add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -14934,6 +15098,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -15006,6 +15171,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -15076,6 +15242,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
+            shadow_dx_px: 0.0, shadow_dy_px: 0.0, shadow_rgba: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),

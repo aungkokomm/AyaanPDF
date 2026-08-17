@@ -193,6 +193,16 @@ internal struct NativeShapeSpec
     /// kind. APPENDED after FillRgba for the same additive-ABI reason.
     /// </summary>
     public float CornerRadiusPx;
+    /// <summary>
+    /// Drop shadow offset in capture pixels and its colour as 0xAARRGGBB.
+    /// <see cref="ShadowRgba"/> of zero means NO SHADOW, which is what a
+    /// zero-init struct gets, so the offsets are only read when the colour says
+    /// there is something to draw. Same convention as <see cref="FillRgba"/>.
+    /// APPENDED for the same additive-ABI reason as everything above.
+    /// </summary>
+    public float ShadowDxPx;
+    public float ShadowDyPx;
+    public uint ShadowRgba;
 }
 
 /// <summary>
