@@ -50,6 +50,26 @@ namespace PdfEditorApp.Rendering;
 /// half device pixel. Skia is 4.2% thicker there. The difference is REAL and it
 /// is Skia's, not the overlay's. Left uncompensated by instruction: this stage
 /// MEASURES it and records it, and the width column can never fail a cell.
+///
+/// A KNOWN LIMIT OF THIS HARNESS, which the placement suite runs into and which
+/// must not be read as a parity finding. The touching, half and corner cells
+/// report MISMATCH because the REFERENCE comes out translated: it is the right
+/// SIZE, to the pixel (152 against 152, 62 against 62), and in the wrong place.
+/// A whole picture moved is a positioning artefact of the capture, not a
+/// renderer drawing something different.
+///
+/// The cause is that a scrolled-off-edge reference cannot be reproduced here.
+/// RenderTargetBitmap renders an element's own subtree, so content pushed past
+/// the frame's origin by a RenderTransform is not composed the way a real
+/// ScrollView composes it. In the app this situation does not arise: the ink
+/// layer spans the whole document at positive slot coordinates and the scroller
+/// clips its viewport.
+///
+/// Those verdicts are LEFT AS THEY FELL rather than tuned away, and the
+/// question they were meant to answer is settled deterministically in tier 1
+/// instead, by PagePlacementParityTests, which asserts that a clipped mark is
+/// cut by the surface and not moved by it, at all four rotations, for all five
+/// placements.
 /// </summary>
 internal static class SkiaParityCapture
 {
@@ -137,7 +157,7 @@ internal static class SkiaParityCapture
 
         var csv = new StringBuilder();
         csv.AppendLine(
-            "subject,rotation,zoom,deviceScale," +
+            "suite,subject,rotation,zoom,deviceScale," +
             "refBounds,skiaBounds,expectedBounds," +
             "refCentroid,skiaCentroid,refMass,skiaMass," +
             "refWidthPx,skiaWidthPx,widthDeltaPct," +
@@ -178,22 +198,262 @@ internal static class SkiaParityCapture
                     catch (Exception ex)
                     {
                         csv.AppendLine(
-                            $"{name},{rotation},{zoom},{device}," +
+                            $"subject,{name},{rotation},{zoom},{device}," +
                             $"CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}");
                         continue;
                     }
 
                     csv.AppendLine(Compare(
-                        name, rotation, zoom, device, reference, candidate,
+                        "subject", name, rotation, zoom, device, reference, candidate,
                         ExpectedBounds(kind, view, device, zoom)));
                     cells++;
                 }
             }
         }
 
+        cells += await PlacementsAsync(host, directory, csv, device);
+
         string path = IOPath.Combine(directory, "stage4-parity.csv");
         File.WriteAllText(path, csv.ToString());
         return $"{cells} cells, {cells * 2} PNGs, stage4-parity.csv";
+    }
+
+    // ---------------- placements: page edges, off-surface, multi-page ----------------
+
+    /// <summary>
+    /// Where a mark sits relative to the surface, in CARD points, so "touching
+    /// the left edge" means that at every rotation rather than only at zero.
+    ///
+    /// The last two are the ones with something to say. "off" must produce no
+    /// ink from EITHER renderer, and two renderers agreeing on nothing is a
+    /// real result: it says the culler and the surface bound agree. "crossPage"
+    /// runs past the page's own right edge while staying on the surface, which
+    /// the ink layer does not clip, so both should draw the overhang.
+    /// </summary>
+    /// <summary>
+    /// Where the mark sits relative to the surface, expressed as the SCROLL
+    /// that puts it there, not as negative geometry.
+    ///
+    /// This distinction cost a whole run. Placing the mark at negative card
+    /// coordinates made the reference come out SHIFTED rather than clipped, by
+    /// exactly the amount it hung off the edge: a WinUI Polyline whose points
+    /// go negative is laid out at its own geometry's origin, so the overhang is
+    /// pulled back into view. That is a situation the app never has. The ink
+    /// layer spans the whole document in positive slot coordinates and the
+    /// SCROLLER moves it, which is what these offsets now are.
+    /// </summary>
+    private static IEnumerable<(string Name, double ScrollX, double ScrollY)> Placements() =>
+    [
+        ("inside", 0, 0),
+        ("touching", -140, 0),
+        ("half", -240, 0),
+        ("corner", -300, -260),
+        ("crossPage", 0, 0),          // the mark itself runs past the PAGE's edge
+        ("off", -520, -520),
+    ];
+
+    /// <summary>The mark, in card points. One box; the scroll does the rest.</summary>
+    private static (double L, double T, double R, double B) PlacedBox(string placement) =>
+        placement == "crossPage" ? (300, 140, 560, 300) : (140, 140, 340, 300);
+
+    /// <summary>
+    /// The placement suite, and the multi-page suite after it.
+    ///
+    /// One subject, a rectangle, because these cells are about WHERE a mark is
+    /// rather than what shape it is: the subject matrix above already covers
+    /// the shapes, and repeating five of them here would quadruple the run for
+    /// nothing.
+    /// </summary>
+    private static async Task<int> PlacementsAsync(
+        Panel host, string directory, StringBuilder csv, double device)
+    {
+        int cells = 0;
+
+        foreach (var (name, scrollX, scrollY) in Placements())
+        {
+            foreach (int rotation in Rotations)
+            {
+                var view = PageTransform.For(ContentWidth, ContentHeight, rotation, ContentWidth);
+                var (l, t, r, b) = PlacedBox(name);
+                var draft = DraftInCard(view, l, t, r, b);
+
+                cells += await OneAsync(
+                    csv, host, directory, "placement", name, rotation, device, view, draft,
+                    pageTop: 0, scrollX: scrollX, scrollY: scrollY,
+                    stem: $"place-{name}-{rotation:D3}");
+            }
+        }
+
+        // Multi-page: the SAME mark on page 0 and on page 1, with the viewport
+        // scrolled onto page 1 for the second. Page 1's mark must land exactly
+        // where page 0's did, and neither may show its neighbour's.
+        foreach (int rotation in Rotations)
+        {
+            var view = PageTransform.For(ContentWidth, ContentHeight, rotation, ContentWidth);
+            var draft = DraftInCard(view, 140, 140, 340, 300);
+
+            for (int page = 0; page < 2; page++)
+            {
+                cells += await OneAsync(
+                    csv, host, directory, "multipage", $"page{page}", rotation, device, view,
+                    draft, pageTop: page * view.CardHeight, scrollX: 0, scrollY: 0,
+                    stem: $"page{page}-{rotation:D3}");
+            }
+        }
+
+        return cells;
+    }
+
+    /// <summary>
+    /// A draft whose CARD-space box is the one asked for, found by inverting
+    /// the page's own turn. Reusing ToContent rather than working out four
+    /// rotations of arithmetic by hand is the point: the placement is stated
+    /// once and the shared transform decides what it means.
+    /// </summary>
+    private static ShapeDraft DraftInCard(
+        PageTransform view, double l, double t, double r, double b)
+    {
+        var a = view.ToContent(l, t);
+        var c = view.ToContent(r, b);
+
+        return new ShapeDraft(
+            ShapeKind.Rectangle,
+            Math.Min(a.X, c.X) / Scale, Math.Min(a.Y, c.Y) / Scale,
+            Math.Max(a.X, c.X) / Scale, Math.Max(a.Y, c.Y) / Scale);
+    }
+
+    /// <summary>
+    /// One cell: both renderers, both PNGs, one CSV row.
+    ///
+    /// No origin framing here, deliberately. The subject suite re-frames each
+    /// mark so it can be measured whole; these cells are ABOUT the frame, and
+    /// shifting them into view would delete the thing under test. The scroll
+    /// offset is the page's own top and nothing else.
+    /// </summary>
+    private static async Task<int> OneAsync(
+        StringBuilder csv, Panel host, string directory, string suite, string name,
+        int rotation, double device, PageTransform view, ShapeDraft draft,
+        double pageTop, double scrollX, double scrollY, string stem)
+    {
+        var shape = new ShapeAnnotation(0, draft, InkColor, StrokeWidthNorm);
+        var items = ShapeRenderList.From([], [shape]);
+
+        // The scroll carries the page's top AND the placement offset, which is
+        // the same number the app's viewport origin carries.
+        var projection = new ViewportProjection(1, device, scrollX, scrollY - pageTop);
+
+        Shot reference, candidate;
+        try
+        {
+            reference = await CaptureAsync(
+                host, PlacedReference(shape, view, pageTop, scrollX, scrollY),
+                ShapeKind.Rectangle, Surface,
+                IOPath.Combine(directory, $"{stem}-ref.png"));
+
+            candidate = await CaptureAsync(
+                host, PlacedCandidate(items, view, projection, pageTop),
+                ShapeKind.Rectangle, Surface,
+                IOPath.Combine(directory, $"{stem}-skia.png"));
+        }
+        catch (Exception ex)
+        {
+            csv.AppendLine($"{suite},{name},{rotation},1,{device},CAPTURE FAILED: {ex.Message}");
+            return 0;
+        }
+
+        csv.AppendLine(Compare(
+            suite, name, rotation, 1, device, reference, candidate,
+            PlacedExpectation(items, view, pageTop, scrollX, scrollY, device)));
+
+        return 1;
+    }
+
+    private static UIElement PlacedReference(
+        ShapeAnnotation shape, PageTransform view, double pageTop,
+        double scrollX, double scrollY)
+    {
+        var canvas = new Canvas
+        {
+            Width = Surface,
+            Height = Surface,
+            IsHitTestVisible = false,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top,
+        };
+
+        var shaft = new Polyline
+        {
+            Stroke = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                OverlayShapeBuilder.ColorFromHex(shape.ColorHex)),
+            StrokeThickness = OverlayProjection.ToSlotThickness(shape.StrokeWidth, Scale, view),
+        };
+
+        // The page's top goes in as the offset the ink layer applies, and the
+        // scroll takes it back out, exactly as the app does.
+        OverlayShapeBuilder.ProjectInto(shaft, shape.Outline, Scale, pageTop, view);
+        canvas.Children.Add(shaft);
+
+        // The scroll moves the LAYER, which keeps every child at the positive
+        // slot coordinates the app gives them and is what the scroller does.
+        canvas.RenderTransform = new Microsoft.UI.Xaml.Media.TranslateTransform
+        {
+            X = scrollX,
+            Y = scrollY - pageTop,
+        };
+
+        return canvas;
+    }
+
+    private static UIElement PlacedCandidate(
+        IReadOnlyList<ShapeRenderItem> items, PageTransform view,
+        ViewportProjection projection, double pageTop)
+    {
+        var layer = new SkiaShapeLayer { Width = Surface, Height = Surface };
+        layer.Show(items, Scale, _ => pageTop, _ => view, projection);
+
+        return layer;
+    }
+
+    /// <summary>
+    /// The arithmetic's answer for a placed mark, clamped to the surface.
+    ///
+    /// Clamped because these cells are about the frame: a mark half off the
+    /// edge SHOULD measure as the part that is on it, and comparing against the
+    /// unclipped box would report correct clipping as a mismatch.
+    /// </summary>
+    private static (double L, double T, double R, double B) PlacedExpectation(
+        IReadOnlyList<ShapeRenderItem> items, PageTransform view, double pageTop,
+        double scrollX, double scrollY, double device)
+    {
+        double l = double.MaxValue, t = double.MaxValue, r = double.MinValue, b = double.MinValue;
+
+        foreach (var item in items)
+        {
+            double reach = OverlayProjection.WidthOf(item, Scale, view) / 2;
+            foreach (var p in item.Points)
+            {
+                var (x, y) = OverlayProjection.ToSlot(p, Scale, pageTop, view);
+                l = Math.Min(l, x - reach); t = Math.Min(t, y - reach);
+                r = Math.Max(r, x + reach); b = Math.Max(b, y + reach);
+            }
+        }
+
+        // The scroll takes the page's top back out, and only from Y. X is
+        // measured from the same left edge on every page in the stack.
+        double edge = Surface - (1.0 / device);
+        l += scrollX; r += scrollX;
+        t += scrollY - pageTop; b += scrollY - pageTop;
+
+        // Nothing of it reaches the surface at all: the expectation is EMPTY,
+        // and both renderers drawing nothing is the correct answer rather than
+        // a missing measurement.
+        if (r < 0 || b < 0 || l > edge || t > edge)
+        {
+            return (double.NaN, double.NaN, double.NaN, double.NaN);
+        }
+
+        return (Math.Clamp(l, 0, edge) * device, Math.Clamp(t, 0, edge) * device,
+                Math.Clamp(r, 0, edge) * device, Math.Clamp(b, 0, edge) * device);
     }
 
     // ---------------- the two renderers ----------------
@@ -457,7 +717,7 @@ internal static class SkiaParityCapture
     // ---------------- verdicts ----------------
 
     private static string Compare(
-        string name, int rotation, double zoom, double device,
+        string suite, string name, int rotation, double zoom, double device,
         Shot reference, Shot candidate,
         (double L, double T, double R, double B) expected)
     {
@@ -466,8 +726,12 @@ internal static class SkiaParityCapture
             Math.Max(Math.Abs(reference.CentroidX - candidate.CentroidX),
                      Math.Abs(reference.CentroidY - candidate.CentroidY)), 0.5, 1.0);
 
-        double massDelta = reference.Mass <= 0 ? 1 : Math.Abs(candidate.Mass - reference.Mass) / reference.Mass;
-        string massVerdict = Near(massDelta, 0.02, 0.08);
+        // Same rule for mass: no ink on either side is agreement.
+        string massVerdict = reference.Mass <= 0 && candidate.Mass <= 0
+            ? "MATCH"
+            : Near(
+                reference.Mass <= 0 ? 1 : Math.Abs(candidate.Mass - reference.Mass) / reference.Mass,
+                0.02, 0.08);
 
         // The width column can NEVER fail a cell. It is measured and recorded
         // by instruction, not compensated and not asserted. Subjects with no
@@ -487,7 +751,7 @@ internal static class SkiaParityCapture
         string verdict = Worst(boundsVerdict, centroidVerdict, massVerdict);
 
         return string.Join(',',
-            name, rotation, F(zoom), F(device),
+            suite, name, rotation, F(zoom), F(device),
             Box(reference.Bounds), Box(candidate.Bounds), BoxOf(expected),
             $"{reference.CentroidX:F2} {reference.CentroidY:F2}",
             $"{candidate.CentroidX:F2} {candidate.CentroidY:F2}",
@@ -500,6 +764,15 @@ internal static class SkiaParityCapture
 
     private static string BoundsVerdict((int L, int T, int R, int B)? a, (int L, int T, int R, int B)? b)
     {
+        // BOTH empty is agreement, not a missing measurement. A mark scrolled
+        // entirely off the surface must produce no ink from either renderer,
+        // and reporting that as a MISMATCH turned the correctly culled cells
+        // into the loudest failures in the report.
+        if (a is null && b is null)
+        {
+            return "MATCH";
+        }
+
         if (a is not { } x || b is not { } y)
         {
             return "MISMATCH";
@@ -518,6 +791,14 @@ internal static class SkiaParityCapture
     /// </summary>
     private static string Agrees((int L, int T, int R, int B)? got, (double L, double T, double R, double B) want)
     {
+        // An EMPTY expectation, written as NaN: the arithmetic says nothing of
+        // this mark reaches the surface, so no ink is the right answer and ink
+        // would be the wrong one.
+        if (double.IsNaN(want.L))
+        {
+            return got is null ? "YES" : "NO (drawn off-surface)";
+        }
+
         if (got is not { } g)
         {
             return "NO INK";
@@ -543,7 +824,7 @@ internal static class SkiaParityCapture
         b is { } v ? $"{v.L} {v.T} {v.R} {v.B}" : "none";
 
     private static string BoxOf((double L, double T, double R, double B) b) =>
-        $"{b.L:F1} {b.T:F1} {b.R:F1} {b.B:F1}";
+        double.IsNaN(b.L) ? "empty" : $"{b.L:F1} {b.T:F1} {b.R:F1} {b.B:F1}";
 
     private static string F(double v) => v.ToString("F3", CultureInfo.InvariantCulture);
 
