@@ -38,6 +38,29 @@ public static class OverlayProjection
     public const double HeadHairlineDips = 0.5;
 
     /// <summary>
+    /// The freehand guide's weight, in DIPs, and the second number the overlay
+    /// does not scale.
+    ///
+    /// A stroke being laid down previews as a thin red line rather than at its
+    /// own colour and weight, because it is a guide showing WHERE the pen has
+    /// been, not a preview of what the ink will look like. The four shape tools
+    /// do preview in their real colour and width; freehand deliberately does
+    /// not, and reproducing that means reproducing this too.
+    /// </summary>
+    public const double InkGuideWidthDips = 2.0;
+
+    /// <summary>
+    /// The width one item is stroked at, in slot DIPs.
+    ///
+    /// The single place the two kinds of width meet: a fixed slot width wins
+    /// when the item carries one, and everything else is normalized and takes
+    /// the page's scale. Both renderers and the culler ask here, so a mark
+    /// cannot be measured one way and drawn another.
+    /// </summary>
+    public static double WidthOf(ShapeRenderItem item, double scale, PageTransform view) =>
+        item.SlotWidth ?? ToSlotThickness(item.StrokeWidth, scale, view);
+
+    /// <summary>
     /// A normalized point in the page's own frame, placed in the continuous
     /// stack: scaled by the overlay scale, then dropped to the page's top.
     ///

@@ -72,7 +72,7 @@ public static class ShapeCulling
 
         // Half the stroke reaches outside the path on every side, so a mark
         // tested on its centreline alone vanishes half a stroke early.
-        double reach = OverlayProjection.ToSlotThickness(item.StrokeWidth, scale, view) / 2;
+        double reach = OverlayProjection.WidthOf(item, scale, view) / 2;
 
         return left - reach <= bounds.Right
             && right + reach >= bounds.Left

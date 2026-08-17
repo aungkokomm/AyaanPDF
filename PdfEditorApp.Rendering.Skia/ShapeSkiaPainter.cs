@@ -186,7 +186,11 @@ public static class ShapeSkiaPainter
         {
             Style = SKPaintStyle.Stroke,
             Color = ToSkColor(item.Color),
-            StrokeWidth = (float)OverlayProjection.ToSlotThickness(item.StrokeWidth, scale, view),
+            // WidthOf, not ToSlotThickness: the freehand guide carries a fixed
+            // slot width instead of a normalized one, and asking the shared
+            // rule is what keeps the painter and the culler measuring the same
+            // mark the same way.
+            StrokeWidth = (float)OverlayProjection.WidthOf(item, scale, view),
 
             // The overlay is a XAML Polyline, which antialiases. Skia does not
             // by default, and leaving it off is a visible parity difference on

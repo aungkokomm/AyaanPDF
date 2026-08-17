@@ -5707,7 +5707,8 @@ public sealed partial class MainPage : Page
         }
 
         SkiaShapeCanvas.Show(
-            ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape()),
+            ShapeRenderList.From(
+                ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape(), PreviewInkGuide()),
             ViewModel.OverlayScale,
             ViewModel.SlotTopOf,
             ViewModel.ViewTransformOf,
@@ -5723,17 +5724,32 @@ public sealed partial class MainPage : Page
     /// outline and head from the draft, the preview cannot disagree with the
     /// committed shape that replaces it at pointer-up.
     ///
-    /// Freehand ink is deliberately NOT previewed here. Its guide is a flat red
-    /// 2-DIP line rather than the stroke's own colour and weight, and a
-    /// ShapeRenderItem carries a NORMALIZED width that the painter multiplies
-    /// back up, so expressing a fixed 2 DIPs would mean passing a reciprocal
-    /// whose only purpose is to cancel that multiplication. Left out rather
-    /// than smuggled in.
+    /// Freehand ink previews separately, through PreviewInkGuide below, because
+    /// its guide follows a different rule.
     /// </summary>
     private ShapeAnnotation? PreviewShape() =>
         ViewModel.ShapeInProgress is { } draft
             ? new ShapeAnnotation(
                 ViewModel.ActiveShapePage, draft, ViewModel.InkColorHex, ViewModel.InkWidth)
+            : null;
+
+    /// <summary>
+    /// The freehand stroke being drawn right now, as the thin red guide, or
+    /// null when nothing is being drawn.
+    ///
+    /// Anchored to the page the stroke STARTED on, like the overlay's, because
+    /// in a continuous view you can begin drawing on a visible page that is not
+    /// the current one and the guide has to land where the ink will.
+    ///
+    /// A shape drag takes precedence, mirroring the overlay's own ternary. The
+    /// two cannot actually both be live, since a shape drag fills _shapeDraft
+    /// and freehand fills _currentStroke, and CurrentStrokeInProgress is null
+    /// unless the latter is set. The guard is here so the two renderers resolve
+    /// the preview by the SAME rule rather than by both happening to be right.
+    /// </summary>
+    private ShapeRenderItem? PreviewInkGuide() =>
+        ViewModel.ShapeInProgress is null && ViewModel.CurrentStrokeInProgress is { } points
+            ? ShapeRenderList.InkGuide(ViewModel.ActiveInkPage, points)
             : null;
 
     /// <summary>

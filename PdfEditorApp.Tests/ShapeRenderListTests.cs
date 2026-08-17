@@ -201,6 +201,71 @@ public class ShapeRenderListTests
         Assert.Equal(7, items[0].PageIndex);
     }
 
+    // ---- the freehand guide ----
+
+    [Fact]
+    public void the_freehand_guide_is_red_and_a_fixed_two_dips()
+    {
+        // Not the ink's colour and not the ink's weight, which is the ONE way a
+        // freehand preview differs from a shape preview. It shows where the pen
+        // has been; it is not a preview of what the ink will look like.
+        var guide = ShapeRenderList.InkGuide(0, [(0.1, 0.1), (0.2, 0.2)]);
+
+        Assert.Equal(new RenderColor(0xFF, 0xFF, 0x00, 0x00), guide.Color);
+        Assert.Equal(2.0, guide.SlotWidth);
+        Assert.Equal(RenderStyle.Stroked, guide.Style);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(90)]
+    [InlineData(180)]
+    [InlineData(270)]
+    public void the_guide_stays_two_dips_whatever_the_page_is_doing(int rotation)
+    {
+        // The whole reason SlotWidth exists. A normalized width is multiplied
+        // by the overlay scale AND the page's scale, so on a turned page it
+        // would come out thinner; the guide does not, because the overlay's is
+        // a literal 2 that nothing scales.
+        var view = PageTransform.For(800, 1000, rotation, 800);
+        var guide = ShapeRenderList.InkGuide(0, [(0.1, 0.1), (0.2, 0.2)]);
+
+        Assert.Equal(2.0, OverlayProjection.WidthOf(guide, 800, view));
+    }
+
+    [Fact]
+    public void everything_without_a_slot_width_is_still_normalized()
+    {
+        // The other half of the same rule, so adding the override cannot have
+        // quietly changed how an ordinary mark is measured.
+        var view = PageTransform.For(800, 1000, 0, 800);
+        var normal = ShapeRenderList.From([], [Shape(ShapeKind.Rectangle)])[0];
+
+        Assert.Null(normal.SlotWidth);
+        Assert.Equal(3.2, OverlayProjection.WidthOf(normal, 800, view), 6);
+    }
+
+    [Fact]
+    public void the_stroke_being_drawn_is_painted_last()
+    {
+        var items = ShapeRenderList.From(
+            [Stroke(0, (0, 0), (0.1, 0.1))],
+            [Shape(ShapeKind.Rectangle)],
+            inkPreview: ShapeRenderList.InkGuide(4, [(0.3, 0.3), (0.4, 0.4)]));
+
+        Assert.Equal(3, items.Count);
+        Assert.Equal(4, items[^1].PageIndex);
+        Assert.Equal(2.0, items[^1].SlotWidth);
+    }
+
+    [Fact]
+    public void no_stroke_in_progress_adds_nothing()
+    {
+        var items = ShapeRenderList.From([], [Shape(ShapeKind.Rectangle)], inkPreview: null);
+
+        Assert.Single(items);
+    }
+
     [Fact]
     public void a_colour_is_parsed_the_way_the_overlay_parses_it()
     {
@@ -290,7 +355,23 @@ public class ShapeRenderListTests
 
         Assert.Contains(
             "UpdateInkPreview();\r\n        RefreshSkiaShapeLayer();", page, StringComparison.Ordinal);
-        Assert.Contains("ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape())",
+        Assert.Contains(
+            "ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape(), PreviewInkGuide()",
+            page, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_freehand_guide_resolves_by_the_same_rule_in_both_renderers()
+    {
+        // The overlay decides with a ternary that prefers the shape draft. The
+        // Skia feed has to agree, or the two disagree about which preview is on
+        // screen the moment both could answer.
+        string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
+
+        Assert.Contains(
+            "ViewModel.ShapeInProgress is null && ViewModel.CurrentStrokeInProgress is { } points",
+            page, StringComparison.Ordinal);
+        Assert.Contains("ShapeRenderList.InkGuide(ViewModel.ActiveInkPage, points)",
                         page, StringComparison.Ordinal);
     }
 

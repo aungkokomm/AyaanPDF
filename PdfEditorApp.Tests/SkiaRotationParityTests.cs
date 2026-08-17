@@ -178,12 +178,25 @@ public class SkiaRotationParityTests
 
     private static bool IsWhite(SKColor c) => c.Red == 255 && c.Green == 255 && c.Blue == 255;
 
+    /// <summary>
+    /// How far one pixel is from white, as coverage, measured on its DARKEST
+    /// channel.
+    ///
+    /// Not the red channel. The freehand guide is pure red, so a fully covered
+    /// pixel is (255, 0, 0) and reading red alone scores it as blank: the first
+    /// version of the guide test measured 0 ink on a stroke that was plainly
+    /// being painted. The darkest channel is 0 for both black and red and 255
+    /// for white, so it measures every fixture in this file the same way.
+    /// </summary>
+    private static double Coverage(SKColor c) =>
+        (255 - Math.Min(c.Red, Math.Min(c.Green, c.Blue))) / 255.0;
+
     private static double InkDownColumn(SKBitmap bitmap, int x, int fromY, int toY)
     {
         double ink = 0;
         for (int y = fromY; y <= toY; y++)
         {
-            ink += (255 - bitmap.GetPixel(x, y).Red) / 255.0;
+            ink += Coverage(bitmap.GetPixel(x, y));
         }
 
         return ink;
@@ -194,7 +207,7 @@ public class SkiaRotationParityTests
         double ink = 0;
         for (int x = fromX; x <= toX; x++)
         {
-            ink += (255 - bitmap.GetPixel(x, y).Red) / 255.0;
+            ink += Coverage(bitmap.GetPixel(x, y));
         }
 
         return ink;
@@ -325,6 +338,33 @@ public class SkiaRotationParityTests
         return (l, t, r, b);
     }
 
+    // ---------------- the freehand guide's fixed weight ----------------
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(90)]
+    public void skia_paints_the_guide_at_two_dips_on_a_turned_page_as_well(int rotation)
+    {
+        // A normalized width would thin to 1.6 at 90 degrees, because the page
+        // is scaled by 800/1000 to fit the card. The guide does not thin: the
+        // overlay draws a literal 2 and this has to match it.
+        //
+        // Measured across a long horizontal run so the scan crosses the stroke
+        // once, and Skia's half-device-pixel snap leaves 2.0 exactly alone.
+        var guide = ShapeRenderList.InkGuide(0, [(0.1, 0.25), (0.6, 0.25)]);
+
+        using var bitmap = Render([guide], rotation);
+
+        var mid = OverlayProjection.ToSlot((0.35, 0.25), Scale, 0, View(rotation));
+        int x = (int)Math.Round(mid.X), y = (int)Math.Round(mid.Y);
+
+        double ink = rotation == 0
+            ? InkDownColumn(bitmap, x, y - 8, y + 8)
+            : InkAcrossRow(bitmap, y, x - 8, x + 8);
+
+        Assert.Equal(2.0, ink, precision: 1);
+    }
+
     // ---------------- culling has to agree with painting ----------------
 
     [Fact]
@@ -368,7 +408,10 @@ public class SkiaRotationParityTests
 
         Assert.Contains("OverlayProjection.ToSlot(item.Points[at], scale, pageTop, view)",
                         painter, StringComparison.Ordinal);
-        Assert.Contains("OverlayProjection.ToSlotThickness(item.StrokeWidth, scale, view)",
+
+        // WidthOf, which resolves the fixed-versus-normalized width question in
+        // the shared library. The painter must not decide that itself.
+        Assert.Contains("OverlayProjection.WidthOf(item, scale, view)",
                         painter, StringComparison.Ordinal);
 
         // MatrixFor is the ONE matrix, and it is the viewport step: zoom,

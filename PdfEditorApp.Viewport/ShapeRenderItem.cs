@@ -35,12 +35,29 @@ public enum RenderStyle
 /// nothing reads would be inventing behaviour during a migration whose whole
 /// rule is that rendering is the only variable.
 /// </summary>
+/// <param name="StrokeWidth">
+/// Normalized, like the points: a width in pixels would mean something
+/// different on every page size and at every zoom.
+/// </param>
+/// <param name="SlotWidth">
+/// A width that is ALREADY in slot DIPs, for the one mark whose weight is fixed
+/// rather than derived from the page: the freehand guide, which the overlay
+/// draws at a flat 2 whatever the page is doing. When set it is used as-is and
+/// <paramref name="StrokeWidth"/> is ignored.
+///
+/// A field rather than a reciprocal at the call site. The alternative was to
+/// pass 2 / (scale * view.Scale) so the painter's multiplication cancels out,
+/// which produces the right pixels and stores a number that is not a width of
+/// anything, and that bakes one page's transform into an item the frame may
+/// outlive. This says what it means instead.
+/// </param>
 public readonly record struct ShapeRenderItem(
     int PageIndex,
     IReadOnlyList<(double X, double Y)> Points,
     RenderColor Color,
     double StrokeWidth,
-    RenderStyle Style);
+    RenderStyle Style,
+    double? SlotWidth = null);
 
 /// <summary>
 /// Turns the marks the view model holds into a frame's worth of render items.
@@ -60,6 +77,23 @@ public static class ShapeRenderList
     /// <summary>An arrow's head is a triangle; anything else is not a head.</summary>
     private const int HeadPointCount = 3;
 
+    /// <summary>The overlay's freehand guide colour, plain red.</summary>
+    private static readonly RenderColor GuideRed = new(0xFF, 0xFF, 0x00, 0x00);
+
+    /// <summary>
+    /// The stroke being drawn right now, as the thin red guide the overlay
+    /// draws for it.
+    ///
+    /// Its colour and weight are the guide's, NOT the ink's, which is the one
+    /// way a freehand preview differs from a shape preview. Built here rather
+    /// than at the call site so that rule is stated once, in the library that
+    /// can be tested, instead of in a WinUI page that cannot.
+    /// </summary>
+    public static ShapeRenderItem InkGuide(
+        int pageIndex, IReadOnlyList<(double X, double Y)> points) =>
+        new(pageIndex, points, GuideRed, StrokeWidth: 0, RenderStyle.Stroked,
+            SlotWidth: OverlayProjection.InkGuideWidthDips);
+
     /// <param name="preview">
     /// The shape being dragged right now, if there is one, as the annotation it
     /// is about to become.
@@ -74,10 +108,20 @@ public static class ShapeRenderList
     /// LAST, so it paints over everything committed, which is what the overlay
     /// does by adding it to the canvas after the rest.
     /// </param>
+    /// <param name="inkPreview">
+    /// The freehand stroke being drawn right now, from <see cref="InkGuide"/>.
+    ///
+    /// A separate argument from <paramref name="preview"/> because the two are
+    /// different marks with different rules, not because both can happen: you
+    /// are either dragging a shape or drawing freehand, never both. Kept in
+    /// this method rather than concatenated by the caller so that PAINT ORDER
+    /// stays decided in one tested place.
+    /// </param>
     public static IReadOnlyList<ShapeRenderItem> From(
         IEnumerable<InkStrokeAnnotation> strokes,
         IEnumerable<ShapeAnnotation> shapes,
-        ShapeAnnotation? preview = null)
+        ShapeAnnotation? preview = null,
+        ShapeRenderItem? inkPreview = null)
     {
         var items = new List<ShapeRenderItem>();
 
@@ -99,6 +143,11 @@ public static class ShapeRenderList
         if (preview is not null)
         {
             Emit(preview);
+        }
+
+        if (inkPreview is { } guide)
+        {
+            items.Add(guide);
         }
 
         return items;
