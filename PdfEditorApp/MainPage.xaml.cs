@@ -167,6 +167,15 @@ public sealed partial class MainPage : Page
                 return;
             }
 
+            if (Rendering.SkiaPerfCapture.RequestedDirectory is { } perfDir
+                && Content is Panel perfHost)
+            {
+                string report = Rendering.SkiaPerfCapture.Run(perfHost, perfDir);
+                Diag.Log($"skia-perf: {report}");
+                Application.Current.Exit();
+                return;
+            }
+
             if (Rendering.RotationEvidenceCapture.RequestedDirectory is { } rotationDir
                 && Content is Panel rotationHost)
             {
