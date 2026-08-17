@@ -102,6 +102,105 @@ public class ShapeRenderListTests
         Assert.Equal(0.004, only.StrokeWidth);
     }
 
+    // ---- the live preview ----
+
+    private static ShapeAnnotation Draft(ShapeKind kind, int page = 0, string? color = null) =>
+        new(page, new ShapeDraft(kind, 0.2, 0.2, 0.6, 0.5), color ?? Blue, 0.004);
+
+    [Fact]
+    public void nothing_in_progress_adds_nothing_to_the_frame()
+    {
+        // The common case, by a wide margin: the frame is rebuilt on every
+        // scroll and every commit, and almost none of those are mid-drag.
+        var committed = ShapeRenderList.From([], [Shape(ShapeKind.Rectangle)]);
+        var withNoPreview = ShapeRenderList.From([], [Shape(ShapeKind.Rectangle)], preview: null);
+
+        Assert.Equal(committed.Count, withNoPreview.Count);
+    }
+
+    [Fact]
+    public void the_shape_being_dragged_is_painted_last()
+    {
+        // On top of everything committed, which is what the overlay does by
+        // adding the preview to the canvas after the rest. Anywhere else in the
+        // list and a preview disappears behind a mark it overlaps.
+        var items = ShapeRenderList.From(
+            [Stroke(0, (0, 0), (0.1, 0.1))],
+            [Shape(ShapeKind.Rectangle), Shape(ShapeKind.Ellipse)],
+            preview: Draft(ShapeKind.Rectangle, color: FourDistinctChannels));
+
+        Assert.Equal(4, items.Count);
+        Assert.Equal(new RenderColor(0x80, 0x11, 0x22, 0x33), items[^1].Color);
+    }
+
+    [Fact]
+    public void a_dragged_arrow_previews_its_shaft_then_its_head()
+    {
+        // Same order as a committed arrow, so the head sits over the shaft in
+        // the preview exactly as it will once the pointer lifts.
+        var items = ShapeRenderList.From([], [], preview: Draft(ShapeKind.Arrow));
+
+        Assert.Equal(2, items.Count);
+        Assert.Equal(RenderStyle.Stroked, items[0].Style);
+        Assert.Equal(RenderStyle.Filled, items[1].Style);
+        Assert.Equal(3, items[1].Points.Count);
+    }
+
+    [Theory]
+    [InlineData(ShapeKind.Rectangle)]
+    [InlineData(ShapeKind.Ellipse)]
+    [InlineData(ShapeKind.Line)]
+    [InlineData(ShapeKind.RoundedRectangle)]
+    public void a_dragged_shape_that_is_not_an_arrow_previews_no_head(ShapeKind kind)
+    {
+        var only = Assert.Single(ShapeRenderList.From([], [], preview: Draft(kind)));
+
+        Assert.Equal(RenderStyle.Stroked, only.Style);
+    }
+
+    [Theory]
+    [InlineData(ShapeKind.Rectangle)]
+    [InlineData(ShapeKind.Ellipse)]
+    [InlineData(ShapeKind.Line)]
+    [InlineData(ShapeKind.Arrow)]
+    public void the_preview_is_the_same_geometry_as_the_shape_that_replaces_it(ShapeKind kind)
+    {
+        // THE regression this feature can produce: a shape that jumps the
+        // instant the pointer lifts. It cannot, because the preview goes
+        // through the same emit path as a committed shape and derives its
+        // points from the same draft, and this is what says so.
+        var shape = Draft(kind, page: 3);
+
+        var previewed = ShapeRenderList.From([], [], preview: shape);
+        var committed = ShapeRenderList.From([], [shape]);
+
+        // Field by field, and the points as a SEQUENCE. Comparing the items
+        // directly passes for the wrong reason or fails for one: a record
+        // struct's generated equality compares its IReadOnlyList field by
+        // reference, and Outline builds a fresh list on every call, so two
+        // identical arrows are never "equal" and two aliased ones always are.
+        Assert.Equal(committed.Count, previewed.Count);
+        for (int at = 0; at < committed.Count; at++)
+        {
+            Assert.Equal(committed[at].PageIndex, previewed[at].PageIndex);
+            Assert.Equal(committed[at].Color, previewed[at].Color);
+            Assert.Equal(committed[at].StrokeWidth, previewed[at].StrokeWidth);
+            Assert.Equal(committed[at].Style, previewed[at].Style);
+            Assert.Equal(committed[at].Points, previewed[at].Points);
+        }
+    }
+
+    [Fact]
+    public void the_preview_keeps_its_own_page()
+    {
+        // A drag can start on a visible page that is not the current one, so
+        // the preview has to carry the page it began on or it is drawn on the
+        // wrong one.
+        var items = ShapeRenderList.From([], [], preview: Draft(ShapeKind.Rectangle, page: 7));
+
+        Assert.Equal(7, items[0].PageIndex);
+    }
+
     [Fact]
     public void a_colour_is_parsed_the_way_the_overlay_parses_it()
     {
@@ -179,6 +278,23 @@ public class ShapeRenderListTests
     }
 
     [Fact]
+    public void the_skia_layer_is_fed_on_every_preview_change_too()
+    {
+        // The whole reason a preview never appeared under Skia: the layer was
+        // fed only when the COMMITTED collection changed, which is pointer-up.
+        // The preview signal has to reach it as well, and the refresh has to
+        // sit outside the preview builder, because that method returns early
+        // when nothing is in progress and that is precisely the case which
+        // clears a finished or cancelled drag off the surface.
+        string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
+
+        Assert.Contains(
+            "UpdateInkPreview();\r\n        RefreshSkiaShapeLayer();", page, StringComparison.Ordinal);
+        Assert.Contains("ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape())",
+                        page, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void the_skia_layer_is_handed_the_same_page_transform_the_overlay_uses()
     {
         // Both renderers must read the turn from the SAME source. The overlay
@@ -199,6 +315,24 @@ public class ShapeRenderListTests
 
         Assert.Contains("StrokeThickness = 0.5", page, StringComparison.Ordinal);
         Assert.Equal(0.5, OverlayProjection.HeadHairlineDips);
+    }
+
+    [Fact]
+    public void the_skia_painter_draws_that_same_hairline_round_a_filled_head()
+    {
+        // The overlay's head is a Polygon with Fill AND Stroke set to the same
+        // brush, so the hairline is part of how big an arrow tip is, not
+        // decoration. Skia fills and strokes the same path for the same reason.
+        //
+        // Guarded at the source rather than in pixels on purpose: half a DIP
+        // centred on the path is a quarter of a pixel of extra coverage at 1x,
+        // which is inside the fill's own antialiasing and cannot be measured
+        // without asserting on the antialiaser's behaviour instead of ours.
+        string painter = ReadSource("PdfEditorApp.Rendering.Skia", "ShapeSkiaPainter.cs");
+
+        Assert.Contains("SKPaintStyle.Fill", painter, StringComparison.Ordinal);
+        Assert.Contains("StrokeWidth = (float)OverlayProjection.HeadHairlineDips",
+                        painter, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -81,16 +81,97 @@ public static class ShapeSkiaPainter
     {
         foreach (var item in items)
         {
-            // Filled items (an arrow's head) are stage 2. Skipping is stated
-            // here and pinned by a test rather than left to be discovered as a
-            // missing arrow tip.
-            if (item.Style != RenderStyle.Stroked)
-            {
-                continue;
-            }
+            double top = pageTop(item.PageIndex);
+            var view = pageView(item.PageIndex);
 
-            PaintStroked(canvas, item, scale, pageTop(item.PageIndex), pageView(item.PageIndex));
+            if (item.Style == RenderStyle.Filled)
+            {
+                PaintFilled(canvas, item, scale, top, view);
+            }
+            else
+            {
+                PaintStroked(canvas, item, scale, top, view);
+            }
         }
+    }
+
+    /// <summary>
+    /// The item's points, projected into slot space.
+    ///
+    /// Shared by both styles so there is one place a mark can be positioned,
+    /// and NOT closed: the overlay draws a shaft as a Polyline whose last point
+    /// repeats its first, and closing the path here would round the join at
+    /// that vertex and stop the two renderers agreeing pixel for pixel. The
+    /// filled path closes itself, because a XAML Polygon does.
+    /// </summary>
+    private static SKPath PathFor(
+        ShapeRenderItem item, double scale, double pageTop, PageTransform view)
+    {
+        var path = new SKPath();
+
+        for (int at = 0; at < item.Points.Count; at++)
+        {
+            var (x, y) = OverlayProjection.ToSlot(item.Points[at], scale, pageTop, view);
+            if (at == 0)
+            {
+                path.MoveTo((float)x, (float)y);
+            }
+            else
+            {
+                path.LineTo((float)x, (float)y);
+            }
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// A solid area: today only an arrow's head.
+    ///
+    /// The overlay builds one as a Polygon with Fill AND Stroke set to the same
+    /// brush, at a literal StrokeThickness of 0.5, so it is painted here the
+    /// same way: filled, then outlined with that same hairline. The hairline is
+    /// what makes the tip the size it is in the file; dropping it leaves every
+    /// arrow head a half-DIP smaller than the reference draws it.
+    ///
+    /// That 0.5 is NOT scaled, by the overlay or here. It is the one number in
+    /// the projection that stays in slot DIPs whatever the page is doing, which
+    /// is why OverlayProjection names it rather than leaving a bare literal in
+    /// a paint call.
+    /// </summary>
+    private static void PaintFilled(
+        SKCanvas canvas, ShapeRenderItem item, double scale, double pageTop, PageTransform view)
+    {
+        // A triangle needs three. Guarded the way the mapper guards on the head
+        // count, so a head that could not be built is not painted as a sliver.
+        if (item.Points.Count < 3)
+        {
+            return;
+        }
+
+        using var path = PathFor(item, scale, pageTop, view);
+        path.Close();
+
+        var color = ToSkColor(item.Color);
+
+        using var fill = new SKPaint
+        {
+            Style = SKPaintStyle.Fill,
+            Color = color,
+            IsAntialias = true,
+        };
+        canvas.DrawPath(path, fill);
+
+        using var hairline = new SKPaint
+        {
+            Style = SKPaintStyle.Stroke,
+            Color = color,
+            StrokeWidth = (float)OverlayProjection.HeadHairlineDips,
+            IsAntialias = true,
+            StrokeCap = SKStrokeCap.Butt,
+            StrokeJoin = SKStrokeJoin.Miter,
+        };
+        canvas.DrawPath(path, hairline);
     }
 
     private static void PaintStroked(
@@ -119,20 +200,7 @@ public static class ShapeSkiaPainter
             StrokeJoin = SKStrokeJoin.Miter,
         };
 
-        using var path = new SKPath();
-        for (int at = 0; at < item.Points.Count; at++)
-        {
-            var (x, y) = OverlayProjection.ToSlot(item.Points[at], scale, pageTop, view);
-            if (at == 0)
-            {
-                path.MoveTo((float)x, (float)y);
-            }
-            else
-            {
-                path.LineTo((float)x, (float)y);
-            }
-        }
-
+        using var path = PathFor(item, scale, pageTop, view);
         canvas.DrawPath(path, paint);
     }
 

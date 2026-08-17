@@ -60,9 +60,24 @@ public static class ShapeRenderList
     /// <summary>An arrow's head is a triangle; anything else is not a head.</summary>
     private const int HeadPointCount = 3;
 
+    /// <param name="preview">
+    /// The shape being dragged right now, if there is one, as the annotation it
+    /// is about to become.
+    ///
+    /// It is a ShapeAnnotation and not a type of its own because that is
+    /// literally what it is: an in-progress draft differs from a committed
+    /// shape only in not having been written yet, and ShapeAnnotation.Outline
+    /// and .Head are already the exact geometry the live preview draws. Giving
+    /// the preview its own emit path is how a shape comes to jump the instant
+    /// the pointer lifts, so it goes through the same lines below.
+    ///
+    /// LAST, so it paints over everything committed, which is what the overlay
+    /// does by adding it to the canvas after the rest.
+    /// </param>
     public static IReadOnlyList<ShapeRenderItem> From(
         IEnumerable<InkStrokeAnnotation> strokes,
-        IEnumerable<ShapeAnnotation> shapes)
+        IEnumerable<ShapeAnnotation> shapes,
+        ShapeAnnotation? preview = null)
     {
         var items = new List<ShapeRenderItem>();
 
@@ -77,6 +92,18 @@ public static class ShapeRenderList
         }
 
         foreach (var shape in shapes)
+        {
+            Emit(shape);
+        }
+
+        if (preview is not null)
+        {
+            Emit(preview);
+        }
+
+        return items;
+
+        void Emit(ShapeAnnotation shape)
         {
             var color = ColorOf(shape.ColorHex);
 
@@ -93,8 +120,6 @@ public static class ShapeRenderList
                     shape.PageIndex, head, color, shape.StrokeWidth, RenderStyle.Filled));
             }
         }
-
-        return items;
     }
 
     /// <summary>

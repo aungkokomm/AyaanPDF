@@ -5707,12 +5707,34 @@ public sealed partial class MainPage : Page
         }
 
         SkiaShapeCanvas.Show(
-            ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes),
+            ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape()),
             ViewModel.OverlayScale,
             ViewModel.SlotTopOf,
             ViewModel.ViewTransformOf,
             CurrentViewportProjection());
     }
+
+    /// <summary>
+    /// The shape currently being dragged, as the annotation it is about to
+    /// become, or null when nothing is in progress.
+    ///
+    /// Built from the SAME four values the overlay's preview reads, so the two
+    /// renderers preview the same thing. Because a ShapeAnnotation derives its
+    /// outline and head from the draft, the preview cannot disagree with the
+    /// committed shape that replaces it at pointer-up.
+    ///
+    /// Freehand ink is deliberately NOT previewed here. Its guide is a flat red
+    /// 2-DIP line rather than the stroke's own colour and weight, and a
+    /// ShapeRenderItem carries a NORMALIZED width that the painter multiplies
+    /// back up, so expressing a fixed 2 DIPs would mean passing a reciprocal
+    /// whose only purpose is to cancel that multiplication. Left out rather
+    /// than smuggled in.
+    /// </summary>
+    private ShapeAnnotation? PreviewShape() =>
+        ViewModel.ShapeInProgress is { } draft
+            ? new ShapeAnnotation(
+                ViewModel.ActiveShapePage, draft, ViewModel.InkColorHex, ViewModel.InkWidth)
+            : null;
 
     /// <summary>
     /// Where slot space currently sits on the viewport, as plain numbers.
@@ -5816,7 +5838,24 @@ public sealed partial class MainPage : Page
 
     private Polygon? _livePreviewHead;
 
+    /// <summary>
+    /// The live preview changed. Split exactly like OnInkStrokesCollectionChanged
+    /// above: the overlay's preview is rebuilt as it always was, and the
+    /// candidate renderer is a SECOND consumer of the same signal rather than a
+    /// change to the first.
+    ///
+    /// The refresh sits out here, not inside UpdateInkPreview, because that
+    /// method returns early when there is nothing in progress and THAT is the
+    /// case which has to clear the preview off the Skia surface. A cancelled
+    /// drag leaves a ghost otherwise.
+    /// </summary>
     private void OnInkStrokeChanged()
+    {
+        UpdateInkPreview();
+        RefreshSkiaShapeLayer();
+    }
+
+    private void UpdateInkPreview()
     {
         // A shape being dragged previews through the same path as ink, built
         // from ShapeGeometry: the preview and the committed shape come from one

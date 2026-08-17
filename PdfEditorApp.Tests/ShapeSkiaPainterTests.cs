@@ -232,26 +232,108 @@ public class ShapeSkiaPainterTests
         Assert.Equal(pixel.Green, pixel.Blue);
     }
 
-    [Fact]
-    public void a_filled_item_is_not_painted_yet()
-    {
-        // Stage 1 covers stroked marks only. Pinned rather than assumed, so the
-        // day an arrow head is expected to appear, this test says where it went.
-        var arrow = new ShapeAnnotation(
-            0, new ShapeDraft(ShapeKind.Arrow, 0.1, 0.1, 0.4, 0.3), "#FF000000", StrokeWidthNorm);
+    /// <summary>
+    /// An arrow, whose head is the only filled item the app produces.
+    /// </summary>
+    private static IReadOnlyList<ShapeRenderItem> Arrow() =>
+        ShapeRenderList.From([], [
+            new ShapeAnnotation(
+                0, new ShapeDraft(ShapeKind.Arrow, 0.1, 0.1, 0.4, 0.3), "#FF000000", StrokeWidthNorm),
+        ]);
 
-        var head = ShapeRenderList.From([], [arrow])[1];
+    [Fact]
+    public void a_filled_item_is_painted_as_a_solid_area()
+    {
+        // This replaces a_filled_item_is_not_painted_yet, which pinned the
+        // stage-1 gap and said where the arrow tip had gone. The tip is now
+        // drawn, so the assertion is inverted rather than deleted: the head has
+        // to be SOLID, and the way to show that is a point strictly inside the
+        // triangle, which a stroked outline would leave white.
+        var head = Arrow()[1];
         Assert.Equal(RenderStyle.Filled, head.Style);
 
         using var bitmap = Render([head]);
 
-        for (int y = 0; y < 400; y += 4)
+        var (cx, cy) = Centroid(head);
+        Assert.False(IsWhite(bitmap.GetPixel(cx, cy)),
+                     $"the head's interior at ({cx}, {cy}) was not filled");
+    }
+
+    [Fact]
+    public void the_head_is_painted_over_the_shaft_and_not_instead_of_it()
+    {
+        // Both items, in list order, which is what an arrow actually is. A
+        // painter that drew only the last item, or skipped the first, would
+        // still produce something arrow-shaped.
+        var items = Arrow();
+        Assert.Equal(2, items.Count);
+
+        using var bitmap = Render(items);
+
+        var (hx, hy) = Centroid(items[1]);
+        Assert.False(IsWhite(bitmap.GetPixel(hx, hy)), "head missing");
+
+        // A point on the shaft, near its start, well away from the head.
+        var (sx, sy) = SlotPixel(items[0].Points[0]);
+        Assert.False(IsWhite(bitmap.GetPixel(sx, sy)), "shaft missing");
+    }
+
+    [Fact]
+    public void a_filled_item_takes_its_own_colour_and_alpha()
+    {
+        // The fill goes through the same channel order as a stroke. A swap here
+        // would be invisible on the black fixture every other test uses.
+        var arrow = new ShapeAnnotation(
+            0, new ShapeDraft(ShapeKind.Arrow, 0.1, 0.1, 0.4, 0.3), "#FF112233", StrokeWidthNorm);
+
+        var head = ShapeRenderList.From([], [arrow])[1];
+        using var bitmap = Render([head]);
+
+        var (cx, cy) = Centroid(head);
+        var pixel = bitmap.GetPixel(cx, cy);
+
+        Assert.Equal(0x11, pixel.Red);
+        Assert.Equal(0x22, pixel.Green);
+        Assert.Equal(0x33, pixel.Blue);
+    }
+
+    [Fact]
+    public void a_head_with_too_few_points_is_not_painted_as_a_sliver()
+    {
+        // The mapper only emits a head at exactly three points, but the painter
+        // is handed lists by more than one caller now that a live preview feeds
+        // it, so it guards too.
+        var sliver = new ShapeRenderItem(
+            0, [(0.2, 0.2), (0.3, 0.3)], new RenderColor(255, 0, 0, 0),
+            StrokeWidthNorm, RenderStyle.Filled);
+
+        using var bitmap = Render([sliver]);
+
+        Assert.True(IsWhite(bitmap.GetPixel(200, 200)));
+        Assert.True(IsWhite(bitmap.GetPixel(240, 240)));
+    }
+
+    private static (int X, int Y) SlotPixel((double X, double Y) normalized)
+    {
+        var (x, y) = OverlayProjection.ToSlot(normalized, Scale, 0, Flat(0));
+        return ((int)Math.Round(x), (int)Math.Round(y));
+    }
+
+    /// <summary>
+    /// The middle of a triangle, in pixels. Strictly inside it, which is the
+    /// whole point: it is white for an outline and coloured for a fill.
+    /// </summary>
+    private static (int X, int Y) Centroid(ShapeRenderItem item)
+    {
+        double x = 0, y = 0;
+        foreach (var p in item.Points)
         {
-            for (int x = 0; x < 400; x += 4)
-            {
-                Assert.True(IsWhite(bitmap.GetPixel(x, y)), $"filled head painted at ({x}, {y})");
-            }
+            var (sx, sy) = OverlayProjection.ToSlot(p, Scale, 0, Flat(0));
+            x += sx;
+            y += sy;
         }
+
+        return ((int)Math.Round(x / item.Points.Count), (int)Math.Round(y / item.Points.Count));
     }
 
     [Fact]

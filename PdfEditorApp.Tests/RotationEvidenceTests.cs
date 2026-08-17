@@ -112,9 +112,13 @@ public class RotationEvidenceTests
         // has to resolve the page ONCE: taking the thickness from one page's
         // transform and the points from another is a way to be subtly wrong
         // only while drawing on a neighbouring page.
+        // The preview builder was split out of OnInkStrokeChanged when the Skia
+        // layer became a second consumer of the same signal, exactly as
+        // RebuildInkCanvas already was. The arithmetic did not move; only its
+        // name did, so this reads the new one.
         string body = BodyOf(
             ReadSource("PdfEditorApp", "MainPage.xaml.cs"),
-            "private void OnInkStrokeChanged()");
+            "private void UpdateInkPreview()");
 
         Assert.Contains("ViewTransformOf(previewPage)", body, StringComparison.Ordinal);
         Assert.Contains("previewView.ToCard(x * scale, y * scale)", body, StringComparison.Ordinal);
