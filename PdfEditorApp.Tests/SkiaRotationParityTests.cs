@@ -343,6 +343,8 @@ public class SkiaRotationParityTests
     [Theory]
     [InlineData(0)]
     [InlineData(90)]
+    [InlineData(180)]
+    [InlineData(270)]
     public void skia_paints_the_guide_at_two_dips_on_a_turned_page_as_well(int rotation)
     {
         // A normalized width would thin to 1.6 at 90 degrees, because the page
@@ -351,6 +353,10 @@ public class SkiaRotationParityTests
         //
         // Measured across a long horizontal run so the scan crosses the stroke
         // once, and Skia's half-device-pixel snap leaves 2.0 exactly alone.
+        //
+        // The scan direction follows the mark: a horizontal segment stays
+        // horizontal at 0 and 180 and stands up at 90 and 270, and scanning the
+        // wrong way runs ALONG the stroke and measures its length instead.
         var guide = ShapeRenderList.InkGuide(0, [(0.1, 0.25), (0.6, 0.25)]);
 
         using var bitmap = Render([guide], rotation);
@@ -358,11 +364,214 @@ public class SkiaRotationParityTests
         var mid = OverlayProjection.ToSlot((0.35, 0.25), Scale, 0, View(rotation));
         int x = (int)Math.Round(mid.X), y = (int)Math.Round(mid.Y);
 
-        double ink = rotation == 0
+        double ink = rotation is 0 or 180
             ? InkDownColumn(bitmap, x, y - 8, y + 8)
             : InkAcrossRow(bitmap, y, x - 8, x + 8);
 
         Assert.Equal(2.0, ink, precision: 1);
+    }
+
+    // ---------------- tier 1: every subject, every rotation ----------------
+    //
+    // Tier 1 measures Skia's pixels against an expectation computed here, from
+    // the shared projection, touching neither renderer. It is the gate that can
+    // fail a build. Tier 2, the in-app capture, is the only thing that can
+    // produce the REFERENCE renderer's pixels, and it produces a report rather
+    // than a verdict. The two are deliberately not mixed.
+    //
+    // The fixture matches tier 2's, so a cell here and a row of
+    // stage4-parity.csv are talking about the same shape.
+
+    private const double MatrixStroke = 0.01;
+
+    private static readonly ShapeDraft MatrixDraft = new(ShapeKind.Rectangle, 0.12, 0.12, 0.72, 0.68);
+
+    private static readonly (double X, double Y)[] MatrixInk =
+    [
+        (0.15, 0.20), (0.28, 0.34), (0.41, 0.28), (0.55, 0.47),
+        (0.62, 0.71), (0.74, 0.66), (0.80, 0.85),
+    ];
+
+    public static TheoryData<string, int> Cells()
+    {
+        var cells = new TheoryData<string, int>();
+        foreach (string subject in new[] { "rect", "ellipse", "line", "arrow", "ink" })
+        {
+            foreach (int rotation in new[] { 0, 90, 180, 270 })
+            {
+                cells.Add(subject, rotation);
+            }
+        }
+
+        return cells;
+    }
+
+    private static ShapeKind? KindOf(string subject) => subject switch
+    {
+        "rect" => ShapeKind.Rectangle,
+        "ellipse" => ShapeKind.Ellipse,
+        "line" => ShapeKind.Line,
+        "arrow" => ShapeKind.Arrow,
+        _ => null,
+    };
+
+    private static IReadOnlyList<ShapeRenderItem> ItemsFor(string subject) =>
+        KindOf(subject) is { } kind
+            ? ShapeRenderList.From([], [
+                new ShapeAnnotation(0, MatrixDraft with { Kind = kind }, "#FF000000", MatrixStroke)])
+            : ShapeRenderList.From([], [], inkPreview: ShapeRenderList.InkGuide(0, MatrixInk));
+
+    /// <summary>
+    /// Where the whole subject should land, from the shared projection alone.
+    ///
+    /// Each item is grown by HALF ITS OWN width, because a path is stroked
+    /// about its centreline and a filled head carries only the hairline. Using
+    /// one width for both would make the arrow's expectation wrong by the
+    /// difference between them.
+    /// </summary>
+    private static (double L, double T, double R, double B) ExpectedBounds(
+        IReadOnlyList<ShapeRenderItem> items, PageTransform view)
+    {
+        double l = double.MaxValue, t = double.MaxValue, r = double.MinValue, b = double.MinValue;
+
+        foreach (var item in items)
+        {
+            double reach = (item.Style == RenderStyle.Filled
+                ? OverlayProjection.HeadHairlineDips
+                : OverlayProjection.WidthOf(item, Scale, view)) / 2;
+
+            foreach (var p in item.Points)
+            {
+                var (x, y) = OverlayProjection.ToSlot(p, Scale, 0, view);
+                l = Math.Min(l, x - reach); t = Math.Min(t, y - reach);
+                r = Math.Max(r, x + reach); b = Math.Max(b, y + reach);
+            }
+        }
+
+        return (l, t, r, b);
+    }
+
+    [Theory]
+    [MemberData(nameof(Cells))]
+    public void every_subject_lands_where_the_shared_projection_says(string subject, int rotation)
+    {
+        // The backbone. Skia's actual ink, against arithmetic that has not been
+        // near a renderer, for all five subjects at all four rotations.
+        //
+        // Two pixels of slack, and no more: antialiasing spreads an edge about
+        // a pixel either way and Skia's stroker snaps a width to the nearest
+        // half device pixel, which moves both edges by up to a quarter each.
+        var view = View(rotation);
+        var items = ItemsFor(subject);
+
+        using var bitmap = Render(items, rotation);
+        var (l, t, r, b) = InkedBounds(bitmap);
+        var want = ExpectedBounds(items, view);
+
+        Assert.InRange(l, want.L - 2, want.L + 2);
+        Assert.InRange(t, want.T - 2, want.T + 2);
+        Assert.InRange(r, want.R - 2, want.R + 2);
+        Assert.InRange(b, want.B - 2, want.B + 2);
+    }
+
+    [Theory]
+    [MemberData(nameof(Cells))]
+    public void every_subject_is_painted_along_its_own_path(string subject, int rotation)
+    {
+        // Bounds alone cannot tell an ellipse from the rectangle that contains
+        // it, or a line from its own bounding box. This samples a point that is
+        // ON the shape and strictly off its box corners, so a subject drawn as
+        // the wrong primitive fails even though its extent is right.
+        var view = View(rotation);
+        using var bitmap = Render(ItemsFor(subject), rotation);
+
+        var (x, y) = OverlayProjection.ToSlot(OnPath(subject), Scale, 0, view);
+
+        Assert.False(IsWhite(bitmap.GetPixel((int)Math.Round(x), (int)Math.Round(y))),
+                     $"{subject} at {rotation} has no ink at its own ({x:F1}, {y:F1})");
+    }
+
+    /// <summary>
+    /// A point genuinely on the drawn path, taken from the geometry rather than
+    /// written down, so it cannot drift from what the shape actually is.
+    /// </summary>
+    private static (double X, double Y) OnPath(string subject)
+    {
+        if (KindOf(subject) is not { } kind)
+        {
+            return MatrixInk[3];            // a vertex of the guide
+        }
+
+        var draft = MatrixDraft with { Kind = kind };
+
+        if (kind == ShapeKind.Ellipse)
+        {
+            // 45 degrees round the ellipse: inside the box's corner, outside
+            // its edges, so neither a rectangle nor a diagonal passes here.
+            double cx = (draft.Left + draft.Right) / 2, cy = (draft.Top + draft.Bottom) / 2;
+            const double Diagonal = 0.70710678118654752;
+
+            return (cx + (draft.Width / 2 * Diagonal), cy + (draft.Height / 2 * Diagonal));
+        }
+
+        if (kind == ShapeKind.Rectangle)
+        {
+            return ((draft.Left + draft.Right) / 2, draft.Top);
+        }
+
+        // Line and arrow: the middle of the shaft the geometry reports, which
+        // for an arrow is shorter than the drag because the head takes the end.
+        var outline = new ShapeAnnotation(0, draft, "#FF000000", MatrixStroke).Outline;
+
+        return ((outline[0].X + outline[^1].X) / 2, (outline[0].Y + outline[^1].Y) / 2);
+    }
+
+    [Theory]
+    [MemberData(nameof(Cells))]
+    public void turning_the_page_moves_every_subject(string subject, int rotation)
+    {
+        // At 0 this asserts the mark does NOT move, which is the property every
+        // existing unrotated document depends on. At the other three it has to.
+        using var flat = Render(ItemsFor(subject), 0);
+        using var turned = Render(ItemsFor(subject), rotation);
+
+        if (rotation == 0)
+        {
+            Assert.Equal(InkedBounds(flat), InkedBounds(turned));
+            return;
+        }
+
+        Assert.NotEqual(InkedBounds(flat), InkedBounds(turned));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(90)]
+    [InlineData(180)]
+    [InlineData(270)]
+    public void an_arrows_head_is_solid_at_every_rotation(int rotation)
+    {
+        // The head is the only filled item the app produces, and it is painted
+        // by its own branch. A point strictly inside the triangle is white for
+        // an outline and coloured for a fill.
+        var view = View(rotation);
+        var items = ItemsFor("arrow");
+
+        var head = Assert.Single(items, i => i.Style == RenderStyle.Filled);
+        using var bitmap = Render(items, rotation);
+
+        double cx = 0, cy = 0;
+        foreach (var p in head.Points)
+        {
+            var (x, y) = OverlayProjection.ToSlot(p, Scale, 0, view);
+            cx += x; cy += y;
+        }
+
+        int px = (int)Math.Round(cx / head.Points.Count);
+        int py = (int)Math.Round(cy / head.Points.Count);
+
+        Assert.False(IsWhite(bitmap.GetPixel(px, py)),
+                     $"the head's interior at {rotation} degrees was not filled");
     }
 
     // ---------------- culling has to agree with painting ----------------
