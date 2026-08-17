@@ -595,14 +595,26 @@ public class SkiaRotationParityTests
         Assert.Single(ShapeCulling.Visible([item], window, Scale, _ => 0, _ => View(90)));
     }
 
-    // ---------------- the layer is still off, and still isolated ----------------
+    // ---------------- the layer is on, and the way back is still there ----------------
 
     [Fact]
-    public void the_skia_layer_is_still_not_on_by_default()
+    public void the_skia_layer_is_the_default_renderer()
     {
-        // Commit 4 makes Skia correct under rotation. It does not make it the
-        // renderer. Default-off is the rollback the whole migration rests on.
-        Assert.False(new AppSettings().UseSkiaShapeLayer);
+        // This assertion used to say the opposite, and changing it was the
+        // whole content of a commit of its own. Stage 4 is what moved it: 72
+        // parity cells reproducing byte for byte, no Skia fault found in any of
+        // them, and a frame cost that stopped scaling with the window.
+        Assert.True(new AppSettings().UseSkiaShapeLayer);
+    }
+
+    [Fact]
+    public void the_xaml_overlay_is_still_reachable_by_turning_the_switch_off()
+    {
+        // The rollback the migration rests on, and the reason this is a switch
+        // and not a deletion. Both layers are built and exactly one is shown,
+        // so setting this false in settings.json puts the old renderer back
+        // with no reload and no change to the document.
+        Assert.False(new AppSettings { UseSkiaShapeLayer = false }.UseSkiaShapeLayer);
     }
 
     [Fact]

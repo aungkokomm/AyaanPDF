@@ -118,18 +118,27 @@ public sealed record AppSettings
     public bool NightMode { get; init; }
 
     /// <summary>
-    /// Draws editable shapes with the candidate Skia renderer instead of the
-    /// XAML overlay.
+    /// Draws editable shapes with the Skia renderer rather than the XAML
+    /// overlay.
     ///
-    /// OFF, and it stays off until parity has been proved and manually
-    /// verified. Both layers are built and exactly one is shown, so this is the
-    /// rollback: turning it off restores the renderer that has always been on
-    /// screen, with no reload and no change to the document.
+    /// ON, as of Stage 4. It was off for as long as it was a candidate, and it
+    /// turned on when the evidence was in rather than when it looked ready:
+    /// 72 parity cells whose verdicts reproduce byte for byte across runs, no
+    /// Skia rendering fault found in any of them, and a per-frame cost that
+    /// stopped being proportional to the size of the window.
     ///
-    /// Not in any menu on purpose. It is a development switch, set by hand in
-    /// settings.json, and it should not read as a feature until it is one.
+    /// The XAML overlay is still built and still correct, and setting this to
+    /// false in settings.json restores it with no reload and no change to the
+    /// document. Both layers exist and exactly one is shown, which is what
+    /// makes this a switch rather than a migration.
+    ///
+    /// A STORED VALUE WINS. Settings are serialised in full, so a settings.json
+    /// written before this changed carries an explicit false and keeps that
+    /// machine on the XAML overlay. That is the right way round for something a
+    /// person may have chosen, but it does mean this default governs fresh
+    /// installs rather than existing ones.
     /// </summary>
-    public bool UseSkiaShapeLayer { get; init; }
+    public bool UseSkiaShapeLayer { get; init; } = true;
 
     /// <summary>
     /// Whether the viewport shows the whole document as one scrolling stack or
