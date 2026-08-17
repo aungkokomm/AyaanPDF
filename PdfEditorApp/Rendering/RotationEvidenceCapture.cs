@@ -182,7 +182,11 @@ internal static class RotationEvidenceCapture
         // the grid's own transform then turns along with the page.
         if (perPage)
         {
-            content.Children.Add(MarkIn(shape, PerPage));
+            content.Children.Add(MarkIn(shape, PerPage, perPageSpace: true, view));
+            if (HeadIn(shape, PerPage, perPageSpace: true, view) is { } head)
+            {
+                content.Children.Add(head);
+            }
         }
 
         var card = new Grid
@@ -209,7 +213,11 @@ internal static class RotationEvidenceCapture
         if (inkLayer)
         {
             var layer = new Canvas { IsHitTestVisible = false };
-            layer.Children.Add(MarkIn(shape, InkLayer));
+            layer.Children.Add(MarkIn(shape, InkLayer, perPageSpace: false, view));
+            if (HeadIn(shape, InkLayer, perPageSpace: false, view) is { } head)
+            {
+                layer.Children.Add(head);
+            }
             stack.Children.Add(layer);
         }
 
@@ -233,21 +241,59 @@ internal static class RotationEvidenceCapture
     /// thing under test, and a source guard in RotationEvidenceTests holds the
     /// real method to the same arithmetic.
     /// </summary>
-    private static Polyline MarkIn(ShapeAnnotation shape, Color color)
+    /// <summary>
+    /// An arrow's filled head, the way BuildFilledHead now draws one, or null
+    /// for a shape that has none.
+    ///
+    /// Included because the head is a SEPARATE polygon built by a separate
+    /// method. A capture of only the shaft would have shown an arrow following
+    /// the page perfectly while its tip stayed behind.
+    /// </summary>
+    private static Polygon? HeadIn(
+        ShapeAnnotation shape, Color color, bool perPageSpace, PageTransform view)
     {
-        // Both are authored at the same thickness. The per-page one is then
-        // additionally scaled by the grid's view.Scale, which is correct and is
-        // part of what the ink layer currently fails to do.
+        var head = shape.Head;
+        if (head.Count != 3)
+        {
+            return null;
+        }
+
+        var brush = new SolidColorBrush(color);
+        var polygon = new Polygon { Fill = brush, Stroke = brush, StrokeThickness = 0.5 };
+
+        foreach (var (nx, ny) in head)
+        {
+            var (x, y) = OverlayProjection.ToSlot((nx, ny), Scale, 0);
+            var (cx, cy) = perPageSpace ? (x, y) : view.ToCard(x, y);
+            polygon.Points.Add(new Point(cx, cy));
+        }
+
+        return polygon;
+    }
+
+    private static Polyline MarkIn(
+        ShapeAnnotation shape, Color color, bool perPageSpace, PageTransform view)
+    {
+        // The per-page mark is authored in CONTENT coordinates and the grid it
+        // sits in applies view.Scale for it. The ink-layer mark is outside that
+        // grid, so it applies the same scale itself, exactly as the corrected
+        // BuildStrokePolyline now does.
         var line = new Polyline
         {
             Stroke = new SolidColorBrush(color),
-            StrokeThickness = StrokeWidthNorm * Scale,
+            StrokeThickness = perPageSpace
+                ? StrokeWidthNorm * Scale
+                : StrokeWidthNorm * Scale * view.Scale,
         };
 
         foreach (var (nx, ny) in shape.Outline)
         {
             var (x, y) = OverlayProjection.ToSlot((nx, ny), Scale, 0);
-            line.Points.Add(new Point(x, y));
+
+            // The correction under test. A per-page mark is turned by its
+            // grid; an ink-layer mark has to turn itself.
+            var (cx, cy) = perPageSpace ? (x, y) : view.ToCard(x, y);
+            line.Points.Add(new Point(cx, cy));
         }
 
         return line;

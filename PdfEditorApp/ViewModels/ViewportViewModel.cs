@@ -2837,6 +2837,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public double SlotHeightOf(int pageIndex) => _layout.HeightOf(pageIndex);
 
+    /// <summary>
+    /// How a page's content is turned inside its card, for anything drawn OVER
+    /// that page rather than inside it.
+    ///
+    /// The page card, the highlights, the search hits and the selection chrome
+    /// all sit inside the grid this transform is bound to, so they follow the
+    /// view rotation for free. The ink layer spans the whole stack and is
+    /// outside every card, so it has to apply the same turn itself.
+    ///
+    /// Identity for an unturned page, so a caller that always routes through it
+    /// changes nothing at 0 degrees.
+    /// </summary>
+    public PageTransform ViewTransformOf(int pageIndex) =>
+        _layout.SlotForPage(pageIndex)?.Transform
+        ?? PageTransform.For(OverlayScale, OverlayScale, 0, OverlayScale);
+
     /// <summary>Which page contains the given Y in slot-space (ViewportHost's
     /// content minus Padding.Top), or -1 if the Y is above the first page or
     /// past the last one. Linear walk over slots is fine - typical documents

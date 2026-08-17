@@ -5770,16 +5770,21 @@ public sealed partial class MainPage : Page
     {
         double scale = ViewModel.OverlayScale;
         double pageTop = ViewModel.SlotTopOf(stroke.PageIndex);
+        var view = ViewModel.ViewTransformOf(stroke.PageIndex);
 
         var polyline = new Polyline
         {
             Stroke = new SolidColorBrush(ColorFromHex(stroke.ColorHex)),
-            StrokeThickness = stroke.StrokeWidth * scale,
+            // view.Scale as well as the overlay scale: a page turned sideways is
+            // scaled to bring its other axis to the card's width, so a mark on
+            // it is a different weight as well as in a different place.
+            StrokeThickness = stroke.StrokeWidth * scale * view.Scale,
         };
 
         foreach (var (x, y) in stroke.Points)
         {
-            polyline.Points.Add(new Point(x * scale, y * scale + pageTop));
+            var (cx, cy) = view.ToCard(x * scale, y * scale);
+            polyline.Points.Add(new Point(cx, cy + pageTop));
         }
 
         return polyline;
@@ -5794,13 +5799,15 @@ public sealed partial class MainPage : Page
     {
         double scale = ViewModel.OverlayScale;
         double pageTop = ViewModel.SlotTopOf(pageIndex);
+        var view = ViewModel.ViewTransformOf(pageIndex);
 
         var brush = new SolidColorBrush(ColorFromHex(colorHex));
         var polygon = new Polygon { Fill = brush, Stroke = brush, StrokeThickness = 0.5 };
 
         foreach (var (x, y) in points)
         {
-            polygon.Points.Add(new Point(x * scale, (y * scale) + pageTop));
+            var (cx, cy) = view.ToCard(x * scale, y * scale);
+            polygon.Points.Add(new Point(cx, cy + pageTop));
         }
 
         return polygon;
@@ -5845,6 +5852,15 @@ public sealed partial class MainPage : Page
 
         double scale = ViewModel.OverlayScale;
 
+        // The page the preview is anchored to, resolved once: the thickness
+        // below and the points further down must use the SAME page's transform,
+        // or a preview drawn on a turned page is the wrong weight for its own
+        // geometry.
+        int previewPage = ViewModel.ShapeInProgress is not null
+            ? ViewModel.ActiveShapePage
+            : ViewModel.ActiveInkPage;
+        var previewView = ViewModel.ViewTransformOf(previewPage);
+
         if (_livePreviewStroke is null)
         {
             // A shape previews in ITS OWN colour and width, so what is on
@@ -5857,7 +5873,12 @@ public sealed partial class MainPage : Page
                 Stroke = shaping
                     ? new SolidColorBrush(ColorFromHex(ViewModel.InkColorHex))
                     : new SolidColorBrush(Colors.Red),
-                StrokeThickness = shaping ? ViewModel.InkWidth * ViewModel.OverlayScale : 2,
+                // Scaled by the page's transform for the same reason a
+                // committed stroke is. The freehand guide stays a flat 2: it is
+                // a guide, not a preview of a weight.
+                StrokeThickness = shaping
+                    ? ViewModel.InkWidth * ViewModel.OverlayScale * previewView.Scale
+                    : 2,
             };
             InkCanvas.Children.Add(_livePreviewStroke);
         }
@@ -5868,13 +5889,13 @@ public sealed partial class MainPage : Page
         // Anchored to the page the stroke STARTED on, not the current page:
         // in continuous view you can start drawing on a visible page that is
         // not the current one, and the preview must land where the ink will.
-        double pageTop = ViewModel.SlotTopOf(
-            ViewModel.ShapeInProgress is not null ? ViewModel.ActiveShapePage : ViewModel.ActiveInkPage);
+        double pageTop = ViewModel.SlotTopOf(previewPage);
 
         _livePreviewStroke.Points.Clear();
         foreach (var (x, y) in points)
         {
-            _livePreviewStroke.Points.Add(new Point(x * scale, y * scale + pageTop));
+            var (cx, cy) = previewView.ToCard(x * scale, y * scale);
+            _livePreviewStroke.Points.Add(new Point(cx, cy + pageTop));
         }
     }
 
@@ -7107,11 +7128,38 @@ public sealed partial class MainPage : Page
             IsHitTestVisible = false,
         };
 
+        var box = CardRect(page, nx, ny, nx, ny);
+        Canvas.SetLeft(_textBoxPreview, box.Left);
+        Canvas.SetTop(_textBoxPreview, box.Top);
+        InkCanvas.Children.Add(_textBoxPreview);
+    }
+
+    /// <summary>
+    /// A normalized rectangle on a page, as a slot-space rectangle on its card.
+    ///
+    /// Both opposite corners go through the same ToCard the strokes use, and
+    /// the bounds are taken AFTERWARDS. Taking them first, in normalized space,
+    /// is what the preview used to do, and it is wrong the moment the page is
+    /// turned: the corner that was top-left is not top-left any more.
+    ///
+    /// Every view rotation is a quarter turn, so an axis-aligned rectangle maps
+    /// to an axis-aligned rectangle exactly and nothing needs a RenderTransform;
+    /// at 90 and 270 the width and height simply swap.
+    /// </summary>
+    private (double Left, double Top, double Width, double Height) CardRect(
+        int page, double nx1, double ny1, double nx2, double ny2)
+    {
         double scale = ViewModel.OverlayScale;
         double pageTop = ViewModel.SlotTopOf(page);
-        Canvas.SetLeft(_textBoxPreview, nx * scale);
-        Canvas.SetTop(_textBoxPreview, (ny * scale) + pageTop);
-        InkCanvas.Children.Add(_textBoxPreview);
+        var view = ViewModel.ViewTransformOf(page);
+
+        var (ax, ay) = view.ToCard(nx1 * scale, ny1 * scale);
+        var (bx, by) = view.ToCard(nx2 * scale, ny2 * scale);
+
+        return (System.Math.Min(ax, bx),
+                System.Math.Min(ay, by) + pageTop,
+                System.Math.Abs(bx - ax),
+                System.Math.Abs(by - ay));
     }
 
     private void UpdateTextBoxPreview(double nx, double ny)
@@ -7121,15 +7169,11 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        double scale = ViewModel.OverlayScale;
-        double pageTop = ViewModel.SlotTopOf(_textDragPage);
-
-        double left = System.Math.Min(_textDragStartX, nx);
-        double top = System.Math.Min(_textDragStartY, ny);
-        Canvas.SetLeft(_textBoxPreview, left * scale);
-        Canvas.SetTop(_textBoxPreview, (top * scale) + pageTop);
-        _textBoxPreview.Width = System.Math.Abs(nx - _textDragStartX) * scale;
-        _textBoxPreview.Height = System.Math.Abs(ny - _textDragStartY) * scale;
+        var box = CardRect(_textDragPage, _textDragStartX, _textDragStartY, nx, ny);
+        Canvas.SetLeft(_textBoxPreview, box.Left);
+        Canvas.SetTop(_textBoxPreview, box.Top);
+        _textBoxPreview.Width = box.Width;
+        _textBoxPreview.Height = box.Height;
     }
 
     private void EndTextBoxSizing(double nx, double ny)

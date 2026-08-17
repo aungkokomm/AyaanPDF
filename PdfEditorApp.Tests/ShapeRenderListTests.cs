@@ -158,14 +158,21 @@ public class ShapeRenderListTests
     [Fact]
     public void the_overlay_still_projects_the_way_this_assembly_believes_it_does()
     {
-        // OverlayProjection claims to reproduce BuildStrokePolyline. This
-        // assembly cannot call it, so the claim is guarded at the source. If
-        // someone changes the reference renderer, the parity work built on top
-        // of it must fail loudly rather than quietly stop being parity.
+        // OverlayProjection claims to reproduce BuildStrokePolyline, and this
+        // assembly cannot call it, so the claim is guarded at the source.
+        //
+        // That claim is now PARTIAL, deliberately, and this test caught it. The
+        // overlay was corrected to route every point through the page's
+        // PageTransform, so normalized-to-slot is no longer the whole story: it
+        // is OverlayProjection's step followed by ToCard. Skia still does only
+        // the first half, which is a known divergence under view rotation and
+        // is what the next commit aligns. Everything else, at every rotation
+        // the app can actually be in when Skia is enabled, is unaffected,
+        // because ToCard is the identity at 0 degrees.
         string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
 
-        Assert.Contains("new Point(x * scale, y * scale + pageTop)", page, StringComparison.Ordinal);
-        Assert.Contains("StrokeThickness = stroke.StrokeWidth * scale", page, StringComparison.Ordinal);
+        Assert.Contains("view.ToCard(x * scale, y * scale)", page, StringComparison.Ordinal);
+        Assert.Contains("stroke.StrokeWidth * scale * view.Scale", page, StringComparison.Ordinal);
     }
 
     [Fact]
