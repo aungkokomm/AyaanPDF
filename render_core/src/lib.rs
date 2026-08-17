@@ -4633,7 +4633,18 @@ fn add_shape_annotations_inner(
             None
         };
 
-        let path = match spec.kind {
+        // THE SHADOW IS THE SAME GEOMETRY, and this closure is what makes that
+        // true rather than merely intended. Both the shape and its shadow are
+        // built from these lines; a second copy for the shadow would be a
+        // second geometry system, and the two would drift the first time a
+        // corner radius or an arrow taper changed.
+        //
+        // The offsets shadow the outer coordinates, so the body below is
+        // exactly the code that was here before and reads as if there were no
+        // such thing as an effect.
+        let build_path = |ox: f32, oy: f32, color: PdfColor, fill: Option<PdfColor>| {
+        let (x1, y1, x2, y2) = (x1 + ox, y1 + oy, x2 + ox, y2 + oy);
+        match spec.kind {
             SHAPE_RECTANGLE | SHAPE_ELLIPSE => {
                 let rect = PdfRect::new(
                     PdfPoints::new(y1.min(y2)),
@@ -4718,9 +4729,10 @@ fn add_shape_annotations_inner(
                     PdfPoints::new(width_pts),
                 )
             }
+        }
         };
 
-        let Ok(mut path) = path else {
+        let Ok(mut path) = build_path(0.0, 0.0, color, fill) else {
             continue;
         };
 
@@ -4728,11 +4740,9 @@ fn add_shape_annotations_inner(
         // measured so its points are inside them: PDFium clips an appearance to
         // its box, and a head outside would be cut off silently, leaving what
         // looks like a plain line.
-        let head = if spec.kind == SHAPE_ARROW {
+        let build_head = |ox: f32, oy: f32, color: PdfColor| {
+            let (x1, y1, x2, y2) = (x1 + ox, y1 + oy, x2 + ox, y2 + oy);
             let (_, tip, left, right) = arrow_parts(x1, y1, x2, y2, width_pts);
-            extent.push(tip);
-            extent.push(left);
-            extent.push(right);
 
             let built = PdfPagePathObject::new_line(
                 &doc_guard,
@@ -4753,6 +4763,13 @@ fn add_shape_annotations_inner(
                 Ok(t)
             });
 
+            (built, [tip, left, right])
+        };
+
+        let head = if spec.kind == SHAPE_ARROW {
+            let (built, points) = build_head(0.0, 0.0, color);
+            extent.extend_from_slice(&points);
+
             match built {
                 Ok(t) => Some(t),
                 Err(_) => continue,
@@ -4760,6 +4777,14 @@ fn add_shape_annotations_inner(
         } else {
             None
         };
+
+        // The shadow's offset in PDF points. Y is NEGATED because the page's
+        // vertical axis runs the other way to the screen's: to_pdf_y subtracts,
+        // so a shadow cast downwards on screen is a smaller y here. Getting
+        // this sign wrong puts every shadow on the wrong side of its shape,
+        // which is why there is a test that only passes for one of them.
+        let (sdx, sdy) = (spec.shadow_dx_px * scale, -(spec.shadow_dy_px * scale));
+        let has_shadow = spec.shadow_rgba != 0;
 
         let pad = width_pts / 2.0 + 1.0;
         let min_x = extent.iter().map(|p| p.0).fold(f32::MAX, f32::min) - pad;
@@ -4776,12 +4801,28 @@ fn add_shape_annotations_inner(
         let cx = (min_x + max_x) / 2.0;
         let cy = (min_y + max_y) / 2.0;
 
+        // PDFium CLIPS an appearance to its box, so a shadow outside the box is
+        // silently cut off. The box grows by the offset, in the direction of
+        // the offset only.
+        //
+        // Exact rather than approximate, and it does not need the rotation
+        // maths repeating: the shadow is the shape TRANSLATED, and both turn by
+        // the same angle about their own centres, so the shadow's final
+        // geometry is the shape's final geometry translated by the same vector.
+        // Growing the finished box by that vector therefore contains it at any
+        // angle.
+        let grow = |lo: f32, hi: f32, d: f32| {
+            if !has_shadow { (lo, hi) } else { (lo.min(lo + d), hi.max(hi + d)) }
+        };
+
         let bounds = if rot == 0.0 {
+            let (bl, br) = grow(min_x, max_x, sdx);
+            let (bb, bt) = grow(min_y, max_y, sdy);
             PdfRect::new(
-                PdfPoints::new(min_y),
-                PdfPoints::new(min_x),
-                PdfPoints::new(max_y),
-                PdfPoints::new(max_x),
+                PdfPoints::new(bb),
+                PdfPoints::new(bl),
+                PdfPoints::new(bt),
+                PdfPoints::new(br),
             )
         } else {
             let (s, c) = rot.to_radians().sin_cos();
@@ -4790,11 +4831,13 @@ fn add_shape_annotations_inner(
             let h = max_y - min_y;
             let hw = (w * c + h * s) / 2.0;
             let hh = (w * s + h * c) / 2.0;
+            let (bl, br) = grow(cx - hw, cx + hw, sdx);
+            let (bb, bt) = grow(cy - hh, cy + hh, sdy);
             PdfRect::new(
-                PdfPoints::new(cy - hh),
-                PdfPoints::new(cx - hw),
-                PdfPoints::new(cy + hh),
-                PdfPoints::new(cx + hw),
+                PdfPoints::new(bb),
+                PdfPoints::new(bl),
+                PdfPoints::new(bt),
+                PdfPoints::new(br),
             )
         };
 
@@ -4846,6 +4889,42 @@ fn add_shape_annotations_inner(
                 spec.shadow_dx_px * scale, spec.shadow_dy_px * scale,
             ),
         );
+
+        // THE SHADOW GOES DOWN FIRST, because objects paint in the order they
+        // are added and a shadow belongs under the thing casting it.
+        //
+        // It turns about its OWN centre, the shape's centre moved by the same
+        // offset. Turning it about the shape's centre would swing it around the
+        // shape as the shape rotated, which is an orbit and not a shadow.
+        if has_shadow {
+            let a = ((spec.shadow_rgba >> 24) & 0xFF) as u8;
+            let r = ((spec.shadow_rgba >> 16) & 0xFF) as u8;
+            let g = ((spec.shadow_rgba >> 8) & 0xFF) as u8;
+            let b = (spec.shadow_rgba & 0xFF) as u8;
+            let shadow_color = PdfColor::new(r, g, b, a);
+
+            // A filled shape casts a filled silhouette and a stroke-only shape
+            // casts an outline, so the shadow is the same KIND of mark as the
+            // thing casting it rather than always one or the other.
+            let shadow_fill = fill.map(|_| shadow_color);
+
+            if let Ok(mut shadow) = build_path(sdx, sdy, shadow_color, shadow_fill) {
+                rotate_object_about!(shadow, rot, cx + sdx, cy + sdy);
+                if annotation.objects_mut().add_path_object(shadow).is_err() {
+                    return STATUS_INVALID_INPUT;
+                }
+            }
+
+            if spec.kind == SHAPE_ARROW {
+                let (built, _) = build_head(sdx, sdy, shadow_color);
+                if let Ok(mut head) = built {
+                    rotate_object_about!(head, rot, cx + sdx, cy + sdy);
+                    if annotation.objects_mut().add_path_object(head).is_err() {
+                        return STATUS_INVALID_INPUT;
+                    }
+                }
+            }
+        }
 
         rotate_object_about!(path, rot, cx, cy);
         if annotation.objects_mut().add_path_object(path).is_err() {
@@ -10607,6 +10686,181 @@ mod tests {
         close_document(reopened);
         close_document(handle);
         free_byte_buffer(saved);
+    }
+
+    // ---------------- the shadow on a committed shape ----------------
+
+    /// How many page objects an annotation's appearance is made of, and the
+    /// axis-aligned box it is allowed to paint inside.
+    fn annotation_shape(
+        handle: u64,
+        index: usize,
+    ) -> Option<(usize, pdfium_render::prelude::PdfRect)> {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned()?;
+        let doc_guard = lock(&doc);
+        let page = doc_guard.pages().get(0).ok()?;
+        let annotation = page.annotations().iter().nth(index)?;
+        let bounds = annotation.bounds().ok()?;
+        Some((annotation.objects().len() as usize, bounds))
+    }
+
+    fn add_one(handle: u64, spec: ShapeSpec) {
+        assert_eq!(
+            add_shape_annotations(handle, 1000, &spec, 1),
+            STATUS_OK_PDFIUM,
+            "the shape was not written"
+        );
+    }
+
+    #[test]
+    fn a_shape_with_no_shadow_draws_exactly_one_object() {
+        // The compatibility half. A shape that has no effect must produce the
+        // appearance it always produced, so an existing file redrawn by this
+        // build is unchanged.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0));
+
+        let (objects, _) = annotation_shape(handle, 0).expect("annotation missing");
+        assert_eq!(objects, 1, "a plain rectangle is one path and nothing else");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_shadowed_shape_draws_a_second_object_underneath() {
+        // The shadow is a real object in the appearance, and it is FIRST, which
+        // is what puts it under the shape: page objects paint in the order they
+        // were added.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        s.shadow_rgba = 0xFF000000;
+        s.shadow_dx_px = 10.0;
+        s.shadow_dy_px = 10.0;
+        add_one(handle, s);
+
+        let (objects, _) = annotation_shape(handle, 0).expect("annotation missing");
+        assert_eq!(objects, 2, "shadow then shape");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_arrows_shadow_covers_its_head_as_well_as_its_shaft() {
+        // An arrow is two objects, so its shadow is two more. A shadow under
+        // the shaft alone is an arrow whose point floats free of it.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_ARROW, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0xFF000000;
+        s.shadow_dx_px = 8.0;
+        s.shadow_dy_px = 8.0;
+        add_one(handle, s);
+
+        let (objects, _) = annotation_shape(handle, 0).expect("annotation missing");
+        assert_eq!(objects, 4, "shadow shaft, shadow head, shaft, head");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_box_grows_to_hold_the_shadow_and_only_towards_it() {
+        // PDFium clips an appearance to its box, so a box that stopped at the
+        // shape would cut the shadow off. It grows in the direction of the
+        // offset and not the other way, which is what stops every shadowed
+        // shape from quietly getting a margin on all four sides.
+        let handle = open_fixture();
+
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0));
+        let (_, plain) = annotation_shape(handle, 0).expect("annotation missing");
+
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        s.shadow_rgba = 0xFF000000;
+        s.shadow_dx_px = 12.0;
+        s.shadow_dy_px = 12.0;
+        add_one(handle, s);
+        let (_, cast) = annotation_shape(handle, 1).expect("annotation missing");
+
+        assert!(cast.right.value > plain.right.value, "right must grow: shadow goes right");
+        assert!(cast.bottom.value < plain.bottom.value, "bottom must drop: shadow goes down");
+        assert_eq!(cast.left.value, plain.left.value, "left must not move");
+        assert_eq!(cast.top.value, plain.top.value, "top must not move");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_shadow_goes_down_the_page_when_the_offset_says_down() {
+        // The Y SIGN, which is the one thing here that a reasonable person gets
+        // backwards: the page's vertical axis runs opposite to the screen's, so
+        // a shadow cast downward on screen has a SMALLER y in the file. Written
+        // as two cases so the test cannot pass for a shadow that ignores the
+        // sign altogether.
+        let handle = open_fixture();
+
+        let mut down = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        down.shadow_rgba = 0xFF000000;
+        down.shadow_dy_px = 20.0;
+        add_one(handle, down);
+        let (_, below) = annotation_shape(handle, 0).expect("annotation missing");
+
+        let mut up = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        up.shadow_rgba = 0xFF000000;
+        up.shadow_dy_px = -20.0;
+        add_one(handle, up);
+        let (_, above) = annotation_shape(handle, 1).expect("annotation missing");
+
+        assert!(below.bottom.value < above.bottom.value, "down must extend further down");
+        assert!(above.top.value > below.top.value, "up must extend further up");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_rotated_shadowed_shape_still_holds_both_inside_its_box() {
+        // Rotation and a shadow together. The shape turns about its centre and
+        // the shadow about its own, so the shadow stays displaced by the same
+        // vector at any angle and the box has to hold both.
+        let handle = open_fixture();
+        for rot in [0.0_f32, 30.0, 90.0, 180.0, 270.0] {
+            let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+            s.rotation_deg = rot;
+            s.shadow_rgba = 0xFF000000;
+            s.shadow_dx_px = 10.0;
+            s.shadow_dy_px = 10.0;
+            add_one(handle, s);
+        }
+
+        for index in 0..5 {
+            let (objects, bounds) = annotation_shape(handle, index).expect("annotation missing");
+            assert_eq!(objects, 2, "rotation must not lose the shadow");
+            assert!(
+                bounds.right.value > bounds.left.value && bounds.top.value > bounds.bottom.value,
+                "index {index} came out with an empty box"
+            );
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_shadows_colour_is_its_own_and_not_the_shapes() {
+        // Opacity rides in the colour's alpha, so a half-transparent shadow
+        // under an opaque shape has to keep them apart. Checked through the tag
+        // rather than the pixels: the writer records what it drew with.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        s.a = 255;
+        s.shadow_rgba = 0x40336699;
+        s.shadow_dx_px = 6.0;
+        s.shadow_dy_px = 6.0;
+        add_one(handle, s);
+
+        let tag = parse_shape_tag(&contents_of(handle, 0, 0).unwrap()).unwrap();
+        assert_eq!(tag.4, 255, "the shape keeps its own alpha");
+        assert_eq!(tag.15, 0x40336699, "the shadow keeps its own colour and alpha");
+
+        close_document(handle);
     }
 
     // ---------------- effects in the tag ----------------
