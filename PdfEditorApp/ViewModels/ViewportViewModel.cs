@@ -6752,7 +6752,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var item = live[at];
 
         string? contents = ReadAnnotationContents(livePage, liveIndex);
-        bool isText = TextBoxTagReader.TryParse(contents, out _);
+        bool isText = TextBoxTagReader.TryParse(contents, out var textTag);
         bool isShape = ShapeTagReader.IsShapeTag(contents);
 
         int status;
@@ -6776,12 +6776,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         else if (isText)
         {
-            float tl = (float)(item.Left * CaptureWidth);
-            float tt = (float)(item.Top * CaptureWidth);
-            float tr = (float)(item.Right * CaptureWidth);
-            float tb = (float)(item.Bottom * CaptureWidth);
+            // The box's OWN UPRIGHT rect, out of its tag, NOT the annotation's
+            // reported rectangle. Same trap the shape branch above avoids, by a
+            // different route: a TURNED box reports the axis-aligned bounding
+            // box of its rotated content, which is larger than the rect the box
+            // actually occupies, so feeding it back in re-lays the text out into
+            // something bigger and the next raise enlarges that again. Measured
+            // at 3.2x the original size after four raises, which is two clicks
+            // of Send to Back and Bring to Front.
+            //
+            // Unturned, the two rectangles are the same and this changes
+            // nothing. Both cases are pinned in render_core by
+            // raising_a_text_box_repeatedly_does_not_move_it and
+            // raising_a_ROTATED_text_box_repeatedly_does_not_move_it.
+            //
+            // A box written before the tag carried its own rect has no upright
+            // rect to use, and falls back to what this always did. That is
+            // correct for the unturned case and no worse than today for the
+            // turned one.
+            double bl = textTag.HasBoxRect ? textTag.BoxLeft : item.Left;
+            double bt = textTag.HasBoxRect ? textTag.BoxTop : item.Top;
+            double br = textTag.HasBoxRect ? textTag.BoxRight : item.Right;
+            double bb = textTag.HasBoxRect ? textTag.BoxBottom : item.Bottom;
+
             status = RenderCoreNative.resize_text_box_annotation(
-                _documentHandle, livePage, liveIndex, CaptureWidth, tl, tt, tr, tb, out newIndex);
+                _documentHandle, livePage, liveIndex, CaptureWidth,
+                (float)(bl * CaptureWidth), (float)(bt * CaptureWidth),
+                (float)(br * CaptureWidth), (float)(bb * CaptureWidth), out newIndex);
         }
         else if (InkTag.TryParse(contents, out string inkColor, out double inkWidth,
                                  out var inkControl, out double inkAngle))

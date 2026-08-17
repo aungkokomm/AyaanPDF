@@ -10852,6 +10852,115 @@ mod tests {
     }
 
     #[test]
+    fn raising_a_text_box_repeatedly_does_not_move_it() {
+        // The same question as the shape and the stamp, for the one kind that
+        // still answers it differently.
+        //
+        // RaiseToTop rebuilds a text box by calling resize_text_box_annotation
+        // with the annotation's REPORTED rectangle. That is the mistake the
+        // shape branch documents avoiding: a reported /Rect is not the box's own
+        // upright rect, so feeding it back in as the new extent re-derives the
+        // layout from the wrong rectangle and the box creeps. This reproduces
+        // exactly that call, four times, which is what two clicks of Send to
+        // Back and Bring to Front amount to.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_box(handle, "Hello Ayaan", 24.0), STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (start_l, start_t, start_r, start_b) = (first.2, first.3, first.4, first.5);
+
+        let mut index = 0i32;
+        for pass in 0..4 {
+            let live = read_annotations(handle, 0);
+            let at = live.iter().position(|a| a.1 == index).unwrap_or(0);
+            let (_, _, l, t, r, b) = live[at];
+
+            // Normalized rect back into capture space, which is what the C#
+            // side does with item.Left/Top/Right/Bottom.
+            let mut next = -1;
+            assert_eq!(
+                resize_text_box_annotation(
+                    handle, 0, index, 1000,
+                    l * 1000.0, t * 1000.0, r * 1000.0, b * 1000.0,
+                    &mut next),
+                STATUS_OK_PDFIUM,
+                "raise {pass} was refused"
+            );
+            index = next;
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+
+        assert_eq!(after.len(), 1, "raising left duplicates: {}", after.len());
+        let (_, _, l, t, r, b) = after[0];
+        println!("TEXT RAISE DRIFT: ({start_l:.4},{start_t:.4},{start_r:.4},{start_b:.4}) \
+                  -> ({l:.4},{t:.4},{r:.4},{b:.4})");
+
+        let tol = 0.002;
+        assert!((l - start_l).abs() < tol && (t - start_t).abs() < tol
+             && (r - start_r).abs() < tol && (b - start_b).abs() < tol,
+            "the text box drifted: left {start_l:.4} -> {l:.4}, top {start_t:.4} -> {t:.4}, \
+             width {:.4} -> {:.4}, height {:.4} -> {:.4}",
+            start_r - start_l, r - l, start_b - start_t, b - t);
+    }
+
+    #[test]
+    fn raising_a_ROTATED_text_box_repeatedly_does_not_move_it() {
+        // The case the plain one above does not reach.
+        //
+        // A turned box reports an /Rect that is the axis-aligned bounding box of
+        // its rotated content, which is BIGGER than the upright rect stored in
+        // its tag. rotate_text_box_annotation's own documentation says the
+        // caller must pass the upright rect "not the enlarged bounding box a
+        // rotated box reports". RaiseToTop passes exactly that enlarged box, so
+        // every raise re-lays the text out into a rectangle larger than the one
+        // it belongs in, and the next raise enlarges it again.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_box(handle, "Hello Ayaan", 24.0), STATUS_OK_PDFIUM);
+
+        // Turn it, passing the UPRIGHT rect as that function requires.
+        let mut index = -1;
+        assert_eq!(
+            rotate_text_box_annotation(
+                handle, 0, 0, 1000, 100.0, 100.0, 700.0, 400.0, 30.0, &mut index),
+            STATUS_OK_PDFIUM);
+
+        let first = read_annotations(handle, 0)[0];
+        let (start_l, start_t, start_r, start_b) = (first.2, first.3, first.4, first.5);
+        println!("ROTATED START: ({start_l:.4},{start_t:.4},{start_r:.4},{start_b:.4})");
+
+        for pass in 0..4 {
+            // The box's OWN UPRIGHT rect, which is what the tag stores and what
+            // this function's documentation asks for. Passing the reported
+            // rectangle instead is the bug: it is the enlarged bounding box of
+            // the turned content, so each raise lays the text out into
+            // something bigger and the next raise enlarges that again.
+            let mut next = -1;
+            assert_eq!(
+                resize_text_box_annotation(
+                    handle, 0, index, 1000, 100.0, 100.0, 700.0, 400.0, &mut next),
+                STATUS_OK_PDFIUM,
+                "raise {pass} was refused"
+            );
+            index = next;
+            let now = read_annotations(handle, 0)[0];
+            println!("  after raise {pass}: ({:.4},{:.4},{:.4},{:.4})", now.2, now.3, now.4, now.5);
+        }
+
+        let after = read_annotations(handle, 0);
+        close_document(handle);
+
+        let (_, _, l, t, r, b) = after[0];
+        let tol = 0.002;
+        assert!((l - start_l).abs() < tol && (t - start_t).abs() < tol
+             && (r - start_r).abs() < tol && (b - start_b).abs() < tol,
+            "the turned text box drifted: left {start_l:.4} -> {l:.4}, top {start_t:.4} -> {t:.4}, \
+             width {:.4} -> {:.4}, height {:.4} -> {:.4}",
+            start_r - start_l, r - l, start_b - start_t, b - t);
+    }
+
+    #[test]
     fn raising_a_stamp_repeatedly_does_not_move_it() {
         // Same question as the shape case, for the other kind the z-order
         // engine rebuilds. A stamp's /Rect is its image rectangle with no pad,
