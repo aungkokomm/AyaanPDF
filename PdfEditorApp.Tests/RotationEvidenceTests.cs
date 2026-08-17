@@ -63,17 +63,33 @@ public class RotationEvidenceTests
         return string.Empty;
     }
 
+    /// <summary>
+    /// The reference renderer's geometry, which now lives in OverlayShapeBuilder
+    /// so the parity harness can measure the SAME construction instead of its
+    /// own copy of it. MainPage keeps the wrappers that resolve a page's numbers
+    /// from the view model.
+    ///
+    /// The wrappers are expression-bodied and have no braces, so BodyOf cannot
+    /// be pointed at them: it would find the next brace in the file and read a
+    /// different method entirely. They are checked against the whole source.
+    /// </summary>
+    private static string BuilderSource() =>
+        ReadSource("PdfEditorApp", "Rendering", "OverlayShapeBuilder.cs");
+
     [Fact]
     public void the_ink_renderer_projects_through_the_pages_transform()
     {
-        // The correction. BuildStrokePolyline now routes every point through
-        // the same PageTransform the page card, the highlights and the
-        // selection chrome all turn by.
-        string body = BodyOf(
-            ReadSource("PdfEditorApp", "MainPage.xaml.cs"),
-            "private Polyline BuildStrokePolyline(");
+        // The correction. Every point goes through the same PageTransform the
+        // page card, the highlights and the selection chrome all turn by.
+        //
+        // BOTH halves are asserted, because either can be right on its own
+        // while the mark still lands in the wrong place: MainPage has to hand
+        // over the page's transform, and the builder has to use it.
+        Assert.Contains("ViewTransformOf(stroke.PageIndex)",
+                        ReadSource("PdfEditorApp", "MainPage.xaml.cs"), StringComparison.Ordinal);
 
-        Assert.Contains("ViewTransformOf(stroke.PageIndex)", body, StringComparison.Ordinal);
+        string body = BodyOf(BuilderSource(), "public static Polyline Stroke(");
+
         Assert.Contains("view.ToCard(x * scale, y * scale)", body, StringComparison.Ordinal);
         Assert.DoesNotContain("new Point(x * scale, y * scale + pageTop)", body, StringComparison.Ordinal);
     }
@@ -83,11 +99,11 @@ public class RotationEvidenceTests
     {
         // The head is a separate filled polygon. Left behind, an arrow's tip
         // detaches from its own shaft the moment the page turns.
-        string body = BodyOf(
-            ReadSource("PdfEditorApp", "MainPage.xaml.cs"),
-            "private Polygon BuildFilledHead(");
+        Assert.Contains("ViewTransformOf(pageIndex)",
+                        ReadSource("PdfEditorApp", "MainPage.xaml.cs"), StringComparison.Ordinal);
 
-        Assert.Contains("ViewTransformOf(pageIndex)", body, StringComparison.Ordinal);
+        string body = BodyOf(BuilderSource(), "public static Polygon FilledHead(");
+
         Assert.Contains("view.ToCard(x * scale, y * scale)", body, StringComparison.Ordinal);
         Assert.DoesNotContain("new Point(x * scale, (y * scale) + pageTop)", body, StringComparison.Ordinal);
     }
@@ -97,11 +113,30 @@ public class RotationEvidenceTests
     {
         // A quarter turn changes PageTransform.Scale, so a mark that ignores it
         // is not only in the wrong place, it is the wrong weight.
-        string body = BodyOf(
-            ReadSource("PdfEditorApp", "MainPage.xaml.cs"),
-            "private Polyline BuildStrokePolyline(");
+        string body = BodyOf(BuilderSource(), "public static Polyline Stroke(");
 
         Assert.Contains("stroke.StrokeWidth * scale * view.Scale", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_page_wrappers_still_hand_the_builder_the_pages_own_numbers()
+    {
+        // The half that cannot live in the builder: which page's scale, top and
+        // transform a mark is drawn with. Passing another page's would put a
+        // stroke on the wrong page and at the wrong weight, and the builder
+        // could not tell.
+        string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
+
+        Assert.Contains("OverlayShapeBuilder.Stroke(", page, StringComparison.Ordinal);
+        Assert.Contains("OverlayShapeBuilder.FilledHead(", page, StringComparison.Ordinal);
+
+        // NAMED, and pinned that way. scale and pageTop are both doubles, so
+        // swapping them compiles cleanly, puts every mark in the wrong place at
+        // the wrong weight, and cannot be caught by this assembly, which is
+        // unable to call a WinUI builder at all.
+        Assert.Contains("pageTop: ViewModel.SlotTopOf(stroke.PageIndex)", page, StringComparison.Ordinal);
+        Assert.Contains("pageTop: ViewModel.SlotTopOf(pageIndex)", page, StringComparison.Ordinal);
+        Assert.Contains("scale: ViewModel.OverlayScale", page, StringComparison.Ordinal);
     }
 
     [Fact]

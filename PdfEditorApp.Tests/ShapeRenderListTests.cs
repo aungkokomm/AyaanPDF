@@ -336,10 +336,13 @@ public class ShapeRenderListTests
         // so there is one rule and two renderers held to it. What this guards is
         // the end the tests cannot call: that the overlay is still performing
         // that arithmetic and has not quietly gone back to the half.
-        string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
+        //
+        // Read from OverlayShapeBuilder, where that arithmetic now lives so the
+        // parity harness measures the real construction instead of its own copy.
+        string builder = ReadSource("PdfEditorApp", "Rendering", "OverlayShapeBuilder.cs");
 
-        Assert.Contains("view.ToCard(x * scale, y * scale)", page, StringComparison.Ordinal);
-        Assert.Contains("stroke.StrokeWidth * scale * view.Scale", page, StringComparison.Ordinal);
+        Assert.Contains("view.ToCard(x * scale, y * scale)", builder, StringComparison.Ordinal);
+        Assert.Contains("stroke.StrokeWidth * scale * view.Scale", builder, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -392,9 +395,10 @@ public class ShapeRenderListTests
     public void the_heads_hairline_is_still_unscaled_in_the_overlay()
     {
         // The one number in the overlay that is not multiplied by the scale.
-        string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
+        // It moved with the builder it belongs to.
+        string builder = ReadSource("PdfEditorApp", "Rendering", "OverlayShapeBuilder.cs");
 
-        Assert.Contains("StrokeThickness = 0.5", page, StringComparison.Ordinal);
+        Assert.Contains("StrokeThickness = 0.5", builder, StringComparison.Ordinal);
         Assert.Equal(0.5, OverlayProjection.HeadHairlineDips);
     }
 

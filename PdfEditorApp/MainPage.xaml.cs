@@ -5804,53 +5804,37 @@ public sealed partial class MainPage : Page
     /// Expands a stroke's normalized points into slot space and offsets them
     /// by its page's position in the stack, so the ink lands on the right page
     /// of the continuous view.
+    ///
+    /// The geometry itself lives in OverlayShapeBuilder now, so the parity
+    /// harness measures the SAME construction rather than its own copy of it.
+    /// This end is where the page's three numbers are resolved from the view
+    /// model, which is the only part the harness cannot share.
     /// </summary>
-    private Polyline BuildStrokePolyline(InkStrokeAnnotation stroke)
-    {
-        double scale = ViewModel.OverlayScale;
-        double pageTop = ViewModel.SlotTopOf(stroke.PageIndex);
-        var view = ViewModel.ViewTransformOf(stroke.PageIndex);
-
-        var polyline = new Polyline
-        {
-            Stroke = new SolidColorBrush(ColorFromHex(stroke.ColorHex)),
-            // view.Scale as well as the overlay scale: a page turned sideways is
-            // scaled to bring its other axis to the card's width, so a mark on
-            // it is a different weight as well as in a different place.
-            StrokeThickness = stroke.StrokeWidth * scale * view.Scale,
-        };
-
-        foreach (var (x, y) in stroke.Points)
-        {
-            var (cx, cy) = view.ToCard(x * scale, y * scale);
-            polyline.Points.Add(new Point(cx, cy + pageTop));
-        }
-
-        return polyline;
-    }
+    /// <remarks>
+    /// Arguments NAMED, because scale and pageTop are both doubles and a
+    /// transposition would compile, draw every mark at the wrong place and
+    /// weight, and be invisible to the test assembly, which cannot call a
+    /// WinUI builder.
+    /// </remarks>
+    private Polyline BuildStrokePolyline(InkStrokeAnnotation stroke) =>
+        Rendering.OverlayShapeBuilder.Stroke(
+            stroke,
+            scale: ViewModel.OverlayScale,
+            pageTop: ViewModel.SlotTopOf(stroke.PageIndex),
+            view: ViewModel.ViewTransformOf(stroke.PageIndex));
 
     /// <summary>
     /// An arrow's head, as a filled triangle. A stroked outline is not the same
     /// shape and would not match what goes into the file.
     /// </summary>
     private Polygon BuildFilledHead(
-        IReadOnlyList<(double X, double Y)> points, int pageIndex, string colorHex)
-    {
-        double scale = ViewModel.OverlayScale;
-        double pageTop = ViewModel.SlotTopOf(pageIndex);
-        var view = ViewModel.ViewTransformOf(pageIndex);
-
-        var brush = new SolidColorBrush(ColorFromHex(colorHex));
-        var polygon = new Polygon { Fill = brush, Stroke = brush, StrokeThickness = 0.5 };
-
-        foreach (var (x, y) in points)
-        {
-            var (cx, cy) = view.ToCard(x * scale, y * scale);
-            polygon.Points.Add(new Point(cx, cy + pageTop));
-        }
-
-        return polygon;
-    }
+        IReadOnlyList<(double X, double Y)> points, int pageIndex, string colorHex) =>
+        Rendering.OverlayShapeBuilder.FilledHead(
+            points,
+            colorHex,
+            scale: ViewModel.OverlayScale,
+            pageTop: ViewModel.SlotTopOf(pageIndex),
+            view: ViewModel.ViewTransformOf(pageIndex));
 
     private Polygon? _livePreviewHead;
 
@@ -5955,15 +5939,13 @@ public sealed partial class MainPage : Page
         }
     }
 
-    private static Color ColorFromHex(string hex)
-    {
-        hex = hex.TrimStart('#');
-        byte a = Convert.ToByte(hex.Substring(0, 2), 16);
-        byte r = Convert.ToByte(hex.Substring(2, 2), 16);
-        byte g = Convert.ToByte(hex.Substring(4, 2), 16);
-        byte b = Convert.ToByte(hex.Substring(6, 2), 16);
-        return Color.FromArgb(a, r, g, b);
-    }
+    /// <summary>
+    /// Kept as a wrapper so the four unrelated call sites that read a tool
+    /// colour do not have to change; the parse itself moved with the builders
+    /// that use it.
+    /// </summary>
+    private static Color ColorFromHex(string hex) =>
+        Rendering.OverlayShapeBuilder.ColorFromHex(hex);
 
     // ---------------- Keyboard: Space = hand tool, track Ctrl for wheel-zoom ----------------
 
