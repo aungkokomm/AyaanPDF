@@ -72,6 +72,39 @@ internal static class SkiaParityCapture
     private static readonly int[] Rotations = [0, 90, 180, 270];
 
     /// <summary>
+    /// The scroller's zoom, applied to BOTH renderers by the same number.
+    ///
+    /// Skia takes it in the ViewportProjection, and the reference takes it as
+    /// the ScaleTransform its Canvas gets, which is what the ScrollView's
+    /// compositor zoom does to the ink layer in the app. Any other arrangement
+    /// would be comparing a zoomed picture with an unzoomed one.
+    ///
+    /// The frame does NOT grow with it. Growing it was tried and does not work:
+    /// the capture is bounded by the app's own window, so a 1240-point frame
+    /// was clipped at about 613 points and every mark at 180 degrees fell
+    /// outside it entirely and measured "none". The frame stays at a size the
+    /// window can hold, and the mark is brought into it by an origin shift,
+    /// which is what Framing does below and what tier 1 already does.
+    /// </summary>
+    private static readonly double[] Zooms = [1.0, 2.0];
+
+    /// <summary>Where the mark is parked, in logical points from the corner.</summary>
+    private const double MarginDips = 24;
+
+    /// <summary>
+    /// The origin that brings a mark's top-left corner to the margin, so a
+    /// zoomed capture measures the whole mark instead of the part that happened
+    /// to stay on the surface.
+    ///
+    /// Applied to BOTH renderers by the same numbers: Skia takes it in the
+    /// ViewportProjection, the reference takes it as a TranslateTransform after
+    /// its ScaleTransform, which composes to the same (slot * zoom) + origin.
+    /// </summary>
+    private static (double X, double Y) OriginFor(
+        double zoom, (double L, double T, double R, double B) slotDips) =>
+        (MarginDips - (slotDips.L * zoom), MarginDips - (slotDips.T * zoom));
+
+    /// <summary>
     /// The preview surface as it actually runs: the four shape tools and the
     /// freehand guide. An arrow contributes two marks, its shaft and its filled
     /// head, which are drawn by different code on both sides.
@@ -104,7 +137,7 @@ internal static class SkiaParityCapture
 
         var csv = new StringBuilder();
         csv.AppendLine(
-            "subject,rotation," +
+            "subject,rotation,zoom,deviceScale," +
             "refBounds,skiaBounds,expectedBounds," +
             "refCentroid,skiaCentroid,refMass,skiaMass," +
             "refWidthPx,skiaWidthPx,widthDeltaPct," +
@@ -125,29 +158,36 @@ internal static class SkiaParityCapture
         {
             foreach (int rotation in Rotations)
             {
-                var view = PageTransform.For(ContentWidth, ContentHeight, rotation, ContentWidth);
-
-                Shot reference, candidate;
-                try
+                foreach (double zoom in Zooms)
                 {
-                    reference = await CaptureAsync(
-                        host, BuildReference(name, kind, view), kind,
-                        IOPath.Combine(directory, $"{name}-{rotation:D3}-ref.png"));
+                    var view = PageTransform.For(ContentWidth, ContentHeight, rotation, ContentWidth);
+                    int side = Surface;
+                    string stem = $"{name}-{rotation:D3}-z{zoom * 100:F0}";
 
-                    candidate = await CaptureAsync(
-                        host, BuildCandidate(name, kind, view, device), kind,
-                        IOPath.Combine(directory, $"{name}-{rotation:D3}-skia.png"));
-                }
-                catch (Exception ex)
-                {
-                    csv.AppendLine($"{name},{rotation},CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}");
-                    continue;
-                }
+                    Shot reference, candidate;
+                    try
+                    {
+                        reference = await CaptureAsync(
+                            host, BuildReference(kind, view, zoom, side), kind, side,
+                            IOPath.Combine(directory, $"{stem}-ref.png"));
 
-                csv.AppendLine(Compare(
-                    name, rotation, reference, candidate,
-                    ExpectedBounds(name, kind, view, device)));
-                cells++;
+                        candidate = await CaptureAsync(
+                            host, BuildCandidate(kind, view, device, zoom, side), kind, side,
+                            IOPath.Combine(directory, $"{stem}-skia.png"));
+                    }
+                    catch (Exception ex)
+                    {
+                        csv.AppendLine(
+                            $"{name},{rotation},{zoom},{device}," +
+                            $"CAPTURE FAILED: {ex.GetType().Name}: {ex.Message}");
+                        continue;
+                    }
+
+                    csv.AppendLine(Compare(
+                        name, rotation, zoom, device, reference, candidate,
+                        ExpectedBounds(kind, view, device, zoom)));
+                    cells++;
+                }
             }
         }
 
@@ -162,9 +202,35 @@ internal static class SkiaParityCapture
     /// The reference: real XAML elements from OverlayShapeBuilder, laid on a
     /// Canvas the way the ink layer lays them out.
     /// </summary>
-    private static UIElement BuildReference(string name, ShapeKind? kind, PageTransform view)
+    private static UIElement BuildReference(
+        ShapeKind? kind, PageTransform view, double zoom, int side)
     {
-        var canvas = new Canvas { Width = Surface, Height = Surface, IsHitTestVisible = false };
+        // Zoom as a RenderTransform on the layer, which is what the scroller's
+        // compositor zoom is: the ink overlay's children keep their slot
+        // coordinates and the whole layer is scaled. Sized at 1:1 and scaled,
+        // NOT laid out at the zoomed size, or the scale would be applied twice.
+        //
+        // Scale THEN translate, in that order, which composes to the same
+        // (slot * zoom) + origin that ViewportProjection gives Skia.
+        //
+        // Left and Top alignment stated explicitly. A Canvas defaults to
+        // Stretch, and when the frame was briefly larger than the canvas that
+        // centred it and put the whole reference 465 device pixels off.
+        var (originX, originY) = OriginFor(zoom, SlotBounds(kind, view));
+
+        var moved = new Microsoft.UI.Xaml.Media.TransformGroup();
+        moved.Children.Add(new Microsoft.UI.Xaml.Media.ScaleTransform { ScaleX = zoom, ScaleY = zoom });
+        moved.Children.Add(new Microsoft.UI.Xaml.Media.TranslateTransform { X = originX, Y = originY });
+
+        var canvas = new Canvas
+        {
+            Width = Surface,
+            Height = Surface,
+            IsHitTestVisible = false,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top,
+            RenderTransform = moved,
+        };
 
         if (kind is null)
         {
@@ -202,25 +268,31 @@ internal static class SkiaParityCapture
 
     /// <summary>The candidate: the real Skia layer, handed the real frame.</summary>
     private static UIElement BuildCandidate(
-        string name, ShapeKind? kind, PageTransform view, double device)
+        ShapeKind? kind, PageTransform view, double device, double zoom, int side)
     {
-        var layer = new SkiaShapeLayer { Width = Surface, Height = Surface };
+        // The Skia surface really is the zoomed size, because it rasterises
+        // once at final resolution rather than being scaled by the compositor.
+        // That IS the architectural difference between the two layers, and it
+        // is why zoom reaches this one as a number.
+        var layer = new SkiaShapeLayer { Width = side, Height = side };
 
         var items = kind is null
             ? ShapeRenderList.From([], [], inkPreview: ShapeRenderList.InkGuide(0, InkPoints))
             : ShapeRenderList.From([], [ShapeFor(kind.Value)]);
 
-        // No zoom and no scroll: zoom is its own commit, and this one measures
-        // the renderers rather than the plumbing between them and the window.
-        // The device scale is NOT optional though, and is passed in rather than
-        // read off this layer, which has no XamlRoot until it is in the tree.
+        // The same origin the reference is translated by, so the two pictures
+        // are of the same thing in the same place. The device scale is passed
+        // in rather than read off this layer, which has no XamlRoot until it is
+        // in the tree.
+        var (originX, originY) = OriginFor(zoom, SlotBounds(kind, view));
+
         layer.Show(
             items, Scale, _ => 0, _ => view,
             new ViewportProjection(
-                Zoom: 1,
+                Zoom: zoom,
                 DeviceScale: device,
-                OriginXDips: 0,
-                OriginYDips: 0));
+                OriginXDips: originX,
+                OriginYDips: originY));
 
         return layer;
     }
@@ -236,11 +308,23 @@ internal static class SkiaParityCapture
     /// under rotation, and only a third opinion could have said so.
     ///
     /// Computed in slot DIPs, grown by half a stroke because a path is stroked
-    /// about its centreline, and then taken to DEVICE pixels so it can be
-    /// compared with what came off the two surfaces.
+    /// about its centreline, and then taken to DEVICE pixels through the zoom
+    /// and the display scale, so it can be compared with what came off the two
+    /// surfaces.
     /// </summary>
     private static (double L, double T, double R, double B) ExpectedBounds(
-        string name, ShapeKind? kind, PageTransform view, double device)
+        ShapeKind? kind, PageTransform view, double device, double zoom)
+    {
+        var slot = SlotBounds(kind, view);
+        var (ox, oy) = OriginFor(zoom, slot);
+
+        return (((slot.L * zoom) + ox) * device, ((slot.T * zoom) + oy) * device,
+                ((slot.R * zoom) + ox) * device, ((slot.B * zoom) + oy) * device);
+    }
+
+    /// <summary>The mark's box in slot DIPs, before zoom, origin or display.</summary>
+    private static (double L, double T, double R, double B) SlotBounds(
+        ShapeKind? kind, PageTransform view)
     {
         var points = kind is null ? InkPoints : (IReadOnlyList<(double X, double Y)>)ShapeFor(kind.Value).Outline;
         double reach = (kind is null
@@ -265,8 +349,7 @@ internal static class SkiaParityCapture
             Take(head);
         }
 
-        return ((l - reach) * device, (t - reach) * device,
-                (r + reach) * device, (b + reach) * device);
+        return (l - reach, t - reach, r + reach, b + reach);
     }
 
     // ---------------- measurement ----------------
@@ -374,7 +457,8 @@ internal static class SkiaParityCapture
     // ---------------- verdicts ----------------
 
     private static string Compare(
-        string name, int rotation, Shot reference, Shot candidate,
+        string name, int rotation, double zoom, double device,
+        Shot reference, Shot candidate,
         (double L, double T, double R, double B) expected)
     {
         string boundsVerdict = BoundsVerdict(reference.Bounds, candidate.Bounds);
@@ -403,7 +487,7 @@ internal static class SkiaParityCapture
         string verdict = Worst(boundsVerdict, centroidVerdict, massVerdict);
 
         return string.Join(',',
-            name, rotation,
+            name, rotation, F(zoom), F(device),
             Box(reference.Bounds), Box(candidate.Bounds), BoxOf(expected),
             $"{reference.CentroidX:F2} {reference.CentroidY:F2}",
             $"{candidate.CentroidX:F2} {candidate.CentroidY:F2}",
@@ -477,10 +561,10 @@ internal static class SkiaParityCapture
     /// came back at the requested size. Same size, same origin, same ground, or
     /// the two images cannot be laid over each other.
     /// </summary>
-    private static Border Frame(UIElement content) => new()
+    private static Border Frame(UIElement content, int side) => new()
     {
-        Width = Surface,
-        Height = Surface,
+        Width = side,
+        Height = side,
         HorizontalAlignment = HorizontalAlignment.Left,
         VerticalAlignment = VerticalAlignment.Top,
         Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(
@@ -489,9 +573,9 @@ internal static class SkiaParityCapture
     };
 
     private static async Task<Shot> CaptureAsync(
-        Panel host, UIElement content, ShapeKind? kind, string pngPath)
+        Panel host, UIElement content, ShapeKind? kind, int side, string pngPath)
     {
-        var frame = Frame(content);
+        var frame = Frame(content, side);
         host.Children.Add(frame);
         try
         {
