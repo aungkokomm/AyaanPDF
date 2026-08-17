@@ -30,10 +30,14 @@ namespace PdfEditorApp.Rendering;
 ///                  preview element and builds a new one on every change.
 ///   XAML retained  the scene built once, then ONE element's points refilled.
 ///                  XAML's best case and its real architectural advantage.
-///   Skia paint     cull plus paint of every item into a viewport-sized
-///                  surface. Exactly the work OnPaintSurface does, measured
-///                  directly rather than inferred, so no compositor scheduling
-///                  sits between the clock and the drawing.
+///   Skia full      cull plus paint of every item into a viewport-sized
+///                  surface, clearing all of it first. What the layer used to
+///                  do on every frame, kept so the improvement is measured
+///                  against a baseline taken on the same machine in the same
+///                  run rather than against a number from a previous commit.
+///   Skia dirty     the same, through DirtyRegionTracker: clip to the union of
+///                  where the mark was and where it is going, clear THAT, and
+///                  paint. What the layer does now.
 ///
 /// A fourth measurement, RenderTargetBitmap over each renderer's host, was
 /// tried as a cross-check and REMOVED. RenderAsync completes only when the
@@ -114,8 +118,9 @@ internal static class SkiaPerfCapture
             "viewportW,viewportH,surfacePx,marks,deviceScale," +
             "xamlRebuildMedianMs,xamlRebuildP95Ms," +
             "xamlRetainedMedianMs,xamlRetainedP95Ms," +
-            "skiaPaintMedianMs,skiaPaintP95Ms," +
-            "skiaVsXamlRebuild,skiaVsXamlRetained,skiaDrawn");
+            "skiaFullMedianMs,skiaFullP95Ms," +
+            "skiaDirtyMedianMs,skiaDirtyP95Ms," +
+            "dirtySpeedup,dirtyVsXamlRebuild,skiaDrawn");
 
         foreach (var (vw, vh) in Viewports)
         foreach (int count in Counts)
@@ -126,6 +131,7 @@ internal static class SkiaPerfCapture
             var rebuild = Time(() => BuildScene(shapes, view, vw, vh), Reps);
             var retained = TimeRetained(shapes, view, vw, vh);
             var (paint, drawn) = TimeSkiaPaint(items, view, projection, device, vw, vh);
+            var dirty = TimeSkiaDirty(count, view, projection, device, vw, vh);
 
             csv.AppendLine(string.Join(",",
                 vw.ToString(CultureInfo.InvariantCulture),
@@ -137,8 +143,9 @@ internal static class SkiaPerfCapture
                 F(rebuild.Median), F(rebuild.P95),
                 F(retained.Median), F(retained.P95),
                 F(paint.Median), F(paint.P95),
-                Ratio(paint.Median, rebuild.Median),
-                Ratio(paint.Median, retained.Median),
+                F(dirty.Median), F(dirty.P95),
+                Ratio(paint.Median, dirty.Median),
+                Ratio(dirty.Median, rebuild.Median),
                 drawn.ToString(CultureInfo.InvariantCulture)));
 
             // Written after every count, not once at the end. The first version
@@ -163,7 +170,9 @@ internal static class SkiaPerfCapture
     /// the number is not one degenerate case repeated. Deterministic: the
     /// position comes from the index, never from a random source.
     /// </summary>
-    private static IReadOnlyList<ShapeAnnotation> SceneOf(int count)
+    private static IReadOnlyList<ShapeAnnotation> SceneOf(int count) => SceneOf(count, 0);
+
+    private static IReadOnlyList<ShapeAnnotation> SceneOf(int count, double nudge)
     {
         var kinds = new[] { ShapeKind.Rectangle, ShapeKind.Ellipse, ShapeKind.Line, ShapeKind.Arrow };
         var shapes = new List<ShapeAnnotation>(count);
@@ -176,8 +185,8 @@ internal static class SkiaPerfCapture
             double row = i / perRow;
             double cell = 1.0 / perRow;
 
-            double l = (col * cell) + (cell * 0.1);
-            double t = (row * cell) + (cell * 0.1);
+            double l = (col * cell) + (cell * 0.1) + nudge;
+            double t = (row * cell) + (cell * 0.1) + nudge;
 
             shapes.Add(new ShapeAnnotation(
                 0,
@@ -272,6 +281,74 @@ internal static class SkiaPerfCapture
         }, Reps);
 
         return (stats, drawn);
+    }
+
+    /// <summary>How many distinct positions a simulated drag cycles through.</summary>
+    private const int DragSteps = 16;
+
+    /// <summary>
+    /// A frame of a DRAG, which is the gesture the whole exercise is about.
+    ///
+    /// The mark moves between repetitions, so every timed frame is a real
+    /// partial paint with a genuine union of two different positions. Measuring
+    /// a still mark would clear a rectangle it had just cleared and flatter the
+    /// result.
+    ///
+    /// The positions are built BEFORE the clock starts. Rebuilding the render
+    /// list is real per-frame work in the app, but it is not what this is
+    /// comparing, and leaving it in would put the same cost on both sides of a
+    /// ratio meant to isolate the clear.
+    /// </summary>
+    private static Stats TimeSkiaDirty(
+        int count, PageTransform view, ViewportProjection projection,
+        double device, int vw, int vh)
+    {
+        int pixelW = (int)Math.Round(vw * device);
+        int pixelH = (int)Math.Round(vh * device);
+
+        var steps = new List<IReadOnlyList<ShapeRenderItem>>(DragSteps);
+        for (int i = 0; i < DragSteps; i++)
+        {
+            steps.Add(ShapeRenderList.From([], SceneOf(count, i * 0.004)));
+        }
+
+        using var surface = SKSurface.Create(
+            new SKImageInfo(pixelW, pixelH, SKColorType.Bgra8888, SKAlphaType.Premul));
+
+        var canvas = surface.Canvas;
+        var tracker = new DirtyRegionTracker();
+        var bounds = projection.VisibleSlotBounds(pixelW, pixelH, 64);
+        int at = 0;
+
+        return Time(() =>
+        {
+            var items = steps[at++ % DragSteps];
+
+            var plan = tracker.Plan(
+                items, Scale, _ => 0, _ => view, projection, pixelW, pixelH);
+
+            if (plan.Scope != PaintScope.Nothing)
+            {
+                int saved = canvas.Save();
+                canvas.ClipRect(SKRect.Create(
+                    plan.Rect.L, plan.Rect.T,
+                    plan.Rect.R - plan.Rect.L, plan.Rect.B - plan.Rect.T));
+                canvas.Clear(SKColors.Transparent);
+
+                var visible = ShapeCulling.Visible(items, bounds, Scale, _ => 0, _ => view);
+                if (visible.Count > 0)
+                {
+                    ShapeSkiaPainter.PaintViewport(
+                        canvas, visible, Scale, _ => 0, _ => view, projection);
+                }
+
+                canvas.RestoreToCount(saved);
+            }
+
+            tracker.Painted(plan);
+            surface.Flush();
+            return plan;
+        }, Reps);
     }
 
     // ---------------- timing ----------------
