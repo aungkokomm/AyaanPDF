@@ -242,4 +242,159 @@ public class PageTransformTests
             Assert.True(t.Scale > 0);
         }
     }
+
+    // ---- ToCard: the direction needed to DRAW with the turn ----
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(90)]
+    [InlineData(180)]
+    [InlineData(270)]
+    public void to_card_is_what_the_markup_does(int rotation)
+    {
+        // The strongest form this can take. Forward above is the test's own
+        // independent statement of what CompositeTransform will do with these
+        // four numbers, written before ToCard existed. If the two agree, ToCard
+        // draws a mark exactly where the markup draws the page under it.
+        var t = PageTransform.For(W, H, rotation, W);
+
+        foreach (var (x, y) in new[]
+        {
+            (0.0, 0.0), (W, 0.0), (0.0, H), (W, H),
+            (W / 2, H / 2), (17.5, 903.25), (123.75, 41.5),
+        })
+        {
+            var expected = Forward(t, x, y);
+            var (cx, cy) = t.ToCard(x, y);
+
+            Assert.Equal(expected.X, cx, 6);
+            Assert.Equal(expected.Y, cy, 6);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(90)]
+    [InlineData(180)]
+    [InlineData(270)]
+    public void to_card_and_to_content_undo_each_other(int rotation)
+    {
+        // Both ways round. One direction being right is not the same as the two
+        // being consistent, and hit testing uses one while drawing uses the
+        // other: if they disagree, a shape is drawn where it cannot be clicked.
+        var t = PageTransform.For(W, H, rotation, W);
+
+        foreach (var (x, y) in new[] { (0.0, 0.0), (W, H), (17.5, 903.25), (W / 2, H / 2) })
+        {
+            var (cx, cy) = t.ToCard(x, y);
+            var (bx, by) = t.ToContent(cx, cy);
+
+            Assert.Equal(x, bx, 6);
+            Assert.Equal(y, by, 6);
+        }
+
+        foreach (var (cx, cy) in new[] { (0.0, 0.0), (t.CardWidth, t.CardHeight), (31.25, 502.5) })
+        {
+            var (x, y) = t.ToContent(cx, cy);
+            var (rx, ry) = t.ToCard(x, y);
+
+            Assert.Equal(cx, rx, 6);
+            Assert.Equal(cy, ry, 6);
+        }
+    }
+
+    [Fact]
+    public void at_no_rotation_to_card_changes_nothing_at_all()
+    {
+        // The safety property the whole correction rests on. An unrotated page
+        // has Scale 1 and no translation, so routing a mark through ToCard must
+        // be a byte-for-byte no-op. If this ever fails, every unrotated
+        // document in existence has just moved.
+        var t = PageTransform.For(W, H, 0, W);
+
+        Assert.Equal(1.0, t.Scale, 6);
+        Assert.Equal(0.0, t.TranslateX, 6);
+        Assert.Equal(0.0, t.TranslateY, 6);
+
+        foreach (var (x, y) in new[]
+        {
+            (0.0, 0.0), (W, H), (17.5, 903.25), (W / 2, H / 2), (-4.5, 1200.75),
+        })
+        {
+            var (cx, cy) = t.ToCard(x, y);
+
+            Assert.Equal(x, cx);
+            Assert.Equal(y, cy);
+        }
+    }
+
+    [Theory]
+    [InlineData(0, 0, 0)]        // top-left stays top-left
+    [InlineData(90, 1, 0)]       // a clockwise quarter turn takes it to top-right
+    [InlineData(180, 1, 1)]      // half turn, to bottom-right
+    [InlineData(270, 0, 1)]      // three quarters, to bottom-left
+    public void the_pages_top_left_corner_lands_on_the_cards_expected_corner(
+        int rotation, int cardRight, int cardBottom)
+    {
+        // Which corner goes where is the one thing a sign error cannot survive,
+        // and it is also the difference between clockwise and anticlockwise.
+        var t = PageTransform.For(W, H, rotation, W);
+
+        var (cx, cy) = t.ToCard(0, 0);
+
+        Assert.Equal(cardRight * t.CardWidth, cx, 6);
+        Assert.Equal(cardBottom * t.CardHeight, cy, 6);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(90)]
+    [InlineData(180)]
+    [InlineData(270)]
+    public void the_four_page_corners_land_on_the_four_card_corners(int rotation)
+    {
+        // A bijection, not just four points inside the card. Two corners
+        // landing on the same one would still pass a bounds check.
+        var t = PageTransform.For(W, H, rotation, W);
+
+        var landed = new System.Collections.Generic.HashSet<(long, long)>();
+        foreach (var (x, y) in new[] { (0.0, 0.0), (W, 0.0), (0.0, H), (W, H) })
+        {
+            var (cx, cy) = t.ToCard(x, y);
+
+            Assert.True(Math.Abs(cx) < 1e-6 || Math.Abs(cx - t.CardWidth) < 1e-6,
+                        $"x {cx} is not a card edge");
+            Assert.True(Math.Abs(cy) < 1e-6 || Math.Abs(cy - t.CardHeight) < 1e-6,
+                        $"y {cy} is not a card edge");
+
+            landed.Add(((long)Math.Round(cx), (long)Math.Round(cy)));
+        }
+
+        Assert.Equal(4, landed.Count);
+    }
+
+    [Theory]
+    [InlineData(0, 1.0)]
+    [InlineData(180, 1.0)]
+    public void an_upright_or_inverted_page_is_not_rescaled(int rotation, double expected)
+    {
+        // A half turn does not change which axis is across the card, so the
+        // content still fits at 1:1 and a stroke keeps its weight.
+        Assert.Equal(expected, PageTransform.For(W, H, rotation, W).Scale, 6);
+    }
+
+    [Theory]
+    [InlineData(90)]
+    [InlineData(270)]
+    public void a_quarter_turn_rescales_by_the_aspect_ratio(int rotation)
+    {
+        // On its side, the page's HEIGHT is what has to be brought to the card's
+        // width, so a portrait page is scaled DOWN. This is the factor a stroke
+        // width has to be multiplied by as well, which the ink layer currently
+        // does not do.
+        var t = PageTransform.For(W, H, rotation, W);
+
+        Assert.Equal(W / H, t.Scale, 6);
+        Assert.True(t.Scale < 1, "a portrait page on its side should shrink");
+    }
 }

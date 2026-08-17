@@ -98,6 +98,34 @@ public readonly record struct PageTransform(
     }
 
     /// <summary>
+    /// Turns a point on the page into a point on the card.
+    ///
+    /// What the markup does to the page's own content, expressed as arithmetic
+    /// so that something drawn OVER a page can be put in the same place the
+    /// page put it. <see cref="ToContent"/> has always been here because hit
+    /// testing needs to undo the turn; this is the direction needed to draw
+    /// with it.
+    ///
+    /// Scale is included, so a mark comes back in card units. A length has to
+    /// be multiplied by <see cref="Scale"/> separately: a stroke on a page
+    /// turned sideways is not only somewhere else, it is a different weight,
+    /// because the content box is scaled to bring its other axis to the card's
+    /// width.
+    /// </summary>
+    public (double X, double Y) ToCard(double contentX, double contentY)
+    {
+        double s = Scale > 0 ? Scale : 1.0;
+
+        return Rotation switch
+        {
+            Quarter => (s * (ContentHeight - contentY), s * contentX),
+            180 => (s * (ContentWidth - contentX), s * (ContentHeight - contentY)),
+            270 => (s * contentY, s * (ContentWidth - contentX)),
+            _ => (s * contentX, s * contentY),
+        };
+    }
+
+    /// <summary>
     /// Turns a point on the card back into a point on the page.
     ///
     /// The inverse of what the markup does, and the only reason hit testing
