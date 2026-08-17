@@ -88,10 +88,17 @@ public class RotationEvidenceTests
         Assert.Contains("ViewTransformOf(stroke.PageIndex)",
                         ReadSource("PdfEditorApp", "MainPage.xaml.cs"), StringComparison.Ordinal);
 
-        string body = BodyOf(BuilderSource(), "public static Polyline Stroke(");
+        // The turn happens in ProjectInto, which is now the ONE loop: the
+        // committed builder, the live preview and the parity harness all fill a
+        // polyline through it, so they cannot drift apart into three subtly
+        // different projections the way two copies of a loop can.
+        string body = BodyOf(BuilderSource(), "public static void ProjectInto(");
 
         Assert.Contains("view.ToCard(x * scale, y * scale)", body, StringComparison.Ordinal);
         Assert.DoesNotContain("new Point(x * scale, y * scale + pageTop)", body, StringComparison.Ordinal);
+
+        Assert.Contains("ProjectInto(polyline, stroke.Points, scale, pageTop, view)",
+                        BuilderSource(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -149,14 +156,20 @@ public class RotationEvidenceTests
         // only while drawing on a neighbouring page.
         // The preview builder was split out of OnInkStrokeChanged when the Skia
         // layer became a second consumer of the same signal, exactly as
-        // RebuildInkCanvas already was. The arithmetic did not move; only its
-        // name did, so this reads the new one.
+        // RebuildInkCanvas already was.
+        //
+        // "The same arithmetic" is now literally the same CODE: the preview
+        // fills its polyline through OverlayShapeBuilder.ProjectInto, which is
+        // the loop the committed builder runs. That is a stronger guarantee
+        // than two copies asserted to match, and it is what lets the parity
+        // harness measure the reference rather than a reconstruction of it.
         string body = BodyOf(
             ReadSource("PdfEditorApp", "MainPage.xaml.cs"),
             "private void UpdateInkPreview()");
 
         Assert.Contains("ViewTransformOf(previewPage)", body, StringComparison.Ordinal);
-        Assert.Contains("previewView.ToCard(x * scale, y * scale)", body, StringComparison.Ordinal);
+        Assert.Contains("OverlayShapeBuilder.ProjectInto(", body, StringComparison.Ordinal);
+        Assert.Contains("view: previewView", body, StringComparison.Ordinal);
         Assert.Contains("ViewModel.InkWidth * ViewModel.OverlayScale * previewView.Scale",
                         body, StringComparison.Ordinal);
         Assert.DoesNotContain("new Point(x * scale, y * scale + pageTop)", body, StringComparison.Ordinal);

@@ -5931,12 +5931,12 @@ public sealed partial class MainPage : Page
         // not the current one, and the preview must land where the ink will.
         double pageTop = ViewModel.SlotTopOf(previewPage);
 
-        _livePreviewStroke.Points.Clear();
-        foreach (var (x, y) in points)
-        {
-            var (cx, cy) = previewView.ToCard(x * scale, y * scale);
-            _livePreviewStroke.Points.Add(new Point(cx, cy + pageTop));
-        }
+        // The same loop the committed builder runs, and the same one the parity
+        // harness fills its polyline with. The element is reused rather than
+        // rebuilt, which is why this refills rather than returning a new one.
+        Rendering.OverlayShapeBuilder.ProjectInto(
+            _livePreviewStroke, points,
+            scale: scale, pageTop: pageTop, view: previewView);
     }
 
     /// <summary>

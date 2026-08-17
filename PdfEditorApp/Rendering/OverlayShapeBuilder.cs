@@ -32,6 +32,28 @@ namespace PdfEditorApp.Rendering;
 internal static class OverlayShapeBuilder
 {
     /// <summary>
+    /// Refills a polyline with one mark's points, projected into slot space.
+    ///
+    /// Takes the element rather than returning one, because the LIVE PREVIEW
+    /// reuses a single Polyline across a whole drag and reallocating it on
+    /// every pointer move would be a real cost on a hot path. This is the loop
+    /// that path already ran, moved here so the parity harness can fill its own
+    /// polyline with the identical code instead of a copy of it.
+    /// </summary>
+    public static void ProjectInto(
+        Polyline line, IReadOnlyList<(double X, double Y)> points,
+        double scale, double pageTop, PageTransform view)
+    {
+        line.Points.Clear();
+
+        foreach (var (x, y) in points)
+        {
+            var (cx, cy) = view.ToCard(x * scale, y * scale);
+            line.Points.Add(new Point(cx, cy + pageTop));
+        }
+    }
+
+    /// <summary>
     /// Expands a stroke's normalized points into slot space and offsets them
     /// by its page's position in the stack, so the ink lands on the right page
     /// of the continuous view.
@@ -48,12 +70,7 @@ internal static class OverlayShapeBuilder
             StrokeThickness = stroke.StrokeWidth * scale * view.Scale,
         };
 
-        foreach (var (x, y) in stroke.Points)
-        {
-            var (cx, cy) = view.ToCard(x * scale, y * scale);
-            polyline.Points.Add(new Point(cx, cy + pageTop));
-        }
-
+        ProjectInto(polyline, stroke.Points, scale, pageTop, view);
         return polyline;
     }
 
