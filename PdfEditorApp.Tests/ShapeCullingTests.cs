@@ -23,10 +23,17 @@ public class ShapeCullingTests
     /// <summary>Every page 1000 slot DIPs tall, so page N starts at N * 1000.</summary>
     private static double PageTop(int page) => page * 1000.0;
 
+    /// <summary>
+    /// An unturned view, so these keep testing culling and not rotation. The
+    /// turned cases live in SkiaRotationParityTests, next to the painter they
+    /// have to agree with.
+    /// </summary>
+    private static PageTransform Flat(int page) => PageTransform.For(1, 1, 0, 1);
+
     private static IReadOnlyList<ShapeRenderItem> Cull(
         IReadOnlyList<ShapeRenderItem> items,
         (double, double, double, double) bounds) =>
-        ShapeCulling.Visible(items, bounds, Scale, PageTop);
+        ShapeCulling.Visible(items, bounds, Scale, PageTop, Flat);
 
     [Fact]
     public void a_shape_inside_the_region_is_kept()
@@ -111,6 +118,6 @@ public class ShapeCullingTests
 
         var items = new[] { Item(page, (0.2, normY), (0.3, normY)) };
 
-        Assert.Single(ShapeCulling.Visible(items, bounds, Scale, PageTop));
+        Assert.Single(ShapeCulling.Visible(items, bounds, Scale, PageTop, Flat));
     }
 }

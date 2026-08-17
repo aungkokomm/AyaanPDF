@@ -40,13 +40,21 @@ public class ShapeSkiaPainterTests
         return ShapeRenderList.From([], [shape])[0];
     }
 
+    /// <summary>
+    /// An unturned view, so every assertion below goes on measuring what it
+    /// always measured. The turn is the identity at 0 degrees, which is what
+    /// lets this whole file stay unchanged; the rotated cases are in
+    /// SkiaRotationParityTests.
+    /// </summary>
+    private static PageTransform Flat(int page) => PageTransform.For(1, 1, 0, 1);
+
     private static SKBitmap Render(
         IReadOnlyList<ShapeRenderItem> items, double pageTop = 0, int w = 400, int h = 400)
     {
         var bitmap = new SKBitmap(w, h, SKColorType.Rgba8888, SKAlphaType.Premul);
         using var canvas = new SKCanvas(bitmap);
         canvas.Clear(SKColors.White);
-        ShapeSkiaPainter.Paint(canvas, items, Scale, _ => pageTop);
+        ShapeSkiaPainter.Paint(canvas, items, Scale, _ => pageTop, Flat);
         return bitmap;
     }
 

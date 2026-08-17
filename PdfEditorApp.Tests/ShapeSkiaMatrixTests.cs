@@ -74,7 +74,8 @@ public class ShapeSkiaMatrixTests
         using (var canvas = new SKCanvas(bitmap))
         {
             canvas.Clear(SKColors.White);
-            ShapeSkiaPainter.PaintViewport(canvas, items, 800, _ => 0, p);
+            ShapeSkiaPainter.PaintViewport(
+                canvas, items, 800, _ => 0, _ => PageTransform.For(1, 1, 0, 1), p);
         }
 
         // The stroke's CENTRE down a column that crosses the top edge but

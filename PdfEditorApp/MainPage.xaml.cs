@@ -5710,6 +5710,7 @@ public sealed partial class MainPage : Page
             ShapeRenderList.From(ViewModel.AllInkStrokes, ViewModel.AllShapes),
             ViewModel.OverlayScale,
             ViewModel.SlotTopOf,
+            ViewModel.ViewTransformOf,
             CurrentViewportProjection());
     }
 

@@ -15,6 +15,12 @@ namespace PdfEditorApp.Rendering.Skia;
 /// own coordinate system is not adopted anywhere: points arrive normalized, are
 /// projected by the app's existing rule, and the results are handed to Skia as
 /// plain floats. No SK type crosses back out of this project.
+///
+/// That includes the VIEW'S TURN, which it did not used to. Each page's
+/// <see cref="PageTransform"/> arrives as data and is applied through the shared
+/// projection, not composed into an SKMatrix of its own. Rotation stays a
+/// property of the page, described in the app's coordinate system, and Skia
+/// stays a thing that draws what it is handed.
 /// </summary>
 public static class ShapeSkiaPainter
 {
@@ -46,11 +52,12 @@ public static class ShapeSkiaPainter
         IReadOnlyList<ShapeRenderItem> items,
         double scale,
         Func<int, double> pageTop,
+        Func<int, PageTransform> pageView,
         ViewportProjection projection)
     {
         int saved = canvas.Save();
         canvas.Concat(MatrixFor(projection));
-        Paint(canvas, items, scale, pageTop);
+        Paint(canvas, items, scale, pageTop, pageView);
         canvas.RestoreToCount(saved);
     }
 
@@ -60,11 +67,17 @@ public static class ShapeSkiaPainter
     /// </summary>
     /// <param name="scale">The overlay scale, the fixed content-box width.</param>
     /// <param name="pageTop">Where a page's slot starts in the stack.</param>
+    /// <param name="pageView">
+    /// How each page is turned by the view. Asked per item, not once, because a
+    /// continuous stack can show pages of different shapes and the turn's scale
+    /// is a function of the page's own proportions.
+    /// </param>
     public static void Paint(
         SKCanvas canvas,
         IReadOnlyList<ShapeRenderItem> items,
         double scale,
-        Func<int, double> pageTop)
+        Func<int, double> pageTop,
+        Func<int, PageTransform> pageView)
     {
         foreach (var item in items)
         {
@@ -76,12 +89,12 @@ public static class ShapeSkiaPainter
                 continue;
             }
 
-            PaintStroked(canvas, item, scale, pageTop(item.PageIndex));
+            PaintStroked(canvas, item, scale, pageTop(item.PageIndex), pageView(item.PageIndex));
         }
     }
 
     private static void PaintStroked(
-        SKCanvas canvas, ShapeRenderItem item, double scale, double pageTop)
+        SKCanvas canvas, ShapeRenderItem item, double scale, double pageTop, PageTransform view)
     {
         if (item.Points.Count < 2)
         {
@@ -92,7 +105,7 @@ public static class ShapeSkiaPainter
         {
             Style = SKPaintStyle.Stroke,
             Color = ToSkColor(item.Color),
-            StrokeWidth = (float)OverlayProjection.ToSlotThickness(item.StrokeWidth, scale),
+            StrokeWidth = (float)OverlayProjection.ToSlotThickness(item.StrokeWidth, scale, view),
 
             // The overlay is a XAML Polyline, which antialiases. Skia does not
             // by default, and leaving it off is a visible parity difference on
@@ -109,7 +122,7 @@ public static class ShapeSkiaPainter
         using var path = new SKPath();
         for (int at = 0; at < item.Points.Count; at++)
         {
-            var (x, y) = OverlayProjection.ToSlot(item.Points[at], scale, pageTop);
+            var (x, y) = OverlayProjection.ToSlot(item.Points[at], scale, pageTop, view);
             if (at == 0)
             {
                 path.MoveTo((float)x, (float)y);

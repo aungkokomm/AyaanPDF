@@ -126,6 +126,10 @@ public class ShapeRenderListTests
     {
         // scale, then drop to the page's top. Only Y takes the offset: X is
         // measured from the same left edge on every page in the stack.
+        //
+        // This is the page's own frame, WITHOUT the view's turn, which is what
+        // the two diagnostic harnesses want and what a renderer must not stop
+        // at. The turned rule is pinned in SkiaRotationParityTests.
         const double scale = 800;
         const double pageTop = 1234.5;
 
@@ -161,18 +165,30 @@ public class ShapeRenderListTests
         // OverlayProjection claims to reproduce BuildStrokePolyline, and this
         // assembly cannot call it, so the claim is guarded at the source.
         //
-        // That claim is now PARTIAL, deliberately, and this test caught it. The
-        // overlay was corrected to route every point through the page's
-        // PageTransform, so normalized-to-slot is no longer the whole story: it
-        // is OverlayProjection's step followed by ToCard. Skia still does only
-        // the first half, which is a known divergence under view rotation and
-        // is what the next commit aligns. Everything else, at every rotation
-        // the app can actually be in when Skia is enabled, is unaffected,
-        // because ToCard is the identity at 0 degrees.
+        // The claim was PARTIAL for one commit and is whole again. The overlay
+        // was corrected to route every point through the page's PageTransform,
+        // which left normalized-to-slot as only the first half of the story;
+        // OverlayProjection now states both halves and Skia takes the same two,
+        // so there is one rule and two renderers held to it. What this guards is
+        // the end the tests cannot call: that the overlay is still performing
+        // that arithmetic and has not quietly gone back to the half.
         string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
 
         Assert.Contains("view.ToCard(x * scale, y * scale)", page, StringComparison.Ordinal);
         Assert.Contains("stroke.StrokeWidth * scale * view.Scale", page, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_skia_layer_is_handed_the_same_page_transform_the_overlay_uses()
+    {
+        // Both renderers must read the turn from the SAME source. The overlay
+        // calls ViewTransformOf per stroke; if the Skia host were passed
+        // anything else, the two would agree at 0 degrees and diverge silently
+        // the moment the view was turned, which is the exact failure this whole
+        // commit exists to remove.
+        string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
+
+        Assert.Contains("ViewModel.ViewTransformOf", page, StringComparison.Ordinal);
     }
 
     [Fact]

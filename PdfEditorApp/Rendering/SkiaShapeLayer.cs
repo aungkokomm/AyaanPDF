@@ -28,20 +28,33 @@ namespace PdfEditorApp.Rendering;
 /// rather than as a compositor transform. Rasterising at final device
 /// resolution every frame is what keeps it sharp at any zoom.
 ///
-/// NO VIEW ROTATION, on purpose. The XAML overlay does not rotate with the
-/// view: the rotation transform is bound inside each page card, and the ink
-/// layer is a sibling of the page stack that nothing ever turns. Matching that
-/// is the only option that keeps rendering the single variable. Making Skia
-/// rotate would be a behaviour change and would also make it disagree with the
-/// renderer it is being measured against. Left undecided rather than called
-/// passed or failed.
+/// VIEW ROTATION ARRIVES AS DATA. Being outside the scroller also puts this
+/// outside every page card, and the rotation transform is bound INSIDE a card,
+/// so nothing turns this layer for it. The XAML ink overlay is a sibling of the
+/// page stack in exactly the same position and has the same problem; it was
+/// corrected to turn its own points through the page's PageTransform, and this
+/// now does the same, through the same shared projection.
+///
+/// Which is why a per-page transform is handed in beside the per-page top. It
+/// is not composed into the Skia matrix: the turn belongs to the page and is
+/// described in the app's coordinates, and letting Skia own it would make a
+/// renderer the authority on where a mark is.
 /// </summary>
 internal sealed partial class SkiaShapeLayer : SKXamlCanvas
 {
     private IReadOnlyList<ShapeRenderItem> _items = [];
     private double _scale;
     private Func<int, double> _pageTop = _ => 0;
+    private Func<int, PageTransform> _pageView = _ => Unturned;
     private ViewportProjection _projection = new(1, 1, 0, 0);
+
+    /// <summary>
+    /// The transform of a page nobody has told us about: no turn, unit scale.
+    /// A square content box in a card of its own width, so ToCard is the
+    /// identity and this layer behaves exactly as it did before it learned
+    /// about rotation.
+    /// </summary>
+    private static PageTransform Unturned => PageTransform.For(1, 1, 0, 1);
 
     public SkiaShapeLayer()
     {
@@ -64,11 +77,13 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
         IReadOnlyList<ShapeRenderItem> items,
         double scale,
         Func<int, double> pageTop,
+        Func<int, PageTransform> pageView,
         ViewportProjection projection)
     {
         _items = items;
         _scale = scale;
         _pageTop = pageTop;
+        _pageView = pageView;
         _projection = projection;
         Invalidate();
     }
@@ -94,7 +109,8 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
             _items,
             _projection.VisibleSlotBounds(e.Info.Width, e.Info.Height, CullPadSlotDips),
             _scale,
-            _pageTop);
+            _pageTop,
+            _pageView);
 
         LastDrawnCount = visible.Count;
         if (visible.Count == 0)
@@ -105,6 +121,6 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
         // The matrix and the painting both live in the rendering project, where
         // they are covered by tests this host cannot be. Nothing is computed
         // here.
-        ShapeSkiaPainter.PaintViewport(canvas, visible, _scale, _pageTop, _projection);
+        ShapeSkiaPainter.PaintViewport(canvas, visible, _scale, _pageTop, _pageView, _projection);
     }
 }

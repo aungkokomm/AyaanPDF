@@ -20,17 +20,24 @@ public static class ShapeCulling
     /// The items whose slot-space bounds meet the given slot-space rectangle.
     /// </summary>
     /// <param name="pageTop">Where each item's page starts in the stack.</param>
+    /// <param name="pageView">
+    /// How each item's page is turned. Culling MUST project the same way the
+    /// painter does: deciding what is on screen from an untuned position while
+    /// painting at a turned one drops marks that are visible and keeps ones that
+    /// are not, and only ever while the view is rotated.
+    /// </param>
     public static IReadOnlyList<ShapeRenderItem> Visible(
         IReadOnlyList<ShapeRenderItem> items,
         (double Left, double Top, double Right, double Bottom) slotBounds,
         double scale,
-        Func<int, double> pageTop)
+        Func<int, double> pageTop,
+        Func<int, PageTransform> pageView)
     {
         var kept = new List<ShapeRenderItem>(items.Count);
 
         foreach (var item in items)
         {
-            if (Meets(item, slotBounds, scale, pageTop(item.PageIndex)))
+            if (Meets(item, slotBounds, scale, pageTop(item.PageIndex), pageView(item.PageIndex)))
             {
                 kept.Add(item);
             }
@@ -43,7 +50,8 @@ public static class ShapeCulling
         ShapeRenderItem item,
         (double Left, double Top, double Right, double Bottom) bounds,
         double scale,
-        double pageTop)
+        double pageTop,
+        PageTransform view)
     {
         if (item.Points.Count == 0)
         {
@@ -55,7 +63,7 @@ public static class ShapeCulling
 
         foreach (var point in item.Points)
         {
-            var (x, y) = OverlayProjection.ToSlot(point, scale, pageTop);
+            var (x, y) = OverlayProjection.ToSlot(point, scale, pageTop, view);
             left = Math.Min(left, x);
             top = Math.Min(top, y);
             right = Math.Max(right, x);
@@ -64,7 +72,7 @@ public static class ShapeCulling
 
         // Half the stroke reaches outside the path on every side, so a mark
         // tested on its centreline alone vanishes half a stroke early.
-        double reach = OverlayProjection.ToSlotThickness(item.StrokeWidth, scale) / 2;
+        double reach = OverlayProjection.ToSlotThickness(item.StrokeWidth, scale, view) / 2;
 
         return left - reach <= bounds.Right
             && right + reach >= bounds.Left

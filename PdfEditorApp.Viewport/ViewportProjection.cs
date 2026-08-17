@@ -18,9 +18,11 @@ namespace PdfEditorApp.Viewport;
 /// therefore sits OUTSIDE the scroller at viewport size, and zoom and scroll
 /// arrive here as numbers instead of as a compositor transform.
 ///
-/// No view rotation. The XAML overlay does not rotate with the view, and this
-/// deliberately matches it; making Skia turn would be a behaviour change, not a
-/// rendering change. See the note in SkiaShapeLayer.
+/// No view rotation HERE, and that is not the same as nowhere. The turn belongs
+/// to a page, so it is applied per page in <see cref="OverlayProjection"/> using
+/// that page's <see cref="PageTransform"/>, before anything reaches this. By the
+/// time coordinates arrive they are slot DIPs and the whole stack shares them,
+/// which is exactly why zoom and scroll can be three numbers.
 /// </summary>
 /// <param name="Zoom">The scroller's zoom factor.</param>
 /// <param name="DeviceScale">Device pixels per DIP.</param>

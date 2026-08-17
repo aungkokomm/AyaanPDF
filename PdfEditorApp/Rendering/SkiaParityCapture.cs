@@ -121,8 +121,15 @@ internal static class SkiaParityCapture
             // Identity projection: no zoom, no scroll, and the device scale
             // read from the surface, so this capture measures the renderer and
             // not the viewport plumbing. That plumbing has its own tests.
+            //
+            // The page transform is identity too, and for the same reason. This
+            // capture compares Skia against a XAML polyline built beside it, and
+            // that polyline is not inside a page card and so is not turned; a
+            // turn here would be measuring the rotation rather than the
+            // rendering. Rotation parity is covered by SkiaRotationParityTests.
             layer.Show(
                 ShapeRenderList.From([], [Subject]), Scale, _ => 0,
+                _ => PageTransform.For(1, 1, 0, 1),
                 new ViewportProjection(
                     Zoom: 1,
                     DeviceScale: layer.XamlRoot?.RasterizationScale ?? 1.0,
