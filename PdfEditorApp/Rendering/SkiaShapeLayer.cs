@@ -67,6 +67,11 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
         // put a second, invisible transform between the projection and the
         // pixels.
         IgnorePixelScaling = false;
+
+        // Partial painting rests on the bitmap still holding the last frame,
+        // and SKXamlCanvas frees it on unload. What the next one holds is not
+        // knowable, so the frame after that has to draw the lot.
+        Unloaded += (_, _) => _dirty.Reset();
     }
 
     /// <summary>How far outside the surface a mark is still worth drawing.</summary>
@@ -91,19 +96,57 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
     /// <summary>How many of the last frame's items survived culling.</summary>
     public int LastDrawnCount { get; private set; }
 
+    /// <summary>
+    /// What the last frame put on the bitmap, so this one knows what to erase.
+    /// </summary>
+    private readonly DirtyRegionTracker _dirty = new();
+
+    /// <summary>The scope of the last frame, for tests and diagnostics.</summary>
+    public PaintScope LastScope { get; private set; }
+
     protected override void OnPaintSurface(SKPaintSurfaceEventArgs e)
     {
         var canvas = e.Surface.Canvas;
+        LastDrawnCount = 0;
+
+        if (_scale <= 0)
+        {
+            // Nothing is known about the projection yet, so nothing here can
+            // reason about what is on the bitmap either.
+            canvas.Clear(SKColors.Transparent);
+            _dirty.Reset();
+            LastScope = PaintScope.Full;
+            return;
+        }
+
+        var plan = _dirty.Plan(
+            _items, _scale, _pageTop, _pageView, _projection, e.Info.Width, e.Info.Height);
+
+        LastScope = plan.Scope;
+
+        if (plan.Scope == PaintScope.Nothing)
+        {
+            // Neither the old mark nor the new one reaches the surface. The
+            // bitmap already shows the right thing, which is nothing.
+            _dirty.Painted(plan);
+            return;
+        }
+
+        int saved = canvas.Save();
+
+        // The clip does two jobs at once, and the ORDER is what makes partial
+        // painting cost anything less than the whole surface: Clear fills the
+        // CLIP, not the bitmap, so clipping first turns a full-surface memset
+        // into one the size of the mark. That memset is the entire cost being
+        // avoided here; at 3840x2160 it was seven milliseconds of the eight a
+        // frame took.
+        canvas.ClipRect(SKRect.Create(
+            plan.Rect.L, plan.Rect.T,
+            plan.Rect.R - plan.Rect.L, plan.Rect.B - plan.Rect.T));
 
         // Transparent, not a colour: this sits over the rendered page and must
         // not paint out what PDFium drew.
         canvas.Clear(SKColors.Transparent);
-        LastDrawnCount = 0;
-
-        if (_items.Count == 0 || _scale <= 0)
-        {
-            return;
-        }
 
         var visible = ShapeCulling.Visible(
             _items,
@@ -113,14 +156,22 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
             _pageView);
 
         LastDrawnCount = visible.Count;
-        if (visible.Count == 0)
+
+        if (visible.Count > 0)
         {
-            return;
+            // The matrix and the painting both live in the rendering project,
+            // where they are covered by tests this host cannot be. Nothing is
+            // computed here, and the clip set above still applies: PaintViewport
+            // saves and restores around its own matrix, which composes with an
+            // outer clip rather than replacing it.
+            ShapeSkiaPainter.PaintViewport(
+                canvas, visible, _scale, _pageTop, _pageView, _projection);
         }
 
-        // The matrix and the painting both live in the rendering project, where
-        // they are covered by tests this host cannot be. Nothing is computed
-        // here.
-        ShapeSkiaPainter.PaintViewport(canvas, visible, _scale, _pageTop, _pageView, _projection);
+        canvas.RestoreToCount(saved);
+
+        // Only now, and only because the paint above actually happened.
+        _dirty.Painted(plan);
     }
+
 }
