@@ -10688,6 +10688,106 @@ mod tests {
         free_byte_buffer(saved);
     }
 
+
+    // ---------------- alpha survives the trip into a PDF image ----------------
+
+    /// Whether an embedded BGRA image keeps its alpha channel.
+    ///
+    /// The soft-shadow design rests entirely on this. A blurred shadow cannot
+    /// be expressed as PDF path objects, so the plan is to rasterise it with
+    /// Skia and embed it through the same route stamps already take. A shadow
+    /// is nothing BUT alpha, so if PDFium flattened the channel the plan would
+    /// have to be abandoned for a hard shadow in the file.
+    ///
+    /// One stamp over the blank white fixture, five horizontal bands. Black
+    /// over white composites to exactly `255 - alpha`, so the expected value is
+    /// arithmetic rather than a number somebody read off a screen once.
+    ///
+    /// THE LAST BAND IS THE ONE THAT EARNS ITS PLACE. It distinguishes STRAIGHT
+    /// alpha from PREMULTIPLIED, and the choice of colour is not free: the
+    /// first version of this test used a fully saturated red, which predicts
+    /// 255 under BOTH conventions and therefore proved nothing. A half-bright
+    /// red at half alpha predicts 191 straight and 255 premultiplied, and it
+    /// comes out 191.
+    ///
+    /// That matters downstream: Skia surfaces here are SKAlphaType.Premul, so
+    /// a rasterised shadow has to be un-premultiplied before its bytes cross
+    /// the FFI, or coloured shadows come out too dark in a way a black-only
+    /// test would never catch.
+    #[test]
+    fn an_embedded_bgra_image_keeps_its_alpha_channel() {
+        let handle = open_fixture();
+
+        // Five bands, tall enough that a probe in the middle of one cannot be
+        // contaminated by its neighbour when the image is scaled onto the page.
+        const BANDS: usize = 5;
+        let (pw, ph) = (64usize, 80usize);
+        let band = ph / BANDS;
+
+        let mut bgra = vec![0u8; pw * ph * 4];
+        for y in 0..ph {
+            let (b, g, r, a) = match (y / band).min(BANDS - 1) {
+                0 => (0u8, 0u8, 0u8, 0u8),
+                1 => (0, 0, 0, 64),
+                2 => (0, 0, 0, 128),
+                3 => (0, 0, 0, 255),
+                // Half-bright red at half alpha: the premultiplication probe.
+                _ => (0, 0, 128, 128),
+            };
+            for x in 0..pw {
+                let at = (y * pw + x) * 4;
+                bgra[at] = b;
+                bgra[at + 1] = g;
+                bgra[at + 2] = r;
+                bgra[at + 3] = a;
+            }
+        }
+
+        assert_eq!(
+            add_stamp_annotation(
+                handle, 0, 1000, 100.0, 100.0, 900.0, 900.0,
+                bgra.as_ptr(), bgra.len(), pw as i32, ph as i32,
+            ),
+            STATUS_OK_PDFIUM,
+            "the stamp was not written, so nothing below proves anything"
+        );
+
+        let (bytes, w) = render_bytes(handle, 0, 1000);
+        let h = bytes.len() / (w * 4);
+
+        // The centre of band `i`, as a fraction down the stamp's own box.
+        let probe = |i: usize| {
+            let frac = (i as f64 + 0.5) / BANDS as f64;
+            let x = w / 2;
+            let y = ((100.0 + (800.0 * frac)) / 1000.0 * h as f64) as usize;
+            let at = (y * w + x) * 4;
+            (bytes[at], bytes[at + 1], bytes[at + 2])
+        };
+
+        // Black over white is exactly 255 - alpha on every channel.
+        for (i, alpha) in [(0usize, 0u16), (1, 64), (2, 128), (3, 255)] {
+            let (b, g, r) = probe(i);
+            let want = (255 - alpha) as i32;
+            for (name, got) in [("b", b), ("g", g), ("r", r)] {
+                assert!(
+                    (got as i32 - want).abs() <= 2,
+                    "alpha {alpha}: channel {name} came out {got}, expected about {want}"
+                );
+            }
+        }
+
+        // Straight alpha, not premultiplied.
+        let (b, g, r) = probe(4);
+        assert!((b as i32 - 127).abs() <= 2, "blue should be the page showing through, got {b}");
+        assert!((g as i32 - 127).abs() <= 2, "green should be the page showing through, got {g}");
+        assert!(
+            (r as i32 - 191).abs() <= 2,
+            "red came out {r}: 191 means STRAIGHT alpha, 255 would mean PREMULTIPLIED"
+        );
+
+        close_document(handle);
+    }
+
     // ---------------- the shadow on a committed shape ----------------
 
     /// How many page objects an annotation's appearance is made of, and the
