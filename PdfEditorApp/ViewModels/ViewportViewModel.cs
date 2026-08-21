@@ -12,6 +12,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media.Imaging;
 using PdfEditorApp.Interop;
+using PdfEditorApp.Rendering.Skia;
 using PdfEditorApp.Viewport;
 
 namespace PdfEditorApp.ViewModels;
@@ -7850,6 +7851,188 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// Marks are part of the page bitmap, so a change stays invisible until
     /// this runs; it just does not have to run once per write.
     /// </summary>
+    // ---------------- the committed drop shadow ----------------
+    //
+    // PDF has no blur, so a SOFT shadow cannot be a path in the file. Skia
+    // draws it and it goes into the shape's own annotation as a picture,
+    // underneath the shape. A HARD shadow is untouched: render_core draws it as
+    // paths, crisp at any zoom.
+    //
+    // ONE PASS, HERE, once per command per page. Every edit that changes a
+    // shape rebuilds its annotation, and a rebuild drops the picture on
+    // purpose: a bitmap stretched to a new size stretches the BLUR with it, and
+    // one turned bodily turns the LIGHT with it. So the rule is that the
+    // picture is regenerated rather than transformed, and the one place that
+    // reliably runs after every edit is the repaint.
+    //
+    // No cache. Rasterising costs 2 to 10ms and happens once per command, not
+    // per frame, and a cache would need to know exactly what this pass exists
+    // to avoid getting wrong.
+
+    /// <summary>True while the sync is writing, so its own writes cannot start
+    /// another one.</summary>
+    private bool _syncingShadowImages;
+
+    private void SyncShadowImages(int pageIndex)
+    {
+        if (_documentHandle == 0 || _syncingShadowImages)
+        {
+            return;
+        }
+
+        double pageWidthPts = PagePointsFor(pageIndex).W;
+        if (pageWidthPts <= 0)
+        {
+            return;
+        }
+
+        _syncingShadowImages = true;
+        try
+        {
+            // By INDEX, descending, because attaching rebuilds the annotation
+            // and moves it to the end of the page's list. Walking down means an
+            // index this loop has not reached yet cannot have been disturbed.
+            var todo = new List<int>();
+            foreach (var a in LoadedFor(pageIndex))
+            {
+                todo.Add(a.Index);
+            }
+
+            todo.Sort();
+            todo.Reverse();
+
+            foreach (int index in todo)
+            {
+                AttachShadowImage(pageIndex, index, pageWidthPts);
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"SyncShadowImages p{pageIndex} failed: {ex.Message}");
+        }
+        finally
+        {
+            _syncingShadowImages = false;
+        }
+    }
+
+    /// <summary>
+    /// Draws one shape's soft shadow and puts it in its annotation, or does
+    /// nothing at all when the shape has no soft shadow to draw.
+    /// </summary>
+    private void AttachShadowImage(int pageIndex, int index, double pageWidthPts)
+    {
+        // The same 1000 every other write across this boundary uses.
+        const int CaptureWidth = 1000;
+
+        string? contents = ReadAnnotationContents(pageIndex, index);
+        if (contents is null || !ShapeTagReader.TryParse(contents, out var tag))
+        {
+            return;
+        }
+
+        if (tag.ShadowHex is null || tag.ShadowSoftnessPts <= 0)
+        {
+            return;
+        }
+
+        var found = LoadedFor(pageIndex).FirstOrDefault(a => a.Index == index);
+        if (found.Id == Guid.Empty && found.Index != index)
+        {
+            return;
+        }
+
+        var sel = new LoadedSelection(
+            pageIndex, index, found.Left, found.Top, found.Right, found.Bottom, found.Id);
+        var (l, t, r, b) = UprightBounds(contents, sel, CaptureWidth, pageWidthPts);
+
+        var items = ShadowCasterItems(tag, l, t, r, b, pageWidthPts);
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        var effects = ShapeEffectsTag.From(tag, pageWidthPts);
+        if (effects?.Shadow is not { } shadow)
+        {
+            return;
+        }
+
+        var raster = ShadowRasterizer.Rasterize(items, shadow, pageWidthPts);
+        if (raster is null)
+        {
+            return;
+        }
+
+        int newIndex = -1;
+        int status = RenderCoreNative.set_shape_shadow_image(
+            _documentHandle, pageIndex, index, CaptureWidth,
+            (float)(raster.Value.Left * CaptureWidth),
+            (float)(raster.Value.Top * CaptureWidth),
+            (float)(raster.Value.Right * CaptureWidth),
+            (float)(raster.Value.Bottom * CaptureWidth),
+            raster.Value.Bgra, (nuint)raster.Value.Bgra.Length,
+            raster.Value.PixelWidth, raster.Value.PixelHeight,
+            out newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"set_shape_shadow_image p{pageIndex} #{index} -> {status}");
+            return;
+        }
+
+        // The annotation was rebuilt, so anything holding the old index is
+        // stale. The cache is dropped rather than patched: the very next lookup
+        // by id has to see where the shape actually is now.
+        InvalidateAnnotationCache(pageIndex);
+    }
+
+    /// <summary>
+    /// The marks that cast the shadow, from the shape's own tag and box.
+    ///
+    /// Built through ShapeAnnotation and ShapeRenderList, the SAME two the
+    /// preview goes through, so the committed shadow and the previewed one are
+    /// cast by the same geometry. Anything reconstructed by hand here would be
+    /// a second definition of what a shape looks like, and the two would drift.
+    /// </summary>
+    private static IReadOnlyList<ShapeRenderItem> ShadowCasterItems(
+        ShapeTag tag, double left, double top, double right, double bottom, double pageWidthPts)
+    {
+        var draft = new ShapeDraft(tag.Kind, left, top, right, bottom)
+        {
+            CornerFraction = ShapeGeometry.CornerFractionFromRadius(
+                tag.CornerRadiusPts / pageWidthPts, right - left, bottom - top),
+        };
+
+        var shape = new ShapeAnnotation(0, draft, tag.StrokeHex, tag.StrokeWidthPts / pageWidthPts);
+        var items = ShapeRenderList.From(Array.Empty<InkStrokeAnnotation>(), new[] { shape });
+
+        if (tag.RotationDeg == 0)
+        {
+            return items;
+        }
+
+        // Turned about the shape's own centre, which is where render_core turns
+        // it. The picture carries the turn in its pixels rather than being
+        // turned as a whole later, because turning the picture would turn the
+        // light with it.
+        double cx = (left + right) / 2;
+        double cy = (top + bottom) / 2;
+        double rad = tag.RotationDeg * Math.PI / 180.0;
+        double cos = Math.Cos(rad), sin = Math.Sin(rad);
+
+        return items
+            .Select(i => i with
+            {
+                Points = i.Points
+                    .Select(p => (
+                        X: cx + (((p.X - cx) * cos) - ((p.Y - cy) * sin)),
+                        Y: cy + (((p.X - cx) * sin) + ((p.Y - cy) * cos))))
+                    .ToList(),
+            })
+            .ToList();
+    }
+
     private void RedrawPage(int pageIndex)
     {
         var slot = SlotFor(pageIndex);
@@ -7857,6 +8040,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             return;
         }
+
+        // The soft shadows first: this is the one place that reliably runs
+        // after every edit, and a rebuilt annotation has had its picture
+        // dropped. Before the tiles go, so the page is rendered with them.
+        SyncShadowImages(pageIndex);
 
         slot.ClearTiles();
         slot.ReleaseBitmap();

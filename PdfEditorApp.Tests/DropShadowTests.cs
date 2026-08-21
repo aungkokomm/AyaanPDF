@@ -96,6 +96,30 @@ public class DropShadowTests
         return lit;
     }
 
+    /// <summary>Every pixel that is a shade of grey: the black shadow, and
+    /// nothing the blue shape painted.</summary>
+    private static HashSet<(int X, int Y)> Grey(SKBitmap bitmap)
+    {
+        var grey = new HashSet<(int, int)>();
+        var pixels = bitmap.GetPixelSpan();
+        int stride = bitmap.RowBytes;
+
+        for (int y = 0; y < bitmap.Height; y++)
+        {
+            for (int x = 0; x < bitmap.Width; x++)
+            {
+                int at = (y * stride) + (x * 4);
+                if (pixels[at] != 255 && pixels[at] == pixels[at + 1]
+                    && pixels[at + 1] == pixels[at + 2])
+                {
+                    grey.Add((x, y));
+                }
+            }
+        }
+
+        return grey;
+    }
+
     private static (int L, int T, int R, int B) Box(HashSet<(int X, int Y)> lit)
     {
         Assert.NotEmpty(lit);
@@ -152,13 +176,21 @@ public class DropShadowTests
         // fails. The shadow's box is the shape's box moved by the offset in slot
         // DIPs, which at zoom 1 and scale 1 is the offset times the overlay
         // scale.
-        using var plain = Paint([Mark(0.3, 0.3)], View(0));
-        using var only = Paint(
-            [Mark(0.3, 0.3, Shadow(dx, dy)) with { Color = new RenderColor(0, 0, 0, 0) }],
-            View(0));
+        //
+        // The shape is painted BLUE and the shadow read off the grey pixels.
+        // This used to hide the shape by making it transparent, which no longer
+        // photographs the shadow on its own: the shadow is derived from the
+        // shape's alpha, so a fully transparent shape casts none at all. That is
+        // correct, since nothing invisible blocks any light, but it means the
+        // two have to be told apart by colour instead.
+        var blue = new RenderColor(0xFF, 0, 0, 0xFF);
+
+        using var plain = Paint([Mark(0.3, 0.3) with { Color = blue }], View(0));
+        using var both = Paint(
+            [Mark(0.3, 0.3, Shadow(dx, dy)) with { Color = blue }], View(0));
 
         var shape = Box(Lit(plain));
-        var shadow = Box(Lit(only));
+        var shadow = Box(Grey(both));
 
         Assert.Equal(shape.L + (dx * Scale), shadow.L, tolerance: 2.0);
         Assert.Equal(shape.T + (dy * Scale), shadow.T, tolerance: 2.0);

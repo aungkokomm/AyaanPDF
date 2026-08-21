@@ -4577,13 +4577,15 @@ pub struct ShapeSpec {
     pub shadow_rgba: u32,
 }
 
-/// Whether a shape surrounds an area, rather than merely being a line.
+/// How far a blurred shadow's ink escapes its own silhouette, in points.
 ///
-/// What casts a silhouette. A rectangle, a rounded rectangle and an ellipse
-/// enclose something whether or not they are filled; a line and an arrow's
-/// shaft do not, and an arrow's HEAD is already a filled triangle.
-fn encloses_an_area(kind: i32) -> bool {
-    matches!(kind, SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_ROUNDED_RECT)
+/// Softness is the RADIUS and sigma is half of it, and a gaussian is spent by
+/// three sigma, so the reach is one and a half times the softness. The SAME
+/// three sigma the preview uses (OverlayProjection.BlurReachSigmas), because
+/// the room the annotation reserves and the room the rasteriser paints have to
+/// be the same room.
+fn shadow_reach_pts(softness_pts: f32) -> f32 {
+    if softness_pts > 0.0 { softness_pts * 1.5 } else { 0.0 }
 }
 
 /// One axis of a reported /Rect, with the SHADOW's growth taken back off.
@@ -4703,6 +4705,16 @@ fn add_shape_annotations_inner(
     capture_width: i32,
     specs: *const ShapeSpec,
     spec_count: usize,
+) -> i32 {
+    add_shape_annotations_inner_with_image(doc_handle, capture_width, specs, spec_count, None)
+}
+
+fn add_shape_annotations_inner_with_image(
+    doc_handle: u64,
+    capture_width: i32,
+    specs: *const ShapeSpec,
+    spec_count: usize,
+    shadow_image: Option<&ShadowImage>,
 ) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -4943,8 +4955,19 @@ fn add_shape_annotations_inner(
         // geometry is the shape's final geometry translated by the same vector.
         // Growing the finished box by that vector therefore contains it at any
         // angle.
+        // PDFium CROPS an appearance to its box, and a BLUR spreads in all
+        // four directions, so a soft shadow needs room on every side as well as
+        // in the direction it falls. Reserved whether or not a picture is
+        // attached yet, so that taking it back off again is a function of the
+        // tag alone and cannot disagree with itself.
+        let reach = if has_shadow {
+            shadow_reach_pts(spec.shadow_softness_px * scale)
+        } else {
+            0.0
+        };
+
         let grow = |lo: f32, hi: f32, d: f32| {
-            if !has_shadow { (lo, hi) } else { (lo.min(lo + d), hi.max(hi + d)) }
+            if !has_shadow { (lo, hi) } else { (lo.min(lo + d) - reach, hi.max(hi + d) + reach) }
         };
 
         let bounds = if rot == 0.0 {
@@ -5024,6 +5047,49 @@ fn add_shape_annotations_inner(
             ),
         );
 
+        // THE RASTERISED SHADOW GOES DOWN BEFORE EVERYTHING, for the same
+        // reason and one step further: it IS the shadow when there is a blur,
+        // and objects paint in the order they are added.
+        //
+        // PDF has no blur operator for a path, so a soft shadow arrives here as
+        // pixels that Skia produced from the same object. Everything below still
+        // runs: a blurred shadow simply has rgba 0 by the time the app calls
+        // this, so no vector shadow is drawn under the picture as well.
+        if let Some(img) = shadow_image {
+            let Some(pdfium) = pdfium() else { return STATUS_INVALID_INPUT; };
+            let mut pixels = img.bgra.to_vec();
+            let bitmap = unsafe {
+                PdfBitmap::from_bytes(
+                    img.px_w, img.px_h, PdfBitmapFormat::BGRA,
+                    pixels.as_mut_slice(), pdfium.bindings())
+            };
+            let Ok(bitmap) = bitmap else { return STATUS_INVALID_INPUT; };
+
+            let Ok(mut image) = PdfPageImageObject::new(&doc_guard) else {
+                return STATUS_INVALID_INPUT;
+            };
+            if image.set_bitmap(&bitmap).is_err() {
+                return STATUS_INVALID_INPUT;
+            }
+
+            // An image object draws the UNIT SQUARE, so the matrix is what
+            // gives it a place and a size. No rotation term: the picture was
+            // rasterised with the shape already turned in it, because turning
+            // the picture bodily would turn the LIGHT with it.
+            let (il, ir) = (to_pdf_x(img.left), to_pdf_x(img.right));
+            let (it, ib) = (to_pdf_y(img.top), to_pdf_y(img.bottom));
+            if image
+                .apply_matrix(PdfMatrix::new(ir - il, 0.0, 0.0, it - ib, il, ib))
+                .is_err()
+            {
+                return STATUS_INVALID_INPUT;
+            }
+
+            if annotation.objects_mut().add_image_object(image).is_err() {
+                return STATUS_INVALID_INPUT;
+            }
+        }
+
         // THE SHADOW GOES DOWN FIRST, because objects paint in the order they
         // are added and a shadow belongs under the thing casting it.
         //
@@ -5037,16 +5103,16 @@ fn add_shape_annotations_inner(
             let b = (spec.shadow_rgba & 0xFF) as u8;
             let shadow_color = PdfColor::new(r, g, b, a);
 
-            // THE SHADOW IS THE SILHOUETTE, not the mark. An outlined
-            // rectangle is a card and not a wire frame, and a card held up to
-            // the light throws a solid rectangle; casting the outline gives an
-            // offset copy of the shape, which is what it was reported as.
+            // THE ALPHA RULE: the shadow is the shape's OWN marks, offset and
+            // recoloured. What the light could not get through is what casts a
+            // shadow, so a hollow rectangle throws a hollow one.
             //
-            // Not simply "always fill": a line encloses nothing, so filling it
-            // would leave no shadow at all. The same rule runs in the preview,
-            // where it is read off the points, so the two renderers agree about
-            // what a shadow is.
-            let shadow_fill = encloses_an_area(spec.kind).then_some(shadow_color);
+            // This is the same rule the preview follows, because an image
+            // filter derives the shadow from the object's alpha, which for a
+            // path is exactly "fill where it fills, stroke where it strokes".
+            // The silhouette rule that briefly stood here filled every closed
+            // shape, and made a hollow rectangle cast a solid grey slab.
+            let shadow_fill = fill.map(|_| shadow_color);
 
             if let Ok(mut shadow) = build_path(sdx, sdy, shadow_color, shadow_fill) {
                 rotate_object_about!(shadow, rot, cx + sdx, cy + sdy);
@@ -5181,7 +5247,7 @@ pub extern "C" fn rotate_shape_annotation(
         // (None), so a rotate does not clear or change a filled shape.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, Some(degrees), None, None, None, out_new_index)
+            0, -1.0, Some(degrees), None, None, None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5207,7 +5273,7 @@ pub extern "C" fn restyle_shape_annotation(
     panic::catch_unwind(|| {
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width, color_rgba, width_px,
-            None, None, None, None, out_new_index)
+            None, None, None, None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5234,7 +5300,7 @@ pub extern "C" fn restyle_shape_fill_annotation(
         // colour, width and rotation. Only the fill changes.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, None, Some(fill_rgba), None, None, out_new_index)
+            0, -1.0, None, Some(fill_rgba), None, None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5266,7 +5332,7 @@ pub extern "C" fn restyle_shape_radius_annotation(
     panic::catch_unwind(|| {
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, None, None, Some(radius_px), None, out_new_index)
+            0, -1.0, None, None, Some(radius_px), None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5320,6 +5386,97 @@ pub extern "C" fn restyle_shape_shadow_annotation(
             doc_handle, page_index, index, capture_width,
             0, -1.0, None, None, None,
             Some(ShadowOverride { angle_deg, distance_px, softness_px, spread_px, rgba }),
+            None, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// A rasterised shadow on its way into an annotation.
+///
+/// PDF has no blur, so a SOFT shadow is drawn by Skia and carried here as
+/// pixels. It is not an alternative to the shape's own marks: it goes into the
+/// same annotation underneath them, so one annotation is still one object and
+/// the tag, the id, selection, undo and delete all keep working unchanged.
+struct ShadowImage<'a> {
+    /// Premultiplied BGRA, as an SKBitmap holds it.
+    bgra: &'a [u8],
+    px_w: i32,
+    px_h: i32,
+    /// The box it covers, in CAPTURE space, the same units as the shape.
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+/// Replaces the rasterised shadow on an existing shape.
+///
+/// A null pointer takes the picture away, which is what a hard shadow and a
+/// cleared shadow both want.
+///
+/// This REBUILDS the annotation, because objects paint in the order they are
+/// added and PDFium can only append: the picture has to go in first, so it
+/// cannot be pushed underneath one that is already there. The rebuild is the
+/// same one every restyle already does, so nothing new can be lost by it.
+///
+/// The caller supplies the box because the caller is the one that blurred the
+/// thing and therefore the only one that knows how far the ink reached.
+///
+/// # Safety
+/// `bgra` must point to `byte_len` readable bytes, or be null.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn set_shape_shadow_image(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    bgra: *const u8,
+    byte_len: usize,
+    px_w: i32,
+    px_h: i32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || capture_width <= 0 || page_index < 0 || index < 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let owned = if bgra.is_null() {
+        None
+    } else {
+        if px_w <= 0 || px_h <= 0 {
+            return STATUS_INVALID_INPUT;
+        }
+        // The length has to agree with the size, because the buffer is handed
+        // to PDFium, which reads what the dimensions promise rather than what
+        // the caller allocated.
+        if byte_len != (px_w as usize) * (px_h as usize) * 4 {
+            return STATUS_INVALID_INPUT;
+        }
+        for edge in [left, top, right, bottom] {
+            if !edge.is_finite() {
+                return STATUS_INVALID_INPUT;
+            }
+        }
+        if right <= left || bottom <= top {
+            return STATUS_INVALID_INPUT;
+        }
+
+        Some(unsafe { std::slice::from_raw_parts(bgra, byte_len) }.to_vec())
+    };
+
+    panic::catch_unwind(|| {
+        let image = owned.as_ref().map(|px| ShadowImage {
+            bgra: px, px_w, px_h, left, top, right, bottom,
+        });
+
+        restyle_shape_annotation_inner_with_rotation(
+            doc_handle, page_index, index, capture_width,
+            0, -1.0, None, None, None, None, image.as_ref(),
             out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
@@ -5337,6 +5494,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     fill_override: Option<u32>,
     radius_override: Option<f32>,
     shadow_override: Option<ShadowOverride>,
+    shadow_image: Option<&ShadowImage>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
@@ -5384,8 +5542,12 @@ fn restyle_shape_annotation_inner_with_rotation(
     let (bl, bb, br, bt) = match cur_shadow {
         Some(sh) if sh.rgba != 0 => {
             let (sdx, sdy) = shadow_offset_pts(sh.angle_deg, sh.distance_pts);
-            let (l, r) = ungrow_shadow(bounds.left().value, bounds.right().value, sdx);
-            let (b, t) = ungrow_shadow(bounds.bottom().value, bounds.top().value, sdy);
+            // The blur's room first, off all four sides; then the offset.
+            let reach = shadow_reach_pts(sh.softness_pts);
+            let (l, r) = ungrow_shadow(
+                bounds.left().value + reach, bounds.right().value - reach, sdx);
+            let (b, t) = ungrow_shadow(
+                bounds.bottom().value + reach, bounds.top().value - reach, sdy);
             (l, b, r, t)
         }
         _ => (
@@ -5479,7 +5641,10 @@ fn restyle_shape_annotation_inner_with_rotation(
         shadow_spread_px: shadow.spread_px,
         shadow_rgba: shadow.rgba,
     };
-    let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
+    let status = panic::catch_unwind(|| {
+        add_shape_annotations_inner_with_image(doc_handle, capture_width, &spec, 1, shadow_image)
+    })
+    .unwrap_or(STATUS_PANIC);
     if status != STATUS_OK_PDFIUM { return status; }
 
     if !out_new_index.is_null() {
@@ -5538,6 +5703,12 @@ fn upright_shape_bounds(
     let (left, top, right, bottom) = match shadow {
         Some(sh) if sh.rgba != 0 => {
             let (sdx, sdy) = shadow_offset_pts(sh.angle_deg, sh.distance_pts);
+            // The blur's room comes off all four sides first. It is symmetric,
+            // so it leaves the centre where it was; the offset is not, so it
+            // has to come off one side each way.
+            let reach = shadow_reach_pts(sh.softness_pts) * per_pt;
+            let (left, top, right, bottom) =
+                (left + reach, top + reach, right - reach, bottom - reach);
             // These bounds run y DOWN and the offset is in PDF points, which
             // run y UP, so the vertical term is negated on the way in.
             let (l, r) = ungrow_shadow(left, right, sdx * per_pt);
@@ -11664,10 +11835,16 @@ mod tests {
     }
 
     fn set_shadow(handle: u64, idx: i32, angle: f32, distance: f32, rgba: u32) -> i32 {
+        set_shadow_soft(handle, idx, angle, distance, 0.0, rgba)
+    }
+
+    fn set_shadow_soft(
+        handle: u64, idx: i32, angle: f32, distance: f32, softness: f32, rgba: u32,
+    ) -> i32 {
         let mut out = -1;
         assert_eq!(
             restyle_shape_shadow_annotation(
-                handle, 0, idx, 1000, angle, distance, 0.0, 0.0, rgba, &mut out),
+                handle, 0, idx, 1000, angle, distance, softness, 0.0, rgba, &mut out),
             STATUS_OK_PDFIUM,
             "the shadow edit was refused");
         out
@@ -11806,15 +11983,293 @@ mod tests {
         hist
     }
 
+
+    // ---------------- a soft shadow is a picture, a hard one is not ----------------
+    //
+    // PDF has no blur, so a soft shadow is rasterised by Skia and embedded as
+    // an image in the SAME annotation, underneath the shape. A HARD shadow is
+    // left exactly as it was: paths, crisp at any zoom, because no raster
+    // resolution reproduces a hard edge (measured in the ShadowLab prototype:
+    // the error never converges, and it is visibly soft at 8 pixels to the
+    // point).
+
+    /// What KIND of marks an annotation is made of.
+    fn object_kinds(handle: u64, index: usize) -> Vec<&'static str> {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let Some(doc) = lock(&core().documents).get(&handle).cloned() else { return vec![] };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(0) else { return vec![] };
+        let Some(annotation) = page.annotations().iter().nth(index) else { return vec![] };
+
+        annotation
+            .objects()
+            .iter()
+            .map(|o| match o {
+                PdfPageObject::Image(_) => "image",
+                PdfPageObject::Path(_) => "path",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// A grey RGBA tile, as Skia would hand one over: fully opaque in the
+    /// middle so the test can find it, and the alpha PREMULTIPLIED, which is
+    /// what an SKBitmap holds.
+    fn grey_tile(w: i32, h: i32) -> Vec<u8> {
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let at = ((y * w + x) * 4) as usize;
+                // A soft edge, so this behaves like a blurred shadow: solid in
+                // the middle, fading out over the outer fifth.
+                let edge = (x.min(y).min(w - 1 - x).min(h - 1 - y)) as f32;
+                let fade = (edge / (w.min(h) as f32 / 5.0)).clamp(0.0, 1.0);
+                let a = (fade * 128.0) as u8;
+                px[at] = 0;
+                px[at + 1] = 0;
+                px[at + 2] = 0;
+                px[at + 3] = a;
+            }
+        }
+        px
+    }
+
+    fn attach_image(
+        handle: u64, idx: i32, left: f32, top: f32, right: f32, bottom: f32,
+        px: &[u8], w: i32, h: i32,
+    ) -> i32 {
+        let mut out = -1;
+        let status = set_shape_shadow_image(
+            handle, 0, idx, 1000, left, top, right, bottom,
+            px.as_ptr(), px.len(), w, h, &mut out);
+        assert_eq!(status, STATUS_OK_PDFIUM, "the shadow image was refused");
+        out
+    }
+
     #[test]
-    fn an_unfilled_shape_still_casts_a_solid_shadow() {
-        // THE REPORT: a stroke-only rectangle's shadow came out as a second
-        // copy of the outline, which reads as a duplicate rather than a shadow.
-        // Measured before the fix: 1600 shadow pixels against 1600 shape
-        // pixels, exactly one for one.
+    fn a_hard_shadow_is_still_drawn_as_paths() {
+        // Softness zero keeps the vector path it always had. Nothing to
+        // rasterise, nothing to go soft, nothing new in the annotation.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+        s.shadow_softness_px = 0.0;
+        add_one(handle, s);
+
+        let kinds = object_kinds(handle, 0);
+        assert!(!kinds.contains(&"image"), "a hard shadow became a picture: {kinds:?}");
+        assert!(kinds.contains(&"path"), "the shape lost its paths");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_soft_shadow_goes_under_the_shape_in_the_same_annotation() {
+        // ONE annotation, so the tag, the id, selection, undo, move and delete
+        // all keep working on one object. The image FIRST, because objects
+        // paint in the order they are added and a shadow belongs underneath.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.fill_rgba = 0xFF3B82F6;
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+        s.shadow_softness_px = 40.0;
+        add_one(handle, s);
+
+        let before = page_count_of_annotations(handle);
+        let px = grey_tile(64, 64);
+        let idx = attach_image(handle, 0, 80.0, 80.0, 480.0, 380.0, &px, 64, 64);
+
+        assert_eq!(
+            page_count_of_annotations(handle), before,
+            "the shadow became a second annotation");
+
+        let kinds = object_kinds(handle, idx as usize);
+        assert_eq!(kinds.first(), Some(&"image"), "the shadow is not underneath: {kinds:?}");
+        assert!(kinds.contains(&"path"), "the shape itself is gone: {kinds:?}");
+
+        close_document(handle);
+    }
+
+    fn page_count_of_annotations(handle: u64) -> usize {
+        let _guard = lock(&CALL_LOCK);
+        let Some(doc) = lock(&core().documents).get(&handle).cloned() else { return 0 };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(0) else { return 0 };
+        let n = page.annotations().len() as usize;
+        n
+    }
+
+    #[test]
+    fn a_soft_shadows_picture_is_not_clipped_by_the_shapes_own_box() {
+        // PDFium CROPS an appearance to the annotation's rectangle, so a blur
+        // that reaches past the shape is cut off unless the rectangle knows
+        // about it. This is the whole reason the box grows.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+
+        s.shadow_softness_px = 0.0;
+        add_one(handle, s);
+        let (_, hard) = annotation_shape(handle, 0).unwrap();
+
+        let mut soft = s;
+        soft.shadow_softness_px = 100.0; // 20pt of radius, so 15pt of reach
+        add_one(handle, soft);
+        let (_, blurred) = annotation_shape(handle, 1).unwrap();
+
+        // Every side, because a blur spreads in all four directions.
+        assert!(blurred.left.value < hard.left.value, "no room on the left");
+        assert!(blurred.right.value > hard.right.value, "no room on the right");
+        assert!(blurred.top.value > hard.top.value, "no room at the top");
+        assert!(blurred.bottom.value < hard.bottom.value, "no room at the bottom");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_room_a_blur_needs_does_not_become_the_shapes_size() {
+        // The same trap the shadow's offset was: /Rect grew, and everything
+        // that rebuilds the shape from it baked the growth into the geometry.
+        // A blur grows all four sides, so left unhandled it would inflate a
+        // shape on every single edit.
+        for rot in [0.0f32, 30.0] {
+            let handle = open_fixture();
+            let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+            sp.rotation_deg = rot;
+            add_one(handle, sp);
+
+            // A shadow with a real blur on it, applied over and over. The
+            // softness is what makes this different from the offset-only case:
+            // the room a blur needs is reserved on all four sides.
+            let mut idx = set_shadow_soft(handle, 0, 135.0, 30.0, 40.0, 0x80000000);
+            let settled = geometry_of(handle, idx as usize);
+
+            for round in 2..=4 {
+                idx = set_shadow_soft(handle, idx, 135.0, 30.0, 40.0, 0x80000000);
+                assert_eq!(
+                    geometry_of(handle, idx as usize), settled,
+                    "at {rot} degrees, blurred edit {round} moved or resized the shape");
+            }
+
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn attaching_a_picture_leaves_the_shape_where_it_was() {
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+        s.shadow_softness_px = 40.0;
+        add_one(handle, s);
+
+        let before = geometry_of(handle, 0);
+        let px = grey_tile(48, 48);
+        let idx = attach_image(handle, 0, 60.0, 60.0, 500.0, 400.0, &px, 48, 48);
+
+        assert_eq!(
+            geometry_of(handle, idx as usize), before,
+            "attaching the shadow moved or resized the shape");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_rebuild_drops_the_old_picture_rather_than_keeping_it() {
+        // Measured in the prototype: a bitmap stretched to a new size stretches
+        // the BLUR with it, and one turned bodily turns the light with it. So a
+        // stale picture is worse than none, and every rebuild starts clean. The
+        // app rasterises a fresh one at the end of the same command.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+        s.shadow_softness_px = 40.0;
+        add_one(handle, s);
+
+        let px = grey_tile(48, 48);
+        let idx = attach_image(handle, 0, 60.0, 60.0, 500.0, 400.0, &px, 48, 48);
+        assert!(object_kinds(handle, idx as usize).contains(&"image"));
+
+        // A resize, through the path the app uses.
+        let (_, b) = annotation_shape(handle, idx as usize).unwrap();
+        let mut out = -1;
+        assert_eq!(
+            resize_shape_annotation(
+                handle, 0, idx, 1000,
+                (b.left.value * 5.0) - 20.0, (200.0 - b.top.value) * 5.0,
+                (b.right.value * 5.0) + 20.0, (200.0 - b.bottom.value) * 5.0,
+                &mut out),
+            STATUS_OK_PDFIUM);
+
+        assert!(
+            !object_kinds(handle, out as usize).contains(&"image"),
+            "the resize kept the old picture, so the blur is now stretched");
+
+        // And the same for a turn, which would otherwise carry the light round
+        // with the shape.
+        let mut turned = -1;
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, out, 1000, 30.0, &mut turned),
+            STATUS_OK_PDFIUM);
+        assert!(
+            !object_kinds(handle, turned as usize).contains(&"image"),
+            "the rotation kept the old picture, so the light turned with it");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn clearing_the_picture_takes_it_away() {
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+        s.shadow_softness_px = 40.0;
+        add_one(handle, s);
+
+        let px = grey_tile(48, 48);
+        let idx = attach_image(handle, 0, 60.0, 60.0, 500.0, 400.0, &px, 48, 48);
+
+        let mut out = -1;
+        assert_eq!(
+            set_shape_shadow_image(
+                handle, 0, idx, 1000, 0.0, 0.0, 0.0, 0.0,
+                std::ptr::null(), 0, 0, 0, &mut out),
+            STATUS_OK_PDFIUM,
+            "clearing the picture was refused");
+
+        assert!(
+            !object_kinds(handle, out as usize).contains(&"image"),
+            "the picture is still there");
+        assert!(object_kinds(handle, out as usize).contains(&"path"), "the shape went too");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_unfilled_shape_casts_the_outline_it_actually_is() {
+        // THE ALPHA RULE, which replaces the silhouette rule of 4a52ff3.
         //
-        // A shadow is the silhouette of the thing casting it, so an unfilled
-        // rectangle casts a filled one.
+        // A shadow is what the light could not get through. A hollow rectangle
+        // is a wire frame, not a card, so it throws a hollow shadow. Filling it
+        // produced a solid grey slab, which the prototype showed reads as a
+        // grey card sitting behind an outline.
+        //
+        // This is also what makes the two renderers agree: SKImageFilter
+        // derives the shadow from the object's own alpha, and drawing the
+        // shape's own marks offset and recoloured is the same thing.
         let handle = open_fixture();
         let before = page_snapshot(handle);
 
@@ -11826,7 +12281,7 @@ mod tests {
         s.width_px = 6.0;
         s.fill_rgba = 0; // stroke only
         s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 180.0; // thrown clear to the right
+        s.shadow_angle_deg = 180.0;
         s.shadow_distance_px = 250.0;
         add_one(handle, s);
 
@@ -11835,54 +12290,11 @@ mod tests {
         let shadow_px = hist.get(&(127, 127, 127)).copied().unwrap_or(0);
 
         assert!(shape_px > 0, "the shape itself did not draw");
+        assert!(shadow_px > 0, "the shadow did not draw at all");
         assert!(
-            shadow_px > shape_px * 3,
+            shadow_px < shape_px * 2,
             "the shadow covered {shadow_px} pixels against the outline's {shape_px}: \
-             it is still tracing the stroke rather than filling the silhouette");
-
-        close_document(handle);
-    }
-
-
-    /// One pixel of an 800-wide render, as (r, g, b). The buffer is BGRA.
-    fn pixel_at(px: &[u8], x: usize, y: usize) -> (u8, u8, u8) {
-        let at = ((y * 800) + x) * 4;
-        (px[at + 2], px[at + 1], px[at])
-    }
-
-    #[test]
-    fn the_pdf_shadow_is_one_tone_throughout() {
-        // The silhouette is stroke AND fill, so the border is drawn over the
-        // fill. With a translucent shadow that is a chance to composite the
-        // same colour over itself and leave a darker rim, which would be a
-        // shadow with a line round it, and would not match the preview.
-        //
-        // The preview is asserted the same way, in ShadowCasterTests.
-        let handle = open_fixture();
-
-        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 250.0, 200.0);
-        s.r = 0;
-        s.g = 0;
-        s.b = 255;
-        s.a = 0xFF;
-        s.width_px = 6.0;
-        s.fill_rgba = 0;
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 180.0;
-        s.shadow_distance_px = 250.0;
-        add_one(handle, s);
-
-        // The shadow covers 70..100pt across and 20..40pt down, and the page
-        // renders at four device pixels to the point.
-        let px = page_snapshot(handle);
-        let border = pixel_at(&px, 283, 120);
-        let middle = pixel_at(&px, 340, 120);
-
-        assert_eq!(middle, (127, 127, 127), "the middle of the shadow is not a half-alpha black");
-        assert!(
-            (border.0 as i32 - middle.0 as i32).abs() <= 2,
-            "the border came out at {border:?} against the middle's {middle:?}: \
-             the silhouette is being composited twice");
+             it is filling the silhouette instead of tracing what is actually there");
 
         close_document(handle);
     }
@@ -11943,14 +12355,19 @@ mod tests {
     // ---------------- reserved, and provably inert ----------------
 
     #[test]
-    fn softness_and_spread_are_stored_but_change_nothing_that_is_drawn() {
-        // They are in the format so a file written today keeps them when
-        // blurring lands. Until then they must be INERT, not half-applied: PDF
-        // has no blur for a path object and no dilation at all, so anything
-        // that looked like softness here would be an invention.
+    fn spread_is_stored_and_changes_nothing_that_is_drawn() {
+        // Spread is in the format so a file written today keeps it when
+        // dilation lands. Until then it must be INERT, not half-applied: PDF
+        // has no dilation at all, so anything that looked like spread here
+        // would be an invention.
         //
         // Proven by drawing the same shape twice and comparing what came out,
-        // rather than by reading the code that ignores them.
+        // rather than by reading the code that ignores it.
+        //
+        // SOFTNESS used to be tested here on the same terms and no longer can
+        // be: a blur reserves room in the annotation's box, because PDFium
+        // crops an appearance to it and a rasterised shadow that reaches past
+        // the shape would be cut off. See the next test.
         let handle = open_fixture();
 
         let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
@@ -11960,7 +12377,6 @@ mod tests {
         add_one(handle, plain);
 
         let mut reserved = plain;
-        reserved.shadow_softness_px = 25.0;
         reserved.shadow_spread_px = 25.0;
         add_one(handle, reserved);
 
@@ -11973,13 +12389,55 @@ mod tests {
         assert_eq!(box_a.top.value, box_b.top.value, "top");
         assert_eq!(box_a.bottom.value, box_b.bottom.value, "bottom");
 
-        // But they DID survive, which is the other half of the bargain. A field
-        // that changes nothing and is not stored is just a field nobody wrote.
+        let sh = parse_shape_tag(&contents_of(handle, 0, 1).unwrap())
+            .expect("tag must parse")
+            .13.expect("the shadow is missing");
+        assert_eq!(sh.spread_pts, 25.0 * 0.2, "spread survived in points");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn softness_reserves_room_but_still_draws_nothing_by_itself() {
+        // The blur is Skia's job, and the picture it produces is attached
+        // separately. What render_core does with softness on its own is make
+        // space for that picture, and nothing else: no extra object, no change
+        // to the marks.
+        let handle = open_fixture();
+
+        let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        plain.shadow_rgba = 0xFF000000;
+        plain.shadow_angle_deg = 135.0;
+        plain.shadow_distance_px = 10.0;
+        add_one(handle, plain);
+
+        let mut soft = plain;
+        soft.shadow_softness_px = 25.0;
+        add_one(handle, soft);
+
+        let (objects_a, box_a) = annotation_shape(handle, 0).expect("annotation missing");
+        let (objects_b, box_b) = annotation_shape(handle, 1).expect("annotation missing");
+
+        assert_eq!(objects_a, objects_b, "softness alone must not add an object");
+
+        // Three sigma, and sigma is half the radius: 25 capture pixels is 5
+        // points of radius, so 7.5 points of room on every side.
+        let reach = 25.0 * 0.2 * 1.5;
+        for (side, a, b, sign) in [
+            ("left", box_a.left.value, box_b.left.value, -1.0),
+            ("right", box_a.right.value, box_b.right.value, 1.0),
+            ("top", box_a.top.value, box_b.top.value, 1.0),
+            ("bottom", box_a.bottom.value, box_b.bottom.value, -1.0),
+        ] {
+            assert!(
+                ((b - (a + (sign * reach))) as f32).abs() < 0.01,
+                "{side}: expected {} points of room, got {}", reach, (b - a) * sign);
+        }
+
         let sh = parse_shape_tag(&contents_of(handle, 0, 1).unwrap())
             .expect("tag must parse")
             .13.expect("the shadow is missing");
         assert_eq!(sh.softness_pts, 25.0 * 0.2, "softness survived in points");
-        assert_eq!(sh.spread_pts, 25.0 * 0.2, "spread survived in points");
 
         close_document(handle);
     }

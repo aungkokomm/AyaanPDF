@@ -761,6 +761,34 @@ internal static partial class RenderCoreNative
     /// Returns <see cref="RenderStatus.Unsupported"/> for a tag that is not a
     /// shape, so the caller can fall back to the rectangle it already had.
     /// </summary>
+    /// <summary>
+    /// Puts a rasterised shadow into a shape's own annotation, underneath the
+    /// shape, or takes it away when <paramref name="bgra"/> is null.
+    ///
+    /// PDF has no blur, so a soft shadow is drawn by Skia and carried here as
+    /// pixels. The box is in capture space, like every other rectangle across
+    /// this boundary, and the caller supplies it because the caller is the one
+    /// that blurred the thing and knows how far the ink reached.
+    ///
+    /// REBUILDS the annotation, so the index changes: read the new one out of
+    /// <paramref name="outNewIndex"/> rather than reusing the old.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_shape_shadow_image(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        [In] byte[]? bgra,
+        nuint byteLen,
+        int pixelWidth,
+        int pixelHeight,
+        out int outNewIndex);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int shape_upright_bounds(
         int captureWidth,

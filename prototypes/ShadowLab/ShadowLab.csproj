@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    A PROTOTYPE. Deliberately outside the solution so nothing builds it by
+    accident and nothing in the app can reference it.
+
+    It renders the same Ayaan shapes three ways and writes the pixels out, so a
+    drop shadow can be judged by looking at one rather than by reading a
+    description of one. It references the real viewport geometry and the real
+    Skia painter, so the "current" column is the shipping renderer and not an
+    imitation of it.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>ShadowLab</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="3.119.1" />
+    <ProjectReference Include="..\..\PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj" />
+    <ProjectReference Include="..\..\PdfEditorApp.Rendering.Skia\PdfEditorApp.Rendering.Skia.csproj" />
+  </ItemGroup>
+
+</Project>

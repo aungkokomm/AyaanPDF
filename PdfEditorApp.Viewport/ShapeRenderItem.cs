@@ -96,48 +96,6 @@ public readonly record struct ShapeRenderItem(
     /// object is its own object, which is exactly the old behaviour.
     /// </summary>
     public Guid ObjectId { get; init; }
-
-    /// <summary>
-    /// Whether this mark surrounds an area, rather than merely being a line.
-    ///
-    /// WHAT CASTS A SHADOW. A shadow is the silhouette of the thing casting it:
-    /// a rectangle drawn as four lines still throws a solid rectangle, because
-    /// the thing held up to the light is a card and not a wire frame. Casting
-    /// the outline instead produces an offset copy of the shape, which is what
-    /// it was reported as.
-    ///
-    /// Read off the POINTS, not a shape kind, for the reason the type carries
-    /// no kind: a mark that comes back to where it started encloses something,
-    /// and that stays true for whatever is added next. It is also the one form
-    /// of the question a renderer holding nothing but points can ask.
-    ///
-    /// A filled mark is an area by definition. Everything else has to close:
-    /// a line and an arrow's shaft do not, and filling them would leave no
-    /// shadow at all, which is why the rule is not simply "always fill".
-    /// </summary>
-    public bool EnclosesAnArea
-    {
-        get
-        {
-            if (Style == RenderStyle.Filled)
-            {
-                return Points.Count >= 3;
-            }
-
-            if (Points.Count < 4)
-            {
-                return false;
-            }
-
-            var first = Points[0];
-            var last = Points[^1];
-
-            // Exact, not approximate. Every closed outline is built by putting
-            // the first point back on the end, so the two are the same number
-            // and not merely near one another.
-            return first.X == last.X && first.Y == last.Y;
-        }
-    }
 }
 
 /// <summary>

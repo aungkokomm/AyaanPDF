@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using PdfEditorApp.Rendering.Skia;
 using PdfEditorApp.Viewport;
 using SkiaSharp;
@@ -8,22 +9,16 @@ using Xunit;
 namespace PdfEditorApp.Tests;
 
 /// <summary>
-/// WHAT CASTS THE SHADOW.
+/// WHAT CASTS THE SHADOW, and what the shadow is made of.
 ///
-/// A shadow is the silhouette of the thing casting it. Held up to a light, a
-/// rectangle drawn as four lines does not throw four lines: it throws a solid
-/// rectangle, because the thing is a card and not a wire frame.
+/// The shadow is produced by an SKImageFilter from the object itself, so it is
+/// derived from the object's own ALPHA. Nothing decides which marks cast a
+/// solid shape and which cast an outline, because the alpha already says: a
+/// hollow rectangle is transparent in the middle, so it casts a hollow shadow.
 ///
-/// The renderer used to cast whatever mark the shape was drawn with, so an
-/// unfilled rectangle threw an unfilled rectangle. The report was that the
-/// result "looks like an offset duplicate of the shape rather than a shadow",
-/// which is exactly what an outline offset by a few points is.
-///
-/// The rule cannot be "always fill", because a line encloses nothing and
-/// filling it would leave no shadow at all. It is: a mark that comes back to
-/// where it started encloses an area, and an area is what casts a silhouette.
-/// The same rule runs in render_core, so the preview and the saved file agree
-/// about what a shadow is.
+/// A rule used to stand here that filled every closed shape, and it made a
+/// hollow rectangle cast a solid grey slab. That rule is gone in both
+/// renderers.
 /// </summary>
 public class ShadowCasterTests
 {
@@ -34,15 +29,15 @@ public class ShadowCasterTests
     private static readonly ViewportProjection Plain = new(1, 1, 0, 0);
     private static readonly PageTransform View = PageTransform.For(Scale, ContentH, 0, Scale);
 
-    /// <summary>Opaque blue, so the shape is never mistaken for its grey shadow.</summary>
     private const string ShapeBlue = "#FF0000FF";
 
     /// <summary>A half-alpha black shadow, thrown by exactly (dx, dy).</summary>
-    private static ShapeEffects Shadow(double dx, double dy) =>
+    private static ShapeEffects Shadow(double dx, double dy, double softness = 0) =>
         new(new DropShadow(
             Math.Atan2(dy, -dx) * 180.0 / Math.PI,
             Math.Sqrt((dx * dx) + (dy * dy)),
-            new RenderColor(0x80, 0, 0, 0)));
+            new RenderColor(0x80, 0, 0, 0),
+            softness));
 
     private static IReadOnlyList<ShapeRenderItem> Items(
         ShapeKind kind, double x1, double y1, double x2, double y2, ShapeEffects effects) =>
@@ -65,8 +60,6 @@ public class ShadowCasterTests
         return bitmap;
     }
 
-    /// <summary>The pixel at a NORMALIZED page position, which is where the
-    /// test can name a place without doing the projection by hand.</summary>
     private static (byte R, byte G, byte B) At(SKBitmap bitmap, double nx, double ny)
     {
         int x = (int)Math.Round(nx * Scale);
@@ -82,144 +75,158 @@ public class ShadowCasterTests
     private static bool IsPage((byte R, byte G, byte B) p) =>
         p is { R: 255, G: 255, B: 255 };
 
-    // ---------------- an enclosed shape casts a silhouette ----------------
+    /// <summary>Every pixel darker than the page, as a count.</summary>
+    private static int InkCount(SKBitmap bitmap)
+    {
+        int count = 0;
+        var pixels = bitmap.GetPixelSpan();
+        for (int i = 0; i + 3 < pixels.Length; i += 4)
+        {
+            if (pixels[i] != 255 || pixels[i + 1] != 255 || pixels[i + 2] != 255) { count++; }
+        }
+
+        return count;
+    }
+
+    // ---------------- the alpha rule ----------------
 
     [Theory]
     [InlineData(ShapeKind.Rectangle)]
     [InlineData(ShapeKind.RoundedRectangle)]
     [InlineData(ShapeKind.Ellipse)]
-    public void an_unfilled_shape_still_casts_a_solid_shadow(ShapeKind kind)
+    public void a_hollow_shape_casts_a_hollow_shadow(ShapeKind kind)
     {
-        // The shape sits at 0.20-0.50 and the shadow is thrown clear of it, to
-        // 0.55-0.85, so the two never overlap and the middle of the shadow can
-        // only be the shadow.
+        // The shape sits at 0.20-0.50 and the shadow is thrown clear of it, so
+        // the middle of the shadow can only be the shadow.
         var bitmap = Paint(Items(kind, 0.20, 0.20, 0.50, 0.50, Shadow(0.35, 0)));
 
         Assert.True(
+            IsPage(At(bitmap, 0.70, 0.35)),
+            "the middle of the shadow is filled in: something is still casting a " +
+            "silhouette instead of reading the object's alpha");
+
+        // Its outline is there, though, which is what a hollow shape throws.
+        Assert.True(IsShadow(At(bitmap, 0.55, 0.35)), "the left edge of the shadow is missing");
+        Assert.True(IsShadow(At(bitmap, 0.85, 0.35)), "the right edge of the shadow is missing");
+    }
+
+    [Fact]
+    public void a_filled_shape_casts_a_filled_shadow()
+    {
+        // The other side of the same rule, and the reason it is not "never
+        // fill": a solid shape blocks the light across its whole area.
+        var items = Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, Shadow(0.35, 0));
+        var filled = items.Select(i => i with { Style = RenderStyle.Filled }).ToList();
+
+        var bitmap = Paint(filled);
+
+        Assert.True(
             IsShadow(At(bitmap, 0.70, 0.35)),
-            "the middle of the shadow is empty: it is still tracing the outline " +
-            "instead of filling the silhouette, which reads as an offset copy");
-
-        // And the shape it was cast by is still hollow. Filling the SHADOW must
-        // not have filled the shape.
-        Assert.True(
-            IsPage(At(bitmap, 0.35, 0.35)),
-            "the shape itself got filled in");
+            "a solid shape cast a hollow shadow");
     }
-
-    [Fact]
-    public void the_silhouette_reaches_the_shapes_own_edges()
-    {
-        // Not merely non-empty: the same size as the thing casting it. A
-        // silhouette that stopped short of the outline would be a smaller
-        // shape, and the stroke is part of what blocks the light.
-        var bitmap = Paint(Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, Shadow(0.35, 0)));
-
-        foreach (double ny in new[] { 0.21, 0.35, 0.49 })
-        {
-            Assert.True(IsShadow(At(bitmap, 0.56, ny)), $"the left edge is missing at {ny}");
-            Assert.True(IsShadow(At(bitmap, 0.84, ny)), $"the right edge is missing at {ny}");
-        }
-
-        Assert.True(IsPage(At(bitmap, 0.70, 0.12)), "the shadow spread above the shape");
-        Assert.True(IsPage(At(bitmap, 0.70, 0.58)), "the shadow spread below the shape");
-    }
-
-    [Fact]
-    public void the_silhouette_includes_the_stroke_that_blocked_the_light()
-    {
-        // The outline is part of the card, so the silhouette is the fill PLUS
-        // the stroke, and reaches half a stroke width beyond the shape's edge.
-        // Drawn at a fat weight so the band is wide enough to sample: 0.04
-        // normalized puts the silhouette's edge at 0.53, a clear 0.02 outside
-        // the fill's own 0.55.
-        var items = ShapeRenderList.From(
-            Array.Empty<InkStrokeAnnotation>(),
-            new[]
-            {
-                new ShapeAnnotation(
-                    0, new ShapeDraft(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50), ShapeBlue, 0.04)
-                {
-                    Effects = Shadow(0.35, 0),
-                },
-            });
-
-        var bitmap = Paint(items);
-
-        Assert.True(
-            IsShadow(At(bitmap, 0.54, 0.35)),
-            "the silhouette stops at the fill: the stroke that blocked the light is missing");
-        Assert.True(
-            IsPage(At(bitmap, 0.52, 0.35)),
-            "the silhouette reaches further than the stroke does");
-    }
-
-    [Fact]
-    public void one_tone_throughout_and_not_two()
-    {
-        // Filling and stroking the silhouette separately would lay the stroke's
-        // alpha over the fill's and leave the border darker than the middle: a
-        // shadow with an outline drawn round it. It is one mark, one tone.
-        var bitmap = Paint(Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, Shadow(0.35, 0)));
-
-        var edge = At(bitmap, 0.55, 0.35);
-        var middle = At(bitmap, 0.70, 0.35);
-
-        Assert.True(IsShadow(edge) && IsShadow(middle), "the shadow is not where it was expected");
-        Assert.True(
-            Math.Abs(edge.R - middle.R) <= 2,
-            $"the border came out at {edge.R} against the middle's {middle.R}: " +
-            "the silhouette is being composited twice");
-    }
-
-    // ---------------- and an open one casts its stroke ----------------
 
     [Theory]
     [InlineData(ShapeKind.Line)]
     [InlineData(ShapeKind.Arrow)]
     public void a_shape_that_encloses_nothing_still_casts_its_stroke(ShapeKind kind)
     {
-        // The other side of the rule, and the reason it is not "always fill":
-        // a line has no interior, so filling it would produce nothing at all.
         var bitmap = Paint(Items(kind, 0.20, 0.20, 0.50, 0.50, Shadow(0.35, 0)));
 
-        Assert.True(
-            IsShadow(At(bitmap, 0.605, 0.255)),
-            $"a {kind} lost its shadow entirely");
-
-        // Its bounding box does not fill in. A diagonal line whose box was
-        // filled would blot out a third of the page.
-        Assert.True(
-            IsPage(At(bitmap, 0.80, 0.25)),
-            $"a {kind} cast the whole of its bounding box");
-    }
-
-    // ---------------- the rule itself ----------------
-
-    [Theory]
-    [InlineData(ShapeKind.Rectangle, true)]
-    [InlineData(ShapeKind.RoundedRectangle, true)]
-    [InlineData(ShapeKind.Ellipse, true)]
-    [InlineData(ShapeKind.Line, false)]
-    [InlineData(ShapeKind.Arrow, false)]
-    public void what_encloses_an_area_is_decided_by_the_geometry(ShapeKind kind, bool encloses)
-    {
-        // Read off the points rather than the kind, so it stays true for
-        // whatever is added next without anyone remembering to update a list.
-        // The arrow here is its SHAFT, which encloses nothing; its head is a
-        // filled triangle already.
-        var items = Items(kind, 0.20, 0.20, 0.50, 0.50, Shadow(0.1, 0.1));
-
-        Assert.Equal(encloses, items[0].EnclosesAnArea);
+        Assert.True(IsShadow(At(bitmap, 0.605, 0.255)), $"a {kind} lost its shadow entirely");
+        Assert.True(IsPage(At(bitmap, 0.80, 0.25)), $"a {kind} cast the whole of its bounding box");
     }
 
     [Fact]
-    public void an_arrows_head_is_an_area_and_its_shaft_is_not()
+    public void one_tone_throughout_and_not_two()
     {
-        var items = Items(ShapeKind.Arrow, 0.20, 0.20, 0.50, 0.50, Shadow(0.1, 0.1));
+        // An arrow is two marks. They are unioned inside one layer before the
+        // filter runs, so the overlap is not composited twice and there is no
+        // seam or dark patch where the head meets the shaft.
+        var bitmap = Paint(Items(ShapeKind.Arrow, 0.20, 0.30, 0.60, 0.30, Shadow(0, 0.18)));
 
-        Assert.Equal(2, items.Count);
-        Assert.False(items[0].EnclosesAnArea, "the shaft is a line");
-        Assert.True(items[1].EnclosesAnArea, "the head is a triangle");
+        var greys = new List<int>();
+        var pixels = bitmap.GetPixelSpan();
+        for (int i = 0; i + 3 < pixels.Length; i += 4)
+        {
+            if (pixels[i] == pixels[i + 1] && pixels[i + 1] == pixels[i + 2] && pixels[i] != 255)
+            {
+                greys.Add(pixels[i]);
+            }
+        }
+
+        Assert.True(greys.Count > 500, "the arrow cast no shadow worth measuring");
+
+        // Half-alpha black over white is 127. A second layer over the first
+        // would be 63, so anything approaching that is the shaft's shadow and
+        // the head's shadow compositing against each other. Antialiasing only
+        // makes edge pixels LIGHTER, so the darkest pixel is the test.
+        Assert.True(
+            greys.Min() >= 120,
+            $"the darkest shadow pixel is {greys.Min()}, not the 127 a single " +
+            "layer gives: the arrow's two marks are shadowed separately");
+    }
+
+    // ---------------- softness actually blurs ----------------
+
+    [Fact]
+    public void softness_changes_what_is_drawn()
+    {
+        // The complaint that started this: a blur control that changed nothing.
+        var hard = Paint(Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, Shadow(0.30, 0)));
+        var soft = Paint(Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, Shadow(0.30, 0, 0.02)));
+
+        Assert.True(
+            InkCount(soft) > InkCount(hard) * 1.2,
+            $"a blurred shadow covered {InkCount(soft)} pixels against the hard one's " +
+            $"{InkCount(hard)}: the blur is not reaching the picture");
+    }
+
+    [Fact]
+    public void more_softness_reaches_further()
+    {
+        int Reach(double softness)
+        {
+            var bitmap = Paint(
+                Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, Shadow(0.30, 0, softness)));
+
+            // How far right the ink gets, which is where the shadow's own edge
+            // fades out.
+            int furthest = 0;
+            var pixels = bitmap.GetPixelSpan();
+            for (int y = 0; y < Surface; y++)
+            {
+                for (int x = 0; x < Surface; x++)
+                {
+                    int at = (y * bitmap.RowBytes) + (x * 4);
+                    if (pixels[at] != 255) { furthest = Math.Max(furthest, x); }
+                }
+            }
+
+            return furthest;
+        }
+
+        int small = Reach(0.005);
+        int large = Reach(0.02);
+
+        Assert.True(large > small + 5, $"blur 0.02 reached {large}, blur 0.005 reached {small}");
+    }
+
+    [Fact]
+    public void the_soft_fringe_is_not_clipped_by_the_layer()
+    {
+        // The layer is bounded for speed, and a bound that forgot the blur
+        // would cut the fringe off in a straight line. Sampled just inside the
+        // reach on the side AWAY from the shadow, where only the blur can put
+        // ink.
+        var soft = Shadow(0.30, 0, 0.02);
+        var items = Items(ShapeKind.Rectangle, 0.20, 0.20, 0.50, 0.50, soft);
+
+        var bitmap = Paint(items);
+        double reach = OverlayProjection.BlurReachOf(soft.Shadow!.Value, Scale, View) / Scale;
+
+        // The shadow's left edge is at 0.50, and the blur puts ink to its left.
+        Assert.True(
+            IsShadow(At(bitmap, 0.50 - (reach * 0.4), 0.35)),
+            "the fringe on the far side of the shadow is missing");
     }
 }

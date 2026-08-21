@@ -195,8 +195,12 @@ public class ShadowSoftnessTests
         using var hard = Paint(new[] { Mark(Shadow(0)) });
         using var soft = Paint(new[] { Mark(Shadow(SoftRadius)) });
 
-        Assert.Equal(Centre(hard).X, Centre(soft).X, 1);
-        Assert.Equal(Centre(hard).Y, Centre(soft).Y, 1);
+        // Half a pixel, which is what "does not move" means for a centroid.
+        // Comparing to one decimal place was measuring the rounding rather than
+        // the shadow: it accepted a shift of 0.049 and rejected one of 0.051
+        // depending only on which side of a boundary the pair happened to land.
+        Assert.Equal(Centre(hard).X, Centre(soft).X, tolerance: 0.5);
+        Assert.Equal(Centre(hard).Y, Centre(soft).Y, tolerance: 0.5);
     }
 
     private static (double X, double Y) Centre(SKBitmap bitmap)
