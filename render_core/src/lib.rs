@@ -18291,6 +18291,26 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     #[test]
+    fn an_effect_that_is_not_a_hard_shadow_is_never_drawn_as_paths() {
+        // THE VECTOR INVARIANT. The core draws exactly one effect, and only
+        // when it has no blur; everything else is a picture Skia makes, laid
+        // under a shape that is still paths. An effect that put geometry in the
+        // file would be a second renderer disagreeing with the first.
+        let handle = open_fixture();
+
+        let plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        add_one(handle, plain);
+
+        add_one(handle, plain.with_effects(&effect('q', 50.0, 0xFF00FF00)));
+
+        assert_eq!(
+            object_kinds(handle, 1), object_kinds(handle, 0),
+            "an effect the core does not draw put objects in the annotation");
+
+        close_document(handle);
+    }
+
+    #[test]
     fn the_room_the_effects_need_is_the_widest_of_them() {
         // Every effect is drawn from the same silhouette into the same picture,
         // so the box holds the one that reaches furthest rather than their sum.
