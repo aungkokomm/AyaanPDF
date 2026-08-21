@@ -4577,6 +4577,30 @@ pub struct ShapeSpec {
     pub shadow_rgba: u32,
 }
 
+/// Whether a shape surrounds an area, rather than merely being a line.
+///
+/// What casts a silhouette. A rectangle, a rounded rectangle and an ellipse
+/// enclose something whether or not they are filled; a line and an arrow's
+/// shaft do not, and an arrow's HEAD is already a filled triangle.
+fn encloses_an_area(kind: i32) -> bool {
+    matches!(kind, SHAPE_RECTANGLE | SHAPE_ELLIPSE | SHAPE_ROUNDED_RECT)
+}
+
+/// One axis of a reported /Rect, with the SHADOW's growth taken back off.
+///
+/// The writer grows /Rect in the shadow's direction so PDFium does not clip the
+/// shadow, and it grows one side only. Anything that rebuilds the SHAPE from
+/// that rectangle has to undo this first: an effect must never become the
+/// geometry. Left in, the offset is baked into the shape's own size and grows
+/// again on the next edit, and for a turned shape the CENTRE moves by half of
+/// it, so the shape drifts instead.
+///
+/// The exact inverse of the `grow` closure in `add_shape_annotations_inner`,
+/// and kept next to nothing else so the two cannot drift apart.
+fn ungrow_shadow(lo: f32, hi: f32, d: f32) -> (f32, f32) {
+    if d >= 0.0 { (lo, hi - d) } else { (lo - d, hi) }
+}
+
 /// Where a shadow falls, in PDF points, given where the light is.
 ///
 /// PDF SPACE, so y runs UP: a shadow cast downwards on the screen has a
@@ -5013,10 +5037,16 @@ fn add_shape_annotations_inner(
             let b = (spec.shadow_rgba & 0xFF) as u8;
             let shadow_color = PdfColor::new(r, g, b, a);
 
-            // A filled shape casts a filled silhouette and a stroke-only shape
-            // casts an outline, so the shadow is the same KIND of mark as the
-            // thing casting it rather than always one or the other.
-            let shadow_fill = fill.map(|_| shadow_color);
+            // THE SHADOW IS THE SILHOUETTE, not the mark. An outlined
+            // rectangle is a card and not a wire frame, and a card held up to
+            // the light throws a solid rectangle; casting the outline gives an
+            // offset copy of the shape, which is what it was reported as.
+            //
+            // Not simply "always fill": a line encloses nothing, so filling it
+            // would leave no shadow at all. The same rule runs in the preview,
+            // where it is read off the points, so the two renderers agree about
+            // what a shadow is.
+            let shadow_fill = encloses_an_area(spec.kind).then_some(shadow_color);
 
             if let Ok(mut shadow) = build_path(sdx, sdy, shadow_color, shadow_fill) {
                 rotate_object_about!(shadow, rot, cx + sdx, cy + sdy);
@@ -5346,6 +5376,24 @@ fn restyle_shape_annotation_inner_with_rotation(
     // opacity-slider case is un-rotated in practice.)
     let scale_cap_per_pt = capture_width as f32 / page_w;
     let pad_pts = cur_width_pts / 2.0 + 1.0;
+
+    // THE SHADOW COMES OFF FIRST. /Rect is grown in the shadow's direction so
+    // PDFium does not clip it, and reading those edges as the shape's own is
+    // what made every shadow edit grow the shape, and every edit to a TURNED
+    // shape drift it by half the offset.
+    let (bl, bb, br, bt) = match cur_shadow {
+        Some(sh) if sh.rgba != 0 => {
+            let (sdx, sdy) = shadow_offset_pts(sh.angle_deg, sh.distance_pts);
+            let (l, r) = ungrow_shadow(bounds.left().value, bounds.right().value, sdx);
+            let (b, t) = ungrow_shadow(bounds.bottom().value, bounds.top().value, sdy);
+            (l, b, r, t)
+        }
+        _ => (
+            bounds.left().value, bounds.bottom().value,
+            bounds.right().value, bounds.top().value,
+        ),
+    };
+
     let (cap_left, cap_right, cap_top, cap_bottom) =
         if cur_rot != 0.0 && cur_box_w_pts > 0.0 && cur_box_h_pts > 0.0 {
             // A TURNED shape's /Rect is the axis-aligned box of the rotated
@@ -5353,17 +5401,17 @@ fn restyle_shape_annotation_inner_with_rotation(
             // it gives something bigger, and restyling repeatedly inflates the
             // shape. Its own upright size is on the tag, and the CENTRE of /Rect
             // is exact at any angle, so the two together reconstruct it.
-            let cx = ((bounds.left().value + bounds.right().value) / 2.0 - page_left) * scale_cap_per_pt;
-            let cy = (page_top - (bounds.top().value + bounds.bottom().value) / 2.0) * scale_cap_per_pt;
+            let cx = ((bl + br) / 2.0 - page_left) * scale_cap_per_pt;
+            let cy = (page_top - ((bt + bb) / 2.0)) * scale_cap_per_pt;
             let hw = cur_box_w_pts * scale_cap_per_pt / 2.0;
             let hh = cur_box_h_pts * scale_cap_per_pt / 2.0;
             (cx - hw, cx + hw, cy - hh, cy + hh)
         } else {
             (
-                (bounds.left().value + pad_pts - page_left) * scale_cap_per_pt,
-                (bounds.right().value - pad_pts - page_left) * scale_cap_per_pt,
-                (page_top - bounds.top().value + pad_pts) * scale_cap_per_pt,
-                (page_top - bounds.bottom().value - pad_pts) * scale_cap_per_pt,
+                (bl + pad_pts - page_left) * scale_cap_per_pt,
+                (br - pad_pts - page_left) * scale_cap_per_pt,
+                (page_top - bt + pad_pts) * scale_cap_per_pt,
+                (page_top - bb - pad_pts) * scale_cap_per_pt,
             )
         };
 
@@ -5477,12 +5525,27 @@ fn upright_shape_bounds(
     box_h_pts: f32,
     capture_width: i32,
     page_width_pts: f32,
+    shadow: Option<TagShadow>,
     left: f32,
     top: f32,
     right: f32,
     bottom: f32,
 ) -> (f32, f32, f32, f32) {
     let per_pt = capture_width as f32 / page_width_pts;
+
+    // THE SHADOW COMES OFF FIRST, before anything else reads these edges or
+    // their centre. A shadow is an effect; the shape is what it is cast by.
+    let (left, top, right, bottom) = match shadow {
+        Some(sh) if sh.rgba != 0 => {
+            let (sdx, sdy) = shadow_offset_pts(sh.angle_deg, sh.distance_pts);
+            // These bounds run y DOWN and the offset is in PDF points, which
+            // run y UP, so the vertical term is negated on the way in.
+            let (l, r) = ungrow_shadow(left, right, sdx * per_pt);
+            let (t, b) = ungrow_shadow(top, bottom, -sdy * per_pt);
+            (l, t, r, b)
+        }
+        _ => (left, top, right, bottom),
+    };
 
     if rot != 0.0 {
         if box_w_pts <= 0.0 || box_h_pts <= 0.0 {
@@ -5547,10 +5610,10 @@ pub extern "C" fn shape_upright_bounds(
         let Some(tag) = parse_shape_tag(text) else {
             return STATUS_UNSUPPORTED;
         };
-        let (_, _, _, _, _, width_pts, _, _, rot, _, _, box_w_pts, box_h_pts, _) = tag;
+        let (_, _, _, _, _, width_pts, _, _, rot, _, _, box_w_pts, box_h_pts, shadow) = tag;
 
         let (l, t, r, b) = upright_shape_bounds(
-            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_width_pts,
+            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_width_pts, shadow,
             left, top, right, bottom,
         );
 
@@ -5629,7 +5692,7 @@ fn resize_shape_annotation_inner(
             return STATUS_INVALID_INPUT;
         }
         upright_shape_bounds(
-            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_w,
+            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_w, cur_shadow,
             left, top, right, bottom,
         )
     } else {
@@ -11581,6 +11644,298 @@ mod tests {
         }
 
         assert!(shadow_of(handle, 0).is_none(), "a refused edit still changed the shape");
+
+        close_document(handle);
+    }
+
+    // ---------------- an effect must never become the shape ----------------
+    //
+    // The annotation's /Rect is grown in the shadow's direction so PDFium does
+    // not clip the shadow. Everything that rebuilds a shape from that rectangle
+    // has to take the growth back off first, or the shadow's offset is baked
+    // into the shape's own size and grows again on the next edit. Measured
+    // before this was fixed: an unrotated shape gained the offset on every
+    // edit, and a rotated one drifted by half of it.
+
+    fn geometry_of(handle: u64, index: usize) -> (f32, f32, f32, f32, f32, f32, f32) {
+        let t = parse_shape_tag(&contents_of(handle, 0, index).unwrap()).unwrap();
+        let (_, b) = annotation_shape(handle, index).unwrap();
+        (t.11, t.12, t.8, b.left.value, b.bottom.value, b.right.value, b.top.value)
+    }
+
+    fn set_shadow(handle: u64, idx: i32, angle: f32, distance: f32, rgba: u32) -> i32 {
+        let mut out = -1;
+        assert_eq!(
+            restyle_shape_shadow_annotation(
+                handle, 0, idx, 1000, angle, distance, 0.0, 0.0, rgba, &mut out),
+            STATUS_OK_PDFIUM,
+            "the shadow edit was refused");
+        out
+    }
+
+    #[test]
+    fn repeating_the_same_shadow_edit_changes_nothing() {
+        // The report, exactly: a person nudges a control back and forth and the
+        // shape creeps. Identical input must give identical output, forever.
+        for rot in [0.0f32, 30.0] {
+            let handle = open_fixture();
+            let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+            sp.rotation_deg = rot;
+            add_one(handle, sp);
+
+            let mut idx = set_shadow(handle, 0, 135.0, 30.0, 0x80000000);
+            let settled = geometry_of(handle, idx as usize);
+
+            for round in 2..=5 {
+                idx = set_shadow(handle, idx, 135.0, 30.0, 0x80000000);
+                assert_eq!(
+                    geometry_of(handle, idx as usize), settled,
+                    "at {rot} degrees, edit {round} moved or resized the shape");
+            }
+
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn changing_only_the_shadow_leaves_the_shape_alone() {
+        // Angle, distance and colour in turn. The /Rect legitimately moves with
+        // the shadow, so the shape itself is checked through the tag's own
+        // upright box and its rotation; then the ORIGINAL shadow is put back
+        // and the whole rectangle has to return to where it started, which no
+        // amount of accumulated drift survives.
+        for rot in [0.0f32, 30.0] {
+            let handle = open_fixture();
+            let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+            sp.rotation_deg = rot;
+            add_one(handle, sp);
+
+            let mut idx = set_shadow(handle, 0, 135.0, 30.0, 0x80000000);
+            let start = geometry_of(handle, idx as usize);
+
+            for (angle, distance, rgba) in [
+                (45.0f32, 30.0f32, 0x80000000u32),
+                (45.0, 60.0, 0x80000000),
+                (45.0, 60.0, 0xFFFF0000),
+                (270.0, 5.0, 0x40336699),
+            ] {
+                idx = set_shadow(handle, idx, angle, distance, rgba);
+                let now = geometry_of(handle, idx as usize);
+
+                assert_eq!(now.0, start.0, "at {rot} degrees the width changed");
+                assert_eq!(now.1, start.1, "at {rot} degrees the height changed");
+                assert_eq!(now.2, start.2, "at {rot} degrees the rotation changed");
+            }
+
+            idx = set_shadow(handle, idx, 135.0, 30.0, 0x80000000);
+            assert_eq!(
+                geometry_of(handle, idx as usize), start,
+                "at {rot} degrees the shape did not come back to where it started");
+
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn moving_a_shadowed_shape_does_not_grow_it() {
+        // The same defect reached through the move path, which also reads the
+        // reported rectangle and hands it straight back.
+        let handle = open_fixture();
+        let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        sp.shadow_rgba = 0x80000000;
+        sp.shadow_angle_deg = 135.0;
+        sp.shadow_distance_px = 30.0;
+        add_one(handle, sp);
+
+        let (w0, h0, ..) = geometry_of(handle, 0);
+        let mut idx = 0i32;
+
+        for round in 1..=4 {
+            let (_, b) = annotation_shape(handle, idx as usize).unwrap();
+            let page_top = 200.0f32;
+            let per_pt = 5.0f32;
+
+            // A one-point nudge to the right, in the /Rect space the app uses.
+            let mut out = -1;
+            assert_eq!(
+                move_shape_annotation(
+                    handle, 0, idx, 1000,
+                    (b.left.value + 1.0) * per_pt,
+                    (page_top - b.top.value) * per_pt,
+                    (b.right.value + 1.0) * per_pt,
+                    (page_top - b.bottom.value) * per_pt,
+                    &mut out),
+                STATUS_OK_PDFIUM);
+            idx = out;
+
+            let (w, h, ..) = geometry_of(handle, idx as usize);
+            assert!(
+                (w - w0).abs() < 0.01 && (h - h0).abs() < 0.01,
+                "move {round} resized the shape from {w0}x{h0} to {w}x{h}");
+        }
+
+        close_document(handle);
+    }
+
+    // ---------------- a shadow is a silhouette ----------------
+
+    fn page_snapshot(handle: u64) -> Vec<u8> {
+        let r = render_uncached(handle, 0, 800);
+        assert_eq!(r.status, STATUS_OK_PDFIUM, "the page did not render");
+        let px = unsafe { std::slice::from_raw_parts(r.buffer, r.len) }.to_vec();
+        free_render_result(r);
+        px
+    }
+
+    /// Only the pixels a shape ADDED to the page, by colour.
+    ///
+    /// The fixture draws content of its own, and counting that as the shape is
+    /// how three earlier measurements of this very bug came out wrong.
+    fn added_pixels(
+        before: &[u8], after: &[u8],
+    ) -> std::collections::HashMap<(u8, u8, u8), usize> {
+        let mut hist = std::collections::HashMap::new();
+        for i in (0..after.len()).step_by(4) {
+            if after[i] != before[i]
+                || after[i + 1] != before[i + 1]
+                || after[i + 2] != before[i + 2]
+            {
+                *hist.entry((after[i + 2], after[i + 1], after[i])).or_insert(0) += 1;
+            }
+        }
+        hist
+    }
+
+    #[test]
+    fn an_unfilled_shape_still_casts_a_solid_shadow() {
+        // THE REPORT: a stroke-only rectangle's shadow came out as a second
+        // copy of the outline, which reads as a duplicate rather than a shadow.
+        // Measured before the fix: 1600 shadow pixels against 1600 shape
+        // pixels, exactly one for one.
+        //
+        // A shadow is the silhouette of the thing casting it, so an unfilled
+        // rectangle casts a filled one.
+        let handle = open_fixture();
+        let before = page_snapshot(handle);
+
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 250.0, 200.0);
+        s.r = 0;
+        s.g = 0;
+        s.b = 0;
+        s.a = 0xFF;
+        s.width_px = 6.0;
+        s.fill_rgba = 0; // stroke only
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 180.0; // thrown clear to the right
+        s.shadow_distance_px = 250.0;
+        add_one(handle, s);
+
+        let hist = added_pixels(&before, &page_snapshot(handle));
+        let shape_px = hist.get(&(0, 0, 0)).copied().unwrap_or(0);
+        let shadow_px = hist.get(&(127, 127, 127)).copied().unwrap_or(0);
+
+        assert!(shape_px > 0, "the shape itself did not draw");
+        assert!(
+            shadow_px > shape_px * 3,
+            "the shadow covered {shadow_px} pixels against the outline's {shape_px}: \
+             it is still tracing the stroke rather than filling the silhouette");
+
+        close_document(handle);
+    }
+
+
+    /// One pixel of an 800-wide render, as (r, g, b). The buffer is BGRA.
+    fn pixel_at(px: &[u8], x: usize, y: usize) -> (u8, u8, u8) {
+        let at = ((y * 800) + x) * 4;
+        (px[at + 2], px[at + 1], px[at])
+    }
+
+    #[test]
+    fn the_pdf_shadow_is_one_tone_throughout() {
+        // The silhouette is stroke AND fill, so the border is drawn over the
+        // fill. With a translucent shadow that is a chance to composite the
+        // same colour over itself and leave a darker rim, which would be a
+        // shadow with a line round it, and would not match the preview.
+        //
+        // The preview is asserted the same way, in ShadowCasterTests.
+        let handle = open_fixture();
+
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 250.0, 200.0);
+        s.r = 0;
+        s.g = 0;
+        s.b = 255;
+        s.a = 0xFF;
+        s.width_px = 6.0;
+        s.fill_rgba = 0;
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 180.0;
+        s.shadow_distance_px = 250.0;
+        add_one(handle, s);
+
+        // The shadow covers 70..100pt across and 20..40pt down, and the page
+        // renders at four device pixels to the point.
+        let px = page_snapshot(handle);
+        let border = pixel_at(&px, 283, 120);
+        let middle = pixel_at(&px, 340, 120);
+
+        assert_eq!(middle, (127, 127, 127), "the middle of the shadow is not a half-alpha black");
+        assert!(
+            (border.0 as i32 - middle.0 as i32).abs() <= 2,
+            "the border came out at {border:?} against the middle's {middle:?}: \
+             the silhouette is being composited twice");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_has_no_silhouette_to_fill_and_still_casts_its_stroke() {
+        // The other side of the rule. A line encloses nothing, so filling it
+        // would produce no shadow at all; its stroke IS its silhouette.
+        let handle = open_fixture();
+        let before = page_snapshot(handle);
+
+        let mut s = shape(SHAPE_LINE, 100.0, 100.0, 400.0, 260.0);
+        s.r = 0;
+        s.g = 0;
+        s.b = 0;
+        s.a = 0xFF;
+        s.width_px = 6.0;
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 270.0;
+        s.shadow_distance_px = 150.0;
+        add_one(handle, s);
+
+        let hist = added_pixels(&before, &page_snapshot(handle));
+
+        assert!(
+            hist.get(&(127, 127, 127)).copied().unwrap_or(0) > 200,
+            "a line lost its shadow entirely");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_shadows_colour_is_its_own_and_half_alpha_reads_as_half() {
+        // The relationship the report doubted. Black at half alpha over white
+        // is 127, and nothing else on the page could be mistaken for it.
+        let handle = open_fixture();
+        let before = page_snapshot(handle);
+
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 250.0, 200.0);
+        s.fill_rgba = 0xFF3B82F6;
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 180.0;
+        s.shadow_distance_px = 250.0;
+        add_one(handle, s);
+
+        let hist = added_pixels(&before, &page_snapshot(handle));
+
+        assert!(
+            hist.get(&(127, 127, 127)).copied().unwrap_or(0) > 1000,
+            "a half-alpha black shadow did not come out at 127 over white");
+        assert!(
+            hist.get(&(59, 130, 246)).copied().unwrap_or(0) > 1000,
+            "the shape's own fill is missing");
 
         close_document(handle);
     }

@@ -273,10 +273,9 @@ public static class ShapeSkiaPainter
     /// would need all four of those handled again, by hand, and would slide out
     /// from under its shape the moment anybody rotated the page.
     ///
-    /// Painted through the same two style branches as the mark itself, so an
-    /// arrow's head casts a filled shadow and its shaft a stroked one, at the
-    /// same weights. A shadow drawn as a generic outline would be a different
-    /// shape from the thing casting it.
+    /// Painted at the mark's own weight and position, but as the mark's
+    /// SILHOUETTE: a closed mark casts the solid area it encloses, and an open
+    /// one casts its stroke. See PaintSilhouette.
     /// </summary>
     private static void PaintShadow(
         SKCanvas canvas, ShapeRenderItem item, DropShadow shadow, RenderColor color,
@@ -300,10 +299,48 @@ public static class ShapeSkiaPainter
         {
             PaintFilled(canvas, ghost, scale, pageTop, view);
         }
+        else if (ghost.EnclosesAnArea)
+        {
+            PaintSilhouette(canvas, ghost, scale, pageTop, view);
+        }
         else
         {
             PaintStroked(canvas, ghost, scale, pageTop, view);
         }
+    }
+
+    /// <summary>
+    /// A closed mark's SOLID shape, for the shadow it casts.
+    ///
+    /// The one place the shadow is not simply the mark again. An outlined
+    /// rectangle is a card, not a wire frame, and a card held up to the light
+    /// throws a solid rectangle; casting the outline gives an offset copy of
+    /// the shape, which is what it was reported as. Open marks keep their
+    /// stroke, because a line has no interior to fill.
+    ///
+    /// The silhouette includes the stroke, since the stroke is part of what
+    /// blocks the light, so this is stroke AND fill at the mark's own width.
+    /// ONE draw, not a fill with an outline over it: a translucent shadow drawn
+    /// twice would come out darker round its border, which is a shadow with a
+    /// line round it.
+    /// </summary>
+    private static void PaintSilhouette(
+        SKCanvas canvas, ShapeRenderItem item, double scale, double pageTop, PageTransform view)
+    {
+        using var path = PathFor(item, scale, pageTop, view);
+        path.Close();
+
+        using var paint = new SKPaint
+        {
+            Style = SKPaintStyle.StrokeAndFill,
+            Color = ToSkColor(item.Color),
+            StrokeWidth = (float)OverlayProjection.WidthOf(item, scale, view),
+            IsAntialias = true,
+            StrokeCap = SKStrokeCap.Butt,
+            StrokeJoin = SKStrokeJoin.Miter,
+        };
+
+        canvas.DrawPath(path, paint);
     }
 
     /// <summary>

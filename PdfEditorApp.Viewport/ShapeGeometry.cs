@@ -444,6 +444,12 @@ public static class ShapeGeometry
                     points.Add((cx + (rx * Math.Cos(t)), cy + (ry * Math.Sin(t))));
                 }
 
+                // The ring closes EXACTLY. cos(2 pi) is not quite cos(0) in
+                // floating point, so the last point came back a hair off the
+                // first, and whether an outline returns to where it started is
+                // how the renderer decides it encloses an area at all.
+                points[^1] = points[0];
+
                 return points;
             }
 
