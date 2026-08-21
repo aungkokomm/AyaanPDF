@@ -2100,6 +2100,36 @@
                     </StackPanel>
                 </StackPanel>
 
+                <!--
+                    Effects: ONE section, holding a ROW per effect.
+
+                    A flyout rather than inline controls, the same escape hatch
+                    FillButton and OutlineButton already take: a drop shadow
+                    alone wants about six controls and this bar must never
+                    scroll. Adding a glow later puts another row inside
+                    EffectRows and changes nothing out here, which is the whole
+                    reason this is a container and not a control.
+
+                    EffectRows is empty until the Drop Shadow row lands.
+                -->
+                <StackPanel x:Name="EffectsSection" Orientation="Horizontal" Spacing="6"
+                            VerticalAlignment="Center" Visibility="Collapsed">
+                    <Rectangle Width="1" Height="18" VerticalAlignment="Center"
+                               Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                    <DropDownButton x:Name="EffectsButton" Height="28" Padding="10,0"
+                                    AutomationProperties.Name="Effects"
+                                    ToolTipService.ToolTip="Effects">
+                        <TextBlock Text="Effects" VerticalAlignment="Center"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <DropDownButton.Flyout>
+                            <Flyout Placement="Bottom">
+                                <StackPanel x:Name="EffectRows" Orientation="Vertical"
+                                            Spacing="8" MinWidth="240" />
+                            </Flyout>
+                        </DropDownButton.Flyout>
+                    </DropDownButton>
+                </StackPanel>
+
             </StackPanel>
             </StackPanel>
         </Border>

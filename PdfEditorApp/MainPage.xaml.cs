@@ -3911,6 +3911,7 @@ public sealed partial class MainPage : Page
         TextStyleSection.Visibility = Show(sections.TextStyle);
         TextAlignRow.Visibility = Show(sections.TextAlign);
         OutlineButton.Visibility = Show(sections.Outline);
+        EffectsSection.Visibility = Show(sections.Effects);
         PropertyBarRow2.Visibility = Show(sections.Row2);
         PropertyBar.Visibility = Show(sections.Bar);
 

@@ -213,9 +213,18 @@ public class AppWiringTests
     [Fact]
     public void the_second_row_appears_only_when_one_of_its_own_sections_does()
     {
-        // A simple tool stays a single row.
+        // A simple tool stays a single row. Width lives in row 1 and pulls
+        // nothing else in with it, so a tool offering only that has no second
+        // row to show.
         Assert.True(PropertyBarLayout.For(Selected(shape: true)).Row2);
         Assert.False(PropertyBarLayout.For(new PropertyBarState(
+            ToolOptions.Width, ShapeKind.Rectangle, false, false, false, false, false, false)).Row2);
+
+        // The SHAPE tool does have one, because the Effects section lives
+        // there. This used to be the false case above, on a tool state the app
+        // cannot actually produce: every real tool that shows a bar offers a
+        // colour, and colour brings opacity, which is in row 2 already.
+        Assert.True(PropertyBarLayout.For(new PropertyBarState(
             ToolOptions.Shape, ShapeKind.Rectangle, true, false, false, false, false, false)).Row2);
     }
 

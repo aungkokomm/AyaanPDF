@@ -38,7 +38,13 @@ public readonly record struct PropertyBarSections(
     bool Font,
     bool TextStyle,
     bool TextAlign,
-    bool Outline);
+    bool Outline,
+    /// <summary>
+    /// The effects container: ONE section holding a row per effect. A glow or
+    /// an outer stroke later adds a row inside it rather than a field here,
+    /// which is what keeps the bar from growing a section per effect.
+    /// </summary>
+    bool Effects);
 
 /// <summary>
 /// The property bar's layout rules, as a pure function.
@@ -73,6 +79,12 @@ public static class PropertyBarLayout
 
         bool shape = s.ToolOptions.HasFlag(ToolOptions.Shape);
 
+        // Effects belong to a SHAPE, so the section shows for a selected one
+        // under any tool and for the shape tool before anything is drawn. The
+        // second half is what lets a shadow be set up once and drawn with,
+        // rather than applied afterwards to every shape in turn.
+        bool effects = s.ToolIsShape || s.HasSelectedShape;
+
         // The text sections show for the Text tool AND whenever a text box is
         // selected under any tool; without the second half, clicking a text box
         // in Select mode gave no way to change its style.
@@ -86,7 +98,7 @@ public static class PropertyBarLayout
         // Row 2 exists only when one of its own sections does, so a simple tool
         // stays a single row.
         bool row2 = s.ToolOptions.HasFlag(ToolOptions.FontSize) || s.HasSelectedTextBox
-                 || textStyle || opacity || stamp || align;
+                 || textStyle || opacity || stamp || align || effects;
 
         // A bar with everything collapsed is an empty pill floating over the
         // page, so the whole thing goes when the tool offers nothing and no
@@ -107,6 +119,7 @@ public static class PropertyBarLayout
             Font: textSections,
             TextStyle: textStyle,
             TextAlign: textSections,
-            Outline: textSections);
+            Outline: textSections,
+            Effects: effects);
     }
 }
