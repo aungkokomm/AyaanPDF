@@ -3412,6 +3412,184 @@ public sealed partial class MainPage : Page
     /// own, because alpha is what actually reaches the saved file; see
     /// <see cref="InkPresets.WithOpacity"/>.
     /// </summary>
+    // ---------------- the Drop Shadow row ----------------
+    //
+    // The row shows the SELECTED SHAPE's own shadow, not a tool state, so
+    // clicking from one shape to another shows each one's own. Everything that
+    // decides a value lives in DropShadowPanel, in the viewport library, where
+    // a test can reach it; what is left here is reading controls and writing
+    // them back, which is all this file should ever hold.
+
+    /// <summary>
+    /// True while the row is being filled in FROM a shape. Setting a slider
+    /// raises ValueChanged, and without this the act of showing a shape's
+    /// shadow would immediately write it back, turning every selection into an
+    /// edit and every edit into a history entry.
+    /// </summary>
+    private bool _syncingShadow;
+
+    /// <summary>The colour the row is set to, "#RRGGBB". The swatch's brush is
+    /// a picture of this rather than the value itself.</summary>
+    private string _shadowColorHex = "#000000";
+
+    /// <summary>A page width to lay the row out against when nothing is
+    /// selected, so the sliders have sensible ends before there is a shape to
+    /// ask. Letter, which is what most documents are.</summary>
+    private const double FallbackPageWidthPts = 612;
+
+    private static SolidColorBrush ShadowBrush(string hex)
+    {
+        var (r, g, b) = DropShadowPanel.RgbOf(hex);
+        return new SolidColorBrush(Windows.UI.Color.FromArgb(0xFF, r, g, b));
+    }
+
+    /// <summary>
+    /// Fills the row in from the selected shape.
+    ///
+    /// With nothing selected the controls are disabled and a line says why:
+    /// there is nowhere to put a shadow, and a row that silently does nothing
+    /// is worse than one that says so.
+    /// </summary>
+    private void SyncDropShadow()
+    {
+        double pageWpt = ViewModel.SelectedShapePageWidthPts;
+        bool editable = ViewModel.HasSelectedShape && pageWpt > 0;
+        double layoutWidth = pageWpt > 0 ? pageWpt : FallbackPageWidthPts;
+
+        var c = DropShadowPanel.From(
+            editable ? ViewModel.SelectedShapeShadow : null, layoutWidth);
+
+        _syncingShadow = true;
+        try
+        {
+            ShadowToggle.IsEnabled = editable;
+            ShadowToggle.IsOn = c.Enabled;
+            ShadowControls.Visibility = editable && c.Enabled
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            ShadowNoSelectionHint.Visibility = editable ? Visibility.Collapsed : Visibility.Visible;
+
+            // The ends of the sliders are a fraction of the PAGE, so they are
+            // set here rather than in the markup: the same shadow is a
+            // different number of points on A3 as on A4.
+            ShadowDistanceSlider.Maximum = System.Math.Round(DropShadowPanel.MaxDistancePts(layoutWidth));
+            ShadowBlurSlider.Maximum = System.Math.Round(DropShadowPanel.MaxBlurPts(layoutWidth));
+
+            ShadowAngleBox.Value = c.AngleDeg;
+            ShadowDistanceSlider.Value = System.Math.Clamp(c.DistancePts, 0, ShadowDistanceSlider.Maximum);
+            ShadowBlurSlider.Value = System.Math.Clamp(c.BlurPts, 0, ShadowBlurSlider.Maximum);
+            ShadowOpacitySlider.Value = System.Math.Clamp(
+                c.OpacityPercent, DropShadowPanel.MinOpacityPercent, 100);
+
+            _shadowColorHex = c.ColorHex;
+            ShadowSwatch.Background = ShadowBrush(c.ColorHex);
+            UpdateShadowReadouts();
+        }
+        finally
+        {
+            _syncingShadow = false;
+        }
+    }
+
+    private void UpdateShadowReadouts()
+    {
+        ShadowDistanceReadout.Text = $"{ShadowDistanceSlider.Value:F0}pt";
+        ShadowBlurReadout.Text = $"{ShadowBlurSlider.Value:F0}pt";
+        ShadowOpacityReadout.Text = $"{ShadowOpacitySlider.Value:F0}%";
+    }
+
+    /// <summary>The row as it stands, ready to become a shadow.</summary>
+    private DropShadowControls ShadowRowNow() => new(
+        Enabled: ShadowToggle.IsOn,
+        // A NumberBox reads NaN while it is empty, which is a state a person
+        // passes through on the way to typing a number.
+        AngleDeg: double.IsFinite(ShadowAngleBox.Value) ? ShadowAngleBox.Value : 0,
+        DistancePts: ShadowDistanceSlider.Value,
+        BlurPts: ShadowBlurSlider.Value,
+        OpacityPercent: (int)System.Math.Round(ShadowOpacitySlider.Value),
+        ColorHex: _shadowColorHex);
+
+    /// <summary>
+    /// Applies the row to the selected shape. Switched off, this hands over
+    /// null, and the core takes the shadow away rather than leaving an
+    /// invisible one behind.
+    /// </summary>
+    private void PushDropShadow()
+    {
+        if (_syncingShadow)
+        {
+            return;
+        }
+
+        double pageWpt = ViewModel.SelectedShapePageWidthPts;
+        if (pageWpt <= 0)
+        {
+            return;
+        }
+
+        UpdateShadowReadouts();
+        ViewModel.ApplyShadowToSelectedShape(
+            DropShadowPanel.ToShadow(ShadowRowNow(), pageWpt));
+    }
+
+    private void Shadow_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingShadow)
+        {
+            return;
+        }
+
+        ShadowControls.Visibility = ShadowToggle.IsOn ? Visibility.Visible : Visibility.Collapsed;
+        PushDropShadow();
+    }
+
+    private void Shadow_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) =>
+        PushDropShadow();
+
+    private void ShadowAngle_ValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args) =>
+        PushDropShadow();
+
+    private void ShadowDirection_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.Tag is not string tag
+            || !double.TryParse(
+                tag,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out double angle))
+        {
+            return;
+        }
+
+        // Under the guard, so moving the box does not push twice.
+        _syncingShadow = true;
+        try
+        {
+            ShadowAngleBox.Value = angle;
+        }
+        finally
+        {
+            _syncingShadow = false;
+        }
+
+        PushDropShadow();
+    }
+
+    private void ShadowColor_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.Tag is not string tag)
+        {
+            return;
+        }
+
+        // The preset buttons carry the same "#AARRGGBB" tags the fill picker
+        // uses, so the markup is the markup that already exists; the alpha is
+        // dropped because opacity is a control of its own.
+        _shadowColorHex = DropShadowPanel.RgbHexOf(tag);
+        ShadowSwatch.Background = ShadowBrush(_shadowColorHex);
+        PushDropShadow();
+    }
+
     private void Opacity_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
         if (_suppressOpacityChange)
@@ -3912,6 +4090,7 @@ public sealed partial class MainPage : Page
         TextAlignRow.Visibility = Show(sections.TextAlign);
         OutlineButton.Visibility = Show(sections.Outline);
         EffectsSection.Visibility = Show(sections.Effects);
+        if (sections.Effects) { SyncDropShadow(); }
         PropertyBarRow2.Visibility = Show(sections.Row2);
         PropertyBar.Visibility = Show(sections.Bar);
 

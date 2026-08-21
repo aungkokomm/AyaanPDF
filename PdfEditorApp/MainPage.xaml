@@ -2124,7 +2124,118 @@
                         <DropDownButton.Flyout>
                             <Flyout Placement="Bottom">
                                 <StackPanel x:Name="EffectRows" Orientation="Vertical"
-                                            Spacing="8" MinWidth="240" />
+                                            Spacing="8" MinWidth="268">
+
+                                    <!--
+                                        The Drop Shadow ROW. Adding a glow later
+                                        puts a second block in here and touches
+                                        nothing outside this flyout.
+                                    -->
+                                    <StackPanel Spacing="8">
+                                        <ToggleSwitch x:Name="ShadowToggle" Header="Drop shadow"
+                                                      OnContent="On" OffContent="Off"
+                                                      Toggled="Shadow_Toggled" />
+
+                                        <StackPanel x:Name="ShadowControls" Spacing="8">
+                                            <TextBlock Text="Light direction" FontSize="12"
+                                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                                            <!--
+                                                Eight presets as a compass, the centre left empty.
+                                                Tag is the angle the LIGHT comes from, counter-clockwise
+                                                from due east, so the shadow falls the opposite way.
+                                            -->
+                                            <Grid ColumnSpacing="3" RowSpacing="3" HorizontalAlignment="Left">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <Grid.RowDefinitions>
+                                                    <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="Auto" />
+                                                </Grid.RowDefinitions>
+                                                <Button Grid.Row="0" Grid.Column="0" Width="30" Height="30" Padding="0" Tag="135" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from the upper left"><TextBlock Text="&#x2196;" /></Button>
+                                                <Button Grid.Row="0" Grid.Column="1" Width="30" Height="30" Padding="0" Tag="90" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from above"><TextBlock Text="&#x2191;" /></Button>
+                                                <Button Grid.Row="0" Grid.Column="2" Width="30" Height="30" Padding="0" Tag="45" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from the upper right"><TextBlock Text="&#x2197;" /></Button>
+                                                <Button Grid.Row="1" Grid.Column="0" Width="30" Height="30" Padding="0" Tag="180" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from the left"><TextBlock Text="&#x2190;" /></Button>
+                                                <Button Grid.Row="1" Grid.Column="2" Width="30" Height="30" Padding="0" Tag="0" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from the right"><TextBlock Text="&#x2192;" /></Button>
+                                                <Button Grid.Row="2" Grid.Column="0" Width="30" Height="30" Padding="0" Tag="225" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from the lower left"><TextBlock Text="&#x2199;" /></Button>
+                                                <Button Grid.Row="2" Grid.Column="1" Width="30" Height="30" Padding="0" Tag="270" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from below"><TextBlock Text="&#x2193;" /></Button>
+                                                <Button Grid.Row="2" Grid.Column="2" Width="30" Height="30" Padding="0" Tag="315" Click="ShadowDirection_Click" ToolTipService.ToolTip="Lit from the lower right"><TextBlock Text="&#x2198;" /></Button>
+                                            </Grid>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="Angle" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <NumberBox x:Name="ShadowAngleBox" Width="120"
+                                                           Minimum="0" Maximum="359" SmallChange="5"
+                                                           SpinButtonPlacementMode="Compact"
+                                                           AutomationProperties.Name="Light angle in degrees"
+                                                           ValueChanged="ShadowAngle_ValueChanged" />
+                                            </StackPanel>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="Distance" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Slider x:Name="ShadowDistanceSlider" Width="126"
+                                                        Maximum="30" Minimum="0" StepFrequency="1"
+                                                        VerticalAlignment="Center"
+                                                        AutomationProperties.Name="Shadow distance in points"
+                                                        ValueChanged="Shadow_ValueChanged" />
+                                                <TextBlock x:Name="ShadowDistanceReadout" VerticalAlignment="Center"
+                                                           MinWidth="30" TextAlignment="Right" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </StackPanel>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="Blur" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Slider x:Name="ShadowBlurSlider" Width="126"
+                                                        Maximum="18" Minimum="0" StepFrequency="1"
+                                                        VerticalAlignment="Center"
+                                                        AutomationProperties.Name="Shadow blur in points"
+                                                        ValueChanged="Shadow_ValueChanged" />
+                                                <TextBlock x:Name="ShadowBlurReadout" VerticalAlignment="Center"
+                                                           MinWidth="30" TextAlignment="Right" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </StackPanel>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="Opacity" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Slider x:Name="ShadowOpacitySlider" Width="126"
+                                                        Maximum="100" Minimum="10" StepFrequency="5"
+                                                        VerticalAlignment="Center"
+                                                        AutomationProperties.Name="Shadow opacity"
+                                                        ValueChanged="Shadow_ValueChanged" />
+                                                <TextBlock x:Name="ShadowOpacityReadout" VerticalAlignment="Center"
+                                                           MinWidth="30" TextAlignment="Right" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </StackPanel>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <TextBlock Text="Colour" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Border x:Name="ShadowSwatch" Width="24" Height="24" CornerRadius="4"
+                                                        BorderBrush="#66000000" BorderThickness="1"
+                                                        VerticalAlignment="Center" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF000000" Tag="#FF000000" Click="ShadowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Black" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF404040" Tag="#FF404040" Click="ShadowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Dark grey" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF808080" Tag="#FF808080" Click="ShadowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Grey" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="ShadowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Red" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="ShadowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Blue" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="ShadowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Green" />
+                                            </StackPanel>
+                                        </StackPanel>
+
+                                        <TextBlock x:Name="ShadowNoSelectionHint"
+                                                   Text="Select a shape to give it a shadow."
+                                                   FontSize="12" TextWrapping="Wrap"
+                                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    </StackPanel>
+                                </StackPanel>
                             </Flyout>
                         </DropDownButton.Flyout>
                     </DropDownButton>

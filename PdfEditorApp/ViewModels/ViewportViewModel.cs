@@ -4849,6 +4849,95 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshSelectionOutline();
     }
 
+    /// <summary>
+    /// The selected shape's OWN drop shadow, read from its tag, or null when
+    /// there is no shape selected or it casts none.
+    ///
+    /// Read from the annotation rather than held as tool state, because the row
+    /// has to show what THIS shape is, not what the controls were last left at.
+    /// The same rule the fill and corner controls already follow.
+    /// </summary>
+    public DropShadow? SelectedShapeShadow
+    {
+        get
+        {
+            if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
+                || !_selectedIsShape)
+            {
+                return null;
+            }
+
+            string? contents = ReadAnnotationContents(sel.PageIndex, sel.Index);
+            if (contents is null || !ShapeTagReader.TryParse(contents, out var tag))
+            {
+                return null;
+            }
+
+            return ShapeEffectsTag.From(tag, PagePointsFor(sel.PageIndex).W)?.Shadow;
+        }
+    }
+
+    /// <summary>The selected shape's page width in points, which is what turns
+    /// the row's points into the model's normalized lengths. Zero when there is
+    /// no selection.</summary>
+    public double SelectedShapePageWidthPts =>
+        _selectedLoaded is LoadedSelection sel ? PagePointsFor(sel.PageIndex).W : 0;
+
+    /// <summary>
+    /// Gives the selected shape a drop shadow, changes the one it has, or takes
+    /// it away when handed null.
+    ///
+    /// Goes through the core's shadow override, which rebuilds the shape from
+    /// its tag with only the shadow replaced, so the rotation, colour, width,
+    /// fill and corners all survive. A null shadow writes a zero colour, and
+    /// the core reads that as "no shadow" and drops the field from the tag
+    /// entirely rather than leaving an invisible one behind.
+    /// </summary>
+    public void ApplyShadowToSelectedShape(DropShadow? shadow)
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
+            || !_selectedIsShape)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+
+        // Normalized lengths become capture pixels, which is the space every
+        // override speaks; the angle is not a length and crosses untouched.
+        float angle = (float)(shadow?.AngleDeg ?? 0);
+        float distance = (float)((shadow?.Distance ?? 0) * CaptureWidth);
+        float softness = (float)((shadow?.Softness ?? 0) * CaptureWidth);
+        float spread = (float)((shadow?.Spread ?? 0) * CaptureWidth);
+        uint rgba = shadow is { } s ? ShapeEffectsTag.RgbaOf(new ShapeEffects(s)) : 0;
+
+        PushHistory(HistoryScope.Document, shadow is null ? "Remove shadow" : "Drop shadow");
+
+        int status = RenderCoreNative.restyle_shape_shadow_annotation(
+            _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
+            angle, distance, softness, spread, rgba, out int newIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "Could not apply that shadow.";
+            return;
+        }
+
+        IsDirty = true;
+        InvalidateLoadedPage(sel.PageIndex);
+
+        // The shape was deleted and re-added, so the marquee follows it to its
+        // new index, exactly as the fill and style restyles do.
+        var actual = LoadedFor(sel.PageIndex)
+            .Where(x => x.Index == newIndex)
+            .Select(x => (Interop.ExistingAnnotation?)x)
+            .FirstOrDefault();
+        _selectedLoaded = actual is Interop.ExistingAnnotation a
+            ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom, sel.Id)
+            : sel with { Index = newIndex };
+        RefreshSelectionOutline();
+    }
+
     public void ApplyFillToSelectedShape()
     {
         if (_documentHandle == 0

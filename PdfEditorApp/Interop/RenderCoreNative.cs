@@ -885,6 +885,32 @@ internal static partial class RenderCoreNative
         out int newIndex);
 
     /// <summary>
+    /// Sets, changes or clears the DROP SHADOW on one of our shapes, leaving
+    /// its position, size, rotation, colour, width, fill and corners alone.
+    ///
+    /// A <paramref name="rgba"/> of ZERO clears the shadow, the same bargain
+    /// the fill makes, and the other four values are then ignored. Lengths are
+    /// in capture pixels, like the corner radius and unlike the points the tag
+    /// stores.
+    ///
+    /// <paramref name="softnessPx"/> and <paramref name="spreadPx"/> are stored
+    /// and round-tripped and drawn by nothing yet; passing them means a shape
+    /// does not lose them when the renderers catch up.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int restyle_shape_shadow_annotation(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        int captureWidth,
+        float angleDeg,
+        float distancePx,
+        float softnessPx,
+        float spreadPx,
+        uint rgba,
+        out int newIndex);
+
+    /// <summary>
     /// Sets a rounded rectangle's corner radius, in capture pixels, leaving its
     /// position, size, colour, width and fill alone. A negative or non-finite
     /// radius is refused rather than coerced to zero, since zero is itself a
