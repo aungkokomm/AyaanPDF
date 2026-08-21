@@ -86,12 +86,10 @@ public sealed record ShapeAnnotation(
     /// parameter, so the record's constructor is unchanged and every existing
     /// call site still compiles and still means the same thing.
     ///
-    /// IN MEMORY ONLY. A shape is persisted as the hand-written tag in its
-    /// annotation's /Contents, and that tag is formatted field by field in
-    /// render_core; nothing reflects over this record. So adding this cannot
-    /// perturb what is written, and equally it is not written: an effect does
-    /// not survive a save and reload. Making it survive means extending the tag
-    /// on both sides of the FFI.
+    /// PERSISTED, as one self-describing field on the shape's tag. Nothing
+    /// reflects over this record: the tag is formatted field by field in
+    /// render_core and read back by ShapeTagReader, so what survives a save is
+    /// exactly what those two agree on. See ShapeEffectsTag for the conversion.
     /// </summary>
     public ShapeEffects? Effects { get; init; }
 

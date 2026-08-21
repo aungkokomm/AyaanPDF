@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace PdfEditorApp.Viewport;
@@ -72,7 +73,30 @@ public readonly record struct ShapeRenderItem(
     double StrokeWidth,
     RenderStyle Style,
     double? SlotWidth = null,
-    ShapeEffects? Effects = null);
+    ShapeEffects? Effects = null)
+{
+    /// <summary>
+    /// Which OBJECT this mark is part of, or <see cref="Guid.Empty"/> when it
+    /// stands alone.
+    ///
+    /// One object can need more than one mark to draw: an arrow is a stroked
+    /// shaft and a filled head, emitted one after the other. Most of the
+    /// renderer is right to treat them separately, because they have different
+    /// styles and must paint in order. An EFFECT is not: a shadow belongs to
+    /// the arrow, and casting one per mark gives two shadows that darken where
+    /// they overlap and a head whose shadow lands on top of the shaft.
+    ///
+    /// That the parts of an object are ADJACENT in the list has always been
+    /// true and was written down only in a comment. This is the part the
+    /// renderer can actually check.
+    ///
+    /// An init-only property rather than a positional parameter, so every
+    /// existing construction still compiles and still means what it meant.
+    /// Empty is therefore the default, and it means "alone": a mark with no
+    /// object is its own object, which is exactly the old behaviour.
+    /// </summary>
+    public Guid ObjectId { get; init; }
+}
 
 /// <summary>
 /// Turns the marks the view model holds into a frame's worth of render items.
@@ -147,7 +171,7 @@ public static class ShapeRenderList
                 stroke.Points,
                 ColorOf(stroke.ColorHex),
                 stroke.StrokeWidth,
-                RenderStyle.Stroked));
+                RenderStyle.Stroked) { ObjectId = stroke.Id });
         }
 
         foreach (var shape in shapes)
@@ -171,13 +195,14 @@ public static class ShapeRenderList
         {
             var color = ColorOf(shape.ColorHex);
 
-            // The shaft and the head both carry the shape's effects, because
-            // they are two marks describing ONE object: shadowing the shaft and
-            // not the head would leave an arrow whose point floats free of its
-            // own shadow.
+            // The shaft and the head both carry the shape's effects AND its
+            // id, because they are two marks describing ONE object. The effects
+            // so the shadow covers the whole arrow rather than leaving its
+            // point floating free; the id so the renderer casts ONE shadow for
+            // both rather than two that darken where they overlap.
             items.Add(new ShapeRenderItem(
                 shape.PageIndex, shape.Outline, color, shape.StrokeWidth, RenderStyle.Stroked,
-                Effects: shape.Effects));
+                Effects: shape.Effects) { ObjectId = shape.Id });
 
             // Guarded on the count rather than on the kind, matching the
             // overlay: a shape whose head could not be built is not drawn as a
@@ -187,7 +212,7 @@ public static class ShapeRenderList
             {
                 items.Add(new ShapeRenderItem(
                     shape.PageIndex, head, color, shape.StrokeWidth, RenderStyle.Filled,
-                    Effects: shape.Effects));
+                    Effects: shape.Effects) { ObjectId = shape.Id });
             }
         }
     }

@@ -79,19 +79,70 @@ public static class ShapeSkiaPainter
         Func<int, double> pageTop,
         Func<int, PageTransform> pageView)
     {
-        foreach (var item in items)
+        // BY OBJECT, not by item. One object can take several marks to draw,
+        // and its effects belong to the object: an arrow shadowed per mark
+        // casts two shadows that darken where they overlap, and paints the
+        // head's shadow on top of the shaft.
+        //
+        // Still in list order, and still one object at a time rather than all
+        // the shadows first, so a shadow goes under its own object and above
+        // whatever was already painted rather than under the whole frame.
+        for (int at = 0; at < items.Count;)
         {
+            int end = EndOfObject(items, at);
+            PaintObject(canvas, items, at, end, scale, pageTop, pageView);
+            at = end;
+        }
+    }
+
+    /// <summary>
+    /// One past the last item belonging to the same object as the one at
+    /// <paramref name="first"/>.
+    ///
+    /// The parts of an object are ADJACENT, which the list has always
+    /// guaranteed. An item with no object id stands alone, which is what every
+    /// mark did before objects were expressed here and what keeps a hand-built
+    /// frame behaving as it always did.
+    /// </summary>
+    private static int EndOfObject(IReadOnlyList<ShapeRenderItem> items, int first)
+    {
+        Guid id = items[first].ObjectId;
+        if (id == Guid.Empty)
+        {
+            return first + 1;
+        }
+
+        int at = first + 1;
+        while (at < items.Count && items[at].ObjectId == id)
+        {
+            at++;
+        }
+
+        return at;
+    }
+
+    /// <summary>One object: its shadow once, underneath, then its marks in order.</summary>
+    private static void PaintObject(
+        SKCanvas canvas,
+        IReadOnlyList<ShapeRenderItem> items,
+        int from,
+        int to,
+        double scale,
+        Func<int, double> pageTop,
+        Func<int, PageTransform> pageView)
+    {
+        // The effects are the object's, so the first mark's are the object's.
+        // Every mark of one object carries the same instance.
+        if (items[from].Effects?.Shadow is { } shadow)
+        {
+            PaintObjectShadow(canvas, items, from, to, shadow, scale, pageTop, pageView);
+        }
+
+        for (int at = from; at < to; at++)
+        {
+            var item = items[at];
             double top = pageTop(item.PageIndex);
             var view = pageView(item.PageIndex);
-
-            // UNDERNEATH, and before this item rather than before the whole
-            // frame: a shadow belongs to its own mark, so it goes below that
-            // mark and above whatever was already painted. Shadowing the entire
-            // frame first would put one shape's shadow over another shape.
-            if (item.Effects?.Shadow is { } shadow)
-            {
-                PaintShadow(canvas, item, shadow, scale, top, view);
-            }
 
             if (item.Style == RenderStyle.Filled)
             {
@@ -105,7 +156,59 @@ public static class ShapeSkiaPainter
     }
 
     /// <summary>
-    /// The item again, shifted and recoloured, painted under it.
+    /// The whole object again, shifted and recoloured, painted under it.
+    ///
+    /// ONE SHADOW FOR THE OBJECT. When an object takes more than one mark its
+    /// parts are drawn into a single layer at FULL opacity and the finished
+    /// layer is laid down once at the shadow's own alpha. Drawn straight onto
+    /// the canvas instead, each part would composite against the last and every
+    /// overlap would come out darker than the rest of the shadow, with a seam
+    /// along the join. A shadow is a silhouette of the object, and a silhouette
+    /// has no internal edges.
+    ///
+    /// A single-mark object skips the layer entirely, because one path cannot
+    /// overlap itself: Skia composites a path once however it folds. That is
+    /// the overwhelmingly common case, the pixels are identical either way, and
+    /// this paint loop runs on every pointer move, so it is not worth an
+    /// offscreen buffer per object per frame to reach the same answer.
+    /// </summary>
+    private static void PaintObjectShadow(
+        SKCanvas canvas,
+        IReadOnlyList<ShapeRenderItem> items,
+        int from,
+        int to,
+        DropShadow shadow,
+        double scale,
+        Func<int, double> pageTop,
+        Func<int, PageTransform> pageView)
+    {
+        bool layered = to - from > 1;
+        int saved = 0;
+
+        if (layered)
+        {
+            using var lift = new SKPaint { Color = new SKColor(0, 0, 0, shadow.Color.A) };
+            saved = canvas.SaveLayer(lift);
+        }
+
+        // Inside a layer the parts go down at full strength and the layer
+        // carries the alpha; on their own they carry it themselves.
+        var color = layered ? shadow.Color with { A = 255 } : shadow.Color;
+
+        for (int at = from; at < to; at++)
+        {
+            PaintShadow(canvas, items[at], shadow, color, scale,
+                        pageTop(items[at].PageIndex), pageView(items[at].PageIndex));
+        }
+
+        if (layered)
+        {
+            canvas.RestoreToCount(saved);
+        }
+    }
+
+    /// <summary>
+    /// One mark of the object again, shifted and recoloured.
     ///
     /// The shift is applied to the NORMALIZED points, before the projection, so
     /// everything downstream is the code that already exists: the page's turn,
@@ -121,7 +224,7 @@ public static class ShapeSkiaPainter
     /// shape from the thing casting it.
     /// </summary>
     private static void PaintShadow(
-        SKCanvas canvas, ShapeRenderItem item, DropShadow shadow,
+        SKCanvas canvas, ShapeRenderItem item, DropShadow shadow, RenderColor color,
         double scale, double pageTop, PageTransform view)
     {
         var shifted = new (double X, double Y)[item.Points.Count];
@@ -133,7 +236,10 @@ public static class ShapeSkiaPainter
 
         // Same geometry, same weight, same style: only the position and the
         // colour differ, and Effects is dropped so the shadow cannot cast one.
-        var ghost = item with { Points = shifted, Color = shadow.Color, Effects = null };
+        // The colour is the caller's rather than the shadow's own, because a
+        // multi-mark object paints its parts at full strength into a layer that
+        // carries the alpha for all of them.
+        var ghost = item with { Points = shifted, Color = color, Effects = null };
 
         if (ghost.Style == RenderStyle.Filled)
         {
