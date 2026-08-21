@@ -5406,6 +5406,49 @@ pub extern "C" fn restyle_shape_shadow_annotation(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Whether a shape's annotation already carries its rasterised shadow.
+///
+/// The app asks before drawing one, because attaching REBUILDS the annotation
+/// and a rebuild changes its index. Doing that on every repaint churned the
+/// file and moved the selection out from under itself.
+///
+/// This is not a cache. Every edit that changes a shape or its shadow rebuilds
+/// the annotation, and a rebuild drops the picture, so "has a picture" and "has
+/// a picture that is still right" are the same question.
+///
+/// Returns 1 for yes, 0 for no, and a negative status for a mark that is not a
+/// shape or cannot be read.
+#[unsafe(no_mangle)]
+pub extern "C" fn shape_has_shadow_image(doc_handle: u64, page_index: i32, index: i32) -> i32 {
+    use pdfium_render::prelude::*;
+
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return -STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        let _guard = lock(&CALL_LOCK);
+        let Some(doc) = lock(&core().documents).get(&doc_handle).cloned() else {
+            return -STATUS_INVALID_INPUT;
+        };
+        let doc_guard = lock(&doc);
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return -STATUS_INVALID_INPUT;
+        };
+        let Some(annotation) = page.annotations().iter().nth(index as usize) else {
+            return -STATUS_INVALID_INPUT;
+        };
+
+        let has = annotation
+            .objects()
+            .iter()
+            .any(|o| matches!(o, PdfPageObject::Image(_)));
+
+        i32::from(has)
+    })
+    .unwrap_or(-STATUS_PANIC)
+}
+
 /// A rasterised shadow on its way into an annotation.
 ///
 /// PDF has no blur, so a SOFT shadow is drawn by Skia and carried here as
@@ -12100,6 +12143,57 @@ mod tests {
             kinds.iter().filter(|k| **k == "path").count(), bare,
             "the picture went in and the old vector shadow stayed: {kinds:?}");
         assert_eq!(kinds.first(), Some(&"image"), "the picture is not underneath: {kinds:?}");
+
+        close_document(handle);
+    }
+
+
+    #[test]
+    fn a_shape_says_whether_it_already_carries_its_picture() {
+        // The app asks this before drawing one. Attaching REBUILDS the
+        // annotation and a rebuild changes its index, so doing it on every
+        // repaint churned the file and moved the selection out from under
+        // itself: a small frame in the middle of a large shape.
+        let handle = open_fixture();
+
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        s.shadow_rgba = 0x80000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 50.0;
+        s.shadow_softness_px = 40.0;
+        add_one(handle, s);
+
+        assert_eq!(shape_has_shadow_image(handle, 0, 0), 0, "a fresh shape has no picture");
+
+        let px = grey_tile(48, 48);
+        let idx = attach_image(handle, 0, 60.0, 60.0, 500.0, 400.0, &px, 48, 48);
+        assert_eq!(shape_has_shadow_image(handle, 0, idx), 1, "the picture is not reported");
+
+        // AND A REBUILD TAKES IT AWAY AGAIN, which is what makes the question
+        // worth asking: "has one" and "has a current one" are the same thing
+        // only because every edit starts clean.
+        let mut out = -1;
+        assert_eq!(
+            resize_shape_annotation(handle, 0, idx, 1000, 100.0, 100.0, 700.0, 500.0, &mut out),
+            STATUS_OK_PDFIUM);
+        assert_eq!(
+            shape_has_shadow_image(handle, 0, out), 0,
+            "a resized shape still claims to have a current picture");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_shape_with_no_picture_keeps_its_index() {
+        // The other half: when nothing needs attaching, nothing is rebuilt, so
+        // an index a caller is holding stays valid.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+        add_one(handle, shape(SHAPE_ELLIPSE, 500.0, 100.0, 800.0, 300.0));
+
+        let before = contents_of(handle, 0, 0);
+        assert_eq!(shape_has_shadow_image(handle, 0, 0), 0);
+        assert_eq!(contents_of(handle, 0, 0), before, "asking must not change anything");
 
         close_document(handle);
     }

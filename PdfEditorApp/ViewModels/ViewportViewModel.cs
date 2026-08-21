@@ -7936,6 +7936,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // ALREADY DONE? Attaching rebuilds the annotation, which changes its
+        // index, so doing it on every repaint churned the file and moved the
+        // selection out from under itself. Every edit that changes the shape or
+        // its shadow rebuilds the annotation and drops the picture, so having
+        // one means having a current one.
+        if (RenderCoreNative.shape_has_shadow_image(_documentHandle, pageIndex, index) == 1)
+        {
+            return;
+        }
+
         var found = LoadedFor(pageIndex).FirstOrDefault(a => a.Index == index);
         if (found.Id == Guid.Empty && found.Index != index)
         {
@@ -7985,6 +7995,63 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // stale. The cache is dropped rather than patched: the very next lookup
         // by id has to see where the shape actually is now.
         InvalidateAnnotationCache(pageIndex);
+        RepointSelection(pageIndex, index, newIndex);
+    }
+
+    /// <summary>
+    /// Follows the selection to where a rebuilt annotation actually went.
+    ///
+    /// A selection is held by INDEX, and attaching a shadow deletes the
+    /// annotation and re-adds it at the end of the page. Left alone, the frame
+    /// and its handles would then be drawn from whatever annotation had taken
+    /// over the old index, which is what put a small frame in the middle of a
+    /// large shape.
+    /// </summary>
+    private void RepointSelection(int pageIndex, int oldIndex, int newIndex)
+    {
+        if (oldIndex == newIndex)
+        {
+            return;
+        }
+
+        static LoadedSelection Moved(LoadedSelection s, ExistingAnnotation now) =>
+            s with
+            {
+                Index = now.Index,
+                Left = now.Left, Top = now.Top, Right = now.Right, Bottom = now.Bottom,
+            };
+
+        var loaded = LoadedFor(pageIndex);
+
+        if (_selectedLoaded is { } sel && sel.PageIndex == pageIndex && sel.Index == oldIndex)
+        {
+            foreach (var a in loaded)
+            {
+                if (a.Index == newIndex)
+                {
+                    _selectedLoaded = Moved(sel, a);
+                    break;
+                }
+            }
+        }
+
+        for (int i = 0; i < _extraSelected.Count; i++)
+        {
+            var ex = _extraSelected[i];
+            if (ex.PageIndex != pageIndex || ex.Index != oldIndex)
+            {
+                continue;
+            }
+
+            foreach (var a in loaded)
+            {
+                if (a.Index == newIndex)
+                {
+                    _extraSelected[i] = Moved(ex, a);
+                    break;
+                }
+            }
+        }
     }
 
     private void RedrawPage(int pageIndex)

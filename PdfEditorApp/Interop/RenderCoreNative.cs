@@ -773,6 +773,16 @@ internal static partial class RenderCoreNative
     /// REBUILDS the annotation, so the index changes: read the new one out of
     /// <paramref name="outNewIndex"/> rather than reusing the old.
     /// </summary>
+    /// <summary>
+    /// Whether a shape's annotation already carries its rasterised shadow: 1
+    /// yes, 0 no, negative for a mark that cannot be read.
+    ///
+    /// Asked before drawing one, because attaching rebuilds the annotation and
+    /// a rebuild changes its index.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int shape_has_shadow_image(ulong docHandle, int pageIndex, int index);
+
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int set_shape_shadow_image(
         ulong docHandle,
