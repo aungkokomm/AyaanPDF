@@ -3821,6 +3821,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// Zero for non-shape selections.</summary>
     private double _selectedShapePadDips;
 
+    /// <summary>The selected SHAPE's own upright box, width and height in
+    /// normalized page units, or null when it cannot be recovered (anything
+    /// that is not a shape, or a shape whose tag predates the recorded size).
+    ///
+    /// Not the same thing as _selectedLoaded's rectangle once a shape is
+    /// turned: that is the axis-aligned box CONTAINING the rotation. The frame,
+    /// the grips and their hit zones are laid out UPRIGHT and then turned as
+    /// one, so laying them out in the /Rect turned them twice.
+    ///
+    /// Normalized rather than DIPs so it survives a zoom, and cached at
+    /// selection time so the overlay never pays an FFI to redraw.</summary>
+    private (double W, double H)? _selectedShapeBoxNorm;
+
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
     {
@@ -4094,11 +4107,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // Inset the DRAW rect by the shape's stroke pad so the frame
             // hugs the shape's outer stroke edge rather than the padded /Rect.
             // Zero pad for non-shapes; unchanged behaviour there.
-            double p = _selectedIsShape ? _selectedShapePadDips : 0;
-            double fl = sel.Left  * SlotLayoutWidth + p;
-            double ft = sel.Top   * SlotLayoutWidth + p;
-            double fr = sel.Right * SlotLayoutWidth - p;
-            double fb = sel.Bottom* SlotLayoutWidth - p;
+            // The shape's own upright box when it is known. That box already
+            // has the stroke pad off it, so the inset applies only to the
+            // fallback, where the rectangle is still the raw /Rect.
+            var frame = SelectionFrameOf(sel);
+            double p = _selectedIsShape && _selectedShapeBoxNorm is null
+                ? _selectedShapePadDips
+                : 0;
+            double fl = frame.Left  * SlotLayoutWidth + p;
+            double ft = frame.Top   * SlotLayoutWidth + p;
+            double fr = frame.Right * SlotLayoutWidth - p;
+            double fb = frame.Bottom* SlotLayoutWidth - p;
             slot?.SelectionOutline.Add(new ScaledRect(
                 fl, ft, fr - fl, fb - ft, string.Empty));
 
@@ -4108,8 +4127,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             if (slot is not null)
             {
                 slot.SelectionRotation = (_selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk) ? _selectedRotationDeg : 0;
-                slot.SelectionCenterX = (sel.Left + sel.Right) / 2 * SlotLayoutWidth;
-                slot.SelectionCenterY = (sel.Top + sel.Bottom) / 2 * SlotLayoutWidth;
+                slot.SelectionCenterX = (frame.Left + frame.Right) / 2 * SlotLayoutWidth;
+                slot.SelectionCenterY = (frame.Top + frame.Bottom) / 2 * SlotLayoutWidth;
             }
 
             // Grips only for what can actually be resized. Offering them on a
@@ -4121,7 +4140,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // picture keeps just its four corners. A text box also gets the
                 // rotate handle above its top edge. Grips inset by the same
                 // shape-pad amount so they sit ON the frame, not outside it.
-                AddGrips(slot, sel, edges: AspectToPreserve(sel) == 0,
+                AddGrips(slot, frame, edges: AspectToPreserve(sel) == 0,
                          rotate: _selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk,
                          insetDips: p);
             }
@@ -4574,6 +4593,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         _selectedRotationDeg = 0;
         _selectedShapePadDips = 0;
+        _selectedShapeBoxNorm = null;
         _selectedIsRoundedRect = false;
         // Whether the selection is a shape is decided by whether its /Contents
         // parses as our shape tag; the shape check comes first because it is a
@@ -4653,6 +4673,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             _selectedShapePadDips = (widthPts > 0 && pageWpt > 0)
                 ? (widthPts / 2.0 + 1.0) * SlotLayoutWidth / pageWpt
                 : 0;
+
+            // And the shape's OWN upright box, which for a turned shape is not
+            // its /Rect. The core owns that inversion because the resize and
+            // rebuild paths already needed it; see UprightBounds. The capture
+            // width is a scale that multiplies in and divides back out, so any
+            // positive value gives the same answer.
+            if (pageWpt > 0 && _selectedLoaded is LoadedSelection shapeSel)
+            {
+                const int Cap = 1000;
+                var up = UprightBounds(contents!, shapeSel, Cap, pageWpt);
+                double bw = up.Right - up.Left;
+                double bh = up.Bottom - up.Top;
+                if (bw > 0 && bh > 0) { _selectedShapeBoxNorm = (bw, bh); }
+            }
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
@@ -5029,12 +5063,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return TextBoxTagReader.TryParse(tag, out var box) ? box.RotationDeg : 0;
     }
 
+    /// <summary>
+    /// The upright rectangle the selection frame, its grips and their hit zones
+    /// are laid out in, before the overlay turns the whole assembly about its
+    /// centre.
+    ///
+    /// One method for all three. A frame drawn in one rectangle and grabbed in
+    /// another is worse than either mistake on its own, and before this they
+    /// agreed only because both were wrong the same way.
+    /// </summary>
+    private (double Left, double Top, double Right, double Bottom) SelectionFrameOf(
+        LoadedSelection sel) =>
+        SelectionFrame.Upright(sel.Left, sel.Top, sel.Right, sel.Bottom,
+            _selectedShapeBoxNorm?.W ?? 0, _selectedShapeBoxNorm?.H ?? 0);
+
     /// <summary>The handle under a point, accounting for the box's rotation: the
     /// pointer is turned back into the box's own upright frame first, then the
     /// rotate handle (above the top edge) and the resize handles are tested.</summary>
     private LoadedAnnotationPicker.Grip GripForPoint(LoadedSelection sel, double nx, double ny)
     {
-        var box = new AnnotationBox(sel.Index, sel.Left, sel.Top, sel.Right, sel.Bottom);
+        // The same rectangle the handles are DRAWN in, or a handle would be
+        // grabbable somewhere other than where it appears.
+        var f = SelectionFrameOf(sel);
+        var box = new AnnotationBox(sel.Index, f.Left, f.Top, f.Right, f.Bottom);
         var (lx, ly) = InverseRotate(nx, ny, box, _selectedRotationDeg);
         if ((_selectedIsTextBox || _selectedIsShape || _selectedIsStamp || _selectedIsInk)
             && LoadedAnnotationPicker.IsRotateHandle(box, lx, ly))
@@ -7894,15 +7945,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return Interop.AnnotSubtype.Other;
     }
 
-    private static void AddGrips(PageSlot slot, LoadedSelection sel, bool edges, bool rotate, double insetDips = 0)
+    private static void AddGrips(
+        PageSlot slot, (double Left, double Top, double Right, double Bottom) frame,
+        bool edges, bool rotate, double insetDips = 0)
     {
-        // Inset from the /Rect corners by the caller's amount, so the grips
-        // sit on the visible outer stroke edge (matches the frame draw above)
-        // rather than floating outside the shape.
-        double l = sel.Left  * SlotLayoutWidth + insetDips;
-        double t = sel.Top   * SlotLayoutWidth + insetDips;
-        double r = sel.Right * SlotLayoutWidth - insetDips;
-        double b = sel.Bottom* SlotLayoutWidth - insetDips;
+        // The SAME rectangle the frame is drawn in, inset by the caller's
+        // amount, so the grips sit on the visible outer stroke edge rather than
+        // floating outside the shape.
+        double l = frame.Left  * SlotLayoutWidth + insetDips;
+        double t = frame.Top   * SlotLayoutWidth + insetDips;
+        double r = frame.Right * SlotLayoutWidth - insetDips;
+        double b = frame.Bottom* SlotLayoutWidth - insetDips;
         double mx = (l + r) / 2;
         double my = (t + b) / 2;
 
