@@ -29,6 +29,7 @@ public static class Program
         ShadowIntoThePdf();
         Benchmark();
         Studies.RunAll(Fixture(), OutDir);
+        WhatTheSlidersCanReach();
 
         Console.WriteLine($"\nSheets written to {Path.GetFullPath(OutDir)}");
     }
@@ -364,6 +365,68 @@ public static class Program
         watch.Stop();
 
         return watch.Elapsed.TotalMilliseconds / frames;
+    }
+
+    /// <summary>
+    /// The SHIPPED committed shadow, at settings a person can actually dial in.
+    ///
+    /// The question this answers is whether the property bar's range can reach
+    /// the big, soft, light shadow people expect, or whether the range itself
+    /// is the limit.
+    /// </summary>
+    private static void WhatTheSlidersCanReach()
+    {
+        string fixture = Fixture();
+        if (fixture is "")
+        {
+            return;
+        }
+
+        const double pageWpts = 200;
+
+        (string Name, double DistPts, double BlurPts, int Percent)[] settings =
+        [
+            ("distance 10pt, blur 2pt, 50%", 10, 2, 50),
+            ("distance 6pt, blur 6pt, 40%", 6, 6, 40),
+            ("MAX blur, distance 3pt, 25%",
+             3, DropShadowPanel.MaxBlurPts(pageWpts), 25),
+            ("MAX blur, distance 0, 18%",
+             0, DropShadowPanel.MaxBlurPts(pageWpts), 18),
+        ];
+
+        var sheet = NewSheet(settings.Length, 1, out var canvas);
+
+        for (int c = 0; c < settings.Length; c++)
+        {
+            var (name, dist, blur, percent) = settings[c];
+            Label(canvas, name, (c * (Cell + Gutter)) + Gutter, 24, 14, bold: true);
+
+            var controls = new DropShadowControls(
+                Enabled: true, AngleDeg: 135, DistancePts: dist, BlurPts: blur,
+                OpacityPercent: percent, ColorHex: "#000000");
+
+            var shadow = DropShadowPanel.ToShadow(controls, pageWpts)!.Value;
+
+            using var page = Committed.Render(fixture, pageWpts, shadow, filled: true, Cell);
+            canvas.DrawBitmap(page, (c * (Cell + Gutter)) + Gutter, Header + Gutter);
+
+            // The darkest grey, which is what the shadow's alpha should give
+            // over white: 50% black is 127, 25% is 191.
+            int darkest = 255;
+            var px = page.GetPixelSpan();
+            for (int i = 0; i + 3 < px.Length; i += 4)
+            {
+                if (px[i] == px[i + 1] && px[i + 1] == px[i + 2] && px[i] != 255)
+                {
+                    darkest = Math.Min(darkest, px[i]);
+                }
+            }
+
+            Console.WriteLine(
+                $"  {name,-32} darkest grey {darkest,3}  (expected {(int)(255 * (1 - percent / 100.0)),3})");
+        }
+
+        Save(sheet, "07-what-the-sliders-reach.png");
     }
 
     // ---------------- sheet plumbing ----------------

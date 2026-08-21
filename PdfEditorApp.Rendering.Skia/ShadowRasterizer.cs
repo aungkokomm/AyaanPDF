@@ -50,6 +50,73 @@ public static class ShadowRasterizer
     public const int MaxSide = 2048;
 
     /// <summary>
+    /// The marks that cast a committed shape's shadow, from its own tag and box.
+    ///
+    /// Built through ShapeGeometry, the same outline the shape itself is drawn
+    /// from, so the shadow and the thing casting it cannot describe different
+    /// shapes.
+    ///
+    /// A FILLED shape gets a filled mark as well as its outline. ShapeRenderList
+    /// emits only a stroked outline, because the live overlay has never drawn a
+    /// fill, and handing that straight to the filter made a solid rectangle cast
+    /// the shadow of a wire frame: a thin soft band instead of a solid one.
+    /// Measured, at 50 per cent black over white: 185 where it should have been
+    /// 127. The alpha the filter reads has to be the alpha the shape really has.
+    /// </summary>
+    public static IReadOnlyList<ShapeRenderItem> CasterItemsFor(
+        ShapeTag tag, double left, double top, double right, double bottom, double pageWidthPts)
+    {
+        if (pageWidthPts <= 0 || right <= left || bottom <= top)
+        {
+            return Array.Empty<ShapeRenderItem>();
+        }
+
+        var draft = new ShapeDraft(tag.Kind, left, top, right, bottom)
+        {
+            CornerFraction = ShapeGeometry.CornerFractionFromRadius(
+                tag.CornerRadiusPts / pageWidthPts, right - left, bottom - top),
+        };
+
+        double strokeNorm = tag.StrokeWidthPts / pageWidthPts;
+        var shape = new ShapeAnnotation(0, draft, tag.StrokeHex, strokeNorm);
+        var items = new List<ShapeRenderItem>(
+            ShapeRenderList.From(Array.Empty<InkStrokeAnnotation>(), new[] { shape }));
+
+        if (tag.FillHex is not null && items.Count > 0)
+        {
+            // UNDER the outline, the way a fill sits under its own stroke.
+            // Colour is irrelevant here, only coverage, but the shape's own
+            // fill colour keeps it honest for anyone reading the pixels.
+            items.Insert(0, items[0] with { Style = RenderStyle.Filled });
+        }
+
+        if (tag.RotationDeg == 0)
+        {
+            return items;
+        }
+
+        // Turned about the shape's own centre, which is where render_core turns
+        // it. The picture carries the turn in its pixels rather than being
+        // turned as a whole later, because turning the picture would turn the
+        // light with it.
+        double cx = (left + right) / 2;
+        double cy = (top + bottom) / 2;
+        double rad = tag.RotationDeg * Math.PI / 180.0;
+        double cos = Math.Cos(rad), sin = Math.Sin(rad);
+
+        return items
+            .Select(i => i with
+            {
+                Points = i.Points
+                    .Select(p => (
+                        X: cx + (((p.X - cx) * cos) - ((p.Y - cy) * sin)),
+                        Y: cy + (((p.X - cx) * sin) + ((p.Y - cy) * cos))))
+                    .ToList(),
+            })
+            .ToList();
+    }
+
+    /// <summary>
     /// The box a shadow's ink can land in, in normalized page units.
     ///
     /// The object's own box, moved by the offset, opened out by half the stroke

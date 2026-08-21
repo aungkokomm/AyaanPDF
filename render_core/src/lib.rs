@@ -4924,11 +4924,26 @@ fn add_shape_annotations_inner_with_image(
         // this sign wrong puts every shadow on the wrong side of its shape,
         // which is why there is a test that only passes for one of them.
         // DERIVED, never stored: angle and distance are what the shape carries.
-        // Softness and spread are deliberately NOT consulted, because neither
-        // can be drawn as a path object; see ShapeSpec.
+        // Spread is deliberately NOT consulted, because it cannot be drawn as
+        // a path object; see ShapeSpec.
         let (sdx, sdy) =
             shadow_offset_pts(spec.shadow_angle_deg, spec.shadow_distance_px * scale);
+
+        // A shadow at all: what the annotation's box has to make room for,
+        // whether the shadow ends up drawn as a path or arrives as a picture.
         let has_shadow = spec.shadow_rgba != 0;
+
+        // A shadow DRAWN HERE, as paths. Only a hard one: a blur is not
+        // something PDF can express for a path, so a soft shadow is rasterised
+        // by Skia and attached as an image instead.
+        //
+        // The two must never both happen. Drawing a hard stand-in under a
+        // blurred picture is what made a soft shadow come out as a dark offset
+        // copy with a faint halo round it, which is exactly what it was
+        // reported as. If the picture has not been attached yet, nothing is
+        // drawn: the app attaches it before the page is rendered, and a wrong
+        // shadow for one frame is worse than none.
+        let draw_shadow_as_paths = has_shadow && spec.shadow_softness_px <= 0.0;
 
         let pad = width_pts / 2.0 + 1.0;
         let min_x = extent.iter().map(|p| p.0).fold(f32::MAX, f32::min) - pad;
@@ -5096,7 +5111,7 @@ fn add_shape_annotations_inner_with_image(
         // It turns about its OWN centre, the shape's centre moved by the same
         // offset. Turning it about the shape's centre would swing it around the
         // shape as the shape rotated, which is an orbit and not a shadow.
-        if has_shadow {
+        if draw_shadow_as_paths {
             let a = ((spec.shadow_rgba >> 24) & 0xFF) as u8;
             let r = ((spec.shadow_rgba >> 16) & 0xFF) as u8;
             let g = ((spec.shadow_rgba >> 8) & 0xFF) as u8;
@@ -12047,6 +12062,48 @@ mod tests {
         out
     }
 
+
+    #[test]
+    fn a_soft_shadow_is_drawn_once_and_not_twice() {
+        // THE SHADOW IS EITHER A PICTURE OR A PATH, never both.
+        //
+        // Reported from the app: a soft shadow came out as a hard dark offset
+        // copy with a faint halo leaking round it. That is what a blurred
+        // picture with the OLD vector shadow painted on top of it looks like.
+        // Measured before the fix: ["image", "path", "path"], the second path
+        // being a shadow nobody wanted any more.
+        let handle = open_fixture();
+
+        let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        plain.fill_rgba = 0xFF3B82F6;
+        add_one(handle, plain);
+        let bare = object_kinds(handle, 0).len();
+
+        let mut soft = plain;
+        soft.shadow_rgba = 0x80000000;
+        soft.shadow_angle_deg = 135.0;
+        soft.shadow_distance_px = 50.0;
+        soft.shadow_softness_px = 40.0;
+        add_one(handle, soft);
+
+        // Before any picture is attached: a blur is not something render_core
+        // can draw, so it draws NOTHING rather than a hard stand-in.
+        assert_eq!(
+            object_kinds(handle, 1).len(), bare,
+            "a blurred shadow was drawn as a hard one: {:?}", object_kinds(handle, 1));
+
+        let px = grey_tile(64, 64);
+        let idx = attach_image(handle, 1, 80.0, 80.0, 480.0, 380.0, &px, 64, 64);
+
+        let kinds = object_kinds(handle, idx as usize);
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "path").count(), bare,
+            "the picture went in and the old vector shadow stayed: {kinds:?}");
+        assert_eq!(kinds.first(), Some(&"image"), "the picture is not underneath: {kinds:?}");
+
+        close_document(handle);
+    }
+
     #[test]
     fn a_hard_shadow_is_still_drawn_as_paths() {
         // Softness zero keeps the vector path it always had. Nothing to
@@ -12418,7 +12475,12 @@ mod tests {
         let (objects_a, box_a) = annotation_shape(handle, 0).expect("annotation missing");
         let (objects_b, box_b) = annotation_shape(handle, 1).expect("annotation missing");
 
-        assert_eq!(objects_a, objects_b, "softness alone must not add an object");
+        // FEWER, not the same. A hard shadow is a path; a soft one is a picture
+        // that Skia has not attached yet, and render_core will not draw a hard
+        // stand-in in the meantime. See a_soft_shadow_is_drawn_once_and_not_twice.
+        assert_eq!(
+            objects_b + 1, objects_a,
+            "a blurred shadow must not also be drawn as a path");
 
         // Three sigma, and sigma is half the radius: 25 capture pixels is 5
         // points of radius, so 7.5 points of room on every side.

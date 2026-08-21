@@ -7946,7 +7946,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             pageIndex, index, found.Left, found.Top, found.Right, found.Bottom, found.Id);
         var (l, t, r, b) = UprightBounds(contents, sel, CaptureWidth, pageWidthPts);
 
-        var items = ShadowCasterItems(tag, l, t, r, b, pageWidthPts);
+        var items = ShadowRasterizer.CasterItemsFor(tag, l, t, r, b, pageWidthPts);
         if (items.Count == 0)
         {
             return;
@@ -7985,52 +7985,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // stale. The cache is dropped rather than patched: the very next lookup
         // by id has to see where the shape actually is now.
         InvalidateAnnotationCache(pageIndex);
-    }
-
-    /// <summary>
-    /// The marks that cast the shadow, from the shape's own tag and box.
-    ///
-    /// Built through ShapeAnnotation and ShapeRenderList, the SAME two the
-    /// preview goes through, so the committed shadow and the previewed one are
-    /// cast by the same geometry. Anything reconstructed by hand here would be
-    /// a second definition of what a shape looks like, and the two would drift.
-    /// </summary>
-    private static IReadOnlyList<ShapeRenderItem> ShadowCasterItems(
-        ShapeTag tag, double left, double top, double right, double bottom, double pageWidthPts)
-    {
-        var draft = new ShapeDraft(tag.Kind, left, top, right, bottom)
-        {
-            CornerFraction = ShapeGeometry.CornerFractionFromRadius(
-                tag.CornerRadiusPts / pageWidthPts, right - left, bottom - top),
-        };
-
-        var shape = new ShapeAnnotation(0, draft, tag.StrokeHex, tag.StrokeWidthPts / pageWidthPts);
-        var items = ShapeRenderList.From(Array.Empty<InkStrokeAnnotation>(), new[] { shape });
-
-        if (tag.RotationDeg == 0)
-        {
-            return items;
-        }
-
-        // Turned about the shape's own centre, which is where render_core turns
-        // it. The picture carries the turn in its pixels rather than being
-        // turned as a whole later, because turning the picture would turn the
-        // light with it.
-        double cx = (left + right) / 2;
-        double cy = (top + bottom) / 2;
-        double rad = tag.RotationDeg * Math.PI / 180.0;
-        double cos = Math.Cos(rad), sin = Math.Sin(rad);
-
-        return items
-            .Select(i => i with
-            {
-                Points = i.Points
-                    .Select(p => (
-                        X: cx + (((p.X - cx) * cos) - ((p.Y - cy) * sin)),
-                        Y: cy + (((p.X - cx) * sin) + ((p.Y - cy) * cos))))
-                    .ToList(),
-            })
-            .ToList();
     }
 
     private void RedrawPage(int pageIndex)

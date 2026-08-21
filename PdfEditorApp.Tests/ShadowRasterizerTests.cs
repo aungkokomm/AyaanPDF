@@ -209,6 +209,79 @@ public class ShadowRasterizerTests
         Assert.True(Ink(20) > Ink(4) * 1.5, "the blur value is not reaching the rasteriser");
     }
 
+    // ---------------- what casts it ----------------
+
+    private static ShapeTag Tag(string? fillHex, double rotation = 0) =>
+        new(ShapeKind.Rectangle, "#FF000000", 2.4, false, false, rotation, fillHex, 0);
+
+    [Fact]
+    public void a_filled_shape_casts_a_solid_picture()
+    {
+        // THE REPORT: a solid rectangle threw the shadow of a wire frame, a
+        // thin soft band instead of a solid one, because the marks handed to
+        // the filter came from ShapeRenderList, which only ever emits a stroked
+        // outline. Measured at 50 per cent black over white: 185 where it
+        // should have been 127.
+        var items = ShadowRasterizer.CasterItemsFor(
+            Tag("#FF3B82F6"), 0.2, 0.2, 0.5, 0.5, PageWidthPts);
+
+        var raster = ShadowRasterizer.Rasterize(items, Shadow(1), PageWidthPts)!.Value;
+        int middle = ((raster.PixelHeight / 2) * raster.PixelWidth + (raster.PixelWidth / 2)) * 4;
+
+        Assert.True(
+            raster.Bgra[middle + 3] > 120,
+            $"the middle of a solid shape's shadow is only {raster.Bgra[middle + 3]} of 128: " +
+            "the fill is missing from what casts it");
+    }
+
+    [Fact]
+    public void an_unfilled_shape_still_casts_only_its_outline()
+    {
+        var items = ShadowRasterizer.CasterItemsFor(
+            Tag(fillHex: null), 0.2, 0.2, 0.5, 0.5, PageWidthPts);
+
+        Assert.All(items, i => Assert.Equal(RenderStyle.Stroked, i.Style));
+
+        var raster = ShadowRasterizer.Rasterize(items, Shadow(1), PageWidthPts)!.Value;
+        int middle = ((raster.PixelHeight / 2) * raster.PixelWidth + (raster.PixelWidth / 2)) * 4;
+
+        Assert.True(raster.Bgra[middle + 3] < 40, "a hollow shape cast a solid shadow");
+    }
+
+    [Fact]
+    public void the_fill_goes_under_the_outline()
+    {
+        var items = ShadowRasterizer.CasterItemsFor(
+            Tag("#FF3B82F6"), 0.2, 0.2, 0.5, 0.5, PageWidthPts);
+
+        Assert.Equal(2, items.Count);
+        Assert.Equal(RenderStyle.Filled, items[0].Style);
+        Assert.Equal(RenderStyle.Stroked, items[1].Style);
+    }
+
+    [Fact]
+    public void a_turned_shape_is_turned_in_the_picture()
+    {
+        // Not turned afterwards as a whole, which would carry the light round
+        // with the shape.
+        var upright = ShadowRasterizer.CasterItemsFor(
+            Tag("#FF3B82F6"), 0.2, 0.2, 0.5, 0.4, PageWidthPts);
+        var turned = ShadowRasterizer.CasterItemsFor(
+            Tag("#FF3B82F6", rotation: 30), 0.2, 0.2, 0.5, 0.4, PageWidthPts);
+
+        Assert.NotEqual(upright[0].Points[0], turned[0].Points[0]);
+
+        // Same centre: a turn is not a move. Measured from the bounding box
+        // rather than averaged, because a closed outline repeats its first
+        // point and an average is therefore pulled towards that corner.
+        static (double X, double Y) Centre(IReadOnlyList<ShapeRenderItem> items) =>
+            ((items[0].Points.Min(p => p.X) + items[0].Points.Max(p => p.X)) / 2,
+             (items[0].Points.Min(p => p.Y) + items[0].Points.Max(p => p.Y)) / 2);
+
+        Assert.Equal(Centre(upright).X, Centre(turned).X, 6);
+        Assert.Equal(Centre(upright).Y, Centre(turned).Y, 6);
+    }
+
     [Fact]
     public void a_hollow_shape_casts_a_hollow_picture()
     {
