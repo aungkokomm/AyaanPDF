@@ -6280,6 +6280,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         int firstNewIndex = LoadedFor(page).Count;
         int emitted = 0;
+        // Read once: every pasted shape lands on the same page.
+        double pastePageWidthPts = PagePointsFor(page).W;
         foreach (var e in _clipboard)
         {
             // Fresh normalized bounds on the current page. Clamp so a paste
@@ -6293,7 +6295,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             if (e.Contents.StartsWith("AyaanShape:", StringComparison.Ordinal))
             {
-                if (!ShapeSpecFromTag(e.Contents, pasted, CaptureWidth, out var spec)) { continue; }
+                if (!ShapeSpecFromTag(e.Contents, pasted, CaptureWidth, pastePageWidthPts,
+                                      out var spec)) { continue; }
                 if (RenderCoreNative.add_shape_annotations(
                         _documentHandle, CaptureWidth, new[] { spec }, 1)
                     == RenderStatus.OkPdfium) { emitted++; }
@@ -6926,7 +6929,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             // Rebuild the ShapeSpec from the tag and add a second copy at the SAME
             // bounds. The subsequent drag will slide it off the original.
-            if (!ShapeSpecFromTag(contents, sel, CaptureWidth, out var spec))
+            if (!ShapeSpecFromTag(contents, sel, CaptureWidth,
+                                  PagePointsFor(sel.PageIndex).W, out var spec))
             {
                 return false;
             }
@@ -7035,12 +7039,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// What is left here is the copy into the interop struct and nothing else.
     /// </summary>
     private static bool ShapeSpecFromTag(string contents, LoadedSelection sel,
-        int captureWidth, out Interop.NativeShapeSpec spec)
+        int captureWidth, double pageWidthPts, out Interop.NativeShapeSpec spec)
     {
         spec = default;
 
+        // The selection's rectangle is the annotation's /Rect, which is not the
+        // shape's extent. Recovering the extent is the core's job because the
+        // resize path already had to do it; see UprightBounds.
+        var (left, top, right, bottom) = UprightBounds(
+            contents, sel, captureWidth, pageWidthPts);
+
         if (!ShapeWriter.TryForExistingShape(
-                contents, sel.Left, sel.Top, sel.Right, sel.Bottom, captureWidth,
+                contents, left, top, right, bottom, captureWidth,
                 out var rebuilt))
         {
             return false;
@@ -7067,6 +7077,46 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         };
 
         return true;
+    }
+
+    /// <summary>
+    /// A shape's own extent, recovered from the /Rect it is reported at.
+    ///
+    /// A rebuilt shape used to be sized from that rectangle directly, which
+    /// carries the stroke pad and, for a turned shape, is the axis-aligned box
+    /// CONTAINING the rotation rather than the shape itself. Every paste,
+    /// ctrl+drag duplicate and undone delete therefore came back larger, and
+    /// the error compounded because each copy's rectangle fed the next. At 90
+    /// degrees the copy came back lying the wrong way round.
+    ///
+    /// Falls back to the rectangle as given whenever the core cannot help: a
+    /// tag it does not recognise, a page with no width, or a rotated shape
+    /// written before the tag recorded its upright size. That is exactly the
+    /// behaviour this replaced, so falling back is no worse than not asking.
+    /// </summary>
+    private static (double Left, double Top, double Right, double Bottom) UprightBounds(
+        string contents, LoadedSelection sel, int captureWidth, double pageWidthPts)
+    {
+        if (pageWidthPts <= 0 || captureWidth <= 0)
+        {
+            return (sel.Left, sel.Top, sel.Right, sel.Bottom);
+        }
+
+        byte[] tagUtf8 = System.Text.Encoding.UTF8.GetBytes(contents);
+
+        int status = RenderCoreNative.shape_upright_bounds(
+            captureWidth, (float)pageWidthPts, tagUtf8, (nuint)tagUtf8.Length,
+            (float)(sel.Left * captureWidth), (float)(sel.Top * captureWidth),
+            (float)(sel.Right * captureWidth), (float)(sel.Bottom * captureWidth),
+            out float l, out float t, out float r, out float b);
+
+        // Back into normalized units, the space the rest of the rebuild works
+        // in. The core takes capture pixels because that is what the resize
+        // path speaks, and one space for both keeps the inversion shared.
+        return status == RenderStatus.OkPdfium
+            ? (l / (double)captureWidth, t / (double)captureWidth,
+               r / (double)captureWidth, b / (double)captureWidth)
+            : (sel.Left, sel.Top, sel.Right, sel.Bottom);
     }
 
     /// <summary>
@@ -9661,7 +9711,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (tag.StartsWith("AyaanShape:", StringComparison.Ordinal))
         {
             var target = new LoadedSelection(page, -1, rect.Left, rect.Top, rect.Right, rect.Bottom, id);
-            if (ShapeSpecFromTag(tag, target, Cap, out var spec))
+            if (ShapeSpecFromTag(tag, target, Cap, PagePointsFor(page).W, out var spec))
             {
                 made = RenderCoreNative.add_shape_annotations(_documentHandle, Cap, new[] { spec }, 1)
                        == RenderStatus.OkPdfium;

@@ -739,6 +739,39 @@ internal static partial class RenderCoreNative
         out int newIndex);
 
     /// <summary>
+    /// A shape's own extent, recovered from the /Rect it is reported at.
+    ///
+    /// An annotation's rectangle is not its geometry. The writer inflates it by
+    /// the stroke pad, and for a ROTATED shape it is the axis-aligned box that
+    /// CONTAINS the turned content, larger than the shape in both axes. Every
+    /// path that rebuilds a shape from its tag has to undo both first, or the
+    /// copy comes back bigger; at 90 degrees it comes back lying the wrong way
+    /// round, because the axis-aligned box of a shape on its side is the
+    /// upright box with its sides swapped.
+    ///
+    /// Only the resize path used to know this. Pure geometry, so it takes the
+    /// page width rather than a document handle. Bounds go in and come out in
+    /// capture-space pixels with a top-left origin.
+    ///
+    /// Returns <see cref="RenderStatus.Unsupported"/> for a tag that is not a
+    /// shape, so the caller can fall back to the rectangle it already had.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int shape_upright_bounds(
+        int captureWidth,
+        float pageWidthPts,
+        [In] byte[] tagUtf8,
+        nuint tagLen,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        out float uprightLeft,
+        out float uprightTop,
+        out float uprightRight,
+        out float uprightBottom);
+
+    /// <summary>
     /// Resizes an annotation, rebuilding it when PDFium will not scale it in
     /// place. Rebuilding reads the image back out of the annotation, so it
     /// works for a stamp the app never placed, including one from a saved file

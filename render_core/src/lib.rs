@@ -5265,6 +5265,123 @@ fn restyle_shape_annotation_inner_with_rotation(
     STATUS_OK_PDFIUM
 }
 
+/// A shape's own extent, recovered from the rectangle PDFium reports for it.
+///
+/// An annotation's /Rect is NOT the shape's geometry. The writer adds two
+/// things to it, and both have to come off before that rectangle can be handed
+/// back as an extent:
+///
+/// 1. THE STROKE PAD, `width/2 + 1` on every side, so PDFium does not clip the
+///    stroke. Feeding it back inflates the shape by another pad.
+/// 2. THE TURN. For a rotated shape /Rect is the axis-aligned box that CONTAINS
+///    the rotated content, bigger than the shape in both axes, and not
+///    invertible at 45 degrees where the two axes contribute equally. The
+///    shape's own upright size is recorded on its tag instead. The CENTRE of
+///    /Rect is exact whatever the angle, so centre plus recorded size
+///    reconstructs the shape precisely.
+///
+/// A rotated shape whose tag predates the recorded size cannot be recovered, so
+/// its bounds come back unchanged: the old behaviour, rather than a different
+/// wrong answer.
+///
+/// Bounds are in capture-space pixels with a top-left origin, the space the app
+/// works in, and `page_width_pts` is what converts the tag's points into it.
+#[allow(clippy::too_many_arguments)]
+fn upright_shape_bounds(
+    rot: f32,
+    width_pts: f32,
+    box_w_pts: f32,
+    box_h_pts: f32,
+    capture_width: i32,
+    page_width_pts: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> (f32, f32, f32, f32) {
+    let per_pt = capture_width as f32 / page_width_pts;
+
+    if rot != 0.0 {
+        if box_w_pts <= 0.0 || box_h_pts <= 0.0 {
+            return (left, top, right, bottom);
+        }
+        let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
+        let (hw, hh) = (box_w_pts * per_pt / 2.0, box_h_pts * per_pt / 2.0);
+        return (cx - hw, cy - hh, cx + hw, cy + hh);
+    }
+
+    // Never inset past nothing: a hairline shape dragged very small would
+    // otherwise invert.
+    let pad = (width_pts / 2.0 + 1.0) * per_pt;
+    let max_inset = ((right - left).min(bottom - top) / 2.0 - 0.5).max(0.0);
+    let inset = pad.min(max_inset);
+    (left + inset, top + inset, right - inset, bottom - inset)
+}
+
+/// The upright extent of the shape a tag describes, given the rectangle it is
+/// reported at. See [`upright_shape_bounds`] for what is being undone.
+///
+/// Exposed because every path that REBUILDS a shape from its tag needs this and
+/// only the resize path had it: a pasted, duplicated or undeleted shape was
+/// built from its /Rect directly and came back larger, or at 90 degrees, lying
+/// the wrong way round. Pure geometry, so it takes the page width rather than a
+/// document handle.
+///
+/// The four out-parameters receive the recovered extent, in the same space.
+#[unsafe(no_mangle)]
+pub extern "C" fn shape_upright_bounds(
+    capture_width: i32,
+    page_width_pts: f32,
+    tag_utf8: *const u8,
+    tag_len: usize,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    out_left: *mut f32,
+    out_top: *mut f32,
+    out_right: *mut f32,
+    out_bottom: *mut f32,
+) -> i32 {
+    if capture_width <= 0 || !page_width_pts.is_finite() || page_width_pts <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if tag_utf8.is_null() || tag_len == 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if out_left.is_null() || out_top.is_null() || out_right.is_null() || out_bottom.is_null() {
+        return STATUS_INVALID_INPUT;
+    }
+    if !(right > left) || !(bottom > top) {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        let bytes = unsafe { std::slice::from_raw_parts(tag_utf8, tag_len) };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let Some(tag) = parse_shape_tag(text) else {
+            return STATUS_UNSUPPORTED;
+        };
+        let (_, _, _, _, _, width_pts, _, _, rot, _, _, box_w_pts, box_h_pts, _, _, _) = tag;
+
+        let (l, t, r, b) = upright_shape_bounds(
+            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_width_pts,
+            left, top, right, bottom,
+        );
+
+        unsafe {
+            *out_left = l;
+            *out_top = t;
+            *out_right = r;
+            *out_bottom = b;
+        }
+        STATUS_OK_PDFIUM
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn resize_shape_annotation_inner(
@@ -5310,43 +5427,11 @@ fn resize_shape_annotation_inner(
         cur_shadow_dx_pts, cur_shadow_dy_pts, cur_shadow_rgba,
     ) = tag;
 
-    // Undo the stroke pad when the caller's bounds came from the annotation's
-    // own /Rect. The writer inflates the extent by width/2 + 1 on every side so
-    // PDFium does not clip the stroke; feeding that back as the new extent
-    // inflates it again, which is the drift.
-    //
-    // Deliberately NOT applied to a rotated shape: its /Rect is the axis-aligned
-    // box of the TURNED content plus the pad, so insetting by the pad alone
-    // would be wrong in a different way. Leaving it padded keeps the existing
-    // behaviour for that case rather than replacing one error with another.
-    // A TURNED shape cannot be de-padded, because its /Rect is the axis-aligned
-    // box of the rotated content: bigger than the shape in both axes, and not
-    // invertible at 45 degrees. Its own upright size is recorded on the tag
-    // instead. The CENTRE of /Rect is exact whatever the angle, so centre plus
-    // recorded size reconstructs the shape precisely.
-    let rotated_box = if bounds_are_padded && rot != 0.0 && box_w_pts > 0.0 && box_h_pts > 0.0 {
-        let page_w = {
-            let _guard = lock(&CALL_LOCK);
-            let doc = lock(&core().documents).get(&doc_handle).cloned();
-            let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
-            let doc_guard = lock(&doc);
-            let Ok(page) = doc_guard.pages().get(page_index as u16) else {
-                return STATUS_INVALID_INPUT;
-            };
-            page.width().value
-        };
-        if page_w <= 0.0 { return STATUS_INVALID_INPUT; }
-        let per_pt = capture_width as f32 / page_w;
-        let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
-        let (hw, hh) = (box_w_pts * per_pt / 2.0, box_h_pts * per_pt / 2.0);
-        Some((cx - hw, cy - hh, cx + hw, cy + hh))
-    } else {
-        None
-    };
-
-    let (left, top, right, bottom) = if let Some(bx) = rotated_box {
-        bx
-    } else if bounds_are_padded && rot == 0.0 {
+    // The two things the writer added to /Rect come off here, and only when the
+    // caller's bounds actually came from /Rect. Shared with every other path
+    // that rebuilds a shape from its tag; see `upright_shape_bounds` for what
+    // is being undone and why a turned shape needs its recorded size.
+    let (left, top, right, bottom) = if bounds_are_padded {
         let page_w = {
             let _guard = lock(&CALL_LOCK);
             let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -5360,12 +5445,10 @@ fn resize_shape_annotation_inner(
         if page_w <= 0.0 {
             return STATUS_INVALID_INPUT;
         }
-        let pad_cap = (width_pts / 2.0 + 1.0) * capture_width as f32 / page_w;
-        // Never inset past nothing: a hairline shape dragged very small would
-        // otherwise invert.
-        let max_inset = ((right - left).min(bottom - top) / 2.0 - 0.5).max(0.0);
-        let inset = pad_cap.min(max_inset);
-        (left + inset, top + inset, right - inset, bottom - inset)
+        upright_shape_bounds(
+            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_w,
+            left, top, right, bottom,
+        )
     } else {
         (left, top, right, bottom)
     };
@@ -10784,6 +10867,122 @@ mod tests {
             (r as i32 - 191).abs() <= 2,
             "red came out {r}: 191 means STRAIGHT alpha, 255 would mean PREMULTIPLIED"
         );
+
+        close_document(handle);
+    }
+
+    fn page_size(handle: u64) -> (f32, f32) {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let doc_guard = lock(&doc);
+        let page = doc_guard.pages().get(0).unwrap();
+        (page.width().value, page.height().value)
+    }
+
+    /// A copy of a shape has to be the SAME SHAPE.
+    ///
+    /// Every path that rebuilds a shape from its tag (paste, ctrl+drag
+    /// duplicate, undoing a delete) starts from the rectangle PDFium reports,
+    /// and that rectangle is not the shape's extent: it carries the stroke pad,
+    /// and for a turned shape it is the axis-aligned box CONTAINING the rotated
+    /// content. Handed straight back as the extent it grows the shape, and the
+    /// growth compounds because each copy's rectangle feeds the next.
+    ///
+    /// Measured on a 60x40pt rectangle before this was fixed: +3%x+5% at 0
+    /// degrees, +36%x+46% at 30, +45%x+45% at 45, and at 90 the copy came back
+    /// 64.7x44.7 where the original was 42.6x62.6, a rectangle lying the wrong
+    /// way round rather than one merely too big.
+    ///
+    /// THREE rounds, not one. One round understates a defect that compounds,
+    /// and a fix that merely halved the error would still pass a single round.
+    #[test]
+    fn a_duplicated_shape_is_the_same_shape_at_every_angle() {
+        let handle = open_fixture();
+        let (page_w, page_h) = page_size(handle);
+        let cap = 1000i32;
+
+        for rot in [0.0f32, 30.0, 45.0, 90.0] {
+            let mut original = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+            original.rotation_deg = rot;
+            add_one(handle, original);
+
+            let (_, first) = annotation_shape(handle, 0).unwrap();
+            let want = (
+                first.right().value - first.left().value,
+                first.top().value - first.bottom().value,
+            );
+
+            for round in 1..=3usize {
+                // Copy the copy, so the rectangle that feeds each rebuild is
+                // the one the previous rebuild produced.
+                let source = round - 1;
+                let (_, bounds) = annotation_shape(handle, source).unwrap();
+                let tag = contents_of(handle, 0, source).unwrap();
+
+                // The app's space: /Rect normalized by the page WIDTH on both
+                // axes with a top-left origin, times the capture width.
+                let px = |v: f32| v * cap as f32 / page_w;
+                let (left, top, right, bottom) = (
+                    px(bounds.left().value),
+                    px(page_h - bounds.top().value),
+                    px(bounds.right().value),
+                    px(page_h - bounds.bottom().value),
+                );
+
+                let mut out = [0.0f32; 4];
+                assert_eq!(
+                    shape_upright_bounds(
+                        cap, page_w, tag.as_ptr(), tag.len(),
+                        left, top, right, bottom,
+                        &mut out[0], &mut out[1], &mut out[2], &mut out[3]),
+                    STATUS_OK_PDFIUM,
+                    "the tag was not understood at {rot} degrees",
+                );
+
+                let (
+                    kind, tr, tg, tb, ta, width_pts, fx, fy, tag_rot, fill_rgba,
+                    radius_pts, _, _, shadow_dx_pts, shadow_dy_pts, shadow_rgba,
+                ) = parse_shape_tag(&tag).unwrap();
+
+                // Points back to capture pixels, the conversion the tag's
+                // lengths always need. The drag-direction flags put the corners
+                // back the way round they were drawn.
+                let per_pt = cap as f32 / page_w;
+                let (x1, x2) = if fx { (out[0], out[2]) } else { (out[2], out[0]) };
+                let (y1, y2) = if fy { (out[1], out[3]) } else { (out[3], out[1]) };
+
+                add_one(handle, ShapeSpec {
+                    page_index: 0,
+                    kind,
+                    x1, y1, x2, y2,
+                    r: tr, g: tg, b: tb, a: ta,
+                    width_px: width_pts * per_pt,
+                    rotation_deg: tag_rot,
+                    fill_rgba,
+                    corner_radius_px: radius_pts * per_pt,
+                    shadow_dx_px: shadow_dx_pts * per_pt,
+                    shadow_dy_px: shadow_dy_pts * per_pt,
+                    shadow_rgba,
+                });
+
+                let (_, copy) = annotation_shape(handle, round).unwrap();
+                let got = (
+                    copy.right().value - copy.left().value,
+                    copy.top().value - copy.bottom().value,
+                );
+
+                assert!(
+                    (got.0 - want.0).abs() < 0.2 && (got.1 - want.1).abs() < 0.2,
+                    "at {rot} degrees, copy {round} measured {:.1}x{:.1} \
+                     but the original is {:.1}x{:.1}",
+                    got.0, got.1, want.0, want.1,
+                );
+            }
+
+            for i in (0..4).rev() {
+                delete_annotation(handle, 0, i);
+            }
+        }
 
         close_document(handle);
     }
