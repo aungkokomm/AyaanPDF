@@ -26,9 +26,14 @@ namespace PdfEditorApp.Viewport;
 /// is every shape written before effects existed and every one that has not
 /// been given one. It is the one field that decides whether there is a shadow
 /// at all, exactly as <paramref name="FillHex"/> decides whether there is a
-/// fill, so the offsets are only meaningful when it is non-null. The offsets
-/// are in POINTS like the other lengths here, and unlike them they may be
-/// NEGATIVE: a shadow cast up and to the left is an ordinary thing to want.
+/// fill, so the rest are only meaningful when it is non-null.
+///
+/// The shadow is described by ANGLE AND DISTANCE, not by an x/y offset, because
+/// an angle cannot be recovered from an offset of no length. The angle is where
+/// the LIGHT is, in degrees counter-clockwise from due east; the shadow falls
+/// the opposite way. <paramref name="ShadowSoftnessPts"/> and
+/// <paramref name="ShadowSpreadPts"/> are RESERVED: stored and round-tripped,
+/// and drawn by nothing. See <see cref="DropShadow"/> for why.
 ///
 /// <paramref name="BoxWidthPts"/> and <paramref name="BoxHeightPts"/> are the
 /// shape's own UPRIGHT size, in points, and are written only by a shape that is
@@ -51,15 +56,24 @@ public readonly record struct ShapeTag(
     double CornerRadiusPts,
     double BoxWidthPts = 0,
     double BoxHeightPts = 0,
-    double ShadowDxPts = 0,
-    double ShadowDyPts = 0,
+    double ShadowAngleDeg = 0,
+    double ShadowDistancePts = 0,
+    double ShadowSoftnessPts = 0,
+    double ShadowSpreadPts = 0,
     string? ShadowHex = null);
 
 /// <summary>
 /// Reads the tag a shape stores, the C# side of <c>parse_shape_tag</c> in
 /// render_core.
 ///
-/// Format: <c>AyaanShape:kind:RRGGBBAA:widthPts:fx:fy[:rot[:fillAARRGGBB[:radiusPts[:boxWPts:boxHPts[:shadowDxPts:shadowDyPts:shadowAARRGGBB]]]]]</c>
+/// Format: <c>AyaanShape:kind:RRGGBBAA:widthPts:fx:fy[:rot[:fillAARRGGBB[:radiusPts[:boxWPts:boxHPts[:s(a=,d=,b=,p=,c=)]]]]]</c>
+///
+/// The shadow is ONE self-describing field rather than several positional ones.
+/// Positional fields do not extend: a second effect would append more of them
+/// and force every shadowed shape to emit intermediate zeros to reach them.
+/// Named keys inside one token mean a later effect is another token, and a key
+/// this build has never heard of is skipped instead of shifting everything
+/// after it.
 ///
 /// The trailing fields were appended over time and are absent from older tags,
 /// so every one of them reads as its historic default rather than failing the
@@ -141,6 +155,8 @@ public static class ShapeTagReader
             return false;
         }
 
+        var shadow = ReadShadow(parts, 10);
+
         tag = new ShapeTag(
             Kind: (ShapeKind)kindNumber,
             StrokeHex: stroke,
@@ -152,13 +168,83 @@ public static class ShapeTagReader
             CornerRadiusPts: Math.Max(0, OptionalNumber(parts, 7)),
             BoxWidthPts: OptionalPositive(parts, 8),
             BoxHeightPts: OptionalPositive(parts, 9),
-            // Signed, so OptionalNumber rather than OptionalPositive: a shadow
-            // may be cast in any direction.
-            ShadowDxPts: OptionalNumber(parts, 10),
-            ShadowDyPts: OptionalNumber(parts, 11),
-            ShadowHex: OptionalFill(parts, 12));
+            ShadowAngleDeg: shadow.AngleDeg,
+            ShadowDistancePts: shadow.DistancePts,
+            ShadowSoftnessPts: shadow.SoftnessPts,
+            ShadowSpreadPts: shadow.SpreadPts,
+            ShadowHex: shadow.Hex);
         return true;
     }
+
+    /// <summary>
+    /// One shadow, as the tag spells it:
+    /// <c>s(a=135.00,d=6.0000,b=0.0000,p=0.0000,c=FF000000)</c>.
+    ///
+    /// Anything malformed yields NO shadow, which is the same answer as a shape
+    /// that never had one, and never a half-read one with invented values. The
+    /// C# half of <c>parse_shadow_field</c> in render_core.
+    /// </summary>
+    private static (double AngleDeg, double DistancePts, double SoftnessPts,
+                    double SpreadPts, string? Hex) ReadShadow(string[] parts, int at)
+    {
+        var none = (0.0, 0.0, 0.0, 0.0, (string?)null);
+        if (at >= parts.Length) { return none; }
+
+        string field = parts[at];
+        if (!field.StartsWith("s(", StringComparison.Ordinal)
+            || !field.EndsWith(")", StringComparison.Ordinal))
+        {
+            return none;
+        }
+
+        double angle = 0, distance = 0, softness = 0, spread = 0;
+        string? hex = null;
+
+        foreach (string pair in field[2..^1].Split(','))
+        {
+            int eq = pair.IndexOf('=');
+            if (eq <= 0) { return none; }
+
+            string key = pair[..eq];
+            string value = pair[(eq + 1)..];
+
+            switch (key)
+            {
+                case "a":
+                    if (!Number(value, out angle)) { return none; }
+                    break;
+                case "d":
+                    if (!NonNegative(value, out distance)) { return none; }
+                    break;
+                case "b":
+                    if (!NonNegative(value, out softness)) { return none; }
+                    break;
+                case "p":
+                    if (!NonNegative(value, out spread)) { return none; }
+                    break;
+                case "c":
+                    if (value.Length != 8 || !IsHex(value)) { return none; }
+                    hex = "#" + value;
+                    break;
+                // Forward compatibility: a key from a later build is not an error.
+                default:
+                    break;
+            }
+        }
+
+        // The colour is what says a shadow exists, the same bargain the fill
+        // makes, and one that paints nothing is not one.
+        if (hex is null || hex == "#00000000") { return none; }
+
+        return (angle, distance, softness, spread, hex);
+    }
+
+    private static bool Number(string text, out double value) =>
+        double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value)
+        && double.IsFinite(value);
+
+    private static bool NonNegative(string text, out double value) =>
+        Number(text, out value) && value >= 0;
 
     /// <summary>Stroke is stored RRGGBBAA; the app speaks "#AARRGGBB".</summary>
     private static string? StrokeHexFrom(string rgba)

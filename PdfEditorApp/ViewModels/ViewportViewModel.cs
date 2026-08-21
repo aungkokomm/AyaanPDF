@@ -2423,8 +2423,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // The shadow crosses in the same capture-pixel space as the
                 // rest of the shape, so the core needs no second scale. Absent
                 // effects leave all three zero, which the core reads as none.
-                ShadowDxPx = (float)((sh.Effects?.Shadow?.OffsetX ?? 0) * CaptureWidth),
-                ShadowDyPx = (float)((sh.Effects?.Shadow?.OffsetY ?? 0) * CaptureWidth),
+                ShadowAngleDeg = (float)(sh.Effects?.Shadow?.AngleDeg ?? 0),
+                ShadowDistancePx = (float)((sh.Effects?.Shadow?.Distance ?? 0) * CaptureWidth),
+                ShadowSoftnessPx = (float)((sh.Effects?.Shadow?.Softness ?? 0) * CaptureWidth),
+                ShadowSpreadPx = (float)((sh.Effects?.Shadow?.Spread ?? 0) * CaptureWidth),
                 ShadowRgba = ShapeEffectsTag.RgbaOf(sh.Effects),
             });
         }
@@ -7122,8 +7124,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RotationDeg = geometry.RotationDeg,
             FillRgba = style.FillRgba,
             CornerRadiusPx = geometry.CornerRadiusPx,
-            ShadowDxPx = style.ShadowDxPx,
-            ShadowDyPx = style.ShadowDyPx,
+            ShadowAngleDeg = style.ShadowAngleDeg,
+            ShadowDistancePx = style.ShadowDistancePx,
+            ShadowSoftnessPx = style.ShadowSoftnessPx,
+            ShadowSpreadPx = style.ShadowSpreadPx,
             ShadowRgba = style.ShadowRgba,
         };
 

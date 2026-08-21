@@ -47,8 +47,10 @@ public class ShapeInteropTests
         // wrong stride, so every element after the first arrives as garbage and
         // the core rejects the batch. That is exactly how this one announced
         // itself, in six batch tests at once.
-        public float ShadowDxPx;
-        public float ShadowDyPx;
+        public float ShadowAngleDeg;
+        public float ShadowDistancePx;
+        public float ShadowSoftnessPx;
+        public float ShadowSpreadPx;
         public uint ShadowRgba;
     }
 
@@ -156,7 +158,7 @@ public class ShapeInteropTests
         // fails LOUDLY when the native struct grows and a mirror does not, in
         // place of six batch tests failing obscurely because the array was
         // marshalled with the wrong stride.
-        Assert.Equal(56, Marshal.SizeOf<ShapeSpec>());
+        Assert.Equal(64, Marshal.SizeOf<ShapeSpec>());
     }
 
     [Fact]

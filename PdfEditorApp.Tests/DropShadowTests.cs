@@ -37,8 +37,24 @@ public class DropShadowTests
     private static PageTransform View(int rotation) =>
         PageTransform.For(Scale, ContentH, rotation, Scale);
 
+    /// <summary>
+    /// A shadow stated as the OFFSET these tests think in, converted into the
+    /// angle and distance the model stores.
+    ///
+    /// The model keeps where the light is and how far the shadow falls, because
+    /// an angle cannot be recovered from an offset of no length. These are
+    /// renderer tests and a renderer only ever sees the offset, so they say
+    /// which offset they expect and this turns it back. Every case below has a
+    /// real length, so the conversion loses nothing.
+    ///
+    /// The inverse of DropShadow.OffsetX/OffsetY: the shadow falls opposite the
+    /// light, and y runs down the page.
+    /// </summary>
     private static ShapeEffects Shadow(double dx, double dy, byte alpha = 0xFF) =>
-        new(new DropShadow(dx, dy, new RenderColor(alpha, 0, 0, 0)));
+        new(new DropShadow(
+            Math.Atan2(dy, -dx) * 180.0 / Math.PI,
+            Math.Sqrt((dx * dx) + (dy * dy)),
+            new RenderColor(alpha, 0, 0, 0)));
 
     private static ShapeRenderItem Mark(
         double l, double t, ShapeEffects? effects = null, int page = 0) =>

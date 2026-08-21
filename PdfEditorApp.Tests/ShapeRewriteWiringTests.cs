@@ -86,8 +86,10 @@ public class ShapeRewriteWiringTests
     [InlineData("G")]
     [InlineData("B")]
     [InlineData("FillRgba")]
-    [InlineData("ShadowDxPx")]
-    [InlineData("ShadowDyPx")]
+    [InlineData("ShadowAngleDeg")]
+    [InlineData("ShadowDistancePx")]
+    [InlineData("ShadowSoftnessPx")]
+    [InlineData("ShadowSpreadPx")]
     [InlineData("ShadowRgba")]
     public void every_field_the_reader_returns_is_copied_into_the_interop_struct(string field)
     {
@@ -121,6 +123,6 @@ public class ShapeRewriteWiringTests
                 return source[at..close].Count(c => c == ',') + 1;
             });
 
-        Assert.Equal(16, expected);
+        Assert.Equal(18, expected);
     }
 }

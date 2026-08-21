@@ -1,27 +1,69 @@
+using System;
+
 namespace PdfEditorApp.Viewport;
 
 /// <summary>
-/// A hard drop shadow: the same shape again, offset, in another colour, painted
-/// underneath.
+/// A drop shadow, described the way a person sets one rather than the way a
+/// renderer draws one.
 ///
-/// NO BLUR, and that is the whole definition rather than a stage on the way to
-/// one. A blurred shadow needs a mask filter, a blur radius in a space somebody
-/// has to choose, and a bleed that the dirty region and the culler would both
-/// have to learn about. This is the shadow that needs none of that: it is the
-/// item's own geometry, moved.
+/// ANGLE AND DISTANCE ARE THE SOURCE OF TRUTH, and the x/y offset is derived
+/// from them. Not the other way round: an angle cannot be recovered from an
+/// offset of zero length, so storing x/y would throw the direction away the
+/// moment somebody dragged the distance down to nothing and back.
 ///
-/// THE OFFSET IS NORMALIZED, like every other length in the model. A shadow in
-/// pixels would sit a different distance away on every page size and would slide
-/// as the view zoomed; normalized means the shadow belongs to the OBJECT and
-/// behaves like part of it. Rotating the page turns the shadow with the shape,
-/// zooming scales it, and none of that needs a line of code, because the offset
-/// is applied to the points before the existing projection ever sees them.
+/// <paramref name="AngleDeg"/> is where the LIGHT is, in degrees
+/// counter-clockwise from due east, so 90 is lit from directly above and the
+/// shadow falls straight down. The shadow always falls the opposite way, which
+/// is the convention every drawing tool uses and the one a person will expect.
 ///
-/// Opacity lives in the colour's alpha rather than in a field of its own. There
-/// is already exactly one way to say how solid something is in this model and
-/// adding a second would mean deciding which one wins.
+/// EVERY LENGTH IS NORMALIZED, like the rest of the model: a fraction of the
+/// page's width. A shadow in pixels would sit a different distance away on
+/// every page size and slide as the view zoomed. Normalized means the shadow
+/// belongs to the OBJECT, so rotating the page turns it with the shape and
+/// zooming scales it, none of which needs a line of code, because the derived
+/// offset is applied to the points before the existing projection sees them.
+///
+/// OPACITY IS THE COLOUR'S ALPHA. There is deliberately no separate opacity
+/// field: two ways to say how solid a shadow is would need a rule about which
+/// one wins, and the alpha is already what decides whether there is a shadow at
+/// all.
 /// </summary>
-public readonly record struct DropShadow(double OffsetX, double OffsetY, RenderColor Color);
+/// <param name="Softness">
+/// RESERVED. Stored, persisted and round-tripped, and DELIBERATELY NOT DRAWN by
+/// any renderer. Blurring is not a parameter here, it is a second rendering
+/// path: PDF has no blur primitive for a path object, so a soft shadow has to
+/// be rasterised, which is its own piece of work. Carrying the value now means
+/// a file written today keeps its softness when that lands rather than silently
+/// losing it. Anything that appeared to honour it before then would be an
+/// invention, so nothing does.
+/// </param>
+/// <param name="Spread">
+/// RESERVED on the same terms as <paramref name="Softness"/>: stored and
+/// round-tripped, never drawn. Spread needs path dilation, which neither PDFium
+/// nor lopdf offers, so it goes the same rasterised route.
+/// </param>
+public readonly record struct DropShadow(
+    double AngleDeg,
+    double Distance,
+    RenderColor Color,
+    double Softness = 0,
+    double Spread = 0)
+{
+    /// <summary>
+    /// How far the shadow sits from its shape horizontally, in normalized page
+    /// units. Derived, never stored.
+    /// </summary>
+    public double OffsetX => -Distance * Math.Cos(AngleDeg * Math.PI / 180.0);
+
+    /// <summary>
+    /// The vertical half, in SCREEN sense: positive is DOWN the page, which is
+    /// the direction normalized page-local units run. render_core's
+    /// <c>shadow_offset_pts</c> is the same derivation in PDF space, where y
+    /// runs the other way, and both are checked against the same table of
+    /// angles so one cannot be changed without the other failing.
+    /// </summary>
+    public double OffsetY => Distance * Math.Sin(AngleDeg * Math.PI / 180.0);
+}
 
 /// <summary>
 /// The visual effects on one mark, beyond its colour and its weight.
@@ -41,12 +83,12 @@ public readonly record struct DropShadow(double OffsetX, double OffsetY, RenderC
 /// exactly what they were before this type existed. That is what keeps the
 /// parity capture byte for byte identical.
 ///
-/// NOT PERSISTED. Shapes are stored as a tag in the PDF annotation's /Contents,
-/// written and parsed by hand in render_core, and nothing here is written to it.
-/// An effect therefore lives as long as the object is in memory and is gone
-/// after a save and reload. Persisting it means extending the tag format on both
-/// sides of the FFI, which is a change to the file contract and belongs in its
-/// own piece of work.
+/// PERSISTED, as one self-describing field on the shape's tag. See
+/// <see cref="ShapeEffectsTag"/> for the conversion and
+/// <see cref="ShapeTagReader"/> for the format. The field carries named keys
+/// rather than positions precisely so a second effect can be added without
+/// disturbing this one, and a key written by a later build is skipped rather
+/// than fatal.
 /// </summary>
 public sealed record ShapeEffects(DropShadow? Shadow = null)
 {

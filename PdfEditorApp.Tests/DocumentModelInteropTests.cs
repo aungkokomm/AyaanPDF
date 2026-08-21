@@ -45,8 +45,10 @@ public class DocumentModelInteropTests
         // wrong stride, so every element after the first arrives as garbage and
         // the core rejects the batch. That is exactly how this one announced
         // itself, in six batch tests at once.
-        public float ShadowDxPx;
-        public float ShadowDyPx;
+        public float ShadowAngleDeg;
+        public float ShadowDistancePx;
+        public float ShadowSoftnessPx;
+        public float ShadowSpreadPx;
         public uint ShadowRgba;
     }
 

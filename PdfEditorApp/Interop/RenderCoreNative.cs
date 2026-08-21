@@ -200,8 +200,13 @@ internal struct NativeShapeSpec
     /// there is something to draw. Same convention as <see cref="FillRgba"/>.
     /// APPENDED for the same additive-ABI reason as everything above.
     /// </summary>
-    public float ShadowDxPx;
-    public float ShadowDyPx;
+    public float ShadowAngleDeg;
+    public float ShadowDistancePx;
+    /// <summary>RESERVED: carried across the FFI and written to the tag, drawn
+    /// by nothing. PDF has no blur primitive for a path object.</summary>
+    public float ShadowSoftnessPx;
+    /// <summary>RESERVED on the same terms as <see cref="ShadowSoftnessPx"/>.</summary>
+    public float ShadowSpreadPx;
     public uint ShadowRgba;
 }
 

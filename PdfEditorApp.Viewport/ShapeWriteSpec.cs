@@ -38,8 +38,10 @@ public readonly record struct ShapeStyleSpec(
     byte G,
     byte B,
     uint FillRgba,
-    float ShadowDxPx,
-    float ShadowDyPx,
+    float ShadowAngleDeg,
+    float ShadowDistancePx,
+    float ShadowSoftnessPx,
+    float ShadowSpreadPx,
     uint ShadowRgba);
 
 /// <summary>Everything needed to write a shape rebuilt from its own tag.</summary>
@@ -148,8 +150,10 @@ public static class ShapeWriter
             new ShapeStyleSpec(
                 A: a, R: r, G: g, B: b,
                 FillRgba: RgbaOf(tag.FillHex),
-                ShadowDxPx: (float)tag.ShadowDxPts,
-                ShadowDyPx: (float)tag.ShadowDyPts,
+                ShadowAngleDeg: (float)tag.ShadowAngleDeg,
+                ShadowDistancePx: (float)tag.ShadowDistancePts,
+                ShadowSoftnessPx: (float)tag.ShadowSoftnessPts,
+                ShadowSpreadPx: (float)tag.ShadowSpreadPts,
                 ShadowRgba: RgbaOf(tag.ShadowHex)));
 
         return true;

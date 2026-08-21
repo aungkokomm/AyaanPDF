@@ -40,7 +40,7 @@ public class ShapeRewriteSpecTests
     /// <summary>The longest rung: rotation, fill, radius, box, then a shadow.</summary>
     private const string FullTag =
         "AyaanShape:0:3B82F6FF:2.5000:1:1:45.00:40FF0000:6.0000:100.0000:50.0000"
-        + ":12.0000:-8.0000:80112233";
+        + ":s(a=135.00,d=12.0000,b=3.0000,p=1.5000,c=80112233)";
 
     // ---------------- every field survives ----------------
 
@@ -90,9 +90,21 @@ public class ShapeRewriteSpecTests
         // Bug three of three, and the one this commit exists for.
         var style = Parse(FullTag).Style;
 
-        Assert.Equal(12f, style.ShadowDxPx);
-        Assert.Equal(-8f, style.ShadowDyPx);
+        Assert.Equal(135f, style.ShadowAngleDeg);
+        Assert.Equal(12f, style.ShadowDistancePx);
         Assert.Equal(0x80112233u, style.ShadowRgba);
+    }
+
+    [Fact]
+    public void the_reserved_shadow_fields_survive_a_rebuild()
+    {
+        // Softness and spread are drawn by nothing, which makes them exactly
+        // the kind of field a rebuild drops without anybody noticing until the
+        // renderer that uses them finally arrives.
+        var style = Parse(FullTag).Style;
+
+        Assert.Equal(3f, style.ShadowSoftnessPx);
+        Assert.Equal(1.5f, style.ShadowSpreadPx);
     }
 
     // ---------------- absence is not a shadow, and not a fill ----------------
@@ -103,8 +115,8 @@ public class ShapeRewriteSpecTests
         var style = Parse("AyaanShape:0:3B82F6FF:2.5000:1:1").Style;
 
         Assert.Equal(0u, style.ShadowRgba);
-        Assert.Equal(0f, style.ShadowDxPx);
-        Assert.Equal(0f, style.ShadowDyPx);
+        Assert.Equal(0f, style.ShadowDistancePx);
+        Assert.Equal(0f, style.ShadowAngleDeg);
     }
 
     [Fact]
@@ -157,7 +169,7 @@ public class ShapeRewriteSpecTests
 
         Assert.Equal(2.5f, spec.Geometry.StrokeWidthPx);
         Assert.Equal(6f, spec.Geometry.CornerRadiusPx);
-        Assert.Equal(12f, spec.Style.ShadowDxPx);
+        Assert.Equal(12f, spec.Style.ShadowDistancePx);
     }
 
     // ---------------- refusals ----------------

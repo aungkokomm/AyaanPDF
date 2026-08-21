@@ -69,9 +69,14 @@ public static class ShapeEffectsTag
         var (a, r, g, b) = InkPresets.ParseHex(tag.ShadowHex);
 
         return new ShapeEffects(new DropShadow(
-            tag.ShadowDxPts / pageWidthPts,
-            tag.ShadowDyPts / pageWidthPts,
-            new RenderColor(a, r, g, b)));
+            // The angle is not a length and needs no conversion; everything
+            // else does, because the tag speaks points and the model speaks
+            // fractions of the page's width.
+            tag.ShadowAngleDeg,
+            tag.ShadowDistancePts / pageWidthPts,
+            new RenderColor(a, r, g, b),
+            tag.ShadowSoftnessPts / pageWidthPts,
+            tag.ShadowSpreadPts / pageWidthPts));
     }
 
     /// <summary>
