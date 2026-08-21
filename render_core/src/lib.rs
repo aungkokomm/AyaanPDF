@@ -4362,6 +4362,25 @@ fn shape_tag(
 /// on one of our shape annotations, or None if it is not one of ours. Rotation
 /// is 0 and fill is 0 on older tags that predate those fields; the caller does
 /// not need to know which form the tag was in.
+/// A shadow as a CALLER supplies it, in capture-space pixels.
+///
+/// Distinct from [`TagShadow`], which is in POINTS, because the two are read
+/// from different places and mixing them silently scales a shadow by the page
+/// width. The same split `radius_override` already makes: a value off the tag
+/// needs converting, a value from the caller does not.
+///
+/// `rgba` of zero CLEARS the shadow, exactly as it does for the fill. There is
+/// no separate way to say "no shadow", because the colour has always been what
+/// decides whether there is one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowOverride {
+    angle_deg: f32,
+    distance_px: f32,
+    softness_px: f32,
+    spread_px: f32,
+    rgba: u32,
+}
+
 /// A shadow as the tag records it: in POINTS, angle-and-distance rather than an
 /// x/y offset, and with the two RESERVED lengths that are stored but not drawn.
 ///
@@ -5132,7 +5151,7 @@ pub extern "C" fn rotate_shape_annotation(
         // (None), so a rotate does not clear or change a filled shape.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, Some(degrees), None, None, out_new_index)
+            0, -1.0, Some(degrees), None, None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5157,7 +5176,8 @@ pub extern "C" fn restyle_shape_annotation(
     }
     panic::catch_unwind(|| {
         restyle_shape_annotation_inner_with_rotation(
-            doc_handle, page_index, index, capture_width, color_rgba, width_px, None, None, None, out_new_index)
+            doc_handle, page_index, index, capture_width, color_rgba, width_px,
+            None, None, None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5184,7 +5204,7 @@ pub extern "C" fn restyle_shape_fill_annotation(
         // colour, width and rotation. Only the fill changes.
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, None, Some(fill_rgba), None, out_new_index)
+            0, -1.0, None, Some(fill_rgba), None, None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5216,7 +5236,61 @@ pub extern "C" fn restyle_shape_radius_annotation(
     panic::catch_unwind(|| {
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, None, None, Some(radius_px), out_new_index)
+            0, -1.0, None, None, Some(radius_px), None, out_new_index)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Sets, changes or clears the DROP SHADOW on one of our shapes, without
+/// moving or otherwise restyling it.
+///
+/// The last of the shape's properties to become editable. Until this existed a
+/// shadow could only be given to a shape as it was drawn: the restyle path
+/// carried whatever the tag already held, so nothing could put one on a shape
+/// that had none, and nothing could take one away.
+///
+/// `rgba` of ZERO CLEARS the shadow, the same bargain the fill makes, and the
+/// other four values are then ignored. Lengths are in capture-space pixels,
+/// like `radius_px` and unlike the points the tag stores.
+///
+/// `softness_px` and `spread_px` are stored and round-tripped and drawn by
+/// nothing; see `ShapeSpec`. They are accepted here so a caller that sets them
+/// does not lose them, not because anything renders them yet.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn restyle_shape_shadow_annotation(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    capture_width: i32,
+    angle_deg: f32,
+    distance_px: f32,
+    softness_px: f32,
+    spread_px: f32,
+    rgba: u32,
+    out_new_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if !angle_deg.is_finite() {
+        return STATUS_INVALID_INPUT;
+    }
+    // Lengths, so negative is meaningless. The angle is not a length and may
+    // be any finite number, since a light can be anywhere and 450 degrees is
+    // simply 90.
+    for length in [distance_px, softness_px, spread_px] {
+        if !length.is_finite() || length < 0.0 {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    panic::catch_unwind(|| {
+        restyle_shape_annotation_inner_with_rotation(
+            doc_handle, page_index, index, capture_width,
+            0, -1.0, None, None, None,
+            Some(ShadowOverride { angle_deg, distance_px, softness_px, spread_px, rgba }),
+            out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5232,6 +5306,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     rotation_override: Option<f32>,
     fill_override: Option<u32>,
     radius_override: Option<f32>,
+    shadow_override: Option<ShadowOverride>,
     out_new_index: *mut i32,
 ) -> i32 {
     use pdfium_render::prelude::*;
@@ -5312,6 +5387,22 @@ fn restyle_shape_annotation_inner_with_rotation(
         return STATUS_INVALID_INPUT;
     }
 
+    // THE SHADOW, resolved once: the caller's when there is one, otherwise the
+    // tag's own converted out of points.
+    //
+    // The override replaces the tag's shadow WHOLE rather than merging field by
+    // field, because a caller with rgba 0 is clearing it and there is nothing
+    // sensible to merge a cleared shadow with. That also means a caller
+    // changing one value has to send the other four, which is what every other
+    // override here already expects.
+    let shadow = shadow_override.unwrap_or_else(|| ShadowOverride {
+        angle_deg: cur_shadow.map_or(0.0, |sh| sh.angle_deg),
+        distance_px: cur_shadow.map_or(0.0, |sh| sh.distance_pts * scale_cap_per_pt),
+        softness_px: cur_shadow.map_or(0.0, |sh| sh.softness_pts * scale_cap_per_pt),
+        spread_px: cur_shadow.map_or(0.0, |sh| sh.spread_pts * scale_cap_per_pt),
+        rgba: cur_shadow.map_or(0, |sh| sh.rgba),
+    });
+
     // Restore the drag-direction so an arrow keeps its head where it was.
     let (x1, x2) = if fx { (cap_left, cap_right) } else { (cap_right, cap_left) };
     let (y1, y2) = if fy { (cap_top, cap_bottom) } else { (cap_bottom, cap_top) };
@@ -5334,11 +5425,11 @@ fn restyle_shape_annotation_inner_with_rotation(
         // restyle rebuilds the whole shape from its tag, so anything not put
         // back here is DROPPED: changing a shape's colour would quietly take
         // its shadow away.
-        shadow_angle_deg: cur_shadow.map_or(0.0, |sh| sh.angle_deg),
-        shadow_distance_px: cur_shadow.map_or(0.0, |sh| sh.distance_pts * scale_cap_per_pt),
-        shadow_softness_px: cur_shadow.map_or(0.0, |sh| sh.softness_pts * scale_cap_per_pt),
-        shadow_spread_px: cur_shadow.map_or(0.0, |sh| sh.spread_pts * scale_cap_per_pt),
-        shadow_rgba: cur_shadow.map_or(0, |sh| sh.rgba),
+        shadow_angle_deg: shadow.angle_deg,
+        shadow_distance_px: shadow.distance_px,
+        shadow_softness_px: shadow.softness_px,
+        shadow_spread_px: shadow.spread_px,
+        shadow_rgba: shadow.rgba,
     };
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
     if status != STATUS_OK_PDFIUM { return status; }
@@ -11314,6 +11405,184 @@ mod tests {
 
         assert_eq!(sh.distance_pts, 0.0, "distance really is nothing");
         assert_eq!(sh.angle_deg, 217.5, "and the direction survived it anyway");
+    }
+
+    // ---------------- the shadow is editable on a shape already drawn ----------------
+
+    /// The fixture page is 200pt wide against a 1000px capture, so a capture
+    /// pixel is a fifth of a point and a point is five pixels.
+    const CAP_PER_PT: f32 = 5.0;
+
+    fn shadow_of(handle: u64, index: usize) -> Option<TagShadow> {
+        parse_shape_tag(&contents_of(handle, 0, index).unwrap())
+            .expect("the tag must still parse")
+            .13
+    }
+
+    /// Everything about a shape EXCEPT its shadow, for the tests that have to
+    /// prove a shadow edit disturbed nothing else.
+    fn style_of(handle: u64, index: usize) -> (i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32) {
+        let t = parse_shape_tag(&contents_of(handle, 0, index).unwrap()).unwrap();
+        (t.0, t.1, t.2, t.3, t.4, t.5, t.6, t.7, t.8, t.9, t.10)
+    }
+
+    #[test]
+    fn a_shape_drawn_without_a_shadow_can_be_given_one() {
+        // The case the restyle path could not reach at all: it carried whatever
+        // the tag already held, so a shape with no shadow could never acquire
+        // one after it was drawn, which is most of what anybody would want.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0));
+        assert!(shadow_of(handle, 0).is_none(), "it should start with none");
+
+        let mut new_index = -1;
+        assert_eq!(
+            restyle_shape_shadow_annotation(
+                handle, 0, 0, 1000, 135.0, 30.0, 10.0, 5.0, 0x80336699, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        let sh = shadow_of(handle, new_index as usize).expect("the shadow is missing");
+        assert_eq!(sh.angle_deg, 135.0, "angle");
+        assert_eq!(sh.distance_pts, 30.0 / CAP_PER_PT, "distance, in points");
+        assert_eq!(sh.softness_pts, 10.0 / CAP_PER_PT, "softness, in points");
+        assert_eq!(sh.spread_pts, 5.0 / CAP_PER_PT, "spread, in points");
+        assert_eq!(sh.rgba, 0x80336699, "colour");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_existing_shadow_can_be_changed() {
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        s.shadow_rgba = 0xFF000000;
+        s.shadow_angle_deg = 45.0;
+        s.shadow_distance_px = 10.0;
+        add_one(handle, s);
+
+        let mut new_index = -1;
+        assert_eq!(
+            restyle_shape_shadow_annotation(
+                handle, 0, 0, 1000, 270.0, 40.0, 0.0, 0.0, 0x40FF0000, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        let sh = shadow_of(handle, new_index as usize).expect("the shadow is missing");
+        assert_eq!(sh.angle_deg, 270.0, "the new angle, not the old one");
+        assert_eq!(sh.distance_pts, 40.0 / CAP_PER_PT, "the new distance");
+        assert_eq!(sh.rgba, 0x40FF0000, "the new colour");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_shadow_can_be_taken_away() {
+        // Zero colour clears it, the same bargain the fill makes. The tag must
+        // come back with NO shadow field at all rather than one that is merely
+        // invisible, or every shape that ever had a shadow would carry a
+        // longer tag forever.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        s.shadow_rgba = 0xFF000000;
+        s.shadow_angle_deg = 135.0;
+        s.shadow_distance_px = 20.0;
+        add_one(handle, s);
+        assert!(shadow_of(handle, 0).is_some(), "it should start with one");
+
+        let mut new_index = -1;
+        assert_eq!(
+            restyle_shape_shadow_annotation(
+                handle, 0, 0, 1000, 0.0, 0.0, 0.0, 0.0, 0, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        assert!(shadow_of(handle, new_index as usize).is_none(), "the shadow is still there");
+
+        let (objects, _) = annotation_shape(handle, new_index as usize).unwrap();
+        assert_eq!(objects, 1, "the shadow object is still being drawn");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn restyling_the_shadow_leaves_the_rotation_alone() {
+        // The trap this whole family of overrides exists to avoid: a restyle
+        // rebuilds the shape from its tag, so anything not put back is DROPPED.
+        // Rotation is the one a person notices instantly.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
+        s.rotation_deg = 30.0;
+        add_one(handle, s);
+
+        let mut new_index = -1;
+        assert_eq!(
+            restyle_shape_shadow_annotation(
+                handle, 0, 0, 1000, 135.0, 20.0, 0.0, 0.0, 0xFF000000, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        let t = parse_shape_tag(&contents_of(handle, 0, new_index as usize).unwrap()).unwrap();
+        assert!(
+            shadow_of(handle, new_index as usize).is_some(),
+            "the shadow never arrived, so this proves nothing about rotation");
+        assert_eq!(t.8, 30.0, "the shape was straightened by a shadow edit");
+        assert_eq!(t.11, 40.0, "the upright width was lost");
+        assert_eq!(t.12, 20.0, "the upright height was lost");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn restyling_the_shadow_leaves_every_other_property_alone() {
+        // Colour, width, kind, drag direction, fill and corner radius all at
+        // once, because a rebuild that forgets one of them forgets it silently.
+        let handle = open_fixture();
+        let mut s = shape(SHAPE_ROUNDED_RECT, 300.0, 200.0, 100.0, 100.0);
+        s.r = 0x11;
+        s.g = 0x22;
+        s.b = 0x33;
+        s.a = 0xDD;
+        s.width_px = 7.0;
+        s.fill_rgba = 0x40FF00FF;
+        s.corner_radius_px = 15.0;
+        add_one(handle, s);
+
+        let before = style_of(handle, 0);
+
+        let mut new_index = -1;
+        assert_eq!(
+            restyle_shape_shadow_annotation(
+                handle, 0, 0, 1000, 200.0, 25.0, 3.0, 0.0, 0xFF112233, &mut new_index),
+            STATUS_OK_PDFIUM);
+
+        assert_eq!(style_of(handle, new_index as usize), before, "a shadow edit changed something else");
+        assert!(shadow_of(handle, new_index as usize).is_some(), "and the shadow did not arrive");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_shadow_edit_refuses_a_length_that_is_not_one() {
+        // Negative or infinite lengths are rejected rather than clamped, so a
+        // caller's mistake does not become a plausible-looking shape.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0));
+
+        let mut new_index = -1;
+        for (angle, distance, softness, spread) in [
+            (f32::NAN, 10.0, 0.0, 0.0),
+            (0.0, -1.0, 0.0, 0.0),
+            (0.0, 10.0, -1.0, 0.0),
+            (0.0, 10.0, 0.0, f32::INFINITY),
+        ] {
+            assert_eq!(
+                restyle_shape_shadow_annotation(
+                    handle, 0, 0, 1000, angle, distance, softness, spread,
+                    0xFF000000, &mut new_index),
+                STATUS_INVALID_INPUT,
+                "wrongly accepted {angle} {distance} {softness} {spread}");
+        }
+
+        assert!(shadow_of(handle, 0).is_none(), "a refused edit still changed the shape");
+
+        close_document(handle);
     }
 
     // ---------------- reserved, and provably inert ----------------
