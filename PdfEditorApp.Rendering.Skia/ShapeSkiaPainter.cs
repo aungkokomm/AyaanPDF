@@ -171,6 +171,18 @@ public static class ShapeSkiaPainter
     /// the overwhelmingly common case, the pixels are identical either way, and
     /// this paint loop runs on every pointer move, so it is not worth an
     /// offscreen buffer per object per frame to reach the same answer.
+    ///
+    /// A SOFT shadow always takes the layer, however few marks it has, because
+    /// the blur is applied to the layer and there is nothing to blur without
+    /// one. Sigma is half the radius the model carries and rides the canvas
+    /// matrix, so a blur scales with the zoom and turns with the page without
+    /// any help here.
+    ///
+    /// THE LAYER IS BOUNDED. Left to itself Skia allocates one the size of the
+    /// surface, which costs the window's area on every frame and is exactly the
+    /// cost the dirty-region work removed. The bounds are the object's own,
+    /// blur reach included, from the same SlotBoundsOf the dirty region reads,
+    /// so the buffer follows the shadow rather than the viewport.
     /// </summary>
     private static void PaintObjectShadow(
         SKCanvas canvas,
@@ -182,13 +194,24 @@ public static class ShapeSkiaPainter
         Func<int, double> pageTop,
         Func<int, PageTransform> pageView)
     {
-        bool layered = to - from > 1;
+        bool soft = shadow.Softness > 0;
+        bool layered = to - from > 1 || soft;
         int saved = 0;
 
         if (layered)
         {
-            using var lift = new SKPaint { Color = new SKColor(0, 0, 0, shadow.Color.A) };
-            saved = canvas.SaveLayer(lift);
+            var view = pageView(items[from].PageIndex);
+            float sigma = (float)OverlayProjection.BlurSigmaOf(shadow, scale, view);
+
+            using var blur = soft ? SKImageFilter.CreateBlur(sigma, sigma) : null;
+            using var lift = new SKPaint
+            {
+                Color = new SKColor(0, 0, 0, shadow.Color.A),
+                ImageFilter = blur,
+            };
+
+            saved = canvas.SaveLayer(
+                LayerBounds(items, from, to, scale, pageTop, pageView), lift);
         }
 
         // Inside a layer the parts go down at full strength and the layer
@@ -205,6 +228,38 @@ public static class ShapeSkiaPainter
         {
             canvas.RestoreToCount(saved);
         }
+    }
+
+    /// <summary>
+    /// The rectangle a shadow can reach, in the canvas's own slot DIPs.
+    ///
+    /// The union of what the dirty region already computes per item, which
+    /// covers the mark, its offset shadow and the blur's reach past it. Read
+    /// from the same place so the buffer painted into and the region cleared
+    /// afterwards cannot disagree.
+    /// </summary>
+    private static SKRect LayerBounds(
+        IReadOnlyList<ShapeRenderItem> items,
+        int from,
+        int to,
+        double scale,
+        Func<int, double> pageTop,
+        Func<int, PageTransform> pageView)
+    {
+        double l = double.MaxValue, t = double.MaxValue;
+        double r = double.MinValue, b = double.MinValue;
+
+        for (int at = from; at < to; at++)
+        {
+            var item = items[at];
+            var (il, it, ir, ib) = OverlayProjection.SlotBoundsOf(
+                item, scale, pageTop(item.PageIndex), pageView(item.PageIndex));
+
+            l = Math.Min(l, il); t = Math.Min(t, it);
+            r = Math.Max(r, ir); b = Math.Max(b, ib);
+        }
+
+        return new SKRect((float)l, (float)t, (float)r, (float)b);
     }
 
     /// <summary>
