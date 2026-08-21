@@ -31,9 +31,10 @@ namespace PdfEditorApp.Viewport;
 /// The shadow is described by ANGLE AND DISTANCE, not by an x/y offset, because
 /// an angle cannot be recovered from an offset of no length. The angle is where
 /// the LIGHT is, in degrees counter-clockwise from due east; the shadow falls
-/// the opposite way. <paramref name="ShadowSoftnessPts"/> and
-/// <paramref name="ShadowSpreadPts"/> are RESERVED: stored and round-tripped,
-/// and drawn by nothing. See <see cref="DropShadow"/> for why.
+/// the opposite way. <paramref name="ShadowSoftnessPts"/> is the blur RADIUS:
+/// zero stays a vector path in the file, and anything above it is rasterised by
+/// Skia into the annotation. <paramref name="ShadowSpreadPts"/> is RESERVED,
+/// stored and round-tripped and drawn by nothing. See <see cref="DropShadow"/>.
 ///
 /// <paramref name="BoxWidthPts"/> and <paramref name="BoxHeightPts"/> are the
 /// shape's own UPRIGHT size, in points, and are written only by a shape that is

@@ -129,7 +129,12 @@ public static class ShadowRasterizer
     /// cut off.
     /// </summary>
     public static (double L, double T, double R, double B) BoundsOf(
-        IReadOnlyList<ShapeRenderItem> group, DropShadow shadow)
+        IReadOnlyList<ShapeRenderItem> group, DropShadow shadow) =>
+        BoundsOf(group, shadow.ToSpec());
+
+    /// <inheritdoc cref="BoundsOf(IReadOnlyList{ShapeRenderItem}, DropShadow)"/>
+    public static (double L, double T, double R, double B) BoundsOf(
+        IReadOnlyList<ShapeRenderItem> group, EffectSpec spec)
     {
         double l = double.MaxValue, t = double.MaxValue;
         double r = double.MinValue, b = double.MinValue;
@@ -153,12 +158,13 @@ public static class ShadowRasterizer
             return (0, 0, 0, 0);
         }
 
-        // Three sigma, and sigma is half the radius: the same reach
-        // OverlayProjection uses for the preview's layer and the dirty region.
-        double reach = pad + (shadow.Softness * OverlayProjection.BlurReachSigmas / 2);
+        // EffectSpec.Reach, which is the same number the preview's layer and
+        // the dirty region open by and the same one render_core reserves in the
+        // annotation, each in its own units.
+        double reach = pad + spec.Reach;
 
-        return (l + shadow.OffsetX - reach, t + shadow.OffsetY - reach,
-                r + shadow.OffsetX + reach, b + shadow.OffsetY + reach);
+        return (l + spec.OffsetX - reach, t + spec.OffsetY - reach,
+                r + spec.OffsetX + reach, b + spec.OffsetY + reach);
     }
 
     /// <summary>
@@ -168,15 +174,20 @@ public static class ShadowRasterizer
     /// into points, which is what the sampling rate is expressed in.
     /// </summary>
     public static ShadowRaster? Rasterize(
-        IReadOnlyList<ShapeRenderItem> group, DropShadow shadow, double pageWidthPts)
+        IReadOnlyList<ShapeRenderItem> group, DropShadow shadow, double pageWidthPts) =>
+        Rasterize(group, shadow.ToSpec(), pageWidthPts);
+
+    /// <inheritdoc cref="Rasterize(IReadOnlyList{ShapeRenderItem}, DropShadow, double)"/>
+    public static ShadowRaster? Rasterize(
+        IReadOnlyList<ShapeRenderItem> group, EffectSpec spec, double pageWidthPts)
     {
-        if (group.Count == 0 || shadow.Softness <= 0 || shadow.Color.A == 0
+        if (group.Count == 0 || spec.Blur <= 0 || spec.Color.A == 0
             || pageWidthPts <= 0)
         {
             return null;
         }
 
-        var box = BoundsOf(group, shadow);
+        var box = BoundsOf(group, spec);
         double wNorm = box.R - box.L;
         double hNorm = box.B - box.T;
         if (wNorm <= 0 || hNorm <= 0)
@@ -201,6 +212,16 @@ public static class ShadowRasterizer
         double scale = pageWidthPts;
         var view = PageTransform.For(scale, scale, 0, scale);
 
+        // THE SAME RECIPE THE PREVIEW USES, which is what makes the saved page
+        // and the screen the same picture rather than two renderings that
+        // happen to agree. Null is an effect this build cannot draw, and there
+        // is then nothing to put in the file.
+        using var filter = EffectRecipe.FilterFor(spec, scale, view);
+        if (filter is null)
+        {
+            return null;
+        }
+
         var bitmap = new SKBitmap(pxW, pxH, SKColorType.Bgra8888, SKAlphaType.Premul);
         using (var canvas = new SKCanvas(bitmap))
         {
@@ -208,12 +229,6 @@ public static class ShadowRasterizer
             canvas.Scale((float)(pxW / (wNorm * scale)), (float)(pxH / (hNorm * scale)));
             canvas.Translate((float)(-box.L * scale), (float)(-box.T * scale));
 
-            float dx = (float)(shadow.OffsetX * scale);
-            float dy = (float)(shadow.OffsetY * scale);
-            float sigma = (float)OverlayProjection.BlurSigmaOf(shadow, scale, view);
-            var color = new SKColor(shadow.Color.R, shadow.Color.G, shadow.Color.B, shadow.Color.A);
-
-            using var filter = SKImageFilter.CreateDropShadowOnly(dx, dy, sigma, sigma, color);
             using var paint = new SKPaint { ImageFilter = filter };
 
             canvas.SaveLayer(paint);

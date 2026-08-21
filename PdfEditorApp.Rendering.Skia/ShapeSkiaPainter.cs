@@ -121,7 +121,7 @@ public static class ShapeSkiaPainter
         return at;
     }
 
-    /// <summary>One object: its shadow once, underneath, then its marks in order.</summary>
+    /// <summary>One object: its effects once, underneath, then its marks in order.</summary>
     private static void PaintObject(
         SKCanvas canvas,
         IReadOnlyList<ShapeRenderItem> items,
@@ -133,9 +133,13 @@ public static class ShapeSkiaPainter
     {
         // The effects are the object's, so the first mark's are the object's.
         // Every mark of one object carries the same instance.
-        if (items[from].Effects?.Shadow is { } shadow)
+        //
+        // IN LIST ORDER, first at the bottom, each in its own layer, so a second
+        // effect composites over the first the way everything else the app
+        // paints does.
+        foreach (var spec in items[from].Effects?.Specs ?? Array.Empty<EffectSpec>())
         {
-            PaintObjectShadow(canvas, items, from, to, shadow, scale, pageTop, pageView);
+            PaintObjectEffect(canvas, items, from, to, spec, scale, pageTop, pageView);
         }
 
         for (int at = from; at < to; at++)
@@ -156,14 +160,14 @@ public static class ShapeSkiaPainter
     }
 
     /// <summary>
-    /// The object's shadow, produced by Skia from the object itself.
+    /// One of the object's effects, produced by Skia from the object itself.
     ///
-    /// ONE LAYER PER OBJECT, with a drop-shadow image filter on it. The object
-    /// is painted into the layer and what comes out is the shadow alone:
-    /// offset, blurred and coloured, with no shadow-shaped geometry built by
-    /// hand anywhere.
+    /// ONE LAYER PER EFFECT, with that effect's image filter on it. The object
+    /// is painted into the layer and what comes out is the effect alone, with
+    /// no effect-shaped geometry built by hand anywhere. Which filter is
+    /// <see cref="EffectRecipe"/>'s to decide; this is only where it is applied.
     ///
-    /// THE SHADOW IS DERIVED FROM THE OBJECT'S ALPHA, which is the whole reason
+    /// THE EFFECT IS DERIVED FROM THE OBJECT'S ALPHA, which is the whole reason
     /// to do it this way. A hollow rectangle casts a hollow shadow because its
     /// middle is transparent, and an arrow's two marks are unioned inside the
     /// layer before the filter runs, so they cast one shadow rather than two
@@ -171,52 +175,29 @@ public static class ShapeSkiaPainter
     /// cast a solid silhouette is gone: nothing has to decide, because the
     /// alpha already says.
     ///
-    /// CreateDropShadowOnly rather than CreateDropShadow: the object is painted
-    /// again afterwards through the ordinary path, so it keeps its own colours
-    /// and its own compositing, and the filter is left doing only the part that
-    /// is hard. Measured in the prototype at about forty per cent cheaper than
-    /// letting the filter draw the object too.
-    ///
     /// THE LAYER IS BOUNDED. Left to itself Skia allocates one the size of the
     /// surface, measured at 550 to 750ms a frame against 5 to 12 bounded. The
-    /// bounds are the object's own, blur reach included, from the same
-    /// SlotBoundsOf the dirty region reads, so the buffer follows the shadow
-    /// rather than the viewport.
+    /// bounds are the object's own, every effect's reach included, from the same
+    /// SlotBoundsOf the dirty region reads, so the buffer follows the ink rather
+    /// than the viewport.
     /// </summary>
-    private static void PaintObjectShadow(
+    private static void PaintObjectEffect(
         SKCanvas canvas,
         IReadOnlyList<ShapeRenderItem> items,
         int from,
         int to,
-        DropShadow shadow,
+        EffectSpec spec,
         double scale,
         Func<int, double> pageTop,
         Func<int, PageTransform> pageView)
     {
-        int page = items[from].PageIndex;
-        var view = pageView(page);
-        double top = pageTop(page);
+        using var filter = EffectRecipe.FilterFor(spec, scale, pageView(items[from].PageIndex));
+        if (filter is null)
+        {
+            // An effect this build cannot draw. The object still paints.
+            return;
+        }
 
-        // THE OFFSET IS PROJECTED, not scaled. It is a page-local vector, so on
-        // a turned page it has to go where the PAGE says down-and-right is, and
-        // the page's turn lives in this projection rather than in a canvas
-        // matrix. Measured as the difference between two projected points, so
-        // the zoom, the display scale and the turn all reach it through exactly
-        // the code every mark already goes through. Scaling the components
-        // instead left the shadow pointing the wrong way at 90, 180 and 270.
-        var origin = OverlayProjection.ToSlot((0, 0), scale, top, view);
-        var thrown = OverlayProjection.ToSlot((shadow.OffsetX, shadow.OffsetY), scale, top, view);
-
-        float dx = (float)(thrown.X - origin.X);
-        float dy = (float)(thrown.Y - origin.Y);
-
-        // Sigma is a length and has no direction, so it takes the ordinary
-        // rule. It rides the canvas matrix, so the blur scales with the zoom.
-        float sigma = (float)OverlayProjection.BlurSigmaOf(shadow, scale, view);
-
-        var color = new SKColor(shadow.Color.R, shadow.Color.G, shadow.Color.B, shadow.Color.A);
-
-        using var filter = SKImageFilter.CreateDropShadowOnly(dx, dy, sigma, sigma, color);
         using var lift = new SKPaint { ImageFilter = filter };
 
         int saved = canvas.SaveLayer(
@@ -224,7 +205,7 @@ public static class ShapeSkiaPainter
 
         for (int at = from; at < to; at++)
         {
-            // Effects dropped, so the shadow cannot cast one of its own, and
+            // Effects dropped, so the effect cannot cast one of its own, and
             // the marks go down exactly as they normally would: the filter
             // reads their alpha and nothing else about them matters.
             var item = items[at] with { Effects = null };

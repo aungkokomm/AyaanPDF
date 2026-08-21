@@ -74,7 +74,7 @@ public static class OverlayProjection
     public const double BlurReachSigmas = 3.0;
 
     /// <summary>
-    /// The Gaussian sigma a shadow blurs at, in slot DIPs.
+    /// The Gaussian sigma an effect blurs at, in slot DIPs.
     ///
     /// Softness is the RADIUS a person sets and sigma is half of it, which is
     /// the relation every drawing tool uses and the one that makes a stated
@@ -86,19 +86,27 @@ public static class OverlayProjection
     /// turned page with no further help. Measured: sigma 8 bleeds 19 device
     /// pixels at zoom 1 and 39 at zoom 2.
     /// </summary>
+    public static double BlurSigmaOf(EffectSpec spec, double scale, PageTransform view) =>
+        ToSlotThickness(spec.Blur, scale, view) / 2;
+
+    /// <summary>The same, for a shadow named rather than listed.</summary>
     public static double BlurSigmaOf(DropShadow shadow, double scale, PageTransform view) =>
-        ToSlotThickness(shadow.Softness, scale, view) / 2;
+        BlurSigmaOf(shadow.ToSpec(), scale, view);
 
     /// <summary>
-    /// How far a soft shadow's ink escapes its own silhouette, in slot DIPs,
-    /// and zero for a hard one.
+    /// How far one effect's ink escapes its own silhouette, in slot DIPs, and
+    /// zero for an unblurred one.
     ///
-    /// The single definition, read by the painter's layer bounds and by
-    /// <see cref="SlotBoundsOf"/>, because the box that is cleared and the box
-    /// that is painted must be the same box.
+    /// <see cref="EffectSpec.Reach"/> in slot units, because the box that is
+    /// cleared, the box that is painted and the box the committed picture is
+    /// cropped to must all be the same box measured in three spaces.
     /// </summary>
+    public static double BlurReachOf(EffectSpec spec, double scale, PageTransform view) =>
+        ToSlotThickness(spec.Reach, scale, view);
+
+    /// <summary>The same, for a shadow named rather than listed.</summary>
     public static double BlurReachOf(DropShadow shadow, double scale, PageTransform view) =>
-        BlurSigmaOf(shadow, scale, view) * BlurReachSigmas;
+        BlurReachOf(shadow.ToSpec(), scale, view);
 
     /// <summary>
     /// One item's extent in slot DIPs: the box its points span, opened out by
@@ -145,12 +153,12 @@ public static class OverlayProjection
         // box: the offset is normalized and page-local, so a turned page sends
         // it somewhere a slot-space addition would not. Running it through the
         // same ToSlot is what makes rotation cost nothing to support.
-        if (item.Effects?.Shadow is { } shadow)
+        foreach (var spec in item.Effects?.Specs ?? System.Array.Empty<EffectSpec>())
         {
             foreach (var (px, py) in item.Points)
             {
                 var (x, y) = ToSlot(
-                    (px + shadow.OffsetX, py + shadow.OffsetY), scale, pageTop, view);
+                    (px + spec.OffsetX, py + spec.OffsetY), scale, pageTop, view);
                 l = System.Math.Min(l, x);
                 t = System.Math.Min(t, y);
                 r = System.Math.Max(r, x);
@@ -166,9 +174,9 @@ public static class OverlayProjection
         // all four directions, and the couple of DIPs this over-reserves on the
         // side away from the shadow are worth less than a second rule about
         // which sides are which.
-        if (item.Effects?.Shadow is { } soft)
+        if (item.Effects is { } effects)
         {
-            reach += BlurReachOf(soft, scale, view);
+            reach += ToSlotThickness(effects.Reach, scale, view);
         }
 
         return (l - reach, t - reach, r + reach, b + reach);

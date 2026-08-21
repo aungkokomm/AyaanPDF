@@ -1,46 +1,34 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace PdfEditorApp.Viewport;
 
 /// <summary>
-/// A drop shadow, described the way a person sets one rather than the way a
-/// renderer draws one.
+/// A drop shadow, named the way a person sets one.
 ///
-/// ANGLE AND DISTANCE ARE THE SOURCE OF TRUTH, and the x/y offset is derived
-/// from them. Not the other way round: an angle cannot be recovered from an
-/// offset of zero length, so storing x/y would throw the direction away the
-/// moment somebody dragged the distance down to nothing and back.
+/// A VIEW over an <see cref="EffectSpec"/> of kind
+/// <see cref="EffectKind.DropShadow"/>, not a thing of its own. The renderers
+/// stopped reading this: they walk the list and hand each spec to the recipe.
+/// It is kept because the shadow's own UI, its tag conversion and its FFI call
+/// are all shadow-shaped and have no reason not to be, and because naming the
+/// four numbers a shadow uses is worth more at those edges than a spec's
+/// generality is.
 ///
-/// <paramref name="AngleDeg"/> is where the LIGHT is, in degrees
-/// counter-clockwise from due east, so 90 is lit from directly above and the
-/// shadow falls straight down. The shadow always falls the opposite way, which
-/// is the convention every drawing tool uses and the one a person will expect.
-///
-/// EVERY LENGTH IS NORMALIZED, like the rest of the model: a fraction of the
-/// page's width. A shadow in pixels would sit a different distance away on
-/// every page size and slide as the view zoomed. Normalized means the shadow
-/// belongs to the OBJECT, so rotating the page turns it with the shape and
-/// zooming scales it, none of which needs a line of code, because the derived
-/// offset is applied to the points before the existing projection sees them.
-///
-/// OPACITY IS THE COLOUR'S ALPHA. There is deliberately no separate opacity
-/// field: two ways to say how solid a shadow is would need a rule about which
-/// one wins, and the alpha is already what decides whether there is a shadow at
-/// all.
+/// See <see cref="EffectSpec"/> for what each number means. Nothing is repeated
+/// here, because a second copy of the explanation is a second thing to keep
+/// true.
 /// </summary>
 /// <param name="Softness">
-/// RESERVED. Stored, persisted and round-tripped, and DELIBERATELY NOT DRAWN by
-/// any renderer. Blurring is not a parameter here, it is a second rendering
-/// path: PDF has no blur primitive for a path object, so a soft shadow has to
-/// be rasterised, which is its own piece of work. Carrying the value now means
-/// a file written today keeps its softness when that lands rather than silently
-/// losing it. Anything that appeared to honour it before then would be an
-/// invention, so nothing does.
+/// The blur RADIUS. Zero is a hard shadow, which stays a vector path in the
+/// file and is crisp at any zoom; anything above it is rasterised by Skia and
+/// carried in the annotation as a picture, because PDF has no blur for a path.
 /// </param>
 /// <param name="Spread">
-/// RESERVED on the same terms as <paramref name="Softness"/>: stored and
-/// round-tripped, never drawn. Spread needs path dilation, which neither PDFium
-/// nor lopdf offers, so it goes the same rasterised route.
+/// RESERVED. Stored, persisted and round-tripped, and drawn by nothing. Spread
+/// needs the silhouette dilated before the blur runs, which is a filter Skia
+/// has and this pipeline does not use yet. Carrying it now means a file written
+/// today keeps the value when that lands rather than silently losing it.
 /// </param>
 public readonly record struct DropShadow(
     double AngleDeg,
@@ -49,53 +37,141 @@ public readonly record struct DropShadow(
     double Softness = 0,
     double Spread = 0)
 {
-    /// <summary>
-    /// How far the shadow sits from its shape horizontally, in normalized page
-    /// units. Derived, never stored.
-    /// </summary>
-    public double OffsetX => -Distance * Math.Cos(AngleDeg * Math.PI / 180.0);
+    /// <summary>This shadow as the generic pipeline carries it.</summary>
+    public EffectSpec ToSpec() => new(
+        EffectKind.DropShadow, Color,
+        Blur: Softness, Distance: Distance, AngleDeg: AngleDeg, Amount: Spread);
+
+    /// <summary>The inverse, for reading one back out of a list.</summary>
+    public static DropShadow FromSpec(EffectSpec spec) => new(
+        spec.AngleDeg, spec.Distance, spec.Color, spec.Blur, spec.Amount);
 
     /// <summary>
-    /// The vertical half, in SCREEN sense: positive is DOWN the page, which is
-    /// the direction normalized page-local units run. render_core's
-    /// <c>shadow_offset_pts</c> is the same derivation in PDF space, where y
-    /// runs the other way, and both are checked against the same table of
-    /// angles so one cannot be changed without the other failing.
+    /// How far the shadow sits from its shape, in normalized page units.
+    /// Derived by <see cref="EffectSpec"/>, so a shadow cannot be thrown one
+    /// way by the preview and the other way by anything reading the list.
     /// </summary>
-    public double OffsetY => Distance * Math.Sin(AngleDeg * Math.PI / 180.0);
+    public double OffsetX => ToSpec().OffsetX;
+
+    /// <inheritdoc cref="OffsetX"/>
+    public double OffsetY => ToSpec().OffsetY;
 }
 
 /// <summary>
 /// The visual effects on one mark, beyond its colour and its weight.
 ///
-/// A record with a slot per effect, and one slot so far. That is the extension
-/// point: a glow or an outer stroke becomes another nullable property here, read
-/// by the painter next to this one, and every existing call site keeps compiling
-/// because it never mentioned effects in the first place.
+/// AN ORDERED LIST, walked in order, first at the bottom. It used to be a slot
+/// per effect, and that is what made the second effect expensive: a glow meant a
+/// property here, a branch in the painter, a branch in the bounds, a field pair
+/// in the core's spec struct, an element in the tag's tuple and an override
+/// entry point of its own, for something that is a drop shadow with the offset
+/// set to nothing.
 ///
-/// Deliberately NOT a list of an IEffect interface. The paint loop runs on every
-/// pointer move and a list means an allocation and a virtual call per mark to
-/// express something that is a fixed, small, known set. Named slots also let the
-/// bounds calculation ask "is there a shadow" without walking anything.
+/// The argument against a list was an allocation and a virtual call per mark.
+/// That was an argument against a list of an IEffect INTERFACE, and it does not
+/// reach this: the specs are structs in an array held by the object, walked once
+/// per object rather than once per mark, and the object's paint is measured in
+/// milliseconds against which a walk of two or three entries does not register.
 ///
 /// NULL IS THE DEFAULT AND NULL COSTS NOTHING. A mark with no effects carries a
 /// null reference, every renderer skips it in one branch, and the pixels are
-/// exactly what they were before this type existed. That is what keeps the
-/// parity capture byte for byte identical.
+/// exactly what they were before this type existed.
 ///
-/// PERSISTED, as one self-describing field on the shape's tag. See
+/// PERSISTED, as self-describing fields on the shape's tag. See
 /// <see cref="ShapeEffectsTag"/> for the conversion and
-/// <see cref="ShapeTagReader"/> for the format. The field carries named keys
-/// rather than positions precisely so a second effect can be added without
-/// disturbing this one, and a key written by a later build is skipped rather
-/// than fatal.
+/// <see cref="ShapeTagReader"/> for the format.
 /// </summary>
-public sealed record ShapeEffects(DropShadow? Shadow = null)
+public sealed record ShapeEffects
 {
+    private readonly EffectSpec[] _specs;
+
+    /// <summary>The effects on this mark, bottom first. Empty for none.</summary>
+    public ShapeEffects(params EffectSpec[] specs) =>
+        _specs = specs ?? Array.Empty<EffectSpec>();
+
     /// <summary>
-    /// Whether this is worth carrying at all. An effects object with every slot
-    /// empty paints exactly like no effects object, so the bounds and the
-    /// painter can both take the cheap path.
+    /// One drop shadow, or none. The shape every existing caller uses, kept so
+    /// that going through the list is a change to the renderers and not to
+    /// everything that ever set a shadow.
     /// </summary>
-    public bool IsEmpty => Shadow is null;
+    public ShapeEffects(DropShadow? shadow)
+        : this(shadow is { } s ? new[] { s.ToSpec() } : Array.Empty<EffectSpec>())
+    {
+    }
+
+    /// <summary>What is drawn, in order, underneath the object.</summary>
+    public IReadOnlyList<EffectSpec> Specs => _specs;
+
+    /// <summary>
+    /// Whether this is worth carrying at all. An empty list paints exactly like
+    /// no effects at all, so the bounds and the painter can both take the cheap
+    /// path.
+    /// </summary>
+    public bool IsEmpty => _specs.Length == 0;
+
+    /// <summary>
+    /// The first drop shadow in the list, named, or null for none.
+    ///
+    /// READ OUT OF THE LIST rather than stored beside it. Two places recording
+    /// the same shadow is how the preview and the file come to disagree, and a
+    /// derived view cannot drift from what the renderers actually draw.
+    /// </summary>
+    public DropShadow? Shadow
+    {
+        get
+        {
+            foreach (var spec in _specs)
+            {
+                if (spec.Kind == EffectKind.DropShadow)
+                {
+                    return DropShadow.FromSpec(spec);
+                }
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// How far the widest of these effects reaches past the silhouette, in
+    /// normalized page units.
+    ///
+    /// THE WIDEST, NOT THE SUM. They are all drawn from the same silhouette into
+    /// the same box, so a second effect does not push the first one further out.
+    /// Adding them up would grow the room reserved on every edit, which is a bug
+    /// this pipeline has already had once.
+    /// </summary>
+    public double Reach
+    {
+        get
+        {
+            double reach = 0;
+            foreach (var spec in _specs)
+            {
+                reach = Math.Max(reach, spec.Reach);
+            }
+
+            return reach;
+        }
+    }
+
+    /// <summary>
+    /// Value equality over the specs. Spelled out because the array field the
+    /// record would otherwise compare by reference makes two identical sets of
+    /// effects unequal, which is not what any caller of a record means.
+    /// </summary>
+    public bool Equals(ShapeEffects? other) =>
+        other is not null && _specs.AsSpan().SequenceEqual(other._specs);
+
+    /// <inheritdoc/>
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        foreach (var spec in _specs)
+        {
+            hash.Add(spec);
+        }
+
+        return hash.ToHashCode();
+    }
 }
