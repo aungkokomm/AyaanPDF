@@ -2405,6 +2405,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // lands in the file comes from the same description the user drew
         // rather than from a flattened list of points.
         var shapes = new List<NativeShapeSpec>();
+        var shapeEffects = new List<string?>();
         foreach (var sh in _allShapes)
         {
             var (r, g, b, a) = ParseHex(sh.ColorHex, defaultAlpha: 0xFF);
@@ -2421,15 +2422,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // From the DRAFT, the single definition the live preview also
                 // draws with. Zero for every other kind, which ignores it.
                 CornerRadiusPx = (float)(sh.Draft.CornerRadius * CaptureWidth),
-                // The shadow crosses in the same capture-pixel space as the
-                // rest of the shape, so the core needs no second scale. Absent
-                // effects leave all three zero, which the core reads as none.
-                ShadowAngleDeg = (float)(sh.Effects?.Shadow?.AngleDeg ?? 0),
-                ShadowDistancePx = (float)((sh.Effects?.Shadow?.Distance ?? 0) * CaptureWidth),
-                ShadowSoftnessPx = (float)((sh.Effects?.Shadow?.Softness ?? 0) * CaptureWidth),
-                ShadowSpreadPx = (float)((sh.Effects?.Shadow?.Spread ?? 0) * CaptureWidth),
-                ShadowRgba = ShapeEffectsTag.RgbaOf(sh.Effects),
             });
+
+            // The effects cross as TEXT, in the same capture-pixel space as the
+            // rest of the shape, so the core needs no second scale and no
+            // knowledge of which effects exist. An empty string is none.
+            shapeEffects.Add(ShapeEffectsTag.TextOf(sh.Effects, CaptureWidth));
         }
 
         if (specs.Count == 0 && strokes.Count == 0 && shapes.Count == 0)
@@ -2451,8 +2449,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (shapes.Count > 0)
         {
-            int status = RenderCoreNative.add_shape_annotations(
-                _documentHandle, CaptureWidth, shapes.ToArray(), (nuint)shapes.Count);
+            int status = NativeShapes.Add(
+                _documentHandle, CaptureWidth, shapes.ToArray(), shapeEffects.ToArray());
             ok &= status == RenderStatus.OkPdfium;
             Diag.Log($"save: {shapes.Count} shape annotations -> {status}");
         }
@@ -4905,19 +4903,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         const int CaptureWidth = 1000;
 
-        // Normalized lengths become capture pixels, which is the space every
-        // override speaks; the angle is not a length and crosses untouched.
-        float angle = (float)(shadow?.AngleDeg ?? 0);
-        float distance = (float)((shadow?.Distance ?? 0) * CaptureWidth);
-        float softness = (float)((shadow?.Softness ?? 0) * CaptureWidth);
-        float spread = (float)((shadow?.Spread ?? 0) * CaptureWidth);
-        uint rgba = shadow is { } s ? ShapeEffectsTag.RgbaOf(new ShapeEffects(s)) : 0;
+        // THE WHOLE EFFECTS LIST, as text, because the core replaces the lot
+        // rather than merging: a shape with a shadow and something else would
+        // lose the something else if only the shadow were sent. Normalized
+        // lengths become capture pixels on the way, which is the space every
+        // override speaks.
+        string text = ShapeEffectsTag.TextOf(
+            shadow is { } s ? new ShapeEffects(s) : null, CaptureWidth);
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
 
         PushHistory(HistoryScope.Document, shadow is null ? "Remove shadow" : "Drop shadow");
 
-        int status = RenderCoreNative.restyle_shape_shadow_annotation(
+        int status = RenderCoreNative.restyle_shape_effects_annotation(
             _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
-            angle, distance, softness, spread, rgba, out int newIndex);
+            utf8, (nuint)utf8.Length, out int newIndex);
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -6465,9 +6464,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             if (e.Contents.StartsWith("AyaanShape:", StringComparison.Ordinal))
             {
                 if (!ShapeSpecFromTag(e.Contents, pasted, CaptureWidth, pastePageWidthPts,
-                                      out var spec)) { continue; }
-                if (RenderCoreNative.add_shape_annotations(
-                        _documentHandle, CaptureWidth, new[] { spec }, 1)
+                                      out var spec, out string effects)) { continue; }
+                if (Interop.NativeShapes.Add(_documentHandle, CaptureWidth, spec, effects)
                     == RenderStatus.OkPdfium) { emitted++; }
             }
             else if (InkTag.TryParse(e.Contents, out string inkColor, out double inkWidth,
@@ -7099,12 +7097,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // Rebuild the ShapeSpec from the tag and add a second copy at the SAME
             // bounds. The subsequent drag will slide it off the original.
             if (!ShapeSpecFromTag(contents, sel, CaptureWidth,
-                                  PagePointsFor(sel.PageIndex).W, out var spec))
+                                  PagePointsFor(sel.PageIndex).W, out var spec,
+                                  out string effects))
             {
                 return false;
             }
-            status = RenderCoreNative.add_shape_annotations(
-                _documentHandle, CaptureWidth, new[] { spec }, 1);
+            status = Interop.NativeShapes.Add(
+                _documentHandle, CaptureWidth, spec, effects);
             if (status != RenderStatus.OkPdfium) { return false; }
             newIndex = LoadedFor(sel.PageIndex).Count; // will resolve after invalidate
         }
@@ -7208,9 +7207,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// What is left here is the copy into the interop struct and nothing else.
     /// </summary>
     private static bool ShapeSpecFromTag(string contents, LoadedSelection sel,
-        int captureWidth, double pageWidthPts, out Interop.NativeShapeSpec spec)
+        int captureWidth, double pageWidthPts, out Interop.NativeShapeSpec spec,
+        out string effects)
     {
         spec = default;
+        effects = string.Empty;
 
         // The selection's rectangle is the annotation's /Rect, which is not the
         // shape's extent. Recovering the extent is the core's job because the
@@ -7240,12 +7241,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RotationDeg = geometry.RotationDeg,
             FillRgba = style.FillRgba,
             CornerRadiusPx = geometry.CornerRadiusPx,
-            ShadowAngleDeg = style.ShadowAngleDeg,
-            ShadowDistancePx = style.ShadowDistancePx,
-            ShadowSoftnessPx = style.ShadowSoftnessPx,
-            ShadowSpreadPx = style.ShadowSpreadPx,
-            ShadowRgba = style.ShadowRgba,
         };
+
+        // Verbatim off the tag, so a duplicate keeps every effect the original
+        // had, including one this build cannot name.
+        effects = style.Effects;
 
         return true;
     }
@@ -10092,9 +10092,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (tag.StartsWith("AyaanShape:", StringComparison.Ordinal))
         {
             var target = new LoadedSelection(page, -1, rect.Left, rect.Top, rect.Right, rect.Bottom, id);
-            if (ShapeSpecFromTag(tag, target, Cap, PagePointsFor(page).W, out var spec))
+            if (ShapeSpecFromTag(tag, target, Cap, PagePointsFor(page).W, out var spec,
+                                 out string effects))
             {
-                made = RenderCoreNative.add_shape_annotations(_documentHandle, Cap, new[] { spec }, 1)
+                made = Interop.NativeShapes.Add(_documentHandle, Cap, spec, effects)
                        == RenderStatus.OkPdfium;
             }
         }

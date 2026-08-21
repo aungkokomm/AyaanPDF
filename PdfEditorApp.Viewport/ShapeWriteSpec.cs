@@ -38,11 +38,40 @@ public readonly record struct ShapeStyleSpec(
     byte G,
     byte B,
     uint FillRgba,
-    float ShadowAngleDeg,
-    float ShadowDistancePx,
-    float ShadowSoftnessPx,
-    float ShadowSpreadPx,
-    uint ShadowRgba);
+    string Effects)
+{
+    /// <summary>
+    /// The drop shadow inside <see cref="Effects"/>, named.
+    ///
+    /// DERIVED, not stored beside the text. The effects cross to the core as
+    /// one string precisely so that nothing between the tag and the file has to
+    /// know which effects exist; these four are here because the shadow is the
+    /// one effect with a UI, and because two places recording the same shadow
+    /// is how a rebuild comes to disagree with the tag it was rebuilt from.
+    ///
+    /// Points are used as pixels, exactly as the stroke width is; see
+    /// <see cref="ShapeWriter.TryForExistingShape"/>.
+    /// </summary>
+    public float ShadowAngleDeg => (float)ShapeTagReader.ShadowIn(Effects).AngleDeg;
+
+    /// <inheritdoc cref="ShadowAngleDeg"/>
+    public float ShadowDistancePx => (float)ShapeTagReader.ShadowIn(Effects).DistancePts;
+
+    /// <inheritdoc cref="ShadowAngleDeg"/>
+    public float ShadowSoftnessPx => (float)ShapeTagReader.ShadowIn(Effects).SoftnessPts;
+
+    /// <inheritdoc cref="ShadowAngleDeg"/>
+    public float ShadowSpreadPx => (float)ShapeTagReader.ShadowIn(Effects).SpreadPts;
+
+    /// <inheritdoc cref="ShadowAngleDeg"/>
+    public uint ShadowRgba => RgbaOf(ShapeTagReader.ShadowIn(Effects).Hex);
+
+    /// <summary>
+    /// An "#AARRGGBB" string as the 0xAARRGGBB the core takes, or 0 for absent.
+    /// </summary>
+    internal static uint RgbaOf(string? hex) =>
+        hex is null ? 0u : Convert.ToUInt32(hex.TrimStart('#'), 16);
+}
 
 /// <summary>Everything needed to write a shape rebuilt from its own tag.</summary>
 public readonly record struct ShapeRewriteSpec(ShapeWriteSpec Geometry, ShapeStyleSpec Style);
@@ -150,11 +179,12 @@ public static class ShapeWriter
             new ShapeStyleSpec(
                 A: a, R: r, G: g, B: b,
                 FillRgba: RgbaOf(tag.FillHex),
-                ShadowAngleDeg: (float)tag.ShadowAngleDeg,
-                ShadowDistancePx: (float)tag.ShadowDistancePts,
-                ShadowSoftnessPx: (float)tag.ShadowSoftnessPts,
-                ShadowSpreadPx: (float)tag.ShadowSpreadPts,
-                ShadowRgba: RgbaOf(tag.ShadowHex)));
+                // VERBATIM, which is the whole point of carrying effects as
+                // text: a duplicate keeps every effect the original had,
+                // including one this build has never heard of. Points are used
+                // as pixels here for the same reason the stroke width is; see
+                // the note above.
+                Effects: tag.EffectsText));
 
         return true;
     }
@@ -163,6 +193,5 @@ public static class ShapeWriter
     /// An "#AARRGGBB" string as the 0xAARRGGBB the core takes, or 0 for absent.
     /// Zero is how both the fill and the shadow say "this feature is off".
     /// </summary>
-    private static uint RgbaOf(string? hex) =>
-        hex is null ? 0u : Convert.ToUInt32(hex.TrimStart('#'), 16);
+    private static uint RgbaOf(string? hex) => ShapeStyleSpec.RgbaOf(hex);
 }

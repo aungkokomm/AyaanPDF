@@ -4281,37 +4281,30 @@ fn shape_tag(
     radius_pts: f32,
     box_w_pts: f32,
     box_h_pts: f32,
-    shadow_distance_pts: f32,
-    shadow_softness_pts: f32,
-    shadow_spread_pts: f32,
+    effects_pts: &str,
 ) -> String {
     let fx = u8::from(spec.x2 >= spec.x1);
     let fy = u8::from(spec.y2 >= spec.y1);
 
-    // A SHADOW IS THE NEW LONGEST RUNG, above the box, and it is emitted only
-    // by a shape that has one. Every shape that does not is byte-identical to
-    // what the previous build wrote, which is what keeps existing files and
-    // their diffs unchanged.
+    // THE EFFECTS ARE THE LONGEST RUNG, above the box, and they are emitted
+    // only by a shape that has some. Every shape that does not is
+    // byte-identical to what the previous build wrote, which is what keeps
+    // existing files and their diffs unchanged.
     //
-    // Fields are positional, so a shadow drags everything before it along even
-    // when those are zero. That is the same bargain the box made and the reason
+    // Everything before them is positional, so effects drag those along even
+    // when they are zero. That is the same bargain the box made and the reason
     // the rungs are ordered by cost rather than by when they were added.
-    if spec.shadow_rgba != 0 {
-        // ONE SELF-DESCRIBING FIELD, not five positional ones. Positional
-        // fields do not extend: a glow would append more of them and force
-        // every shadowed shape to emit intermediate zeros to reach them. Named
-        // keys inside one token mean a later effect is `+g(...)` and an unknown
-        // key is skipped rather than fatal.
-        //
-        // Re-cut deliberately while it was still free. There is no UI that can
-        // set a shadow, so no file in existence carries one, and the moment one
-        // does this format is permanent.
+    //
+    // THE TAIL ITSELF IS NOT POSITIONAL: it is one self-describing field per
+    // effect, each `<kind>(key=value,...)`, appended verbatim from what the
+    // caller handed over. Positional fields do not extend, and named keys mean
+    // a later effect is another field and an unknown key is skipped rather than
+    // fatal. Nothing here knows which effects exist.
+    if !effects_pts.is_empty() {
         return format!(
-            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}:{:.4}:{:.4}:{:.4}:s(a={:.2},d={:.4},b={:.4},p={:.4},c={:08X})",
+            "{SHAPE_TAG}{}:{:02X}{:02X}{:02X}{:02X}:{:.4}:{fx}:{fy}:{:.2}:{:08X}:{:.4}:{:.4}:{:.4}:{effects_pts}",
             spec.kind, spec.r, spec.g, spec.b, spec.a, width_pts,
-            spec.rotation_deg, spec.fill_rgba, radius_pts, box_w_pts, box_h_pts,
-            spec.shadow_angle_deg, shadow_distance_pts, shadow_softness_pts,
-            shadow_spread_pts, spec.shadow_rgba
+            spec.rotation_deg, spec.fill_rgba, radius_pts, box_w_pts, box_h_pts
         );
     }
     // Rotation and fill are BOTH appended so an older reader that stops after
@@ -4362,44 +4355,31 @@ fn shape_tag(
 /// on one of our shape annotations, or None if it is not one of ours. Rotation
 /// is 0 and fill is 0 on older tags that predate those fields; the caller does
 /// not need to know which form the tag was in.
-/// A shadow as a CALLER supplies it, in capture-space pixels.
+/// A drop shadow as the tag records it: in POINTS, angle-and-distance rather
+/// than an x/y offset, and with the RESERVED spread that is stored but never
+/// drawn.
 ///
-/// Distinct from [`TagShadow`], which is in POINTS, because the two are read
-/// from different places and mixing them silently scales a shadow by the page
-/// width. The same split `radius_override` already makes: a value off the tag
-/// needs converting, a value from the caller does not.
+/// The named form of the one effect this core draws. Everything else about
+/// effects here is generic over the text; see `shadow_of`.
 ///
-/// `rgba` of zero CLEARS the shadow, exactly as it does for the fill. There is
-/// no separate way to say "no shadow", because the colour has always been what
-/// decides whether there is one.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ShadowOverride {
-    angle_deg: f32,
-    distance_px: f32,
-    softness_px: f32,
-    spread_px: f32,
-    rgba: u32,
-}
-
-/// A shadow as the tag records it: in POINTS, angle-and-distance rather than an
-/// x/y offset, and with the two RESERVED lengths that are stored but not drawn.
-///
-/// `rgba` of zero is impossible here, because a shadow with no colour is not a
-/// shadow and `parse_shadow_field` returns None for it.
+/// `rgba` of zero is impossible here, because an effect with no colour is not
+/// an effect and `parse_effect_field` returns None for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct TagShadow {
     angle_deg: f32,
     distance_pts: f32,
-    /// RESERVED, never rendered. See `ShapeSpec::shadow_softness_px`.
+    /// The blur RADIUS. Zero is a hard shadow, which is drawn here as paths;
+    /// anything above it is rasterised by Skia and arrives as a picture.
     softness_pts: f32,
-    /// RESERVED, never rendered. See `ShapeSpec::shadow_spread_px`.
+    /// RESERVED: stored and round-tripped, never drawn. Spread needs the
+    /// silhouette dilated before the blur runs.
     spread_pts: f32,
     rgba: u32,
 }
 
 fn parse_shape_tag(
     contents: &str,
-) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32, f32, f32, Option<TagShadow>)> {
+) -> Option<(i32, u8, u8, u8, u8, f32, bool, bool, f32, u32, f32, f32, f32, String)> {
     let contents = strip_id_prefix(contents).1;
     let rest = contents.strip_prefix(SHAPE_TAG)?;
     let mut parts = rest.split(':');
@@ -4452,55 +4432,239 @@ fn parse_shape_tag(
     let box_w: f32 = parts.next().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0);
     let box_h: f32 = parts.next().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0);
 
-    // The drop shadow, as ONE self-describing field. Absent from every tag
-    // written before effects existed and from every shape that has none, so its
-    // absence reads as no shadow rather than failing the parse.
-    let shadow = parts.next().and_then(parse_shadow_field);
+    // THE EFFECTS, CARRIED AS TEXT AND NOT MODELLED. Everything left is the
+    // tail: one self-describing field per effect, joined back up exactly as it
+    // was written. Absent from every tag written before effects existed and
+    // from every shape that has none, so an empty tail reads as no effects
+    // rather than failing the parse.
+    //
+    // This is the element that used to be an Option<TagShadow>, and the reason
+    // the tuple no longer grows: a second effect is more text in the same
+    // element rather than a fifteenth one, so none of the thirty-odd callers
+    // has to learn about it.
+    let effects = parts.collect::<Vec<_>>().join(":");
 
     Some((
         kind, byte(0)?, byte(2)?, byte(4)?, byte(6)?, width, fx, fy, rot, fill, radius, box_w,
-        box_h, shadow,
+        box_h, effects,
     ))
 }
 
-/// One shadow, as the tag spells it: `s(a=135.00,d=6.0000,b=0.0000,p=0.0000,c=FF000000)`.
-///
-/// Keys rather than positions, so an effect added later is another token and an
-/// key this build does not know is skipped instead of shifting everything after
-/// it. Anything malformed yields no shadow, which is the same answer as a shape
-/// that never had one, and never a half-read one.
-fn parse_shadow_field(field: &str) -> Option<TagShadow> {
-    let inner = field.strip_prefix("s(")?.strip_suffix(')')?;
+fn non_negative(value: &str) -> Option<f32> {
+    value.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+}
 
-    let mut shadow = TagShadow::default();
+// ---------------------------------------------------------------------------
+// EFFECTS, CARRIED RATHER THAN MODELLED
+//
+// The core does not know what effects exist. It carries their text from the
+// caller to the tag and back, reserves the room their ink needs, and draws the
+// ONE effect a PDF can express as paths, which is a hard drop shadow. A glow, a
+// spread, a second shadow or something this build has never heard of all reach
+// the file through the code below without a line being added for them.
+//
+// THE TEXT is the shape tag's tail: colon-separated self-describing fields, one
+// per effect, each `<kind>(key=value,...)`. See `shape_tag` for the format and
+// `parse_effect_field` for the keys.
+// ---------------------------------------------------------------------------
+
+/// The effect fields in one effects string, in order, skipping anything empty.
+fn effect_fields(effects: &str) -> impl Iterator<Item = &str> {
+    effects.split(':').filter(|f| !f.is_empty())
+}
+
+/// One effect field's numbers, whatever effect it turns out to be.
+///
+/// The KEYS are shared across effects rather than owned by one: `a` and `d` say
+/// where a mark is thrown, `b` how far it is blurred, `p` how far its
+/// silhouette is grown, `c` what colour it is. An effect uses the ones it needs
+/// and leaves the rest at zero, which is why a glow needs no key of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TagEffect {
+    /// The letter before the bracket: 's' for a drop shadow.
+    kind: char,
+    angle_deg: f32,
+    distance_pts: f32,
+    blur_pts: f32,
+    spread_pts: f32,
+    rgba: u32,
+}
+
+/// Reads one `<kind>(...)` field, or None for anything malformed.
+///
+/// The COLOUR is what says an effect exists, the same bargain the fill makes: a
+/// fully transparent mark paints nothing, so it is not one. A key from a later
+/// build is skipped rather than fatal, so a shape carrying an effect this build
+/// cannot draw still opens and still keeps its other effects.
+fn parse_effect_field(field: &str) -> Option<TagEffect> {
+    let open = field.find('(')?;
+    let inner = field.get(open + 1..)?.strip_suffix(')')?;
+
+    let name = &field[..open];
+    let mut chars = name.chars();
+    let kind = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+
+    let mut effect = TagEffect { kind, ..TagEffect::default() };
     let mut seen_colour = false;
 
     for pair in inner.split(',') {
         let (key, value) = pair.split_once('=')?;
         match key {
-            "a" => shadow.angle_deg = value.parse().ok().filter(|v: &f32| v.is_finite())?,
-            "d" => shadow.distance_pts = non_negative(value)?,
-            "b" => shadow.softness_pts = non_negative(value)?,
-            "p" => shadow.spread_pts = non_negative(value)?,
+            "a" => effect.angle_deg = value.parse().ok().filter(|v: &f32| v.is_finite())?,
+            "d" => effect.distance_pts = non_negative(value)?,
+            "b" => effect.blur_pts = non_negative(value)?,
+            "p" => effect.spread_pts = non_negative(value)?,
             "c" => {
-                shadow.rgba = u32::from_str_radix(value, 16).ok()?;
+                effect.rgba = u32::from_str_radix(value, 16).ok()?;
                 seen_colour = true;
             }
-            // Forward compatibility: a key from a later build is not an error.
             _ => {}
         }
     }
 
-    // The colour is what says a shadow exists, the same bargain the fill makes.
-    // A fully transparent one paints nothing, so it is not one.
-    if !seen_colour || shadow.rgba == 0 {
+    if !seen_colour || effect.rgba == 0 {
         return None;
     }
-    Some(shadow)
+    Some(effect)
 }
 
-fn non_negative(value: &str) -> Option<f32> {
-    value.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+/// The DROP SHADOW among a shape's effects, if it has one.
+///
+/// The one effect-specific reader left in the core, and it exists for one
+/// reason: a hard shadow is drawn as PATHS, crisp at any zoom, which is
+/// something only this effect can be. Everything else about effects here is
+/// generic over the text.
+fn shadow_effect_of(effects: &str) -> Option<TagShadow> {
+    effect_fields(effects)
+        .filter_map(parse_effect_field)
+        .find(|e| e.kind == 's')
+        .map(|e| TagShadow {
+            angle_deg: e.angle_deg,
+            distance_pts: e.distance_pts,
+            softness_pts: e.blur_pts,
+            spread_pts: e.spread_pts,
+            rgba: e.rgba,
+        })
+}
+
+/// The room a shape's effects need around its own box, in points.
+///
+/// Four one-sided amounts, each the distance that side must open by and each at
+/// least zero. Growing the box is an addition of these and taking the growth
+/// back off is a subtraction of the same four, so the two CANNOT drift apart.
+/// They used to be a `grow` closure and an `ungrow_shadow` function that had to
+/// be kept exact inverses of each other by hand, in three places.
+///
+/// PDFium CROPS an appearance to its rectangle, so room short of this does not
+/// leave a fringe behind, it cuts the ink off in a straight line.
+///
+/// THE WIDEST, NOT THE SUM: every effect is drawn from the same silhouette into
+/// the same picture, so each side opens by the furthest any one effect reaches
+/// on it, and a second effect never pushes the first further out. Adding them
+/// up would grow the shape on every edit.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct EffectsRoom {
+    left: f32,
+    right: f32,
+    /// The VISUAL top, which is the higher y in PDF space.
+    top: f32,
+    bottom: f32,
+}
+
+impl EffectsRoom {
+    fn is_empty(self) -> bool {
+        self == EffectsRoom::default()
+    }
+}
+
+fn effects_room_pts(effects: &str) -> EffectsRoom {
+    let mut room = EffectsRoom::default();
+
+    for effect in effect_fields(effects).filter_map(parse_effect_field) {
+        // Softness is the RADIUS and sigma is half of it, and a gaussian is
+        // spent by three sigma, so the reach is one and a half times the
+        // radius. The SAME three sigma the preview uses
+        // (OverlayProjection.BlurReachSigmas), because the room the annotation
+        // reserves and the room the rasteriser paints have to be the same room.
+        let reach = if effect.blur_pts > 0.0 { effect.blur_pts * 1.5 } else { 0.0 };
+
+        // Where this effect is thrown, in PDF points, so y runs UP.
+        let (dx, dy) = shadow_offset_pts(effect.angle_deg, effect.distance_pts);
+
+        room.left = room.left.max(reach + (-dx).max(0.0));
+        room.right = room.right.max(reach + dx.max(0.0));
+        room.top = room.top.max(reach + dy.max(0.0));
+        room.bottom = room.bottom.max(reach + (-dy).max(0.0));
+    }
+
+    room
+}
+
+/// The same effects text with every LENGTH multiplied.
+///
+/// The tag stores points and `ShapeSpec` carries capture pixels, exactly as
+/// every other length in the struct does, so the text is rescaled on the way in
+/// and on the way out. Which keys are lengths is a property of the FORMAT and
+/// not of any one effect, which is what keeps this generic: an effect that
+/// reuses `d`, `b` or `p` is converted without a line being added.
+///
+/// A KEY THIS BUILD DOES NOT KNOW IS COPIED VERBATIM, not dropped and not
+/// reformatted, so a file written by a later build survives a round trip
+/// through this one intact.
+fn scale_effect_lengths(effects: &str, factor: f32) -> String {
+    let mut out = String::with_capacity(effects.len() + 8);
+
+    for (at, field) in effects.split(':').enumerate() {
+        if at > 0 {
+            out.push(':');
+        }
+        let Some(open) = field.find('(') else {
+            out.push_str(field);
+            continue;
+        };
+        let Some(inner) = field.get(open + 1..).and_then(|s| s.strip_suffix(')')) else {
+            out.push_str(field);
+            continue;
+        };
+
+        out.push_str(&field[..=open]);
+        for (n, pair) in inner.split(',').enumerate() {
+            if n > 0 {
+                out.push(',');
+            }
+            match pair.split_once('=') {
+                Some((key @ ("d" | "b" | "p"), value)) => match value.parse::<f32>() {
+                    Ok(v) if v.is_finite() => {
+                        out.push_str(&format!("{key}={:.4}", v * factor));
+                    }
+                    _ => out.push_str(pair),
+                },
+                _ => out.push_str(pair),
+            }
+        }
+        out.push(')');
+    }
+
+    out
+}
+
+/// A shape's effects, as the text the caller handed over.
+///
+/// Empty for a shape with none, which is what a zero-initialised struct gets
+/// and what every shape written before effects existed has.
+fn effects_of(spec: &ShapeSpec) -> &str {
+    if spec.effects_utf8.is_null() || spec.effects_len == 0 {
+        return "";
+    }
+
+    // SAFETY: the caller owns the bytes for the duration of the call, which is
+    // the same contract every other pointer across this ABI has.
+    let bytes = unsafe { std::slice::from_raw_parts(spec.effects_utf8, spec.effects_len) };
+
+    std::str::from_utf8(bytes).unwrap_or("")
 }
 
 /// One shape to add, in render-pixel space.
@@ -4541,66 +4705,29 @@ pub struct ShapeSpec {
     /// rectangle rather than to nothing. APPENDED to the struct for the same
     /// additive-ABI reason as the two fields above.
     pub corner_radius_px: f32,
-    /// The drop shadow. ANGLE AND DISTANCE ARE THE SOURCE OF TRUTH, and the
-    /// x/y offset is derived from them wherever it is needed.
+    /// THE SHAPE'S EFFECTS, AS TEXT, and the core does not model them.
     ///
-    /// Not the other way round: an angle cannot be recovered from an offset of
-    /// zero length, so storing x/y would lose the direction the moment somebody
-    /// dragged the distance to nothing. The angle is where the LIGHT is, in
-    /// degrees counter-clockwise from due east, so 90 is lit from directly
-    /// above and the shadow falls straight down. Distance is in capture-space
-    /// pixels, the same space as `width_px`, and the colour is 0xAARRGGBB.
+    /// UTF-8 bytes owned by the caller for the duration of the call, in the
+    /// tag's own tail format: colon-separated self-describing fields, one per
+    /// effect, each `<kind>(key=value,...)`. Null or empty is a shape with no
+    /// effects, which is what a zero-initialised struct gets and what every
+    /// shape written before effects existed has.
     ///
-    /// OPACITY IS THE COLOUR'S ALPHA. There is no separate opacity, because two
-    /// ways to say how solid a shadow is would need a rule about which wins.
+    /// ONE FIELD RATHER THAN A PAIR PER EFFECT, which is the whole point. The
+    /// struct used to carry an angle, a distance, a softness, a spread and a
+    /// colour, all of them the drop shadow's; a glow would have added two more,
+    /// and every caller and every test that spells the struct out would have
+    /// had to learn them. The core now carries whatever it is handed, reserves
+    /// the room it asks for, and draws the one effect a PDF can express as
+    /// paths. Adding an effect costs nothing here.
     ///
-    /// `shadow_rgba == 0` means NO SHADOW, which is the historic behaviour and
-    /// what a zero-initialised struct gets, so the offsets are only read when
-    /// the colour says there is something to draw. Same convention as
-    /// `fill_rgba` above, for the same reason: one field decides whether the
-    /// feature is on, so a caller that knows nothing about it cannot switch it
-    /// on by accident.
+    /// LENGTHS ARE IN CAPTURE-SPACE PIXELS, like `width_px` and
+    /// `corner_radius_px` and unlike the points the tag stores;
+    /// `scale_effect_lengths` converts on the way through.
     ///
     /// APPENDED to the struct for the additive-ABI reason as everything above.
-    pub shadow_angle_deg: f32,
-    pub shadow_distance_px: f32,
-    /// RESERVED. Stored, round-tripped through the tag, and DELIBERATELY NOT
-    /// RENDERED. A soft shadow cannot be drawn as a path object because PDF has
-    /// no blur primitive for one; it has to be rasterised, which is its own
-    /// piece of work. Carrying the value now means a file written today keeps
-    /// its softness when that lands, instead of silently losing it.
-    pub shadow_softness_px: f32,
-    /// RESERVED, exactly as `shadow_softness_px` is: stored and round-tripped,
-    /// never drawn. Spread needs path dilation, which neither PDFium nor lopdf
-    /// offers, so it goes the same rasterised route.
-    pub shadow_spread_px: f32,
-    pub shadow_rgba: u32,
-}
-
-/// How far a blurred shadow's ink escapes its own silhouette, in points.
-///
-/// Softness is the RADIUS and sigma is half of it, and a gaussian is spent by
-/// three sigma, so the reach is one and a half times the softness. The SAME
-/// three sigma the preview uses (OverlayProjection.BlurReachSigmas), because
-/// the room the annotation reserves and the room the rasteriser paints have to
-/// be the same room.
-fn shadow_reach_pts(softness_pts: f32) -> f32 {
-    if softness_pts > 0.0 { softness_pts * 1.5 } else { 0.0 }
-}
-
-/// One axis of a reported /Rect, with the SHADOW's growth taken back off.
-///
-/// The writer grows /Rect in the shadow's direction so PDFium does not clip the
-/// shadow, and it grows one side only. Anything that rebuilds the SHAPE from
-/// that rectangle has to undo this first: an effect must never become the
-/// geometry. Left in, the offset is baked into the shape's own size and grows
-/// again on the next edit, and for a turned shape the CENTRE moves by half of
-/// it, so the shape drifts instead.
-///
-/// The exact inverse of the `grow` closure in `add_shape_annotations_inner`,
-/// and kept next to nothing else so the two cannot drift apart.
-fn ungrow_shadow(lo: f32, hi: f32, d: f32) -> (f32, f32) {
-    if d >= 0.0 { (lo, hi - d) } else { (lo - d, hi) }
+    pub effects_utf8: *const u8,
+    pub effects_len: usize,
 }
 
 /// Where a shadow falls, in PDF points, given where the light is.
@@ -4918,24 +5045,31 @@ fn add_shape_annotations_inner_with_image(
             None
         };
 
-        // The shadow's offset in PDF points. Y is NEGATED because the page's
-        // vertical axis runs the other way to the screen's: to_pdf_y subtracts,
-        // so a shadow cast downwards on screen is a smaller y here. Getting
-        // this sign wrong puts every shadow on the wrong side of its shape,
-        // which is why there is a test that only passes for one of them.
-        // DERIVED, never stored: angle and distance are what the shape carries.
-        // Spread is deliberately NOT consulted, because it cannot be drawn as
-        // a path object; see ShapeSpec.
-        let (sdx, sdy) =
-            shadow_offset_pts(spec.shadow_angle_deg, spec.shadow_distance_px * scale);
+        // THE EFFECTS, IN THE TAG'S OWN UNITS. The struct carries capture
+        // pixels like every other length on it; from here down everything is
+        // points, and nothing below reads the text again except to write it.
+        let effects_pts = scale_effect_lengths(effects_of(spec), scale);
 
-        // A shadow at all: what the annotation's box has to make room for,
-        // whether the shadow ends up drawn as a path or arrives as a picture.
-        let has_shadow = spec.shadow_rgba != 0;
+        // The room the effects need, generically: the widest reach on each
+        // side, offsets included, and nothing here knows which effect is which.
+        let room = effects_room_pts(&effects_pts);
 
-        // A shadow DRAWN HERE, as paths. Only a hard one: a blur is not
-        // something PDF can express for a path, so a soft shadow is rasterised
-        // by Skia and attached as an image instead.
+        // THE ONE EFFECT THIS CORE DRAWS. A hard drop shadow is paths, crisp at
+        // any zoom, which is something PDF can express and a blur is not.
+        //
+        // Its offset in PDF points. Y is NEGATED because the page's vertical
+        // axis runs the other way to the screen's: to_pdf_y subtracts, so a
+        // shadow cast downwards on screen is a smaller y here. Getting this
+        // sign wrong puts every shadow on the wrong side of its shape, which is
+        // why there is a test that only passes for one of them. DERIVED, never
+        // stored: angle and distance are what the shape carries. Spread is
+        // deliberately NOT consulted, because it cannot be drawn as a path.
+        let shadow = shadow_effect_of(&effects_pts);
+        let (sdx, sdy) = shadow
+            .map_or((0.0, 0.0), |sh| shadow_offset_pts(sh.angle_deg, sh.distance_pts));
+
+        // Only a HARD one is drawn here: a soft shadow is rasterised by Skia
+        // and attached as an image instead.
         //
         // The two must never both happen. Drawing a hard stand-in under a
         // blurred picture is what made a soft shadow come out as a dark offset
@@ -4943,7 +5077,7 @@ fn add_shape_annotations_inner_with_image(
         // reported as. If the picture has not been attached yet, nothing is
         // drawn: the app attaches it before the page is rendered, and a wrong
         // shadow for one frame is worse than none.
-        let draw_shadow_as_paths = has_shadow && spec.shadow_softness_px <= 0.0;
+        let draw_shadow_as_paths = shadow.is_some_and(|sh| sh.softness_pts <= 0.0);
 
         let pad = width_pts / 2.0 + 1.0;
         let min_x = extent.iter().map(|p| p.0).fold(f32::MAX, f32::min) - pad;
@@ -4960,34 +5094,24 @@ fn add_shape_annotations_inner_with_image(
         let cx = (min_x + max_x) / 2.0;
         let cy = (min_y + max_y) / 2.0;
 
-        // PDFium CLIPS an appearance to its box, so a shadow outside the box is
-        // silently cut off. The box grows by the offset, in the direction of
-        // the offset only.
+        // PDFium CROPS an appearance to its box, so ink outside the box is
+        // silently cut off. The box opens by the room the effects asked for: a
+        // blur spreads in all four directions and a thrown mark lands on one
+        // side, and `effects_room_pts` has already reduced both to four
+        // one-sided amounts. Reserved whether or not a picture is attached yet,
+        // so that taking it back off again is a function of the tag alone and
+        // cannot disagree with itself.
         //
         // Exact rather than approximate, and it does not need the rotation
-        // maths repeating: the shadow is the shape TRANSLATED, and both turn by
-        // the same angle about their own centres, so the shadow's final
-        // geometry is the shape's final geometry translated by the same vector.
-        // Growing the finished box by that vector therefore contains it at any
-        // angle.
-        // PDFium CROPS an appearance to its box, and a BLUR spreads in all
-        // four directions, so a soft shadow needs room on every side as well as
-        // in the direction it falls. Reserved whether or not a picture is
-        // attached yet, so that taking it back off again is a function of the
-        // tag alone and cannot disagree with itself.
-        let reach = if has_shadow {
-            shadow_reach_pts(spec.shadow_softness_px * scale)
-        } else {
-            0.0
-        };
-
-        let grow = |lo: f32, hi: f32, d: f32| {
-            if !has_shadow { (lo, hi) } else { (lo.min(lo + d) - reach, hi.max(hi + d) + reach) }
-        };
+        // maths repeating: an effect is the shape TRANSLATED and blurred, and
+        // both turn by the same angle about their own centres, so growing the
+        // finished box contains it at any angle.
+        let grow_x = |lo: f32, hi: f32| (lo - room.left, hi + room.right);
+        let grow_y = |lo: f32, hi: f32| (lo - room.bottom, hi + room.top);
 
         let bounds = if rot == 0.0 {
-            let (bl, br) = grow(min_x, max_x, sdx);
-            let (bb, bt) = grow(min_y, max_y, sdy);
+            let (bl, br) = grow_x(min_x, max_x);
+            let (bb, bt) = grow_y(min_y, max_y);
             PdfRect::new(
                 PdfPoints::new(bb),
                 PdfPoints::new(bl),
@@ -5001,8 +5125,8 @@ fn add_shape_annotations_inner_with_image(
             let h = max_y - min_y;
             let hw = (w * c + h * s) / 2.0;
             let hh = (w * s + h * c) / 2.0;
-            let (bl, br) = grow(cx - hw, cx + hw, sdx);
-            let (bb, bt) = grow(cy - hh, cy + hh, sdy);
+            let (bl, br) = grow_x(cx - hw, cx + hw);
+            let (bb, bt) = grow_y(cy - hh, cy + hh);
             PdfRect::new(
                 PdfPoints::new(bb),
                 PdfPoints::new(bl),
@@ -5054,12 +5178,7 @@ fn add_shape_annotations_inner_with_image(
         let box_h_pts = (y2 - y1).abs();
         let _ = set_annotation_tag(
             &mut annotation,
-            &shape_tag(
-                spec, width_pts, radius_pts, box_w_pts, box_h_pts,
-                spec.shadow_distance_px * scale,
-                spec.shadow_softness_px * scale,
-                spec.shadow_spread_px * scale,
-            ),
+            &shape_tag(spec, width_pts, radius_pts, box_w_pts, box_h_pts, &effects_pts),
         );
 
         // THE RASTERISED SHADOW GOES DOWN BEFORE EVERYTHING, for the same
@@ -5111,11 +5230,11 @@ fn add_shape_annotations_inner_with_image(
         // It turns about its OWN centre, the shape's centre moved by the same
         // offset. Turning it about the shape's centre would swing it around the
         // shape as the shape rotated, which is an orbit and not a shadow.
-        if draw_shadow_as_paths {
-            let a = ((spec.shadow_rgba >> 24) & 0xFF) as u8;
-            let r = ((spec.shadow_rgba >> 16) & 0xFF) as u8;
-            let g = ((spec.shadow_rgba >> 8) & 0xFF) as u8;
-            let b = (spec.shadow_rgba & 0xFF) as u8;
+        if let (true, Some(sh)) = (draw_shadow_as_paths, shadow) {
+            let a = ((sh.rgba >> 24) & 0xFF) as u8;
+            let r = ((sh.rgba >> 16) & 0xFF) as u8;
+            let g = ((sh.rgba >> 8) & 0xFF) as u8;
+            let b = (sh.rgba & 0xFF) as u8;
             let shadow_color = PdfColor::new(r, g, b, a);
 
             // THE ALPHA RULE: the shadow is the shape's OWN marks, offset and
@@ -5352,56 +5471,65 @@ pub extern "C" fn restyle_shape_radius_annotation(
     .unwrap_or(STATUS_PANIC)
 }
 
-/// Sets, changes or clears the DROP SHADOW on one of our shapes, without
-/// moving or otherwise restyling it.
+/// Sets, changes or clears ALL the EFFECTS on one of our shapes, without moving
+/// or otherwise restyling it.
 ///
-/// The last of the shape's properties to become editable. Until this existed a
-/// shadow could only be given to a shape as it was drawn: the restyle path
-/// carried whatever the tag already held, so nothing could put one on a shape
-/// that had none, and nothing could take one away.
+/// ONE ENTRY POINT FOR EVERY EFFECT, and the reason there is no second one. It
+/// used to be `restyle_shape_shadow_annotation`, taking the drop shadow's five
+/// numbers, and a glow would have needed its own twin taking the glow's two.
+/// The effects now cross as the tag's own text, so an effect this build has
+/// never heard of can be set through here by a caller that has.
 ///
-/// `rgba` of ZERO CLEARS the shadow, the same bargain the fill makes, and the
-/// other four values are then ignored. Lengths are in capture-space pixels,
-/// like `radius_px` and unlike the points the tag stores.
+/// THE WHOLE LIST IS REPLACED rather than merged field by field. A caller
+/// changing one effect sends all of them, which is what every other override
+/// here already expects, and an EMPTY string clears the lot. There is nothing
+/// sensible to merge a cleared effect with.
 ///
-/// `softness_px` and `spread_px` are stored and round-tripped and drawn by
-/// nothing; see `ShapeSpec`. They are accepted here so a caller that sets them
-/// does not lose them, not because anything renders them yet.
+/// Lengths inside the text are in capture-space pixels, like `radius_px` and
+/// unlike the points the tag stores.
 #[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
-pub extern "C" fn restyle_shape_shadow_annotation(
+pub extern "C" fn restyle_shape_effects_annotation(
     doc_handle: u64,
     page_index: i32,
     index: i32,
     capture_width: i32,
-    angle_deg: f32,
-    distance_px: f32,
-    softness_px: f32,
-    spread_px: f32,
-    rgba: u32,
+    effects_utf8: *const u8,
+    effects_len: usize,
     out_new_index: *mut i32,
 ) -> i32 {
     if doc_handle == 0 || page_index < 0 || index < 0 || capture_width <= 0 {
         return STATUS_INVALID_INPUT;
     }
-    if !angle_deg.is_finite() {
+
+    // A null pointer and an empty string are the same request: no effects.
+    let effects = if effects_utf8.is_null() || effects_len == 0 {
+        String::new()
+    } else {
+        // SAFETY: the caller owns the bytes for the duration of the call.
+        let bytes = unsafe { std::slice::from_raw_parts(effects_utf8, effects_len) };
+        match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_string(),
+            Err(_) => return STATUS_INVALID_INPUT,
+        }
+    };
+
+    // EVERY FIELD HAS TO READ, or the whole edit is refused. Negative and
+    // infinite lengths are rejected rather than clamped, so a caller's mistake
+    // does not become a plausible-looking shape, and this is where that used to
+    // happen field by field for the one effect there was.
+    //
+    // Generic, and still forward-compatible: `parse_effect_field` carries a
+    // kind it has never heard of and skips a key it does not know, so what is
+    // being refused here is text that does not make sense at all rather than
+    // text from a later build.
+    if effect_fields(&effects).any(|f| parse_effect_field(f).is_none()) {
         return STATUS_INVALID_INPUT;
     }
-    // Lengths, so negative is meaningless. The angle is not a length and may
-    // be any finite number, since a light can be anywhere and 450 degrees is
-    // simply 90.
-    for length in [distance_px, softness_px, spread_px] {
-        if !length.is_finite() || length < 0.0 {
-            return STATUS_INVALID_INPUT;
-        }
-    }
 
-    panic::catch_unwind(|| {
+    panic::catch_unwind(move || {
         restyle_shape_annotation_inner_with_rotation(
             doc_handle, page_index, index, capture_width,
-            0, -1.0, None, None, None,
-            Some(ShadowOverride { angle_deg, distance_px, softness_px, spread_px, rgba }),
-            None, out_new_index)
+            0, -1.0, None, None, None, Some(effects), None, out_new_index)
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -5551,7 +5679,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     rotation_override: Option<f32>,
     fill_override: Option<u32>,
     radius_override: Option<f32>,
-    shadow_override: Option<ShadowOverride>,
+    effects_override: Option<String>,
     shadow_image: Option<&ShadowImage>,
     out_new_index: *mut i32,
 ) -> i32 {
@@ -5560,7 +5688,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     // Read tag AND the annotation's own bounds BEFORE the delete, so a mark
     // that is not one of our shapes leaves the page untouched.
     let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, cur_radius_pts,
-         cur_box_w_pts, cur_box_h_pts, cur_shadow,
+         cur_box_w_pts, cur_box_h_pts, cur_effects,
          page_left, page_top, page_w, bounds) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
@@ -5593,26 +5721,18 @@ fn restyle_shape_annotation_inner_with_rotation(
     let scale_cap_per_pt = capture_width as f32 / page_w;
     let pad_pts = cur_width_pts / 2.0 + 1.0;
 
-    // THE SHADOW COMES OFF FIRST. /Rect is grown in the shadow's direction so
-    // PDFium does not clip it, and reading those edges as the shape's own is
+    // THE EFFECTS COME OFF FIRST. /Rect is grown by the room they asked for so
+    // PDFium does not crop them, and reading those edges as the shape's own is
     // what made every shadow edit grow the shape, and every edit to a TURNED
-    // shape drift it by half the offset.
-    let (bl, bb, br, bt) = match cur_shadow {
-        Some(sh) if sh.rgba != 0 => {
-            let (sdx, sdy) = shadow_offset_pts(sh.angle_deg, sh.distance_pts);
-            // The blur's room first, off all four sides; then the offset.
-            let reach = shadow_reach_pts(sh.softness_pts);
-            let (l, r) = ungrow_shadow(
-                bounds.left().value + reach, bounds.right().value - reach, sdx);
-            let (b, t) = ungrow_shadow(
-                bounds.bottom().value + reach, bounds.top().value - reach, sdy);
-            (l, b, r, t)
-        }
-        _ => (
-            bounds.left().value, bounds.bottom().value,
-            bounds.right().value, bounds.top().value,
-        ),
-    };
+    // shape drift it by half the offset. Subtracting the same four one-sided
+    // amounts the writer added is the exact inverse by construction.
+    let room = effects_room_pts(&cur_effects);
+    let (bl, bb, br, bt) = (
+        bounds.left().value + room.left,
+        bounds.bottom().value + room.bottom,
+        bounds.right().value - room.right,
+        bounds.top().value - room.top,
+    );
 
     let (cap_left, cap_right, cap_top, cap_bottom) =
         if cur_rot != 0.0 && cur_box_w_pts > 0.0 && cur_box_h_pts > 0.0 {
@@ -5655,21 +5775,15 @@ fn restyle_shape_annotation_inner_with_rotation(
         return STATUS_INVALID_INPUT;
     }
 
-    // THE SHADOW, resolved once: the caller's when there is one, otherwise the
-    // tag's own converted out of points.
+    // THE EFFECTS, resolved once: the caller's when there are any, otherwise
+    // the tag's own converted out of points. A restyle rebuilds the whole shape
+    // from its tag, so anything not put back here is DROPPED: changing a
+    // shape's colour would quietly take its shadow away.
     //
-    // The override replaces the tag's shadow WHOLE rather than merging field by
-    // field, because a caller with rgba 0 is clearing it and there is nothing
-    // sensible to merge a cleared shadow with. That also means a caller
-    // changing one value has to send the other four, which is what every other
-    // override here already expects.
-    let shadow = shadow_override.unwrap_or_else(|| ShadowOverride {
-        angle_deg: cur_shadow.map_or(0.0, |sh| sh.angle_deg),
-        distance_px: cur_shadow.map_or(0.0, |sh| sh.distance_pts * scale_cap_per_pt),
-        softness_px: cur_shadow.map_or(0.0, |sh| sh.softness_pts * scale_cap_per_pt),
-        spread_px: cur_shadow.map_or(0.0, |sh| sh.spread_pts * scale_cap_per_pt),
-        rgba: cur_shadow.map_or(0, |sh| sh.rgba),
-    });
+    // The override replaces the tag's effects WHOLE rather than merging, which
+    // is what lets an empty string clear them.
+    let effects_px = effects_override
+        .unwrap_or_else(|| scale_effect_lengths(&cur_effects, scale_cap_per_pt));
 
     // Restore the drag-direction so an arrow keeps its head where it was.
     let (x1, x2) = if fx { (cap_left, cap_right) } else { (cap_right, cap_left) };
@@ -5689,19 +5803,12 @@ fn restyle_shape_annotation_inner_with_rotation(
         // scale the width uses. Restyling colour or fill must never disturb the
         // corners of a rounded rectangle.
         corner_radius_px: radius_override.unwrap_or(cur_radius_pts * scale_cap_per_pt),
-        // Carried straight back off the tag, like the fill and the radius. A
-        // restyle rebuilds the whole shape from its tag, so anything not put
-        // back here is DROPPED: changing a shape's colour would quietly take
-        // its shadow away.
-        shadow_angle_deg: shadow.angle_deg,
-        shadow_distance_px: shadow.distance_px,
-        shadow_softness_px: shadow.softness_px,
-        shadow_spread_px: shadow.spread_px,
-        shadow_rgba: shadow.rgba,
+        effects_utf8: effects_px.as_ptr(),
+        effects_len: effects_px.len(),
     };
-    let status = panic::catch_unwind(|| {
+    let status = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         add_shape_annotations_inner_with_image(doc_handle, capture_width, &spec, 1, shadow_image)
-    })
+    }))
     .unwrap_or(STATUS_PANIC);
     if status != STATUS_OK_PDFIUM { return status; }
 
@@ -5748,7 +5855,7 @@ fn upright_shape_bounds(
     box_h_pts: f32,
     capture_width: i32,
     page_width_pts: f32,
-    shadow: Option<TagShadow>,
+    effects: &str,
     left: f32,
     top: f32,
     right: f32,
@@ -5756,25 +5863,19 @@ fn upright_shape_bounds(
 ) -> (f32, f32, f32, f32) {
     let per_pt = capture_width as f32 / page_width_pts;
 
-    // THE SHADOW COMES OFF FIRST, before anything else reads these edges or
-    // their centre. A shadow is an effect; the shape is what it is cast by.
-    let (left, top, right, bottom) = match shadow {
-        Some(sh) if sh.rgba != 0 => {
-            let (sdx, sdy) = shadow_offset_pts(sh.angle_deg, sh.distance_pts);
-            // The blur's room comes off all four sides first. It is symmetric,
-            // so it leaves the centre where it was; the offset is not, so it
-            // has to come off one side each way.
-            let reach = shadow_reach_pts(sh.softness_pts) * per_pt;
-            let (left, top, right, bottom) =
-                (left + reach, top + reach, right - reach, bottom - reach);
-            // These bounds run y DOWN and the offset is in PDF points, which
-            // run y UP, so the vertical term is negated on the way in.
-            let (l, r) = ungrow_shadow(left, right, sdx * per_pt);
-            let (t, b) = ungrow_shadow(top, bottom, -sdy * per_pt);
-            (l, t, r, b)
-        }
-        _ => (left, top, right, bottom),
-    };
+    // THE EFFECTS COME OFF FIRST, before anything else reads these edges or
+    // their centre. An effect must never become the geometry.
+    //
+    // The same four one-sided amounts the writer opened the box by, subtracted.
+    // These bounds run y DOWN and the room is named for the VISUAL sides, so
+    // `top` is the smaller number here and still the side the room calls top.
+    let room = effects_room_pts(effects);
+    let (left, top, right, bottom) = (
+        left + room.left * per_pt,
+        top + room.top * per_pt,
+        right - room.right * per_pt,
+        bottom - room.bottom * per_pt,
+    );
 
     if rot != 0.0 {
         if box_w_pts <= 0.0 || box_h_pts <= 0.0 {
@@ -5839,10 +5940,10 @@ pub extern "C" fn shape_upright_bounds(
         let Some(tag) = parse_shape_tag(text) else {
             return STATUS_UNSUPPORTED;
         };
-        let (_, _, _, _, _, width_pts, _, _, rot, _, _, box_w_pts, box_h_pts, shadow) = tag;
+        let (_, _, _, _, _, width_pts, _, _, rot, _, _, box_w_pts, box_h_pts, effects) = tag;
 
         let (l, t, r, b) = upright_shape_bounds(
-            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_width_pts, shadow,
+            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_width_pts, &effects,
             left, top, right, bottom,
         );
 
@@ -5899,7 +6000,7 @@ fn resize_shape_annotation_inner(
 
     let (
         kind, r, g, b, a, width_pts, fx, fy, rot, fill_rgba, radius_pts, box_w_pts, box_h_pts,
-        cur_shadow,
+        cur_effects,
     ) = tag;
 
     // The two things the writer added to /Rect come off here, and only when the
@@ -5921,7 +6022,7 @@ fn resize_shape_annotation_inner(
             return STATUS_INVALID_INPUT;
         }
         upright_shape_bounds(
-            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_w, cur_shadow,
+            rot, width_pts, box_w_pts, box_h_pts, capture_width, page_w, &cur_effects,
             left, top, right, bottom,
         )
     } else {
@@ -5939,7 +6040,7 @@ fn resize_shape_annotation_inner(
 
     // Width was stored in PDF points and the spec wants capture-space pixels,
     // so it goes back through the same scale the writer applied.
-    let (width_px, radius_px, shadow_distance, shadow_softness, shadow_spread) = {
+    let (width_px, radius_px, effects_px) = {
         let _guard = lock(&CALL_LOCK);
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
@@ -5959,16 +6060,14 @@ fn resize_shape_annotation_inner(
         // than having it grow with the box, which is what a rounded rectangle
         // is expected to do. The draw-time clamp handles a box shrunk below
         // twice the radius.
-        // The shadow rides through a resize the way the radius does: its
-        // DISTANCE is absolute, so a box stretched wider keeps the same shadow
-        // rather than having it stretch with the box. The angle is not a
-        // length and needs no conversion at all.
+        // The effects ride through a resize the way the radius does: their
+        // lengths are ABSOLUTE, so a box stretched wider keeps the same shadow
+        // rather than having it stretch with the box. Carried as text, so a
+        // resize costs nothing per effect.
         (
             width_pts * cap_per_pt,
             radius_pts * cap_per_pt,
-            cur_shadow.map_or(0.0, |sh| sh.distance_pts * cap_per_pt),
-            cur_shadow.map_or(0.0, |sh| sh.softness_pts * cap_per_pt),
-            cur_shadow.map_or(0.0, |sh| sh.spread_pts * cap_per_pt),
+            scale_effect_lengths(&cur_effects, cap_per_pt),
         )
     };
 
@@ -5987,11 +6086,8 @@ fn resize_shape_annotation_inner(
         rotation_deg: rot,
         fill_rgba,
         corner_radius_px: radius_px,
-        shadow_angle_deg: cur_shadow.map_or(0.0, |sh| sh.angle_deg),
-        shadow_distance_px: shadow_distance,
-        shadow_softness_px: shadow_softness,
-        shadow_spread_px: shadow_spread,
-        shadow_rgba: cur_shadow.map_or(0, |sh| sh.rgba),
+        effects_utf8: effects_px.as_ptr(),
+        effects_len: effects_px.len(),
     };
 
     let status = add_shape_annotations(doc_handle, capture_width, &spec, 1);
@@ -9546,6 +9642,131 @@ mod tests {
         count
     }
 
+    // ---------------- effects, as the tests say them ----------------
+    //
+    // ShapeSpec carries its effects as TEXT, so a test that wants a drop shadow
+    // spells one rather than setting five fields. The numbers and the units are
+    // exactly what those fields took: capture-space pixels, and a colour whose
+    // alpha decides whether there is a shadow at all.
+    //
+    // The text is LEAKED, which is what lets this be a one-liner: the struct
+    // holds a borrowed pointer, and a test process is short.
+
+    impl ShapeSpec {
+        fn set_effects(&mut self, text: &str) {
+            let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
+            self.effects_utf8 = leaked.as_ptr();
+            self.effects_len = leaked.len();
+        }
+
+        fn with_effects(mut self, text: &str) -> Self {
+            self.set_effects(text);
+            self
+        }
+
+        fn with_shadow(
+            self,
+            angle_deg: f32,
+            distance_px: f32,
+            softness_px: f32,
+            spread_px: f32,
+            rgba: u32,
+        ) -> Self {
+            if rgba == 0 {
+                return self.with_effects("");
+            }
+            self.with_effects(&format!(
+                "s(a={angle_deg:.2},d={distance_px:.4},b={softness_px:.4},\
+p={spread_px:.4},c={rgba:08X})"
+            ))
+        }
+
+        /// The drop shadow this spec currently carries, for the tests that
+        /// change one of its numbers on a copy of another shape.
+        fn shadow_now(&self) -> TagShadow {
+            shadow_effect_of(effects_of(self)).unwrap_or_default()
+        }
+
+        fn with_softness(self, softness_px: f32) -> Self {
+            let sh = self.shadow_now();
+            self.with_shadow(sh.angle_deg, sh.distance_pts, softness_px, sh.spread_pts, sh.rgba)
+        }
+
+        fn with_spread(self, spread_px: f32) -> Self {
+            let sh = self.shadow_now();
+            self.with_shadow(sh.angle_deg, sh.distance_pts, sh.softness_pts, spread_px, sh.rgba)
+        }
+    }
+
+    /// The tag the writer produces, with the drop shadow's lengths given in
+    /// POINTS the way it used to take them.
+    ///
+    /// The writer takes the whole effects list as text now and knows nothing
+    /// about shadows, so the conversion lives here rather than in it.
+    fn shape_tag(
+        spec: &ShapeSpec,
+        width_pts: f32,
+        radius_pts: f32,
+        box_w_pts: f32,
+        box_h_pts: f32,
+        shadow_distance_pts: f32,
+        shadow_softness_pts: f32,
+        shadow_spread_pts: f32,
+    ) -> String {
+        let sh = spec.shadow_now();
+        let effects = if sh.rgba == 0 {
+            String::new()
+        } else {
+            format!(
+                "s(a={:.2},d={shadow_distance_pts:.4},b={shadow_softness_pts:.4},\
+p={shadow_spread_pts:.4},c={:08X})",
+                sh.angle_deg, sh.rgba
+            )
+        };
+
+        super::shape_tag(spec, width_pts, radius_pts, box_w_pts, box_h_pts, &effects)
+    }
+
+    /// The drop shadow on the shape a tag describes, named, for the tests that
+    /// were written when `parse_shape_tag` returned one.
+    fn tag_shadow(tag: &str) -> Option<TagShadow> {
+        parse_shape_tag(tag).and_then(|t| shadow_effect_of(&t.13))
+    }
+
+    /// The shadow-shaped call the drop shadow's tests were written against.
+    ///
+    /// The FFI itself is `restyle_shape_effects_annotation`, which takes the
+    /// whole effects list as text and knows nothing about shadows. This is the
+    /// convenience form, and it lives HERE rather than in the shipped ABI
+    /// because the shipped ABI does not get a per-effect entry point: the C#
+    /// side reaches the generic one directly, and so will the glow.
+    #[allow(clippy::too_many_arguments)]
+    fn restyle_shape_shadow_annotation(
+        doc_handle: u64,
+        page_index: i32,
+        index: i32,
+        capture_width: i32,
+        angle_deg: f32,
+        distance_px: f32,
+        softness_px: f32,
+        spread_px: f32,
+        rgba: u32,
+        out_new_index: *mut i32,
+    ) -> i32 {
+        let text = if rgba == 0 {
+            String::new()
+        } else {
+            format!(
+                "s(a={angle_deg:.2},d={distance_px:.4},b={softness_px:.4},\
+p={spread_px:.4},c={rgba:08X})"
+            )
+        };
+
+        restyle_shape_effects_annotation(
+            doc_handle, page_index, index, capture_width,
+            text.as_ptr(), text.len(), out_new_index)
+    }
+
     fn shape(kind: i32, x1: f32, y1: f32, x2: f32, y2: f32) -> ShapeSpec {
         ShapeSpec {
             page_index: 0,
@@ -9561,8 +9782,7 @@ mod tests {
             width_px: 3.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         }
     }
 
@@ -11421,7 +11641,7 @@ mod tests {
 
                 let (
                     kind, tr, tg, tb, ta, width_pts, fx, fy, tag_rot, fill_rgba,
-                    radius_pts, _, _, shadow,
+                    radius_pts, _, _, effects,
                 ) = parse_shape_tag(&tag).unwrap();
 
                 // Points back to capture pixels, the conversion the tag's
@@ -11440,12 +11660,8 @@ mod tests {
                     rotation_deg: tag_rot,
                     fill_rgba,
                     corner_radius_px: radius_pts * per_pt,
-                    shadow_angle_deg: shadow.map_or(0.0, |sh| sh.angle_deg),
-                    shadow_distance_px: shadow.map_or(0.0, |sh| sh.distance_pts * per_pt),
-                    shadow_softness_px: shadow.map_or(0.0, |sh| sh.softness_pts * per_pt),
-                    shadow_spread_px: shadow.map_or(0.0, |sh| sh.spread_pts * per_pt),
-                    shadow_rgba: shadow.map_or(0, |sh| sh.rgba),
-                });
+                    effects_utf8: std::ptr::null(), effects_len: 0,
+                }.with_effects(&scale_effect_lengths(&effects, per_pt)));
 
                 let (_, copy) = annotation_shape(handle, round).unwrap();
                 let got = (
@@ -11516,9 +11732,7 @@ mod tests {
         // were added.
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        s.shadow_rgba = 0xFF000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 14.1421;
+        s = s.with_shadow(135.0, 14.1421, 0.0, 0.0, 0xFF000000);
         add_one(handle, s);
 
         let (objects, _) = annotation_shape(handle, 0).expect("annotation missing");
@@ -11533,9 +11747,7 @@ mod tests {
         // the shaft alone is an arrow whose point floats free of it.
         let handle = open_fixture();
         let mut s = shape(SHAPE_ARROW, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0xFF000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 11.3137;
+        s = s.with_shadow(135.0, 11.3137, 0.0, 0.0, 0xFF000000);
         add_one(handle, s);
 
         let (objects, _) = annotation_shape(handle, 0).expect("annotation missing");
@@ -11556,9 +11768,7 @@ mod tests {
         let (_, plain) = annotation_shape(handle, 0).expect("annotation missing");
 
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        s.shadow_rgba = 0xFF000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 16.9706;
+        s = s.with_shadow(135.0, 16.9706, 0.0, 0.0, 0xFF000000);
         add_one(handle, s);
         let (_, cast) = annotation_shape(handle, 1).expect("annotation missing");
 
@@ -11580,18 +11790,14 @@ mod tests {
         let handle = open_fixture();
 
         let mut down = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        down.shadow_rgba = 0xFF000000;
         // Lit from directly above, so the shadow falls straight down.
-        down.shadow_angle_deg = 90.0;
-        down.shadow_distance_px = 20.0;
+        down = down.with_shadow(90.0, 20.0, 0.0, 0.0, 0xFF000000);
         add_one(handle, down);
         let (_, below) = annotation_shape(handle, 0).expect("annotation missing");
 
         let mut up = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        up.shadow_rgba = 0xFF000000;
         // Lit from directly below, so it falls straight up.
-        up.shadow_angle_deg = 270.0;
-        up.shadow_distance_px = 20.0;
+        up = up.with_shadow(270.0, 20.0, 0.0, 0.0, 0xFF000000);
         add_one(handle, up);
         let (_, above) = annotation_shape(handle, 1).expect("annotation missing");
 
@@ -11610,9 +11816,7 @@ mod tests {
         for rot in [0.0_f32, 30.0, 90.0, 180.0, 270.0] {
             let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
             s.rotation_deg = rot;
-            s.shadow_rgba = 0xFF000000;
-            s.shadow_angle_deg = 135.0;
-            s.shadow_distance_px = 14.1421;
+            s = s.with_shadow(135.0, 14.1421, 0.0, 0.0, 0xFF000000);
             add_one(handle, s);
         }
 
@@ -11636,15 +11840,13 @@ mod tests {
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
         s.a = 255;
-        s.shadow_rgba = 0x40336699;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 8.4853;
+        s = s.with_shadow(135.0, 8.4853, 0.0, 0.0, 0x40336699);
         add_one(handle, s);
 
         let tag = parse_shape_tag(&contents_of(handle, 0, 0).unwrap()).unwrap();
         assert_eq!(tag.4, 255, "the shape keeps its own alpha");
         assert_eq!(
-            tag.13.expect("the shadow is missing").rgba, 0x40336699,
+            shadow_effect_of(&tag.13).expect("the shadow is missing").rgba, 0x40336699,
             "the shadow keeps its own colour and alpha");
 
         close_document(handle);
@@ -11688,12 +11890,11 @@ mod tests {
         // cannot be recovered from an offset of zero length, so a user who
         // drags the distance to nothing and back would lose their direction.
         let mut s = shape(SHAPE_RECTANGLE, 10.0, 20.0, 90.0, 80.0);
-        s.shadow_rgba = 0xFF000000;
-        s.shadow_angle_deg = 217.5;
+        s = s.with_shadow(217.5, 0.0, 0.0, 0.0, 0xFF000000);
 
         let sh = parse_shape_tag(&shape_tag(&s, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
-            .expect("tag must parse")
-            .13.expect("the shadow is missing");
+            .expect("tag must parse");
+        let sh = shadow_effect_of(&sh.13).expect("the shadow is missing");
 
         assert_eq!(sh.distance_pts, 0.0, "distance really is nothing");
         assert_eq!(sh.angle_deg, 217.5, "and the direction survived it anyway");
@@ -11706,9 +11907,11 @@ mod tests {
     const CAP_PER_PT: f32 = 5.0;
 
     fn shadow_of(handle: u64, index: usize) -> Option<TagShadow> {
-        parse_shape_tag(&contents_of(handle, 0, index).unwrap())
-            .expect("the tag must still parse")
-            .13
+        shadow_effect_of(
+            &parse_shape_tag(&contents_of(handle, 0, index).unwrap())
+                .expect("the tag must still parse")
+                .13,
+        )
     }
 
     /// Everything about a shape EXCEPT its shadow, for the tests that have to
@@ -11747,9 +11950,7 @@ mod tests {
     fn an_existing_shadow_can_be_changed() {
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        s.shadow_rgba = 0xFF000000;
-        s.shadow_angle_deg = 45.0;
-        s.shadow_distance_px = 10.0;
+        s = s.with_shadow(45.0, 10.0, 0.0, 0.0, 0xFF000000);
         add_one(handle, s);
 
         let mut new_index = -1;
@@ -11774,9 +11975,7 @@ mod tests {
         // longer tag forever.
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        s.shadow_rgba = 0xFF000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 20.0;
+        s = s.with_shadow(135.0, 20.0, 0.0, 0.0, 0xFF000000);
         add_one(handle, s);
         assert!(shadow_of(handle, 0).is_some(), "it should start with one");
 
@@ -11977,9 +12176,7 @@ mod tests {
         // reported rectangle and hands it straight back.
         let handle = open_fixture();
         let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        sp.shadow_rgba = 0x80000000;
-        sp.shadow_angle_deg = 135.0;
-        sp.shadow_distance_px = 30.0;
+        sp = sp.with_shadow(135.0, 30.0, 0.0, 0.0, 0x80000000);
         add_one(handle, sp);
 
         let (w0, h0, ..) = geometry_of(handle, 0);
@@ -12123,10 +12320,7 @@ mod tests {
         let bare = object_kinds(handle, 0).len();
 
         let mut soft = plain;
-        soft.shadow_rgba = 0x80000000;
-        soft.shadow_angle_deg = 135.0;
-        soft.shadow_distance_px = 50.0;
-        soft.shadow_softness_px = 40.0;
+        soft = soft.with_shadow(135.0, 50.0, 40.0, 0.0, 0x80000000);
         add_one(handle, soft);
 
         // Before any picture is attached: a blur is not something render_core
@@ -12157,10 +12351,7 @@ mod tests {
         let handle = open_fixture();
 
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
-        s.shadow_softness_px = 40.0;
+        s = s.with_shadow(135.0, 50.0, 40.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         assert_eq!(shape_has_shadow_image(handle, 0, 0), 0, "a fresh shape has no picture");
@@ -12204,10 +12395,7 @@ mod tests {
         // rasterise, nothing to go soft, nothing new in the annotation.
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
-        s.shadow_softness_px = 0.0;
+        s = s.with_shadow(135.0, 50.0, 0.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let kinds = object_kinds(handle, 0);
@@ -12225,10 +12413,7 @@ mod tests {
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
         s.fill_rgba = 0xFF3B82F6;
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
-        s.shadow_softness_px = 40.0;
+        s = s.with_shadow(135.0, 50.0, 40.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let before = page_count_of_annotations(handle);
@@ -12262,16 +12447,15 @@ mod tests {
         // about it. This is the whole reason the box grows.
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
+        s = s.with_shadow(135.0, 50.0, 0.0, 0.0, 0x80000000);
 
-        s.shadow_softness_px = 0.0;
+        s = s.with_softness(0.0);
         add_one(handle, s);
         let (_, hard) = annotation_shape(handle, 0).unwrap();
 
         let mut soft = s;
-        soft.shadow_softness_px = 100.0; // 20pt of radius, so 15pt of reach
+        // 20pt of radius, so 15pt of reach
+        soft = soft.with_softness(100.0);
         add_one(handle, soft);
         let (_, blurred) = annotation_shape(handle, 1).unwrap();
 
@@ -12317,10 +12501,7 @@ mod tests {
     fn attaching_a_picture_leaves_the_shape_where_it_was() {
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
-        s.shadow_softness_px = 40.0;
+        s = s.with_shadow(135.0, 50.0, 40.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let before = geometry_of(handle, 0);
@@ -12342,10 +12523,7 @@ mod tests {
         // app rasterises a fresh one at the end of the same command.
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
-        s.shadow_softness_px = 40.0;
+        s = s.with_shadow(135.0, 50.0, 40.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let px = grey_tile(48, 48);
@@ -12384,10 +12562,7 @@ mod tests {
     fn clearing_the_picture_takes_it_away() {
         let handle = open_fixture();
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 135.0;
-        s.shadow_distance_px = 50.0;
-        s.shadow_softness_px = 40.0;
+        s = s.with_shadow(135.0, 50.0, 40.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let px = grey_tile(48, 48);
@@ -12431,9 +12606,7 @@ mod tests {
         s.a = 0xFF;
         s.width_px = 6.0;
         s.fill_rgba = 0; // stroke only
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 180.0;
-        s.shadow_distance_px = 250.0;
+        s = s.with_shadow(180.0, 250.0, 0.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let hist = added_pixels(&before, &page_snapshot(handle));
@@ -12463,9 +12636,7 @@ mod tests {
         s.b = 0;
         s.a = 0xFF;
         s.width_px = 6.0;
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 270.0;
-        s.shadow_distance_px = 150.0;
+        s = s.with_shadow(270.0, 150.0, 0.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let hist = added_pixels(&before, &page_snapshot(handle));
@@ -12486,9 +12657,7 @@ mod tests {
 
         let mut s = shape(SHAPE_RECTANGLE, 100.0, 100.0, 250.0, 200.0);
         s.fill_rgba = 0xFF3B82F6;
-        s.shadow_rgba = 0x80000000;
-        s.shadow_angle_deg = 180.0;
-        s.shadow_distance_px = 250.0;
+        s = s.with_shadow(180.0, 250.0, 0.0, 0.0, 0x80000000);
         add_one(handle, s);
 
         let hist = added_pixels(&before, &page_snapshot(handle));
@@ -12522,13 +12691,11 @@ mod tests {
         let handle = open_fixture();
 
         let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        plain.shadow_rgba = 0xFF000000;
-        plain.shadow_angle_deg = 135.0;
-        plain.shadow_distance_px = 10.0;
+        plain = plain.with_shadow(135.0, 10.0, 0.0, 0.0, 0xFF000000);
         add_one(handle, plain);
 
         let mut reserved = plain;
-        reserved.shadow_spread_px = 25.0;
+        reserved = reserved.with_spread(25.0);
         add_one(handle, reserved);
 
         let (objects_a, box_a) = annotation_shape(handle, 0).expect("annotation missing");
@@ -12541,8 +12708,8 @@ mod tests {
         assert_eq!(box_a.bottom.value, box_b.bottom.value, "bottom");
 
         let sh = parse_shape_tag(&contents_of(handle, 0, 1).unwrap())
-            .expect("tag must parse")
-            .13.expect("the shadow is missing");
+            .expect("tag must parse");
+        let sh = shadow_effect_of(&sh.13).expect("the shadow is missing");
         assert_eq!(sh.spread_pts, 25.0 * 0.2, "spread survived in points");
 
         close_document(handle);
@@ -12557,13 +12724,11 @@ mod tests {
         let handle = open_fixture();
 
         let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0);
-        plain.shadow_rgba = 0xFF000000;
-        plain.shadow_angle_deg = 135.0;
-        plain.shadow_distance_px = 10.0;
+        plain = plain.with_shadow(135.0, 10.0, 0.0, 0.0, 0xFF000000);
         add_one(handle, plain);
 
         let mut soft = plain;
-        soft.shadow_softness_px = 25.0;
+        soft = soft.with_softness(25.0);
         add_one(handle, soft);
 
         let (objects_a, box_a) = annotation_shape(handle, 0).expect("annotation missing");
@@ -12591,8 +12756,8 @@ mod tests {
         }
 
         let sh = parse_shape_tag(&contents_of(handle, 0, 1).unwrap())
-            .expect("tag must parse")
-            .13.expect("the shadow is missing");
+            .expect("tag must parse");
+        let sh = shadow_effect_of(&sh.13).expect("the shadow is missing");
         assert_eq!(sh.softness_pts, 25.0 * 0.2, "softness survived in points");
 
         close_document(handle);
@@ -12607,8 +12772,8 @@ mod tests {
             "{SHAPE_TAG}0:FF0000FF:2.0000:1:1:0.00:00000000:0.0000:0.0000:0.0000\
 :s(a=135.00,d=6.0000,b=0.0000,p=0.0000,c=FF000000,z=99)"
         );
-        let sh = parse_shape_tag(&tag).expect("tag must parse")
-            .13.expect("the shadow is missing");
+        let sh = shadow_effect_of(&parse_shape_tag(&tag).expect("tag must parse").13)
+            .expect("the shadow is missing");
 
         assert_eq!(sh.angle_deg, 135.0);
         assert_eq!(sh.rgba, 0xFF000000);
@@ -12631,7 +12796,7 @@ mod tests {
                 "{SHAPE_TAG}0:FF0000FF:2.0000:1:1:0.00:00000000:0.0000:0.0000:0.0000:{field}"
             );
             let t = parse_shape_tag(&tag).expect("the SHAPE must still parse");
-            assert!(t.13.is_none(), "wrongly accepted {field:?}");
+            assert!(shadow_effect_of(&t.13).is_none(), "wrongly accepted {field:?}");
         }
     }
 
@@ -12657,7 +12822,9 @@ mod tests {
         let legacy = format!("{SHAPE_TAG}0:FF0000FF:2.0000:1:1");
         let t = parse_shape_tag(&legacy).expect("a legacy tag must still parse");
 
-        assert!(t.13.is_none(), "an old tag has no shadow, and absence is not a zeroed one");
+        assert!(
+            shadow_effect_of(&t.13).is_none(),
+            "an old tag has no shadow, and absence is not a zeroed one");
     }
 
     #[test]
@@ -12667,12 +12834,11 @@ mod tests {
         // before anything renders it: a file written today must not lose it
         // when blurring arrives.
         let mut s = shape(SHAPE_RECTANGLE, 10.0, 20.0, 90.0, 80.0);
-        s.shadow_rgba = 0x80336699;
-        s.shadow_angle_deg = 135.0;
+        s = s.with_shadow(135.0, 0.0, 0.0, 0.0, 0x80336699);
 
         let tag = shape_tag(&s, 2.0, 0.0, 0.0, 0.0, 4.5, 3.25, 1.75);
-        let sh = parse_shape_tag(&tag).expect("a shadow tag must parse")
-            .13.expect("the shadow is missing");
+        let sh = shadow_effect_of(&parse_shape_tag(&tag).expect("a shadow tag must parse").13)
+            .expect("the shadow is missing");
 
         assert_eq!(sh.angle_deg, 135.0, "angle");
         assert_eq!(sh.distance_pts, 4.5, "distance");
@@ -12689,7 +12855,7 @@ mod tests {
         let mut s = shape(SHAPE_ELLIPSE, 10.0, 20.0, 90.0, 80.0);
         s.rotation_deg = 45.0;
         s.fill_rgba = 0x40FF0000;
-        s.shadow_rgba = 0xFF000000;
+        s = s.with_shadow(0.0, 0.0, 0.0, 0.0, 0xFF000000);
 
         let t = parse_shape_tag(&shape_tag(&s, 2.0, 6.0, 70.0, 50.0, 2.0, 0.0, 0.0))
             .expect("tag must parse");
@@ -12699,7 +12865,8 @@ mod tests {
         assert_eq!(t.10, 6.0, "radius");
         assert_eq!(t.11, 70.0, "box width");
         assert_eq!(t.12, 50.0, "box height");
-        assert_eq!(t.13.expect("shadow missing").rgba, 0xFF000000, "shadow");
+        assert_eq!(
+            shadow_effect_of(&t.13).expect("shadow missing").rgba, 0xFF000000, "shadow");
     }
 
     #[test]
@@ -13319,15 +13486,15 @@ mod tests {
 
         let specs = [
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 100.0, x2: 700.0, y2: 100.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_angle_deg: 0.0, shadow_distance_px: 0.0, shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0},
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, effects_utf8: std::ptr::null(), effects_len: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 80.0, y1: 200.0, x2: 700.0, y2: 320.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_angle_deg: 0.0, shadow_distance_px: 0.0, shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0},
+                        r: 0, g: 90, b: 200, a: 255, width_px: 8.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, effects_utf8: std::ptr::null(), effects_len: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_ARROW, x1: 700.0, y1: 420.0, x2: 80.0, y2: 420.0,
-                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_angle_deg: 0.0, shadow_distance_px: 0.0, shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0},
+                        r: 0, g: 140, b: 60, a: 255, width_px: 1.5, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, effects_utf8: std::ptr::null(), effects_len: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_RECTANGLE, x1: 80.0, y1: 500.0, x2: 350.0, y2: 640.0,
-                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_angle_deg: 0.0, shadow_distance_px: 0.0, shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0},
+                        r: 200, g: 0, b: 0, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, effects_utf8: std::ptr::null(), effects_len: 0},
             ShapeSpec { page_index: 0, kind: SHAPE_ELLIPSE, x1: 420.0, y1: 500.0, x2: 700.0, y2: 640.0,
-                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, shadow_angle_deg: 0.0, shadow_distance_px: 0.0, shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0},
+                        r: 0, g: 90, b: 200, a: 255, width_px: 3.0, rotation_deg: 0.0, fill_rgba: 0 , corner_radius_px: 0.0, effects_utf8: std::ptr::null(), effects_len: 0},
         ];
         assert_eq!(add_shape_annotations(handle, 1000, specs.as_ptr(), specs.len()), STATUS_OK_PDFIUM);
 
@@ -16346,8 +16513,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -16440,8 +16606,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -16478,8 +16643,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -16518,8 +16682,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -16876,8 +17039,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -16946,8 +17108,7 @@ mod tests {
             x1, y1, x2, y2,
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         let specs = [
             mk(SHAPE_RECTANGLE, 100.0, 100.0, 300.0, 200.0),
@@ -16998,8 +17159,7 @@ mod tests {
             x2: 0.40 * CAP as f32, y2: 0.50 * CAP as f32,
             r: 255, g: 0, b: 0, a: 255,
             width_px: 4.0, rotation_deg: 0.0, fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -17071,8 +17231,7 @@ mod tests {
                 width_px: 4.0,
                 rotation_deg: 0.0,
                 fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
             };
             assert_eq!(
                 add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -17138,8 +17297,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -17212,8 +17370,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -17284,8 +17441,7 @@ mod tests {
             width_px: 4.0,
             rotation_deg: 0.0,
             fill_rgba: 0, corner_radius_px: 0.0,
-            shadow_angle_deg: 0.0, shadow_distance_px: 0.0,
-            shadow_softness_px: 0.0, shadow_spread_px: 0.0, shadow_rgba: 0,
+            effects_utf8: std::ptr::null(), effects_len: 0,
         };
         assert_eq!(
             add_shape_annotations(handle, CAP, &spec as *const ShapeSpec, 1),
@@ -17980,6 +18136,327 @@ mod tests {
 
         close_document(handle);
     }
+
+    // ---------------- effects the core does not model ----------------
+    //
+    // The core carries a shape's effects from the caller to the tag and back,
+    // reserves the room their ink needs, and draws the one effect a PDF can
+    // express as paths. It does not know what effects exist. These are the
+    // tests of that claim, and they are deliberately written with effects this
+    // build has no name for: if they pass, adding one costs nothing here.
+    //
+    // The fixture page is 200pt wide against a 1000px capture, so a capture
+    // pixel is a fifth of a point.
+
+    /// One effect field, as the tag spells it, in capture pixels.
+    fn effect(kind: char, blur_px: f32, rgba: u32) -> String {
+        format!("{kind}(b={blur_px:.4},c={rgba:08X})")
+    }
+
+    #[test]
+    fn an_effect_this_build_cannot_name_reaches_the_tag() {
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0)
+                .with_effects("q(b=10.0000,c=FF00FF00,zz=7)"),
+        );
+
+        let tag = contents_of(handle, 0, 0).unwrap();
+
+        // Its lengths were converted like anybody's, its unknown key was left
+        // exactly as it arrived, and nothing refused it for being unfamiliar.
+        assert!(tag.contains("q(b=2.0000"), "the effect did not reach the tag: {tag}");
+        assert!(tag.contains("zz=7"), "an unknown key was dropped: {tag}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_effect_this_build_cannot_name_survives_a_move_a_resize_and_a_turn() {
+        // The reason to carry rather than model. Every one of these deletes the
+        // annotation and builds it again from its tag, so an effect the rebuild
+        // does not understand is exactly the kind of thing that gets dropped.
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0)
+                .with_effects("q(b=10.0000,c=FF00FF00,zz=7)"),
+        );
+
+        let mut idx = 0i32;
+        let mut out = -1;
+
+        assert_eq!(
+            resize_shape_annotation(handle, 0, idx, 1000, 100.0, 100.0, 700.0, 500.0, &mut out),
+            STATUS_OK_PDFIUM);
+        idx = out;
+        assert!(
+            contents_of(handle, 0, idx as usize).unwrap().contains("q(b=2.0000"),
+            "the resize dropped it");
+
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, idx, 1000, 30.0, &mut out), STATUS_OK_PDFIUM);
+        idx = out;
+        let turned = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(turned.contains("q(b=2.0000"), "the turn dropped it: {turned}");
+        assert!(turned.contains("zz=7"), "the turn dropped its unknown key: {turned}");
+
+        let (_, b) = annotation_shape(handle, idx as usize).unwrap();
+        assert_eq!(
+            move_shape_annotation(
+                handle, 0, idx, 1000,
+                (b.left.value + 2.0) * 5.0, (200.0 - b.top.value) * 5.0,
+                (b.right.value + 2.0) * 5.0, (200.0 - b.bottom.value) * 5.0,
+                &mut out),
+            STATUS_OK_PDFIUM);
+        assert!(
+            contents_of(handle, 0, out as usize).unwrap().contains("q(b=2.0000"),
+            "the move dropped it");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn two_effects_live_side_by_side_in_one_tag() {
+        // The tail is a LIST of self-describing fields, which is the whole
+        // reason it is not positional: either can be there without the other.
+        let handle = open_fixture();
+
+        let both = format!(
+            "s(a=135.00,d=50.0000,b=0.0000,p=0.0000,c=80000000):{}",
+            effect('q', 40.0, 0xFF00FF00));
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0).with_effects(&both));
+
+        let tag = contents_of(handle, 0, 0).unwrap();
+        assert!(tag.contains(":s("), "the shadow field is missing: {tag}");
+        assert!(tag.contains(":q("), "the second field is missing: {tag}");
+
+        let effects = parse_shape_tag(&tag).unwrap().13;
+        assert_eq!(effect_fields(&effects).count(), 2, "both fields must come back");
+        assert_eq!(
+            shadow_effect_of(&effects).expect("the shadow is missing").rgba, 0x80000000);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_effect_alone_needs_no_shadow_to_hold_its_place() {
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0)
+                .with_effects(&effect('q', 40.0, 0xFF00FF00)));
+
+        let tag = contents_of(handle, 0, 0).unwrap();
+        assert!(!tag.contains(":s("), "a shadow field was written for a shape with none");
+        assert!(tag.contains(":q("), "the effect is missing: {tag}");
+        assert!(
+            shadow_effect_of(&parse_shape_tag(&tag).unwrap().13).is_none(),
+            "a shadow appeared from nowhere");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_effect_with_nowhere_to_fall_opens_the_box_on_every_side() {
+        // A blur and a colour and no throw, which is what an outer glow is as
+        // far as this core is concerned. It needs no code here: the room comes
+        // from the same generic reach every effect gets, and the box opens
+        // evenly because there is no offset to lean it one way.
+        let handle = open_fixture();
+
+        let plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        add_one(handle, plain);
+        let (_, bare) = annotation_shape(handle, 0).unwrap();
+
+        // 50 capture pixels is 10 points of radius, so 15 points of reach.
+        add_one(handle, plain.with_effects(&effect('q', 50.0, 0xFF00FF00)));
+        let (_, lit) = annotation_shape(handle, 1).unwrap();
+
+        for (side, a, b, sign) in [
+            ("left", bare.left.value, lit.left.value, -1.0),
+            ("right", bare.right.value, lit.right.value, 1.0),
+            ("top", bare.top.value, lit.top.value, 1.0),
+            ("bottom", bare.bottom.value, lit.bottom.value, -1.0),
+        ] {
+            assert!(
+                ((b - (a + (sign * 15.0))) as f32).abs() < 0.01,
+                "{side}: expected 15 points of room, got {}", (b - a) * sign);
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_room_the_effects_need_is_the_widest_of_them() {
+        // Every effect is drawn from the same silhouette into the same picture,
+        // so the box holds the one that reaches furthest rather than their sum.
+        // Adding them up would grow the shape on every edit, which is a trap
+        // this pipeline has fallen into once already.
+        let handle = open_fixture();
+
+        let wide = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0)
+            .with_effects(&effect('q', 50.0, 0xFF00FF00));
+        add_one(handle, wide);
+        let (_, alone) = annotation_shape(handle, 0).unwrap();
+
+        let pair = format!("{}:{}", effect('q', 50.0, 0xFF00FF00), effect('w', 10.0, 0xFF0000FF));
+        add_one(handle, wide.with_effects(&pair));
+        let (_, together) = annotation_shape(handle, 1).unwrap();
+
+        for (side, a, b) in [
+            ("left", alone.left.value, together.left.value),
+            ("right", alone.right.value, together.right.value),
+            ("top", alone.top.value, together.top.value),
+            ("bottom", alone.bottom.value, together.bottom.value),
+        ] {
+            assert!(
+                (a - b).abs() < 0.01,
+                "{side}: a narrower second effect widened the box, so the reaches are \
+                 being added up: {a} against {b}");
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_room_an_effect_needs_does_not_become_the_shapes_size() {
+        // The trap the shadow's own reach was, and the reason growing and
+        // ungrowing the box are the same four numbers. An effect that opens all
+        // four sides would otherwise inflate the shape on every edit.
+        for rot in [0.0f32, 30.0] {
+            let handle = open_fixture();
+            let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+            sp.rotation_deg = rot;
+            add_one(handle, sp);
+
+            let text = effect('q', 40.0, 0xFF00FF00);
+            let mut idx = set_effects(handle, 0, &text);
+            let settled = geometry_of(handle, idx as usize);
+
+            for round in 2..=4 {
+                idx = set_effects(handle, idx, &text);
+                assert_eq!(
+                    geometry_of(handle, idx as usize), settled,
+                    "at {rot} degrees, effect edit {round} moved or resized the shape");
+            }
+
+            close_document(handle);
+        }
+    }
+
+    /// The generic effects edit, which is the only one the shipped ABI has.
+    fn set_effects(handle: u64, idx: i32, text: &str) -> i32 {
+        let mut out = -1;
+        assert_eq!(
+            restyle_shape_effects_annotation(
+                handle, 0, idx, 1000, text.as_ptr(), text.len(), &mut out),
+            STATUS_OK_PDFIUM,
+            "the effects edit was refused");
+        out
+    }
+
+    #[test]
+    fn the_generic_effects_edit_sets_changes_and_clears() {
+        let handle = open_fixture();
+        let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        sp.fill_rgba = 0xFF3B82F6;
+        add_one(handle, sp);
+        let before = geometry_of(handle, 0);
+
+        let idx = set_effects(handle, 0, "s(a=135.00,d=50.0000,b=0.0000,p=0.0000,c=80000000)");
+        assert_eq!(shadow_of(handle, idx as usize).expect("shadow").rgba, 0x80000000);
+
+        let idx = set_effects(handle, idx, &effect('q', 40.0, 0xFF00FF00));
+        assert!(
+            shadow_of(handle, idx as usize).is_none(),
+            "the list is replaced whole, so the shadow should be gone");
+        assert!(
+            contents_of(handle, 0, idx as usize).unwrap().contains(":q("),
+            "the new effect did not arrive");
+
+        let mut out = -1;
+        assert_eq!(
+            restyle_shape_effects_annotation(
+                handle, 0, idx, 1000, std::ptr::null(), 0, &mut out),
+            STATUS_OK_PDFIUM,
+            "a null clear was refused");
+        assert!(
+            !contents_of(handle, 0, out as usize).unwrap().contains(":q("),
+            "the effects were not cleared");
+
+        // WITHIN A HUNDREDTH OF A POINT, and set and cleared four times over.
+        //
+        // Not exact: opening the box by twelve points and closing it again is
+        // an f32 round trip, and 138.7 comes back as 138.70001. What matters is
+        // that it does not ACCUMULATE, which is what a shape growing on every
+        // edit would look like and what this loop actually watches. The exact
+        // statement lives next door, where the same edit is repeated without
+        // clearing.
+        let mut idx = out;
+        for round in 1..=4 {
+            idx = set_effects(handle, idx, &effect('q', 40.0, 0xFF00FF00));
+            let mut cleared = -1;
+            assert_eq!(
+                restyle_shape_effects_annotation(
+                    handle, 0, idx, 1000, std::ptr::null(), 0, &mut cleared),
+                STATUS_OK_PDFIUM);
+            idx = cleared;
+
+            let now = geometry_of(handle, idx as usize);
+            for (side, a, b) in [
+                ("left", before.3, now.3), ("bottom", before.4, now.4),
+                ("right", before.5, now.5), ("top", before.6, now.6),
+            ] {
+                assert!(
+                    (a - b).abs() < 0.01,
+                    "after {round} set-and-clear rounds the {side} edge drifted from {a} to {b}");
+            }
+        }
+        let out = idx;
+
+        // And the fill is not a casualty of any of it.
+        assert_eq!(
+            parse_shape_tag(&contents_of(handle, 0, out as usize).unwrap()).unwrap().9,
+            0xFF3B82F6,
+            "the fill was dropped");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_effects_edit_that_makes_no_sense_is_refused_whole() {
+        // Negative and infinite lengths are rejected rather than clamped, the
+        // same rule the shadow-shaped entry point had, now stated once for
+        // every effect there will ever be.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+
+        let mut out = -1;
+        for bad in [
+            "q(b=-1.0000,c=FF00FF00)",
+            "q(b=inf,c=FF00FF00)",
+            "q(b=1.0000,c=NOTHEX)",
+            "q(b=1.0000)",
+            "s(a=135.00,d=50.0000,b=0.0000,p=0.0000,c=80000000):q(b=-1.0000,c=FF00FF00)",
+        ] {
+            assert_eq!(
+                restyle_shape_effects_annotation(
+                    handle, 0, 0, 1000, bad.as_ptr(), bad.len(), &mut out),
+                STATUS_INVALID_INPUT,
+                "wrongly accepted {bad:?}");
+        }
+
+        assert!(
+            !contents_of(handle, 0, 0).unwrap().contains("q("),
+            "a refused edit still changed the shape");
+
+        close_document(handle);
+    }
+
 }
 
 

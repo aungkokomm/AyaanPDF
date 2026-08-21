@@ -86,11 +86,9 @@ public class ShapeRewriteWiringTests
     [InlineData("G")]
     [InlineData("B")]
     [InlineData("FillRgba")]
-    [InlineData("ShadowAngleDeg")]
-    [InlineData("ShadowDistancePx")]
-    [InlineData("ShadowSoftnessPx")]
-    [InlineData("ShadowSpreadPx")]
-    [InlineData("ShadowRgba")]
+    // One member for every effect there will ever be: the core carries the
+    // effects as text rather than modelling them, so this list does not grow.
+    [InlineData("Effects")]
     public void every_field_the_reader_returns_is_copied_into_the_interop_struct(string field)
     {
         // Read from the parsed values, not merely mentioned: the field has to
@@ -119,10 +117,13 @@ public class ShapeRewriteWiringTests
             {
                 int at = source.IndexOf("public readonly record struct " + name, StringComparison.Ordinal);
                 Assert.True(at > 0, $"{name} has been renamed; this test needs updating");
-                int close = source.IndexOf(");", at, StringComparison.Ordinal);
+                int close = source.IndexOf(")\r\n{", at, StringComparison.Ordinal) is int brace
+                    && brace > at && brace < source.IndexOf(");", at, StringComparison.Ordinal)
+                    ? brace
+                    : source.IndexOf(");", at, StringComparison.Ordinal);
                 return source[at..close].Count(c => c == ',') + 1;
             });
 
-        Assert.Equal(18, expected);
+        Assert.Equal(14, expected);
     }
 }

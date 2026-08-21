@@ -166,15 +166,21 @@ public class DropShadowRowWiringTests
     {
         // Not a delete and re-add of its own: the override is what preserves
         // the rotation, colour, width, fill and corners.
+        //
+        // ONE OVERRIDE FOR EVERY EFFECT. It used to be a shadow-shaped entry
+        // point, and a glow would have needed its own twin; the effects cross
+        // as text now, so this is the only one there will be.
         Assert.Contains(
-            "RenderCoreNative.restyle_shape_shadow_annotation(", ViewModel(), StringComparison.Ordinal);
+            "RenderCoreNative.restyle_shape_effects_annotation(",
+            ViewModel(),
+            StringComparison.Ordinal);
     }
 
     [Fact]
     public void the_interop_declaration_exists_for_it()
     {
         Assert.Contains(
-            "public static extern int restyle_shape_shadow_annotation(",
+            "public static extern int restyle_shape_effects_annotation(",
             FileFromRepo("PdfEditorApp", "Interop", "RenderCoreNative.cs"),
             StringComparison.Ordinal);
     }
@@ -182,8 +188,10 @@ public class DropShadowRowWiringTests
     [Fact]
     public void switching_the_row_off_clears_the_shadow_rather_than_hiding_it()
     {
-        // A null shadow becomes a zero colour, which is what the core reads as
-        // "no shadow" and what drops the field from the tag entirely.
+        // A null shadow becomes an EMPTY effects list, which is what the core
+        // reads as "no effects" and what drops the field from the tag entirely.
+        // Hiding it instead would leave an invisible shadow reserving room in
+        // the annotation's rectangle for ever.
         int at = ViewModel().IndexOf(
             "public void ApplyShadowToSelectedShape(", StringComparison.Ordinal);
         Assert.True(at > 0, "ApplyShadowToSelectedShape has been renamed; this test needs updating");
@@ -191,7 +199,7 @@ public class DropShadowRowWiringTests
         int end = ViewModel().IndexOf("\n    }", at, StringComparison.Ordinal);
         string body = ViewModel()[at..end];
 
-        Assert.Contains("shadow is { } s ? ShapeEffectsTag.RgbaOf(", body, StringComparison.Ordinal);
-        Assert.Contains(": 0", body, StringComparison.Ordinal);
+        Assert.Contains("ShapeEffectsTag.TextOf(", body, StringComparison.Ordinal);
+        Assert.Contains("shadow is { } s ? new ShapeEffects(s) : null", body, StringComparison.Ordinal);
     }
 }

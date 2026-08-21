@@ -36,6 +36,12 @@ namespace PdfEditorApp.Viewport;
 /// Skia into the annotation. <paramref name="ShadowSpreadPts"/> is RESERVED,
 /// stored and round-tripped and drawn by nothing. See <see cref="DropShadow"/>.
 ///
+/// <paramref name="EffectsText"/> is the tag's whole TAIL, verbatim: one
+/// self-describing field per effect. It is what a rebuild hands back to the
+/// core, which carries effects rather than modelling them, so a shape keeps an
+/// effect this build cannot name. The named Shadow fields above are the same
+/// data read for the one effect that has a UI.
+///
 /// <paramref name="BoxWidthPts"/> and <paramref name="BoxHeightPts"/> are the
 /// shape's own UPRIGHT size, in points, and are written only by a shape that is
 /// turned or rounded. Zero means "not recorded". They matter because a rotated
@@ -61,7 +67,8 @@ public readonly record struct ShapeTag(
     double ShadowDistancePts = 0,
     double ShadowSoftnessPts = 0,
     double ShadowSpreadPts = 0,
-    string? ShadowHex = null);
+    string? ShadowHex = null,
+    string EffectsText = "");
 
 /// <summary>
 /// Reads the tag a shape stores, the C# side of <c>parse_shape_tag</c> in
@@ -156,7 +163,7 @@ public static class ShapeTagReader
             return false;
         }
 
-        var shadow = ReadShadow(parts, 10);
+        var shadow = ShadowIn(parts.Length > 10 ? string.Join(":", parts[10..]) : "");
 
         tag = new ShapeTag(
             Kind: (ShapeKind)kindNumber,
@@ -173,27 +180,40 @@ public static class ShapeTagReader
             ShadowDistancePts: shadow.DistancePts,
             ShadowSoftnessPts: shadow.SoftnessPts,
             ShadowSpreadPts: shadow.SpreadPts,
-            ShadowHex: shadow.Hex);
+            ShadowHex: shadow.Hex,
+            EffectsText: parts.Length > 10 ? string.Join(":", parts[10..]) : "");
         return true;
     }
 
     /// <summary>
-    /// One shadow, as the tag spells it:
-    /// <c>s(a=135.00,d=6.0000,b=0.0000,p=0.0000,c=FF000000)</c>.
+    /// The DROP SHADOW inside an effects string, named, or nothing when there
+    /// is none: <c>s(a=135.00,d=6.0000,b=0.0000,p=0.0000,c=FF000000)</c>.
+    ///
+    /// The one effect with a UI, so the one that gets a named reader. The
+    /// effects text itself is carried around whole, because nothing between
+    /// here and the file needs to know what is in it.
     ///
     /// Anything malformed yields NO shadow, which is the same answer as a shape
     /// that never had one, and never a half-read one with invented values. The
-    /// C# half of <c>parse_shadow_field</c> in render_core.
+    /// C# half of <c>shadow_effect_of</c> in render_core.
     /// </summary>
-    private static (double AngleDeg, double DistancePts, double SoftnessPts,
-                    double SpreadPts, string? Hex) ReadShadow(string[] parts, int at)
+    public static (double AngleDeg, double DistancePts, double SoftnessPts,
+                   double SpreadPts, string? Hex) ShadowIn(string? effects)
     {
         var none = (0.0, 0.0, 0.0, 0.0, (string?)null);
-        if (at >= parts.Length) { return none; }
+        if (string.IsNullOrEmpty(effects)) { return none; }
 
-        string field = parts[at];
-        if (!field.StartsWith("s(", StringComparison.Ordinal)
-            || !field.EndsWith(")", StringComparison.Ordinal))
+        string? field = null;
+        foreach (string candidate in effects.Split(':'))
+        {
+            if (candidate.StartsWith("s(", StringComparison.Ordinal))
+            {
+                field = candidate;
+                break;
+            }
+        }
+
+        if (field is null || !field.EndsWith(")", StringComparison.Ordinal))
         {
             return none;
         }

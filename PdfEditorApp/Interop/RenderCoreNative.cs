@@ -194,20 +194,106 @@ internal struct NativeShapeSpec
     /// </summary>
     public float CornerRadiusPx;
     /// <summary>
-    /// Drop shadow offset in capture pixels and its colour as 0xAARRGGBB.
-    /// <see cref="ShadowRgba"/> of zero means NO SHADOW, which is what a
-    /// zero-init struct gets, so the offsets are only read when the colour says
-    /// there is something to draw. Same convention as <see cref="FillRgba"/>.
+    /// The shape's EFFECTS, as text, in the tag's own tail format: one
+    /// self-describing <c>kind(key=value,...)</c> field per effect, joined by
+    /// colons. <see cref="IntPtr.Zero"/> or a length of zero is a shape with no
+    /// effects, which is what a zero-init struct gets.
+    ///
+    /// ONE FIELD RATHER THAN A PAIR PER EFFECT. The core does not model effects
+    /// any more: it carries this through to the tag, reserves the room it asks
+    /// for, and draws the one effect a PDF can express as paths. Adding an
+    /// effect costs nothing here or there.
+    ///
+    /// Lengths inside are in capture pixels like <see cref="WidthPx"/> and
+    /// unlike the points the tag stores; the core converts on the way through.
+    /// The bytes must stay alive for the duration of the call, which is what
+    /// <see cref="NativeEffects"/> is for.
+    ///
     /// APPENDED for the same additive-ABI reason as everything above.
     /// </summary>
-    public float ShadowAngleDeg;
-    public float ShadowDistancePx;
-    /// <summary>RESERVED: carried across the FFI and written to the tag, drawn
-    /// by nothing. PDF has no blur primitive for a path object.</summary>
-    public float ShadowSoftnessPx;
-    /// <summary>RESERVED on the same terms as <see cref="ShadowSoftnessPx"/>.</summary>
-    public float ShadowSpreadPx;
-    public uint ShadowRgba;
+    public IntPtr EffectsUtf8;
+    public nuint EffectsLen;
+}
+
+/// <summary>
+/// One effects string, as unmanaged UTF-8 bytes for the length of a call.
+///
+/// <see cref="NativeShapeSpec"/> is an array crossing the ABI, so its effects
+/// cannot be a managed string: each element needs its own pointer, alive until
+/// the call returns. Allocated here and freed by the caller in a finally.
+/// </summary>
+internal static class NativeEffects
+{
+    /// <summary>Copies the text to unmanaged memory, or zero for none.</summary>
+    public static IntPtr Alloc(string? text, out nuint length)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            length = 0;
+
+            return IntPtr.Zero;
+        }
+
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text);
+        IntPtr buffer = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, buffer, bytes.Length);
+        length = (nuint)bytes.Length;
+
+        return buffer;
+    }
+
+    /// <summary>Releases what <see cref="Alloc"/> returned. Zero is a no-op.</summary>
+    public static void Free(IntPtr buffer)
+    {
+        if (buffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+}
+
+/// <summary>
+/// Adding shapes whose effects live in managed strings.
+///
+/// The core BORROWS the effects bytes for the length of the call, so they have
+/// to be unmanaged and they have to be freed afterwards. Wrapped here rather
+/// than at each call site: four places add shapes, and a missed free in any one
+/// of them is a leak nobody would notice.
+/// </summary>
+internal static class NativeShapes
+{
+    /// <summary>Adds several shapes, each with its own effects text.</summary>
+    public static int Add(
+        ulong docHandle, int captureWidth, NativeShapeSpec[] specs, string?[] effects)
+    {
+        var buffers = new IntPtr[specs.Length];
+
+        try
+        {
+            for (int at = 0; at < specs.Length; at++)
+            {
+                buffers[at] = NativeEffects.Alloc(
+                    at < effects.Length ? effects[at] : null, out nuint length);
+                specs[at].EffectsUtf8 = buffers[at];
+                specs[at].EffectsLen = length;
+            }
+
+            return RenderCoreNative.add_shape_annotations(
+                docHandle, captureWidth, specs, (nuint)specs.Length);
+        }
+        finally
+        {
+            foreach (IntPtr buffer in buffers)
+            {
+                NativeEffects.Free(buffer);
+            }
+        }
+    }
+
+    /// <summary>Adds one shape with its effects text.</summary>
+    public static int Add(
+        ulong docHandle, int captureWidth, NativeShapeSpec spec, string? effects) =>
+        Add(docHandle, captureWidth, new[] { spec }, new[] { effects });
 }
 
 /// <summary>
@@ -924,28 +1010,25 @@ internal static partial class RenderCoreNative
 
     /// <summary>
     /// Sets, changes or clears the DROP SHADOW on one of our shapes, leaving
-    /// its position, size, rotation, colour, width, fill and corners alone.
+    /// Sets, changes or clears ALL of a shape's EFFECTS, leaving its position,
+    /// size, rotation, colour, width, fill and corners alone.
     ///
-    /// A <paramref name="rgba"/> of ZERO clears the shadow, the same bargain
-    /// the fill makes, and the other four values are then ignored. Lengths are
-    /// in capture pixels, like the corner radius and unlike the points the tag
-    /// stores.
+    /// THE WHOLE LIST IS REPLACED, not merged: a caller changing one effect
+    /// sends all of them, and an EMPTY string clears the lot. One entry point
+    /// for every effect, which is why there is no second one to add when an
+    /// effect is.
     ///
-    /// <paramref name="softnessPx"/> and <paramref name="spreadPx"/> are stored
-    /// and round-tripped and drawn by nothing yet; passing them means a shape
-    /// does not lose them when the renderers catch up.
+    /// Lengths inside the text are in capture pixels, like the corner radius
+    /// and unlike the points the tag stores.
     /// </summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int restyle_shape_shadow_annotation(
+    public static extern int restyle_shape_effects_annotation(
         ulong docHandle,
         int pageIndex,
         int index,
         int captureWidth,
-        float angleDeg,
-        float distancePx,
-        float softnessPx,
-        float spreadPx,
-        uint rgba,
+        [In] byte[]? effectsUtf8,
+        nuint effectsLen,
         out int newIndex);
 
     /// <summary>

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Globalization;
 
 namespace PdfEditorApp.Viewport;
@@ -77,6 +78,62 @@ public static class ShapeEffectsTag
             new RenderColor(a, r, g, b),
             tag.ShadowSoftnessPts / pageWidthPts,
             tag.ShadowSpreadPts / pageWidthPts));
+    }
+
+    /// <summary>
+    /// These effects as the TAG and the core spell them: one self-describing
+    /// <c>kind(key=value,...)</c> field each, joined by colons, and an empty
+    /// string for none.
+    ///
+    /// THE ONE PLACE A KIND'S LETTER IS NAMED on this side. Everything else
+    /// about an effect crosses as the six numbers every effect shares, which is
+    /// what lets the core carry effects it knows nothing about.
+    ///
+    /// An effect with no colour paints nothing, so it is not written: the same
+    /// bargain the fill makes, and what lets "has a field" and "has an effect"
+    /// stay the same statement.
+    /// </summary>
+    /// <param name="scale">
+    /// What turns the model's normalized lengths into the space the caller
+    /// wants: the capture width for the core, the page width in points for the
+    /// tag itself.
+    /// </param>
+    public static string TextOf(ShapeEffects? effects, double scale)
+    {
+        if (effects is null || effects.IsEmpty)
+        {
+            return string.Empty;
+        }
+
+        var fields = new List<string>(effects.Specs.Count);
+
+        foreach (var spec in effects.Specs)
+        {
+            if (spec.Color.A == 0)
+            {
+                continue;
+            }
+
+            char kind = spec.Kind switch
+            {
+                EffectKind.DropShadow => 's',
+                _ => '\0',
+            };
+
+            if (kind == '\0')
+            {
+                continue;
+            }
+
+            uint rgba = ((uint)spec.Color.A << 24) | ((uint)spec.Color.R << 16)
+                | ((uint)spec.Color.G << 8) | spec.Color.B;
+
+            fields.Add(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{kind}(a={spec.AngleDeg:F2},d={spec.Distance * scale:F4},b={spec.Blur * scale:F4},p={spec.Amount * scale:F4},c={rgba:X8})"));
+        }
+
+        return string.Join(":", fields);
     }
 
     /// <summary>
