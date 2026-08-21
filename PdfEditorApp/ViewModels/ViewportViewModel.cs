@@ -3835,7 +3835,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     ///
     /// Normalized rather than DIPs so it survives a zoom, and cached at
     /// selection time so the overlay never pays an FFI to redraw.</summary>
-    private (double W, double H)? _selectedShapeBoxNorm;
+    /// <summary>
+    /// The selected shape's own tag, kept so the frame can be worked out from
+    /// the shape's CURRENT rectangle every time it is drawn.
+    ///
+    /// A remembered SIZE stood here and went stale the moment the shape was
+    /// resized: the commit updates the rectangle and redraws the outline, but
+    /// nothing recomputed the size, so the frame and its handles stayed at
+    /// whatever the shape measured when it was selected. The tag is the right
+    /// thing to keep because it does not change during a gesture; the size
+    /// does.
+    /// </summary>
+    private string? _selectedShapeTag;
 
     /// <summary>Every annotation, in draw order, as the layer stack.</summary>
     private List<IAnnotation> AllAnnotations()
@@ -4114,7 +4125,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // has the stroke pad off it, so the inset applies only to the
             // fallback, where the rectangle is still the raw /Rect.
             var frame = SelectionFrameOf(sel);
-            double p = _selectedIsShape && _selectedShapeBoxNorm is null
+            double p = _selectedIsShape && _selectedShapeTag is null
                 ? _selectedShapePadDips
                 : 0;
             double fl = frame.Left  * SlotLayoutWidth + p;
@@ -4596,7 +4607,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         _selectedRotationDeg = 0;
         _selectedShapePadDips = 0;
-        _selectedShapeBoxNorm = null;
+        _selectedShapeTag = null;
         _selectedIsRoundedRect = false;
         // Whether the selection is a shape is decided by whether its /Contents
         // parses as our shape tag; the shape check comes first because it is a
@@ -4677,19 +4688,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 ? (widthPts / 2.0 + 1.0) * SlotLayoutWidth / pageWpt
                 : 0;
 
-            // And the shape's OWN upright box, which for a turned shape is not
-            // its /Rect. The core owns that inversion because the resize and
-            // rebuild paths already needed it; see UprightBounds. The capture
-            // width is a scale that multiplies in and divides back out, so any
-            // positive value gives the same answer.
-            if (pageWpt > 0 && _selectedLoaded is LoadedSelection shapeSel)
-            {
-                const int Cap = 1000;
-                var up = UprightBounds(contents!, shapeSel, Cap, pageWpt);
-                double bw = up.Right - up.Left;
-                double bh = up.Bottom - up.Top;
-                if (bw > 0 && bh > 0) { _selectedShapeBoxNorm = (bw, bh); }
-            }
+            // The tag, so the frame can be worked out from the shape's own
+            // rectangle whenever it is drawn. See SelectionFrameOf.
+            _selectedShapeTag = contents;
         }
 
         if (!TextBoxTagReader.TryParse(contents, out var tag))
@@ -5163,11 +5164,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// One method for all three. A frame drawn in one rectangle and grabbed in
     /// another is worse than either mistake on its own, and before this they
     /// agreed only because both were wrong the same way.
+    ///
+    /// WORKED OUT EVERY TIME, from the shape's CURRENT rectangle. A remembered
+    /// size stood here and went stale the moment the shape was resized: the
+    /// commit updated the rectangle and redrew the outline, but nothing
+    /// recomputed the size, so the frame and its handles kept whatever the
+    /// shape measured when it was selected. Measured in the app, resizing a
+    /// rectangle from 0.3543 wide to 0.7628: the shape followed the drag
+    /// exactly and the frame stayed at 0.3543.
+    ///
+    /// It also has to be the whole rectangle rather than a size centred on the
+    /// annotation's own. A shadow grows /Rect on ONE side, which moves its
+    /// centre by half the offset, so a box centred there sat that far off the
+    /// shape. UprightBounds takes the stroke pad, the shadow's offset and the
+    /// blur's reach off all the right sides.
     /// </summary>
     private (double Left, double Top, double Right, double Bottom) SelectionFrameOf(
         LoadedSelection sel) =>
-        SelectionFrame.Upright(sel.Left, sel.Top, sel.Right, sel.Bottom,
-            _selectedShapeBoxNorm?.W ?? 0, _selectedShapeBoxNorm?.H ?? 0);
+        _selectedIsShape && _selectedShapeTag is string tag
+            ? UprightBounds(tag, sel, 1000, PagePointsFor(sel.PageIndex).W)
+            : (sel.Left, sel.Top, sel.Right, sel.Bottom);
 
     /// <summary>The handle under a point, accounting for the box's rotation: the
     /// pointer is turned back into the box's own upright frame first, then the
@@ -6027,6 +6043,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         StampSelectedIds();
         RecordBoundsBatch(undoTargets);
         CommitEdit();
+
+        // The write above rebuilt the shape from its tag and recorded a new
+        // upright size on it, so the cached tag is one gesture out of date.
+        // Everything the frame is worked out from has to come from after the
+        // edit, not before it.
+        if (_selectedIsShape && _selectedLoaded is LoadedSelection after)
+        {
+            _selectedShapeTag = ReadAnnotationContents(after.PageIndex, after.Index);
+        }
+
         RefreshSelectionOutline();
     }
 
