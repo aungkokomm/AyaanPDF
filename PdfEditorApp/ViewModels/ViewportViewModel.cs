@@ -7020,74 +7020,52 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
-    /// <summary>Reconstructs a NativeShapeSpec from a selected shape's tag, using
-    /// its own bounds. Returns false if the tag is malformed.</summary>
+    /// <summary>
+    /// Reconstructs a NativeShapeSpec from a selected shape's tag, at its own
+    /// bounds. Returns false if the tag is not a shape we can rebuild.
+    ///
+    /// The READING is done by ShapeWriter.TryForExistingShape, in the viewport
+    /// library, where a test can reach it. This method used to parse the tag
+    /// itself, and that copy read the first eight fields and dropped the rest:
+    /// three bugs of one kind came out of it, a duplicate losing its fill, a
+    /// duplicated rounded rectangle coming back square, and a duplicate losing
+    /// its drop shadow. None was caught by a test, because this class cannot be
+    /// loaded by the test assembly.
+    ///
+    /// What is left here is the copy into the interop struct and nothing else.
+    /// </summary>
     private static bool ShapeSpecFromTag(string contents, LoadedSelection sel,
         int captureWidth, out Interop.NativeShapeSpec spec)
     {
         spec = default;
-        string? rest = contents.StartsWith("AyaanShape:", StringComparison.Ordinal)
-            ? contents.Substring("AyaanShape:".Length) : null;
-        if (rest is null) { return false; }
-        string[] parts = rest.Split(':');
-        if (parts.Length < 5) { return false; }
-        if (!int.TryParse(parts[0], out int kind)) { return false; }
-        string rgba = parts[1];
-        if (rgba.Length != 8) { return false; }
-        byte r = byte.Parse(rgba.Substring(0, 2), System.Globalization.NumberStyles.HexNumber);
-        byte g = byte.Parse(rgba.Substring(2, 2), System.Globalization.NumberStyles.HexNumber);
-        byte b = byte.Parse(rgba.Substring(4, 2), System.Globalization.NumberStyles.HexNumber);
-        byte a = byte.Parse(rgba.Substring(6, 2), System.Globalization.NumberStyles.HexNumber);
-        if (!double.TryParse(parts[2], System.Globalization.NumberStyles.Float,
-            System.Globalization.CultureInfo.InvariantCulture, out double widthPts))
+
+        if (!ShapeWriter.TryForExistingShape(
+                contents, sel.Left, sel.Top, sel.Right, sel.Bottom, captureWidth,
+                out var rebuilt))
         {
             return false;
         }
-        bool fx = parts[3] == "1";
-        bool fy = parts[4] == "1";
-        double rot = parts.Length >= 6
-            && double.TryParse(parts[5], System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double rv) ? rv : 0;
-        // Fill lives at position 6 (kind, rgba, width, fx, fy, rot, FILL) as
-        // 8-char AARRGGBB hex. Older tags without it come back as 0 (stroke
-        // only), which was the historic default. Missing this field is what
-        // made Ctrl+drag drop the fill on the clone.
-        uint fillRgba = parts.Length >= 7
-            && parts[6].Length == 8
-            && uint.TryParse(parts[6], System.Globalization.NumberStyles.HexNumber,
-                System.Globalization.CultureInfo.InvariantCulture, out uint fv) ? fv : 0;
-        // Corner radius at position 7, in POINTS, for a rounded rectangle.
-        // Absent on every other kind and on every tag written before rounded
-        // rectangles existed, so a miss is 0, which draws square corners.
-        // Dropping it here would flatten the corners of a Ctrl-drag duplicate.
-        double radiusPts = parts.Length >= 8
-            && double.TryParse(parts[7], System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out double rr) ? rr : 0;
 
-        // The drag-direction flags let the arrow head keep its side.
-        float x1 = (float)((fx ? sel.Left : sel.Right) * captureWidth);
-        float x2 = (float)((fx ? sel.Right : sel.Left) * captureWidth);
-        float y1 = (float)((fy ? sel.Top : sel.Bottom) * captureWidth);
-        float y2 = (float)((fy ? sel.Bottom : sel.Top) * captureWidth);
-
-        // Tag stores width in POINTS; ShapeSpec wants capture-space pixels. Without
-        // the page width here we approximate: capture_width matches the writer's
-        // capture, so widthPts * (capture/page_w) - but page_w isn't exposed. Use
-        // widthPts directly; the resize path uses the same conversion the writer
-        // did, so a duplicate will be roughly the same visual width.
-        float widthPx = (float)widthPts;
+        var geometry = rebuilt.Geometry;
+        var style = rebuilt.Style;
 
         spec = new Interop.NativeShapeSpec
         {
-            PageIndex = sel.PageIndex, Kind = kind,
-            X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
-            R = r, G = g, B = b, A = a,
-            WidthPx = widthPx, RotationDeg = (float)rot,
-            FillRgba = fillRgba,
-            // Same points-as-pixels approximation the width above uses, for the
-            // same reason: the page width is not available here.
-            CornerRadiusPx = (float)radiusPts,
+            // The page is the SELECTION's, not the tag's: a paste puts the copy
+            // on the page being pasted into.
+            PageIndex = sel.PageIndex,
+            Kind = (int)geometry.Kind,
+            X1 = geometry.X1, Y1 = geometry.Y1, X2 = geometry.X2, Y2 = geometry.Y2,
+            R = style.R, G = style.G, B = style.B, A = style.A,
+            WidthPx = geometry.StrokeWidthPx,
+            RotationDeg = geometry.RotationDeg,
+            FillRgba = style.FillRgba,
+            CornerRadiusPx = geometry.CornerRadiusPx,
+            ShadowDxPx = style.ShadowDxPx,
+            ShadowDyPx = style.ShadowDyPx,
+            ShadowRgba = style.ShadowRgba,
         };
+
         return true;
     }
 
