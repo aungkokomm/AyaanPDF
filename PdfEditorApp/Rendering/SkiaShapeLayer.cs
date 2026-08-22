@@ -157,11 +157,6 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
 
         LastDrawnCount = visible.Count;
 
-        int gradientIn = 0, gradientVisible = 0;
-        foreach (var it in _items) { if (it.Fill.Gradient is not null) { gradientIn++; } }
-        foreach (var it in visible) { if (it.Fill.Gradient is not null) { gradientVisible++; } }
-        int drawsBefore = ShapeSkiaPainter.GradientDraws;
-
         if (visible.Count > 0)
         {
             // The matrix and the painting both live in the rendering project,
@@ -174,13 +169,6 @@ internal sealed partial class SkiaShapeLayer : SKXamlCanvas
         }
 
         canvas.RestoreToCount(saved);
-
-        GradientTrace.Once(
-            "paint",
-            $"scope={plan.Scope} surface={e.Info.Width}x{e.Info.Height} clip=({plan.Rect.L},{plan.Rect.T})-({plan.Rect.R},{plan.Rect.B}) "
-            + $"items={_items.Count} visible={visible.Count} gradientIn={gradientIn} gradientVisible={gradientVisible} "
-            + $"gradientDraws={ShapeSkiaPainter.GradientDraws - drawsBefore} "
-            + $"lastGradientSlot={ShapeSkiaPainter.LastGradientSlot}");
 
         // Only now, and only because the paint above actually happened.
         _dirty.Painted(plan);

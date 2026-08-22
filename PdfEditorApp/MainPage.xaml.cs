@@ -6326,7 +6326,6 @@ public sealed partial class MainPage : Page
 
         if (!on || ViewModel.OverlayScale <= 0)
         {
-            GradientTrace.Once("refresh", $"EARLY OUT on={on} overlayScale={ViewModel.OverlayScale:F3}");
             return;
         }
 
@@ -6346,16 +6345,8 @@ public sealed partial class MainPage : Page
 
         // Prepared first, and bounded to the pages in view: a page entering the
         // range is loaded once, and one already prepared costs a lookup.
-        int baseCount = frame.Count;
         ViewModel.PrepareGradientOverlay();
         frame.AddRange(ViewModel.GradientOverlayItems);
-
-        GradientTrace.Once(
-            "refresh",
-            $"base={baseCount} gradientItems={frame.Count - baseCount} total={frame.Count} scale={ViewModel.OverlayScale:F3}"
-            + (frame.Count > baseCount
-                ? $" first=[page={frame[baseCount].PageIndex} pts={frame[baseCount].Points.Count} style={frame[baseCount].Style} grad={(frame[baseCount].Fill.Gradient is { } g0 ? $"({g0.X0:F3},{g0.Y0:F3})->({g0.X1:F3},{g0.Y1:F3}) #{g0.From.R:X2}{g0.From.G:X2}{g0.From.B:X2}->#{g0.To.R:X2}{g0.To.G:X2}{g0.To.B:X2}" : "NONE")}]"
-                : ""));
 
         SkiaShapeCanvas.Show(
             frame,
