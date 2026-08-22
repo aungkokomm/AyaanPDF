@@ -8303,6 +8303,10 @@ fn buffer_to_result(width: i32, height: i32, buf: Vec<u8>, status: i32) -> Rende
     RenderResult { width: w, height: h, buffer: ptr, len, status }
 }
 
+/// A SPIKE, test-only and called by nothing. See the file for what it asks.
+#[cfg(test)]
+mod gradient_spike;
+
 #[cfg(test)]
 mod tests {
     use super::*;
