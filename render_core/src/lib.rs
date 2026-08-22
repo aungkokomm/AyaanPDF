@@ -8314,6 +8314,163 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
 
+    // ---------------- INSPECTION ONLY: existing PDF text ----------------
+    //
+    // Not a regression test. `#[ignore]`d so it never runs in CI; run with
+    // `cargo test --release existing_text_spike -- --ignored --nocapture` to
+    // print what PDFium actually reports and permits for text this app did not
+    // author. Delete once the answers are recorded in the plan.
+
+    #[test]
+    #[ignore]
+    fn existing_text_spike_what_the_page_objects_are() {
+        use pdfium_render::prelude::*;
+
+        for name in ["sample.pdf", "sample_styled.pdf", "sample_20pages.pdf"] {
+            let handle = open_fixture_named(&format!("tests/fixtures/{name}"));
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+
+            let objects = page.objects();
+            let mut kinds = std::collections::BTreeMap::new();
+            for i in 0..objects.len() {
+                let Ok(obj) = objects.get(i) else { continue };
+                let kind = match &obj {
+                    PdfPageObject::Text(_) => "text",
+                    PdfPageObject::Path(_) => "path",
+                    PdfPageObject::Image(_) => "image",
+                    PdfPageObject::Shading(_) => "shading",
+                    PdfPageObject::XObjectForm(_) => "form",
+                    _ => "other",
+                };
+                *kinds.entry(kind).or_insert(0usize) += 1;
+            }
+
+            println!("\n=== {name}: {} objects {:?}", objects.len(), kinds);
+
+            for i in 0..objects.len().min(6) {
+                let Ok(obj) = objects.get(i) else { continue };
+                let PdfPageObject::Text(t) = &obj else { continue };
+
+                let font = t.font();
+                let embedded = font.is_embedded().map(|b| b.to_string())
+                    .unwrap_or_else(|e| format!("err {e:?}"));
+                let data = font.data().map(|d| d.len().to_string())
+                    .unwrap_or_else(|e| format!("err {e:?}"));
+
+                println!(
+                    "  #{i} text={:?} font={:?} family={:?} size={} embedded={} data_bytes={}",
+                    t.text(), font.name(), font.family(),
+                    t.unscaled_font_size().value, embedded, data);
+            }
+
+            drop(page);
+            drop(doc_guard);
+            drop(doc);
+            drop(_guard);
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn existing_text_spike_can_pdfium_replace_the_words() {
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample.pdf");
+
+        // ASCII the original almost certainly has, then a character it almost
+        // certainly does not: the question a subset font decides.
+        for replacement in ["EDITED", "Edited \u{e9}\u{2014}", "\u{1000}\u{1031}"] {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let mut page = doc_guard.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(
+                PdfPageContentRegenerationStrategy::Manual);
+
+            let mut before = String::new();
+            let mut set = "no text object".to_string();
+
+            let count = page.objects().len();
+            for i in 0..count {
+                let Ok(mut obj) = page.objects().get(i) else { continue };
+                let PdfPageObject::Text(t) = &mut obj else { continue };
+                before = t.text();
+                set = match t.set_text(replacement) {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("{e:?}"),
+                };
+                break;
+            }
+
+            let regen = page.regenerate_content().map(|_| "ok".to_string())
+                .unwrap_or_else(|e| format!("{e:?}"));
+
+            // What the TEXT PAGE says afterwards, which is what search, the
+            // text layer and every reader would see.
+            let after: String = page.text()
+                .map(|tp| tp.all().chars().take(60).collect())
+                .unwrap_or_else(|_| "<no text page>".to_string());
+
+            println!(
+                "\nreplace with {replacement:?}\n  before={before:?}\n  set_text={set} regenerate={regen}\n  page text now={after:?}");
+
+            drop(page);
+            drop(doc_guard);
+            drop(doc);
+            drop(_guard);
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    #[ignore]
+    fn existing_text_spike_geometry_and_the_round_trip_guard() {
+        use pdfium_render::prelude::*;
+
+        for replacement in ["Hi", "EDITED", "a much longer replacement than the original", "caf\u{e9}"] {
+            let handle = open_fixture_named("tests/fixtures/sample.pdf");
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let mut page = doc_guard.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(
+                PdfPageContentRegenerationStrategy::Manual);
+
+            let mut line = String::new();
+            for i in 0..page.objects().len() {
+                let Ok(mut obj) = page.objects().get(i) else { continue };
+                let before_box = obj.bounds().ok()
+                    .map(|r| (r.left().value, r.right().value, r.top().value));
+                let PdfPageObject::Text(t) = &mut obj else { continue };
+
+                let _ = t.set_text(replacement);
+
+                let read_back = t.text();
+                let after_box = t.bounds().ok()
+                    .map(|r| (r.left().value, r.right().value, r.top().value));
+
+                line = format!(
+                    "asked={replacement:?}\n    read back={read_back:?}  faithful={}\n    box before={before_box:?}\n    box after ={after_box:?}",
+                    read_back == replacement);
+                break;
+            }
+
+            let _ = page.regenerate_content();
+            println!("\n  {line}");
+
+            drop(page);
+            drop(doc_guard);
+            drop(doc);
+            drop(_guard);
+            close_document(handle);
+        }
+    }
+
     fn open_fixture() -> u64 {
         open_fixture_named("tests/fixtures/sample.pdf")
     }
