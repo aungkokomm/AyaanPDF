@@ -759,6 +759,138 @@
                                   Visibility="Collapsed" />
 
         <!--
+            The Gradient panel: MOVABLE, and outside every flyout.
+
+            It used to be an expander inside the Fill flyout, which was the
+            wrong control for it twice over. A flyout is light-dismiss, so
+            clicking the page to look at the shape closed it; and it is anchored
+            to its button, so it sat over the document however little room there
+            was. Setting a gradient means dragging four controls while WATCHING
+            the shape, and a flyout allows neither.
+
+            Positioned exactly as ObjectToolbar is, and for the reason recorded
+            there: page cards carry a ThemeShadow and are therefore raised in
+            the composition tree, so anything left at ground level is drawn
+            behind the paper whatever its ZIndex says. Position and elevation
+            both go through Translation, set in code; a RenderTransform would
+            drive the same composition visual and quietly win, Z included.
+        -->
+        <Border x:Name="GradientPanelWindow" Grid.Column="2"
+                HorizontalAlignment="Left" VerticalAlignment="Top"
+                Visibility="Collapsed" Canvas.ZIndex="30" Translation="0,0,40"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="8"
+                SizeChanged="GradientPanelWindow_SizeChanged">
+            <StackPanel Width="264">
+
+                <!-- Title bar: the drag handle, and the only way to move it. -->
+                <Grid x:Name="GradientPanelTitleBar" Height="32" Padding="10,0,4,0"
+                      Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                      PointerPressed="GradientPanelTitle_PointerPressed"
+                      PointerMoved="GradientPanelTitle_PointerMoved"
+                      PointerReleased="GradientPanelTitle_PointerReleased"
+                      PointerCaptureLost="GradientPanelTitle_PointerCaptureLost">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <TextBlock Grid.Column="0" Text="Gradient" VerticalAlignment="Center"
+                               FontSize="12" FontWeight="SemiBold" />
+
+                    <Button Grid.Column="1" x:Name="GradientPanelClose"
+                            Width="28" Height="24" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            AutomationProperties.Name="Close the gradient panel"
+                            ToolTipService.ToolTip="Close"
+                            Click="GradientPanelClose_Click">
+                        <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE711;" FontSize="12" />
+                    </Button>
+                </Grid>
+
+                <StackPanel Padding="10" Spacing="8">
+                    <StackPanel x:Name="GradientSection"
+                              HorizontalAlignment="Stretch">
+                        <StackPanel x:Name="GradientRows" Spacing="8">
+                            <ToggleSwitch x:Name="GradientToggle" Header="Gradient fill"
+                                          OnContent="On" OffContent="Off"
+                                          Toggled="Gradient_Toggled" />
+
+                            <StackPanel x:Name="GradientControlsPanel" Spacing="8">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <TextBlock Text="Start" VerticalAlignment="Center" MinWidth="42" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Border x:Name="GradientStartSwatch" Width="24" Height="24" CornerRadius="4"
+                                            BorderBrush="#66000000" BorderThickness="1" VerticalAlignment="Center" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Blue" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Red" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Green" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFB900" Tag="#FFFFB900" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Amber" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FF000000" Tag="#FF000000" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Black" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="White" />
+                                </StackPanel>
+
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <TextBlock Text="End" VerticalAlignment="Center" MinWidth="42" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Border x:Name="GradientEndSwatch" Width="24" Height="24" CornerRadius="4"
+                                            BorderBrush="#66000000" BorderThickness="1" VerticalAlignment="Center" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Blue" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Red" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Green" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFB900" Tag="#FFFFB900" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Amber" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FF000000" Tag="#FF000000" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Black" />
+                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="White" />
+                                </StackPanel>
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Angle" VerticalAlignment="Center" MinWidth="42" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Slider x:Name="GradientAngleSlider" Width="126"
+                                            Maximum="359" Minimum="0" StepFrequency="1"
+                                            VerticalAlignment="Center"
+                                            AutomationProperties.Name="Gradient direction in degrees"
+                                            ValueChanged="Gradient_ValueChanged" />
+                                    <TextBlock x:Name="GradientAngleReadout" VerticalAlignment="Center"
+                                               MinWidth="34" TextAlignment="Right" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                </StackPanel>
+
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <TextBlock Text="Spread" VerticalAlignment="Center" MinWidth="42" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <Slider x:Name="GradientSpreadSlider" Width="126"
+                                            Maximum="500" Minimum="10" StepFrequency="5"
+                                            VerticalAlignment="Center"
+                                            AutomationProperties.Name="Gradient ramp length as a percentage"
+                                            ToolTipService.ToolTip="How long the ramp is. Below 100% each end fills flat; above 100% the shape shows only the middle of the ramp."
+                                            ValueChanged="Gradient_ValueChanged" />
+                                    <TextBlock x:Name="GradientSpreadReadout" VerticalAlignment="Center"
+                                               MinWidth="34" TextAlignment="Right" FontSize="12"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                </StackPanel>
+
+                                <Button x:Name="GradientSwapButton" Content="Swap colours"
+                                        HorizontalAlignment="Stretch" Height="28" FontSize="12"
+                                        AutomationProperties.Name="Swap the gradient's two colours"
+                                        Click="GradientSwap_Click" />
+
+                                <Border x:Name="GradientPreview" Height="22" CornerRadius="4"
+                                        BorderBrush="#66000000" BorderThickness="1" />
+                            </StackPanel>
+
+                            <TextBlock x:Name="GradientNoSelectionHint"
+                                       Text="Select a shape to give it a gradient."
+                                       FontSize="12" TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                                </StackPanel>
+                </StackPanel>
+            </StackPanel>
+        </Border>
+
+        <!--
             Contextual object toolbar. Floats over the viewport and follows the
             selection, so object commands are reachable without going to the
             menu. This is now the primary route to Group and Ungroup, because
@@ -1775,82 +1907,11 @@
                                     <!-- Gradient. A FILL, not an effect: it is what the
                                          inside of the shape is painted with, so it lives
                                          beside the solid colours it replaces. -->
-                                    <Expander x:Name="GradientSection" Header="Gradient"
-                                              HorizontalAlignment="Stretch" IsExpanded="False">
-                                        <StackPanel x:Name="GradientRows" Spacing="8" Width="238">
-                                            <ToggleSwitch x:Name="GradientToggle" Header="Gradient fill"
-                                                          OnContent="On" OffContent="Off"
-                                                          Toggled="Gradient_Toggled" />
-
-                                            <StackPanel x:Name="GradientControlsPanel" Spacing="8">
-                                                <StackPanel Orientation="Horizontal" Spacing="6">
-                                                    <TextBlock Text="Start" VerticalAlignment="Center" MinWidth="42" FontSize="12"
-                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                                    <Border x:Name="GradientStartSwatch" Width="24" Height="24" CornerRadius="4"
-                                                            BorderBrush="#66000000" BorderThickness="1" VerticalAlignment="Center" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Blue" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Red" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Green" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFB900" Tag="#FFFFB900" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Amber" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FF000000" Tag="#FF000000" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Black" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="GradientStart_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="White" />
-                                                </StackPanel>
-
-                                                <StackPanel Orientation="Horizontal" Spacing="6">
-                                                    <TextBlock Text="End" VerticalAlignment="Center" MinWidth="42" FontSize="12"
-                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                                    <Border x:Name="GradientEndSwatch" Width="24" Height="24" CornerRadius="4"
-                                                            BorderBrush="#66000000" BorderThickness="1" VerticalAlignment="Center" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Blue" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Red" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FF107C10" Tag="#FF107C10" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Green" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFB900" Tag="#FFFFB900" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Amber" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FF000000" Tag="#FF000000" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Black" />
-                                                    <Button Width="22" Height="22" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="GradientEnd_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="White" />
-                                                </StackPanel>
-
-                                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                                    <TextBlock Text="Angle" VerticalAlignment="Center" MinWidth="42" FontSize="12"
-                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                                    <Slider x:Name="GradientAngleSlider" Width="126"
-                                                            Maximum="359" Minimum="0" StepFrequency="1"
-                                                            VerticalAlignment="Center"
-                                                            AutomationProperties.Name="Gradient direction in degrees"
-                                                            ValueChanged="Gradient_ValueChanged" />
-                                                    <TextBlock x:Name="GradientAngleReadout" VerticalAlignment="Center"
-                                                               MinWidth="34" TextAlignment="Right" FontSize="12"
-                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                                </StackPanel>
-
-                                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                                    <TextBlock Text="Spread" VerticalAlignment="Center" MinWidth="42" FontSize="12"
-                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                                    <Slider x:Name="GradientSpreadSlider" Width="126"
-                                                            Maximum="500" Minimum="10" StepFrequency="5"
-                                                            VerticalAlignment="Center"
-                                                            AutomationProperties.Name="Gradient ramp length as a percentage"
-                                                            ToolTipService.ToolTip="How long the ramp is. Below 100% each end fills flat; above 100% the shape shows only the middle of the ramp."
-                                                            ValueChanged="Gradient_ValueChanged" />
-                                                    <TextBlock x:Name="GradientSpreadReadout" VerticalAlignment="Center"
-                                                               MinWidth="34" TextAlignment="Right" FontSize="12"
-                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                                </StackPanel>
-
-                                                <Button x:Name="GradientSwapButton" Content="Swap colours"
-                                                        HorizontalAlignment="Stretch" Height="28" FontSize="12"
-                                                        AutomationProperties.Name="Swap the gradient's two colours"
-                                                        Click="GradientSwap_Click" />
-
-                                                <Border x:Name="GradientPreview" Height="22" CornerRadius="4"
-                                                        BorderBrush="#66000000" BorderThickness="1" />
-                                            </StackPanel>
-
-                                            <TextBlock x:Name="GradientNoSelectionHint"
-                                                       Text="Select a shape to give it a gradient."
-                                                       FontSize="12" TextWrapping="Wrap"
-                                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                        </StackPanel>
-                                    </Expander>
+                                    <Button x:Name="GradientOpenButton" Content="Gradient…"
+                                            HorizontalAlignment="Stretch" Height="30" FontSize="12"
+                                            AutomationProperties.Name="Open the gradient panel"
+                                            ToolTipService.ToolTip="Opens a movable panel, so the shape stays visible while you set the gradient"
+                                            Click="GradientOpen_Click" />
                                 </StackPanel>
                             </Flyout>
                         </Button.Flyout>

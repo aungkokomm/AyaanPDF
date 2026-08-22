@@ -54,19 +54,115 @@ public class GradientRowWiringTests
     // ---------------- where it lives ----------------
 
     [Fact]
-    public void the_row_is_in_the_fill_flyout_and_not_in_effects()
+    public void the_gradient_is_reached_from_fill_and_not_from_effects()
     {
         // A gradient is what the inside of the shape is PAINTED with. A shadow
-        // and a glow are marks made beside it. Putting the gradient in Effects
-        // would be filing it under the one thing it is not.
+        // and a glow are marks made beside it. Filing the gradient under
+        // Effects would file it under the one thing it is not.
+        //
+        // The ROW itself is no longer in the flyout, because a flyout is the
+        // wrong control for it; what has to stay in Fill is the way in.
         string xaml = Xaml();
 
         int fill = xaml.IndexOf("x:Name=\"FillFlyout\"", StringComparison.Ordinal);
-        int gradient = xaml.IndexOf("x:Name=\"GradientSection\"", StringComparison.Ordinal);
+        int opener = xaml.IndexOf("x:Name=\"GradientOpenButton\"", StringComparison.Ordinal);
         int effects = xaml.IndexOf("x:Name=\"EffectRows\"", StringComparison.Ordinal);
 
-        Assert.True(fill > 0 && gradient > fill, "the gradient row is not inside the fill flyout");
-        Assert.True(gradient < effects, "the gradient row ended up in the effects flyout");
+        Assert.True(fill > 0 && opener > fill, "the way into the gradient is not in the fill flyout");
+        Assert.True(opener < effects, "the way into the gradient ended up in the effects flyout");
+    }
+
+    // ---------------- and it is a movable panel, not a flyout ----------------
+
+    [Fact]
+    public void the_gradient_row_is_no_longer_inside_any_flyout()
+    {
+        // The whole point. A flyout is light dismiss, so clicking the page to
+        // look at the shape closed it, and it is anchored to its button, so it
+        // covered the document. Setting a gradient is dragging four controls
+        // while watching the shape.
+        string xaml = Xaml();
+
+        int panel = xaml.IndexOf("x:Name=\"GradientPanelWindow\"", StringComparison.Ordinal);
+        int row = xaml.IndexOf("x:Name=\"GradientSection\"", StringComparison.Ordinal);
+        int fill = xaml.IndexOf("x:Name=\"FillFlyout\"", StringComparison.Ordinal);
+
+        Assert.True(panel > 0, "there is no gradient panel");
+        Assert.True(row > panel, "the gradient row is not inside the panel");
+        Assert.True(row < fill, "the gradient row is still down in the fill flyout");
+    }
+
+    [Fact]
+    public void the_panel_has_a_title_bar_that_can_be_dragged_and_a_way_to_close_it()
+    {
+        string xaml = Xaml();
+
+        Assert.Contains("x:Name=\"GradientPanelTitleBar\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("GradientPanelTitle_PointerPressed", xaml, StringComparison.Ordinal);
+        Assert.Contains("GradientPanelTitle_PointerMoved", xaml, StringComparison.Ordinal);
+        Assert.Contains("GradientPanelTitle_PointerReleased", xaml, StringComparison.Ordinal);
+        Assert.Contains("GradientPanelClose_Click", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_lost_pointer_capture_ends_the_drag()
+    {
+        // Capture can be taken away without a release: a system gesture,
+        // another window. Without this the panel follows the pointer with no
+        // button held.
+        Assert.Contains("GradientPanelTitle_PointerCaptureLost", Xaml(), StringComparison.Ordinal);
+        Assert.Contains(
+            "private void GradientPanelTitle_PointerCaptureLost", Code(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_panel_is_moved_by_translation_and_never_by_a_render_transform()
+    {
+        // THE TRAP, recorded on ObjectToolbarPlacement.Elevation and paid for
+        // once already: a RenderTransform drives the same composition visual as
+        // Translation and wins, taking the Z with it. The panel is then drawn
+        // behind every page card, because each card is raised by its own
+        // ThemeShadow and Canvas.ZIndex does not reach across depth.
+        string body = PageMethodBody("private void PlaceGradientPanel()");
+
+        Assert.Contains("GradientPanelWindow.Translation", body, StringComparison.Ordinal);
+        Assert.Contains("FloatingPanelPlacement.Elevation", body, StringComparison.Ordinal);
+        // The method's own comment names the trap, so this looks for the
+        // ASSIGNMENT rather than the word.
+        Assert.DoesNotContain(".RenderTransform =", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_panel_is_put_back_in_bounds_when_the_window_changes_size()
+    {
+        // Parked against the right edge of a wide window, it is off the side of
+        // a narrow one, and nothing else would bring it back.
+        string xaml = Xaml();
+
+        Assert.Contains("SizeChanged=\"GradientPanelWindow_SizeChanged\"", xaml, StringComparison.Ordinal);
+        Assert.Contains(
+            "FloatingPanelPlacement.Clamp(", PageMethodBody("private void PlaceGradientPanel()"),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_drag_goes_through_the_same_placement_as_an_open()
+    {
+        // Or a drag could leave the panel somewhere opening it would refuse.
+        string body = PageMethodBody("private void GradientPanelTitle_PointerMoved(object sender, PointerRoutedEventArgs e)");
+
+        Assert.Contains("PlaceGradientPanel();", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void opening_the_panel_dismisses_the_flyout_it_came_from()
+    {
+        // Leaving a light-dismiss flyout open over a panel you are about to
+        // drag sends the first click to the wrong place.
+        string body = PageMethodBody("private void GradientOpen_Click(object sender, RoutedEventArgs e)");
+
+        Assert.Contains("FillFlyout.Hide();", body, StringComparison.Ordinal);
+        Assert.Contains("SyncGradient();", body, StringComparison.Ordinal);
     }
 
     // ---------------- the controls the row needs ----------------
@@ -271,6 +367,44 @@ public class GradientRowWiringTests
 
         Assert.Contains("SelectedShapeFill.Gradient is not null", body, StringComparison.Ordinal);
         Assert.Contains("ShapeFill.None", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// One method's body out of MainPage.xaml.cs, found by matching braces.
+    ///
+    /// Separate from MethodBody, which reads the view model, and brace-matched
+    /// rather than delimited by the next "/// &lt;summary&gt;": the page's
+    /// members are mostly private one-liners with no doc comment between them,
+    /// so a delimiter search runs straight past the end of the method and a
+    /// neighbour's line reads as this one's.
+    /// </summary>
+    private static string PageMethodBody(string signature)
+    {
+        string code = Code();
+        int at = code.IndexOf(signature, StringComparison.Ordinal);
+        Assert.True(at > 0, signature + " is missing from MainPage.xaml.cs");
+
+        int open = code.IndexOf('{', at);
+        int arrow = code.IndexOf("=>", at);
+
+        // An expression-bodied member has no braces to match; it ends at its
+        // semicolon.
+        if (arrow > at && (open < at || arrow < open))
+        {
+            return code[at..(code.IndexOf(';', arrow) + 1)];
+        }
+
+        Assert.True(open > at, signature + " has no body");
+
+        int depth = 0;
+        for (int i = open; i < code.Length; i++)
+        {
+            if (code[i] == '{') { depth++; }
+            else if (code[i] == '}' && --depth == 0) { return code[at..(i + 1)]; }
+        }
+
+        Assert.Fail(signature + " is never closed");
+        return string.Empty;
     }
 
     private static string MethodBody(string signature)

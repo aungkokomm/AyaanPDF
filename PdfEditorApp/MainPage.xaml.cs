@@ -3009,10 +3009,10 @@ public sealed partial class MainPage : Page
             : ColorFromHex(current);
         _suppressFillChange = false;
 
-        // The gradient row lives in this flyout and is filled in with it, which
-        // is the moment it can be looked at and the moment the selection is
-        // known. There is no cheaper signal: the fill button is not part of the
-        // property bar's section sync.
+        // The gradient panel is no longer in this flyout, but opening the
+        // flyout is still a moment the selection is known, and the panel may be
+        // open beside it. Keeping it current here costs nothing and means the
+        // Gradient button never opens onto a stale row.
         SyncGradient();
     }
 
@@ -3729,6 +3729,10 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void SyncGradient()
     {
+        // Nothing to sync before the panel exists, and SyncGradient is reached
+        // from selection changes that happen during startup.
+        if (GradientToggle is null) { return; }
+
         bool editable = ViewModel.HasSelectedShape;
         var c = GradientPanel.From(editable ? ViewModel.SelectedShapeGradient : null);
 
@@ -3854,6 +3858,131 @@ public sealed partial class MainPage : Page
 
     private void Gradient_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) =>
         PushGradient();
+
+    // ---------------- The movable Gradient panel ----------------
+    //
+    // It used to be an expander inside the Fill flyout, and a flyout is the
+    // wrong control for it twice over: light dismiss means clicking the page to
+    // look at the shape closes it, and being anchored to its button means it
+    // covers the document. Setting a gradient is dragging four controls while
+    // WATCHING the shape, which needs neither of those.
+
+    /// <summary>Where the panel has been dragged to, in viewport DIPs, or null
+    /// while it has never been opened and has no position of its own.</summary>
+    private PanelPlacement? _gradientPanelAt;
+
+    private bool _draggingGradientPanel;
+    private double _gradientPanelGrabX;
+    private double _gradientPanelGrabY;
+
+    /// <summary>
+    /// Opens the panel and dismisses the flyout it was launched from, because
+    /// leaving a light-dismiss flyout open over a panel you are about to drag
+    /// is how the first click after opening it goes to the wrong place.
+    /// </summary>
+    private void GradientOpen_Click(object sender, RoutedEventArgs e)
+    {
+        FillFlyout.Hide();
+
+        GradientPanelWindow.Visibility = Visibility.Visible;
+        SyncGradient();
+
+        // Placed AFTER it is visible, so it has a measured size to place. The
+        // SizeChanged that follows the first layout pass re-enters and settles
+        // it; until then it sits where the last one did, or at the opening spot.
+        PlaceGradientPanel();
+    }
+
+    private void GradientPanelClose_Click(object sender, RoutedEventArgs e) =>
+        GradientPanelWindow.Visibility = Visibility.Collapsed;
+
+    private void GradientPanelWindow_SizeChanged(object sender, SizeChangedEventArgs e) =>
+        PlaceGradientPanel();
+
+    /// <summary>
+    /// Puts the panel where it belongs: where it was dragged to, brought back
+    /// inside the viewport, or at the opening position if it has never moved.
+    ///
+    /// Re-run on every size change, the window's as well as the panel's, so a
+    /// panel parked against the right edge of a wide window is not left off the
+    /// side of a narrow one with nothing able to bring it back.
+    /// </summary>
+    private void PlaceGradientPanel()
+    {
+        // Fires from SizeChanged during teardown and before fields are assigned.
+        if (GradientPanelWindow is null || PageScroller is null) { return; }
+
+        double w = GradientPanelWindow.ActualWidth;
+        double h = GradientPanelWindow.ActualHeight;
+        if (w <= 0 || h <= 0) { return; }
+
+        double topInset = PropertyBar is { Visibility: Visibility.Visible }
+            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
+            : 0;
+
+        var at = _gradientPanelAt is { } placed
+            ? FloatingPanelPlacement.Clamp(
+                placed.Left, placed.Top, w, h,
+                PageScroller.ViewportWidth, PageScroller.ViewportHeight, Math.Max(0, topInset))
+            : FloatingPanelPlacement.Opening(
+                w, h,
+                PageScroller.ViewportWidth, PageScroller.ViewportHeight, Math.Max(0, topInset));
+
+        _gradientPanelAt = at;
+
+        // Position AND elevation through the ONE property. A RenderTransform
+        // drives the same composition visual and wins, Z included, which would
+        // drop the panel behind every page card it floats over; the object
+        // toolbar learned this the hard way and the note is kept there.
+        GradientPanelWindow.Translation = new System.Numerics.Vector3(
+            (float)at.Left, (float)at.Top, FloatingPanelPlacement.Elevation);
+    }
+
+    private void GradientPanelTitle_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        var p = e.GetCurrentPoint(PageScroller).Position;
+
+        // The grab OFFSET, not the pointer position, so the panel does not jump
+        // its own top-left corner under the cursor on the first move.
+        _gradientPanelGrabX = p.X - (_gradientPanelAt?.Left ?? 0);
+        _gradientPanelGrabY = p.Y - (_gradientPanelAt?.Top ?? 0);
+
+        _draggingGradientPanel = true;
+        GradientPanelTitleBar.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    private void GradientPanelTitle_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_draggingGradientPanel) { return; }
+
+        var p = e.GetCurrentPoint(PageScroller).Position;
+
+        _gradientPanelAt = new PanelPlacement(
+            p.X - _gradientPanelGrabX, p.Y - _gradientPanelGrabY);
+
+        // Through the same placement the opening takes, so a drag can never
+        // leave the panel somewhere opening it would have refused.
+        PlaceGradientPanel();
+        e.Handled = true;
+    }
+
+    private void GradientPanelTitle_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_draggingGradientPanel) { return; }
+
+        _draggingGradientPanel = false;
+        GradientPanelTitleBar.ReleasePointerCapture(e.Pointer);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Capture can be taken away without a release: a system gesture, another
+    /// window, the panel being collapsed mid-drag. Without this the flag stays
+    /// set and the panel follows the pointer with no button held.
+    /// </summary>
+    private void GradientPanelTitle_PointerCaptureLost(object sender, PointerRoutedEventArgs e) =>
+        _draggingGradientPanel = false;
 
     /// <summary>
     /// Exchanges the two stops.
