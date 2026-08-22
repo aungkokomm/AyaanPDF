@@ -33,6 +33,7 @@
 /// Writing the document outline. Its own module because it is the one feature
 /// that does not go through PDFium at all: PDFium can read bookmarks but has no
 /// API to create them, so the /Outlines tree is built as PDF objects directly.
+pub mod gradient;
 pub mod outline;
 
 use std::collections::HashMap;
@@ -18701,6 +18702,443 @@ p={spread_px:.4},c={rgba:08X})"
             "the gradient was read as a shadow");
 
         close_document(handle);
+    }
+
+    // -----------------------------------------------------------------------
+    // THE GRADIENT REACHES THE FILE AS REAL VECTOR PAINT
+    //
+    // The whole point of the feature, measured the only way that settles it:
+    // save the document the way the app saves it, run the writer over the
+    // result, reopen THAT with the PDFium we ship, and look at the pixels.
+    //
+    // The fixture page is 200pt wide and rendered at 200px, so a pixel is a
+    // point. A shape added at capture (100,100)-(400,300) lands at x 20..80,
+    // y 20..60 down the rendered page, whose centre is (50, 40).
+    // -----------------------------------------------------------------------
+
+    /// A red-to-blue ramp, as the shape's tag stores one: fractions of the
+    /// shape's own upright box, y running DOWN.
+    fn gradient_field(x0: f32, y0: f32, x1: f32, y1: f32) -> String {
+        format!("f(c=FFFF0000,c2=FF0000FF,x0={x0:.4},y0={y0:.4},x1={x1:.4},y1={y1:.4})")
+    }
+
+    /// Left to right across the shape.
+    fn across() -> String {
+        gradient_field(0.0, 0.5, 1.0, 0.5)
+    }
+
+    fn scratch_pdf(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ayaan-gradient-{name}-{}.pdf", std::process::id()));
+        path
+    }
+
+    /// Saves the document the way the app does, then runs the gradient writer
+    /// over what came out. Returns the finished file and how many gradients it
+    /// wrote.
+    fn save_and_write(handle: u64, name: &str) -> (std::path::PathBuf, i32) {
+        let src = scratch_pdf(&format!("{name}-src"));
+        let dst = scratch_pdf(name);
+
+        let c_src = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c_src.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let c_dst = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+        let mut written = -1;
+        let status = unsafe {
+            crate::gradient::write_gradients(c_src.as_ptr(), c_dst.as_ptr(), &mut written)
+        };
+        assert_eq!(status, STATUS_OK_PDFIUM, "the gradient writer refused the file");
+
+        let _ = std::fs::remove_file(&src);
+
+        (dst, written)
+    }
+
+    fn render_file(path: &std::path::Path, width: i32) -> (i32, Vec<u8>) {
+        use pdfium_render::prelude::*;
+
+        let _guard = lock(&CALL_LOCK);
+        let pdfium = pdfium().expect("pdfium is not available");
+        let doc = pdfium
+            .load_pdf_from_file(path.to_str().unwrap(), None)
+            .expect("PDFium refused to reopen the written file");
+        let page = doc.pages().get(0).unwrap();
+
+        let config = PdfRenderConfig::new()
+            .set_target_width(width)
+            .set_reverse_byte_order(false)
+            .rotate_if_landscape(PdfPageRenderRotation::None, false);
+
+        let bitmap = page.render_with_config(&config).unwrap();
+
+        (bitmap.width() as i32, bitmap.as_raw_bytes().to_vec())
+    }
+
+    /// One pixel as (blue, green, red).
+    fn px(bytes: &[u8], w: i32, x: i32, y: i32) -> (u8, u8, u8) {
+        let i = ((y * w + x) * 4) as usize;
+        (bytes[i], bytes[i + 1], bytes[i + 2])
+    }
+
+    /// Decisively the FIRST stop, and both halves matter: "red is high" is true
+    /// of white paper, which is how a test comes to pass over a blank page.
+    fn is_red((b, _, r): (u8, u8, u8)) -> bool {
+        r > 180 && b < 80
+    }
+
+    /// Decisively the SECOND stop.
+    fn is_blue((b, _, r): (u8, u8, u8)) -> bool {
+        b > 180 && r < 80
+    }
+
+    fn is_paper((b, g, r): (u8, u8, u8)) -> bool {
+        b > 240 && g > 240 && r > 240
+    }
+
+    /// How far along the ramp a pixel is, 0 at the red end and 1 at the blue.
+    fn ramp((b, _, _): (u8, u8, u8)) -> f32 {
+        b as f32 / 255.0
+    }
+
+    /// A shape of the given kind with a gradient across it, added to a fresh
+    /// fixture. Returns the handle.
+    fn fixture_with_gradient(kind: i32) -> u64 {
+        let handle = open_fixture();
+        let mut sp = shape(kind, 100.0, 100.0, 400.0, 300.0).with_effects(&across());
+        // FULLY rounded, so the corner is missing by twenty points rather than
+        // by a couple and the assertion cannot be satisfied by antialiasing.
+        sp.corner_radius_px = if kind == SHAPE_ROUNDED_RECT { 100.0 } else { 0.0 };
+        add_one(handle, sp);
+        handle
+    }
+
+    #[test]
+    fn a_gradient_survives_a_save_and_comes_back_rendered_by_pdfium() {
+        let (file, written) = save_and_write(fixture_with_gradient(SHAPE_RECTANGLE), "rect");
+        assert_eq!(written, 1, "the writer found no gradient to write");
+
+        let (w, bytes) = render_file(&file, 200);
+
+        assert!(is_red(px(&bytes, w, 24, 40)), "the red end is missing: {:?}", px(&bytes, w, 24, 40));
+        assert!(is_blue(px(&bytes, w, 76, 40)), "the blue end is missing: {:?}", px(&bytes, w, 76, 40));
+
+        // And it RAMPS between them rather than being two flat halves.
+        let mut last = -1.0;
+        for x in (24..=76).step_by(4) {
+            let now = ramp(px(&bytes, w, x, 40));
+            assert!(now >= last - 0.02, "the ramp went backwards at x={x}");
+            last = now;
+        }
+
+        // Outside the shape the page is still the page.
+        assert!(is_paper(px(&bytes, w, 10, 40)), "the gradient escaped the shape");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_gradient_down_the_shape_starts_at_the_top() {
+        // THE ONE TEST THAT PINS THE Y DIRECTION, and it needs its own fixture
+        // because a gradient running ACROSS a shape has the same y at both
+        // ends and cannot tell one convention from the other.
+        //
+        // The tag measures from the top DOWN, the way everything in the model
+        // does; a PDF measures from the bottom UP. Get that backwards and every
+        // vertical gradient in every saved file comes out upside down.
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0)
+                .with_effects(&gradient_field(0.5, 0.0, 0.5, 1.0)),
+        );
+
+        let (file, written) = save_and_write(handle, "down");
+        assert_eq!(written, 1);
+
+        let (w, bytes) = render_file(&file, 200);
+
+        assert!(
+            is_red(px(&bytes, w, 50, 24)),
+            "the first stop is not at the TOP: {:?}", px(&bytes, w, 50, 24));
+        assert!(
+            is_blue(px(&bytes, w, 50, 56)),
+            "the second stop is not at the BOTTOM: {:?}", px(&bytes, w, 50, 56));
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_gradient_is_clipped_by_an_ellipse_and_by_a_rounded_rectangle() {
+        // The two kinds whose paint is NOT their bounding box. The corner of
+        // the box is what tells them apart from a rectangle.
+        for (kind, name) in [(SHAPE_ELLIPSE, "ellipse"), (SHAPE_ROUNDED_RECT, "rounded")] {
+            let (file, written) = save_and_write(fixture_with_gradient(kind), name);
+            assert_eq!(written, 1, "{name}: nothing was written");
+
+            let (w, bytes) = render_file(&file, 200);
+
+            assert!(
+                is_red(px(&bytes, w, 26, 40)) || is_blue(px(&bytes, w, 74, 40)),
+                "{name}: neither end of the ramp is there");
+            assert!(
+                is_paper(px(&bytes, w, 22, 22)),
+                "{name}: the paint reached the corner of the box: {:?}",
+                px(&bytes, w, 22, 22));
+
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+
+    #[test]
+    fn the_gradient_follows_a_move_a_resize_and_a_turn() {
+        // Each of these deletes the annotation and builds it again from its
+        // tag, and the writer runs over whatever came out. Nothing about the
+        // stored gradient changes: it is fractions of a box, and the box is
+        // what moved.
+        let handle = fixture_with_gradient(SHAPE_RECTANGLE);
+        let mut out = -1;
+
+        // MOVED right and down by 20 capture pixels, which is 4 points.
+        assert_eq!(
+            move_shape_annotation(handle, 0, 0, 1000, 120.0, 120.0, 420.0, 320.0, &mut out),
+            STATUS_OK_PDFIUM);
+
+        let (file, written) = save_and_write(handle, "moved");
+        assert_eq!(written, 1);
+        let (w, bytes) = render_file(&file, 200);
+
+        // The whole ramp came with it: red at the new left, blue at the new
+        // right, and the old left edge is now outside the shape.
+        assert!(is_red(px(&bytes, w, 28, 44)), "the moved shape lost its red end");
+        assert!(is_blue(px(&bytes, w, 80, 44)), "the moved shape lost its blue end");
+        assert!(is_paper(px(&bytes, w, 21, 44)), "the shape did not move");
+        let _ = std::fs::remove_file(&file);
+
+        // RESIZED wider. The gradient stretches, which is the deliberate
+        // consequence of storing fractions.
+        let handle = fixture_with_gradient(SHAPE_RECTANGLE);
+        assert_eq!(
+            resize_shape_annotation(handle, 0, 0, 1000, 100.0, 100.0, 700.0, 300.0, &mut out),
+            STATUS_OK_PDFIUM);
+
+        let (file, written) = save_and_write(handle, "resized");
+        assert_eq!(written, 1);
+        let (w, bytes) = render_file(&file, 200);
+
+        assert!(is_red(px(&bytes, w, 24, 40)), "the wider shape lost its red end");
+        assert!(is_blue(px(&bytes, w, 136, 40)), "the ramp did not stretch to the new width");
+        // Halfway along the NEW width is halfway along the ramp, not the end.
+        let middle = ramp(px(&bytes, w, 80, 40));
+        assert!((0.35..=0.65).contains(&middle), "the ramp did not stretch: {middle}");
+        let _ = std::fs::remove_file(&file);
+
+        // TURNED a quarter. The pattern carries the same matrix the path does,
+        // so a gradient that ran across the shape now runs down it.
+        let handle = fixture_with_gradient(SHAPE_RECTANGLE);
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, 0, 1000, 90.0, &mut out), STATUS_OK_PDFIUM);
+
+        let (file, written) = save_and_write(handle, "turned");
+        assert_eq!(written, 1);
+        let (w, bytes) = render_file(&file, 200);
+
+        // The turned shape is 40 points wide and 60 tall about the same
+        // centre, so it runs from y=10 to y=70 and these two sit near its ends.
+        let (above, below) = (ramp(px(&bytes, w, 50, 14)), ramp(px(&bytes, w, 50, 66)));
+        let (left, right) = (ramp(px(&bytes, w, 40, 40)), ramp(px(&bytes, w, 60, 40)));
+
+        assert!(
+            (above - below).abs() > 0.5,
+            "the ramp does not run down the turned shape: {above} to {below}");
+        assert!(
+            (left - right).abs() < 0.15,
+            "the ramp still runs across the turned shape: {left} to {right}");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn the_stroke_is_still_drawn_over_the_gradient() {
+        // The writer PREPENDS its fill and leaves the drawing PDFium wrote
+        // exactly as it was, so the stroke lands on top of the paint the way
+        // PDF's own fill-and-stroke operator would have put it. A shape whose
+        // outline had been eaten would be a shape half a stroke thinner than
+        // the file says.
+        let handle = open_fixture();
+        let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0).with_effects(&across());
+        sp.r = 0;
+        sp.g = 0;
+        sp.b = 0;
+        sp.a = 255;
+        sp.width_px = 20.0;
+        add_one(handle, sp);
+
+        let (file, _) = save_and_write(handle, "stroked");
+        let (w, bytes) = render_file(&file, 200);
+
+        // On the top edge, above the fill: black, and neither red nor blue.
+        let edge = px(&bytes, w, 50, 40 - 20);
+        assert!(
+            edge.0 < 90 && edge.1 < 90 && edge.2 < 90,
+            "the stroke is not on the top edge: {edge:?}");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn nothing_about_the_gradient_is_rasterised() {
+        // A gradient is VECTOR PAINT. If it ever became a picture, this is
+        // where that would show: an image XObject in the appearance's
+        // resources, or a Do operator drawing one.
+        use lopdf::{Document as LoDoc, Object as LoObj};
+
+        let (file, _) = save_and_write(fixture_with_gradient(SHAPE_RECTANGLE), "vector");
+        let doc = LoDoc::load(&file).unwrap();
+
+        let mut checked = 0;
+        for (_, page_id) in doc.get_pages() {
+            let page = doc.get_dictionary(page_id).unwrap();
+            let LoObj::Array(annots) = page.get(b"Annots").unwrap() else { continue };
+
+            for annot in annots {
+                let LoObj::Dictionary(d) = annot else { continue };
+                let ap = d.get(b"AP").unwrap().as_dict().unwrap();
+                let LoObj::Reference(sid) = ap.get(b"N").unwrap() else { continue };
+                let stream = doc.get_object(*sid).unwrap().as_stream().unwrap();
+
+                let resources = stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
+                assert!(
+                    resources.has(b"Pattern"),
+                    "the pattern did not reach the appearance's own resources");
+                assert!(
+                    !resources.has(b"XObject"),
+                    "an XObject appeared in a gradient shape's appearance");
+
+                let content = stream.get_plain_content().unwrap();
+                let text = String::from_utf8_lossy(&content);
+                assert!(!text.contains(" Do"), "something is being drawn as an image: {text}");
+                assert!(text.contains("/Pattern cs"), "the pattern is never selected: {text}");
+
+                checked += 1;
+            }
+        }
+
+        assert_eq!(checked, 1, "the test did not find the shape it was written for");
+
+        // And no image object anywhere in the file.
+        for (_, obj) in doc.objects.iter() {
+            if let Ok(stream) = obj.as_stream() {
+                assert_ne!(
+                    stream.dict.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b""),
+                    b"Image",
+                    "an image was introduced into the document");
+            }
+        }
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn pdfium_can_save_the_written_document_again_without_losing_the_shading() {
+        // The spike proved PDFium preserves someone else's shading. This is the
+        // same claim about OUR shading, on the real path: a person opens a file
+        // with a gradient in it, edits something else, and saves.
+        use lopdf::Document as LoDoc;
+
+        let (file, _) = save_and_write(fixture_with_gradient(SHAPE_RECTANGLE), "resaved");
+
+        let c_in = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        let handle = open_document(c_in.as_ptr());
+        assert_ne!(handle, 0, "PDFium refused to open the written file");
+
+        let again = scratch_pdf("resaved-again");
+        let c_out = std::ffi::CString::new(again.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c_out.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let doc = LoDoc::load(&again).unwrap();
+        let has_pattern = doc.objects.values().any(|o| {
+            o.as_stream()
+                .map(|s| s.dict.get(b"Resources")
+                    .and_then(|r| r.as_dict())
+                    .map(|r| r.has(b"Pattern"))
+                    .unwrap_or(false))
+                .unwrap_or(false)
+        });
+        assert!(has_pattern, "PDFium's own save dropped the shading pattern");
+
+        let (w, bytes) = render_file(&again, 200);
+        assert!(is_red(px(&bytes, w, 24, 40)), "the resaved file lost its red end");
+        assert!(is_blue(px(&bytes, w, 76, 40)), "the resaved file lost its blue end");
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&again);
+    }
+
+    #[test]
+    fn the_writer_leaves_the_stored_gradient_exactly_as_it_found_it() {
+        // The tag is the authority and the writer only READS it. If the
+        // appearance and the tag ever disagreed, the next edit would rebuild
+        // the shape from the tag and the file's gradient would jump.
+        let (file, _) = save_and_write(fixture_with_gradient(SHAPE_RECTANGLE), "tagkept");
+
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        let handle = open_document(c.as_ptr());
+        assert_ne!(handle, 0);
+
+        let tag = contents_of(handle, 0, 0).unwrap();
+        assert!(tag.contains(&across()), "the stored gradient was rewritten: {tag}");
+
+        close_document(handle);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_document_with_no_gradient_is_not_rewritten_at_all() {
+        // An ordinary save must not pay for a feature it is not using, and a
+        // file nobody asked to change must not be replaced by one lopdf
+        // rewrote.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+
+        let src = scratch_pdf("plain-src");
+        let dst = scratch_pdf("plain-dst");
+        let c_src = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c_src.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let c_dst = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+        let mut written = -1;
+        assert_eq!(
+            unsafe { crate::gradient::write_gradients(c_src.as_ptr(), c_dst.as_ptr(), &mut written) },
+            STATUS_OK_PDFIUM);
+
+        assert_eq!(written, 0, "a plain document reported gradients");
+        assert!(!dst.exists(), "a file with nothing to change was rewritten anyway");
+
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn a_gradient_this_build_cannot_represent_is_refused_rather_than_flattened() {
+        // A PDF shading carries no alpha of its own. Writing a translucent
+        // gradient as an opaque one would be exactly the silent simplification
+        // this feature exists to avoid, so it is not written at all: the shape
+        // is left unfilled, which is visibly missing, and the tag keeps the
+        // definition so nothing is lost.
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0).with_effects(
+                "f(c=80FF0000,c2=800000FF,x0=0.0000,y0=0.5000,x1=1.0000,y1=0.5000)"),
+        );
+
+        let (file, written) = save_and_write(handle, "translucent");
+        assert_eq!(written, 0, "a translucent gradient was written as something else");
+
+        let _ = std::fs::remove_file(&file);
     }
 
 }

@@ -1770,6 +1770,49 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// without discarding that copy every subsequent save would stack another
     /// duplicate set.
     /// </summary>
+    /// <summary>
+    /// Turns every gradient-filled shape in a just-written file into a real PDF
+    /// shading, in place.
+    ///
+    /// Nothing here reads the screen. The writer works from each shape's own
+    /// stored gradient and the appearance PDFium wrote for it, so what lands in
+    /// the file is a consequence of the document rather than of what happened
+    /// to be rendered.
+    ///
+    /// A document with no gradient is not rewritten at all: the writer says so
+    /// and does not create the destination, which is what keeps an ordinary
+    /// save from paying for a feature it is not using.
+    /// </summary>
+    private static void WriteGradientFills(string path)
+    {
+        string temp = path + ".ayaan-gradients";
+
+        int status = RenderCoreNative.write_gradients(path, temp, out int written);
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"write_gradients {path} -> {status}");
+            return;
+        }
+
+        if (written == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Move(temp, path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            // The saved file is intact and its gradients are simply not painted
+            // into it yet, so the shapes come out unfilled rather than wrong.
+            // The rewritten copy is left where it is rather than deleted: a
+            // failed replace must never be able to lose both.
+            Diag.Log($"write_gradients: could not replace {path}: {ex.Message}");
+        }
+    }
+
     public bool SaveDocumentAs(string path) => SaveDocumentAs(path, flatten: false);
 
     /// <summary>
@@ -1813,6 +1856,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         string writePath = inPlace ? path + ".ayaan-saving" : path;
 
         bool saved = RenderCoreNative.save_document(_documentHandle, writePath) == RenderStatus.OkPdfium;
+
+        // A gradient becomes real PDF paint HERE, on the file PDFium has just
+        // written, because PDFium cannot create a shading and so cannot put one
+        // in the appearance stream it generates. It runs on the file rather
+        // than on the open document for the same reason the outline writer
+        // does: lopdf works file to file, and the document PDFium is streaming
+        // from must never be the file being rewritten.
+        //
+        // AFTER the save and BEFORE the swap, so an in-place save rewrites the
+        // temporary copy and the original is only replaced once.
+        if (saved)
+        {
+            WriteGradientFills(writePath);
+        }
 
         if (inPlace && saved)
         {

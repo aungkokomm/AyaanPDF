@@ -516,6 +516,26 @@ internal static partial class RenderCoreNative
         nuint len);
 
     /// <summary>
+    /// Writes every gradient-filled shape's paint into the file as a real PDF
+    /// shading, which is the second thing PDFium cannot create.
+    ///
+    /// File to file, like the outline writer and for the same reason: the
+    /// source is left untouched and the caller swaps them.
+    ///
+    /// <paramref name="written"/> comes back as the number of gradients
+    /// written, and when it is ZERO the destination is not created at all, so
+    /// an ordinary document pays for a read and nothing else.
+    ///
+    /// Returns Ok, InvalidInput, Unsupported (unparseable or encrypted), or
+    /// Panic.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int write_gradients(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string srcPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string dstPath,
+        out int written);
+
+    /// <summary>
     /// Deletes the widget(s) for a named form field, so PDFium's form layer
     /// stops painting the field box on top of the text the app draws to fill it.
     /// A no-op (still Ok) when no field matches.
