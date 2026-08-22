@@ -4889,6 +4889,34 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>The selected shape's OWN glow, on the same terms.</summary>
     public Glow? SelectedShapeGlow => SelectedShapeEffects?.Glow;
 
+    /// <summary>
+    /// What the selected shape is filled with: nothing, one colour, or a
+    /// gradient.
+    ///
+    /// Read out of the tag on demand exactly as its effects are, and for the
+    /// same reason: the document is the authority, and a copy kept beside it is
+    /// a copy that drifts. Not to be confused with
+    /// <see cref="ShapeFillHex"/>, which is the TOOL's colour for shapes about
+    /// to be drawn.
+    /// </summary>
+    public ShapeFill SelectedShapeFill
+    {
+        get
+        {
+            if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
+                || !_selectedIsShape)
+            {
+                return ShapeFill.None;
+            }
+
+            string? contents = ReadAnnotationContents(sel.PageIndex, sel.Index);
+
+            return contents is not null && ShapeTagReader.TryParse(contents, out var tag)
+                ? ShapeFillTag.From(tag)
+                : ShapeFill.None;
+        }
+    }
+
     /// <summary>The selected shape's page width in points, which is what turns
     /// the row's points into the model's normalized lengths. Zero when there is
     /// no selection.</summary>
@@ -4945,7 +4973,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // Normalized lengths become capture pixels on the way, which is the
         // space every override speaks.
-        string text = ShapeEffectsTag.TextOf(effects, CaptureWidth);
+        //
+        // THE WHOLE TAIL, fill included. The core replaces it wholesale, so
+        // sending only the effects would take the shape's gradient off every
+        // time somebody nudged the shadow's slider. The fill is read back from
+        // the shape rather than passed in, because this edit is not about it.
+        string text = ShapeFillTag.TailOf(SelectedShapeFill, effects, CaptureWidth);
         byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
 
         PushHistory(HistoryScope.Document, historyLabel);

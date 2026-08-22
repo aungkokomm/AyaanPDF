@@ -18559,6 +18559,150 @@ p={spread_px:.4},c={rgba:08X})"
         close_document(handle);
     }
 
+    // -----------------------------------------------------------------------
+    // THE FILL'S FIELD SHARES THE TAIL AND IS NOT AN EFFECT
+    //
+    // A gradient is PAINT. It stays inside the path, it reserves no room, and
+    // the core draws none of it: the shading is written at save time by lopdf,
+    // which is the one thing PDFium cannot create. What the core does for a
+    // gradient is exactly what it does for an effect it has never heard of,
+    // which is carry it.
+    //
+    // NOT ONE LINE OF THE CORE WAS ADDED FOR THIS. If these pass, a shape's
+    // gradient costs render_core nothing, which is the whole reason the tail is
+    // a list of self-describing fields rather than a widening tuple.
+    // -----------------------------------------------------------------------
+
+    /// A gradient field exactly as `ShapeFillTag` writes one: red to blue,
+    /// left to right across the shape's own upright box.
+    const FILL_FIELD: &str =
+        "f(c=FFFF0000,c2=FF0000FF,x0=0.0000,y0=0.5000,x1=1.0000,y1=0.5000)";
+
+    #[test]
+    fn a_gradient_fill_field_reaches_the_tag_with_its_fractions_intact() {
+        // THE POINT OF THE TEST. Every length in the tail is converted from
+        // capture pixels to points on the way in, and on this fixture that is a
+        // fifth. A gradient's endpoints are fractions of the SHAPE's box and
+        // must not be touched by that, or a gradient drawn across a shape would
+        // arrive compressed into its left fifth.
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0)
+                .with_effects(&format!("{FILL_FIELD}:{}", effect('q', 10.0, 0xFF00FF00))),
+        );
+
+        let tag = contents_of(handle, 0, 0).unwrap();
+
+        assert!(tag.contains(FILL_FIELD), "the gradient did not survive the trip: {tag}");
+
+        // And the control, in the same tag: a real length in the field beside
+        // it WAS converted, so the fractions above were left alone deliberately
+        // rather than because nothing in this tail was converted at all.
+        assert!(tag.contains("q(b=2.0000,c=FF00FF00)"), "nothing was rescaled: {tag}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_gradient_fill_field_survives_a_move_a_resize_and_a_turn() {
+        // Each of these deletes the annotation and builds it again from its
+        // tag. A gradient is the shape's paint, so losing it in a rebuild would
+        // silently return the shape to being unfilled.
+        let handle = open_fixture();
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0).with_effects(FILL_FIELD),
+        );
+
+        let mut idx = 0i32;
+        let mut out = -1;
+
+        assert_eq!(
+            resize_shape_annotation(handle, 0, idx, 1000, 100.0, 100.0, 700.0, 500.0, &mut out),
+            STATUS_OK_PDFIUM);
+        idx = out;
+        assert!(
+            contents_of(handle, 0, idx as usize).unwrap().contains(FILL_FIELD),
+            "the resize dropped the gradient");
+
+        assert_eq!(
+            rotate_shape_annotation(handle, 0, idx, 1000, 30.0, &mut out), STATUS_OK_PDFIUM);
+        idx = out;
+        assert!(
+            contents_of(handle, 0, idx as usize).unwrap().contains(FILL_FIELD),
+            "the turn dropped the gradient");
+
+        let (_, b) = annotation_shape(handle, idx as usize).unwrap();
+        assert_eq!(
+            move_shape_annotation(
+                handle, 0, idx, 1000,
+                (b.left.value + 2.0) * 5.0, (200.0 - b.top.value) * 5.0,
+                (b.right.value + 2.0) * 5.0, (200.0 - b.bottom.value) * 5.0,
+                &mut out),
+            STATUS_OK_PDFIUM);
+        assert!(
+            contents_of(handle, 0, out as usize).unwrap().contains(FILL_FIELD),
+            "the move dropped the gradient");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_gradient_fill_field_reserves_no_room_around_the_shape() {
+        // An effect reaches OUTSIDE the silhouette and the annotation's
+        // rectangle is opened to hold its ink. A gradient reaches nowhere: it
+        // is what the inside is painted with. If the field ever grew the box,
+        // every gradient shape would creep outwards on every edit, which is a
+        // bug this pipeline has already had once with effects.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+        add_one(
+            handle,
+            shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0).with_effects(FILL_FIELD),
+        );
+
+        let plain = geometry_of(handle, 0);
+        let filled = geometry_of(handle, 1);
+
+        for (side, a, b) in [
+            ("left", plain.3, filled.3), ("bottom", plain.4, filled.4),
+            ("right", plain.5, filled.5), ("top", plain.6, filled.6),
+        ] {
+            assert_eq!(a, b, "the gradient moved the {side} edge from {a} to {b}");
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_generic_effects_edit_accepts_a_tail_that_carries_a_gradient() {
+        // THE HAZARD THIS PINS. The edit refuses the whole tail when any field
+        // in it fails to parse, so a gradient field that the core could not
+        // read would not be ignored: it would make every shadow and glow edit
+        // on that shape fail, with the row appearing to do nothing.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+
+        let both = format!("{FILL_FIELD}:s(a=135.00,d=50.0000,b=0.0000,p=0.0000,c=80000000)");
+        let idx = set_effects(handle, 0, &both);
+
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(tag.contains(FILL_FIELD), "the gradient did not arrive: {tag}");
+        assert_eq!(
+            shadow_of(handle, idx as usize).expect("shadow").rgba, 0x80000000,
+            "the shadow beside it did not arrive");
+
+        // And the gradient is not mistaken for one: it has no blur and no
+        // throw, so nothing about it reads as a shadow.
+        let alone = set_effects(handle, idx, FILL_FIELD);
+        assert!(
+            shadow_of(handle, alone as usize).is_none(),
+            "the gradient was read as a shadow");
+
+        close_document(handle);
+    }
+
 }
 
 

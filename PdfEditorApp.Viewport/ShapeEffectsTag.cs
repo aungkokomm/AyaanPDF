@@ -83,6 +83,17 @@ public static class ShapeEffectsTag
 
         foreach (var field in fields)
         {
+            // THE FILL'S FIELD IS NOT AN EFFECT. It shares the tail and nothing
+            // else: it is paint, it reserves no room, and ShapeFillTag reads
+            // it. Carrying it here as well would write it a second time on the
+            // next edit. A malformed one does NOT read as a gradient and so
+            // falls through to be carried verbatim, which is what keeps it from
+            // being dropped by the build that could not understand it.
+            if (ShapeFillTag.Read(field.Field) is not null)
+            {
+                continue;
+            }
+
             if (field.Hex is null || KindOf(field.Kind) is not { } kind)
             {
                 // Not ours to understand. It keeps its own text and its lengths
@@ -104,6 +115,14 @@ public static class ShapeEffectsTag
                 Distance: field.DistancePts / pageWidthPts,
                 AngleDeg: field.AngleDeg,
                 Amount: field.SpreadPts / pageWidthPts));
+        }
+
+        // A tag whose only tail field was the fill records no effects, which
+        // is null and not an empty list, exactly as a tag with no tail at all
+        // does.
+        if (specs.Count == 0 && carried.Count == 0)
+        {
+            return null;
         }
 
         return new ShapeEffects(specs, carried);
