@@ -5053,14 +5053,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_documentHandle == 0 || PageSlots.Count == 0)
         {
+            GradientTrace.Once("prepare", $"EARLY OUT handle={_documentHandle} slots={PageSlots.Count}");
             return;
         }
 
         var (first, last) = _layout.VisibleRange(_lastViewTop, _lastViewBottom);
         if (first < 0)
         {
+            GradientTrace.Once("prepare", $"EARLY OUT no visible range viewTop={_lastViewTop:F1} viewBottom={_lastViewBottom:F1}");
             return;
         }
+
+        GradientTrace.Once("prepare", $"range {first}..{last} viewTop={_lastViewTop:F1} viewBottom={_lastViewBottom:F1} cached={_gradientOverlayByPage.Count}");
 
         // Only when the range actually moved. This runs on every scroll frame,
         // and walking the keys to evict on each of them would be work done
@@ -5093,7 +5097,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             // THE ONLY PAGE LOAD IN THIS FEATURE, and it happens once per page
             // per visit rather than once per frame.
-            _gradientOverlayByPage[page] = GradientOverlay.ItemsFor(PageModelFor(page));
+            var model = PageModelFor(page);
+            var built = GradientOverlay.ItemsFor(model);
+            _gradientOverlayByPage[page] = built;
+
+            int withGradient = 0;
+            int shapeCount = 0;
+            var kinds = new List<string>();
+            foreach (var sh in model.Shapes)
+            {
+                shapeCount++;
+                if (sh.Gradient is not null) { withGradient++; }
+                kinds.Add($"{sh.ShapeKind}/grad={(sh.Gradient is null ? "no" : "YES")}/fill={sh.FillHex ?? "-"}");
+            }
+
+            GradientTrace.Once(
+                $"page{page}",
+                $"objects={model.Objects.Count} shapes={shapeCount} withGradient={withGradient} items={built.Count} [{string.Join(", ", kinds)}]");
+
+            foreach (var a in LoadedFor(page))
+            {
+                GradientTrace.Once($"tag{page}", $"#{a.Index} subtype={a.Subtype} contents={ReadAnnotationContents(page, a.Index) ?? "(null)"}");
+            }
         }
     }
 
@@ -8239,6 +8264,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // here: PrepareGradientOverlay is the ONE place that builds one, and it
         // runs on the next refresh, which every edit already triggers.
         _gradientOverlayByPage.Remove(pageIndex);
+        GradientTrace.Once("invalidate", $"page={pageIndex}");
 
         // The model is a projection of the annotation cache, so it is dropped
         // with it and can never be staler than the data everything else already

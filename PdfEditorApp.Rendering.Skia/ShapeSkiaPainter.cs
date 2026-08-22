@@ -37,6 +37,12 @@ public static class ShapeSkiaPainter
     /// page-local remains canonical, slot DIPs remain the app's working space,
     /// and this is the last step before pixels.
     /// </summary>
+    /// <summary>TEMPORARY diagnostic counters for the gradient live-editing trace.</summary>
+    public static int GradientDraws;
+
+    /// <summary>TEMPORARY diagnostic for the gradient live-editing trace.</summary>
+    public static string LastGradientSlot = "-";
+
     public static SKMatrix MatrixFor(ViewportProjection p) =>
         SKMatrix.CreateScale((float)p.DeviceScale, (float)p.DeviceScale)
             .PreConcat(SKMatrix.CreateTranslation((float)p.OriginXDips, (float)p.OriginYDips))
@@ -447,6 +453,12 @@ public static class ShapeSkiaPainter
 
         var from = OverlayProjection.ToSlot((gradient.X0, gradient.Y0), scale, pageTop, view);
         var to = OverlayProjection.ToSlot((gradient.X1, gradient.Y1), scale, pageTop, view);
+
+        // TEMPORARY diagnostic for the gradient live-editing trace.
+        GradientDraws++;
+        var pb = path.Bounds;
+        LastGradientSlot =
+            $"from=({from.X:F1},{from.Y:F1}) to=({to.X:F1},{to.Y:F1}) pathBounds=({pb.Left:F1},{pb.Top:F1})-({pb.Right:F1},{pb.Bottom:F1})";
 
         // Both live until after the draw, the way the effect layer's filter and
         // its paint do. Which of the two owns the native object is not a thing
