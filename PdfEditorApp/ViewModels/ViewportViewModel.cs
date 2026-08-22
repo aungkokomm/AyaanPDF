@@ -4850,14 +4850,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// The selected shape's OWN drop shadow, read from its tag, or null when
-    /// there is no shape selected or it casts none.
+    /// ALL of the selected shape's effects, read from its tag, or null when
+    /// there is no shape selected or it has none.
     ///
-    /// Read from the annotation rather than held as tool state, because the row
-    /// has to show what THIS shape is, not what the controls were last left at.
-    /// The same rule the fill and corner controls already follow.
+    /// THE PRIMITIVE both named views and every edit go through. Read from the
+    /// annotation rather than held as tool state, because a row has to show what
+    /// THIS shape is, not what the controls were last left at, and because an
+    /// edit has to start from the shape's CURRENT list or it would send one
+    /// without whatever it did not know about.
     /// </summary>
-    public DropShadow? SelectedShapeShadow
+    public ShapeEffects? SelectedShapeEffects
     {
         get
         {
@@ -4873,9 +4875,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 return null;
             }
 
-            return ShapeEffectsTag.From(tag, PagePointsFor(sel.PageIndex).W)?.Shadow;
+            return ShapeEffectsTag.From(tag, PagePointsFor(sel.PageIndex).W);
         }
     }
+
+    /// <summary>
+    /// The selected shape's OWN drop shadow, or null when it casts none.
+    /// Narrowed out of <see cref="SelectedShapeEffects"/>, never stored beside
+    /// it.
+    /// </summary>
+    public DropShadow? SelectedShapeShadow => SelectedShapeEffects?.Shadow;
+
+    /// <summary>The selected shape's OWN glow, on the same terms.</summary>
+    public Glow? SelectedShapeGlow => SelectedShapeEffects?.Glow;
 
     /// <summary>The selected shape's page width in points, which is what turns
     /// the row's points into the model's normalized lengths. Zero when there is
@@ -4893,7 +4905,35 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// the core reads that as "no shadow" and drops the field from the tag
     /// entirely rather than leaving an invisible one behind.
     /// </summary>
-    public void ApplyShadowToSelectedShape(DropShadow? shadow)
+    public void ApplyShadowToSelectedShape(DropShadow? shadow) =>
+        ApplyEffectsToSelectedShape(
+            (SelectedShapeEffects ?? new ShapeEffects()).With(shadow),
+            shadow is null ? "Remove shadow" : "Drop shadow",
+            "Could not apply that shadow.");
+
+    /// <summary>
+    /// Gives the selected shape a glow, changes the one it has, or takes it
+    /// away when handed null. The shadow's twin, on the same terms.
+    /// </summary>
+    public void ApplyGlowToSelectedShape(Glow? glow) =>
+        ApplyEffectsToSelectedShape(
+            (SelectedShapeEffects ?? new ShapeEffects()).With(glow),
+            glow is null ? "Remove glow" : "Glow",
+            "Could not apply that glow.");
+
+    /// <summary>
+    /// Writes the selected shape's WHOLE effects list, replacing whatever it
+    /// had.
+    ///
+    /// THE ONLY WAY EFFECTS ARE WRITTEN, and the reason the two rows above are
+    /// two lines each. The core replaces the list wholesale rather than merging
+    /// field by field, so an edit that sends only its own effect deletes every
+    /// other one: moving the shadow's slider would take the glow off, and
+    /// touching either would take off an effect written by a later build. Both
+    /// start from the shape's current list and change one thing in it.
+    /// </summary>
+    private void ApplyEffectsToSelectedShape(
+        ShapeEffects? effects, string historyLabel, string failure)
     {
         if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
             || !_selectedIsShape)
@@ -4903,16 +4943,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         const int CaptureWidth = 1000;
 
-        // THE WHOLE EFFECTS LIST, as text, because the core replaces the lot
-        // rather than merging: a shape with a shadow and something else would
-        // lose the something else if only the shadow were sent. Normalized
-        // lengths become capture pixels on the way, which is the space every
-        // override speaks.
-        string text = ShapeEffectsTag.TextOf(
-            shadow is { } s ? new ShapeEffects(s) : null, CaptureWidth);
+        // Normalized lengths become capture pixels on the way, which is the
+        // space every override speaks.
+        string text = ShapeEffectsTag.TextOf(effects, CaptureWidth);
         byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
 
-        PushHistory(HistoryScope.Document, shadow is null ? "Remove shadow" : "Drop shadow");
+        PushHistory(HistoryScope.Document, historyLabel);
 
         int status = RenderCoreNative.restyle_shape_effects_annotation(
             _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
@@ -4920,7 +4956,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (status != RenderStatus.OkPdfium)
         {
-            Status = "Could not apply that shadow.";
+            Status = failure;
             return;
         }
 
@@ -7957,7 +7993,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (tag.ShadowHex is null || tag.ShadowSoftnessPts <= 0)
+        var effects = ShapeEffectsTag.From(tag, pageWidthPts);
+        if (effects is null || effects.IsEmpty)
+        {
+            return;
+        }
+
+        // ANY effect with a blur needs a picture; the rasteriser decides which
+        // ones actually go in it. A shape whose only effect is a hard shadow, or
+        // one this build cannot draw, needs nothing here.
+        bool anySoft = false;
+        foreach (var spec in effects.Specs)
+        {
+            if (spec.Blur > 0 && spec.Color.A != 0)
+            {
+                anySoft = true;
+                break;
+            }
+        }
+
+        if (!anySoft)
         {
             return;
         }
@@ -7988,13 +8043,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var effects = ShapeEffectsTag.From(tag, pageWidthPts);
-        if (effects?.Shadow is not { } shadow)
-        {
-            return;
-        }
-
-        var raster = ShadowRasterizer.Rasterize(items, shadow, pageWidthPts);
+        var raster = ShadowRasterizer.Rasterize(items, effects.Specs, pageWidthPts);
         if (raster is null)
         {
             return;

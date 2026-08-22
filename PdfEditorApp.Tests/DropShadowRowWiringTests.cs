@@ -188,18 +188,42 @@ public class DropShadowRowWiringTests
     [Fact]
     public void switching_the_row_off_clears_the_shadow_rather_than_hiding_it()
     {
-        // A null shadow becomes an EMPTY effects list, which is what the core
-        // reads as "no effects" and what drops the field from the tag entirely.
-        // Hiding it instead would leave an invisible shadow reserving room in
-        // the annotation's rectangle for ever.
-        int at = ViewModel().IndexOf(
-            "public void ApplyShadowToSelectedShape(", StringComparison.Ordinal);
-        Assert.True(at > 0, "ApplyShadowToSelectedShape has been renamed; this test needs updating");
+        // A null shadow goes straight into With, which REMOVES the drop shadow
+        // from the list rather than writing an invisible one. Hiding it instead
+        // would leave a shadow reserving room in the annotation's rectangle for
+        // ever.
+        Assert.Contains(
+            "(SelectedShapeEffects ?? new ShapeEffects()).With(shadow)",
+            ViewModel(),
+            StringComparison.Ordinal);
+    }
 
-        int end = ViewModel().IndexOf("\n    }", at, StringComparison.Ordinal);
-        string body = ViewModel()[at..end];
+    [Fact]
+    public void the_row_sends_the_whole_list_and_not_just_its_own_effect()
+    {
+        // THE ONE THAT MATTERS once there is more than one effect. The core
+        // replaces the list wholesale, so an edit that builds a list containing
+        // only its own effect deletes every other one: moving this row's slider
+        // would take a glow off the shape, and either row would take off an
+        // effect written by a later build.
+        //
+        // Starting from SelectedShapeEffects is what prevents that, and it is
+        // asserted on the source because the write path lives in a WinUI class
+        // no test assembly can load.
+        string source = ViewModel();
 
-        Assert.Contains("ShapeEffectsTag.TextOf(", body, StringComparison.Ordinal);
-        Assert.Contains("shadow is { } s ? new ShapeEffects(s) : null", body, StringComparison.Ordinal);
+        foreach (string row in new[] { "shadow", "glow" })
+        {
+            Assert.Contains(
+                $"(SelectedShapeEffects ?? new ShapeEffects()).With({row})",
+                source,
+                StringComparison.Ordinal);
+        }
+
+        // And exactly ONE place actually writes them, so there is one place to
+        // get this right rather than one per row.
+        Assert.Equal(
+            1,
+            source.Split("RenderCoreNative.restyle_shape_effects_annotation(").Length - 1);
     }
 }
