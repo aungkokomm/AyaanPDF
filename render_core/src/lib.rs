@@ -12343,6 +12343,84 @@ p={spread_px:.4},c={rgba:08X})"
 
 
     #[test]
+    fn two_soft_effects_still_attach_as_one_picture_and_no_extra_paths() {
+        // ONE IMAGE SLOT. A shape with a shadow and a glow gets ONE picture with
+        // both drawn into it, because the annotation holds one image object and
+        // the caller is the one that composes them. Two would mean two image
+        // objects, and the second attach would have nothing to replace.
+        //
+        // And no extra PATHS either: both effects are blurred, so neither is
+        // something a PDF can express as geometry and the shape must carry
+        // exactly the objects it would carry with no effects at all.
+        let handle = open_fixture();
+
+        let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        plain.fill_rgba = 0xFF3B82F6;
+        add_one(handle, plain);
+        let bare = object_kinds(handle, 0);
+
+        let both = plain.with_effects(
+            "s(a=135.00,d=50.0000,b=40.0000,p=0.0000,c=80000000):q(b=40.0000,c=FF00FF00)");
+        add_one(handle, both);
+
+        assert_eq!(
+            object_kinds(handle, 1), bare,
+            "an effect that cannot be a path was drawn as one");
+
+        let px = grey_tile(64, 64);
+        let idx = attach_image(handle, 1, 60.0, 60.0, 500.0, 400.0, &px, 64, 64);
+
+        let kinds = object_kinds(handle, idx as usize);
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "image").count(), 1,
+            "two effects produced more than one picture: {kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "path").count(),
+            bare.iter().filter(|k| **k == "path").count(),
+            "the picture went in and something else was drawn as well: {kinds:?}");
+        assert_eq!(kinds.first(), Some(&"image"), "the picture is not underneath: {kinds:?}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_hard_shadow_beside_a_soft_glow_keeps_its_paths_and_gains_one_picture() {
+        // The mixed case, and the one that says the two halves are decided per
+        // EFFECT rather than per shape: the shadow has no blur so it stays
+        // vector, the glow has one so it arrives as pixels, and the annotation
+        // ends up with both.
+        let handle = open_fixture();
+
+        let mut plain = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        plain.fill_rgba = 0xFF3B82F6;
+        add_one(handle, plain);
+        let bare_paths = object_kinds(handle, 0).iter().filter(|k| **k == "path").count();
+
+        let mixed = plain.with_effects(
+            "s(a=135.00,d=50.0000,b=0.0000,p=0.0000,c=80000000):q(b=40.0000,c=FF00FF00)");
+        add_one(handle, mixed);
+
+        let drawn = object_kinds(handle, 1);
+        assert!(
+            drawn.iter().filter(|k| **k == "path").count() > bare_paths,
+            "the hard shadow was not drawn as paths: {drawn:?}");
+
+        let px = grey_tile(64, 64);
+        let idx = attach_image(handle, 1, 60.0, 60.0, 500.0, 400.0, &px, 64, 64);
+
+        let kinds = object_kinds(handle, idx as usize);
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "image").count(), 1,
+            "the glow's picture is missing or doubled: {kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "path").count(),
+            drawn.iter().filter(|k| **k == "path").count(),
+            "attaching the picture changed the vector shadow: {kinds:?}");
+
+        close_document(handle);
+    }
+
+    #[test]
     fn a_shape_says_whether_it_already_carries_its_picture() {
         // The app asks this before drawing one. Attaching REBUILDS the
         // annotation and a rebuild changes its index, so doing it on every
