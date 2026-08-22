@@ -18451,6 +18451,105 @@ p={spread_px:.4},c={rgba:08X})"
         }
     }
 
+    /// A gradient's field in the tail, exactly as ShapeFillTag.FieldOf writes it.
+    const GRADIENT: &str =
+        "f(c=FFFF0000,c2=FF0000FF,x0=0.0000,y0=0.5000,x1=1.0000,y1=0.5000)";
+
+    /// REPORTED: with a gradient on the shape, the drop shadow does nothing and
+    /// the shape grows a little on every touch of a shadow control.
+    #[test]
+    fn a_shadow_still_arrives_when_the_shape_already_has_a_gradient() {
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+
+        let idx = set_effects(handle, 0, GRADIENT);
+        assert!(
+            shadow_of(handle, idx as usize).is_none(),
+            "a gradient on its own is not a shadow");
+
+        let both = format!("{GRADIENT}:s(a=135.0000,d=50.0000,b=0.0000,p=0.0000,c=80000000)");
+        let idx = set_effects(handle, idx, &both);
+
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(tag.contains(":s("), "the shadow is not on the tag: {tag}");
+        assert!(tag.contains("f(c="), "the gradient was dropped: {tag}");
+
+        assert_eq!(
+            shadow_of(handle, idx as usize).expect("the shadow was not read back").rgba,
+            0x80000000);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn editing_a_shadow_does_not_grow_a_shape_that_has_a_gradient() {
+        // The reported symptom, and the one the tag's own room accounting is
+        // supposed to make impossible: growing the box and taking the growth
+        // back off are the same four numbers.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+
+        let both = format!("{GRADIENT}:s(a=135.0000,d=50.0000,b=0.0000,p=0.0000,c=80000000)");
+
+        let mut idx = set_effects(handle, 0, &both);
+        let settled = geometry_of(handle, idx as usize);
+
+        for round in 2..=5 {
+            idx = set_effects(handle, idx, &both);
+            assert_eq!(
+                geometry_of(handle, idx as usize), settled,
+                "with a gradient present, shadow edit {round} moved or resized the shape");
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_gradient_reserves_no_room_of_its_own() {
+        // A gradient is paint. It is drawn inside the shape's own outline and
+        // reaches nowhere, so adding one must not change the box at all.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+        let bare = annotation_shape(handle, 0).unwrap().1;
+
+        let idx = set_effects(handle, 0, GRADIENT);
+        let after = annotation_shape(handle, idx as usize).unwrap().1;
+
+        // The RECTANGLE, not geometry_of: a fresh add records no upright box on
+        // the tag and a restyle does, so the tuple differs for a reason that is
+        // not the box moving.
+        assert_eq!(
+            (bare.left().value, bare.bottom().value, bare.right().value, bare.top().value),
+            (after.left().value, after.bottom().value, after.right().value, after.top().value),
+            "the gradient changed the shape's rectangle");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_box_is_the_same_whichever_order_the_paint_and_the_shadow_arrive_in() {
+        // Gradient first then shadow is what a person does; shadow first then
+        // gradient is the same shape. If the two disagree, the room accounting
+        // depends on history, which is the shape of an accumulating bug.
+        let shadow = "s(a=135.0000,d=50.0000,b=0.0000,p=0.0000,c=80000000)";
+
+        let a = open_fixture();
+        add_one(a, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+        let mut ia = set_effects(a, 0, GRADIENT);
+        ia = set_effects(a, ia, &format!("{GRADIENT}:{shadow}"));
+        let first = geometry_of(a, ia as usize);
+        close_document(a);
+
+        let b = open_fixture();
+        add_one(b, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+        let mut ib = set_effects(b, 0, shadow);
+        ib = set_effects(b, ib, &format!("{GRADIENT}:{shadow}"));
+        let second = geometry_of(b, ib as usize);
+        close_document(b);
+
+        assert_eq!(first, second, "the box depends on the order the paint arrived in");
+    }
+
     /// The generic effects edit, which is the only one the shipped ABI has.
     fn set_effects(handle: u64, idx: i32, text: &str) -> i32 {
         let mut out = -1;

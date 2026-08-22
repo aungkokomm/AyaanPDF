@@ -164,6 +164,19 @@ public static class DocumentModelBuilder
     {
         if (pageWidthPts <= 0) { return bounds; }
 
+        // THE EFFECTS COME OFF FIRST, which is the order render_core's own
+        // inversion uses and the reason it is stated the same way here. /Rect is
+        // grown by the room the effects asked for so PDFium does not crop a
+        // shadow; reading those edges as the shape's own makes the shape as big
+        // as its shadow.
+        //
+        // Before the ROTATED branch as well, and that is not a detail: a shadow
+        // thrown down and to the right opens only two sides, so the CENTRE of
+        // /Rect is not the shape's centre, and reconstructing a turned shape
+        // about it puts the shape somewhere it is not.
+        bounds = ShapeEffectsRoom.TakenOff(
+            bounds, ShapeEffectsRoom.Of(tag.EffectsText, pageWidthPts));
+
         if (tag.RotationDeg != 0)
         {
             if (tag.BoxWidthPts <= 0 || tag.BoxHeightPts <= 0) { return bounds; }
