@@ -82,7 +82,16 @@ public static class ShadowRasterizer
         var items = new List<ShapeRenderItem>(
             ShapeRenderList.From(Array.Empty<InkStrokeAnnotation>(), new[] { shape }));
 
-        if (tag.FillHex is not null && items.Count > 0)
+        // DOES THE SHAPE HAVE AN INSIDE? Asked of the whole fill and not of the
+        // positional field alone, which is the bug this line used to be.
+        //
+        // A gradient lives on the tag's TAIL and clears the positional field,
+        // because a shape must never carry both. So a gradient-filled shape
+        // read that field as null, cast its shadow as a hollow one, and got
+        // back the exact wire-frame band the comment below was written about.
+        // A solid and a gradient are both an inside; only a stroke-only shape
+        // has none, and that one is still correctly hollow.
+        if (!ShapeFillTag.From(tag).IsEmpty && items.Count > 0)
         {
             // UNDER the outline, the way a fill sits under its own stroke.
             // Colour is irrelevant here, only coverage, but the shape's own

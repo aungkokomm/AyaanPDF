@@ -27,7 +27,7 @@ public class ShapeEffectsRoomTests
 
     /// <summary>A shape's tag with a given tail, at a known box.</summary>
     private static string Tag(string tail) =>
-        "AyaanShape:0:FF000000:2.0000:0:0:0:0:0.0000:0.0000:0.0000"
+        "AyaanShape:0:000000FF:2.0000:0:0:0:0:0.0000:0.0000:0.0000"
         + (tail.Length > 0 ? ":" + tail : "");
 
     /// <summary>The shape's own rectangle, before anything is reserved.</summary>
@@ -234,7 +234,7 @@ public class ShapeEffectsRoomTests
         // The rotated branch reconstructs the shape about the CENTRE of /Rect,
         // and a shadow thrown one way moves that centre. Taking the room off
         // before the reconstruction is what keeps it honest.
-        string turned = "AyaanShape:0:FF000000:2.0000:0:0:30.0000:0:0.0000:120.0000:90.0000";
+        string turned = "AyaanShape:0:000000FF:2.0000:0:0:30.0000:0:0.0000:120.0000:90.0000";
 
         ShapeObject Read(string tail)
         {
