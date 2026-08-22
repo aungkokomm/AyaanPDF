@@ -31,7 +31,38 @@ internal static class SettingsStore
 
     private static string FilePath => File.Exists(PortablePath) ? PortablePath : UserPath;
 
-    public static AppSettings Current => _cached ??= Load();
+    public static AppSettings Current => _cached ??= LoadAndMigrate();
+
+    /// <summary>
+    /// The stored settings, brought up to what this build means by them.
+    ///
+    /// WRITTEN BACK when the migration changed something, so an install is
+    /// migrated once rather than on every launch, and so a later save cannot
+    /// put the old meaning back by serialising an un-stamped file.
+    ///
+    /// A file already at the current version is returned untouched and nothing
+    /// is written, which is what keeps a deliberate later change to a migrated
+    /// setting from being undone on the next start.
+    /// </summary>
+    private static AppSettings LoadAndMigrate()
+    {
+        var stored = Load();
+        var migrated = stored.Migrated();
+
+        if (migrated.SettingsVersion == stored.SettingsVersion)
+        {
+            return stored;
+        }
+
+        Diag.Log(
+            $"settings: migrated v{stored.SettingsVersion} -> v{migrated.SettingsVersion}"
+            + $" (UseSkiaShapeLayer {stored.UseSkiaShapeLayer} -> {migrated.UseSkiaShapeLayer})");
+
+        // Sets _cached itself, so the app is on the migrated settings whether
+        // or not the disk accepts the write.
+        Save(migrated);
+        return migrated;
+    }
 
     private static AppSettings Load()
     {

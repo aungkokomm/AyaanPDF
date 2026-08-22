@@ -185,6 +185,59 @@ public sealed record AppSettings
     }
 
     /// <summary>
+    /// Which generation of this file's meaning the stored settings were
+    /// written against.
+    ///
+    /// ZERO MEANS "BEFORE THIS EXISTED", which is the only reason the default
+    /// is not the current version: a file written before versioning has no such
+    /// key, deserialises to zero, and is therefore recognisable as old. A fresh
+    /// AppSettings is zero too, and is migrated on its way to disk like any
+    /// other, which costs nothing because every migration is already a no-op on
+    /// a default value.
+    ///
+    /// Bumped only when a stored value's MEANING changes, not when a property
+    /// is added. An added property deserialises to its default on an old file,
+    /// which is already the right answer.
+    /// </summary>
+    public int SettingsVersion { get; init; }
+
+    /// <summary>
+    /// The generation this build writes. See <see cref="Migrated"/> for what
+    /// each step does.
+    /// </summary>
+    public const int CurrentSettingsVersion = 1;
+
+    /// <summary>
+    /// Brings a file written by an older build up to what this one means.
+    ///
+    /// VERSION 1: <see cref="UseSkiaShapeLayer"/> stops being a stored answer
+    /// and becomes the renderer.
+    ///
+    /// Settings are serialised in FULL, so every machine that ran the app while
+    /// the Skia layer was still a candidate has an explicit false on disk. That
+    /// false was never chosen: the flag has no UI and never had one, it was
+    /// written out because every property is. Honouring it pinned those
+    /// installs to the XAML overlay for good, and silently, which cost a whole
+    /// diagnostic session to find: the gradient live preview draws through the
+    /// Skia layer and could not appear at all.
+    ///
+    /// So a version 0 file is moved onto the current default and stamped. A
+    /// file already stamped is left exactly as it is, which is what keeps the
+    /// escape hatch working: setting the flag to false by hand AFTER this
+    /// survives, because that one really is a choice.
+    ///
+    /// Applied on LOAD and then written back, so it happens once per install
+    /// rather than once per launch.
+    /// </summary>
+    public AppSettings Migrated() => SettingsVersion >= CurrentSettingsVersion
+        ? this
+        : this with
+        {
+            UseSkiaShapeLayer = true,
+            SettingsVersion = CurrentSettingsVersion,
+        };
+
+    /// <summary>
     /// Brings anything unrecognised back to a sane value.
     ///
     /// Applied on LOAD, not on save, so a file written by a newer version, or
