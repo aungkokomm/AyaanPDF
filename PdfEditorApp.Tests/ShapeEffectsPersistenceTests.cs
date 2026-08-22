@@ -164,10 +164,15 @@ public class ShapeEffectsPersistenceTests
     {
         // Converting points to normalized units divides by the page width, and
         // a zero would produce infinities that then travel into the geometry.
+        // The EFFECTS TEXT is what From reads, so the tag has to carry one or
+        // this asserts nothing: a tag with no effects comes back null whatever
+        // the page width is, and the guard could then be deleted unnoticed.
         var tag = new ShapeTag(
             ShapeKind.Rectangle, "#FF0000FF", 2.0, true, true, 0, null, 0, 0, 0,
-            135, 10, 0, 0, "#FF000000");
+            135, 10, 0, 0, "#FF000000",
+            "s(a=135.00,d=10.0000,b=0.0000,p=0.0000,c=FF000000)");
 
+        Assert.NotNull(ShapeEffectsTag.From(tag, 200));
         Assert.Null(ShapeEffectsTag.From(tag, 0));
     }
 }

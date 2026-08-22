@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 
 namespace PdfEditorApp.Viewport;
@@ -92,6 +93,23 @@ public readonly record struct ShapeTag(
 /// it and each with its own idea of what a malformed value meant. One reader,
 /// one set of defaults.
 /// </summary>
+/// <summary>
+/// One effect field off a shape's tag, whatever effect it turns out to be.
+///
+/// <paramref name="Kind"/> is the letter before the bracket, and
+/// <paramref name="Hex"/> is null when the field did not read as an effect at
+/// all. <paramref name="Field"/> is always the text exactly as it was written,
+/// because a field this build cannot type still has to be carried.
+/// </summary>
+public readonly record struct TagEffect(
+    char Kind,
+    double AngleDeg,
+    double DistancePts,
+    double BlurPts,
+    double SpreadPts,
+    string? Hex,
+    string Field);
+
 public static class ShapeTagReader
 {
     public const string Prefix = "AyaanShape:";
@@ -186,45 +204,85 @@ public static class ShapeTagReader
     }
 
     /// <summary>
+    /// EVERY effect field in an effects string, in the order written, one entry
+    /// per field whether this build can read it or not.
+    ///
+    /// The C# half of <c>parse_effect_field</c> in render_core, and the same
+    /// bargain: the KEYS are shared across effects rather than owned by one, a
+    /// key from a later build is skipped rather than fatal, and the colour is
+    /// what says an effect exists at all.
+    ///
+    /// A field that does NOT read comes back with a null <c>Hex</c> and its
+    /// text intact, because the caller still has to carry it. Never a half-read
+    /// one with invented values.
+    /// </summary>
+    public static IReadOnlyList<TagEffect> EffectsIn(string? effects)
+    {
+        if (string.IsNullOrEmpty(effects))
+        {
+            return Array.Empty<TagEffect>();
+        }
+
+        var read = new List<TagEffect>(2);
+
+        foreach (string field in effects.Split(':'))
+        {
+            if (field.Length == 0)
+            {
+                continue;
+            }
+
+            read.Add(ReadEffect(field));
+        }
+
+        return read;
+    }
+
+    /// <summary>
     /// The DROP SHADOW inside an effects string, named, or nothing when there
     /// is none: <c>s(a=135.00,d=6.0000,b=0.0000,p=0.0000,c=FF000000)</c>.
     ///
-    /// The one effect with a UI, so the one that gets a named reader. The
-    /// effects text itself is carried around whole, because nothing between
-    /// here and the file needs to know what is in it.
-    ///
-    /// Anything malformed yields NO shadow, which is the same answer as a shape
-    /// that never had one, and never a half-read one with invented values. The
-    /// C# half of <c>shadow_effect_of</c> in render_core.
+    /// One effect narrowed out of <see cref="EffectsIn"/>, because the shadow
+    /// is the one this build has always had a named form for. The FIRST s field
+    /// decides, readable or not, so a shape does not quietly fall back to a
+    /// second one further along.
     /// </summary>
     public static (double AngleDeg, double DistancePts, double SoftnessPts,
                    double SpreadPts, string? Hex) ShadowIn(string? effects)
     {
-        var none = (0.0, 0.0, 0.0, 0.0, (string?)null);
-        if (string.IsNullOrEmpty(effects)) { return none; }
-
-        string? field = null;
-        foreach (string candidate in effects.Split(':'))
+        foreach (var effect in EffectsIn(effects))
         {
-            if (candidate.StartsWith("s(", StringComparison.Ordinal))
+            if (effect.Kind != 's')
             {
-                field = candidate;
-                break;
+                continue;
             }
+
+            return effect.Hex is null
+                ? (0.0, 0.0, 0.0, 0.0, (string?)null)
+                : (effect.AngleDeg, effect.DistancePts, effect.BlurPts, effect.SpreadPts, effect.Hex);
         }
 
-        if (field is null || !field.EndsWith(")", StringComparison.Ordinal))
+        return (0.0, 0.0, 0.0, 0.0, (string?)null);
+    }
+
+    /// <summary>One field, read as far as it can be.</summary>
+    private static TagEffect ReadEffect(string field)
+    {
+        var unreadable = new TagEffect(field.Length > 0 ? field[0] : '\0', 0, 0, 0, 0, null, field);
+
+        int open = field.IndexOf('(');
+        if (open != 1 || !field.EndsWith(")", StringComparison.Ordinal))
         {
-            return none;
+            return unreadable;
         }
 
-        double angle = 0, distance = 0, softness = 0, spread = 0;
+        double angle = 0, distance = 0, blur = 0, spread = 0;
         string? hex = null;
 
         foreach (string pair in field[2..^1].Split(','))
         {
             int eq = pair.IndexOf('=');
-            if (eq <= 0) { return none; }
+            if (eq <= 0) { return unreadable; }
 
             string key = pair[..eq];
             string value = pair[(eq + 1)..];
@@ -232,19 +290,19 @@ public static class ShapeTagReader
             switch (key)
             {
                 case "a":
-                    if (!Number(value, out angle)) { return none; }
+                    if (!Number(value, out angle)) { return unreadable; }
                     break;
                 case "d":
-                    if (!NonNegative(value, out distance)) { return none; }
+                    if (!NonNegative(value, out distance)) { return unreadable; }
                     break;
                 case "b":
-                    if (!NonNegative(value, out softness)) { return none; }
+                    if (!NonNegative(value, out blur)) { return unreadable; }
                     break;
                 case "p":
-                    if (!NonNegative(value, out spread)) { return none; }
+                    if (!NonNegative(value, out spread)) { return unreadable; }
                     break;
                 case "c":
-                    if (value.Length != 8 || !IsHex(value)) { return none; }
+                    if (value.Length != 8 || !IsHex(value)) { return unreadable; }
                     hex = "#" + value;
                     break;
                 // Forward compatibility: a key from a later build is not an error.
@@ -253,11 +311,11 @@ public static class ShapeTagReader
             }
         }
 
-        // The colour is what says a shadow exists, the same bargain the fill
+        // The colour is what says an effect exists, the same bargain the fill
         // makes, and one that paints nothing is not one.
-        if (hex is null || hex == "#00000000") { return none; }
+        if (hex is null || hex == "#00000000") { return unreadable; }
 
-        return (angle, distance, softness, spread, hex);
+        return new TagEffect(field[0], angle, distance, blur, spread, hex, field);
     }
 
     private static bool Number(string text, out double value) =>

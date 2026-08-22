@@ -19,9 +19,9 @@ namespace PdfEditorApp.Viewport;
 /// tag already uses. The page width is what converts between them, and it is
 /// the caller's to supply: a tag does not carry one.
 ///
-/// ZERO MEANS NO SHADOW, decided by the COLOUR and not by the offsets. A shadow
+/// ZERO MEANS NO EFFECT, decided by the COLOUR and not by the offsets. A shadow
 /// directly under its shape, offset by nothing, is a legitimate thing to ask
-/// for; a shadow in no colour is not. The same rule the fill already uses.
+/// for; one in no colour is not. The same rule the fill already uses.
 /// </summary>
 public static class ShapeEffectsTag
 {
@@ -55,6 +55,11 @@ public static class ShapeEffectsTag
     /// Null rather than an empty <see cref="ShapeEffects"/>, so a shape read
     /// from a file that predates effects is indistinguishable from one that has
     /// none, which it is.
+    ///
+    /// EVERY FIELD IS ACCOUNTED FOR. One whose letter this build knows becomes
+    /// a typed spec; anything else is carried verbatim, so that editing the
+    /// shadow on a shape written by a later build does not quietly delete what
+    /// that build put there.
     /// </summary>
     /// <param name="pageWidthPts">
     /// The width of the page the shape is on, in points. What converts the
@@ -62,22 +67,140 @@ public static class ShapeEffectsTag
     /// </param>
     public static ShapeEffects? From(ShapeTag tag, double pageWidthPts)
     {
-        if (tag.ShadowHex is null || pageWidthPts <= 0)
+        if (pageWidthPts <= 0)
         {
             return null;
         }
 
-        var (a, r, g, b) = InkPresets.ParseHex(tag.ShadowHex);
+        var fields = ShapeTagReader.EffectsIn(tag.EffectsText);
+        if (fields.Count == 0)
+        {
+            return null;
+        }
 
-        return new ShapeEffects(new DropShadow(
-            // The angle is not a length and needs no conversion; everything
-            // else does, because the tag speaks points and the model speaks
-            // fractions of the page's width.
-            tag.ShadowAngleDeg,
-            tag.ShadowDistancePts / pageWidthPts,
-            new RenderColor(a, r, g, b),
-            tag.ShadowSoftnessPts / pageWidthPts,
-            tag.ShadowSpreadPts / pageWidthPts));
+        var specs = new List<EffectSpec>(fields.Count);
+        var carried = new List<string>();
+
+        foreach (var field in fields)
+        {
+            if (field.Hex is null || KindOf(field.Kind) is not { } kind)
+            {
+                // Not ours to understand. It keeps its own text and its lengths
+                // come into the model's units with everything else, so that
+                // writing it back out is the exact inverse.
+                carried.Add(ScaleFields(field.Field, 1.0 / pageWidthPts));
+                continue;
+            }
+
+            var (a, r, g, b) = InkPresets.ParseHex(field.Hex);
+
+            specs.Add(new EffectSpec(
+                kind,
+                new RenderColor(a, r, g, b),
+                // The angle is not a length and needs no conversion; everything
+                // else does, because the tag speaks points and the model speaks
+                // fractions of the page's width.
+                Blur: field.BlurPts / pageWidthPts,
+                Distance: field.DistancePts / pageWidthPts,
+                AngleDeg: field.AngleDeg,
+                Amount: field.SpreadPts / pageWidthPts));
+        }
+
+        return new ShapeEffects(specs, carried);
+    }
+
+    /// <summary>
+    /// The letter a kind is written as, and the kind a letter reads as.
+    ///
+    /// SIDE BY SIDE, because they are one mapping and a kind that writes a
+    /// letter nothing reads would save and then vanish on the next load. An
+    /// unknown letter is not an error: it is somebody else's effect, and it is
+    /// carried rather than typed.
+    /// </summary>
+    private static char LetterOf(EffectKind kind) => kind switch
+    {
+        EffectKind.DropShadow => 's',
+        EffectKind.Glow => 'g',
+        _ => '\0',
+    };
+
+    /// <inheritdoc cref="LetterOf"/>
+    private static EffectKind? KindOf(char letter) => letter switch
+    {
+        's' => EffectKind.DropShadow,
+        'g' => EffectKind.Glow,
+        _ => null,
+    };
+
+    /// <summary>
+    /// The same effect fields with every LENGTH multiplied, and everything else
+    /// copied exactly.
+    ///
+    /// The C# half of <c>scale_effect_lengths</c> in render_core, and needed for
+    /// the same reason: a carried field's lengths are in whatever space its
+    /// holder is in, and this side moves between points, normalized units and
+    /// capture pixels. Which keys are lengths is a property of the FORMAT rather
+    /// than of any effect, and a key this build does not recognise is copied
+    /// verbatim rather than dropped or reformatted.
+    /// </summary>
+    public static string ScaleFields(string fields, double factor)
+    {
+        if (string.IsNullOrEmpty(fields))
+        {
+            return string.Empty;
+        }
+
+        var built = new System.Text.StringBuilder(fields.Length + 8);
+
+        string[] parts = fields.Split(':');
+        for (int at = 0; at < parts.Length; at++)
+        {
+            if (at > 0)
+            {
+                built.Append(':');
+            }
+
+            string field = parts[at];
+            int open = field.IndexOf('(');
+            if (open < 0 || !field.EndsWith(")", StringComparison.Ordinal))
+            {
+                built.Append(field);
+                continue;
+            }
+
+            built.Append(field, 0, open + 1);
+
+            string[] pairs = field[(open + 1)..^1].Split(',');
+            for (int n = 0; n < pairs.Length; n++)
+            {
+                if (n > 0)
+                {
+                    built.Append(',');
+                }
+
+                string pair = pairs[n];
+                int eq = pair.IndexOf('=');
+                string key = eq > 0 ? pair[..eq] : string.Empty;
+
+                if ((key is "d" or "b" or "p")
+                    && double.TryParse(
+                        pair[(eq + 1)..], NumberStyles.Float, CultureInfo.InvariantCulture,
+                        out double value)
+                    && double.IsFinite(value))
+                {
+                    built.Append(key).Append('=');
+                    built.Append((value * factor).ToString("F4", CultureInfo.InvariantCulture));
+                }
+                else
+                {
+                    built.Append(pair);
+                }
+            }
+
+            built.Append(')');
+        }
+
+        return built.ToString();
     }
 
     /// <summary>
@@ -100,12 +223,12 @@ public static class ShapeEffectsTag
     /// </param>
     public static string TextOf(ShapeEffects? effects, double scale)
     {
-        if (effects is null || effects.IsEmpty)
+        if (effects is null || effects.HasNothing)
         {
             return string.Empty;
         }
 
-        var fields = new List<string>(effects.Specs.Count);
+        var fields = new List<string>(effects.Specs.Count + effects.Carried.Count);
 
         foreach (var spec in effects.Specs)
         {
@@ -114,11 +237,7 @@ public static class ShapeEffectsTag
                 continue;
             }
 
-            char kind = spec.Kind switch
-            {
-                EffectKind.DropShadow => 's',
-                _ => '\0',
-            };
+            char kind = LetterOf(spec.Kind);
 
             if (kind == '\0')
             {
@@ -131,6 +250,15 @@ public static class ShapeEffectsTag
             fields.Add(string.Create(
                 CultureInfo.InvariantCulture,
                 $"{kind}(a={spec.AngleDeg:F2},d={spec.Distance * scale:F4},b={spec.Blur * scale:F4},p={spec.Amount * scale:F4},c={rgba:X8})"));
+        }
+
+        // THE CARRIED FIELDS GO LAST, and out they go untouched but for their
+        // lengths. Their place in the order is not recoverable and would not
+        // mean anything if it were: this build cannot draw them, so it has no
+        // opinion about what they sit above.
+        foreach (string field in effects.Carried)
+        {
+            fields.Add(ScaleFields(field, scale));
         }
 
         return string.Join(":", fields);

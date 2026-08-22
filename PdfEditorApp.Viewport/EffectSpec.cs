@@ -16,6 +16,12 @@ public enum EffectKind
 {
     /// <summary>A copy of the object thrown by a light, blurred, behind it.</summary>
     DropShadow = 0,
+
+    /// <summary>
+    /// The same, with nowhere to fall: a blurred halo of the object's own
+    /// silhouette, in a colour of its own, sitting directly behind it.
+    /// </summary>
+    Glow = 1,
 }
 
 /// <summary>
