@@ -67,7 +67,14 @@ public static class EffectRecipe
             // doing only the part that is hard. Measured in the prototype at
             // about forty per cent cheaper than letting the filter draw the
             // object too.
-            EffectKind.DropShadow => SKImageFilter.CreateDropShadowOnly(dx, dy, sigma, sigma, color),
+            //
+            // A GLOW IS THE SAME PRIMITIVE WITH NOWHERE TO FALL. Its spec has no
+            // distance, so the offset the projection produced above is already
+            // zero and there is nothing to special-case: the filter takes the
+            // object's alpha, blurs it, colours it and puts it back where the
+            // object is. This line is what the whole generalisation was for.
+            EffectKind.DropShadow or EffectKind.Glow =>
+                SKImageFilter.CreateDropShadowOnly(dx, dy, sigma, sigma, color),
             _ => null,
         };
     }

@@ -12,7 +12,7 @@ public readonly record struct ShadowRaster(
     double Left, double Top, double Right, double Bottom);
 
 /// <summary>
-/// The committed half of a Drop Shadow.
+/// The committed half of an effect.
 ///
 /// A page renders through PDFium, which draws paths and has no blur, so a SOFT
 /// shadow cannot be a path in the file. It is drawn here by the same
@@ -132,6 +132,51 @@ public static class ShadowRasterizer
         IReadOnlyList<ShapeRenderItem> group, DropShadow shadow) =>
         BoundsOf(group, shadow.ToSpec());
 
+    /// <summary>
+    /// The box every RASTERISED effect's ink can land in, in normalized page
+    /// units: the union of what each one needs.
+    ///
+    /// ONLY THE ONES THAT ARE IN THE PICTURE count. An unblurred effect is drawn
+    /// as paths by render_core, so counting its reach here would size the box
+    /// for something the picture does not contain and leave the picture sitting
+    /// off-centre inside it.
+    /// </summary>
+    public static (double L, double T, double R, double B) BoundsOf(
+        IReadOnlyList<ShapeRenderItem> group, IReadOnlyList<EffectSpec> specs)
+    {
+        double l = double.MaxValue, t = double.MaxValue;
+        double r = double.MinValue, b = double.MinValue;
+        bool any = false;
+
+        foreach (var spec in specs)
+        {
+            if (!GoesInThePicture(spec))
+            {
+                continue;
+            }
+
+            var box = BoundsOf(group, spec);
+            l = Math.Min(l, box.L);
+            t = Math.Min(t, box.T);
+            r = Math.Max(r, box.R);
+            b = Math.Max(b, box.B);
+            any = true;
+        }
+
+        return any ? (l, t, r, b) : (0, 0, 0, 0);
+    }
+
+    /// <summary>
+    /// Whether this effect is drawn here rather than as paths in the file.
+    ///
+    /// A BLUR IS WHAT DECIDES. PDF has no blur for a path object, so anything
+    /// with one has to arrive as pixels; anything without one is crisp vector
+    /// geometry that no raster resolution improves on. An effect in no colour
+    /// paints nothing either way.
+    /// </summary>
+    private static bool GoesInThePicture(EffectSpec spec) =>
+        spec.Blur > 0 && spec.Color.A != 0;
+
     /// <inheritdoc cref="BoundsOf(IReadOnlyList{ShapeRenderItem}, DropShadow)"/>
     public static (double L, double T, double R, double B) BoundsOf(
         IReadOnlyList<ShapeRenderItem> group, EffectSpec spec)
@@ -175,19 +220,45 @@ public static class ShadowRasterizer
     /// </summary>
     public static ShadowRaster? Rasterize(
         IReadOnlyList<ShapeRenderItem> group, DropShadow shadow, double pageWidthPts) =>
-        Rasterize(group, shadow.ToSpec(), pageWidthPts);
+        Rasterize(group, new[] { shadow.ToSpec() }, pageWidthPts);
 
     /// <inheritdoc cref="Rasterize(IReadOnlyList{ShapeRenderItem}, DropShadow, double)"/>
     public static ShadowRaster? Rasterize(
-        IReadOnlyList<ShapeRenderItem> group, EffectSpec spec, double pageWidthPts)
+        IReadOnlyList<ShapeRenderItem> group, EffectSpec spec, double pageWidthPts) =>
+        Rasterize(group, new[] { spec }, pageWidthPts);
+
+    /// <summary>
+    /// Draws every rasterised effect for one object into ONE picture, in list
+    /// order with the first underneath, or null when there is nothing to draw.
+    ///
+    /// One picture because the annotation has ONE image slot. Two would mean two
+    /// image objects, a second attach path, a second thing to keep in step with
+    /// the tag, and a second thing to leave behind when an effect is removed.
+    /// </summary>
+    public static ShadowRaster? Rasterize(
+        IReadOnlyList<ShapeRenderItem> group, IReadOnlyList<EffectSpec> specs,
+        double pageWidthPts)
     {
-        if (group.Count == 0 || spec.Blur <= 0 || spec.Color.A == 0
-            || pageWidthPts <= 0)
+        if (group.Count == 0 || pageWidthPts <= 0)
         {
             return null;
         }
 
-        var box = BoundsOf(group, spec);
+        var drawn = new List<EffectSpec>(specs.Count);
+        foreach (var spec in specs)
+        {
+            if (GoesInThePicture(spec))
+            {
+                drawn.Add(spec);
+            }
+        }
+
+        if (drawn.Count == 0)
+        {
+            return null;
+        }
+
+        var box = BoundsOf(group, drawn);
         double wNorm = box.R - box.L;
         double hNorm = box.B - box.T;
         if (wNorm <= 0 || hNorm <= 0)
@@ -212,16 +283,6 @@ public static class ShadowRasterizer
         double scale = pageWidthPts;
         var view = PageTransform.For(scale, scale, 0, scale);
 
-        // THE SAME RECIPE THE PREVIEW USES, which is what makes the saved page
-        // and the screen the same picture rather than two renderings that
-        // happen to agree. Null is an effect this build cannot draw, and there
-        // is then nothing to put in the file.
-        using var filter = EffectRecipe.FilterFor(spec, scale, view);
-        if (filter is null)
-        {
-            return null;
-        }
-
         var bitmap = new SKBitmap(pxW, pxH, SKColorType.Bgra8888, SKAlphaType.Premul);
         using (var canvas = new SKCanvas(bitmap))
         {
@@ -229,14 +290,31 @@ public static class ShadowRasterizer
             canvas.Scale((float)(pxW / (wNorm * scale)), (float)(pxH / (hNorm * scale)));
             canvas.Translate((float)(-box.L * scale), (float)(-box.T * scale));
 
-            using var paint = new SKPaint { ImageFilter = filter };
+            // ONE LAYER PER EFFECT, in list order, so a later one composites
+            // over an earlier one exactly as it does in the preview.
+            var casters = group.Select(i => i with { Effects = null }).ToList();
 
-            canvas.SaveLayer(paint);
-            ShapeSkiaPainter.PaintViewport(
-                canvas,
-                group.Select(i => i with { Effects = null }).ToList(),
-                scale, _ => 0, _ => view, new ViewportProjection(1, 1, 0, 0));
-            canvas.Restore();
+            foreach (var spec in drawn)
+            {
+                // THE SAME RECIPE THE PREVIEW USES, which is what makes the
+                // saved page and the screen the same picture rather than two
+                // renderings that happen to agree. Null is an effect this build
+                // cannot draw, so it contributes nothing rather than sinking
+                // the whole picture.
+                using var filter = EffectRecipe.FilterFor(spec, scale, view);
+                if (filter is null)
+                {
+                    continue;
+                }
+
+                using var paint = new SKPaint { ImageFilter = filter };
+
+                canvas.SaveLayer(paint);
+                ShapeSkiaPainter.PaintViewport(
+                    canvas, casters, scale, _ => 0, _ => view,
+                    new ViewportProjection(1, 1, 0, 0));
+                canvas.Restore();
+            }
         }
 
         var bytes = new byte[bitmap.ByteCount];
