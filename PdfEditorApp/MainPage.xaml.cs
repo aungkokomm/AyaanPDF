@@ -3008,6 +3008,12 @@ public sealed partial class MainPage : Page
             ? Microsoft.UI.Colors.White
             : ColorFromHex(current);
         _suppressFillChange = false;
+
+        // The gradient row lives in this flyout and is filled in with it, which
+        // is the moment it can be looked at and the moment the selection is
+        // known. There is no cheaper signal: the fill button is not part of the
+        // property bar's section sync.
+        SyncGradient();
     }
 
     private void FillColor_Changed(ColorPicker sender, ColorChangedEventArgs args)
@@ -3698,6 +3704,160 @@ public sealed partial class MainPage : Page
         _glowColorHex = DropShadowPanel.RgbHexOf(tag);
         GlowSwatch.Background = ShadowBrush(_glowColorHex);
         PushGlow();
+    }
+
+    // ---------------- the gradient row ----------------
+    //
+    // In the FILL flyout, not the Effects one. A gradient is what the inside of
+    // the shape is painted with; a shadow and a glow are marks made beside it.
+    // The row is filled in when the flyout OPENS, which is the moment it can be
+    // looked at and the moment the selection is known.
+
+    private bool _syncingGradient;
+    private string _gradientStartHex = GradientPanel.Defaults.StartHex;
+    private string _gradientEndHex = GradientPanel.Defaults.EndHex;
+
+    /// <summary>
+    /// Fills the row in from the selected shape.
+    ///
+    /// Guarded, because setting a slider raises ValueChanged: without it,
+    /// merely opening the flyout on a shape would write its own gradient back
+    /// to it and turn every look into an edit.
+    /// </summary>
+    private void SyncGradient()
+    {
+        bool editable = ViewModel.HasSelectedShape;
+        var c = GradientPanel.From(editable ? ViewModel.SelectedShapeGradient : null);
+
+        _syncingGradient = true;
+        try
+        {
+            GradientToggle.IsEnabled = editable;
+            GradientToggle.IsOn = c.Enabled;
+            GradientControlsPanel.Visibility = editable && c.Enabled
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            GradientNoSelectionHint.Visibility = editable
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+
+            _gradientStartHex = c.StartHex;
+            _gradientEndHex = c.EndHex;
+            GradientAngleSlider.Value =
+                Math.Clamp(c.AngleDeg, 0, GradientPanel.MaxAngleDeg);
+
+            ShowGradientRow();
+        }
+        finally
+        {
+            _syncingGradient = false;
+        }
+    }
+
+    private GradientControls GradientRowNow() => new(
+        Enabled: GradientToggle.IsOn,
+        StartHex: _gradientStartHex,
+        EndHex: _gradientEndHex,
+        AngleDeg: (int)Math.Round(GradientAngleSlider.Value));
+
+    /// <summary>
+    /// The row's own readouts: the two stop swatches, the angle, and a strip
+    /// showing the gradient the controls describe.
+    ///
+    /// The strip is the only place a gradient can be SEEN while it is being
+    /// set. The page itself is drawn by PDFium from the shape's appearance
+    /// stream, and PDFium cannot make a shading, so the paint only reaches the
+    /// page once the file has been saved and reopened.
+    /// </summary>
+    private void ShowGradientRow()
+    {
+        var row = GradientRowNow();
+
+        GradientStartSwatch.Background = ShadowBrush(row.StartHex);
+        GradientEndSwatch.Background = ShadowBrush(row.EndHex);
+        GradientAngleReadout.Text = $"{row.AngleDeg}\u00B0";
+        GradientPreview.Background = GradientBrushFor(row);
+    }
+
+    /// <summary>
+    /// The row's gradient as a XAML brush, through the SAME endpoints the
+    /// renderer and the PDF writer use.
+    ///
+    /// A LinearGradientBrush measures its points as fractions of the box it
+    /// fills, y down, which is exactly the model's own convention, so the strip
+    /// shows the direction the shape will get rather than an impression of it.
+    /// </summary>
+    private static LinearGradientBrush GradientBrushFor(GradientControls row)
+    {
+        var g = GradientPanel.AtAngle(
+            RenderColorOf(row.StartHex), RenderColorOf(row.EndHex), row.AngleDeg);
+
+        var brush = new LinearGradientBrush
+        {
+            StartPoint = new Windows.Foundation.Point(g.X0, g.Y0),
+            EndPoint = new Windows.Foundation.Point(g.X1, g.Y1),
+        };
+
+        brush.GradientStops.Add(new GradientStop { Offset = 0, Color = ColorFromHex(row.StartHex) });
+        brush.GradientStops.Add(new GradientStop { Offset = 1, Color = ColorFromHex(row.EndHex) });
+
+        return brush;
+    }
+
+    private static RenderColor RenderColorOf(string hex)
+    {
+        var (a, r, g, b) = InkPresets.ParseHex(hex);
+        return new RenderColor(a, r, g, b);
+    }
+
+    /// <summary>
+    /// Applies the row to the selected shape. Switched off, this hands over
+    /// null, and the view model takes the gradient off the tag and puts a solid
+    /// back in its place.
+    /// </summary>
+    private void PushGradient()
+    {
+        if (_syncingGradient || !ViewModel.HasSelectedShape)
+        {
+            return;
+        }
+
+        ShowGradientRow();
+        ViewModel.ApplyGradientToSelectedShape(GradientPanel.ToGradient(GradientRowNow()));
+    }
+
+    private void Gradient_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingGradient)
+        {
+            return;
+        }
+
+        GradientControlsPanel.Visibility = GradientToggle.IsOn
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        PushGradient();
+    }
+
+    private void Gradient_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) =>
+        PushGradient();
+
+    private void GradientStart_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag })
+        {
+            _gradientStartHex = tag;
+            PushGradient();
+        }
+    }
+
+    private void GradientEnd_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag })
+        {
+            _gradientEndHex = tag;
+            PushGradient();
+        }
     }
 
     private void Opacity_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)

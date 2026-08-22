@@ -19121,6 +19121,101 @@ p={spread_px:.4},c={rgba:08X})"
         let _ = std::fs::remove_file(&src);
     }
 
+    /// The positional fill edit, which is the second half of every paint the
+    /// UI writes.
+    fn set_fill(handle: u64, idx: i32, rgba: u32) -> i32 {
+        let mut out = -1;
+        assert_eq!(
+            restyle_shape_fill_annotation(handle, 0, idx, 1000, rgba, &mut out),
+            STATUS_OK_PDFIUM,
+            "the fill edit was refused");
+        out
+    }
+
+    /// The exact pair of calls the view model makes for one paint: the tail
+    /// that carries any gradient, then the positional field that carries any
+    /// solid.
+    fn set_paint(handle: u64, idx: i32, tail: &str, solid: u32) -> i32 {
+        set_fill(handle, set_effects(handle, idx, tail), solid)
+    }
+
+    fn fill_of(handle: u64, idx: i32) -> u32 {
+        parse_shape_tag(&contents_of(handle, 0, idx as usize).unwrap()).unwrap().9
+    }
+
+    #[test]
+    fn a_solid_becomes_a_gradient_and_back_without_ever_being_both() {
+        // THE PAIR THAT MUST NOT DRIFT. A gradient lives on the tail and a
+        // solid lives in the positional field, and PDFium paints the positional
+        // one as part of the appearance it generates. Leaving a solid behind
+        // would paint it straight over the shading the writer puts underneath.
+        let handle = open_fixture();
+        let mut sp = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        sp.fill_rgba = 0xFF3B82F6;
+        add_one(handle, sp);
+
+        assert_eq!(fill_of(handle, 0), 0xFF3B82F6, "the shape did not start solid");
+
+        // SOLID -> GRADIENT.
+        let idx = set_paint(handle, 0, &across(), 0);
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+
+        assert!(tag.contains(&across()), "the gradient did not arrive: {tag}");
+        assert_eq!(fill_of(handle, idx), 0, "the solid was left underneath the gradient");
+
+        // GRADIENT -> SOLID, in the gradient's own first colour.
+        let idx = set_paint(handle, idx, "", 0xFFFF0000);
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+
+        assert!(!tag.contains("f("), "the gradient field was left behind: {tag}");
+        assert_eq!(fill_of(handle, idx), 0xFFFF0000, "the solid did not come back");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_gradient_and_the_effects_survive_every_edit_to_each_other() {
+        // Three things share one tail: a fill field and two effects. Every edit
+        // sends the WHOLE tail, so the test of that is to change each of them
+        // in turn and find the other two still there.
+        let handle = open_fixture();
+        add_one(handle, shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0));
+
+        let shadow = "s(a=135.00,d=50.0000,b=0.0000,p=0.0000,c=80000000)";
+        let glow = "g(a=0.00,d=0.0000,b=10.0000,p=0.0000,c=FFFFD400)";
+
+        // A gradient, a shadow and a glow together.
+        let idx = set_paint(handle, 0, &format!("{}:{shadow}:{glow}", across()), 0);
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(tag.contains(&across()), "the gradient is missing: {tag}");
+        assert!(tag.contains(":s("), "the shadow is missing: {tag}");
+        assert!(tag.contains(":g("), "the glow is missing: {tag}");
+
+        // Take the SHADOW off. The other two stay.
+        let idx = set_paint(handle, idx, &format!("{}:{glow}", across()), 0);
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(!tag.contains(":s("), "the shadow was not removed: {tag}");
+        assert!(tag.contains(&across()), "removing the shadow took the gradient: {tag}");
+        assert!(tag.contains(":g("), "removing the shadow took the glow: {tag}");
+
+        // Change the GRADIENT. The glow stays.
+        let turned = gradient_field(0.5, 0.0, 0.5, 1.0);
+        let idx = set_paint(handle, idx, &format!("{turned}:{glow}"), 0);
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(tag.contains(&turned), "the new gradient is missing: {tag}");
+        assert!(!tag.contains(&across()), "the old gradient was left behind: {tag}");
+        assert!(tag.contains(":g("), "changing the gradient took the glow: {tag}");
+
+        // Take the GRADIENT off. The glow stays.
+        let idx = set_paint(handle, idx, glow, 0xFF3B82F6);
+        let tag = contents_of(handle, 0, idx as usize).unwrap();
+        assert!(!tag.contains("f("), "the gradient was not removed: {tag}");
+        assert!(tag.contains("g("), "removing the gradient took the glow: {tag}");
+        assert_eq!(fill_of(handle, idx), 0xFF3B82F6, "the solid did not come back");
+
+        close_document(handle);
+    }
+
     #[test]
     fn a_gradient_this_build_cannot_represent_is_refused_rather_than_flattened() {
         // A PDF shading carries no alpha of its own. Writing a translucent

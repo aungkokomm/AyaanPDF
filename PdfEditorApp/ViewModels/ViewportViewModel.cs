@@ -4974,6 +4974,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// The selected shape's OWN gradient, or null when it has none. Narrowed
+    /// out of <see cref="SelectedShapeFill"/> the way the shadow and the glow
+    /// are narrowed out of the effects.
+    /// </summary>
+    public GradientFill? SelectedShapeGradient => SelectedShapeFill.Gradient;
+
     /// <summary>The selected shape's page width in points, which is what turns
     /// the row's points into the model's normalized lengths. Zero when there is
     /// no selection.</summary>
@@ -5026,23 +5033,100 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        const int CaptureWidth = 1000;
-
-        // Normalized lengths become capture pixels on the way, which is the
-        // space every override speaks.
-        //
         // THE WHOLE TAIL, fill included. The core replaces it wholesale, so
         // sending only the effects would take the shape's gradient off every
         // time somebody nudged the shadow's slider. The fill is read back from
-        // the shape rather than passed in, because this edit is not about it.
-        string text = ShapeFillTag.TailOf(SelectedShapeFill, effects, CaptureWidth);
-        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text);
+        // the shape rather than passed in, because this edit is not about it,
+        // and its positional half is left alone for the same reason.
+        WriteShapePaint(sel, SelectedShapeFill, effects, solid: null, historyLabel, failure);
+    }
 
-        PushHistory(HistoryScope.Document, historyLabel);
+    /// <summary>
+    /// Gives the selected shape a gradient fill, changes the one it has, or
+    /// takes it away when handed null.
+    ///
+    /// TWO WRITES, ONE UNDO. A gradient lives on the tag's tail and a solid
+    /// lives in the tag's positional fill field, and the two must never both be
+    /// set: PDFium paints the positional fill as part of the appearance it
+    /// generates, so a leftover solid would be painted straight over the
+    /// shading the save-time writer puts underneath it. The core exposes one
+    /// entry point for each, so this makes both calls inside a single history
+    /// push and the pair undoes together.
+    ///
+    /// THE WHOLE TAIL GOES, effects included, for the same reason the effect
+    /// rows send the whole effect list: the core replaces it wholesale, so
+    /// sending only the gradient would take the shape's shadow and glow off.
+    ///
+    /// Turning a gradient off leaves the shape in its START colour rather than
+    /// blank. The solid it had before the gradient was cleared when the
+    /// gradient was applied and is not remembered anywhere, and going blank
+    /// would make the shape vanish under a switch that only said "solid".
+    /// </summary>
+    public void ApplyGradientToSelectedShape(GradientFill? gradient)
+    {
+        if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
+            || !_selectedIsShape)
+        {
+            return;
+        }
+
+        const int CaptureWidth = 1000;
+
+        var effects = SelectedShapeEffects;
+        var fill = gradient is { } g ? ShapeFill.Of(g) : ShapeFill.None;
+
+        // What the shape is left filled with once the gradient is gone. Read
+        // BEFORE the writes, because the first of them replaces the annotation.
+        uint solid = gradient is null
+            ? SolidAfterGradient(SelectedShapeFill)
+            : 0;
+
+        WriteShapePaint(
+            sel, fill, effects, solid,
+            gradient is null ? "Remove gradient" : "Gradient fill",
+            "Could not apply that gradient.");
+    }
+
+    /// <summary>
+    /// Writes a shape's WHOLE paint: the tail that carries any gradient, then
+    /// the positional field that carries any solid.
+    ///
+    /// THE ONLY WAY BOTH ARE SET, so they cannot end up disagreeing. One
+    /// history push covers the pair, because a person switching a fill did one
+    /// thing and expects one undo.
+    /// </summary>
+    /// <param name="solid">
+    /// The positional fill to leave the shape with, or NULL to leave whatever
+    /// it already has.
+    ///
+    /// Null is the ordinary case and costs a write: an edit to an effect has no
+    /// opinion about the fill, and rewriting it would rebuild the annotation a
+    /// second time on every drag of a slider.
+    /// </param>
+    private void WriteShapePaint(
+        LoadedSelection sel,
+        ShapeFill fill,
+        ShapeEffects? effects,
+        uint? solid,
+        string label,
+        string failure)
+    {
+        const int CaptureWidth = 1000;
+
+        PushHistory(HistoryScope.Document, label);
+
+        string tail = ShapeFillTag.TailOf(fill, effects, CaptureWidth);
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(tail);
 
         int status = RenderCoreNative.restyle_shape_effects_annotation(
             _documentHandle, sel.PageIndex, sel.Index, CaptureWidth,
             utf8, (nuint)utf8.Length, out int newIndex);
+
+        if (status == RenderStatus.OkPdfium && solid is { } rgba)
+        {
+            status = RenderCoreNative.restyle_shape_fill_annotation(
+                _documentHandle, sel.PageIndex, newIndex, CaptureWidth, rgba, out newIndex);
+        }
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -5050,18 +5134,48 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        if (solid is { } written)
+        {
+            ShapeFillHex = written == 0 ? null : $"#{written:X8}";
+        }
+
         IsDirty = true;
         InvalidateLoadedPage(sel.PageIndex);
+        FollowRestyledShape(sel, newIndex);
+    }
 
-        // The shape was deleted and re-added, so the marquee follows it to its
-        // new index, exactly as the fill and style restyles do.
+    /// <summary>
+    /// The solid a shape keeps when its gradient is taken away: the gradient's
+    /// own first stop, opaque, or nothing at all when there was no gradient.
+    /// </summary>
+    private static uint SolidAfterGradient(ShapeFill fill)
+    {
+        if (fill.Gradient is not { } gradient)
+        {
+            return 0;
+        }
+
+        var c = gradient.From;
+
+        return 0xFF000000u | ((uint)c.R << 16) | ((uint)c.G << 8) | c.B;
+    }
+
+    /// <summary>
+    /// Moves the marquee onto the annotation a restyle just re-added, which
+    /// every shape restyle has to do because the core deletes and re-adds
+    /// rather than editing in place.
+    /// </summary>
+    private void FollowRestyledShape(LoadedSelection sel, int newIndex)
+    {
         var actual = LoadedFor(sel.PageIndex)
             .Where(x => x.Index == newIndex)
             .Select(x => (Interop.ExistingAnnotation?)x)
             .FirstOrDefault();
+
         _selectedLoaded = actual is Interop.ExistingAnnotation a
             ? new LoadedSelection(sel.PageIndex, newIndex, a.Left, a.Top, a.Right, a.Bottom, sel.Id)
             : sel with { Index = newIndex };
+
         RefreshSelectionOutline();
     }
 
@@ -5076,6 +5190,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         const int CaptureWidth = 1000;
         uint fillRgba = PackShapeFillRgba(ShapeFillHex);
+
+        // A SOLID REPLACES A GRADIENT, it does not sit under one. The gradient
+        // is the more specific paint and wins wherever both are recorded, so
+        // picking a colour on a gradient-filled shape would otherwise appear to
+        // do nothing at all. Taking the gradient off needs the tail rewritten
+        // as well, which is a second write and belongs with the first.
+        if (SelectedShapeFill.Gradient is not null)
+        {
+            WriteShapePaint(
+                sel, ShapeFill.None, SelectedShapeEffects, fillRgba,
+                "Shape fill", "Could not apply that fill.");
+            return;
+        }
 
         PushHistory(HistoryScope.Document, "Shape fill");
         int status = RenderCoreNative.restyle_shape_fill_annotation(
