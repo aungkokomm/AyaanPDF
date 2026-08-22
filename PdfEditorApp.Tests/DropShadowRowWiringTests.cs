@@ -113,7 +113,11 @@ public class DropShadowRowWiringTests
     public void the_row_is_refilled_whenever_the_bar_is_laid_out()
     {
         // Otherwise it would show the last shape's shadow on the next one.
-        Assert.Contains("if (sections.Effects) { SyncDropShadow(); }", Code(), StringComparison.Ordinal);
+        //
+        // Not pinned to the whole statement: the flyout takes another row per
+        // effect, and each one adds its own sync call beside this one.
+        Assert.Contains(
+            "if (sections.Effects) { SyncDropShadow();", Code(), StringComparison.Ordinal);
     }
 
     [Fact]

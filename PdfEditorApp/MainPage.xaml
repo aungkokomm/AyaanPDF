@@ -2235,6 +2235,72 @@
                                                    FontSize="12" TextWrapping="Wrap"
                                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                     </StackPanel>
+
+                                    <Rectangle Height="1" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                                    <!--
+                                        The Glow ROW. A second block in the same
+                                        flyout, which is what the Effects section
+                                        was shaped for: it touches nothing
+                                        outside these lines.
+
+                                        The shadow's row minus direction and
+                                        distance, because a glow has nowhere to
+                                        fall. Same control shapes, same handler
+                                        pattern, same guard.
+                                    -->
+                                    <StackPanel Spacing="8">
+                                        <ToggleSwitch x:Name="GlowToggle" Header="Outer glow"
+                                                      OnContent="On" OffContent="Off"
+                                                      Toggled="Glow_Toggled" />
+
+                                        <StackPanel x:Name="GlowControlsPanel" Spacing="8">
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="Blur" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Slider x:Name="GlowBlurSlider" Width="126"
+                                                        Maximum="18" Minimum="1" StepFrequency="1"
+                                                        VerticalAlignment="Center"
+                                                        AutomationProperties.Name="Glow blur in points"
+                                                        ValueChanged="Glow_ValueChanged" />
+                                                <TextBlock x:Name="GlowBlurReadout" VerticalAlignment="Center"
+                                                           MinWidth="30" TextAlignment="Right" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </StackPanel>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="Opacity" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Slider x:Name="GlowOpacitySlider" Width="126"
+                                                        Maximum="100" Minimum="10" StepFrequency="5"
+                                                        VerticalAlignment="Center"
+                                                        AutomationProperties.Name="Glow opacity"
+                                                        ValueChanged="Glow_ValueChanged" />
+                                                <TextBlock x:Name="GlowOpacityReadout" VerticalAlignment="Center"
+                                                           MinWidth="30" TextAlignment="Right" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </StackPanel>
+
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <TextBlock Text="Colour" VerticalAlignment="Center" MinWidth="52" FontSize="12"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                <Border x:Name="GlowSwatch" Width="24" Height="24" CornerRadius="4"
+                                                        BorderBrush="#66000000" BorderThickness="1"
+                                                        VerticalAlignment="Center" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FFFFD400" Tag="#FFFFD400" Click="GlowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Yellow" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FFFF7A00" Tag="#FFFF7A00" Click="GlowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Orange" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FFD13438" Tag="#FFD13438" Click="GlowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Red" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF0078D4" Tag="#FF0078D4" Click="GlowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Blue" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FF10D070" Tag="#FF10D070" Click="GlowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="Green" />
+                                                <Button Width="24" Height="24" Padding="0" Background="#FFFFFFFF" Tag="#FFFFFFFF" Click="GlowColor_Click" BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}" BorderThickness="1" ToolTipService.ToolTip="White" />
+                                            </StackPanel>
+                                        </StackPanel>
+
+                                        <TextBlock x:Name="GlowNoSelectionHint"
+                                                   Text="Select a shape to give it a glow."
+                                                   FontSize="12" TextWrapping="Wrap"
+                                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    </StackPanel>
                                 </StackPanel>
                             </Flyout>
                         </DropDownButton.Flyout>

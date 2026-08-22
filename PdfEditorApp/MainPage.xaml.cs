@@ -3590,6 +3590,116 @@ public sealed partial class MainPage : Page
         PushDropShadow();
     }
 
+    // ---------------- the Glow row ----------------
+    //
+    // The shadow's row minus direction and distance, sharing its guard because
+    // the two are filled in together and a second flag would only be a second
+    // thing to forget to set. Everything that decides a value lives in
+    // GlowPanel, where a test can reach it.
+
+    /// <summary>The colour the glow row is set to, "#RRGGBB".</summary>
+    private string _glowColorHex = GlowPanel.Defaults.ColorHex;
+
+    /// <summary>Fills the glow row in from the selected shape.</summary>
+    private void SyncGlow()
+    {
+        double pageWpt = ViewModel.SelectedShapePageWidthPts;
+        bool editable = ViewModel.HasSelectedShape && pageWpt > 0;
+        double layoutWidth = pageWpt > 0 ? pageWpt : FallbackPageWidthPts;
+
+        var c = GlowPanel.From(editable ? ViewModel.SelectedShapeGlow : null, layoutWidth);
+
+        _syncingShadow = true;
+        try
+        {
+            GlowToggle.IsEnabled = editable;
+            GlowToggle.IsOn = c.Enabled;
+            GlowControlsPanel.Visibility = editable && c.Enabled
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            GlowNoSelectionHint.Visibility = editable ? Visibility.Collapsed : Visibility.Visible;
+
+            // The ends before the value, or a value past the old maximum is
+            // clamped to it on the way in and the row shows the wrong number.
+            GlowBlurSlider.Minimum = GlowPanel.MinBlurPts;
+            GlowBlurSlider.Maximum = System.Math.Round(GlowPanel.MaxBlurPts(layoutWidth));
+            GlowBlurSlider.Value = System.Math.Clamp(
+                c.BlurPts, GlowBlurSlider.Minimum, GlowBlurSlider.Maximum);
+            GlowOpacitySlider.Value = System.Math.Clamp(
+                c.OpacityPercent, GlowPanel.MinOpacityPercent, 100);
+
+            _glowColorHex = c.ColorHex;
+            GlowSwatch.Background = ShadowBrush(c.ColorHex);
+            UpdateGlowReadouts();
+        }
+        finally
+        {
+            _syncingShadow = false;
+        }
+    }
+
+    private void UpdateGlowReadouts()
+    {
+        GlowBlurReadout.Text = $"{GlowBlurSlider.Value:F0}pt";
+        GlowOpacityReadout.Text = $"{GlowOpacitySlider.Value:F0}%";
+    }
+
+    /// <summary>The glow row as it stands.</summary>
+    private GlowControls GlowRowNow() => new(
+        Enabled: GlowToggle.IsOn,
+        BlurPts: GlowBlurSlider.Value,
+        OpacityPercent: (int)System.Math.Round(GlowOpacitySlider.Value),
+        ColorHex: _glowColorHex);
+
+    /// <summary>
+    /// Applies the row to the selected shape. Switched off, this hands over
+    /// null, and the view model takes the glow out of the shape's list while
+    /// leaving every other effect on it.
+    /// </summary>
+    private void PushGlow()
+    {
+        if (_syncingShadow)
+        {
+            return;
+        }
+
+        double pageWpt = ViewModel.SelectedShapePageWidthPts;
+        if (pageWpt <= 0)
+        {
+            return;
+        }
+
+        UpdateGlowReadouts();
+        ViewModel.ApplyGlowToSelectedShape(GlowPanel.ToGlow(GlowRowNow(), pageWpt));
+    }
+
+    private void Glow_Toggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncingShadow)
+        {
+            return;
+        }
+
+        GlowControlsPanel.Visibility = GlowToggle.IsOn ? Visibility.Visible : Visibility.Collapsed;
+        PushGlow();
+    }
+
+    private void Glow_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) => PushGlow();
+
+    private void GlowColor_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement fe || fe.Tag is not string tag)
+        {
+            return;
+        }
+
+        // The same "#AARRGGBB" tags the fill picker uses; the alpha is dropped
+        // because opacity is a control of its own.
+        _glowColorHex = DropShadowPanel.RgbHexOf(tag);
+        GlowSwatch.Background = ShadowBrush(_glowColorHex);
+        PushGlow();
+    }
+
     private void Opacity_ValueChanged(object sender, RangeBaseValueChangedEventArgs e)
     {
         if (_suppressOpacityChange)
@@ -4090,7 +4200,7 @@ public sealed partial class MainPage : Page
         TextAlignRow.Visibility = Show(sections.TextAlign);
         OutlineButton.Visibility = Show(sections.Outline);
         EffectsSection.Visibility = Show(sections.Effects);
-        if (sections.Effects) { SyncDropShadow(); }
+        if (sections.Effects) { SyncDropShadow(); SyncGlow(); }
         PropertyBarRow2.Visibility = Show(sections.Row2);
         PropertyBar.Visibility = Show(sections.Bar);
 
