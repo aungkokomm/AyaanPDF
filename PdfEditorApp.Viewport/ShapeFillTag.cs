@@ -71,14 +71,7 @@ public static class ShapeFillTag
             }
         }
 
-        if (tag.FillHex is null)
-        {
-            return ShapeFill.None;
-        }
-
-        var (a, r, g, b) = InkPresets.ParseHex(tag.FillHex);
-
-        return ShapeFill.Of(new RenderColor(a, r, g, b));
+        return ShapeFill.FromHex(tag.FillHex);
     }
 
     /// <summary>

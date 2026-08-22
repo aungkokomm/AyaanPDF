@@ -334,6 +334,26 @@ public static class ShapeSkiaPainter
         canvas.DrawPath(path, hairline);
     }
 
+    /// <summary>
+    /// A mark's outline, and its inside first when it has one.
+    ///
+    /// FILL THEN STROKE, in that order, which is not a preference: PDF's
+    /// combined paint operator fills and then strokes, so PDFium puts the
+    /// stroke's inner half on TOP of the fill and the shape is exactly as thick
+    /// as its stroke says. Painting the other way round eats half the outline
+    /// and every filled shape comes out looking thinner here than in the file.
+    ///
+    /// THE SAME PATH, not a second one built for the fill. Whatever moves,
+    /// turns, resizes or zooms the outline moves the fill with it, because
+    /// there is only one geometry to move. A line or an arrow shaft encloses no
+    /// area, so a fill on one paints nothing without anybody having to decide
+    /// that it should not.
+    ///
+    /// A GRADIENT PAINTS NOTHING HERE YET, deliberately. There is no average
+    /// colour standing in for one: a renderer that cannot draw the gradient
+    /// leaves the shape unfilled, which is visibly missing rather than quietly
+    /// wrong.
+    /// </summary>
     private static void PaintStroked(
         SKCanvas canvas, ShapeRenderItem item, double scale, double pageTop, PageTransform view)
     {
@@ -365,6 +385,26 @@ public static class ShapeSkiaPainter
         };
 
         using var path = PathFor(item, scale, pageTop, view);
+
+        if (item.Fill.Solid is { } inside)
+        {
+            using var fill = new SKPaint
+            {
+                Style = SKPaintStyle.Fill,
+                Color = ToSkColor(inside),
+
+                // As the stroke is, and for the same reason: without it every
+                // curve and diagonal edge is a staircase against the page.
+                IsAntialias = true,
+            };
+
+            // Skia closes a contour to fill it, which is what a fill means. The
+            // path itself stays open so the STROKE is unchanged: a shaft is
+            // drawn as a polyline whose last point repeats its first, and
+            // closing it would round the join at that vertex.
+            canvas.DrawPath(path, fill);
+        }
+
         canvas.DrawPath(path, paint);
     }
 

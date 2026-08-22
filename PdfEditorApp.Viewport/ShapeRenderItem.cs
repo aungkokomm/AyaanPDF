@@ -96,6 +96,28 @@ public readonly record struct ShapeRenderItem(
     /// object is its own object, which is exactly the old behaviour.
     /// </summary>
     public Guid ObjectId { get; init; }
+
+    /// <summary>
+    /// What the inside of this mark is painted with, or
+    /// <see cref="ShapeFill.None"/> for a stroke-only mark, which is the
+    /// default and what ink, guides and arrow heads all are.
+    ///
+    /// An init-only property alongside <see cref="ObjectId"/> and for the same
+    /// reason: every existing construction of this type keeps compiling and
+    /// keeps producing exactly the pixels it produced before, so the parity
+    /// evidence gathered against the XAML overlay still means something.
+    ///
+    /// UNDER THE STROKE, always. PDF's combined paint operator fills and then
+    /// strokes, so the stroke's inner half sits on top of the fill and a shape
+    /// is exactly as thick as its stroke says. Painting the other way round
+    /// would eat half the outline, which is the failure this is written down to
+    /// prevent.
+    ///
+    /// NOT THE ARROW HEAD'S. A head is a solid triangle in the STROKE's colour
+    /// and is emitted as its own <see cref="RenderStyle.Filled"/> mark; it has
+    /// nothing to do with the shape's fill and is unaffected by it.
+    /// </summary>
+    public ShapeFill Fill { get; init; }
 }
 
 /// <summary>
@@ -202,7 +224,7 @@ public static class ShapeRenderList
             // both rather than two that darken where they overlap.
             items.Add(new ShapeRenderItem(
                 shape.PageIndex, shape.Outline, color, shape.StrokeWidth, RenderStyle.Stroked,
-                Effects: shape.Effects) { ObjectId = shape.Id });
+                Effects: shape.Effects) { ObjectId = shape.Id, Fill = shape.Fill });
 
             // Guarded on the count rather than on the kind, matching the
             // overlay: a shape whose head could not be built is not drawn as a

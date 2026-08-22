@@ -93,6 +93,22 @@ public sealed record ShapeAnnotation(
     /// </summary>
     public ShapeEffects? Effects { get; init; }
 
+    /// <summary>
+    /// What the inside of this shape is painted with, or
+    /// <see cref="ShapeFill.None"/> for the stroke-only shape that was the
+    /// historic default and is still what every shape read from a file without
+    /// a fill has.
+    ///
+    /// An init-only property beside <see cref="Effects"/>, on the same terms.
+    ///
+    /// A LINE AND AN ARROW HAVE NO INSIDE, and neither render_core nor the
+    /// painter needs telling: a two-point path encloses no area, so a fill set
+    /// on one paints nothing rather than being refused somewhere. That is why
+    /// there is no list of which kinds may be filled to keep in step with
+    /// render_core's.
+    /// </summary>
+    public ShapeFill Fill { get; init; }
+
     /// <summary>The polyline this shape draws as, including any arrowhead.</summary>
     public IReadOnlyList<(double X, double Y)> Outline =>
         ShapeGeometry.Outline(Draft, StrokeWidth);

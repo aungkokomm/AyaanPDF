@@ -6030,6 +6030,13 @@ public sealed partial class MainPage : Page
         ViewModel.ShapeInProgress is { } draft
             ? new ShapeAnnotation(
                 ViewModel.ActiveShapePage, draft, ViewModel.InkColorHex, ViewModel.InkWidth)
+            {
+                // The SAME fill the shape is about to be committed with, from
+                // the same property EndShape reads. Without it a filled
+                // rectangle is an empty outline right up until the pointer
+                // lifts and then fills all at once.
+                Fill = ShapeFill.FromHex(ViewModel.ShapeFillHex),
+            }
             : null;
 
     /// <summary>

@@ -109,6 +109,25 @@ public readonly record struct ShapeFill
     /// <summary>The gradient, or null when this is not a gradient fill.</summary>
     public GradientFill? Gradient { get; }
 
+    /// <summary>
+    /// A fill from the "#AARRGGBB" string the app carries solid colours as,
+    /// with null and empty both meaning stroke-only.
+    ///
+    /// The app has spoken hex at every edge since long before there was a fill
+    /// model, and this is the one place that string becomes one.
+    /// </summary>
+    public static ShapeFill FromHex(string? hex)
+    {
+        if (string.IsNullOrEmpty(hex))
+        {
+            return None;
+        }
+
+        var (a, r, g, b) = InkPresets.ParseHex(hex);
+
+        return Of(new RenderColor(a, r, g, b));
+    }
+
     /// <summary>Whether the shape is stroke-only.</summary>
     public bool IsEmpty => Solid is null && Gradient is null;
 }
