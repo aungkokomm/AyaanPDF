@@ -130,6 +130,53 @@ public readonly record struct ShapeRenderItem(
     /// arithmetic, because they are the same kind of number in the same space.
     /// </summary>
     public ShapeFill Fill { get; init; }
+
+    /// <summary>
+    /// The same mark turned about a point, in its own normalized page units.
+    ///
+    /// POINTS AND GRADIENT TOGETHER, which is the whole reason this is one
+    /// method rather than a loop at each call site. A shape's own angle is
+    /// carried by turning its points, and the gradient's endpoints live in the
+    /// same space beside them, so a turn that moved one and not the other would
+    /// leave the paint upright inside a turned shape. That was a real trap: the
+    /// shadow rasteriser turned points and nothing else, and only had no bug
+    /// because nothing had yet given it a fill.
+    ///
+    /// The stored gradient is untouched by any of this. It is fractions of the
+    /// shape's upright box and stays that way; what turns is the resolved copy
+    /// the renderer was handed.
+    /// </summary>
+    public ShapeRenderItem TurnedAbout(double cx, double cy, double degrees)
+    {
+        if (degrees == 0)
+        {
+            return this;
+        }
+
+        double radians = degrees * Math.PI / 180.0;
+        double cos = Math.Cos(radians), sin = Math.Sin(radians);
+
+        (double X, double Y) About((double X, double Y) p) => (
+            cx + (((p.X - cx) * cos) - ((p.Y - cy) * sin)),
+            cy + (((p.X - cx) * sin) + ((p.Y - cy) * cos)));
+
+        var points = new List<(double X, double Y)>(Points.Count);
+        foreach (var point in Points)
+        {
+            points.Add(About(point));
+        }
+
+        var fill = Fill;
+        if (fill.Gradient is { } gradient)
+        {
+            var (x0, y0) = About((gradient.X0, gradient.Y0));
+            var (x1, y1) = About((gradient.X1, gradient.Y1));
+
+            fill = ShapeFill.Of(gradient with { X0 = x0, Y0 = y0, X1 = x1, Y1 = y1 });
+        }
+
+        return this with { Points = points, Fill = fill };
+    }
 }
 
 /// <summary>

@@ -4981,6 +4981,43 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public GradientFill? SelectedShapeGradient => SelectedShapeFill.Gradient;
 
+    /// <summary>
+    /// What Skia paints for the selected shape on top of PDFium's rendering of
+    /// it, which is nothing at all unless that shape has a gradient.
+    ///
+    /// THE ONE COMMITTED SHAPE THE LIVE SURFACE DRAWS, and only while it is
+    /// selected and only while it needs it. PDFium cannot make a shading, so a
+    /// gradient reaches the appearance stream only when the file is saved; this
+    /// is what stands in between choosing one and saving. Every other shape on
+    /// every page is PDFium's, as it has been since v1.72.
+    ///
+    /// Read from the tag on demand, like the fill and the effects, and for the
+    /// same reason: the document is the authority.
+    /// </summary>
+    public IReadOnlyList<ShapeRenderItem> SelectedShapeOverlayItems
+    {
+        get
+        {
+            if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
+                || !_selectedIsShape)
+            {
+                return Array.Empty<ShapeRenderItem>();
+            }
+
+            string? contents = ReadAnnotationContents(sel.PageIndex, sel.Index);
+            if (contents is null || !ShapeTagReader.TryParse(contents, out var tag))
+            {
+                return Array.Empty<ShapeRenderItem>();
+            }
+
+            const int CaptureWidth = 1000;
+            double pageWidthPts = PagePointsFor(sel.PageIndex).W;
+            var (l, t, r, b) = UprightBounds(contents, sel, CaptureWidth, pageWidthPts);
+
+            return SelectedShapeOverlay.ItemsFor(tag, sel.PageIndex, l, t, r, b, pageWidthPts);
+        }
+    }
+
     /// <summary>The selected shape's page width in points, which is what turns
     /// the row's points into the model's normalized lengths. Zero when there is
     /// no selection.</summary>

@@ -99,20 +99,15 @@ public static class ShadowRasterizer
         // it. The picture carries the turn in its pixels rather than being
         // turned as a whole later, because turning the picture would turn the
         // light with it.
+        //
+        // THROUGH THE SHARED TURN, which also carries a gradient's endpoints.
+        // This path never has one today, and the point of going through the one
+        // method is that it cannot start having one that fails to turn.
         double cx = (left + right) / 2;
         double cy = (top + bottom) / 2;
-        double rad = tag.RotationDeg * Math.PI / 180.0;
-        double cos = Math.Cos(rad), sin = Math.Sin(rad);
 
         return items
-            .Select(i => i with
-            {
-                Points = i.Points
-                    .Select(p => (
-                        X: cx + (((p.X - cx) * cos) - ((p.Y - cy) * sin)),
-                        Y: cy + (((p.X - cx) * sin) + ((p.Y - cy) * cos))))
-                    .ToList(),
-            })
+            .Select(i => i.TurnedAbout(cx, cy, tag.RotationDeg))
             .ToList();
     }
 

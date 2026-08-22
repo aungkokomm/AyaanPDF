@@ -3037,6 +3037,7 @@ public sealed partial class MainPage : Page
         {
             ViewModel.ShapeFillHex = hex;
             ViewModel.ApplyFillToSelectedShape();
+            RefreshSkiaShapeLayer();
         }
         else
         {
@@ -3054,6 +3055,7 @@ public sealed partial class MainPage : Page
         {
             ViewModel.ShapeFillHex = null;
             ViewModel.ApplyFillToSelectedShape();
+            RefreshSkiaShapeLayer();
         }
         else
         {
@@ -3139,6 +3141,7 @@ public sealed partial class MainPage : Page
             {
                 ViewModel.ShapeFillHex = hex;
                 ViewModel.ApplyFillToSelectedShape();
+            RefreshSkiaShapeLayer();
             }
             else
             {
@@ -3824,6 +3827,11 @@ public sealed partial class MainPage : Page
 
         ShowGradientRow();
         ViewModel.ApplyGradientToSelectedShape(GradientPanel.ToGradient(GradientRowNow()));
+
+        // The shape's paint changed, so what Skia has to stand in for changed
+        // with it. Switching the row OFF is the case that matters: the overlay
+        // has to go, or a gradient stays on screen after it has been removed.
+        RefreshSkiaShapeLayer();
     }
 
     private void Gradient_Toggled(object sender, RoutedEventArgs e)
@@ -4007,6 +4015,7 @@ public sealed partial class MainPage : Page
         {
             ViewModel.ShapeFillHex = InkPresets.WithOpacity(ViewModel.ShapeFillHex, e.NewValue / 100.0);
             ViewModel.ApplyFillToSelectedShape();
+            RefreshSkiaShapeLayer();
         }
         else if (ViewModel.HasSelectedTextBox && !string.IsNullOrEmpty(ViewModel.TextFillHex))
         {
@@ -4331,6 +4340,10 @@ public sealed partial class MainPage : Page
         _suppressToolSelection = false;
 
         PropertyBarToolName.Text = tool.Name;
+
+        // The selected shape's gradient overlay lives or dies with the
+        // selection, and this runs on every selection change.
+        RefreshSkiaShapeLayer();
 
         // EVERY section's visibility comes from one pure function, so a new
         // section cannot be wired up in the wrong place. The corner slider
@@ -6165,9 +6178,23 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        SkiaShapeCanvas.Show(
+        // The frame, plus the one committed shape PDFium cannot finish drawing.
+        //
+        // A gradient reaches a shape's appearance stream only when the file is
+        // saved, because PDFium cannot make a shading, so the selected shape's
+        // gradient is painted here until the save catches up. It is not the old
+        // overlay list coming back: one shape, only while selected, only while
+        // it has a gradient, and read from its own tag.
+        //
+        // LAST, so it lands on top of the PDFium page underneath it.
+        var frame = new List<ShapeRenderItem>(
             ShapeRenderList.From(
-                ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape(), PreviewInkGuide()),
+                ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape(), PreviewInkGuide()));
+
+        frame.AddRange(ViewModel.SelectedShapeOverlayItems);
+
+        SkiaShapeCanvas.Show(
+            frame,
             ViewModel.OverlayScale,
             ViewModel.SlotTopOf,
             ViewModel.ViewTransformOf,
