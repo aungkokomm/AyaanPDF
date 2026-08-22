@@ -38,16 +38,15 @@ public class RoundedRectangleTests
         public float RotationDeg;
         public uint FillRgba;
         public float CornerRadiusPx;
-        // ...and a fourth time, for the drop shadow. Adding the fields here is
-        // not optional bookkeeping: a short mirror marshals the ARRAY with the
-        // wrong stride, so every element after the first arrives as garbage and
-        // the core rejects the batch. That is exactly how this one announced
-        // itself, in six batch tests at once.
-        public float ShadowAngleDeg;
-        public float ShadowDistancePx;
-        public float ShadowSoftnessPx;
-        public float ShadowSpreadPx;
-        public uint ShadowRgba;
+        // ...and a fourth time, for the effects. Getting these right is not
+        // optional bookkeeping, and it is worse than a wrong stride now: the
+        // core reads bytes 48 to 55 as a POINTER to the effects text. A mirror
+        // that still spells the old five shadow floats is the SAME 64 bytes, so
+        // the stride is right and the size assertion passes, and it only stays
+        // harmless while those bytes happen to be zero, which reads as null.
+        // Anything writing a value there hands the core a wild pointer.
+        public IntPtr EffectsUtf8;
+        public nuint EffectsLen;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -177,6 +176,21 @@ public class RoundedRectangleTests
         // radius. Getting this wrong does not error: it silently feeds the
         // native side garbage coordinates.
         Assert.Equal(64, Marshal.SizeOf<ShapeSpec>());
+    }
+
+    [Fact]
+    public void the_effects_pointer_sits_where_the_native_side_reads_it()
+    {
+        // THE SIZE ALONE IS NOT ENOUGH, which is how a stale mirror survived.
+        // Five shadow floats and a pointer-plus-length both leave the struct at
+        // 64 bytes, so the size assertion passed and the stride stayed right
+        // while byte 48 changed from a float into a POINTER. It only stayed
+        // harmless because those bytes were zero, which reads as null.
+        //
+        // Naming the member is what makes this bite: a mirror still spelling
+        // the old five floats does not fail here, it does not compile.
+        Assert.Equal(48, (int)Marshal.OffsetOf<ShapeSpec>(nameof(ShapeSpec.EffectsUtf8)));
+        Assert.Equal(56, (int)Marshal.OffsetOf<ShapeSpec>(nameof(ShapeSpec.EffectsLen)));
     }
 
     [Fact]
