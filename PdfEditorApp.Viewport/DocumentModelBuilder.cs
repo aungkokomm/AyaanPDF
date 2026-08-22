@@ -99,6 +99,7 @@ public static class DocumentModelBuilder
                 FillHex = tag.FillHex,
                 RotationDeg = tag.RotationDeg,
                 CornerRadiusPts = tag.CornerRadiusPts,
+                Gradient = ShapeFillTag.From(tag).Gradient,
             };
         }
 

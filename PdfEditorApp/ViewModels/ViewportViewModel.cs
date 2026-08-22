@@ -4982,41 +4982,123 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public GradientFill? SelectedShapeGradient => SelectedShapeFill.Gradient;
 
     /// <summary>
-    /// What Skia paints for the selected shape on top of PDFium's rendering of
-    /// it, which is nothing at all unless that shape has a gradient.
+    /// What Skia paints on top of PDFium's page for the gradient-filled shapes
+    /// on the pages currently in view, which is nothing at all in a document
+    /// that has none.
     ///
-    /// THE ONE COMMITTED SHAPE THE LIVE SURFACE DRAWS, and only while it is
-    /// selected and only while it needs it. PDFium cannot make a shading, so a
-    /// gradient reaches the appearance stream only when the file is saved; this
-    /// is what stands in between choosing one and saving. Every other shape on
-    /// every page is PDFium's, as it has been since v1.72.
+    /// PDFium cannot make a shading, so a gradient reaches a shape's appearance
+    /// stream only when the file is saved. This is what stands in between, and
+    /// it does NOT stop at the selection: a shape has to keep its paint when
+    /// the person clicks somewhere else, or the fill is a thing that only
+    /// exists while you look at it.
     ///
-    /// Read from the tag on demand, like the fill and the effects, and for the
-    /// same reason: the document is the authority.
+    /// NOT THE OLD OVERLAY LIST. Every shape without a gradient is PDFium's, as
+    /// it has been since v1.72. The filter is one specific gap in what PDFium
+    /// can generate, and nothing else goes through here.
+    ///
+    /// BOUNDED. Only pages already prepared are read, and preparing one is a
+    /// page load; see <see cref="PrepareGradientOverlay"/> for when that
+    /// happens and why it is not here.
     /// </summary>
-    public IReadOnlyList<ShapeRenderItem> SelectedShapeOverlayItems
+    public IReadOnlyList<ShapeRenderItem> GradientOverlayItems
     {
         get
         {
-            if (_documentHandle == 0 || _selectedLoaded is not LoadedSelection sel
-                || !_selectedIsShape)
+            if (_documentHandle == 0 || _gradientOverlayByPage.Count == 0)
             {
                 return Array.Empty<ShapeRenderItem>();
             }
 
-            string? contents = ReadAnnotationContents(sel.PageIndex, sel.Index);
-            if (contents is null || !ShapeTagReader.TryParse(contents, out var tag))
+            List<ShapeRenderItem>? items = null;
+            foreach (var page in _gradientOverlayByPage.Values)
             {
-                return Array.Empty<ShapeRenderItem>();
+                if (page.Count == 0)
+                {
+                    continue;
+                }
+
+                (items ??= new List<ShapeRenderItem>(page.Count)).AddRange(page);
             }
 
-            const int CaptureWidth = 1000;
-            double pageWidthPts = PagePointsFor(sel.PageIndex).W;
-            var (l, t, r, b) = UprightBounds(contents, sel, CaptureWidth, pageWidthPts);
-
-            return SelectedShapeOverlay.ItemsFor(tag, sel.PageIndex, l, t, r, b, pageWidthPts);
+            return (IReadOnlyList<ShapeRenderItem>?)items ?? Array.Empty<ShapeRenderItem>();
         }
     }
+
+    /// <summary>
+    /// Built once per page and kept until that page's annotations change, which
+    /// is what makes reading it during a scroll frame free.
+    /// </summary>
+    private readonly Dictionary<int, IReadOnlyList<ShapeRenderItem>> _gradientOverlayByPage = new();
+
+    /// <summary>
+    /// Makes sure the pages in view have their gradient overlay ready, and
+    /// forgets the ones that have scrolled far away.
+    ///
+    /// THE BOUNDED HALF, and the reason it is a method called at known moments
+    /// rather than work done by the property above. Preparing a page means
+    /// building its model, and building a model means asking PDFium for the
+    /// page's annotations and reading each of their tags. Doing that inside
+    /// every scroll frame is exactly the shape of the hitch this codebase has
+    /// been bitten by three times.
+    ///
+    /// So it runs only for pages ENTERING the visible range. Those same pages
+    /// are being parsed to be rendered at that moment anyway, and a page whose
+    /// model is already cached costs a dictionary lookup.
+    ///
+    /// A page that cannot be prepared in time is not a problem: PDFium still
+    /// draws whatever the file already says, and the overlay appears on the
+    /// next refresh. A stutter would be the worse trade.
+    /// </summary>
+    public void PrepareGradientOverlay()
+    {
+        if (_documentHandle == 0 || PageSlots.Count == 0)
+        {
+            return;
+        }
+
+        var (first, last) = _layout.VisibleRange(_lastViewTop, _lastViewBottom);
+        if (first < 0)
+        {
+            return;
+        }
+
+        // Only when the range actually moved. This runs on every scroll frame,
+        // and walking the keys to evict on each of them would be work done
+        // hundreds of times to throw nothing away.
+        if (first != _overlayFirstPage || last != _overlayLastPage)
+        {
+            _overlayFirstPage = first;
+            _overlayLastPage = last;
+
+            // Kept by DISTANCE rather than exactly, so scrolling back a page
+            // does not rebuild what was just thrown away.
+            var (keepFrom, keepTo) = RenderBudget.Widen(
+                first, last, ReleaseBeyondPages, Math.Max(1, PageSlots.Count));
+
+            foreach (int page in _gradientOverlayByPage.Keys.ToList())
+            {
+                if (page < keepFrom || page > keepTo)
+                {
+                    _gradientOverlayByPage.Remove(page);
+                }
+            }
+        }
+
+        for (int page = first; page <= last; page++)
+        {
+            if (_gradientOverlayByPage.ContainsKey(page))
+            {
+                continue;
+            }
+
+            // THE ONLY PAGE LOAD IN THIS FEATURE, and it happens once per page
+            // per visit rather than once per frame.
+            _gradientOverlayByPage[page] = GradientOverlay.ItemsFor(PageModelFor(page));
+        }
+    }
+
+    private int _overlayFirstPage = -1;
+    private int _overlayLastPage = -1;
 
     /// <summary>The selected shape's page width in points, which is what turns
     /// the row's points into the model's normalized lengths. Zero when there is
@@ -8151,6 +8233,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void InvalidateAnnotationCache(int pageIndex)
     {
         _loadedByPage.Remove(pageIndex);
+
+        // The gradient overlay is a projection of the page model, which is a
+        // projection of this, so it goes with them. Dropped and not rebuilt
+        // here: PrepareGradientOverlay is the ONE place that builds one, and it
+        // runs on the next refresh, which every edit already triggers.
+        _gradientOverlayByPage.Remove(pageIndex);
+
         // The model is a projection of the annotation cache, so it is dropped
         // with it and can never be staler than the data everything else already
         // trusts. Giving it a lifetime of its own is how a second source of

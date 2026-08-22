@@ -214,6 +214,23 @@ public sealed record ShapeObject : DocumentObject
     /// <summary>Corner radius in PDF points. Zero for every kind but a rounded
     /// rectangle, and for a rounded rectangle drawn square.</summary>
     public double CornerRadiusPts { get; init; }
+
+    /// <summary>
+    /// The shape's gradient, in its own shape-relative fractions, or null for
+    /// every shape without one.
+    ///
+    /// SEPARATE FROM <see cref="FillHex"/> rather than folded into it, because
+    /// the two live in different halves of the tag and a shape must never
+    /// carry both. The positional field is the solid; the tail carries this.
+    ///
+    /// Here because the builder has already parsed the tag this comes out of,
+    /// so knowing which shapes on a page have a gradient costs nothing beyond
+    /// the model that was going to be built anyway. That is what makes the live
+    /// gradient overlay affordable: PDFium cannot draw a shading it has not
+    /// been given one for, and finding the shapes that need standing in for
+    /// must not mean reading the document again.
+    /// </summary>
+    public GradientFill? Gradient { get; init; }
 }
 
 /// <summary>

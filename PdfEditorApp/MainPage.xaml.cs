@@ -6178,20 +6178,24 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // The frame, plus the one committed shape PDFium cannot finish drawing.
+        // The frame, plus the committed shapes PDFium cannot finish drawing.
         //
         // A gradient reaches a shape's appearance stream only when the file is
-        // saved, because PDFium cannot make a shading, so the selected shape's
-        // gradient is painted here until the save catches up. It is not the old
-        // overlay list coming back: one shape, only while selected, only while
-        // it has a gradient, and read from its own tag.
+        // saved, because PDFium cannot make a shading, so every gradient shape
+        // in view is painted here. It is not the old overlay list coming back:
+        // the filter is that one gap, the shapes come from the page model that
+        // selection and hit-testing already build, and a document with no
+        // gradient adds nothing at all.
         //
         // LAST, so it lands on top of the PDFium page underneath it.
         var frame = new List<ShapeRenderItem>(
             ShapeRenderList.From(
                 ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape(), PreviewInkGuide()));
 
-        frame.AddRange(ViewModel.SelectedShapeOverlayItems);
+        // Prepared first, and bounded to the pages in view: a page entering the
+        // range is loaded once, and one already prepared costs a lookup.
+        ViewModel.PrepareGradientOverlay();
+        frame.AddRange(ViewModel.GradientOverlayItems);
 
         SkiaShapeCanvas.Show(
             frame,
