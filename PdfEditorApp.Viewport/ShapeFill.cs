@@ -66,6 +66,39 @@ public readonly record struct GradientFill(
     /// swapped. Identical paint, and the one normalization the tag needs.
     /// </summary>
     public GradientFill Reversed() => new(To, From, X1, Y1, X0, Y0);
+
+    /// <summary>
+    /// The same gradient with its endpoints moved out of the shape's box and
+    /// into the units the box was given in.
+    ///
+    /// THE ONE CONVERSION between the two spaces a gradient lives in. The MODEL
+    /// stores fractions of the shape's own upright box, which is what makes a
+    /// gradient survive being moved and resized without anybody writing code
+    /// for either. A RENDERER cannot use a fraction: it needs two points beside
+    /// the ones it is already drawing, in the same space as those.
+    ///
+    /// Doing it here, once, is what keeps move, resize and turn from being
+    /// three features. The resolved endpoints sit in exactly the space the
+    /// mark's own points sit in, so whatever transform reaches the points
+    /// reaches the gradient: a page's turn, the zoom, the scroll, all of it,
+    /// through the projection that was already there.
+    /// </summary>
+    /// <param name="left">The shape's upright box. Its own, not its bounds
+    /// with the stroke or an effect's room added: a fraction of the box is
+    /// measured against the box the person dragged out.</param>
+    public GradientFill InBox(double left, double top, double right, double bottom)
+    {
+        double w = right - left;
+        double h = bottom - top;
+
+        return this with
+        {
+            X0 = left + (X0 * w),
+            Y0 = top + (Y0 * h),
+            X1 = left + (X1 * w),
+            Y1 = top + (Y1 * h),
+        };
+    }
 }
 
 /// <summary>

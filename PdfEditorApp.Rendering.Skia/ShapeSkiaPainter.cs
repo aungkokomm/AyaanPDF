@@ -349,10 +349,10 @@ public static class ShapeSkiaPainter
     /// area, so a fill on one paints nothing without anybody having to decide
     /// that it should not.
     ///
-    /// A GRADIENT PAINTS NOTHING HERE YET, deliberately. There is no average
-    /// colour standing in for one: a renderer that cannot draw the gradient
-    /// leaves the shape unfilled, which is visibly missing rather than quietly
-    /// wrong.
+    /// A GRADIENT IS REAL VECTOR PAINT, a Skia shader on the same path, not a
+    /// picture of one. It stays sharp at any zoom for the same reason the
+    /// outline does, and it is clipped by the path rather than by a rectangle,
+    /// because the path is what is being filled.
     /// </summary>
     private static void PaintStroked(
         SKCanvas canvas, ShapeRenderItem item, double scale, double pageTop, PageTransform view)
@@ -386,9 +386,47 @@ public static class ShapeSkiaPainter
 
         using var path = PathFor(item, scale, pageTop, view);
 
+        // Skia closes a contour to fill it, which is what a fill means. The
+        // path itself stays open so the STROKE is unchanged: a shaft is drawn
+        // as a polyline whose last point repeats its first, and closing it
+        // would round the join at that vertex.
+        PaintInside(canvas, path, item, scale, pageTop, view);
+
+        canvas.DrawPath(path, paint);
+    }
+
+    /// <summary>
+    /// The inside of a mark: one colour, a gradient, or nothing at all.
+    ///
+    /// A GRADIENT IS A SHADER, not a picture of one. The paint stays
+    /// resolution-free, so it is as sharp at eight hundred percent as the
+    /// outline round it, and it is clipped by the PATH because the path is what
+    /// is being filled. Nothing here knows what shape it is filling.
+    ///
+    /// THE ENDPOINTS ARE PROJECTED LIKE ANY OTHER POINT, through the same
+    /// <see cref="OverlayProjection.ToSlot"/> the path itself goes through, and
+    /// that is the whole of the transform story. The page's turn, the scroll
+    /// and the zoom all reach the gradient because they reach that projection.
+    /// Moving, resizing or turning the SHAPE reaches it because the endpoints
+    /// were resolved into the mark's own space beside its points; see
+    /// <see cref="GradientFill.InBox"/>.
+    ///
+    /// CLAMPED at both ends, which is what PDF's <c>Extend</c> array says when
+    /// both its entries are true. A gradient may begin before the shape and end
+    /// after it, and past its ends the paint is that end's own colour rather
+    /// than nothing.
+    /// </summary>
+    private static void PaintInside(
+        SKCanvas canvas,
+        SKPath path,
+        ShapeRenderItem item,
+        double scale,
+        double pageTop,
+        PageTransform view)
+    {
         if (item.Fill.Solid is { } inside)
         {
-            using var fill = new SKPaint
+            using var solid = new SKPaint
             {
                 Style = SKPaintStyle.Fill,
                 Color = ToSkColor(inside),
@@ -398,12 +436,33 @@ public static class ShapeSkiaPainter
                 IsAntialias = true,
             };
 
-            // Skia closes a contour to fill it, which is what a fill means. The
-            // path itself stays open so the STROKE is unchanged: a shaft is
-            // drawn as a polyline whose last point repeats its first, and
-            // closing it would round the join at that vertex.
-            canvas.DrawPath(path, fill);
+            canvas.DrawPath(path, solid);
+            return;
         }
+
+        if (item.Fill.Gradient is not { } gradient)
+        {
+            return;
+        }
+
+        var from = OverlayProjection.ToSlot((gradient.X0, gradient.Y0), scale, pageTop, view);
+        var to = OverlayProjection.ToSlot((gradient.X1, gradient.Y1), scale, pageTop, view);
+
+        // Both live until after the draw, the way the effect layer's filter and
+        // its paint do. Which of the two owns the native object is not a thing
+        // to be clever about at a call site.
+        using var shader = SKShader.CreateLinearGradient(
+            new SKPoint((float)from.X, (float)from.Y),
+            new SKPoint((float)to.X, (float)to.Y),
+            [ToSkColor(gradient.From), ToSkColor(gradient.To)],
+            SKShaderTileMode.Clamp);
+
+        using var paint = new SKPaint
+        {
+            Style = SKPaintStyle.Fill,
+            IsAntialias = true,
+            Shader = shader,
+        };
 
         canvas.DrawPath(path, paint);
     }

@@ -116,6 +116,18 @@ public readonly record struct ShapeRenderItem(
     /// NOT THE ARROW HEAD'S. A head is a solid triangle in the STROKE's colour
     /// and is emitted as its own <see cref="RenderStyle.Filled"/> mark; it has
     /// nothing to do with the shape's fill and is unaffected by it.
+    ///
+    /// A GRADIENT'S ENDPOINTS ARE IN THIS ITEM'S OWN UNITS, normalized
+    /// page-local, exactly like <see cref="Points"/>. That is NOT where the
+    /// model keeps them: <see cref="GradientFill"/> stores fractions of the
+    /// shape's upright box, and <see cref="GradientFill.InBox"/> is the one
+    /// conversion, performed by <see cref="ShapeRenderList"/> where the shape's
+    /// box is still known.
+    ///
+    /// The point of resolving them here rather than in a renderer is that the
+    /// gradient then travels with the points and needs no transform of its own.
+    /// Whatever moves, turns or scales the mark moves the gradient by the same
+    /// arithmetic, because they are the same kind of number in the same space.
     /// </summary>
     public ShapeFill Fill { get; init; }
 }
@@ -224,7 +236,7 @@ public static class ShapeRenderList
             // both rather than two that darken where they overlap.
             items.Add(new ShapeRenderItem(
                 shape.PageIndex, shape.Outline, color, shape.StrokeWidth, RenderStyle.Stroked,
-                Effects: shape.Effects) { ObjectId = shape.Id, Fill = shape.Fill });
+                Effects: shape.Effects) { ObjectId = shape.Id, Fill = FillOf(shape) });
 
             // Guarded on the count rather than on the kind, matching the
             // overlay: a shape whose head could not be built is not drawn as a
@@ -238,6 +250,26 @@ public static class ShapeRenderList
             }
         }
     }
+
+    /// <summary>
+    /// A shape's fill as a RENDER ITEM carries it.
+    ///
+    /// A solid colour crosses unchanged; there is nothing about it that depends
+    /// on the shape. A gradient's endpoints are fractions of the shape's own
+    /// upright box, and this is where that box is still known, so this is where
+    /// they become the ordinary normalized page-local points every renderer
+    /// already knows how to project.
+    ///
+    /// THE BOX IS THE DRAFT'S, the rectangle the person dragged out, and not
+    /// the outline's bounds: an arrow's bounds cover its head and a stroked
+    /// shape's cover half its own weight, and a fraction measured against
+    /// either would drift as the stroke changed.
+    /// </summary>
+    private static ShapeFill FillOf(ShapeAnnotation shape) =>
+        shape.Fill.Gradient is { } gradient
+            ? ShapeFill.Of(gradient.InBox(
+                shape.Draft.Left, shape.Draft.Top, shape.Draft.Right, shape.Draft.Bottom))
+            : shape.Fill;
 
     /// <summary>
     /// The overlay's own colour rule, reached through the parser the rest of the
