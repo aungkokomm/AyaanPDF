@@ -104,13 +104,39 @@ public class GradientRowWiringTests
     }
 
     [Fact]
-    public void the_direction_slider_covers_the_whole_turn_in_even_steps()
+    public void the_direction_slider_covers_the_whole_turn_one_degree_at_a_time()
     {
+        // It used to step in 45s, which made every gradient in the app one of
+        // eight. The endpoints were always free; the step was a limit the
+        // controls invented.
         string row = Row();
 
         Assert.Contains("Minimum=\"0\"", row, StringComparison.Ordinal);
-        Assert.Contains("Maximum=\"315\"", row, StringComparison.Ordinal);
-        Assert.Contains("StepFrequency=\"45\"", row, StringComparison.Ordinal);
+        Assert.Contains("Maximum=\"359\"", row, StringComparison.Ordinal);
+        Assert.Contains("StepFrequency=\"1\"", row, StringComparison.Ordinal);
+
+        Assert.DoesNotContain("StepFrequency=\"45\"", row, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_spread_slider_is_on_the_row_and_cannot_reach_zero()
+    {
+        // Zero is two endpoints in the same place, which is not a gradient.
+        string row = Row();
+
+        Assert.Contains("GradientSpreadSlider", row, StringComparison.Ordinal);
+        Assert.Contains("GradientSpreadReadout", row, StringComparison.Ordinal);
+        Assert.Contains("Minimum=\"10\"", row, StringComparison.Ordinal);
+        Assert.Contains("Maximum=\"500\"", row, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_swap_button_is_on_the_row()
+    {
+        string row = Row();
+
+        Assert.Contains("GradientSwapButton", row, StringComparison.Ordinal);
+        Assert.Contains("GradientSwap_Click", row, StringComparison.Ordinal);
     }
 
     // ---------------- and they are wired ----------------
@@ -120,6 +146,7 @@ public class GradientRowWiringTests
     [InlineData("Gradient_ValueChanged")]
     [InlineData("GradientStart_Click")]
     [InlineData("GradientEnd_Click")]
+    [InlineData("GradientSwap_Click")]
     public void every_handler_the_markup_names_exists(string handler)
     {
         Assert.Contains(handler + "\"", Row(), StringComparison.Ordinal);

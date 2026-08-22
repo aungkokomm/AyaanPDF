@@ -1813,7 +1813,7 @@
                                                     <TextBlock Text="Angle" VerticalAlignment="Center" MinWidth="42" FontSize="12"
                                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                                     <Slider x:Name="GradientAngleSlider" Width="126"
-                                                            Maximum="315" Minimum="0" StepFrequency="45"
+                                                            Maximum="359" Minimum="0" StepFrequency="1"
                                                             VerticalAlignment="Center"
                                                             AutomationProperties.Name="Gradient direction in degrees"
                                                             ValueChanged="Gradient_ValueChanged" />
@@ -1821,6 +1821,25 @@
                                                                MinWidth="34" TextAlignment="Right" FontSize="12"
                                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                                 </StackPanel>
+
+                                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                                    <TextBlock Text="Spread" VerticalAlignment="Center" MinWidth="42" FontSize="12"
+                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                    <Slider x:Name="GradientSpreadSlider" Width="126"
+                                                            Maximum="500" Minimum="10" StepFrequency="5"
+                                                            VerticalAlignment="Center"
+                                                            AutomationProperties.Name="Gradient ramp length as a percentage"
+                                                            ToolTipService.ToolTip="How long the ramp is. Below 100% each end fills flat; above 100% the shape shows only the middle of the ramp."
+                                                            ValueChanged="Gradient_ValueChanged" />
+                                                    <TextBlock x:Name="GradientSpreadReadout" VerticalAlignment="Center"
+                                                               MinWidth="34" TextAlignment="Right" FontSize="12"
+                                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                                </StackPanel>
+
+                                                <Button x:Name="GradientSwapButton" Content="Swap colours"
+                                                        HorizontalAlignment="Stretch" Height="28" FontSize="12"
+                                                        AutomationProperties.Name="Swap the gradient's two colours"
+                                                        Click="GradientSwap_Click" />
 
                                                 <Border x:Name="GradientPreview" Height="22" CornerRadius="4"
                                                         BorderBrush="#66000000" BorderThickness="1" />

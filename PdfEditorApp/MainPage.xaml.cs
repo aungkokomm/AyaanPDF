@@ -3748,6 +3748,8 @@ public sealed partial class MainPage : Page
             _gradientEndHex = c.EndHex;
             GradientAngleSlider.Value =
                 Math.Clamp(c.AngleDeg, 0, GradientPanel.MaxAngleDeg);
+            GradientSpreadSlider.Value = Math.Clamp(
+                c.SpreadPercent, GradientPanel.MinSpreadPercent, GradientPanel.MaxSpreadPercent);
 
             ShowGradientRow();
         }
@@ -3761,7 +3763,8 @@ public sealed partial class MainPage : Page
         Enabled: GradientToggle.IsOn,
         StartHex: _gradientStartHex,
         EndHex: _gradientEndHex,
-        AngleDeg: (int)Math.Round(GradientAngleSlider.Value));
+        AngleDeg: (int)Math.Round(GradientAngleSlider.Value),
+        SpreadPercent: (int)Math.Round(GradientSpreadSlider.Value));
 
     /// <summary>
     /// The row's own readouts: the two stop swatches, the angle, and a strip
@@ -3779,6 +3782,7 @@ public sealed partial class MainPage : Page
         GradientStartSwatch.Background = ShadowBrush(row.StartHex);
         GradientEndSwatch.Background = ShadowBrush(row.EndHex);
         GradientAngleReadout.Text = $"{row.AngleDeg}\u00B0";
+        GradientSpreadReadout.Text = $"{row.SpreadPercent}%";
         GradientPreview.Background = GradientBrushFor(row);
     }
 
@@ -3793,7 +3797,8 @@ public sealed partial class MainPage : Page
     private static LinearGradientBrush GradientBrushFor(GradientControls row)
     {
         var g = GradientPanel.AtAngle(
-            RenderColorOf(row.StartHex), RenderColorOf(row.EndHex), row.AngleDeg);
+            RenderColorOf(row.StartHex), RenderColorOf(row.EndHex),
+            row.AngleDeg, row.SpreadPercent);
 
         var brush = new LinearGradientBrush
         {
@@ -3849,6 +3854,23 @@ public sealed partial class MainPage : Page
 
     private void Gradient_ValueChanged(object sender, RangeBaseValueChangedEventArgs e) =>
         PushGradient();
+
+    /// <summary>
+    /// Exchanges the two stops.
+    ///
+    /// Through the same fields the swatches write and the same PushGradient
+    /// everything else takes, so it is one history entry like any other edit
+    /// and cannot drift from what the row shows.
+    /// </summary>
+    private void GradientSwap_Click(object sender, RoutedEventArgs e)
+    {
+        var swapped = GradientPanel.Swapped(GradientRowNow());
+
+        _gradientStartHex = swapped.StartHex;
+        _gradientEndHex = swapped.EndHex;
+
+        PushGradient();
+    }
 
     private void GradientStart_Click(object sender, RoutedEventArgs e)
     {

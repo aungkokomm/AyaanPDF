@@ -81,15 +81,33 @@ public class GradientPanelTests
         Assert.Equal(angle, GradientPanel.AngleOf(GradientPanel.AtAngle(Red, Blue, angle)));
     }
 
-    [Fact]
-    public void a_direction_from_somewhere_else_shows_at_the_nearest_step()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(23)]
+    [InlineData(112)]
+    [InlineData(199)]
+    [InlineData(347)]
+    [InlineData(359)]
+    public void an_angle_between_the_old_eight_steps_survives_the_trip_too(int angle)
     {
-        // The model takes any two endpoints and the row offers eight
-        // directions. A gradient made by a later build still has to put the
-        // thumb somewhere on the track.
+        // THE POINT OF FREEING THE SLIDER. These used to snap to a multiple of
+        // 45 and come back as a different gradient; 23 became 45 and 347 became
+        // 0. Nothing in the model, the tag, the shader or the PDF shading ever
+        // cared about the step, so the only thing that had to change was the
+        // controls' own arithmetic.
+        Assert.Equal(angle, GradientPanel.AngleOf(GradientPanel.AtAngle(Red, Blue, angle)));
+    }
+
+    [Fact]
+    public void a_direction_from_somewhere_else_shows_at_the_nearest_degree()
+    {
+        // The model takes any two endpoints and the row offers whole degrees.
+        // A gradient made elsewhere still has to put the thumb on the track.
         var odd = new GradientFill(Red, Blue, 0, 0, 1, 0.1);
 
-        Assert.Equal(0, GradientPanel.AngleOf(odd));
+        // atan2(0.1, 1) is 5.71 degrees.
+        Assert.Equal(6, GradientPanel.AngleOf(odd));
     }
 
     [Fact]
@@ -105,13 +123,142 @@ public class GradientPanelTests
     public void every_direction_produces_a_gradient_that_can_actually_be_drawn()
     {
         // Two endpoints in the same place have no direction, and both renderers
-        // refuse one. The row must not be able to reach that state.
+        // refuse one. The row must not be able to reach that state, at any of
+        // the 360 directions it now offers.
         for (int angle = 0; angle <= GradientPanel.MaxAngleDeg; angle += GradientPanel.AngleStepDeg)
         {
             Assert.True(
                 GradientPanel.AtAngle(Red, Blue, angle).IsDrawable,
                 $"{angle} degrees produced a gradient of no length");
         }
+    }
+
+    // ---------------- spread ----------------
+
+    [Fact]
+    public void full_spread_is_the_ramp_the_row_has_always_produced()
+    {
+        // The default must not move anything. Every gradient already in a file
+        // was written at this length, and a shape read back has to show the
+        // same paint it was saved with.
+        var before = GradientPanel.AtAngle(Red, Blue, 37);
+        var after = GradientPanel.AtAngle(Red, Blue, 37, GradientPanel.FullSpreadPercent);
+
+        Assert.Equal(before, after);
+        Assert.Equal(GradientPanel.FullSpreadPercent, GradientPanel.SpreadOf(before));
+    }
+
+    [Theory]
+    [InlineData(10)]
+    [InlineData(25)]
+    [InlineData(50)]
+    [InlineData(100)]
+    [InlineData(220)]
+    [InlineData(500)]
+    public void a_spread_survives_the_trip_out_and_back(int spread)
+    {
+        var g = GradientPanel.AtAngle(Red, Blue, 0, spread);
+
+        Assert.Equal(spread, GradientPanel.SpreadOf(g));
+    }
+
+    [Fact]
+    public void spread_shortens_the_ramp_without_moving_it_or_turning_it()
+    {
+        // It scales about the CENTRE, so the middle colour stays in the middle
+        // and the direction is untouched. Growing from one end instead would
+        // slide the whole ramp as the slider moved.
+        var tight = GradientPanel.AtAngle(Red, Blue, 0, 50);
+
+        Assert.Equal(0.25, tight.X0, 6);
+        Assert.Equal(0.75, tight.X1, 6);
+        Assert.Equal(0.5, tight.Y0, 6);
+        Assert.Equal(0.5, tight.Y1, 6);
+
+        Assert.Equal(0, GradientPanel.AngleOf(tight));
+    }
+
+    [Fact]
+    public void a_long_spread_puts_both_ends_outside_the_shape()
+    {
+        // Which is the whole point of going past 100: the shape shows a slice
+        // out of the middle of the ramp. It costs nothing on either side,
+        // because Skia clamps past an endpoint and the shading extends.
+        var wide = GradientPanel.AtAngle(Red, Blue, 0, 300);
+
+        Assert.True(wide.X0 < 0, "the start should sit off the near edge");
+        Assert.True(wide.X1 > 1, "the end should sit off the far edge");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(-40)]
+    [InlineData(9000)]
+    public void a_spread_the_slider_could_never_send_is_still_drawable(int spread)
+    {
+        // A caller is not the slider. Zero would be two endpoints in the same
+        // place, which is not a gradient and which both renderers refuse.
+        Assert.True(GradientPanel.AtAngle(Red, Blue, 0, spread).IsDrawable);
+    }
+
+    [Fact]
+    public void a_spread_from_somewhere_else_is_shown_on_the_track()
+    {
+        // A gradient with endpoint handles dragged far apart by a later build
+        // must still put the thumb somewhere the slider can render.
+        var enormous = new GradientFill(Red, Blue, -20, 0.5, 20, 0.5);
+
+        int shown = GradientPanel.SpreadOf(enormous);
+
+        Assert.InRange(shown, GradientPanel.MinSpreadPercent, GradientPanel.MaxSpreadPercent);
+    }
+
+    // ---------------- swap ----------------
+
+    [Fact]
+    public void swapping_exchanges_the_two_colours()
+    {
+        var before = new GradientControls(true, "#FF112233", "#FF445566", 90, 150);
+        var after = GradientPanel.Swapped(before);
+
+        Assert.Equal("#FF445566", after.StartHex);
+        Assert.Equal("#FF112233", after.EndHex);
+    }
+
+    [Fact]
+    public void swapping_leaves_the_direction_and_the_length_alone()
+    {
+        // Turning the ramp 180 as well would put it back where it started, so
+        // the button would appear to do nothing.
+        var after = GradientPanel.Swapped(
+            new GradientControls(true, "#FF112233", "#FF445566", 90, 150));
+
+        Assert.Equal(90, after.AngleDeg);
+        Assert.Equal(150, after.SpreadPercent);
+        Assert.True(after.Enabled);
+    }
+
+    [Fact]
+    public void swapping_twice_is_where_it_started()
+    {
+        var before = new GradientControls(true, "#FF112233", "#FF445566", 217, 45);
+
+        Assert.Equal(before, GradientPanel.Swapped(GradientPanel.Swapped(before)));
+    }
+
+    [Fact]
+    public void a_swapped_row_paints_the_reverse_of_the_original()
+    {
+        // The row's swap and the model's own Reversed have to agree, or the
+        // button means one thing in the flyout and another on the page.
+        var row = new GradientControls(true, "#FF112233", "#FF445566", 90, 100);
+
+        var swapped = GradientPanel.ToGradient(GradientPanel.Swapped(row))!.Value;
+        var original = GradientPanel.ToGradient(row)!.Value;
+
+        Assert.Equal(original.To, swapped.From);
+        Assert.Equal(original.From, swapped.To);
     }
 
     // ---------------- and the whole row ----------------
