@@ -5107,8 +5107,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        const int CaptureWidth = 1000;
-
         var effects = SelectedShapeEffects;
         var fill = gradient is { } g ? ShapeFill.Of(g) : ShapeFill.None;
 

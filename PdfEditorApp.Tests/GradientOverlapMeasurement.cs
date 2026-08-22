@@ -522,6 +522,15 @@ public class GradientOverlapMeasurement
         // all. If this matches A, the difference is two rasterisers disagreeing
         // about an antialiased edge and has nothing to do with drawing the
         // stroke twice, which means hiding the annotation would buy nothing.
+        // AND THE CASE A PERSISTENT FEED CREATES. After a save and a reopen the
+        // appearance stream already holds the shading, so PDFium draws the
+        // gradient and Skia would draw it again on top. Same colours, same
+        // geometry, so the fill should compose to itself; the question is
+        // whether anything at the edge gets worse than A.
+        using var twice = Composited(referenceBitmap, kind, cornerFraction, rotationDeg, stroke: true);
+        var e = Compare(referenceBitmap, twice);
+        Report("E: Skia over a shape PDFium ALREADY draws with its gradient", e);
+
         using var blank = RenderPdfium(Path.Combine(AppContext.BaseDirectory, "blank.pdf"));
         using var alone = Composited(blank, kind, cornerFraction, rotationDeg, stroke: true);
         var d = Compare(referenceBitmap, alone);
@@ -553,6 +562,14 @@ public class GradientOverlapMeasurement
             b.ByRegion[Region.Stroke].Delta5 > a.ByRegion[Region.Stroke].Delta5 * 3,
             $"{name}: filling without stroking no longer eats the stroke"
             + $" (B {b.ByRegion[Region.Stroke].Delta5} vs A {a.ByRegion[Region.Stroke].Delta5})");
+
+        // PAINTING OVER A GRADIENT PDFIUM ALREADY DRAWS COSTS NOTHING EXTRA, and
+        // it is exact rather than close: an opaque fill covers whatever was
+        // underneath it, so the only thing left to differ is the stroke, which
+        // is the same stroke in both. That is what lets the overlay stay on
+        // after a save without a second rule for documents that have been saved.
+        Assert.Equal(a.Total().Delta5, e.Total().Delta5);
+        Assert.Equal(a.Worst, e.Worst);
 
         Assert.True(
             d.Total().Delta5 * 2 > a.Total().Delta5,
