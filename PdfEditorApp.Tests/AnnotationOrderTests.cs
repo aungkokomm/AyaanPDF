@@ -247,4 +247,109 @@ public class AnnotationOrderTests
         Assert.Equal(new[] { B, A }, target);
         Assert.Equal(0, AnnotationOrder.RewriteFrom(current, target));
     }
+
+    // ---------------- pages that also hold the document's own text ----------------
+    //
+    // A REGRESSION. Text Stage 1 put the document's own text into the page
+    // model, and both z-order call sites were reading the model's whole object
+    // list. Page text carries no identity, so each one arrived as Guid.Empty
+    // and sat UNDERNEATH every annotation, which is where "send to back" wants
+    // to write. The plan is rewritten by POSITION, so a list holding things
+    // that are not annotations is not a list this code can act on at all.
+    //
+    // It failed safe, because the guard refuses anything it cannot rebuild and
+    // page text is not rebuildable. But "Send to back" and "Send backward" then
+    // refused on every page containing a word, which is nearly every real one.
+    //
+    // The controls matter more than the assertions here: each command is run
+    // twice on the same page, once with text and once without, and the two have
+    // to agree. A test that only ran the WITH case could pass while the whole
+    // operation was broken for a different reason.
+
+    private const double PageW = 600;
+    private const string Rect = "AyaanShape:0:FF0000FF:2.5000:1:1";
+
+    private static PageTextSnapshot Words(int index, double top) =>
+        new(index, 0.1, top, 0.5, top + 0.05, 12, 0x112233u, false, "Helvetica", "words");
+
+    private static AnnotationSnapshot Shape(Guid id, double top) =>
+        new(0, PdfAnnotationSubtype.Square, 0.1, top, 0.5, top + 0.05, 1.0, id, Rect);
+
+    /// <summary>The page as the z-order commands see it. LOW is the lower of
+    /// the two shapes, so sending it back has to cross the page text and
+    /// bringing it forward does not.</summary>
+    private static PageModel PageOf(bool withText) =>
+        DocumentModelBuilder.BuildPage(
+            0, [Shape(A, 0.4), Shape(B, 0.5)], PageW,
+            withText ? [Words(0, 0.1), Words(1, 0.2)] : []);
+
+    /// <summary>What the command's own guard would refuse, run against the same
+    /// list the command builds.</summary>
+    private static string Refusals(
+        PageModel page, Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>> plan, Guid moving)
+    {
+        var stack = page.Annotations.ToList();
+        var current = stack.Select(o => o.Id).ToList();
+        var target = plan(current, Moving(moving));
+        int from = AnnotationOrder.RewriteFrom(current, target);
+
+        var refused = new List<string>();
+        for (int i = from; i < target.Count; i++)
+        {
+            var obj = stack.FirstOrDefault(o => o.Id == target[i]);
+            if (obj is null || !obj.IsRebuildable)
+            {
+                refused.Add($"i={i}:{(obj is null ? "not in the stack" : obj.Kind.ToString())}");
+            }
+        }
+
+        return $"from={from} refused=[{string.Join(",", refused)}]";
+    }
+
+    [Theory]
+    [InlineData("Bring to front")]
+    [InlineData("Bring forward")]
+    [InlineData("Send backward")]
+    [InlineData("Send to back")]
+    public void every_command_behaves_the_same_whether_or_not_the_page_has_text(string name)
+    {
+        Func<IReadOnlyList<Guid>, ISet<Guid>, List<Guid>> plan = name switch
+        {
+            "Bring to front" => AnnotationOrder.BringToFront,
+            "Bring forward" => AnnotationOrder.BringForward,
+            "Send backward" => AnnotationOrder.SendBackward,
+            _ => AnnotationOrder.SendToBack,
+        };
+
+        string without = Refusals(PageOf(false), plan, A);
+        string with = Refusals(PageOf(true), plan, A);
+
+        Assert.True(without.Contains("refused=[]", StringComparison.Ordinal),
+            $"{name}: the CONTROL refused, so this test is measuring the wrong thing: {without}");
+        Assert.Equal(without, with);
+    }
+
+    [Fact]
+    public void the_list_a_reorder_is_planned_against_holds_only_annotations()
+    {
+        // The defect in one assertion. Guid.Empty in this list means the plan
+        // is being built against something that has no identity to rewrite.
+        var ids = PageOf(withText: true).Annotations.Select(o => o.Id).ToList();
+
+        Assert.Equal(2, ids.Count);
+        Assert.DoesNotContain(Guid.Empty, ids);
+    }
+
+    [Fact]
+    public void page_text_does_not_shift_the_index_an_annotation_is_addressed_by()
+    {
+        // The worse bug this one was next door to. ZOrder is handed to calls
+        // that move, restyle and delete annotations BY INDEX. Had it been
+        // assigned from the position in the model's list, every annotation on a
+        // page with text would address a different one.
+        var withText = PageOf(true).Annotations.Select(o => o.ZOrder).ToList();
+        var without = PageOf(false).Annotations.Select(o => o.ZOrder).ToList();
+
+        Assert.Equal(without, withText);
+    }
 }

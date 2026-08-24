@@ -189,6 +189,24 @@ public class PageTextObjectWiringTests
     }
 
     [Fact]
+    public void nothing_plans_a_reorder_against_the_whole_object_list()
+    {
+        // THE REGRESSION THIS LOCKS DOWN. Both z-order sites read the model's
+        // whole object list, which since Stage 1 also holds the document's own
+        // text. Page text has no id, so each one arrived as Guid.Empty in an
+        // order that is rewritten by position, and "Send to back" refused on
+        // every page containing a word.
+        //
+        // Asserted on the SOURCE because these live in the WinUI project, and
+        // as an absence because the mistake is easy to make again: .Objects and
+        // .Annotations read the same at a glance and differ only on real pages.
+        string code = ViewModel();
+
+        Assert.DoesNotContain("PageModelFor(page).Objects", code, StringComparison.Ordinal);
+        Assert.Equal(2, code.Split("PageModelFor(page).Annotations").Length - 1);
+    }
+
+    [Fact]
     public void the_frame_is_drawn_from_its_own_collection()
     {
         // Separate from SelectionOutline on purpose: that frame promises

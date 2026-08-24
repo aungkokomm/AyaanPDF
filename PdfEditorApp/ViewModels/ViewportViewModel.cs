@@ -7302,12 +7302,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         InvalidateLoadedPage(page);
 
-        // The page as OBJECTS, from the model, rather than as annotations to be
-        // re-parsed. The model already knows each object's kind and whether it
-        // can be rebuilt, which is exactly what this operation has to decide;
+        // The page's ANNOTATIONS, from the model, rather than as annotations to
+        // be re-parsed. The model already knows each object's kind and whether
+        // it can be rebuilt, which is exactly what this operation has to decide;
         // asking it costs one pass instead of re-reading every annotation's tag
         // twice, once for the guard and again for the write.
-        var stack = PageModelFor(page).Objects;
+        //
+        // ⚠️ NOT .Objects. That list also holds the document's OWN text, which
+        // carries no identity, so every one of them arrives here as Guid.Empty
+        // and lands in the middle of an order this code rewrites by position.
+        // Reordering is a list of annotation ids and nothing else.
+        var stack = PageModelFor(page).Annotations.ToList();
         var current = stack.Select(o => o.Id).ToList();
 
         var moving = new HashSet<Guid>();
@@ -7397,7 +7402,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void ApplyOrder(int page, IReadOnlyList<Guid> target, string label)
     {
         InvalidateLoadedPage(page);
-        var current = PageModelFor(page).Objects.Select(o => o.Id).ToList();
+        // ANNOTATIONS ONLY, for the reason given where the plan is built: page
+        // text has no id, and an untouched prefix is only safe if both lists
+        // describe the same things in the same positions.
+        var current = PageModelFor(page).Annotations.Select(o => o.Id).ToList();
         int from = AnnotationOrder.RewriteFrom(current, target);
 
         for (int i = from; i < target.Count; i++)
