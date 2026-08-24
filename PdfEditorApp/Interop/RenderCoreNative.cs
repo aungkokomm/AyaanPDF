@@ -481,6 +481,27 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_page_text_runs(ulong docHandle, int pageIndex);
 
     /// <summary>
+    /// Every TEXT OBJECT in a page's CONTENT stream, as a self-describing byte
+    /// buffer. Parsed by <see cref="PageTextObjectLoader"/>. Free with
+    /// <see cref="free_byte_buffer"/>.
+    ///
+    /// The difference from the two calls above is the whole point of it. Both
+    /// of those read the TEXT PAGE, which is an extraction of the page's
+    /// characters: it can be searched and it can be highlighted, but it cannot
+    /// be pointed at or changed. This reads the page's OBJECT GRAPH, where each
+    /// entry has a real index PDFium will hand back and can modify in place. A
+    /// run is something to find; an object is something to select.
+    ///
+    /// Text this app authored is excluded: our text boxes are annotations, not
+    /// page content, and the invisible searchable runs written for them are
+    /// skipped by their mark.
+    ///
+    /// A page with no text is a successful EMPTY result, not an error.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_page_text_objects(ulong docHandle, int pageIndex);
+
+    /// <summary>
     /// Rewrites the searchable text layer on the given pages.
     ///
     /// Our text boxes draw their glyphs inside a stamp annotation, and a page's

@@ -3979,8 +3979,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
         if (SelectLoadedAt(pageIndex, normX, normY))
         {
+            // One selection at a time. A mark of ours and a word of the
+            // document's are two different things to be holding.
+            ClearPageTextSelection();
             return true;
         }
+
+        // NOTHING OF OURS IS HERE, so the click may have meant the document's
+        // own words. Last, because annotations are painted over the finished
+        // page: anything of ours under the pointer is on top of the text and is
+        // what the click meant.
+        //
+        // Deliberately does NOT change what this method returns. False still
+        // means "no annotation was picked", which is what starts the selection
+        // marquee and the drag-to-select-text every reader already has. Stage 1
+        // adds a frame and a description and takes nothing away.
+        SelectPageTextAt(pageIndex, normX, normY);
 
         RefreshSelectionOutline();
         OnPropertyChanged(nameof(HasSelectedAnnotation));
@@ -3992,6 +4006,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void ClearAnnotationSelection()
     {
+        // Unconditional, and BEFORE the early return below: the page-text
+        // selection is independent of the two fields that guard it, so a leftover
+        // frame would survive every "clear the selection" the app does.
+        ClearPageTextSelection();
+
         if (_selectedAnnotationId is null && _selectedLoaded is null)
         {
             return;
@@ -4167,7 +4186,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.SelectionOutline.Clear();
             slot.SelectionGrips.Clear();
             slot.ExtraSelectionOutlines.Clear();
+            slot.PageTextOutline.Clear();
             slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
+        }
+
+        // The document's own text, which is not one of ours and gets its own
+        // frame. No grips: there is nothing to drag yet, and a handle that does
+        // nothing is worse than no handle.
+        if (_selectedPageText is { } pageText)
+        {
+            var textSlot = SlotFor(pageText.PageIndex);
+            var b = pageText.Bounds;
+            double tl = b.Left * SlotLayoutWidth;
+            double tt = b.Top * SlotLayoutWidth;
+            textSlot?.PageTextOutline.Add(new ScaledRect(
+                tl, tt,
+                (b.Right * SlotLayoutWidth) - tl,
+                (b.Bottom * SlotLayoutWidth) - tt,
+                string.Empty));
         }
 
         if (_selectedLoaded is LoadedSelection sel)
@@ -4467,6 +4503,102 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             picked.ZOrder,
             picked.Bounds.Left, picked.Bounds.Top, picked.Bounds.Right, picked.Bounds.Bottom,
             picked.Id);
+    }
+
+    // ---------------- The document's own text ----------------
+    //
+    // STAGE 1: found, modelled, hit-tested and selectable. Nothing edits it.
+    //
+    // Deliberately NOT threaded through _selectedLoaded, which is the
+    // annotation selection and carries an annotation index. Thirty-odd
+    // operations hang off that field, every one of them meaning "the annotation
+    // at this index on this page", and a page text object has no such index. So
+    // this is its own field, the two are mutually exclusive, and no existing
+    // operation can reach one of these by accident.
+
+    private PageTextObject? _selectedPageText;
+
+    /// <summary>
+    /// The piece of the document's own text that is selected, or null.
+    ///
+    /// Read-only in every sense: there is nothing yet that changes it, and the
+    /// object itself is a snapshot out of the model.
+    /// </summary>
+    public PageTextObject? SelectedPageText
+    {
+        get => _selectedPageText;
+        private set
+        {
+            if (ReferenceEquals(_selectedPageText, value)) { return; }
+
+            _selectedPageText = value;
+            OnPropertyChanged(nameof(SelectedPageText));
+            OnPropertyChanged(nameof(HasSelectedPageText));
+            OnPropertyChanged(nameof(SelectedPageTextDescription));
+        }
+    }
+
+    public bool HasSelectedPageText => _selectedPageText is not null;
+
+    /// <summary>
+    /// What the status bar says about the selected text, or empty.
+    ///
+    /// The whole of Stage 1's visible result besides the frame: it proves the
+    /// words, the font and the size came back, and it shows whether the font
+    /// travels with the document, which is what decides how far a later edit
+    /// can go.
+    /// </summary>
+    public string SelectedPageTextDescription
+    {
+        get
+        {
+            if (_selectedPageText is not { } t) { return string.Empty; }
+
+            string words = t.Text.Length > 40 ? t.Text[..40] + "\u2026" : t.Text;
+
+            return $"\u201c{words}\u201d  \u2022  {t.FontName} {t.FontSizePts:0.#}pt"
+                 + (t.IsFontEmbedded ? "  \u2022  embedded" : "  \u2022  not embedded");
+        }
+    }
+
+    /// <summary>Drops the page-text selection, if there is one.</summary>
+    public void ClearPageTextSelection() => SelectedPageText = null;
+
+    /// <summary>
+    /// Selects the document's own text under a point, if any is there.
+    ///
+    /// ONLY REACHED WHEN NO ANNOTATION WAS HIT, which is both the safe order
+    /// and the one that matches what the reader sees: annotations are painted
+    /// over the finished page, so anything of ours under the pointer is on top
+    /// of the words and is what the click meant.
+    /// </summary>
+    public bool SelectPageTextAt(int pageIndex, double normX, double normY)
+    {
+        if (_documentHandle == 0)
+        {
+            return false;
+        }
+
+        var picked = ObjectHitTest.PickTopmostPageText(
+            PageModelFor(pageIndex), normX, normY, AnnotationHitTester.DefaultTolerance);
+
+        SelectedPageText = picked;
+
+        if (picked is not null)
+        {
+            Diag.Log(
+                $"SelectPageTextAt p{pageIndex} obj#{picked.ObjectIndex} "
+                + $"font={picked.FontName} {picked.FontSizePts:0.#}pt "
+                + $"embedded={picked.IsFontEmbedded} text={picked.Text}");
+
+            // THE VISIBLE HALF OF STAGE 1 besides the frame. It says the words,
+            // the font and the size came back off a real object, and whether
+            // that font travels with the document, which is what decides how
+            // far a later edit can go.
+            Status = SelectedPageTextDescription;
+        }
+
+        return picked is not null;
     }
 
     /// <summary>
@@ -7737,7 +7869,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // into the normalized units everything else is in. One FFI per model
         // build, which is once per page load, not once per object.
         var (pageWidthPts, _) = PagePointsFor(pageIndex);
-        return DocumentModelBuilder.BuildPage(pageIndex, snapshots, pageWidthPts);
+
+        // AND THE PAGE'S OWN TEXT, which is not an annotation and has never
+        // been in this model before. One more FFI per page load, on the same
+        // terms as the width: the model is built once per page and cached, so
+        // this is not per object and not per frame.
+        var pageText = Interop.PageTextObjectLoader.Load(_documentHandle, pageIndex);
+
+        return DocumentModelBuilder.BuildPage(pageIndex, snapshots, pageWidthPts, pageText);
     }
 
     /// <summary>

@@ -51,9 +51,23 @@ public static class DocumentModelBuilder
     /// what the model did before it had this at all.
     /// </param>
     public static PageModel BuildPage(
-        int pageIndex, IReadOnlyList<AnnotationSnapshot> annotations, double pageWidthPts = 0)
+        int pageIndex,
+        IReadOnlyList<AnnotationSnapshot> annotations,
+        double pageWidthPts = 0,
+        IReadOnlyList<PageTextSnapshot>? pageText = null)
     {
-        var objects = new List<DocumentObject>(annotations?.Count ?? 0);
+        var objects = new List<DocumentObject>(
+            (annotations?.Count ?? 0) + (pageText?.Count ?? 0));
+
+        // PAGE CONTENT FIRST, because that is the order it is painted in: a
+        // page's own text is drawn as part of the page, and every annotation is
+        // drawn over the finished page. So a highlight laid across a word is
+        // above the word, and clicking where they overlap picks the highlight,
+        // which is what the reader can see.
+        foreach (var t in (pageText ?? []).OrderBy(t => t.ObjectIndex))
+        {
+            objects.Add(BuildPageText(pageIndex, t, pageWidthPts, objects.Count));
+        }
 
         foreach (var a in (annotations ?? []).OrderBy(a => a.Index))
         {
@@ -67,6 +81,35 @@ public static class DocumentModelBuilder
             Objects = objects,
         };
     }
+
+    /// <summary>
+    /// One of the document's own text objects.
+    ///
+    /// ⚠️ ZOrder is its position in the MODEL's list, not an annotation index,
+    /// and the real content index is kept separately on
+    /// <see cref="PageTextObject.ObjectIndex"/>. Every other object here can
+    /// have its ZOrder handed to an annotation call; this one cannot, and
+    /// giving it a plausible-looking one is how it would be.
+    ///
+    /// No Id. Identity for page content is a later stage's problem, and an
+    /// invented Guid would be a new one on every reload, which is exactly the
+    /// bug the annotation loader was fixed for.
+    /// </summary>
+    private static DocumentObject BuildPageText(
+        int pageIndex, PageTextSnapshot t, double pageWidthPts, int zOrder) =>
+        new PageTextObject
+        {
+            PageIndex = pageIndex,
+            ZOrder = zOrder,
+            Bounds = new TextRect(t.Left, t.Top, t.Right, t.Bottom),
+            PageWidthPts = pageWidthPts,
+            ObjectIndex = t.ObjectIndex,
+            Text = t.Text,
+            FontName = t.FontName,
+            FontSizePts = t.FontSizePts,
+            ColorRgb = t.ColorRgb,
+            IsFontEmbedded = t.IsFontEmbedded,
+        };
 
     /// <summary>Assembles pages into a document snapshot, page order preserved.</summary>
     public static DocumentModel Build(IEnumerable<PageModel> pages) =>

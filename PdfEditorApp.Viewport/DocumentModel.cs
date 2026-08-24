@@ -50,6 +50,16 @@ public enum DocumentObjectKind
     /// foreign annotations were dropped would report the wrong stacking for
     /// everything above them.</summary>
     Unknown,
+
+    /// <summary>
+    /// A piece of the document's own text, out of the page's CONTENT stream
+    /// rather than its annotation list.
+    ///
+    /// The only kind here that is not an annotation, which is why it is last:
+    /// every value before it can be handed to code that acts on annotations by
+    /// index, and this one cannot.
+    /// </summary>
+    PageText,
 }
 
 /// <summary>
@@ -301,6 +311,20 @@ public sealed record PageModel
 
     /// <summary>Just the editable shapes, in paint order.</summary>
     public IEnumerable<ShapeObject> Shapes => Objects.OfType<ShapeObject>();
+
+    /// <summary>The document's own text objects, in paint order.</summary>
+    public IEnumerable<PageTextObject> PageTexts => Objects.OfType<PageTextObject>();
+
+    /// <summary>
+    /// Everything that IS an annotation, in paint order.
+    ///
+    /// The list every existing caller means when it says "objects". A page's
+    /// annotations are indexed by <see cref="DocumentObject.ZOrder"/>, and that
+    /// index is passed straight to calls that move, restyle and delete them; a
+    /// page text object carries no such index and must never reach them.
+    /// </summary>
+    public IEnumerable<DocumentObject> Annotations =>
+        Objects.Where(o => o.Kind != DocumentObjectKind.PageText);
 
     /// <summary>The object with this identity, or null.</summary>
     public DocumentObject? ById(Guid id) =>

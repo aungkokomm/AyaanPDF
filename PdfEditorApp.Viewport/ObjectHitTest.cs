@@ -46,7 +46,38 @@ public static class ObjectHitTest
         var objects = page.Objects;
         for (int i = objects.Count - 1; i >= 0; i--)
         {
+            // ANNOTATIONS ONLY, and this is a safety rule rather than a
+            // preference. The caller turns what comes back into an
+            // AnnotationBox whose Index is the object's ZOrder, and hands that
+            // index to calls that move, restyle and delete ANNOTATIONS. A page
+            // text object has no annotation index; letting one through would
+            // not fail, it would silently edit a different mark.
+            if (objects[i].Kind == DocumentObjectKind.PageText) { continue; }
+
             if (Hit(objects[i], x, y, tolerance)) { return objects[i]; }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The topmost piece of the document's OWN text under a point, or null.
+    ///
+    /// Separate from <see cref="PickTopmost"/> rather than a flag on it,
+    /// because the two answers are not interchangeable and a caller that got
+    /// the wrong one would not find out until something was edited. This one
+    /// returns things that can be read and selected; that one returns things
+    /// that can be moved and restyled.
+    /// </summary>
+    public static PageTextObject? PickTopmostPageText(
+        PageModel? page, double x, double y, double tolerance = DefaultTolerance)
+    {
+        if (page is null) { return null; }
+
+        var objects = page.Objects;
+        for (int i = objects.Count - 1; i >= 0; i--)
+        {
+            if (objects[i] is PageTextObject t && Hit(t, x, y, tolerance)) { return t; }
         }
 
         return null;

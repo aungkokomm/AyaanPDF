@@ -580,6 +580,35 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
+                                        <!--
+                                            The document's OWN text, selected.
+
+                                            Distinct on purpose: a dashed frame
+                                            in a different colour, no handles,
+                                            and outside the rotate transform,
+                                            because this is not one of our marks
+                                            and none of the operations the
+                                            accent frame implies exist for it
+                                            yet. Looking like a normal selection
+                                            would promise dragging and resizing
+                                            that would do nothing.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind PageTextOutline}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Stroke="#FF8A2BE2"
+                                                               StrokeThickness="1.5" StrokeDashArray="4,3"
+                                                               Fill="#148A2BE2"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <!-- Frame + handles, turned as ONE about the box centre for a rotated text box. -->
                                         <Grid>
                                             <Grid.RenderTransform>

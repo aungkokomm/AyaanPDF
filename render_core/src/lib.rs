@@ -7705,6 +7705,145 @@ impl CharInfoArray {
     }
 }
 
+/// The most text objects one page reports.
+///
+/// A generated document can set every word, or every glyph, as its own object.
+/// The cap is generous enough for real prose and finite enough that a
+/// pathological page cannot allocate without bound; a page past it is truncated
+/// rather than refused, because the objects that did come back are still
+/// selectable and still correct.
+const MAX_TEXT_OBJECTS: u32 = 20_000;
+
+/// Every TEXT OBJECT in a page's content stream: what it says, where it is, and
+/// what it is set in.
+///
+/// NOT `get_page_chars` and NOT `get_page_text_runs`. Both of those read the
+/// TEXT PAGE, which is an extraction of the page's characters and cannot be
+/// edited or pointed at; this reads the page's OBJECT GRAPH, where each entry
+/// has a real index that `FPDFPage_GetObject` will hand back and PDFium can
+/// modify in place. That difference is the whole point: a run is something to
+/// search, an object is something to select.
+///
+/// Text this app AUTHORED is deliberately excluded. Our text boxes live in an
+/// annotation's appearance stream, so they are not page content and never
+/// appear here; the invisible searchable runs the text layer writes ARE page
+/// content, and they are skipped by their mark, because selecting an invisible
+/// stand-in for a text box the user can already select would be nonsense.
+///
+/// Little-endian, shaped like `get_page_text_runs`: an object count, then per
+/// object the object's INDEX on the page, its bounds normalized with a top-left
+/// origin and BOTH axes divided by the page WIDTH (the convention the whole app
+/// draws in), the font size in points, the fill colour packed as 0x00RRGGBB, a
+/// flags word, and two length-prefixed UTF-8 strings, the font name and the
+/// text.
+///
+/// Flags: bit 0 is set when the font is EMBEDDED in the document. That one bit
+/// decides whether the characters available are the document's own or a
+/// substitute the reader chose, which is the difference between an edit that
+/// will look right everywhere and one that will not.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_page_text_objects(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_page_text_objects_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (page_left, page_top) = page_origin(&page);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&0u32.to_le_bytes()); // count, backfilled below
+    let mut count: u32 = 0;
+
+    let objects = page.objects();
+    for index in 0..objects.len() {
+        if count >= MAX_TEXT_OBJECTS {
+            break;
+        }
+
+        let Ok(obj) = objects.get(index) else { continue };
+        let PdfPageObject::Text(t) = &obj else { continue };
+
+        // OURS, so not the user's to select. The invisible runs that make a
+        // text box searchable are page content like any other, and they are
+        // transparent: offering one would be offering a hit on nothing.
+        if search_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
+            continue;
+        }
+
+        let text = t.text();
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let Ok(bounds) = obj.bounds() else { continue };
+
+        // PDF is bottom-left origin and Y-up; the app is top-left and Y-down.
+        let left = (bounds.left().value - page_left) / page_w;
+        let right = (bounds.right().value - page_left) / page_w;
+        let top = (page_top - bounds.top().value) / page_w;
+        let bottom = (page_top - bounds.bottom().value) / page_w;
+
+        let font = t.font();
+        let embedded = font.is_embedded().unwrap_or(false);
+        let color = t
+            .fill_color()
+            .map(|f| ((f.red() as u32) << 16) | ((f.green() as u32) << 8) | f.blue() as u32)
+            .unwrap_or(0);
+
+        let font_name = font.name();
+
+        out.extend_from_slice(&(index as u32).to_le_bytes());
+        out.extend_from_slice(&left.to_le_bytes());
+        out.extend_from_slice(&top.to_le_bytes());
+        out.extend_from_slice(&right.to_le_bytes());
+        out.extend_from_slice(&bottom.to_le_bytes());
+        out.extend_from_slice(&t.unscaled_font_size().value.to_le_bytes());
+        out.extend_from_slice(&color.to_le_bytes());
+        out.extend_from_slice(&u32::from(embedded).to_le_bytes());
+        out.extend_from_slice(&(font_name.len() as u32).to_le_bytes());
+        out.extend_from_slice(font_name.as_bytes());
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+        count += 1;
+    }
+
+    out[0..4].copy_from_slice(&count.to_le_bytes());
+
+    drop(page);
+    drop(doc_guard);
+    drop(doc);
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
 /// Extracts every character's position and codepoint for a page, scaled to
 /// `target_width` — the same width a caller would pass to `render_low_res`/
 /// `request_high_res` for that page, so the boxes line up with whatever
@@ -8469,6 +8608,267 @@ mod tests {
             drop(_guard);
             close_document(handle);
         }
+    }
+
+    /// INSPECTION ONLY, and the one Stage 1 said to measure: every fixture we
+    /// have is a standard-14 font that is NOT embedded, so the encoding result
+    /// from the earlier spikes may be the optimistic case. This builds a page
+    /// whose text is set in a real embedded TrueType font and asks the same
+    /// questions of it.
+    ///
+    ///     cargo test --release existing_text_spike_embedded -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn existing_text_spike_embedded_font() {
+        use pdfium_render::prelude::*;
+
+        let font_file = r"C:\Windows\Fonts\arial.ttf";
+        if !std::path::Path::new(font_file).exists() {
+            println!("no system font at {font_file}; nothing measured");
+            return;
+        }
+
+        let out = std::env::temp_dir().join("ayaan_embedded_spike.pdf");
+
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let mut doc_guard = lock(&doc);
+
+            // THROUGH A TOKEN, the way production does. A PdfFont borrows the
+            // document, and a borrow taken here outlives what the page work
+            // below needs to move; the token is a handle instead, so the font
+            // is looked up again at the moment it is used.
+            let bytes = font_file_bytes(font_file).expect("the font did not read");
+            let token = doc_guard
+                .fonts_mut()
+                .load_true_type_from_bytes(&bytes, true)
+                .expect("the font did not embed");
+            let font = doc_guard.fonts().get(token).expect("the token did not resolve");
+
+            let mut page = doc_guard.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(
+                PdfPageContentRegenerationStrategy::Manual);
+
+            let mut obj = PdfPageTextObject::new(
+                &doc_guard, "Hello world", font, PdfPoints::new(24.0)).unwrap();
+            let _ = obj.translate(PdfPoints::new(40.0), PdfPoints::new(400.0));
+            page.objects_mut().add_text_object(obj).unwrap();
+            page.regenerate_content().unwrap();
+        }
+
+        {
+            // save_document takes CALL_LOCK itself, so the block above has to
+            // have released it, which is what the brace does.
+            let c_out = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+            assert_eq!(save_document(handle, c_out.as_ptr()), STATUS_OK_PDFIUM);
+            close_document(handle);
+        }
+
+        // REOPENED, so what is measured is what a reader would find in the
+        // file rather than what is still in memory from having made it.
+        let c_path = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+        let handle = open_document(c_path.as_ptr());
+        assert_ne!(handle, 0);
+
+        for t in decode_text_objects(handle, 0) {
+            println!(
+                "\n  obj#{} text={:?} font={:?} embedded={}",
+                t.index, t.text, t.font, t.embedded);
+        }
+
+        // And the question that decides Stage 2's guard: what can an embedded
+        // font's object be changed to?
+        for replacement in ["EDITED", "caf\u{e9}", "\u{1000}\u{1031}"] {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let mut page = doc_guard.pages().get(0).unwrap();
+            page.set_content_regeneration_strategy(
+                PdfPageContentRegenerationStrategy::Manual);
+
+            let mut line = "no text object".to_string();
+            for i in 0..page.objects().len() {
+                let Ok(mut obj) = page.objects().get(i) else { continue };
+                let PdfPageObject::Text(t) = &mut obj else { continue };
+                let set = t.set_text(replacement).is_ok();
+                let back = t.text();
+                line = format!(
+                    "asked={replacement:?} set_ok={set} read_back={back:?} faithful={}",
+                    back == replacement);
+                break;
+            }
+
+            let _ = page.regenerate_content();
+            println!("  {line}");
+        }
+
+        close_document(handle);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // ---------------- page text objects, the Stage 1 feed ----------------
+
+    /// One decoded entry of `get_page_text_objects`.
+    #[derive(Debug)]
+    struct DecodedTextObject {
+        index: u32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        size_pts: f32,
+        color: u32,
+        embedded: bool,
+        font: String,
+        text: String,
+    }
+
+    fn decode_text_objects(handle: u64, page: i32) -> Vec<DecodedTextObject> {
+        let buffer = get_page_text_objects(handle, page);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "the read failed");
+        assert!(!buffer.data.is_null());
+
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+
+        let u32_at = |at: usize| -> u32 {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        };
+        let f32_at = |at: usize| -> f32 {
+            f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        };
+
+        let count = u32_at(0);
+        let mut at = 4usize;
+        let mut out = Vec::new();
+
+        for _ in 0..count {
+            let index = u32_at(at);
+            let left = f32_at(at + 4);
+            let top = f32_at(at + 8);
+            let right = f32_at(at + 12);
+            let bottom = f32_at(at + 16);
+            let size_pts = f32_at(at + 20);
+            let color = u32_at(at + 24);
+            let embedded = u32_at(at + 28) & 1 == 1;
+            at += 32;
+
+            let font_len = u32_at(at) as usize;
+            at += 4;
+            let font = String::from_utf8(bytes[at..at + font_len].to_vec()).unwrap();
+            at += font_len;
+
+            let text_len = u32_at(at) as usize;
+            at += 4;
+            let text = String::from_utf8(bytes[at..at + text_len].to_vec()).unwrap();
+            at += text_len;
+
+            out.push(DecodedTextObject {
+                index, left, top, right, bottom, size_pts, color, embedded, font, text,
+            });
+        }
+
+        assert_eq!(at, bytes.len(), "the buffer did not decode exactly");
+        out
+    }
+
+    #[test]
+    fn page_text_objects_report_what_the_page_actually_says() {
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+        let found = decode_text_objects(handle, 0);
+
+        assert_eq!(found.len(), 4, "expected the four runs the fixture sets");
+
+        let words: Vec<&str> = found.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(
+            words,
+            vec!["Chapter One", "Ordinary body text.", "Same line: ", "louder"]);
+
+        // The INDEX has to be the object's real position on the page, because
+        // that is what an edit will pass back to FPDFPage_GetObject.
+        assert_eq!(
+            found.iter().map(|t| t.index).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+
+        // Set at the sizes the fixture chose, in points.
+        assert_eq!(found[0].size_pts, 18.0);
+        assert_eq!(found[1].size_pts, 10.0);
+        assert_eq!(found[3].size_pts, 14.0);
+
+        assert!(found[0].font.contains("Bold"), "font was {:?}", found[0].font);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn page_text_objects_are_normalized_the_way_the_app_draws() {
+        // Top-left origin, BOTH axes divided by the page WIDTH, which is what
+        // every annotation and every shape already reports. A second convention
+        // here would put the selection frame somewhere the text is not.
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+        let found = decode_text_objects(handle, 0);
+
+        for t in &found {
+            assert!(t.right > t.left, "{:?} has no width", t.text);
+            assert!(t.bottom > t.top, "{:?} has no height (y must run DOWN)", t.text);
+            assert!(
+                t.left >= -0.01 && t.right <= 1.01,
+                "{:?} is off the page horizontally: {}..{}", t.text, t.left, t.right);
+            assert!(t.top >= -0.01, "{:?} is above the page: {}", t.text, t.top);
+        }
+
+        // The heading is set above the body text, so it is nearer the top.
+        assert!(
+            found[0].top < found[1].top,
+            "the heading should sit above the body text");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_with_no_text_reports_none_rather_than_failing() {
+        let handle = open_fixture_named("tests/fixtures/sample_scanned.pdf");
+
+        // A scan is pixels. Zero objects is the right answer and an error is
+        // not: the caller has to be able to tell "nothing to select" from
+        // "something went wrong".
+        assert!(decode_text_objects(handle, 0).is_empty());
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_out_of_range_is_refused() {
+        let handle = open_fixture();
+        let buffer = get_page_text_objects(handle, 9999);
+        assert_ne!(buffer.status, STATUS_OK_PDFIUM);
+        free_byte_buffer(buffer);
+        close_document(handle);
+    }
+
+    #[test]
+    fn our_own_invisible_search_runs_are_not_offered_for_selection() {
+        // A text box's searchable stand-in IS page content, and it is
+        // transparent. Offering one would be offering a hit on nothing, on top
+        // of a text box the user can already select by its annotation.
+        let handle = open_fixture();
+
+        let text = "Hello box";
+        let utf8 = text.as_bytes();
+        assert_eq!(
+            add_text_box_annotation(
+                handle, 0, 1000, 40.0, 40.0, 400.0, 120.0,
+                utf8.as_ptr(), utf8.len(), 24.0, 0, 0, 0, 0xFF),
+            STATUS_OK_PDFIUM);
+
+        // Whatever the search layer wrote, none of it may appear here.
+        let found = decode_text_objects(handle, 0);
+        for t in &found {
+            assert_ne!(t.text, text, "the text box's invisible run was offered");
+        }
+
+        close_document(handle);
     }
 
     fn open_fixture() -> u64 {

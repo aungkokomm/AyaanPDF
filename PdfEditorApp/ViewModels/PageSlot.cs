@@ -105,6 +105,18 @@ public partial class PageSlot : ObservableObject
     /// </summary>
     public ObservableCollection<ScaledRect> SelectionGrips { get; } = new();
 
+    /// <summary>
+    /// Marquee around the piece of the document's OWN text that is selected, at
+    /// most one entry.
+    ///
+    /// SEPARATE from SelectionOutline, and that is the point rather than an
+    /// implementation detail. That frame means "this is yours, drag it, resize
+    /// it, delete it"; this one means "this is the document's, and Stage 1 can
+    /// only show it to you". Drawing them the same would promise operations
+    /// that do not exist.
+    /// </summary>
+    public ObservableCollection<ScaledRect> PageTextOutline { get; } = new();
+
     /// <summary>Marquees for the objects that are ALSO in the multi-selection
     /// besides the anchor. Drawn as thinner accent outlines so the anchor stays
     /// visually primary; no handles because operations key off the anchor.</summary>
