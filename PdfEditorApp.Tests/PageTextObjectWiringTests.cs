@@ -207,6 +207,27 @@ public class PageTextObjectWiringTests
     }
 
     [Fact]
+    public void the_frame_does_not_tint_the_words_it_is_around()
+    {
+        // The reader's own document is underneath this frame. A fill, at any
+        // alpha, sits OVER the glyphs and changes the colour of text they came
+        // to read; the first version washed every selected line in pale purple.
+        // A dashed rule reads as provisional, which selection chrome in a PDF
+        // editor is not. One thin solid rule, no fill.
+        string xaml = Source("PdfEditorApp", "MainPage.xaml");
+
+        int at = xaml.IndexOf("{x:Bind PageTextOutline}", StringComparison.Ordinal);
+        Assert.True(at > 0, "the page-text frame is no longer bound");
+
+        int end = xaml.IndexOf("</ItemsControl>", at, StringComparison.Ordinal);
+        string frame = xaml[at..end];
+
+        Assert.DoesNotContain("Fill=", frame, StringComparison.Ordinal);
+        Assert.DoesNotContain("StrokeDashArray", frame, StringComparison.Ordinal);
+        Assert.Contains("StrokeThickness=\"1\"", frame, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void the_frame_is_drawn_from_its_own_collection()
     {
         // Separate from SelectionOutline on purpose: that frame promises

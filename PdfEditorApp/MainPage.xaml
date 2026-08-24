@@ -583,15 +583,31 @@
                                         <!--
                                             The document's OWN text, selected.
 
-                                            Distinct on purpose: a dashed frame
-                                            in a different colour, no handles,
-                                            and outside the rotate transform,
-                                            because this is not one of our marks
-                                            and none of the operations the
-                                            accent frame implies exist for it
-                                            yet. Looking like a normal selection
-                                            would promise dragging and resizing
-                                            that would do nothing.
+                                            A HAIRLINE, and nothing else. This
+                                            is the convention every PDF editor
+                                            uses for a piece of existing page
+                                            content: one thin solid rule around
+                                            the words, no handles, no fill.
+
+                                            NO FILL is the part that matters
+                                            most. A tint, however light, sits
+                                            OVER the glyphs and discolours the
+                                            document the reader came to read.
+                                            The frame has to say "this one"
+                                            without touching how the text looks.
+
+                                            NO HANDLES because there is nothing
+                                            to drag. Acrobat draws handles only
+                                            on a clustered block it can actually
+                                            resize, and puts a plain rule around
+                                            each line; one Stage 1 selection is
+                                            one line, so a plain rule is the
+                                            honest match. Handles arrive when
+                                            they do something.
+
+                                            Outside the rotate transform, since
+                                            page content is not one of our marks
+                                            and never carries our rotation.
                                         -->
                                         <ItemsControl ItemsSource="{x:Bind PageTextOutline}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
@@ -599,9 +615,17 @@
                                             </ItemsControl.ItemsPanel>
                                             <ItemsControl.ItemTemplate>
                                                 <DataTemplate x:DataType="viewport:ScaledRect">
-                                                    <Rectangle Stroke="#FF8A2BE2"
-                                                               StrokeThickness="1.5" StrokeDashArray="4,3"
-                                                               Fill="#148A2BE2"
+                                                    <!--
+                                                        Fixed blue rather than
+                                                        the theme accent: a page
+                                                        is white paper in both
+                                                        themes, and this frame
+                                                        is read against the
+                                                        paper, not against the
+                                                        app around it.
+                                                    -->
+                                                    <Rectangle Stroke="#FF2D6FC4"
+                                                               StrokeThickness="1"
                                                                Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
