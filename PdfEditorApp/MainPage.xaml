@@ -1237,6 +1237,33 @@
                                Fill="{ThemeResource TextFillColorTertiaryBrush}" />
                 </Border>
                 <!--
+                    VIEW / EDIT.
+
+                    Two buttons rather than one toggle, and that is deliberate:
+                    a toggle says "pressed" or "not pressed" and the reader has
+                    to know which state means which. Two labelled halves with
+                    one of them lit say what the app IS.
+
+                    At the top of the rail, because the rail is what changes
+                    underneath it: two tools in View and nine in Edit, which is
+                    the loudest signal available and costs nothing.
+                -->
+                <StackPanel Grid.Row="0" Orientation="Vertical" Spacing="2" Margin="0,22,0,6">
+                    <Button x:Name="ViewModeButton" Click="ViewMode_Click"
+                            ToolTipService.ToolTip="View: read, select text, follow links, fill forms"
+                            HorizontalAlignment="Stretch" Height="30" Padding="0"
+                            BorderThickness="1" CornerRadius="4,4,0,0">
+                        <FontIcon Glyph="&#xE890;" FontSize="14" />
+                    </Button>
+                    <Button x:Name="EditModeButton" Click="EditMode_Click"
+                            ToolTipService.ToolTip="Edit: change text, place marks, move objects"
+                            HorizontalAlignment="Stretch" Height="30" Padding="0"
+                            BorderThickness="1" CornerRadius="0,0,4,4">
+                        <FontIcon Glyph="&#xE70F;" FontSize="14" />
+                    </Button>
+                </StackPanel>
+
+                <!--
                     The tools themselves come from ToolCatalog, one row each.
 
                     They used to be six hand-written buttons plus a method that
@@ -1249,7 +1276,7 @@
                     hand-made.
                 -->
                 <ListView x:Name="ToolRailList" Grid.Row="1" VerticalAlignment="Top"
-                          ItemsSource="{x:Bind viewport:ToolCatalog.All}"
+                          ItemsSource="{x:Bind ViewModel.Tools}"
                           SelectionMode="Single"
                           SelectionChanged="ToolRail_SelectionChanged"
                           ScrollViewer.VerticalScrollMode="Disabled"
@@ -1308,11 +1335,16 @@
                     <PathIcon Data="{StaticResource BookmarkRibbonPath}" Width="12" Height="16" />
                 </Button>
 
-                <!-- Only shown when the open document actually has fillable fields. -->
+                <!--
+                    Only shown when the open document actually has fillable
+                    fields, and it draws them rather than switching anything on.
+                    Filling a form needs no mode: an ordinary click operates a
+                    field in View and in Edit alike.
+                -->
                 <ToggleButton x:Name="FillFormButton"
-                              ToolTipService.ToolTip="Fill form fields"
+                              ToolTipService.ToolTip="Show form fields"
                               Visibility="{x:Bind ViewModel.FillFormButtonVisibility, Mode=OneWay}"
-                              IsChecked="{x:Bind ViewModel.FormFillMode, Mode=TwoWay}"
+                              IsChecked="{x:Bind ViewModel.ShowFormFields, Mode=TwoWay}"
                               Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE762;" FontSize="16" />
                 </ToggleButton>

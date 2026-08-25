@@ -174,14 +174,21 @@ public class FormInteractionTests
     }
 
     [Fact]
-    public void fill_mode_still_exists_and_still_draws_the_outlines()
+    public void showing_the_fields_is_a_view_option_and_no_longer_a_mode()
     {
-        // It is no longer required, but it is still how a reader asks "which of
-        // these are fields", so it must not have been ripped out.
+        // ⚠️ IT USED TO INTERCEPT THE POINTER, whatever tool was armed, which
+        // made filling a form something a reader had to discover and switch
+        // into. A field is operated by an ordinary click now, so all that is
+        // left is the answer to "which of these are fields": a thing to draw,
+        // not a way to behave.
         string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
 
-        Assert.Contains("public partial bool FormFillMode", vm, StringComparison.Ordinal);
+        Assert.Contains("public partial bool ShowFormFields", vm, StringComparison.Ordinal);
         Assert.Contains("private void DistributeFormOutlines()", vm, StringComparison.Ordinal);
+
+        Assert.DoesNotContain("FormFillMode", vm, StringComparison.Ordinal);
+        Assert.DoesNotContain("FormFillMode", page, StringComparison.Ordinal);
     }
 
     // ---------------- the repaint ----------------

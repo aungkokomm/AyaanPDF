@@ -168,6 +168,9 @@ public sealed partial class MainPage : Page
             RootGrid.Focus(FocusState.Programmatic);
             InitializePenPickers();
             UpdateToolRail();
+            // The control starts lit on View, which is what the app starts in.
+            // Without this both halves look inactive until the first switch.
+            ApplyModeVisuals();
             UpdateCursor();
             PushWindowTitle();
             RefreshRecentMenu();
@@ -2436,6 +2439,60 @@ public sealed partial class MainPage : Page
     /// over to Select), which would otherwise re-enter and reset the pointer
     /// interaction a second time.
     /// </summary>
+    // ---------------- View and Edit ----------------
+
+    private void ViewMode_Click(object sender, RoutedEventArgs e) => SetMode(AppMode.View);
+
+    private void EditMode_Click(object sender, RoutedEventArgs e) => SetMode(AppMode.Edit);
+
+    /// <summary>
+    /// Switches mode, closing anything the old one had open first.
+    ///
+    /// The editor has to be committed rather than abandoned: the reader typed
+    /// it, and leaving Edit is not the same as pressing Escape.
+    /// </summary>
+    private void SetMode(AppMode mode)
+    {
+        if (ViewModel.Mode == mode) { return; }
+
+        CommitTextEdit();
+        CommitUnitEdit();
+        ResetPointerInteraction();
+
+        ViewModel.Mode = mode;
+
+        // The rail's rows were just replaced, so whatever was selected in it is
+        // gone; this puts the armed tool back on the new list.
+        UpdateToolRail();
+        ApplyModeVisuals();
+        UpdateObjectToolbar();
+        UpdateCursor();
+    }
+
+    /// <summary>
+    /// Lights the half of the control the app is in.
+    ///
+    /// Done in code rather than with a style trigger because the two buttons
+    /// have to be read as ONE control with one lit half, and a pair of
+    /// independently styled buttons is exactly what would drift apart.
+    /// </summary>
+    private void ApplyModeVisuals()
+    {
+        if (ViewModeButton is null || EditModeButton is null) { return; }
+
+        var lit = (Brush)Application.Current.Resources["AccentFillColorDefaultBrush"];
+        var litText = (Brush)Application.Current.Resources["TextOnAccentFillColorPrimaryBrush"];
+        var dim = (Brush)Application.Current.Resources["ControlFillColorTransparentBrush"];
+        var dimText = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+
+        bool editing = ViewModel.IsEditMode;
+
+        ViewModeButton.Background = editing ? dim : lit;
+        ViewModeButton.Foreground = editing ? dimText : litText;
+        EditModeButton.Background = editing ? lit : dim;
+        EditModeButton.Foreground = editing ? litText : dimText;
+    }
+
     private void ToolRail_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_suppressToolSelection)
@@ -7062,7 +7119,7 @@ public sealed partial class MainPage : Page
         // and only for keys nothing above claimed, so a shortcut can never
         // shadow a real command.
         if (!e.Handled && !_isCtrlDown
-            && ToolCatalog.ForShortcut((char)e.Key) is { } picked)
+            && ViewModel.ToolForShortcut((char)e.Key) is { } picked)
         {
             SetActiveTool(picked.Mode);
             e.Handled = true;
@@ -7258,6 +7315,10 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void ViewportHost_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
     {
+        // Reopening one of OUR text boxes is an edit, so it needs the mode. The
+        // document's own text is not reached this way at all any more.
+        if (!ViewModel.IsEditMode) { return; }
+
         if (ViewModel.ActiveTool is not (ToolMode.Select or ToolMode.Text))
         {
             return;
@@ -7578,6 +7639,7 @@ public sealed partial class MainPage : Page
             CanUngroup = ViewModel.CanUngroupSelection,
             IsTextBox = ViewModel.HasSelectedTextBox,
             ClipboardHasContent = ViewModel.HasClipboardContent,
+            EditMode = ViewModel.IsEditMode,
         });
 
         if (items.Count == 0)
@@ -7712,23 +7774,6 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // Form fill mode intercepts a click on a fillable field and opens the
-        // text editor on it, whatever tool is active. A click that misses every
-        // field falls through to the normal handling below (pan/select), so the
-        // user can still move around the page.
-        if (ViewModel.FormFillMode)
-        {
-            var fc = ContentPoint(e);
-            double fnx = fc.X / ViewModel.OverlayScale;
-            double fny = fc.Y / ViewModel.OverlayScale;
-            if (ViewModel.FillableFieldAt(fc.Page, fnx, fny) is { } filling)
-            {
-                HandleFormFieldClick(filling, e.GetCurrentPoint(ViewportHost).Position);
-                e.Handled = true;
-                return;
-            }
-        }
-
         // Hand tool and Space-hand pan by dragging.
         //
         // This used to just leave the event unhandled "so ScrollView pans on
@@ -7765,7 +7810,7 @@ public sealed partial class MainPage : Page
         // tool is armed: the user picked it from a menu and is now pointing at
         // where it goes, so the pen or the select tool acting instead would be
         // the wrong answer to a question they already asked.
-        if (TryPlacePendingSignature(content.Page, nx, ny))
+        if (ViewModel.IsEditMode && TryPlacePendingSignature(content.Page, nx, ny))
         {
             UpdateObjectToolbar();
             e.Handled = true;
@@ -7782,7 +7827,7 @@ public sealed partial class MainPage : Page
         // drag-move; a miss falls through so the click reaches the normal
         // tool path. Any other press clears the guide selection so the
         // highlight doesn't linger.
-        if (ViewModel.PickGuideAt(content.Page, nx, ny) is { } guideHit)
+        if (ViewModel.IsEditMode && ViewModel.PickGuideAt(content.Page, nx, ny) is { } guideHit)
         {
             ViewModel.SelectGuide(content.Page, guideHit);
             ViewModel.BeginGuideDrag();
@@ -7799,6 +7844,8 @@ public sealed partial class MainPage : Page
         switch (ViewModel.ActiveTool)
         {
             case ToolMode.Select:
+                // ---- editing, only in Edit mode ----
+                //
                 // A CLICK INSIDE THE SELECTED TEXT BOX means "type here", and
                 // comes first because every check below would treat it as an
                 // ordinary press: a link would be followed, a form field
@@ -7807,18 +7854,21 @@ public sealed partial class MainPage : Page
                 // Narrow by construction. It fires only while a unit is
                 // selected on this page and only inside its box, which is a
                 // state the reader created with the click before this one.
-                if (ViewModel.TextUnitBoxContains(content.Page, nx, ny))
+                if (ViewModel.IsEditMode)
                 {
-                    OpenUnitEditor(ViewModel.CaretOffsetFor(content.Page, content.X));
-                    e.Handled = true;
-                    break;
-                }
+                    if (ViewModel.TextUnitBoxContains(content.Page, nx, ny))
+                    {
+                        OpenUnitEditor(ViewModel.CaretOffsetFor(content.Page, content.X));
+                        e.Handled = true;
+                        break;
+                    }
 
-                // Any other press drops the box. Clicking elsewhere means the
-                // reader has moved on, and a box left behind over text they are
-                // no longer working on is just clutter that still swallows
-                // clicks the next time they aim near it.
-                ViewModel.ClearTextUnitSelection();
+                    // Any other press drops the box. Clicking elsewhere means
+                    // the reader has moved on, and a box left behind over text
+                    // they are no longer working on is just clutter that still
+                    // swallows clicks the next time they aim near it.
+                    ViewModel.ClearTextUnitSelection();
+                }
 
                 // A LINK first, and only while Show Links is on. A link is the
                 // document's, not ours: the reader who has asked to see links
@@ -7869,7 +7919,12 @@ public sealed partial class MainPage : Page
                 // A click on an existing mark picks it up; a click on empty
                 // space falls through to text selection. That is what makes
                 // annotations objects rather than paint.
-                if (ViewModel.SelectAnnotationAt(content.Page, nx, ny))
+                //
+                // ⚠️ EDIT MODE ONLY. In View mode our marks are drawn and are
+                // not pickable: a reader who cannot move a highlight also
+                // cannot move one by accident, which is most of what the mode
+                // is for.
+                if (ViewModel.IsEditMode && ViewModel.SelectAnnotationAt(content.Page, nx, ny))
                 {
                     // Ctrl-drag clones the picked mark IN PLACE; the drag that
                     // follows moves the clone, so the original stays put. Every
@@ -7902,7 +7957,7 @@ public sealed partial class MainPage : Page
                     .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift);
                 bool shiftDown = (shiftState & Windows.UI.Core.CoreVirtualKeyStates.Down)
                                  == Windows.UI.Core.CoreVirtualKeyStates.Down;
-                if (shiftDown)
+                if (ViewModel.IsEditMode && shiftDown)
                 {
                     _isMarqueeing = true;
                     _isAnnotationMarquee = true;
@@ -8176,7 +8231,9 @@ public sealed partial class MainPage : Page
             //
             // Deciding this on release is what lets one gesture keep doing both
             // without a modifier or a mode.
-            if (ViewModel.ActiveTool == ToolMode.Select && !MovedSincePress(e))
+            if (ViewModel.IsEditMode
+                && ViewModel.ActiveTool == ToolMode.Select
+                && !MovedSincePress(e))
             {
                 ViewModel.ClearReaderTextSelection();
                 ViewModel.SelectTextUnitAt(_textPressPage, _textPressNormX, _textPressNormY);

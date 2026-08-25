@@ -132,14 +132,17 @@ public class TextUnitGestureTests
     }
 
     [Fact]
-    public void only_the_select_tool_turns_a_click_into_a_unit()
+    public void only_the_select_tool_in_edit_mode_turns_a_click_into_a_unit()
     {
-        // The highlight tool selects text too, and a click with it means "make
-        // a highlight", not "edit this line".
+        // Two conditions, both load-bearing. The highlight tool selects text
+        // too, and a click with it means "make a highlight", not "edit this
+        // line". And a reader in View mode selecting text to copy must not end
+        // up with an editable box round it.
         string released = Body(Page(), "private void ViewportHost_PointerReleased(");
 
-        Assert.Contains("ViewModel.ActiveTool == ToolMode.Select && !MovedSincePress(e)",
-                        released, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.IsEditMode", released, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.ActiveTool == ToolMode.Select", released, StringComparison.Ordinal);
+        Assert.Contains("!MovedSincePress(e)", released, StringComparison.Ordinal);
     }
 
     // ---------------- the box cannot swallow the second click ----------------

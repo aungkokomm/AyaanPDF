@@ -16,17 +16,21 @@ namespace PdfEditorApp.Tests;
 /// </summary>
 public class ContextMenuModelTests
 {
+    // Every menu below this line is the EDITING menu. A reader in View mode
+    // gets one row, which the View-mode section at the bottom describes.
     private static ContextTarget OnObject => new()
     {
         DocumentOpen = true,
         OnObject = true,
         SelectionCount = 1,
+        EditMode = true,
     };
 
     private static ContextTarget OnPage => new()
     {
         DocumentOpen = true,
         OnObject = false,
+        EditMode = true,
     };
 
     private static ContextMenuItem Find(ContextTarget target, ContextCommand command) =>
@@ -289,5 +293,43 @@ public class ContextMenuModelTests
         Assert.Equal(
             expected,
             KeyboardCommands.Resolve(key, ctrl: true, shift: shift, textFocused: false));
+    }
+
+    // ---------------- The reader's menu ----------------
+
+    [Fact]
+    public void a_reader_is_offered_the_one_command_that_changes_nothing()
+    {
+        // ⚠️ EVERY OTHER ROW EDITS THE DOCUMENT. A reader can still right-click,
+        // and a menu full of Cut, Delete and Rotate page would be a second door
+        // into editing that the mode was meant to close.
+        var target = new ContextTarget { DocumentOpen = true, EditMode = false };
+
+        var item = Assert.Single(ContextMenuModel.For(target));
+
+        Assert.Equal(ContextCommand.Copy, item.Command);
+        Assert.True(item.Enabled);
+    }
+
+    [Fact]
+    public void a_reader_gets_the_same_menu_wherever_they_click()
+    {
+        // Nothing is pickable in View mode, so there is no such thing as
+        // clicking "on an object": the two menus collapse into one.
+        var onPage = new ContextTarget { DocumentOpen = true, EditMode = false };
+        var onMark = new ContextTarget
+        {
+            DocumentOpen = true, OnObject = true, SelectionCount = 1, EditMode = false,
+        };
+
+        Assert.Equal(
+            ContextMenuModel.For(onPage).Select(i => i.Command),
+            ContextMenuModel.For(onMark).Select(i => i.Command));
+    }
+
+    [Fact]
+    public void a_reader_with_no_document_still_gets_no_menu()
+    {
+        Assert.Empty(ContextMenuModel.For(new ContextTarget { EditMode = false }));
     }
 }

@@ -326,9 +326,103 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     partial void OnHasFillableFormChanged(bool value) =>
         OnPropertyChanged(nameof(FillFormButtonVisibility));
 
-    /// <summary>When on, fillable fields are outlined and a click opens the text editor on one.</summary>
+    /// <summary>
+    /// When on, fillable fields are outlined.
+    ///
+    /// ⚠️ A VIEW OPTION, NOT A MODE, and it used to be one. It intercepted a
+    /// click on a field whatever tool was armed, which made filling a form
+    /// something the reader had to discover and switch into. Forms are operated
+    /// from an ordinary click now, in either mode, so all that is left of this
+    /// is the answer to "which of these are fields", which is a thing to draw
+    /// rather than a way to behave.
+    /// </summary>
     [ObservableProperty]
-    public partial bool FormFillMode { get; set; }
+    public partial bool ShowFormFields { get; set; }
+
+    // ---------------- View and Edit ----------------
+    //
+    // ⚠️ NOT ANOTHER GESTURE LAYER. It exists to remove one. A single pointer
+    // chain was answering two questions at once: a press on the page had to be
+    // a reader's text selection AND a possible object pick AND a possible
+    // text-unit selection, and every capability made that chain longer. The
+    // mode splits it, so each half only decides among things that belong
+    // together.
+
+    private AppMode _mode = AppMode.View;
+
+    /// <summary>
+    /// Whether the app is being read or edited. View on every document open.
+    ///
+    /// A reader who never presses Edit gets a viewer, and nothing they click
+    /// can change the file.
+    /// </summary>
+    public AppMode Mode
+    {
+        get => _mode;
+        set
+        {
+            if (_mode == value) { return; }
+
+            _mode = value;
+            OnPropertyChanged(nameof(Mode));
+            OnPropertyChanged(nameof(IsEditMode));
+            OnPropertyChanged(nameof(IsViewMode));
+
+            RebuildToolList();
+
+            if (_mode == AppMode.View)
+            {
+                // ⚠️ EVERYTHING EDITING GOES WITH IT. A selection that outlived
+                // the mode would still be drawn, still be moved by the arrow
+                // keys and still be deleted by Backspace, none of which View
+                // mode has any way to undo or even to show.
+                ClearTextUnitSelection();
+                ClearAnnotationSelection();
+                ClearGuideSelection();
+                ActiveTool = ToolMode.Select;
+            }
+            else
+            {
+                // Entering Edit always arms Select. The last tool used is
+                // whatever they happened to leave armed a document ago, and
+                // arriving in a drawing tool is how a stray click becomes an
+                // ink stroke nobody asked for.
+                ActiveTool = ToolMode.Select;
+            }
+
+            Status = _mode == AppMode.Edit
+                ? "Edit mode. Click text to select it, then click again to type."
+                : "View mode.";
+        }
+    }
+
+    public bool IsEditMode => _mode == AppMode.Edit;
+    public bool IsViewMode => _mode == AppMode.View;
+
+    /// <summary>The tools the rail shows, which is the tools this mode offers.</summary>
+    public ObservableCollection<ToolDefinition> Tools { get; } =
+        new(ToolCatalog.ForMode(AppMode.View));
+
+    private void RebuildToolList()
+    {
+        Tools.Clear();
+        foreach (var t in ToolCatalog.ForMode(_mode))
+        {
+            Tools.Add(t);
+        }
+    }
+
+    /// <summary>
+    /// The tool a key selects in the current mode, or null.
+    ///
+    /// ⚠️ THE ONLY DOOR. Going through the modeless lookup would arm a tool the
+    /// rail is not showing: the reader sees a viewer, presses D, and is in the
+    /// drawing tool with nothing on screen saying so.
+    /// </summary>
+    public ToolDefinition? ToolForShortcut(char key) => ToolCatalog.ForShortcut(key, _mode);
+
+    /// <summary>Whether the current mode offers a tool at all.</summary>
+    public bool ModeOffers(ToolMode tool) => ToolCatalog.Offers(_mode, tool);
 
     // ---------------- Bookmarks (the document's own outline) ----------------
 
@@ -732,19 +826,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         HasFillableForm = _formFields.Any(f => f.IsFillable);
         if (!HasFillableForm)
         {
-            FormFillMode = false;
+            ShowFormFields = false;
         }
     }
 
-    partial void OnFormFillModeChanged(bool value)
+    partial void OnShowFormFieldsChanged(bool value)
     {
         DistributeFormOutlines();
         if (value)
         {
             int n = _formFields.Count(f => f.IsFillable);
             Status = n == 1
-                ? "Form fill: click the highlighted field to type."
-                : $"Form fill: click any of the {n} highlighted fields to type.";
+                ? "One fillable field on this page. Click it to type."
+                : $"{n} fillable fields. Click any of them to type.";
         }
     }
 
@@ -756,7 +850,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.FormFieldOutlines.Clear();
         }
 
-        if (!FormFillMode)
+        if (!ShowFormFields)
         {
             return;
         }
@@ -1035,6 +1129,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public DocumentOpenOutcome OpenDocument(
         string path, bool preserveAnnotations = false, string? password = null)
     {
+        // ⚠️ EVERY DOCUMENT OPENS AS A DOCUMENT. Carrying Edit mode across an
+        // open would hand the next reader a file already armed for changes they
+        // did not ask to make, which is exactly the surprise the mode exists to
+        // remove.
+        Mode = AppMode.View;
+
         // The document being left behind is no longer recoverable through this
         // tab, and by here the reader has already answered the unsaved-changes
         // guard. Leaving its snapshot would offer it back on the next launch as

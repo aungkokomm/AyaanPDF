@@ -75,6 +75,15 @@ public readonly record struct ContextTarget
 
     /// <summary>Whether a previous Copy or Cut left anything to paste.</summary>
     public bool ClipboardHasContent { get; init; }
+
+    /// <summary>
+    /// Whether the app is in Edit mode.
+    ///
+    /// ⚠️ A reader in View mode can reach this menu, and every row in it
+    /// except Copy changes the document. Offering them there would be a second
+    /// door into editing that the mode was supposed to close.
+    /// </summary>
+    public bool EditMode { get; init; }
 }
 
 /// <summary>
@@ -103,6 +112,13 @@ public static class ContextMenuModel
         if (!target.DocumentOpen)
         {
             return [];
+        }
+
+        // A reader gets the one command that takes nothing away from them.
+        // Nothing is pickable in View mode, so there is never an object menu.
+        if (!target.EditMode)
+        {
+            return [new(ContextCommand.Copy, "Copy", Accelerator: "Ctrl+C")];
         }
 
         return target.OnObject ? ObjectMenu(target) : PageMenu(target);

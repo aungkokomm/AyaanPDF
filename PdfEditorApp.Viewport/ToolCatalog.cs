@@ -4,6 +4,30 @@ using System.Linq;
 
 namespace PdfEditorApp.Viewport;
 
+/// <summary>
+/// Whether the app is being read or being edited.
+///
+/// ⚠️ NOT another gesture layer, and it exists to remove one. A single
+/// pointer chain was answering both questions at once: a press on the page had
+/// to be a reader's text selection AND a possible object pick AND a possible
+/// text-unit selection, and every new capability made that chain longer. The
+/// mode splits it in two, so each half only has to decide among things that
+/// belong together.
+///
+/// View is the default on every document open. A reader who never presses Edit
+/// gets a viewer, and nothing they click can change the file.
+/// </summary>
+public enum AppMode
+{
+    /// <summary>Read, select text, follow links, fill forms. Ayaan's own marks
+    /// are drawn but cannot be picked up.</summary>
+    View,
+
+    /// <summary>Everything View does, plus the tools and the selections that
+    /// change the document.</summary>
+    Edit,
+}
+
 /// <summary>What plain left-drag/click currently does in the viewport.</summary>
 public enum ToolMode
 {
@@ -130,6 +154,26 @@ public static class ToolCatalog
         All.FirstOrDefault(t => t.Mode == mode) ?? All[0];
 
     /// <summary>
+    /// The tools a mode offers, in rail order.
+    ///
+    /// ⚠️ DECLARED HERE, next to the tools themselves, and read by BOTH the
+    /// rail and the keyboard. A rail that hid a tool while its shortcut still
+    /// armed it would be the worst of both: the reader sees a viewer and one
+    /// keystroke puts them in a drawing tool with no way to tell.
+    ///
+    /// View keeps only the two that change nothing: the hand pans and Select
+    /// reads. Everything else places a mark, and placing a mark is editing.
+    /// </summary>
+    public static IReadOnlyList<ToolDefinition> ForMode(AppMode mode) =>
+        mode == AppMode.Edit
+            ? All
+            : All.Where(t => t.Mode is ToolMode.Hand or ToolMode.Select).ToList();
+
+    /// <summary>Whether a mode offers a tool at all.</summary>
+    public static bool Offers(AppMode mode, ToolMode tool) =>
+        ForMode(mode).Any(t => t.Mode == tool);
+
+    /// <summary>
     /// The tool a key selects, or null.
     ///
     /// Lives here rather than in a switch in the key handler so that a tool
@@ -140,5 +184,17 @@ public static class ToolCatalog
     {
         char upper = char.ToUpperInvariant(key);
         return All.FirstOrDefault(t => t.Shortcut == upper);
+    }
+
+    /// <summary>
+    /// The tool a key selects IN THIS MODE, or null.
+    ///
+    /// ⚠️ The mode-aware one, and the only one the key handler may call. Its
+    /// modeless sibling above would happily arm a tool the rail is not showing.
+    /// </summary>
+    public static ToolDefinition? ForShortcut(char key, AppMode mode)
+    {
+        char upper = char.ToUpperInvariant(key);
+        return ForMode(mode).FirstOrDefault(t => t.Shortcut == upper);
     }
 }

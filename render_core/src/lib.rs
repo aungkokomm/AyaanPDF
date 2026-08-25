@@ -9899,6 +9899,14 @@ fn set_line_text_inner(
     struct Plan {
         range: Vec<usize>,
         originals: Vec<String>,
+        /// The object the replacement goes into: the range's LAST text object,
+        /// so that anything the producer drew between the line's objects keeps
+        /// the relationship to the line that it had.
+        anchor: usize,
+        /// What the anchor's matrix was, so a refusal can put it back. It is
+        /// overwritten with the first object's, and restoring the TEXT without
+        /// restoring this would leave the line's own words in the wrong place.
+        anchor_matrix: FS_MATRIX,
         matrix: FS_MATRIX,
         color: Option<PdfColor>,
         size: f32,
@@ -9959,6 +9967,16 @@ fn set_line_text_inner(
             .bindings()
             .FPDFPageObj_GetMatrix(ft.object_handle(), &mut m);
 
+        let anchor = *range.last().unwrap();
+        let mut anchor_matrix = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
+        if let Ok(o) = objs.get(anchor) {
+            if let PdfPageObject::Text(t) = &o {
+                doc_guard
+                    .bindings()
+                    .FPDFPageObj_GetMatrix(t.object_handle(), &mut anchor_matrix);
+            }
+        }
+
         // Where to measure the width change from, exactly as the word write
         // decides it: the OBJECT grows when the line is spliced into a longer
         // string, and the line's own right edge is the comparable figure when
@@ -9977,6 +9995,8 @@ fn set_line_text_inner(
         Plan {
             range,
             originals,
+            anchor,
+            anchor_matrix,
             matrix: m,
             color: ft.fill_color().ok(),
             size: ft.unscaled_font_size().value,
@@ -10002,6 +10022,20 @@ fn set_line_text_inner(
             return STATUS_UNSUPPORTED;
         }
 
+        // ⚠️ AND IT TAKES THE FIRST OBJECT'S POSITION. The text now lives in
+        // the range's LAST object, which was sitting whereever the end of the
+        // line was; left alone, the replacement would start there. Every object
+        // on the line shares a font and a size (a line that does not is
+        // refused), so the two matrices differ only in their translation and
+        // copying the first one whole is exactly "start where the line starts".
+        if let Ok(o) = page.objects().get(plan.anchor) {
+            if let PdfPageObject::Text(t) = &o {
+                doc_guard
+                    .bindings()
+                    .FPDFPageObj_SetMatrix(t.object_handle(), &plan.matrix);
+            }
+        }
+
         let said = cluster_text_of(&page, &plan.range);
         let expected = spliced_expectation(&plan.originals, new_text, plan.prefix, plan.suffix);
 
@@ -10016,16 +10050,17 @@ fn set_line_text_inner(
         // page keep answering with the size the page had when it was loaded,
         // so the only way to learn how wide the replacement came out is to take
         // the page again and ask the characters.
-        if line_overflows(&doc_guard, page_index, plan.range[0], plan.page_right) {
+        if line_overflows(&doc_guard, page_index, plan.anchor, plan.page_right) {
             let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
                 return STATUS_INVALID_INPUT;
             };
             restore_cluster_objects(&page, &plan.range, &plan.originals);
+            restore_matrix(&doc_guard, &page, plan.anchor, &plan.anchor_matrix);
             let _ = page.regenerate_content();
             return STATUS_TOO_WIDE;
         }
         return finish_cluster_write(
-            &mut doc_guard, page_index, plan.range[0], plan.right, &plan.shift);
+            &mut doc_guard, page_index, plan.anchor, plan.right, &plan.shift);
     }
 
     // The font could not spell it. Put the line back before trying anything
@@ -10035,6 +10070,7 @@ fn set_line_text_inner(
             return STATUS_INVALID_INPUT;
         };
         restore_cluster_objects(&page, &plan.range, &plan.originals);
+        restore_matrix(&doc_guard, &page, plan.anchor, &plan.anchor_matrix);
     }
 
     // ---- path 2: a replacement in the stand-in font ----
@@ -10084,32 +10120,40 @@ fn set_line_text_inner(
             .bindings()
             .FPDFPageObj_SetMatrix(obj.object_handle(), &plan.matrix);
 
-        // AT THE FIRST OBJECT'S INDEX, so PDFium's reading order survives.
+        // ⚠️ DIRECTLY AFTER THE RANGE, not at its start, for the reason the
+        // other path writes into the last object: anything the producer drew
+        // between the line's own objects has to keep drawing where it did.
+        // Still not appended to the page, which was measured to move the text
+        // to the end of PDFium's reading order and break extraction and search:
+        // this lands between the line's last object and whatever followed it,
+        // which is where the line already read.
+        let at = (plan.anchor + 1).min(page.objects().len() as usize);
         let ok = page
             .objects_mut()
-            .insert_object_at_index(plan.range[0], PdfPageObject::Text(obj))
+            .insert_object_at_index(at, PdfPageObject::Text(obj))
             .is_ok();
         ok && page.regenerate_content().is_ok()
     };
 
-    // Everything at or after the insertion moved up by one.
-    let moved: Vec<usize> = plan.range.iter().map(|&i| i + 1).collect();
+    // Everything at or after the insertion moved up by one. The range's own
+    // objects all sit BEFORE it, so unlike the word path they do not move.
+    let inserted_at = plan.anchor + 1;
     let shift_after: Vec<usize> = plan
         .shift
         .iter()
-        .map(|&i| if i >= plan.range[0] { i + 1 } else { i })
+        .map(|&i| if i >= inserted_at { i + 1 } else { i })
         .collect();
 
     let put_back = |doc_guard: &pdfium_render::prelude::PdfDocument| {
         let Ok(page) = doc_guard.pages().get(page_index as u16) else {
             return;
         };
-        if let Ok(mut o) = page.objects().get(plan.range[0]) {
+        if let Ok(mut o) = page.objects().get(inserted_at) {
             if let PdfPageObject::Text(t) = &mut o {
                 let _ = t.set_text("");
             }
         }
-        restore_cluster_objects(&page, &moved, &plan.originals);
+        restore_cluster_objects(&page, &plan.range, &plan.originals);
         let mut page = page;
         let _ = page.regenerate_content();
     };
@@ -10126,7 +10170,7 @@ fn set_line_text_inner(
         let Ok(page) = doc_guard.pages().get(page_index as u16) else {
             return STATUS_INVALID_INPUT;
         };
-        cluster_text_of(&page, &[plan.range[0]])
+        cluster_text_of(&page, &[inserted_at])
     };
 
     if !same_text(&said, new_text) {
@@ -10134,13 +10178,33 @@ fn set_line_text_inner(
         return STATUS_UNSUPPORTED;
     }
 
-    if line_overflows(&doc_guard, page_index, plan.range[0], plan.page_right) {
+    if line_overflows(&doc_guard, page_index, inserted_at, plan.page_right) {
         put_back(&doc_guard);
         return STATUS_TOO_WIDE;
     }
 
     finish_cluster_write(
-        &mut doc_guard, page_index, plan.range[0], plan.right, &shift_after)
+        &mut doc_guard, page_index, inserted_at, plan.right, &shift_after)
+}
+
+/// Puts one object's matrix back.
+///
+/// Needed because the line write MOVES its anchor: the replacement goes into
+/// the range's last text object and takes the first one's position, so undoing
+/// the text without undoing the position would leave the original words
+/// sitting where the end of the line used to be.
+fn restore_matrix(
+    doc_guard: &pdfium_render::prelude::PdfDocument,
+    page: &pdfium_render::prelude::PdfPage,
+    index: usize,
+    matrix: &pdfium_render::prelude::FS_MATRIX,
+) {
+    use pdfium_render::prelude::*;
+    let Ok(o) = page.objects().get(index) else { return };
+    let PdfPageObject::Text(t) = &o else { return };
+    doc_guard
+        .bindings()
+        .FPDFPageObj_SetMatrix(t.object_handle(), matrix);
 }
 
 /// Whether what one object now draws runs off the right of the page.
@@ -10184,10 +10248,27 @@ fn write_line_objects(
     use pdfium_render::prelude::*;
 
     if prefix == 0 && suffix == 0 {
-        for (n, &i) in range.iter().enumerate() {
+        // ⚠️ THE LAST OBJECT TAKES THE TEXT, NOT THE FIRST, and that is a
+        // z-order fix rather than a preference.
+        //
+        // A line's objects are a RANGE, and a producer is free to draw
+        // something else inside it. Measured on an ordinary page with one
+        // highlighted phrase: the grey background was a PATH at index 12, with
+        // the line's text at 0..11 and 13..49, so the second half of the line
+        // was drawn ON TOP of the fill. Collapsing the line into object 0 put
+        // all of it UNDER the fill, and rewriting the line with the text it
+        // already had lost 671 of its 2367 dark pixels.
+        //
+        // Writing into the last text object instead puts the replacement after
+        // everything the range contained, so whatever was interleaved keeps the
+        // relationship to the line that its author gave it. When nothing is
+        // interleaved this is indistinguishable from writing into the first:
+        // the others are emptied either way and an empty object draws nothing.
+        let Some(&anchor) = range.last() else { return false };
+        for &i in range {
             let Ok(mut o) = page.objects().get(i) else { continue };
             let PdfPageObject::Text(t) = &mut o else { continue };
-            let _ = t.set_text(if n == 0 { new_text } else { "" });
+            let _ = t.set_text(if i == anchor { new_text } else { "" });
         }
         return true;
     }
@@ -13573,6 +13654,171 @@ mod tests {
 
         close_document(reopened);
         let _ = std::fs::remove_file(&file);
+    }
+
+    // ---- the content order a line edit has to leave alone ----
+
+    /// Dark pixels inside a rectangle of the rendered page, given in the app's
+    /// normalized coordinates (top-left, both axes over the page WIDTH).
+    fn dark_pixels_in(handle: u64, left: f32, top: f32, right: f32, bottom: f32) -> u32 {
+        use pdfium_render::prelude::*;
+        const WIDE: i32 = 1200;
+
+        // ⚠️ THE SAME LOCK EVERY FFI CALL TAKES. Rendering reaches into PDFium,
+        // which is not re-entrant, and the test harness runs these in parallel
+        // with the writes: without this the process dies with a stack overrun
+        // rather than failing an assertion.
+        let _guard = lock(&CALL_LOCK);
+
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let page = g.pages().get(0).unwrap();
+        let (bw, bh, bytes) = render_page_via_pdfium_page(&page, WIDE).unwrap();
+        let pw = page.width().value;
+        drop(page);
+        drop(g);
+        drop(doc);
+
+        // Normalized is over the page WIDTH on both axes and the bitmap is the
+        // page's width across, so its pixel width converts both.
+        let _ = pw;
+        let scale = bw as f32;
+        let x0 = ((left * scale) as i32).clamp(0, bw - 1);
+        let x1 = ((right * scale) as i32).clamp(0, bw - 1);
+        let y0 = ((top * scale) as i32).clamp(0, bh - 1);
+        let y1 = ((bottom * scale) as i32).clamp(0, bh - 1);
+
+        let mut dark = 0u32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let p = ((y * bw + x) * 4) as usize;
+                if p + 2 < bytes.len() {
+                    let lum =
+                        (bytes[p] as u32 + bytes[p + 1] as u32 + bytes[p + 2] as u32) / 3;
+                    if lum < 100 {
+                        dark += 1;
+                    }
+                }
+            }
+        }
+        dark
+    }
+
+    #[test]
+    fn a_line_drawn_over_a_fill_is_still_drawn_over_it_afterwards() {
+        // ⚠️ A MEASURED REGRESSION, and the reason the replacement goes into the
+        // range's LAST text object.
+        //
+        // A line's objects are a RANGE and a producer may draw inside it. On
+        // this page one phrase has a grey background, which Chromium emits as a
+        // PATH at index 12 with the line's text at 0..11 and 13..49: the middle
+        // of the line is drawn ON TOP of that fill. Collapsing the line into
+        // object 0 put all of it underneath, and rewriting the line with the
+        // text it already had lost 671 of its 2367 dark pixels.
+        //
+        // Rewriting a line with its own text has to be invisible.
+        let handle = open_fixture_named("tests/fixtures/sample_midline_fill.pdf");
+
+        let line = line_starting(&lines_of(handle), "alpha bravo");
+        assert!(line.last_object > line.first_object + 5, "{line:?}");
+
+        let before = dark_pixels_in(
+            handle, line.left, line.top, line.right, line.bottom);
+        assert!(before > 500, "the fixture drew almost nothing: {before}");
+
+        let same = line.text.clone();
+        assert_eq!(retype(handle, &line, &same, Some(TIMES)), STATUS_OK_PDFIUM);
+
+        let after = dark_pixels_in(
+            handle, line.left, line.top, line.right, line.bottom);
+
+        // Re-rendering is not bit-exact (the replacement is one object where
+        // there were fifty), so this allows a little noise and would still have
+        // caught the 28% that went missing.
+        let drop = (before as f32 - after as f32) / before as f32;
+        assert!(drop < 0.05,
+                "the line lost {:.0}% of its ink: {before} -> {after}", drop * 100.0);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_replacement_lands_after_everything_its_range_contained() {
+        // The structural half of the same rule, which does not depend on
+        // rendering: whatever was interleaved must still come BEFORE the text.
+        use pdfium_render::prelude::*;
+
+        let handle = open_fixture_named("tests/fixtures/sample_midline_fill.pdf");
+        let line = line_starting(&lines_of(handle), "alpha bravo");
+
+        // The fixture has to actually contain the case, or this proves nothing.
+        let interleaved = {
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let g = lock(&doc);
+            let page = g.pages().get(0).unwrap();
+            let objs = page.objects();
+            let found = (line.first_object..=line.last_object)
+                .filter(|&i| !matches!(objs.get(i), Ok(PdfPageObject::Text(_))))
+                .collect::<Vec<_>>();
+            drop(page);
+            drop(g);
+            drop(doc);
+            found
+        };
+        assert!(!interleaved.is_empty(),
+                "the fixture no longer has a non-text object inside the line");
+
+        assert_eq!(retype(handle, &line, "alpha bravo charlie delta echo", Some(TIMES)),
+                   STATUS_OK_PDFIUM);
+
+        // The line now lives in ONE object, and it has to sit after the object
+        // that was drawn between its pieces.
+        let after = line_starting(&lines_of(handle), "alpha bravo");
+        assert!(after.first_object > *interleaved.last().unwrap(),
+                "the text landed at {} which is before the fill at {:?}",
+                after.first_object, interleaved);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_replacement_starts_where_the_line_started() {
+        // ⚠️ Moving the text to the range's last object moves it to wherever
+        // that object was sitting, which is the END of the line. The first
+        // object's matrix has to go with it or the whole line shifts right.
+        let handle = open_fixture_named("tests/fixtures/sample_midline_fill.pdf");
+
+        let before = line_starting(&lines_of(handle), "alpha bravo");
+        assert_eq!(retype(handle, &before, &before.text.clone(), Some(TIMES)),
+                   STATUS_OK_PDFIUM);
+
+        let after = line_starting(&lines_of(handle), "alpha bravo");
+        assert!((after.left - before.left).abs() < 0.002,
+                "the line moved from {:.4} to {:.4}", before.left, after.left);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_ordinary_line_is_unaffected_by_the_rule() {
+        // Where nothing is interleaved, writing into the last object is
+        // indistinguishable from writing into the first: the others are emptied
+        // either way and an empty object draws nothing.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let before = dark_pixels_in(handle, line.left, line.top, line.right, line.bottom);
+
+        assert_eq!(retype(handle, &line, &line.text.clone(), Some(TIMES)), STATUS_OK_PDFIUM);
+
+        let after = line_starting(&lines_of(handle), "breaks where");
+        assert!((after.left - line.left).abs() < 0.002, "the line moved");
+
+        let ink = dark_pixels_in(handle, line.left, line.top, line.right, line.bottom);
+        let drop = (before as f32 - ink as f32) / before as f32;
+        assert!(drop.abs() < 0.05, "ink changed: {before} -> {ink}");
+
+        close_document(handle);
     }
 
     // ---- the reflow that a line edit made reachable ----
