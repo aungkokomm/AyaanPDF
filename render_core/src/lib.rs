@@ -7844,6 +7844,716 @@ fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
     buffer
 }
 
+/// The most clusters one page may offer. A page cannot make the app allocate
+/// without bound just by containing a great deal of text.
+const MAX_WORD_CLUSTERS: u32 = 20_000;
+
+/// Why a cluster refuses to be edited. `CLUSTER_OK` means it does not.
+///
+/// EVERY ONE OF THESE WAS MEASURED, not imagined. A cluster that cannot be
+/// edited is offered to the reader anyway, so it can still be selected and
+/// looked at; only the write is refused, and it is refused BEFORE anything is
+/// touched rather than half way through.
+const CLUSTER_OK: u32 = 0;
+/// The object's matrix is rotated or skewed. Copying such a matrix onto a
+/// replacement was measured to move and resize the words.
+const CLUSTER_NOT_UPRIGHT: u32 = 1;
+/// More than one font or size inside one word, so there is no single style a
+/// replacement could be written in.
+const CLUSTER_MIXED_STYLE: u32 = 2;
+/// The word's objects are not consecutive on the page. Measured on Burmese,
+/// where stacked marks arrive out of reading order; rewriting those would
+/// scramble the text.
+const CLUSTER_SPLIT_OBJECTS: u32 = 3;
+/// PDFium reports no font name at all for the object, so nothing identifies a
+/// font that could stand in for it. Measured on a real document.
+const CLUSTER_NO_FONT_NAME: u32 = 4;
+/// No text object owns these characters, so there is nothing to write to.
+const CLUSTER_NO_OBJECTS: u32 = 5;
+
+/// One word of a page's own text, and the objects that draw it.
+struct WordCluster {
+    text: String,
+    objects: Vec<usize>,
+    font: String,
+    size_pts: f32,
+    color: u32,
+    baseline: f32,
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+    upright: bool,
+    /// Set when a later character disagreed with the first about font or size.
+    /// Kept as its own flag rather than folded into the font name, so the
+    /// reader is told the real objection.
+    mixed: bool,
+}
+
+impl WordCluster {
+    /// The one reason this word cannot be rewritten, or `CLUSTER_OK`.
+    ///
+    /// Ordered by how fundamental the objection is, so the reason a reader is
+    /// shown is the most useful one rather than whichever was checked first.
+    fn refusal(&self) -> u32 {
+        if self.objects.is_empty() {
+            return CLUSTER_NO_OBJECTS;
+        }
+        if !self.upright {
+            return CLUSTER_NOT_UPRIGHT;
+        }
+        if self.mixed {
+            return CLUSTER_MIXED_STYLE;
+        }
+        if self.font.is_empty() {
+            return CLUSTER_NO_FONT_NAME;
+        }
+        if self.objects.windows(2).any(|p| p[1] != p[0] + 1) {
+            return CLUSTER_SPLIT_OBJECTS;
+        }
+        CLUSTER_OK
+    }
+}
+
+/// Every word on a page, built from PDFium's CHARACTER stream rather than from
+/// its text objects.
+///
+/// WHY THE CHAR STREAM. A producer decides for itself where one text object
+/// ends: measured on real files, Chromium emits ONE OBJECT PER GLYPH, 565 of
+/// them for four short paragraphs, while other producers emit one per run.
+/// Objects are therefore not a unit anybody wants to edit. PDFium's text page
+/// already reassembles them into readable text with word spacing and line
+/// breaks, and every character can name the object that draws it, so words come
+/// from the characters and the objects come back from the words.
+///
+/// The result is that the same page reads the same way whether its producer
+/// wrote a glyph at a time or a paragraph at a time.
+fn page_word_clusters(
+    doc_guard: &pdfium_render::prelude::PdfDocument,
+    page: &pdfium_render::prelude::PdfPage,
+) -> Vec<WordCluster> {
+    use pdfium_render::prelude::*;
+
+    let objects = page.objects();
+
+    // Two lookups built in one pass: which index a text object sits at, and
+    // whether its matrix is upright. Both are needed per character, and asking
+    // PDFium per character instead would parse the page repeatedly.
+    let mut index_of = std::collections::HashMap::new();
+    let mut upright_of = std::collections::HashMap::new();
+    for i in 0..objects.len() {
+        let Ok(o) = objects.get(i) else { continue };
+        let PdfPageObject::Text(t) = &o else { continue };
+        let handle = t.object_handle() as usize;
+        index_of.insert(handle, i as usize);
+
+        let mut m = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
+        doc_guard
+            .bindings()
+            .FPDFPageObj_GetMatrix(t.object_handle(), &mut m);
+        upright_of.insert(i as usize, m.b.abs() < 1e-4 && m.c.abs() < 1e-4);
+    }
+
+    let Ok(text_page) = page.text() else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<WordCluster> = Vec::new();
+    let mut cur: Option<WordCluster> = None;
+
+    for c in text_page.chars().iter() {
+        let ch = c.unicode_char().unwrap_or('\u{fffd}');
+
+        // A word ends at whitespace. PDFium inserts its own spaces and line
+        // breaks between objects that only LOOK adjacent, which is exactly the
+        // judgement wanted here and is why the split is on the char stream.
+        if ch.is_whitespace() {
+            if let Some(w) = cur.take() {
+                out.push(w);
+            }
+            continue;
+        }
+
+        if out.len() as u32 >= MAX_WORD_CLUSTERS {
+            break;
+        }
+
+        let owner = c
+            .text_object()
+            .ok()
+            .and_then(|t| index_of.get(&(t.object_handle() as usize)).copied());
+
+        let font = c.font_name();
+        let size = c.scaled_font_size().value;
+
+        let w = cur.get_or_insert(WordCluster {
+            text: String::new(),
+            objects: Vec::new(),
+            font: font.clone(),
+            size_pts: size,
+            color: c
+                .fill_color()
+                .map(|f| ((f.red() as u32) << 16) | ((f.green() as u32) << 8) | f.blue() as u32)
+                .unwrap_or(0),
+            baseline: c.origin().map(|(_, y)| y.value).unwrap_or(0.0),
+            left: f32::MAX,
+            bottom: f32::MAX,
+            right: f32::MIN,
+            top: f32::MIN,
+            upright: true,
+            mixed: false,
+        });
+
+        w.text.push(ch);
+
+        // A word set in two fonts or two sizes has no single style to write a
+        // replacement in, and saying so here is cheaper than discovering it at
+        // write time.
+        if font != w.font || (size - w.size_pts).abs() > 0.01 {
+            w.mixed = true;
+        }
+
+        if let Some(i) = owner {
+            if !w.objects.contains(&i) {
+                w.objects.push(i);
+            }
+            if !upright_of.get(&i).copied().unwrap_or(true) {
+                w.upright = false;
+            }
+        }
+
+        if let Ok(b) = c.tight_bounds() {
+            w.left = w.left.min(b.left().value);
+            w.bottom = w.bottom.min(b.bottom().value);
+            w.right = w.right.max(b.right().value);
+            w.top = w.top.max(b.top().value);
+        }
+    }
+
+    if let Some(w) = cur.take() {
+        out.push(w);
+    }
+
+    out.retain(|w| !w.text.is_empty() && w.left <= w.right);
+    out
+}
+
+/// Every word on a page, for the app's model.
+///
+/// Little-endian. A count, then per cluster: the first object's index, the
+/// object count and that many indices, the bounds normalized top-left and
+/// divided by the page WIDTH (the convention the whole app draws in), the
+/// baseline in the same units, the font size in points, the fill colour packed
+/// as 0x00RRGGBB, a refusal code, and two length-prefixed UTF-8 strings, the
+/// text and the font name.
+///
+/// The refusal code travels WITH the cluster because the reader is shown every
+/// word, editable or not: a word that cannot be rewritten can still be selected
+/// and read, and the app can say why rather than silently doing nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_page_word_clusters(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_page_word_clusters_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_page_word_clusters_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (page_left, page_top) = page_origin(&page);
+
+    let clusters = page_word_clusters(&doc_guard, &page);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(clusters.len() as u32).to_le_bytes());
+
+    for w in &clusters {
+        let first = w.objects.first().copied().unwrap_or(0);
+        out.extend_from_slice(&(first as u32).to_le_bytes());
+        out.extend_from_slice(&(w.objects.len() as u32).to_le_bytes());
+        for &i in &w.objects {
+            out.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+
+        // PDF is bottom-left origin and Y-up; the app is top-left and Y-down.
+        out.extend_from_slice(&((w.left - page_left) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - w.top) / page_w).to_le_bytes());
+        out.extend_from_slice(&((w.right - page_left) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - w.bottom) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - w.baseline) / page_w).to_le_bytes());
+
+        out.extend_from_slice(&w.size_pts.to_le_bytes());
+        out.extend_from_slice(&w.color.to_le_bytes());
+        out.extend_from_slice(&w.refusal().to_le_bytes());
+
+        out.extend_from_slice(&(w.text.len() as u32).to_le_bytes());
+        out.extend_from_slice(w.text.as_bytes());
+        out.extend_from_slice(&(w.font.len() as u32).to_le_bytes());
+        out.extend_from_slice(w.font.as_bytes());
+    }
+
+    drop(page);
+    drop(doc_guard);
+    drop(doc);
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Replaces the text of one word cluster, or changes nothing at all.
+///
+/// TWO PATHS, and which one runs is decided by the document rather than by the
+/// caller:
+///
+/// 1. The word's own font can spell the new text. `set_text` on the first
+///    object, the rest emptied. Nothing is created and the original font,
+///    matrix and colour are all kept exactly.
+/// 2. It cannot. A replacement is built in the font at `fallback_font_path`,
+///    given the original's matrix, colour and size, and INSERTED AT THE FIRST
+///    OBJECT'S INDEX so PDFium's reading order is preserved.
+///
+/// Path 2 exists because real documents subset their fonts: a page's Arial
+/// contains only the glyphs that page already uses, so typing a genuinely new
+/// word into it was measured to silently drop the letters it lacks
+/// ("Section" came back "etin"). Substituting the matching system font was
+/// measured to be PIXEL-IDENTICAL for upright text in five of six typefaces.
+///
+/// SUPERSEDED OBJECTS ARE EMPTIED, NEVER REMOVED. `FPDFPage_RemoveObject`
+/// followed by a drop destroys the process, and an emptied object keeps every
+/// later index pointing where it did, so nothing else on the page has to move.
+///
+/// EVERY WRITE IS READ BACK. PDFium reports success for a `set_text` that
+/// silently truncated, so the only way to know the page says what was asked is
+/// to ask it afterwards. Anything short of an exact match restores the original
+/// text and returns `STATUS_UNSUPPORTED`.
+///
+/// Returns `STATUS_OK_PDFIUM` when the page now says exactly `new_text`,
+/// `STATUS_UNSUPPORTED` when it refused and left the page as it found it, and
+/// `STATUS_INVALID_INPUT` for a request that does not describe a cluster.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_word_cluster_text(
+    doc_handle: u64,
+    page_index: i32,
+    objects: *const u32,
+    object_count: usize,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+    fallback_font_path_utf8: *const u8,
+    fallback_font_path_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || objects.is_null() || object_count == 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let wanted: Vec<usize> = unsafe { std::slice::from_raw_parts(objects, object_count) }
+        .iter()
+        .map(|&i| i as usize)
+        .collect();
+
+    let Some(new_text) = utf8_arg(new_text_utf8, new_text_len) else {
+        return STATUS_INVALID_INPUT;
+    };
+    // An empty replacement would delete the word, which this operation does not
+    // do; deleting is a different edit with a different undo.
+    if new_text.trim().is_empty() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let fallback = utf8_arg(fallback_font_path_utf8, fallback_font_path_len);
+
+    panic::catch_unwind(|| {
+        set_word_cluster_text_inner(doc_handle, page_index, &wanted, &new_text, fallback.as_deref())
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// A UTF-8 argument that may be absent, as a String.
+fn utf8_arg(ptr: *const u8, len: usize) -> Option<String> {
+    if ptr.is_null() || len == 0 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn set_word_cluster_text_inner(
+    doc_handle: u64,
+    page_index: i32,
+    wanted: &[usize],
+    new_text: &str,
+    fallback_font_path: Option<&str>,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let mut doc_guard = lock(&doc);
+
+    // ---- what is there now, and may it be touched ----
+    //
+    // The cluster is re-derived rather than trusted from the caller: the page
+    // may have changed since the app read it, and writing to a stale object
+    // list would edit whatever happens to be at those indices now.
+    struct Plan {
+        objects: Vec<usize>,
+        originals: Vec<String>,
+        matrix: FS_MATRIX,
+        color: Option<PdfColor>,
+        size: f32,
+        right: f32,
+        shift: Vec<usize>,
+    }
+
+    let plan = {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let clusters = page_word_clusters(&doc_guard, &page);
+
+        let Some(target) = clusters.iter().find(|c| c.objects == wanted) else {
+            return STATUS_INVALID_INPUT;
+        };
+        if target.refusal() != CLUSTER_OK {
+            return STATUS_UNSUPPORTED;
+        }
+
+        // Words further along the SAME LINE, which have to move by whatever the
+        // replacement's width changes by. A word's baseline is what puts it on
+        // a line; a third of the type size is comfortably inside the leading of
+        // any normal setting and well outside the wobble within one line.
+        let tolerance = (target.size_pts * 0.3).max(0.5);
+        let shift: Vec<usize> = clusters
+            .iter()
+            .filter(|c| {
+                (c.baseline - target.baseline).abs() < tolerance && c.left > target.right
+            })
+            .flat_map(|c| c.objects.iter().copied())
+            .filter(|i| !target.objects.contains(i))
+            .collect();
+
+        let objs = page.objects();
+        let mut originals = Vec::with_capacity(target.objects.len());
+        for &i in &target.objects {
+            let Ok(o) = objs.get(i) else {
+                return STATUS_INVALID_INPUT;
+            };
+            let PdfPageObject::Text(t) = &o else {
+                return STATUS_INVALID_INPUT;
+            };
+            originals.push(t.text());
+        }
+
+        let Ok(first) = objs.get(target.objects[0]) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let PdfPageObject::Text(ft) = &first else {
+            return STATUS_INVALID_INPUT;
+        };
+        let mut m = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
+        doc_guard
+            .bindings()
+            .FPDFPageObj_GetMatrix(ft.object_handle(), &mut m);
+
+        Plan {
+            objects: target.objects.clone(),
+            originals,
+            matrix: m,
+            color: ft.fill_color().ok(),
+            size: ft.unscaled_font_size().value,
+            right: target.right,
+            shift,
+        }
+    };
+
+    // ---- path 1: the word's own font ----
+    let path_one = {
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+        write_cluster_objects(&page, &plan.objects, new_text);
+        let said = cluster_text_of(&page, &plan.objects);
+
+        // REGENERATE BEFORE THIS PAGE GOES OUT OF SCOPE. Object edits live on
+        // the page wrapper; letting it drop without rebuilding the content
+        // stream throws them away, and the next caller to take the page sees
+        // the document exactly as it was.
+        if same_text(&said, new_text) && page.regenerate_content().is_err() {
+            return STATUS_UNSUPPORTED;
+        }
+        same_text(&said, new_text)
+    };
+
+    if path_one {
+        return finish_cluster_write(
+            &mut doc_guard, page_index, plan.objects[0], plan.right, &plan.shift);
+    }
+
+    // The font could not spell it. Put the word back before trying anything
+    // else, so a failure from here leaves the page exactly as it was found.
+    {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        restore_cluster_objects(&page, &plan.objects, &plan.originals);
+    }
+
+    // ---- path 2: a replacement in the stand-in font ----
+    let Some(font_path) = fallback_font_path else {
+        return STATUS_UNSUPPORTED;
+    };
+    if font_file_bytes(font_path).is_none() {
+        return STATUS_UNSUPPORTED;
+    }
+
+    let token = resolve_text_font(&mut doc_guard, Some(font_path));
+
+    let inserted = {
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+        for &i in &plan.objects {
+            if let Ok(mut o) = page.objects().get(i) {
+                if let PdfPageObject::Text(t) = &mut o {
+                    let _ = t.set_text("");
+                }
+            }
+        }
+
+        let Some(font) = doc_guard.fonts().get(token) else {
+            return STATUS_UNSUPPORTED;
+        };
+        let Ok(mut obj) =
+            PdfPageTextObject::new(&doc_guard, new_text, font, PdfPoints::new(plan.size))
+        else {
+            restore_cluster_objects(&page, &plan.objects, &plan.originals);
+            return STATUS_UNSUPPORTED;
+        };
+        if let Some(c) = plan.color {
+            let _ = obj.set_fill_color(c);
+        }
+        doc_guard
+            .bindings()
+            .FPDFPageObj_SetMatrix(obj.object_handle(), &plan.matrix);
+
+        // AT THE ORIGINAL'S INDEX, not appended. Appending was measured to move
+        // the word to the end of PDFium's reading order, which would break
+        // extraction, search and every future cluster read of this page.
+        let ok = page
+            .objects_mut()
+            .insert_object_at_index(plan.objects[0], PdfPageObject::Text(obj))
+            .is_ok();
+        ok && page.regenerate_content().is_ok()
+    };
+
+    if !inserted {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        restore_cluster_objects(&page, &plan.objects, &plan.originals);
+        return STATUS_UNSUPPORTED;
+    }
+
+    // The replacement now sits at the first index, so every object at or after
+    // it moved up by one, including the ones this edit superseded and the ones
+    // further along the line that still have to be shifted.
+    let moved: Vec<usize> = plan.objects.iter().map(|&i| i + 1).collect();
+    let shift_after: Vec<usize> = plan
+        .shift
+        .iter()
+        .map(|&i| if i >= plan.objects[0] { i + 1 } else { i })
+        .collect();
+
+    let said = {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        cluster_text_of(&page, &[plan.objects[0]])
+    };
+
+    if !same_text(&said, new_text) {
+        // Empty the failed replacement rather than removing it, and put the
+        // original word back. The page reads as it did; one invisible empty
+        // object is the price of never calling FPDFPage_RemoveObject.
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        if let Ok(mut o) = page.objects().get(plan.objects[0]) {
+            if let PdfPageObject::Text(t) = &mut o {
+                let _ = t.set_text("");
+            }
+        }
+        restore_cluster_objects(&page, &moved, &plan.originals);
+        let mut page = page;
+        let _ = page.regenerate_content();
+        return STATUS_UNSUPPORTED;
+    }
+
+    finish_cluster_write(
+        &mut doc_guard, page_index, plan.objects[0], plan.right, &shift_after)
+}
+
+/// Whether the page now says what was asked for.
+///
+/// TRIMMED, and only trimmed. PDFium synthesizes a word separator when it reads
+/// text back out, so a freshly written "Zwolf" comes back as "Zwolf " for
+/// reasons that have nothing to do with what was stored; it was measured on
+/// several unrelated fonts. Clusters split on whitespace, so that space is
+/// invisible to everything above this line.
+///
+/// What this must still catch, and does, is the failure that matters: a subset
+/// font silently dropping the characters it does not have. "Section" written
+/// into a font without S, c or o comes back "etin", and a font with no usable
+/// mapping comes back empty. Neither survives this comparison.
+fn same_text(said: &str, wanted: &str) -> bool {
+    said.trim() == wanted.trim()
+}
+
+/// The first object carries the whole word; the rest are emptied.
+fn write_cluster_objects(
+    page: &pdfium_render::prelude::PdfPage,
+    objects: &[usize],
+    new_text: &str,
+) {
+    use pdfium_render::prelude::*;
+    for (n, &i) in objects.iter().enumerate() {
+        let Ok(mut o) = page.objects().get(i) else { continue };
+        let PdfPageObject::Text(t) = &mut o else { continue };
+        let _ = t.set_text(if n == 0 { new_text } else { "" });
+    }
+}
+
+/// Puts every object back to the text it held.
+fn restore_cluster_objects(
+    page: &pdfium_render::prelude::PdfPage,
+    objects: &[usize],
+    originals: &[String],
+) {
+    use pdfium_render::prelude::*;
+    for (&i, was) in objects.iter().zip(originals) {
+        let Ok(mut o) = page.objects().get(i) else { continue };
+        let PdfPageObject::Text(t) = &mut o else { continue };
+        let _ = t.set_text(was);
+    }
+}
+
+/// The right-hand edge of what one text object currently draws, in page points.
+///
+/// From the CHARACTERS rather than the object's bounding box, because the box
+/// is only refreshed when the page is reloaded.
+fn char_right_edge(page: &pdfium_render::prelude::PdfPage, index: usize) -> Option<f32> {
+    use pdfium_render::prelude::*;
+
+    let text_page = page.text().ok()?;
+    let object = page.objects().get(index).ok()?;
+    let PdfPageObject::Text(t) = &object else { return None };
+
+    let mut right = f32::MIN;
+    for c in text_page.chars_for_object(t).ok()?.iter() {
+        if let Ok(b) = c.tight_bounds() {
+            right = right.max(b.right().value);
+        }
+    }
+    (right > f32::MIN).then_some(right)
+}
+
+/// What these objects now say, joined.
+fn cluster_text_of(page: &pdfium_render::prelude::PdfPage, objects: &[usize]) -> String {
+    use pdfium_render::prelude::*;
+    let mut out = String::new();
+    for &i in objects {
+        let Ok(o) = page.objects().get(i) else { continue };
+        if let PdfPageObject::Text(t) = &o {
+            out.push_str(&t.text());
+        }
+    }
+    out
+}
+
+/// Moves the rest of the line by however much the word's width changed, then
+/// regenerates the page.
+///
+/// Without this a longer word runs into its neighbour and a shorter one leaves
+/// a hole: every word carries its own absolute matrix, so nothing follows a
+/// word that changes size. Measured before this existed, the next word stayed
+/// exactly where it was whether the edit shortened or lengthened the line.
+fn finish_cluster_write(
+    doc_guard: &mut pdfium_render::prelude::PdfDocument,
+    page_index: i32,
+    anchor: usize,
+    old_right: f32,
+    to_shift: &[usize],
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    // MEASURED ON A FRESHLY TAKEN PAGE. Two caches sit in the way of asking how
+    // wide the word is now: an object's bounding box keeps reporting the size it
+    // had when the page was loaded, and so does the text page. Both were
+    // measured still answering "C" for an object that had just been given the
+    // word "Chapters", which made the shift come out as zero and let a longer
+    // word overlap its neighbour. Dropping the page and taking it again is what
+    // makes the answer current.
+    let Ok(fresh) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+    let new_right = char_right_edge(&fresh, anchor).unwrap_or(old_right);
+    let delta = new_right - old_right;
+    drop(fresh);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    if delta.abs() > 0.01 {
+        for &i in to_shift {
+            let Ok(o) = page.objects().get(i) else { continue };
+            let PdfPageObject::Text(t) = &o else { continue };
+            let mut m = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
+            doc_guard
+                .bindings()
+                .FPDFPageObj_GetMatrix(t.object_handle(), &mut m);
+            m.e += delta;
+            doc_guard
+                .bindings()
+                .FPDFPageObj_SetMatrix(t.object_handle(), &m);
+        }
+    }
+
+    if page.regenerate_content().is_err() {
+        return STATUS_UNSUPPORTED;
+    }
+    STATUS_OK_PDFIUM
+}
+
 /// Extracts every character's position and codepoint for a page, scaled to
 /// `target_width` — the same width a caller would pass to `render_low_res`/
 /// `request_high_res` for that page, so the boxes line up with whatever
@@ -8706,6 +9416,462 @@ mod tests {
 
         close_document(handle);
         let _ = std::fs::remove_file(&out);
+    }
+
+    // ---------------- word clusters, the editing unit ----------------
+
+    #[derive(Debug, Clone)]
+    struct DecodedCluster {
+        first: usize,
+        objects: Vec<usize>,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        baseline: f32,
+        size_pts: f32,
+        color: u32,
+        refusal: u32,
+        text: String,
+        font: String,
+    }
+
+    impl DecodedCluster {
+        /// The two things the reflow test has to remember across a write.
+        fn clone_shallow(&self) -> (Vec<usize>, f32) {
+            (self.objects.clone(), self.left)
+        }
+    }
+
+    fn decode_clusters(handle: u64, page_index: i32) -> Vec<DecodedCluster> {
+        let buffer = get_page_word_clusters(handle, page_index);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "the core refused the page");
+        assert!(!buffer.data.is_null());
+
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+
+        let mut at = 0usize;
+        let u32_at = |b: &[u8], p: &mut usize| {
+            let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let f32_at = |b: &[u8], p: &mut usize| {
+            let v = f32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let str_at = |b: &[u8], p: &mut usize| {
+            let n = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap()) as usize;
+            *p += 4;
+            let s = String::from_utf8(b[*p..*p + n].to_vec()).unwrap();
+            *p += n;
+            s
+        };
+
+        let count = u32_at(&bytes, &mut at);
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let first = u32_at(&bytes, &mut at) as usize;
+            let n = u32_at(&bytes, &mut at) as usize;
+            let objects = (0..n).map(|_| u32_at(&bytes, &mut at) as usize).collect();
+            out.push(DecodedCluster {
+                first,
+                objects,
+                left: f32_at(&bytes, &mut at),
+                top: f32_at(&bytes, &mut at),
+                right: f32_at(&bytes, &mut at),
+                bottom: f32_at(&bytes, &mut at),
+                baseline: f32_at(&bytes, &mut at),
+                size_pts: f32_at(&bytes, &mut at),
+                color: u32_at(&bytes, &mut at),
+                refusal: u32_at(&bytes, &mut at),
+                text: str_at(&bytes, &mut at),
+                font: str_at(&bytes, &mut at),
+            });
+        }
+
+        assert_eq!(at, bytes.len(), "the cluster buffer did not decode exactly");
+        out
+    }
+
+    #[test]
+    fn a_word_is_one_cluster_however_the_producer_split_it() {
+        // THE WHOLE POINT OF CLUSTERS, on a file that really is one object per
+        // glyph. "Chapter" is seven objects and one word, and the reader must
+        // never be shown the seven.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let found = decode_clusters(handle, 0);
+
+        let first = &found[0];
+        assert_eq!(first.text, "Chapter");
+        assert_eq!(first.objects, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(first.first, 0);
+        assert_eq!(first.refusal, CLUSTER_OK);
+
+        assert_eq!(found[1].text, "Three");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_same_reading_holds_for_a_producer_that_writes_whole_runs() {
+        // The other extreme: one object per run. The words come out the same,
+        // which is the property that makes clusters worth having.
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+        let found = decode_clusters(handle, 0);
+
+        let words: Vec<&str> = found.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(&words[..2], &["Chapter", "One"]);
+
+        // Both words live in ONE object here, so the cluster's objects overlap.
+        assert_eq!(found[0].objects, vec![0]);
+        assert_eq!(found[1].objects, vec![0]);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn every_ordinary_word_on_a_real_page_can_be_edited() {
+        // Measured before this existed: 103 of 103 words were contiguous and
+        // single-styled. If that stops being true the design assumption is
+        // wrong, and this is where it shows.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let found = decode_clusters(handle, 0);
+
+        let editable = found.iter().filter(|c| c.refusal == CLUSTER_OK).count();
+        assert_eq!(
+            editable,
+            found.len(),
+            "some words refused: {:?}",
+            found
+                .iter()
+                .filter(|c| c.refusal != CLUSTER_OK)
+                .map(|c| (&c.text, c.refusal))
+                .collect::<Vec<_>>()
+        );
+        assert!(found.len() > 50, "only {} words found", found.len());
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn bounds_are_normalized_the_way_the_app_draws() {
+        // Top-left origin, BOTH axes divided by the page WIDTH, matching every
+        // annotation and shape. A second convention here would put the frame
+        // somewhere the word is not.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let found = decode_clusters(handle, 0);
+
+        for c in &found {
+            assert!(c.right > c.left, "{:?} has no width", c.text);
+            assert!(c.bottom > c.top, "{:?} has no height (y must run DOWN)", c.text);
+            assert!(
+                c.left >= -0.01 && c.right <= 1.01,
+                "{:?} is off the page: {}..{}", c.text, c.left, c.right);
+            // The baseline sits inside the box, nearer the bottom than the top.
+            assert!(
+                c.baseline > c.top && c.baseline <= c.bottom + 0.01,
+                "{:?} baseline {} is outside {}..{}", c.text, c.baseline, c.top, c.bottom);
+        }
+
+        assert!(found[0].top < found[2].top, "the heading should sit above the body");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn rotated_words_refuse_rather_than_being_moved() {
+        // Copying a rotated matrix onto a replacement was MEASURED to resize
+        // and move the word. Until that is solved the cluster says so, and it
+        // says so before anything is written.
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let found = decode_clusters(handle, 0);
+
+        let rotated: Vec<&DecodedCluster> = found
+            .iter()
+            .filter(|c| c.refusal == CLUSTER_NOT_UPRIGHT)
+            .collect();
+
+        assert!(!rotated.is_empty(), "the rotated line was not detected");
+        assert!(
+            rotated.iter().any(|c| c.text == "rotated" || c.text == "twenty"),
+            "expected the rotated words, got {:?}",
+            rotated.iter().map(|c| &c.text).collect::<Vec<_>>());
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_word_whose_font_has_no_name_refuses() {
+        // Measured on a real document: PDFium reports an empty font name for
+        // some objects, which leaves nothing to match a stand-in font against.
+        let handle = open_fixture_named("tests/fixtures/sample_font_metrics.pdf");
+        let found = decode_clusters(handle, 0);
+
+        assert!(
+            found.iter().any(|c| c.refusal == CLUSTER_NO_FONT_NAME),
+            "the nameless font was not detected");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn complex_script_refuses_because_its_objects_are_out_of_order() {
+        // Burmese stacks marks as separate objects that arrive out of reading
+        // order. Rewriting those would scramble the text, so the cluster
+        // declines and the reader keeps a document that still says what it did.
+        let handle = open_fixture_named("tests/fixtures/sample_complex_script.pdf");
+        let found = decode_clusters(handle, 0);
+
+        assert!(!found.is_empty());
+        assert!(
+            found.iter().any(|c| c.refusal == CLUSTER_SPLIT_OBJECTS),
+            "expected split objects, got {:?}",
+            found.iter().map(|c| (&c.text, c.refusal)).collect::<Vec<_>>());
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_with_no_text_offers_no_clusters() {
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        assert!(decode_clusters(handle, 0).is_empty());
+        close_document(handle);
+    }
+
+    #[test]
+    fn asking_for_a_page_that_is_not_there_fails_rather_than_panicking() {
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+        let buffer = get_page_word_clusters(handle, 999);
+        assert_eq!(buffer.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(buffer);
+
+        let buffer = get_page_word_clusters(0, 0);
+        assert_eq!(buffer.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(buffer);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_words_colour_and_size_come_from_its_characters() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let found = decode_clusters(handle, 0);
+
+        let crimson = found.iter().find(|c| c.text == "crimson").expect("no crimson word");
+        assert_eq!(crimson.color, 0x00C00000, "colour was {:06X}", crimson.color);
+        assert!(crimson.size_pts > 10.0, "size was {}", crimson.size_pts);
+        assert!(crimson.font.contains("Arial"), "font was {:?}", crimson.font);
+
+        close_document(handle);
+    }
+
+    // ---------------- rewriting one word ----------------
+
+    const ARIAL_BOLD: &str = r"C:\Windows\Fonts\arialbd.ttf";
+
+    /// Asks the core to rewrite one word, the way the app will.
+    fn rewrite(handle: u64, objects: &[usize], new_text: &str, font: Option<&str>) -> i32 {
+        let objs: Vec<u32> = objects.iter().map(|&i| i as u32).collect();
+        let text = new_text.as_bytes();
+        let (fptr, flen) = match font {
+            Some(f) => (f.as_ptr(), f.len()),
+            None => (std::ptr::null(), 0),
+        };
+        set_word_cluster_text(
+            handle, 0, objs.as_ptr(), objs.len(),
+            text.as_ptr(), text.len(), fptr, flen)
+    }
+
+    /// The words a page reads as, in order.
+    fn words_of(handle: u64) -> Vec<String> {
+        decode_clusters(handle, 0).into_iter().map(|c| c.text).collect()
+    }
+
+    #[test]
+    fn a_word_is_rewritten_in_its_own_font_when_that_font_can_spell_it() {
+        // PATH ONE. "s" is already on this page (in "subheading"), so the
+        // heading's own subset can spell "Chapters" and nothing is replaced:
+        // the original objects, font and matrix all stay.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let before = decode_clusters(handle, 0);
+        let target = &before[0];
+        assert_eq!(target.text, "Chapter");
+
+        assert_eq!(
+            rewrite(handle, &target.objects, "Chapters", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let after = decode_clusters(handle, 0);
+        assert_eq!(after[0].text, "Chapters");
+        assert_eq!(after[1].text, "Three", "the rest of the line was disturbed");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_word_the_subset_cannot_spell_is_rebuilt_in_the_stand_in_font() {
+        // PATH TWO. A page's font carries only the glyphs that page already
+        // uses, so this is the common case for any genuinely new word. Measured
+        // before this existed: "Section" came back "etin" from the subset.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let target = decode_clusters(handle, 0).remove(0);
+
+        assert_eq!(
+            rewrite(handle, &target.objects, "Zwolf", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let after = decode_clusters(handle, 0);
+        assert_eq!(after[0].text, "Zwolf");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn without_a_stand_in_font_an_unspellable_word_refuses_and_changes_nothing() {
+        // THE GUARD THAT MATTERS. PDFium reports success for a set_text that
+        // silently dropped characters, so refusing means reading back and
+        // putting the original text where it was.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let before = words_of(handle);
+        let target = decode_clusters(handle, 0).remove(0);
+
+        assert_eq!(
+            rewrite(handle, &target.objects, "Zwolf", None),
+            STATUS_UNSUPPORTED);
+
+        assert_eq!(words_of(handle), before, "the page was left changed after a refusal");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_rotated_word_refuses_before_anything_is_written() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let before = words_of(handle);
+
+        let rotated = decode_clusters(handle, 0)
+            .into_iter()
+            .find(|c| c.refusal == CLUSTER_NOT_UPRIGHT)
+            .expect("no rotated word in the fixture");
+
+        assert_eq!(
+            rewrite(handle, &rotated.objects, "upright", Some(ARIAL_BOLD)),
+            STATUS_UNSUPPORTED);
+        assert_eq!(words_of(handle), before);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn nothing_is_ever_removed_from_the_page() {
+        // FPDFPage_RemoveObject followed by a drop destroys the process, so
+        // superseded objects are emptied instead. The count may GROW by the one
+        // replacement, and must never shrink.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let before = count_page_objects(handle, 0);
+        let target = decode_clusters(handle, 0).remove(0);
+
+        assert_eq!(
+            rewrite(handle, &target.objects, "Zwolf", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        assert!(
+            count_page_objects(handle, 0) >= before,
+            "objects went from {} to {}", before, count_page_objects(handle, 0));
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_replacement_keeps_its_place_in_the_reading_order() {
+        // Appending was MEASURED to move the edited word to the end of the
+        // page's reading order, which would break extraction and search. It
+        // must come back as the first word, not the last.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let target = decode_clusters(handle, 0).remove(0);
+
+        assert_eq!(
+            rewrite(handle, &target.objects, "Zwolf", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let after = words_of(handle);
+        assert_eq!(after[0], "Zwolf", "the edited word left its place: {:?}", &after[..4]);
+        assert_eq!(after[1], "Three");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_rest_of_the_line_moves_when_the_word_changes_width() {
+        // Every word carries its own absolute matrix, so nothing follows a word
+        // that changes size unless it is moved. Measured before this existed:
+        // the next word stayed exactly where it was.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let before = decode_clusters(handle, 0);
+        let (target, next) = (before[0].clone_shallow(), before[1].clone_shallow());
+
+        assert_eq!(
+            rewrite(handle, &target.0, "Chapters", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let after = decode_clusters(handle, 0);
+        let moved = &after[1];
+        assert_eq!(moved.text, "Three");
+        assert!(
+            moved.left > next.1 + 0.001,
+            "the next word did not move: {} then {}", next.1, moved.left);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_edit_survives_a_save_and_a_reopen() {
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let target = decode_clusters(handle, 0).remove(0);
+        assert_eq!(
+            rewrite(handle, &target.objects, "Zwolf", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let out = std::env::temp_dir().join("ayaan_cluster_roundtrip.pdf");
+        let c_out = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c_out.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let reopened = open_fixture_named(out.to_str().unwrap());
+        assert_eq!(words_of(reopened)[0], "Zwolf");
+        close_document(reopened);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn a_request_that_does_not_describe_a_cluster_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        let before = words_of(handle);
+
+        // Objects that are not a word on this page.
+        assert_eq!(rewrite(handle, &[900, 901], "x", Some(ARIAL_BOLD)), STATUS_INVALID_INPUT);
+        // Nothing to say.
+        let target = decode_clusters(handle, 0).remove(0);
+        assert_eq!(rewrite(handle, &target.objects, "   ", Some(ARIAL_BOLD)), STATUS_INVALID_INPUT);
+        // No objects at all.
+        assert_eq!(rewrite(handle, &[], "x", Some(ARIAL_BOLD)), STATUS_INVALID_INPUT);
+
+        assert_eq!(words_of(handle), before);
+        close_document(handle);
+    }
+
+    /// How many objects a page holds, for the never-removed rule.
+    fn count_page_objects(handle: u64, page_index: i32) -> usize {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let doc_guard = lock(&doc);
+        let page = doc_guard.pages().get(page_index as u16).unwrap();
+        let n = page.objects().len();
+        n as usize
     }
 
     // ---------------- page text objects, the Stage 1 feed ----------------

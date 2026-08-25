@@ -7519,7 +7519,7 @@ pub trait PdfiumLibraryBindings {
     #[allow(non_snake_case)]
     fn FPDFPage_InsertObject(&self, page: FPDF_PAGE, page_obj: FPDF_PAGEOBJECT);
 
-    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350"))]
+    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350", feature = "pdfium_7543"))]
     /// Inserts `page_object` into `page` at the specified `index`.
     ///
     ///    `page`        - handle to a page

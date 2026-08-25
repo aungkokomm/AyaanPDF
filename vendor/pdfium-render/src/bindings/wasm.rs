@@ -13361,7 +13361,7 @@ impl PdfiumLibraryBindings for WasmPdfiumBindings {
         );
     }
 
-    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350"))]
+    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350", feature = "pdfium_7543"))]
     #[allow(non_snake_case)]
     fn FPDFPage_InsertObjectAtIndex(
         &self,

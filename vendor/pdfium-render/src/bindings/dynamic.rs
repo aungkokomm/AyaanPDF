@@ -1761,7 +1761,7 @@ pub(crate) struct DynamicPdfiumBindings {
         stroke: *mut FPDF_BOOL,
     ) -> FPDF_BOOL,
     extern_FPDFPage_InsertObject: unsafe extern "C" fn(page: FPDF_PAGE, page_obj: FPDF_PAGEOBJECT),
-    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350"))]
+    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350", feature = "pdfium_7543"))]
     extern_FPDFPage_InsertObjectAtIndex: unsafe extern "C" fn(
         page: FPDF_PAGE,
         page_object: FPDF_PAGEOBJECT,
@@ -3361,7 +3361,7 @@ impl DynamicPdfiumBindings {
             extern_FPDFPath_SetDrawMode: *(Self::bind(&library, "FPDFPath_SetDrawMode")?),
             extern_FPDFPath_GetDrawMode: *(Self::bind(&library, "FPDFPath_GetDrawMode")?),
             extern_FPDFPage_InsertObject: *(Self::bind(&library, "FPDFPage_InsertObject")?),
-            #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350"))]
+            #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350", feature = "pdfium_7543"))]
             extern_FPDFPage_InsertObjectAtIndex: *(Self::bind(
                 &library,
                 "FPDFPage_InsertObjectAtIndex",
@@ -7571,7 +7571,7 @@ impl PdfiumLibraryBindings for DynamicPdfiumBindings {
         unsafe { (self.extern_FPDFPage_InsertObject)(page, page_obj) }
     }
 
-    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350"))]
+    #[cfg(any(feature = "pdfium_future", feature = "pdfium_7350", feature = "pdfium_7543"))]
     #[inline]
     #[allow(non_snake_case)]
     fn FPDFPage_InsertObjectAtIndex(
