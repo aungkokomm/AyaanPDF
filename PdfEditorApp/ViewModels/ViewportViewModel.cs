@@ -4191,18 +4191,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         // The document's own text, which is not one of ours and gets its own
-        // frame. No grips: there is nothing to drag yet, and a handle that does
+        // frame. No grips: nothing here is draggable, and a handle that does
         // nothing is worse than no handle.
-        if (_selectedPageText is { } pageText)
+        if (_selectedWord is { } word && _selectedWordPage >= 0)
         {
-            var textSlot = SlotFor(pageText.PageIndex);
-            var b = pageText.Bounds;
-            double tl = b.Left * SlotLayoutWidth;
-            double tt = b.Top * SlotLayoutWidth;
+            var textSlot = SlotFor(_selectedWordPage);
+            double tl = word.Left * SlotLayoutWidth;
+            double tt = word.Top * SlotLayoutWidth;
             textSlot?.PageTextOutline.Add(new ScaledRect(
                 tl, tt,
-                (b.Right * SlotLayoutWidth) - tl,
-                (b.Bottom * SlotLayoutWidth) - tt,
+                (word.Right * SlotLayoutWidth) - tl,
+                (word.Bottom * SlotLayoutWidth) - tt,
                 string.Empty));
         }
 
@@ -4516,56 +4515,83 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // this is its own field, the two are mutually exclusive, and no existing
     // operation can reach one of these by accident.
 
-    private PageTextObject? _selectedPageText;
+    private readonly Dictionary<int, IReadOnlyList<WordClusterSnapshot>> _clustersByPage = new();
+
+    private WordClusterSnapshot? _selectedWord;
+    private int _selectedWordPage = -1;
 
     /// <summary>
-    /// The piece of the document's own text that is selected, or null.
+    /// The page's own text as WORDS, read once and cached until the page
+    /// changes.
     ///
-    /// Read-only in every sense: there is nothing yet that changes it, and the
-    /// object itself is a snapshot out of the model.
+    /// Words, not text objects, because a producer decides for itself where one
+    /// object ends: measured on real files, Chromium emits ONE OBJECT PER GLYPH,
+    /// 565 of them for four short paragraphs, while others emit one per run.
+    /// Nothing above this line should have to know which kind of file it has.
     /// </summary>
-    public PageTextObject? SelectedPageText
+    private IReadOnlyList<WordClusterSnapshot> ClustersFor(int pageIndex)
     {
-        get => _selectedPageText;
+        if (_documentHandle == 0) { return Array.Empty<WordClusterSnapshot>(); }
+
+        if (!_clustersByPage.TryGetValue(pageIndex, out var found))
+        {
+            found = Interop.WordClusterGateway.Load(_documentHandle, pageIndex);
+            _clustersByPage[pageIndex] = found;
+        }
+
+        return found;
+    }
+
+    /// <summary>The word of the document's own text that is selected, or null.</summary>
+    public WordClusterSnapshot? SelectedWord
+    {
+        get => _selectedWord;
         private set
         {
-            if (ReferenceEquals(_selectedPageText, value)) { return; }
+            if (ReferenceEquals(_selectedWord, value)) { return; }
 
-            _selectedPageText = value;
-            OnPropertyChanged(nameof(SelectedPageText));
-            OnPropertyChanged(nameof(HasSelectedPageText));
-            OnPropertyChanged(nameof(SelectedPageTextDescription));
+            _selectedWord = value;
+            OnPropertyChanged(nameof(SelectedWord));
+            OnPropertyChanged(nameof(HasSelectedWord));
+            OnPropertyChanged(nameof(SelectedWordDescription));
         }
     }
 
-    public bool HasSelectedPageText => _selectedPageText is not null;
+    public bool HasSelectedWord => _selectedWord is not null;
+
+    /// <summary>The page the selected word is on, or -1.</summary>
+    public int SelectedWordPage => _selectedWordPage;
 
     /// <summary>
-    /// What the status bar says about the selected text, or empty.
+    /// What the status bar says about the selected word.
     ///
-    /// The whole of Stage 1's visible result besides the frame: it proves the
-    /// words, the font and the size came back, and it shows whether the font
-    /// travels with the document, which is what decides how far a later edit
-    /// can go.
+    /// A word that cannot be edited says so HERE, before the reader tries and
+    /// is refused. Rotated text, mixed styling and scripts whose marks arrive
+    /// out of order are all real cases measured on real documents, and being
+    /// told up front is the difference between a limitation and a bug.
     /// </summary>
-    public string SelectedPageTextDescription
+    public string SelectedWordDescription
     {
         get
         {
-            if (_selectedPageText is not { } t) { return string.Empty; }
+            if (_selectedWord is not { } w) { return string.Empty; }
 
-            string words = t.Text.Length > 40 ? t.Text[..40] + "\u2026" : t.Text;
+            string words = w.Text.Length > 40 ? w.Text[..40] + "\u2026" : w.Text;
+            string head = $"\u201c{words}\u201d  \u2022  {w.FontName} {w.FontSizePts:0.#}pt";
 
-            return $"\u201c{words}\u201d  \u2022  {t.FontName} {t.FontSizePts:0.#}pt"
-                 + (t.IsFontEmbedded ? "  \u2022  embedded" : "  \u2022  not embedded");
+            return w.CanEdit ? head : head + "  \u2022  " + w.RefusalReason;
         }
     }
 
-    /// <summary>Drops the page-text selection, if there is one.</summary>
-    public void ClearPageTextSelection() => SelectedPageText = null;
+    /// <summary>Drops the word selection, if there is one.</summary>
+    public void ClearPageTextSelection()
+    {
+        SelectedWord = null;
+        _selectedWordPage = -1;
+    }
 
     /// <summary>
-    /// Selects the document's own text under a point, if any is there.
+    /// Selects the word of the document's own text under a point, if any.
     ///
     /// ONLY REACHED WHEN NO ANNOTATION WAS HIT, which is both the safe order
     /// and the one that matches what the reader sees: annotations are painted
@@ -4574,31 +4600,117 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public bool SelectPageTextAt(int pageIndex, double normX, double normY)
     {
-        if (_documentHandle == 0)
-        {
-            return false;
-        }
+        if (_documentHandle == 0) { return false; }
 
-        var picked = ObjectHitTest.PickTopmostPageText(
-            PageModelFor(pageIndex), normX, normY, AnnotationHitTester.DefaultTolerance);
+        var picked = WordAt(pageIndex, normX, normY);
 
-        SelectedPageText = picked;
+        SelectedWord = picked;
+        _selectedWordPage = picked is null ? -1 : pageIndex;
 
         if (picked is not null)
         {
             Diag.Log(
-                $"SelectPageTextAt p{pageIndex} obj#{picked.ObjectIndex} "
+                $"SelectPageTextAt p{pageIndex} objs=[{string.Join(",", picked.ObjectIndices)}] "
                 + $"font={picked.FontName} {picked.FontSizePts:0.#}pt "
-                + $"embedded={picked.IsFontEmbedded} text={picked.Text}");
+                + $"refusal={picked.Refusal} text={picked.Text}");
 
-            // THE VISIBLE HALF OF STAGE 1 besides the frame. It says the words,
-            // the font and the size came back off a real object, and whether
-            // that font travels with the document, which is what decides how
-            // far a later edit can go.
-            Status = SelectedPageTextDescription;
+            Status = SelectedWordDescription;
         }
 
         return picked is not null;
+    }
+
+    /// <summary>
+    /// The word under a point, or null.
+    ///
+    /// Searched BACKWARDS so the last word painted wins where two overlap, the
+    /// same rule the annotation pick uses. A small tolerance is added because a
+    /// word's tight bounds hug its glyphs, and clicking just under a letter's
+    /// baseline is still clicking the word.
+    /// </summary>
+    private WordClusterSnapshot? WordAt(int pageIndex, double normX, double normY)
+    {
+        const double Tolerance = 0.004;
+
+        var words = ClustersFor(pageIndex);
+        for (int i = words.Count - 1; i >= 0; i--)
+        {
+            var w = words[i];
+            if (normX >= w.Left - Tolerance && normX <= w.Right + Tolerance
+                && normY >= w.Top - Tolerance && normY <= w.Bottom + Tolerance)
+            {
+                return w;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Rewrites the selected word, as ONE undoable action.
+    ///
+    /// The core does the deciding: it re-derives the page's words, refuses if
+    /// the selection no longer describes one, writes through the word's own
+    /// font where that font can spell the replacement and through a stand-in
+    /// where it cannot, reads back what the page now says, and puts the original
+    /// text back if it does not match. Nothing here second-guesses any of that;
+    /// this turns one answer into one history entry and one message.
+    /// </summary>
+    public bool EditSelectedWord(string newText)
+    {
+        if (_documentHandle == 0 || _selectedWord is not { } word) { return false; }
+        if (_selectedWordPage < 0) { return false; }
+
+        newText = newText.Trim();
+        if (newText.Length == 0)
+        {
+            Status = "A word cannot be made empty. Delete is a different edit.";
+            return false;
+        }
+        if (newText == word.Text) { return false; }
+
+        if (!word.CanEdit)
+        {
+            Status = word.RefusalReason;
+            return false;
+        }
+
+        int page = _selectedWordPage;
+
+        // ONE ENTRY, opened before the write and closed after it, so undo puts
+        // the word back in a single step rather than unpicking whatever the core
+        // did internally.
+        BeginEdit("Edit text");
+        RecordEdit(new WordTextRecord(page, word.ObjectIndices, word.Text, newText));
+
+        int status = Interop.WordClusterGateway.Write(_documentHandle, page, word, newText);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            // The core leaves the page as it found it when it refuses, so the
+            // entry is abandoned rather than committed: there is nothing to undo.
+            AbandonEdit();
+
+            Status = status == RenderStatus.Unsupported
+                ? SystemFontMatch.PathFor(word.FontName) is null
+                    ? $"\u201c{word.FontName}\u201d is not a font this app can match, so the word cannot be retyped."
+                    : "This word cannot be rewritten with the letters it needs."
+                : "That word no longer matches the page. Select it again.";
+
+            Diag.Log($"EditSelectedWord refused status={status} font={word.FontName}");
+            return false;
+        }
+
+        CommitEdit();
+
+        InvalidateLoadedPage(page);
+        ClearPageTextSelection();
+        RefreshSelectionOutline();
+        RenderCurrentPage();
+        IsDirty = true;
+
+        Status = $"Changed \u201c{word.Text}\u201d to \u201c{newText}\u201d.";
+        return true;
     }
 
     /// <summary>
@@ -8387,6 +8499,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // runs on the next refresh, which every edit already triggers.
         _gradientOverlayByPage.Remove(pageIndex);
 
+        // The page's words go too. They are read straight from the content
+        // stream rather than from the annotation cache, but an edit invalidates
+        // both, and a stale word carries object indices that no longer describe
+        // it. The core re-derives and refuses in that case, so this is about
+        // showing the reader the truth rather than about safety.
+        _clustersByPage.Remove(pageIndex);
+
         // The model is a projection of the annotation cache, so it is dropped
         // with it and can never be staler than the data everything else already
         // trusts. Giving it a lifetime of its own is how a second source of
@@ -10538,6 +10657,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     touched.Add(o.Page);
                     break;
 
+                case WordTextRecord w:
+                    ApplyWordText(w, backwards);
+                    touched.Add(w.Page);
+                    break;
+
                 case GroupsRecord g:
                     _groups.Clear();
                     foreach (var members in backwards ? g.Before : g.After)
@@ -10555,6 +10679,50 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshAnnotationsForCurrentPage();
         RenderCurrentPage();
         NotifyHistoryChanged();
+    }
+
+    /// <summary>
+    /// Puts one word back to what it said, in either direction.
+    ///
+    /// ⚠️ VERIFIES BEFORE IT WRITES. Every other record here is keyed by a Guid
+    /// that identifies its annotation wherever it has moved to; a word has no
+    /// such identity and is keyed by where it sits in the page's content. So the
+    /// page is asked what those objects say now, and the record is applied only
+    /// if it says what this record expects to find. If the page has moved on,
+    /// the step is refused rather than overwriting text it was never about.
+    ///
+    /// The write goes through the same core call the edit used, so undo cannot
+    /// take a path the edit did not: if the original text needed a stand-in font
+    /// to be written, restoring it needs the same one.
+    /// </summary>
+    private void ApplyWordText(WordTextRecord record, bool backwards)
+    {
+        string expected = backwards ? record.After : record.Before;
+        string wanted = backwards ? record.Before : record.After;
+
+        _clustersByPage.Remove(record.Page);
+
+        var word = ClustersFor(record.Page)
+            .FirstOrDefault(c => c.ObjectIndices.SequenceEqual(record.Objects));
+
+        if (word is null || word.Text.Trim() != expected.Trim())
+        {
+            Diag.Log(
+                $"undo word: page {record.Page} objects [{string.Join(",", record.Objects)}] "
+                + $"expected {expected.Trim()} but found {(word is null ? "no word" : word.Text.Trim())}, refusing");
+            Status = "That text has changed since, so this step could not be undone.";
+            return;
+        }
+
+        int status = Interop.WordClusterGateway.Write(_documentHandle, record.Page, word, wanted);
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"undo word: the core refused with {status}");
+            Status = "That text could not be put back.";
+            return;
+        }
+
+        _clustersByPage.Remove(record.Page);
     }
 
     /// <summary>Puts one annotation back to a rectangle, by Id, through the

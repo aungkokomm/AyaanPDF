@@ -7143,15 +7143,157 @@ public sealed partial class MainPage : Page
         double nx = content.X / ViewModel.OverlayScale;
         double ny = content.Y / ViewModel.OverlayScale;
 
-        if (ViewModel.HitLoadedTextBox(content.Page, nx, ny) is not ViewportViewModel.TextBoxEditTarget target)
+        if (ViewModel.HitLoadedTextBox(content.Page, nx, ny) is ViewportViewModel.TextBoxEditTarget target)
         {
+            if (OpenTextBoxEditor(target))
+            {
+                e.Handled = true;
+            }
             return;
         }
 
-        if (OpenTextBoxEditor(target))
+        // Nothing of OURS under the pointer, so try the document's own words.
+        // This order is the safe one and the one the reader expects: our marks
+        // are painted over the finished page, so anything of ours here is on top
+        // of the words and is what the double-click meant.
+        if (ViewModel.SelectPageTextAt(content.Page, nx, ny)
+            && OpenWordEditor(content.Page))
         {
             e.Handled = true;
         }
+    }
+
+    // ---------------- Editing one of the document's own words ----------------
+
+    /// <summary>The editor over a word of the document's own text, if one is
+    /// open. Separate from <c>_textEditor</c> on purpose: that one belongs to
+    /// the Add Text pipeline, with its fonts, alignment and commit path, and
+    /// none of that applies to retyping a word that is already on the page.</summary>
+    private TextBox? _wordEditor;
+    private WordClusterSnapshot? _wordBeingEdited;
+    private int _wordEditorPage = -1;
+
+    /// <summary>
+    /// Opens a one-line editor over the selected word.
+    ///
+    /// Refuses up front for a word the core will not rewrite, because being
+    /// told before typing is the difference between a limitation and a bug. The
+    /// reasons are real and measured: rotated text, a word set in two fonts, and
+    /// scripts whose marks arrive out of reading order.
+    /// </summary>
+    private bool OpenWordEditor(int page)
+    {
+        if (ViewModel.SelectedWord is not WordClusterSnapshot word) { return false; }
+
+        if (!word.CanEdit)
+        {
+            ViewModel.Status = word.RefusalReason;
+            return false;
+        }
+
+        CommitTextEdit();
+        CancelWordEdit();
+        ResetPointerInteraction();
+
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(page);
+        double widthDip = (word.Right - word.Left) * scale;
+        double heightDip = (word.Bottom - word.Top) * scale;
+
+        _wordBeingEdited = word;
+        _wordEditorPage = page;
+
+        _wordEditor = new TextBox
+        {
+            // ONE LINE. A word is being retyped, not composed; Enter means
+            // "done" here rather than "new paragraph".
+            AcceptsReturn = false,
+            TextWrapping = TextWrapping.NoWrap,
+            Width = System.Math.Max(48, widthDip + (12 * scale / 4)),
+            MinHeight = System.Math.Max(20, heightDip * 1.5),
+            Padding = new Thickness(2, 0, 2, 0),
+            BorderThickness = new Thickness(1.5),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2D, 0x6F, 0xC4)),
+            CornerRadius = new CornerRadius(2),
+            Background = new SolidColorBrush(Colors.White),
+            FontSize = System.Math.Max(8, word.FontSizePts * scale * 0.75),
+            Text = word.Text,
+        };
+
+        // Sat a little above and left of the word so its frame does not hide the
+        // baseline the reader is matching against.
+        Canvas.SetLeft(_wordEditor, (word.Left * scale) - 2);
+        Canvas.SetTop(_wordEditor, (word.Top * scale) + pageTop - 2);
+        EditCanvas.Children.Add(_wordEditor);
+
+        _wordEditor.KeyDown += WordEditor_KeyDown;
+        _wordEditor.LostFocus += WordEditor_LostFocus;
+
+        _wordEditor.Focus(FocusState.Programmatic);
+        _wordEditor.SelectAll();
+        return true;
+    }
+
+    /// <summary>Enter commits, Escape abandons. Nothing else is special.</summary>
+    private void WordEditor_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.Enter)
+        {
+            e.Handled = true;
+            CommitWordEdit();
+        }
+        else if (e.Key == Windows.System.VirtualKey.Escape)
+        {
+            e.Handled = true;
+            CancelWordEdit();
+        }
+    }
+
+    /// <summary>Clicking away commits, the way every in-place rename does.</summary>
+    private void WordEditor_LostFocus(object sender, RoutedEventArgs e) => CommitWordEdit();
+
+    /// <summary>
+    /// Sends the typed word to the core, then closes the editor either way.
+    ///
+    /// The editor closes even when the core refuses, because it has already put
+    /// the page back as it found it and said why: leaving a box open over
+    /// unchanged text would suggest the edit was still pending.
+    /// </summary>
+    private void CommitWordEdit()
+    {
+        if (_wordEditor is not TextBox editor) { return; }
+
+        string typed = editor.Text;
+        var word = _wordBeingEdited;
+
+        TearDownWordEditor();
+
+        if (word is null || typed.Trim() == word.Text.Trim()) { return; }
+
+        ViewModel.EditSelectedWord(typed);
+    }
+
+    /// <summary>Closes the editor and changes nothing.</summary>
+    private void CancelWordEdit()
+    {
+        if (_wordEditor is null) { return; }
+        TearDownWordEditor();
+    }
+
+    private void TearDownWordEditor()
+    {
+        if (_wordEditor is not TextBox editor) { return; }
+
+        // Unhooked BEFORE removal: removing a focused TextBox raises LostFocus,
+        // which would re-enter the commit that is already running.
+        editor.KeyDown -= WordEditor_KeyDown;
+        editor.LostFocus -= WordEditor_LostFocus;
+
+        _wordEditor = null;
+        _wordBeingEdited = null;
+        _wordEditorPage = -1;
+
+        EditCanvas.Children.Remove(editor);
     }
 
     /// <summary>

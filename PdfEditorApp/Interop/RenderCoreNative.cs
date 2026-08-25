@@ -502,6 +502,52 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_page_text_objects(ulong docHandle, int pageIndex);
 
     /// <summary>
+    /// Every WORD on a page, with the objects that draw it.
+    ///
+    /// The unit the reader works in, and the reason it is not
+    /// <see cref="get_page_text_objects"/>: a producer decides for itself where
+    /// one text object ends. Measured on real files, Chromium emits ONE OBJECT
+    /// PER GLYPH, 565 of them for four short paragraphs, while other producers
+    /// emit one per run. Offering objects to a reader would mean offering to
+    /// edit one letter at a time on some documents and a whole paragraph at a
+    /// time on others.
+    ///
+    /// Each word carries the reason it cannot be rewritten, if it cannot, so a
+    /// word that refuses can still be selected and read and the app can say why.
+    ///
+    /// A page with no text is a successful EMPTY result, not an error.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_page_word_clusters(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// Rewrites one word, or changes nothing at all.
+    ///
+    /// <paramref name="objects"/> must be exactly the object indices the word
+    /// was read with; the core re-derives the page's words and refuses if they
+    /// no longer describe one, so a stale list cannot edit whatever happens to
+    /// sit at those indices now.
+    ///
+    /// <paramref name="fallbackFontPath"/> is used only when the word's own font
+    /// cannot spell the replacement, which for a subset font is the common case.
+    /// Pass null to refuse rather than substitute.
+    ///
+    /// Returns OkPdfium when the page now says exactly what was asked,
+    /// Unsupported when it refused and left the page as it found it, and
+    /// InvalidInput for a request that does not describe a word.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int set_word_cluster_text(
+        ulong docHandle,
+        int pageIndex,
+        uint[] objects,
+        nuint objectCount,
+        byte[] newTextUtf8,
+        nuint newTextLen,
+        byte[]? fallbackFontPathUtf8,
+        nuint fallbackFontPathLen);
+
+    /// <summary>
     /// Rewrites the searchable text layer on the given pages.
     ///
     /// Our text boxes draw their glyphs inside a stamp annotation, and a page's

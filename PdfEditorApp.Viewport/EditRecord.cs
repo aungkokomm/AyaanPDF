@@ -80,3 +80,26 @@ public sealed record GroupsRecord(
     IReadOnlyList<IReadOnlyList<Guid>> Before,
     IReadOnlyList<IReadOnlyList<Guid>> After)
     : EditRecord(Guid.Empty, -1);
+
+/// <summary>
+/// One WORD of the document's own text was rewritten.
+///
+/// ⚠️ KEYED BY OBJECT INDEX, not by Guid like every other record here, and that
+/// difference is the whole hazard. A page's own text is not an annotation and
+/// carries no identity we put there, so the only handle on it is where it sits
+/// in the page's content.
+///
+/// Content indices are not eternal. Nothing in this first version removes an
+/// object, so they do not shift underneath a normal edit, but the searchable
+/// layer written for our own text boxes does add page content, and a document
+/// can be reloaded. So <see cref="Before"/> is not only what to restore: it is
+/// what the objects must still SAY for the record to be applied at all. If the
+/// page no longer reads that way, the record refuses rather than overwriting
+/// text it was never about.
+/// </summary>
+public sealed record WordTextRecord(
+    int Page,
+    IReadOnlyList<int> Objects,
+    string Before,
+    string After)
+    : EditRecord(Guid.Empty, Page);
