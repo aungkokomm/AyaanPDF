@@ -3230,7 +3230,10 @@ public sealed partial class MainPage : Page
     /// <summary>Clicking the dimmed area outside the box finishes the edit, keeping what was typed.</summary>
     private void EditScrim_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
+        // Either kind of editor may be open on this layer, and clicking away
+        // means the same thing for both: commit and close.
         CommitTextEdit();
+        CommitWordEdit();
         e.Handled = true;
     }
 
@@ -7195,6 +7198,11 @@ public sealed partial class MainPage : Page
         CancelWordEdit();
         ResetPointerInteraction();
 
+        // Reaching a word takes a click, and a click on page text starts a text
+        // selection, so without this the reader's blue highlight sits under the
+        // editor and the same word looks selected two different ways.
+        ViewModel.ClearReaderTextSelection();
+
         double scale = ViewModel.OverlayScale;
         double pageTop = ViewModel.SlotTopOf(page);
         double widthDip = (word.Right - word.Left) * scale;
@@ -7225,6 +7233,11 @@ public sealed partial class MainPage : Page
         Canvas.SetLeft(_wordEditor, (word.Left * scale) - 2);
         Canvas.SetTop(_wordEditor, (word.Top * scale) + pageTop - 2);
         EditCanvas.Children.Add(_wordEditor);
+
+        // THE LAYER HAS TO BE SHOWN. EditOverlay is Collapsed until an edit
+        // begins, so an editor added to it without this is built, focused and
+        // typed into entirely invisibly. Same call BeginTextEdit makes.
+        EditOverlay.Visibility = Visibility.Visible;
 
         _wordEditor.KeyDown += WordEditor_KeyDown;
         _wordEditor.LostFocus += WordEditor_LostFocus;
@@ -7294,6 +7307,13 @@ public sealed partial class MainPage : Page
         _wordEditorPage = -1;
 
         EditCanvas.Children.Remove(editor);
+
+        // Only if nothing else is being edited: the text-box editor shares this
+        // layer, and hiding it from under one would take the other with it.
+        if (_textEditor is null)
+        {
+            EditOverlay.Visibility = Visibility.Collapsed;
+        }
     }
 
     /// <summary>

@@ -195,6 +195,59 @@ public class WordEditWiringTests
             code, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void opening_the_editor_shows_the_layer_it_is_built_on()
+    {
+        // ⚠️ THE DEFECT THIS EXISTS FOR. EditOverlay is Collapsed in the XAML
+        // until an edit begins. An editor added to it without showing it is
+        // built, focused and typed into entirely invisibly: every unit test
+        // passes, the core does the right thing, and the reader sees nothing
+        // happen when they double-click.
+        string code = Page();
+
+        int open = code.IndexOf("private bool OpenWordEditor(", StringComparison.Ordinal);
+        int next = code.IndexOf("/// <summary>", open, StringComparison.Ordinal);
+        string body = code[open..next];
+
+        Assert.Contains("EditOverlay.Visibility = Visibility.Visible",
+            body, StringComparison.Ordinal);
+
+        int add = body.IndexOf("EditCanvas.Children.Add", StringComparison.Ordinal);
+        int show = body.IndexOf("EditOverlay.Visibility", StringComparison.Ordinal);
+        Assert.True(add > 0 && show > add, "the layer is shown before the editor exists");
+    }
+
+    [Fact]
+    public void closing_the_editor_hides_the_layer_but_not_from_under_the_other_one()
+    {
+        // The scrim dims the whole page, so leaving the layer up would grey the
+        // document for the rest of the session. The text-box editor shares this
+        // layer, though, so hiding it unconditionally would close that one too.
+        string code = Page();
+
+        int tear = code.IndexOf("private void TearDownWordEditor()", StringComparison.Ordinal);
+        string body = code[tear..(tear + 1200)];
+
+        Assert.Contains("_textEditor is null", body, StringComparison.Ordinal);
+        Assert.Contains("EditOverlay.Visibility = Visibility.Collapsed",
+            body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void clicking_away_commits_either_kind_of_editor()
+    {
+        // Both live on the same dimmed layer, and clicking off the box means
+        // the same thing for both.
+        string code = Page();
+
+        int scrim = code.IndexOf(
+            "private void EditScrim_PointerPressed(", StringComparison.Ordinal);
+        string body = code[scrim..(scrim + 600)];
+
+        Assert.Contains("CommitTextEdit();", body, StringComparison.Ordinal);
+        Assert.Contains("CommitWordEdit();", body, StringComparison.Ordinal);
+    }
+
     private static int Count(string haystack, string needle)
     {
         int n = 0, at = 0;

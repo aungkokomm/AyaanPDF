@@ -9490,6 +9490,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// Drops the reader's own text highlight.
+    ///
+    /// Called when the word editor opens: reaching a word takes a click, which
+    /// starts a text selection, and leaving that blue behind under the editor
+    /// would show two different kinds of "selected" over the same word.
+    /// </summary>
+    public void ClearReaderTextSelection() => ClearSelection();
+
     private void ClearSelection()
     {
         _selection = null;
