@@ -230,39 +230,89 @@ fn set_radio(
     Ok(())
 }
 
-/// The export value of one `/Opt` entry.
+/// The export value of one `/Opt` entry, AS THE STRING OBJECT IT ALREADY IS.
 ///
-/// Two forms are legal and both appear in the wild: a bare string, where the
+/// Two shapes are legal and both appear in the wild: a bare string, where the
 /// export value and the label are the same, and a two-element array
 /// `[export display]`, where they differ. Writing the display text as the value
 /// is the mistake that makes a form submit "United Kingdom" where the server
 /// expects "UK".
-fn export_value(entry: &Object) -> Option<String> {
-    match entry {
-        Object::Array(pair) => pair
-            .first()
-            .and_then(|o| o.as_str().ok())
-            .map(|b| String::from_utf8_lossy(b).into_owned()),
-        _ => entry
-            .as_str()
-            .ok()
-            .map(|b| String::from_utf8_lossy(b).into_owned()),
+///
+/// ⚠️ THE OBJECT IS COPIED, NOT RE-ENCODED, and that is the whole fix for the
+/// real-world failure. A PDF text string can be PDFDocEncoded or UTF-16BE with
+/// a byte order mark, and any producer writes the second one the moment a form
+/// is authored outside plain ASCII. Decoding to a Rust `String` and writing that
+/// back turned `FE FF 00 57 ...` ("Woman") into
+/// `EF BF BD EF BF BD 00 57 ...`: the BOM became two replacement characters,
+/// the string stopped being valid UTF-16, PDFium matched no option, and the
+/// field was silently BLANKED while the write reported success.
+///
+/// Handing back the very bytes and the very string format that are already in
+/// `/Opt` cannot get the encoding wrong, because it never has an opinion about
+/// it. Anything that is not a string is refused rather than guessed at.
+fn export_object(entry: &Object) -> Option<Object> {
+    let candidate = match entry {
+        Object::Array(pair) => pair.first()?,
+        other => other,
+    };
+
+    match candidate {
+        Object::String(bytes, format) => Some(Object::String(bytes.clone(), *format)),
+        _ => None,
     }
 }
 
+/// A PDF text string as text, for reporting and for tests.
+///
+/// Two encodings, told apart the way the specification says: a leading
+/// `FE FF` means UTF-16BE, anything else is PDFDocEncoded, which agrees with
+/// Latin-1 across everything a form field is likely to hold.
+///
+/// Reading only. Nothing writes through this, so a lossy corner cannot reach
+/// the document.
+pub fn decode_pdf_string(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Choice-field flag bit 22 (1-based): more than one option may be selected.
+const FF_MULTISELECT: i64 = 1 << 21;
+
 fn set_choice(doc: &mut Document, field_id: ObjectId, index: i32) -> Result<(), i32> {
     let wanted = usize::try_from(index).map_err(|_| STATUS_INVALID_INPUT)?;
+
+    // ⚠️ REFUSED, not quietly narrowed. A multi-select list holds a LIST of
+    // values, and writing one over it would throw away every other selection
+    // the reader had made. Single selection is what this milestone supports, so
+    // the honest answer is to decline rather than to lose their work.
+    let flags = doc
+        .get_dictionary(field_id)
+        .ok()
+        .and_then(|d| d.get(b"Ff").and_then(|o| o.as_i64()).ok())
+        .unwrap_or(0);
+    if flags & FF_MULTISELECT != 0 {
+        return Err(STATUS_UNSUPPORTED);
+    }
 
     let value = doc
         .get_dictionary(field_id)
         .ok()
         .and_then(|d| d.get(b"Opt").and_then(|o| o.as_array()).ok())
         .and_then(|opts| opts.get(wanted))
-        .and_then(export_value)
+        .and_then(export_object)
         .ok_or(STATUS_INVALID_INPUT)?;
 
     if let Ok(dict) = doc.get_dictionary_mut(field_id) {
-        dict.set("V", Object::string_literal(value.as_str()));
+        // The option's own string object, byte for byte, so whatever encoding
+        // the document was written in is the encoding it keeps.
+        dict.set("V", value);
         // The selected INDEX as well as the value. A reader uses /I to know
         // which row to highlight, and two options can share a display label.
         dict.set("I", Object::Array(vec![Object::Integer(wanted as i64)]));
@@ -319,8 +369,9 @@ pub fn read_state(bytes: &[u8], field_name: &str) -> Option<(String, Vec<String>
     let dict = doc.get_dictionary(field_id).ok()?;
 
     let value = match dict.get(b"V") {
+        // A name is never text: it is an identifier, always ASCII here.
         Ok(Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
-        Ok(Object::String(s, _)) => String::from_utf8_lossy(s).into_owned(),
+        Ok(Object::String(s, _)) => decode_pdf_string(s),
         _ => String::new(),
     };
 

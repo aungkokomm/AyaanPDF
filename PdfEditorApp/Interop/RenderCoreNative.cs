@@ -134,6 +134,7 @@ internal static class AnnotSubtype
     public const int Strikeout = 8;
     public const int Squiggly = 9;
     public const int Link = 10;
+    public const int Widget = 11;
 }
 
 /// <summary>

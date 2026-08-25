@@ -62,6 +62,14 @@ public static class ObjectHitTest
             // link path, which knows what one is and offers following it.
             if (objects[i].Kind == DocumentObjectKind.Link) { continue; }
 
+            // A FORM FIELD, for the same reason and after the same failure. It
+            // belongs to the document's form, and a click on one is a request to
+            // OPERATE it: tick it, pick it, choose from it, type in it. Handing
+            // it back here made a real form's fields into anonymous boxes that
+            // were dragged and resized instead. Fields are picked by the form
+            // path, which knows what kind of control each one is.
+            if (objects[i].Kind == DocumentObjectKind.FormField) { continue; }
+
             if (Hit(objects[i], x, y, tolerance)) { return objects[i]; }
         }
 

@@ -44,6 +44,7 @@ public readonly record struct FormField(
     bool ReadOnly,
     bool Checked,
     int GroupIndex,
+    bool MultiSelect,
     double Left,
     double Top,
     double Right,
@@ -59,8 +60,13 @@ public readonly record struct FormField(
     /// Signature fields are read-only by decision, not by limitation, and
     /// pushbuttons do nothing to fill. Anything the core could not classify is
     /// left alone rather than guessed at.
+    ///
+    /// ⚠️ A MULTI-SELECT list is excluded, and the core refuses one too. It
+    /// holds a LIST of values, and writing a single one over it would discard
+    /// every other selection the reader had made. Offering a picker that the
+    /// write then declines would be worse than not offering it.
     /// </summary>
-    public bool IsFillable => !ReadOnly && Kind is FormFieldKind.Text
+    public bool IsFillable => !ReadOnly && !MultiSelect && Kind is FormFieldKind.Text
         or FormFieldKind.Checkbox or FormFieldKind.Radio
         or FormFieldKind.Combo or FormFieldKind.ListBox;
 
@@ -90,6 +96,7 @@ public static class FormFieldReader
 {
     private const int FlagReadOnly = 1;
     private const int FlagChecked = 2;
+    private const int FlagMultiSelect = 4;
 
     /// <summary>
     /// Parses the whole buffer into fields. Throws nothing on a well-formed,
@@ -139,6 +146,7 @@ public static class FormFieldReader
                 (flags & FlagReadOnly) != 0,
                 (flags & FlagChecked) != 0,
                 groupIndex,
+                (flags & FlagMultiSelect) != 0,
                 left, top, right, bottom,
                 name, value, options));
         }

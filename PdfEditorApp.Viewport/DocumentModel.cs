@@ -25,6 +25,7 @@ public static class PdfAnnotationSubtype
     public const int Strikeout = 8;
     public const int Squiggly = 9;
     public const int Link = 10;
+    public const int Widget = 11;
 }
 
 /// <summary>What an object in the model is.</summary>
@@ -66,6 +67,22 @@ public enum DocumentObjectKind
     /// and the annotation snapshot has no room for it.
     /// </summary>
     Link,
+
+    /// <summary>
+    /// An interactive form field's control: a text box, a checkbox, a radio
+    /// button, a combo box, a list box, a signature or a pushbutton.
+    ///
+    /// Named for the same reason <see cref="Link"/> is, and after the same
+    /// failure. Left in <see cref="Unknown"/>, a widget was an anonymous
+    /// rectangle the object pick returned, so a click on a form field with the
+    /// Select tool picked it up: on a real form, six clicks each MOVED OR
+    /// RESIZED a field instead of operating it.
+    ///
+    /// What kind of control it is, what it holds and what it offers are not
+    /// here. Fields are read separately, by <see cref="FormFieldReader"/>,
+    /// because none of that is geometry.
+    /// </summary>
+    FormField,
 
     /// <summary>
     /// A piece of the document's own text, out of the page's CONTENT stream

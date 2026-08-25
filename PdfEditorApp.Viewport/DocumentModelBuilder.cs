@@ -324,6 +324,7 @@ public static class DocumentModelBuilder
             PdfAnnotationSubtype.Ink => DocumentObjectKind.Ink,
             PdfAnnotationSubtype.Highlight => DocumentObjectKind.Highlight,
             PdfAnnotationSubtype.Link => DocumentObjectKind.Link,
+            PdfAnnotationSubtype.Widget => DocumentObjectKind.FormField,
             _ => DocumentObjectKind.Unknown,
         };
     }

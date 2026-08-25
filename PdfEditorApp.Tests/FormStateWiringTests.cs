@@ -95,12 +95,20 @@ public class FormStateWiringTests
         // /Opt is legal in two forms, and the pair form is where the display
         // label and the stored value differ. Writing the label is the mistake
         // that makes a form submit the wrong thing with nothing on screen wrong.
-        string body = RustBody(Core(), "fn export_value(entry: &Object)");
+        //
+        // ⚠️ And the value is COPIED, not decoded and re-encoded. A real form
+        // writes its strings as UTF-16BE with a byte order mark, and rebuilding
+        // one turned the BOM into replacement characters and silently blanked
+        // the field. Handing back the string object that is already there cannot
+        // get the encoding wrong, because it never has an opinion about it.
+        string body = RustBody(Core(), "fn export_object(entry: &Object)");
         Assert.Contains("Object::Array(pair)", body, StringComparison.Ordinal);
         Assert.Contains(".first()", body, StringComparison.Ordinal);
+        Assert.Contains("Object::String(bytes.clone(), *format)", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("from_utf8", body, StringComparison.Ordinal);
 
         string choice = RustBody(Core(), "fn set_choice(");
-        Assert.Contains("dict.set(\"V\"", choice, StringComparison.Ordinal);
+        Assert.Contains("dict.set(\"V\", value)", choice, StringComparison.Ordinal);
         Assert.Contains("dict.set(\"I\"", choice, StringComparison.Ordinal);
     }
 
@@ -117,6 +125,17 @@ public class FormStateWiringTests
         Assert.DoesNotContain("need_appearances", checkbox, StringComparison.Ordinal);
         Assert.DoesNotContain("need_appearances", radio, StringComparison.Ordinal);
         Assert.Contains("need_appearances(doc)", choice, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_multi_select_choice_field_is_refused_by_the_core()
+    {
+        // It holds a LIST of values. Writing one over it would discard every
+        // other selection the reader had made.
+        string body = RustBody(Core(), "fn set_choice(");
+
+        Assert.Contains("FF_MULTISELECT", body, StringComparison.Ordinal);
+        Assert.Contains("STATUS_UNSUPPORTED", body, StringComparison.Ordinal);
     }
 
     [Fact]

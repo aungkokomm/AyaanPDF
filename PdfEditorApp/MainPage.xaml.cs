@@ -7682,9 +7682,9 @@ public sealed partial class MainPage : Page
             var fc = ContentPoint(e);
             double fnx = fc.X / ViewModel.OverlayScale;
             double fny = fc.Y / ViewModel.OverlayScale;
-            if (ViewModel.FillableFieldAt(fc.Page, fnx, fny) is { } field)
+            if (ViewModel.FillableFieldAt(fc.Page, fnx, fny) is { } filling)
             {
-                HandleFormFieldClick(field, e.GetCurrentPoint(ViewportHost).Position);
+                HandleFormFieldClick(filling, e.GetCurrentPoint(ViewportHost).Position);
                 e.Handled = true;
                 return;
             }
@@ -7786,6 +7786,24 @@ public sealed partial class MainPage : Page
                     // because "I clicked the link and nothing happened" and
                     // "Show Links is off" look identical from outside.
                     Diag.Log($"link press p{content.Page} IGNORED, Show Links is off");
+                }
+
+                // A FORM FIELD is operated, not selected.
+                //
+                // ⚠️ NOT behind Fill mode, and that is the point. A form in a
+                // document is something a reader expects to just work: nobody
+                // opens a PDF, finds a tick box and goes looking for a mode
+                // first. Measured on a real form, where every click landed in
+                // the object path instead and MOVED or RESIZED the field.
+                //
+                // Before the object pick, because a widget is an annotation and
+                // would otherwise be picked up as one. Fill mode remains, and
+                // still draws the outlines that say which fields are there.
+                if (ViewModel.FillableFieldAt(content.Page, nx, ny) is { } field)
+                {
+                    HandleFormFieldClick(field, current.Position);
+                    e.Handled = true;
+                    break;
                 }
 
                 // A click on an existing mark picks it up; a click on empty

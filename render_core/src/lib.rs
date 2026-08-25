@@ -7103,7 +7103,8 @@ fn fill_text_field_inner(doc_handle: u64, field_name: *const c_char, value: *con
 //   repeated `count` times:
 //     i32  page_index
 //     i32  kind          (FIELD_* below)
-//     i32  flags         (bit0 = read-only, bit1 = checked)
+//     i32  flags         (bit0 = read-only, bit1 = checked,
+//                         bit2 = multi-select, for a choice field)
 //     i32  group_index   (a radio/checkbox widget's unique index within its
 //                         control group; 0 for everything else — this is how a
 //                         specific radio button is addressed, since the export
@@ -7135,6 +7136,11 @@ pub const FIELD_SIGNATURE: i32 = 7;
 
 const FIELD_FLAG_READONLY: i32 = 1;
 const FIELD_FLAG_CHECKED: i32 = 2;
+
+/// More than one option may be selected. Reported so the app can decline to
+/// offer a picker for a field the writer will refuse: a single value written
+/// over a multi-select list would discard every other selection in it.
+const FIELD_FLAG_MULTISELECT: i32 = 4;
 
 /// Every form-field widget in the document, serialized as described above.
 /// A document with no AcroForm is a successful EMPTY result (count 0), not an
@@ -7274,6 +7280,7 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
             // Determine control kind, current value string, checked state, and
             // (for grouped controls) the widget's unique index within its group.
             let mut options: Vec<(String, bool)> = Vec::new();
+            let mut multiselect = false;
             let (kind, value, checked, group_index) = if let Some(t) = field.as_text_field() {
                 (FIELD_TEXT, t.value().unwrap_or_default(), false, 0i32)
             } else if let Some(c) = field.as_checkbox_field() {
@@ -7296,9 +7303,11 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
                 )
             } else if let Some(cb) = field.as_combo_box_field() {
                 options = choice_options(cb.options());
+                multiselect = cb.is_multiselect();
                 (FIELD_COMBO, cb.value().unwrap_or_default(), false, 0)
             } else if let Some(lb) = field.as_list_box_field() {
                 options = choice_options(lb.options());
+                multiselect = lb.is_multiselect();
                 (FIELD_LISTBOX, lb.value().unwrap_or_default(), false, 0)
             } else if field.as_signature_field().is_some() {
                 (FIELD_SIGNATURE, String::new(), false, 0)
@@ -7322,6 +7331,9 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
             }
             if checked {
                 flags |= FIELD_FLAG_CHECKED;
+            }
+            if multiselect {
+                flags |= FIELD_FLAG_MULTISELECT;
             }
 
             let name = field.name().unwrap_or_default();
@@ -7702,6 +7714,15 @@ pub const ANNOT_SQUIGGLY: i32 = 9;
 /// selectable and movable as an anonymous box.
 pub const ANNOT_LINK: i32 = 10;
 
+/// An interactive form field's control.
+///
+/// Reported so the app can tell one apart from an annotation it does not
+/// recognise. Left as "other", a widget was an anonymous rectangle that the
+/// object pick handed back, so clicking a form field with the Select tool MOVED
+/// AND RESIZED it: measured on a real form, where six presses each dragged a
+/// field instead of operating it.
+pub const ANNOT_WIDGET: i32 = 11;
+
 #[repr(C)]
 pub struct AnnotationInfo {
     /// Position in the page's annotation list. This is the handle passed back
@@ -7798,6 +7819,7 @@ fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
             PdfPageAnnotationType::Strikeout => ANNOT_STRIKEOUT,
             PdfPageAnnotationType::Squiggly => ANNOT_SQUIGGLY,
             PdfPageAnnotationType::Link => ANNOT_LINK,
+            PdfPageAnnotationType::Widget => ANNOT_WIDGET,
             _ => ANNOT_OTHER,
         };
 
@@ -10609,8 +10631,9 @@ mod tests {
     // ---- the real world, reduced ----
     //
     // ⚠️ THESE THREE ARE THE REPRODUCTION of the failure a real form showed and
-    // both synthetic fixtures missed. They are #[ignore]d, and un-ignoring them
-    // is the acceptance criterion for the fix, NOT something to do before it.
+    // both synthetic fixtures missed. Both of the choice ones failed until the
+    // option's own string OBJECT started being copied instead of decoded and
+    // re-encoded; they are the acceptance criterion for that fix.
     //
     // sample_form_utf16.pdf is OoPdfFormExample_2.pdf reduced to the smallest
     // file that still fails: /Opt and /V in UTF-16BE with a byte order mark, a
@@ -10621,7 +10644,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reproduction of the real-form failure; un-ignore with the fix"]
     fn a_utf16_combo_takes_the_option_that_was_asked_for() {
         // Today: /V comes back EMPTY, because export_value reads the UTF-16
         // bytes as UTF-8, turns the BOM into two replacement characters and
@@ -10645,7 +10667,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reproduction of the real-form failure; un-ignore with the fix"]
     fn a_utf16_pair_option_stores_the_export_half_and_not_the_label() {
         // Both halves of /Opt are UTF-16 here, so the writer has to pick the
         // right one AND decode it. Writing the label would submit
@@ -10764,6 +10785,155 @@ mod tests {
 
         assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_INVALID_INPUT);
         assert_eq!(get_page_count(handle), 20, "the document was replaced anyway");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_pdf_string_is_read_in_whichever_of_its_two_encodings_it_uses() {
+        use crate::form_state::decode_pdf_string;
+
+        // PDFDocEncoded, which agrees with Latin-1 over anything a field holds.
+        assert_eq!(decode_pdf_string(b"Woman"), "Woman");
+        assert_eq!(decode_pdf_string(b""), "");
+
+        // UTF-16BE behind a byte order mark, which is what a real form used.
+        let utf16 = [0xFE, 0xFF, 0x00, b'W', 0x00, b'o', 0x00, b'm', 0x00, b'a', 0x00, b'n'];
+        assert_eq!(decode_pdf_string(&utf16), "Woman");
+
+        // Outside ASCII, both ways.
+        assert_eq!(decode_pdf_string(&[0xFE, 0xFF, 0x00, 0xE9]), "é");
+        assert_eq!(decode_pdf_string(&[0xE9]), "é");
+    }
+
+    #[test]
+    fn the_option_that_is_written_back_is_the_one_that_was_there() {
+        // ⚠️ THE FIX, stated as bytes. The value is not decoded and re-encoded,
+        // it is the option's own string object copied whole, so no encoding
+        // decision is ever taken and none can be taken wrongly.
+        use lopdf::{Document, Object};
+
+        let before = std::fs::read("tests/fixtures/sample_form_utf16.pdf").unwrap();
+        let source = Document::load_mem(&before).unwrap();
+
+        let wanted = source
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"T").and_then(|o| o.as_str()).ok() == Some(b"Gender"))
+            .and_then(|d| d.get(b"Opt").and_then(|o| o.as_array()).ok())
+            .and_then(|opts| opts.get(1))
+            .and_then(|o| o.as_str().ok())
+            .unwrap()
+            .to_vec();
+
+        assert_eq!(&wanted[..2], &[0xFE, 0xFF], "the fixture is not UTF-16 any more");
+
+        let after = crate::form_state::apply(
+            &before, "Gender", crate::form_state::KIND_COMBO, 1, true).unwrap();
+        let written = Document::load_mem(&after).unwrap();
+
+        let value = written
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"T").and_then(|o| o.as_str()).ok() == Some(b"Gender"))
+            .and_then(|d| d.get(b"V").ok())
+            .and_then(|o| match o {
+                Object::String(bytes, _) => Some(bytes.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(value, wanted, "the value is not byte for byte the option's own");
+    }
+
+    #[test]
+    fn a_multi_select_list_is_refused_rather_than_narrowed() {
+        // ⚠️ It holds a LIST of values. Writing one over it would discard every
+        // other selection the reader had made, which is worse than declining.
+        let bytes = std::fs::read("tests/fixtures/sample_form_utf16.pdf").unwrap();
+
+        // Turn the Gender combo into a multi-select list the way a form author
+        // would: clear the combo flag, set bit 22.
+        let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let id = doc
+            .objects
+            .iter()
+            .find(|(_, o)| o.as_dict()
+                .map(|d| d.get(b"T").and_then(|t| t.as_str()).ok() == Some(b"Gender"))
+                .unwrap_or(false))
+            .map(|(id, _)| *id)
+            .unwrap();
+        doc.get_dictionary_mut(id).unwrap()
+            .set("Ff", lopdf::Object::Integer(1 << 21));
+
+        let mut multi = Vec::new();
+        doc.save_to(&mut multi).unwrap();
+
+        assert_eq!(
+            crate::form_state::apply(&multi, "Gender", crate::form_state::KIND_LISTBOX, 1, true),
+            Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn a_malformed_option_is_refused_rather_than_guessed_at() {
+        // /Opt is legal as a string or as a [export display] pair. A number in
+        // there describes nothing, and inventing a value for it would write
+        // something the form never offered.
+        let bytes = std::fs::read("tests/fixtures/sample_form_utf16.pdf").unwrap();
+
+        let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let id = doc
+            .objects
+            .iter()
+            .find(|(_, o)| o.as_dict()
+                .map(|d| d.get(b"T").and_then(|t| t.as_str()).ok() == Some(b"Gender"))
+                .unwrap_or(false))
+            .map(|(id, _)| *id)
+            .unwrap();
+        doc.get_dictionary_mut(id).unwrap().set(
+            "Opt",
+            lopdf::Object::Array(vec![lopdf::Object::Integer(7), lopdf::Object::Null]));
+
+        let mut broken = Vec::new();
+        doc.save_to(&mut broken).unwrap();
+
+        assert_eq!(
+            crate::form_state::apply(&broken, "Gender", crate::form_state::KIND_COMBO, 0, true),
+            Err(STATUS_INVALID_INPUT));
+    }
+
+    #[test]
+    fn a_field_with_no_name_anywhere_cannot_be_addressed_and_is_refused() {
+        // Identity is the qualified name. A widget with no /T on itself or any
+        // ancestor has none, so nothing can safely name it.
+        let bytes = std::fs::read("tests/fixtures/sample_form_utf16.pdf").unwrap();
+
+        assert_eq!(
+            crate::form_state::apply(&bytes, "", crate::form_state::KIND_CHECKBOX, 0, true),
+            Err(STATUS_INVALID_INPUT));
+        assert_eq!(
+            crate::form_state::apply(&bytes, "Nope", crate::form_state::KIND_CHECKBOX, 0, true),
+            Err(STATUS_INVALID_INPUT));
+    }
+
+    #[test]
+    fn a_form_widget_is_reported_as_a_widget_and_not_as_something_unrecognised() {
+        // ⚠️ WHY IT MATTERS. Left as "other", a widget was an anonymous
+        // rectangle the object pick handed back, so a Select-tool click on a
+        // form field MOVED AND RESIZED it. Measured on a real form: six presses,
+        // six dragged fields, no form interaction at all.
+        let handle = open_choice_form();
+
+        let array = get_annotations(handle, 0);
+        let items = unsafe { std::slice::from_raw_parts(array.items, array.len) };
+        let subtypes: Vec<i32> = items.iter().map(|a| a.subtype).collect();
+        free_annotation_array(array);
+
+        assert!(!subtypes.is_empty());
+        assert!(subtypes.iter().all(|&s| s == ANNOT_WIDGET),
+                "a form's widgets came back as {subtypes:?}");
 
         close_document(handle);
     }
