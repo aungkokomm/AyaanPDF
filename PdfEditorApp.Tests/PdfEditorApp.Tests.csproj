@@ -54,6 +54,17 @@
       <Link>sample_20pages.pdf</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!--
+      Every field kind the Forms milestone finishes, with deliberately
+      awkward on-state names (/On, /Red, /Green, /Blue) and /Opt in the
+      [export display] pair form, so anything that assumes /Yes or writes
+      the label instead of the export value fails here.
+    -->
+    <Content Include="..\render_core\tests\fixtures\sample_form_choice.pdf"
+             Condition="Exists('..\render_core\tests\fixtures\sample_form_choice.pdf')">
+      <Link>sample_form_choice.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="..\render_core\tests\fixtures\sample_form_rich.pdf"
              Condition="Exists('..\render_core\tests\fixtures\sample_form_rich.pdf')">
       <Link>sample_form_rich.pdf</Link>

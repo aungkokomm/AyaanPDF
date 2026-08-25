@@ -1,5 +1,6 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using PdfEditorApp.Viewport;
 using Xunit;
@@ -30,7 +31,8 @@ public class FormFieldReaderTests
         }
 
         public BufferBuilder Add(int page, int kind, int flags, int groupIndex,
-            float left, float top, float right, float bottom, string name, string value)
+            float left, float top, float right, float bottom, string name, string value,
+            params (string Label, bool Selected)[] options)
         {
             AddI32(page);
             AddI32(kind);
@@ -42,6 +44,15 @@ public class FormFieldReaderTests
             AddF32(bottom);
             AddString(name);
             AddString(value);
+
+            // The choices a combo or list offers, empty for every other kind.
+            _bytes.AddRange(BitConverter.GetBytes((uint)options.Length));
+            foreach (var (label, selected) in options)
+            {
+                AddString(label);
+                _bytes.Add(selected ? (byte)1 : (byte)0);
+            }
+
             _count++;
             return this;
         }
@@ -87,22 +98,83 @@ public class FormFieldReaderTests
     }
 
     [Fact]
-    public void read_only_and_radio_and_signature_report_as_not_fillable()
+    public void read_only_and_signature_and_pushbutton_report_as_not_fillable()
     {
+        // A radio USED to be here. It is editable now, and that is the point of
+        // the Forms milestone; what stays out is a field the document itself
+        // locked, a signature (read-only by decision, not by limitation) and a
+        // pushbutton, which has nothing to fill.
         byte[] buffer = new BufferBuilder()
             .Add(0, (int)FormFieldKind.Text, 0b01 /* read-only */, 0, 0f, 0f, 1f, 0.1f, "Locked", "x")
-            .Add(0, (int)FormFieldKind.Radio, 0, 1, 0f, 0f, 0.02f, 0.02f, "Plan", "Pro")
             .Add(0, (int)FormFieldKind.Signature, 0, 0, 0f, 0f, 0.3f, 0.1f, "Sig", "")
+            .Add(0, (int)FormFieldKind.PushButton, 0, 0, 0f, 0f, 0.3f, 0.1f, "Go", "")
             .Build();
 
         var fields = FormFieldReader.Parse(buffer);
 
         Assert.True(fields[0].ReadOnly);
         Assert.False(fields[0].IsFillable);
-        Assert.Equal(FormFieldKind.Radio, fields[1].Kind);
-        Assert.Equal(1, fields[1].GroupIndex);
         Assert.False(fields[1].IsFillable);
         Assert.False(fields[2].IsFillable);
+    }
+
+    [Fact]
+    public void the_four_kinds_this_milestone_finishes_are_fillable()
+    {
+        byte[] buffer = new BufferBuilder()
+            .Add(0, (int)FormFieldKind.Checkbox, 0, 0, 0f, 0f, 0.02f, 0.02f, "Agree", "Off")
+            .Add(0, (int)FormFieldKind.Radio, 0, 1, 0f, 0f, 0.02f, 0.02f, "Colour", "Off")
+            .Add(0, (int)FormFieldKind.Combo, 0, 0, 0f, 0f, 0.3f, 0.05f, "Country", "UK")
+            .Add(0, (int)FormFieldKind.ListBox, 0, 0, 0f, 0f, 0.3f, 0.2f, "Size", "M")
+            .Build();
+
+        var fields = FormFieldReader.Parse(buffer);
+
+        Assert.All(fields, f => Assert.True(f.IsFillable, $"{f.Kind} is not fillable"));
+        Assert.True(fields[0].IsToggle);
+        Assert.True(fields[1].IsToggle);
+        Assert.Equal(1, fields[1].GroupIndex);
+        Assert.True(fields[2].IsChoice);
+        Assert.True(fields[3].IsChoice);
+    }
+
+    [Fact]
+    public void a_choice_fields_options_decode_in_order_with_the_one_selected()
+    {
+        byte[] buffer = new BufferBuilder()
+            .Add(0, (int)FormFieldKind.Combo, 0, 0, 0f, 0f, 0.3f, 0.05f, "Country", "United Kingdom",
+                 ("United States", false), ("United Kingdom", true), ("Myanmar", false))
+            .Build();
+
+        var combo = Assert.Single(FormFieldReader.Parse(buffer));
+
+        Assert.Equal(3, combo.Options.Count);
+        Assert.Equal(new[] { 0, 1, 2 }, combo.Options.Select(o => o.Index));
+        Assert.Equal("Myanmar", combo.Options[2].Label);
+        Assert.True(combo.Options[1].Selected);
+        Assert.False(combo.Options[0].Selected);
+    }
+
+    [Fact]
+    public void a_field_with_no_choices_carries_an_empty_list_rather_than_null()
+    {
+        byte[] buffer = new BufferBuilder()
+            .Add(0, (int)FormFieldKind.Checkbox, 0, 0, 0f, 0f, 0.02f, 0.02f, "Agree", "Off")
+            .Build();
+
+        Assert.Empty(Assert.Single(FormFieldReader.Parse(buffer)).Options);
+    }
+
+    [Fact]
+    public void a_buffer_truncated_inside_its_options_throws_rather_than_reading_on()
+    {
+        byte[] whole = new BufferBuilder()
+            .Add(0, (int)FormFieldKind.Combo, 0, 0, 0f, 0f, 0.3f, 0.05f, "Country", "UK",
+                 ("United States", false), ("United Kingdom", true))
+            .Build();
+
+        Assert.Throws<ArgumentException>(
+            () => FormFieldReader.Parse(whole[..(whole.Length - 3)]));
     }
 
     [Fact]

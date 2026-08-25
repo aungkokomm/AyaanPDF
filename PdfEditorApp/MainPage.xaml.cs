@@ -2879,6 +2879,77 @@ public sealed partial class MainPage : Page
         _fillingFieldName = field.Name;
     }
 
+    /// <summary>
+    /// What a click on a form field does, which is not the same for all of them.
+    ///
+    /// A TEXT field opens the editor and is filled by drawing one of our text
+    /// boxes, the path that has always been here. The other four change the
+    /// field's OWN state and leave the widget exactly where it is, so the
+    /// document still has a working form in it afterwards.
+    ///
+    /// A checkbox flips. A radio turns on, and clicking the one already selected
+    /// does nothing, which is what a radio group means. A combo or list has to
+    /// ask which option first.
+    /// </summary>
+    private void HandleFormFieldClick(PdfEditorApp.Viewport.FormField field, Point at)
+    {
+        if (field.Kind == PdfEditorApp.Viewport.FormFieldKind.Text)
+        {
+            BeginFormFieldEdit(field.PageIndex, field);
+            return;
+        }
+
+        if (field.IsToggle)
+        {
+            if (ViewModel.ToggleStateFor(field) is bool on)
+            {
+                ViewModel.SetFormFieldState(field, field.GroupIndex, on);
+            }
+            return;
+        }
+
+        if (field.IsChoice)
+        {
+            ShowFieldOptions(field, at);
+        }
+    }
+
+    /// <summary>
+    /// The list of choices for a combo box or list box, at the field.
+    ///
+    /// Labels only, because that is all the app is given: the export value the
+    /// form actually stores never crosses the FFI boundary, and what goes back
+    /// is the option's INDEX. That is what makes it impossible to write
+    /// "United Kingdom" into a field whose form expects "UK".
+    ///
+    /// Single selection. A list box that allows several is out of scope for this
+    /// milestone, and offering it here would write a state the core will not.
+    /// </summary>
+    private void ShowFieldOptions(PdfEditorApp.Viewport.FormField field, Point at)
+    {
+        if (field.Options.Count == 0)
+        {
+            ViewModel.Status = "This field offers no choices.";
+            return;
+        }
+
+        var flyout = new MenuFlyout();
+        foreach (var option in field.Options)
+        {
+            var row = new ToggleMenuFlyoutItem
+            {
+                Text = option.Label.Length > 0 ? option.Label : "(blank)",
+                IsChecked = option.Selected,
+            };
+
+            int index = option.Index;
+            row.Click += (_, _) => ViewModel.SetFormFieldState(field, index, true);
+            flyout.Items.Add(row);
+        }
+
+        flyout.ShowAt(ViewportHost, new FlyoutShowOptions { Position = at });
+    }
+
     /// <summary>The form field the open editor is filling, or null for an ordinary text box.</summary>
     private string? _fillingFieldName;
 
@@ -7613,7 +7684,7 @@ public sealed partial class MainPage : Page
             double fny = fc.Y / ViewModel.OverlayScale;
             if (ViewModel.FillableFieldAt(fc.Page, fnx, fny) is { } field)
             {
-                BeginFormFieldEdit(fc.Page, field);
+                HandleFormFieldClick(field, e.GetCurrentPoint(ViewportHost).Position);
                 e.Handled = true;
                 return;
             }

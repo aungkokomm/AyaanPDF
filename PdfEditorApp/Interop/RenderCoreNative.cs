@@ -458,6 +458,37 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_form_fields(ulong docHandle);
 
     /// <summary>
+    /// Sets a form field's state: checkbox, radio, combo box or list box.
+    ///
+    /// ⚠️ THE ONLY WAY THIS CAN BE DONE. A button's /V and a widget's /AS are
+    /// PDF NAMES, and PDFium has no call that writes a name into an annotation
+    /// dictionary; writing them as strings was measured to destroy the widget's
+    /// appearance rather than merely fail. So the core serializes the document,
+    /// rewrites it with lopdf and reopens it under the SAME handle. Every
+    /// annotation index the app holds is invalid afterwards, exactly as it is
+    /// after any other document-scope edit.
+    ///
+    /// <paramref name="fieldName"/> is the fully qualified name
+    /// <see cref="get_form_fields"/> reported. <paramref name="index"/> is the
+    /// widget's position within its group for a checkbox or radio, and the
+    /// option's position for a choice field. Neither is a page or annotation
+    /// index, so neither drifts when the document is rewritten.
+    ///
+    /// <paramref name="on"/> applies only to a checkbox.
+    ///
+    /// The field remains a real, interactive form field: nothing is deleted and
+    /// nothing is drawn over it.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_form_field_state(
+        ulong docHandle,
+        byte[] fieldNameUtf8,
+        nuint fieldNameLen,
+        int kind,
+        int index,
+        int on);
+
+    /// <summary>
     /// The document's own outline, flattened into reading order as a
     /// self-describing byte buffer (depth, page index, title per entry). Parsed
     /// by <see cref="Viewport.BookmarkReader"/>. A document without an outline

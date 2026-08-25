@@ -1,0 +1,115 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 3 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Fields [7 0 R 8 0 R 11 0 R 17 0 R 19 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 6 0 R >> >> >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] /Resources << /Font << /Helv 6 0 R >> >> /Contents 5 0 R /Annots [7 0 R 8 0 R 12 0 R 13 0 R 14 0 R 17 0 R 19 0 R] >>
+endobj
+5 0 obj
+<<  /Length 196 >>
+stream
+BT /Helv 10 Tf 40 360 Td (Notes) Tj ET
+BT /Helv 10 Tf 40 320 Td (Agree) Tj ET
+BT /Helv 10 Tf 40 280 Td (Colour) Tj ET
+BT /Helv 10 Tf 40 220 Td (Country) Tj ET
+BT /Helv 10 Tf 40 170 Td (Size) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (Notes) /V () /DA (/Helv 10 Tf 0 g) /F 4 /Rect [100 352 300 372] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Btn /T (Agree) /V /Off /AS /Off /F 4 /Rect [100 312 116 328] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> /AP << /N << /Off 9 0 R /On 10 0 R >> >> >>
+endobj
+9 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 31 >>
+stream
+0 0 0 RG 1 w 0.5 0.5 15 15 re S
+endstream
+endobj
+10 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 67 >>
+stream
+0 0 0 RG 1 w 0.5 0.5 15 15 re S 2 w 3 3 m 13 13 l S 13 3 m 3 13 l S
+endstream
+endobj
+11 0 obj
+<< /FT /Btn /Ff 32768 /T (Colour) /V /Off /Kids [12 0 R 13 0 R 14 0 R] >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Widget /Parent 11 0 R /AS /Off /F 4 /Rect [100 272 116 288] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> /AP << /N << /Off 15 0 R /Red 16 0 R >> >> >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Widget /Parent 11 0 R /AS /Off /F 4 /Rect [160 272 176 288] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> /AP << /N << /Off 15 0 R /Green 16 0 R >> >> >>
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Widget /Parent 11 0 R /AS /Off /F 4 /Rect [220 272 236 288] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> /AP << /N << /Off 15 0 R /Blue 16 0 R >> >> >>
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 36 >>
+stream
+0 0 0 RG 1 w 8 8 m 8 8 7 0 360 arc S
+endstream
+endobj
+16 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 16 16] /Length 73 >>
+stream
+0 0 0 RG 1 w 8 8 m 8 8 7 0 360 arc S 0 0 0 rg 4 8 m 8 4 l 12 8 l 8 12 l f
+endstream
+endobj
+17 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Ch /Ff 131072 /T (Country) /Opt [[(US) (United States)] [(UK) (United Kingdom)] [(MM) (Myanmar)]] /V (UK) /I [1] /DA (/Helv 10 Tf 0 g) /F 4 /Rect [100 212 260 234] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> /AP << /N 18 0 R >> >>
+endobj
+18 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 160 22] /Resources << /Font << /Helv 6 0 R >> >> /Length 70 >>
+stream
+q 1 1 158 20 re W n BT /Helv 10 Tf 0 g 3 7 Td (United Kingdom) Tj ET Q
+endstream
+endobj
+19 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Ch /Ff 0 /T (Size) /Opt [[(S) (Small)] [(M) (Medium)] [(L) (Large)]] /V (M) /I [1] /DA (/Helv 10 Tf 0 g) /F 4 /Rect [100 120 260 186] /P 4 0 R /MK << /BC [0 0 0] /BG [1 1 1] >> /AP << /N 20 0 R >> >>
+endobj
+20 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 160 66] /Resources << /Font << /Helv 6 0 R >> >> /Length 175 >>
+stream
+q 1 1 158 64 re W n BT /Helv 10 Tf 0 g 3 46 Td (Small) Tj ET 0.6 0.75 1 rg 1 23 158 22 re f BT /Helv 10 Tf 0 g 3 30 Td (Medium) Tj ET BT /Helv 10 Tf 0 g 3 8 Td (Large) Tj ET Q
+endstream
+endobj
+xref
+0 21
+0000000000 65535 f 
+0000000015 00000 n 
+0000000080 00000 n 
+0000000137 00000 n 
+0000000256 00000 n 
+0000000441 00000 n 
+0000000689 00000 n 
+0000000786 00000 n 
+0000000956 00000 n 
+0000001157 00000 n 
+0000001286 00000 n 
+0000001452 00000 n 
+0000001542 00000 n 
+0000001733 00000 n 
+0000001926 00000 n 
+0000002118 00000 n 
+0000002253 00000 n 
+0000002425 00000 n 
+0000002709 00000 n 
+0000002920 00000 n 
+0000003174 00000 n 
+trailer
+<< /Size 21 /Root 1 0 R >>
+startxref
+3491
+%%EOF

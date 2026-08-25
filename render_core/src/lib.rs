@@ -33,6 +33,7 @@
 /// Writing the document outline. Its own module because it is the one feature
 /// that does not go through PDFium at all: PDFium can read bookmarks but has no
 /// API to create them, so the /Outlines tree is built as PDF objects directly.
+pub mod form_state;
 pub mod gradient;
 pub mod outline;
 
@@ -7112,6 +7113,10 @@ fn fill_text_field_inner(doc_handle: u64, field_name: *const c_char, value: *con
 //     u32  name_len,  name_bytes  (UTF-8)
 //     u32  value_len, value_bytes (UTF-8; for radio/checkbox this is the GROUP's
 //                                  currently-selected value, shared by the group)
+//     u32  option_count            (0 for everything but a combo or a list)
+//     repeated `option_count` times:
+//       u32 label_len, label_bytes (UTF-8, the DISPLAY half of /Opt)
+//       u8  selected               (1 for the option currently chosen)
 //
 // A radio widget's own export value ("Basic"/"Pro") would be the natural key,
 // but FPDFAnnot_GetFormFieldExportValue needs the raw FPDF_ANNOTATION handle,
@@ -7141,6 +7146,69 @@ pub extern "C" fn get_form_fields(doc_handle: u64) -> ByteBuffer {
     }
     panic::catch_unwind(|| get_form_fields_inner(doc_handle))
         .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+/// A widget's current appearance state, `/AS`, with any leading slash off.
+///
+/// The one honest answer to "is this button on". PDFium reports a name with or
+/// without its slash depending on how it was written, so both are normalized to
+/// the bare word.
+fn appearance_state<A: pdfium_render::prelude::PdfPageAnnotationCommon>(
+    annotation: &A,
+) -> String {
+    use pdfium_render::prelude::*;
+    let bindings = annotation.library_bindings();
+    let handle = annotation.annotation_handle();
+
+    // Length is in BYTES and includes the UTF-16 null terminator.
+    let len = bindings.FPDFAnnot_GetStringValue(handle, "AS", std::ptr::null_mut(), 0);
+    if len <= 2 {
+        return String::new();
+    }
+
+    let mut buf = vec![0u16; len as usize / 2];
+    bindings.FPDFAnnot_GetStringValue(handle, "AS", buf.as_mut_ptr(), len);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+
+    String::from_utf16(&buf)
+        .map(|s| s.trim_start_matches('/').to_owned())
+        .unwrap_or_default()
+}
+
+/// Whether a checkbox or radio widget is the one that is on.
+///
+/// ⚠️ COMPUTED HERE, because both of the vendored crate's answers are wrong on
+/// ordinary forms and each is wrong differently:
+///
+/// * `checkbox.is_checked()` returns `AS == "Yes"`, hard-coded. A form whose on
+///   state is `/On` reads as unchecked no matter what it says.
+/// * `radio.is_checked()` returns `V == AS` without excluding `Off`, so a group
+///   with nothing selected reports every button selected, which is what the
+///   fixture does at rest.
+///
+/// The rule that holds for both: a widget is on when its own appearance state is
+/// the field's value AND that state is not `Off`. Same comparison the file
+/// itself uses to decide which stream to draw.
+fn button_is_on(appearance: &str, group_value: &str) -> bool {
+    let value = group_value.trim_start_matches('/');
+    !appearance.is_empty() && appearance != "Off" && appearance == value
+}
+
+/// A choice field's options, in order, each with its display label and whether
+/// it is the selected one.
+///
+/// PDFium reports the LABEL, which is the display half of an `/Opt` entry; the
+/// export half stays in the file. That split is deliberate and is what keeps the
+/// app from ever writing "United Kingdom" where the form wants "UK".
+fn choice_options(
+    options: &pdfium_render::prelude::PdfFormFieldOptions,
+) -> Vec<(String, bool)> {
+    options
+        .iter()
+        .map(|o| (o.label().cloned().unwrap_or_default(), o.is_set()))
+        .collect()
 }
 
 fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
@@ -7205,25 +7273,32 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
 
             // Determine control kind, current value string, checked state, and
             // (for grouped controls) the widget's unique index within its group.
+            let mut options: Vec<(String, bool)> = Vec::new();
             let (kind, value, checked, group_index) = if let Some(t) = field.as_text_field() {
                 (FIELD_TEXT, t.value().unwrap_or_default(), false, 0i32)
             } else if let Some(c) = field.as_checkbox_field() {
+                let value = c.group_value().unwrap_or_default();
+                let index = c.index_in_group() as i32;
                 (
                     FIELD_CHECKBOX,
-                    c.group_value().unwrap_or_default(),
-                    c.is_checked().unwrap_or(false),
-                    c.index_in_group() as i32,
+                    value.clone(),
+                    button_is_on(&appearance_state(&annotation), &value),
+                    index,
                 )
             } else if let Some(r) = field.as_radio_button_field() {
+                let value = r.group_value().unwrap_or_default();
+                let index = r.index_in_group() as i32;
                 (
                     FIELD_RADIO,
-                    r.group_value().unwrap_or_default(),
-                    r.is_checked().unwrap_or(false),
-                    r.index_in_group() as i32,
+                    value.clone(),
+                    button_is_on(&appearance_state(&annotation), &value),
+                    index,
                 )
             } else if let Some(cb) = field.as_combo_box_field() {
+                options = choice_options(cb.options());
                 (FIELD_COMBO, cb.value().unwrap_or_default(), false, 0)
             } else if let Some(lb) = field.as_list_box_field() {
+                options = choice_options(lb.options());
                 (FIELD_LISTBOX, lb.value().unwrap_or_default(), false, 0)
             } else if field.as_signature_field().is_some() {
                 (FIELD_SIGNATURE, String::new(), false, 0)
@@ -7263,6 +7338,17 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(&(value.len() as u32).to_le_bytes());
             out.extend_from_slice(value.as_bytes());
+
+            // The choices, for a combo or a list. Labels only: the app shows
+            // these and sends back an INDEX, so the export value never has to
+            // cross the boundary and cannot be written by mistake in place of
+            // the label. Empty for every other kind.
+            out.extend_from_slice(&(options.len() as u32).to_le_bytes());
+            for (label, selected) in &options {
+                out.extend_from_slice(&(label.len() as u32).to_le_bytes());
+                out.extend_from_slice(label.as_bytes());
+                out.push(if *selected { 1 } else { 0 });
+            }
 
             count += 1;
         }
@@ -7398,20 +7484,118 @@ fn get_bookmarks_inner(doc_handle: u64) -> ByteBuffer {
     buffer
 }
 
-// No set_checkbox_field / set_radio_field: pdfium-render's form-module WRITES
-// are both non-rendering and unreliable. Setting /V via FPDFAnnot_SetStringValue
-// never regenerates the widget /AP, so the value is invisible on render AND on
-// flatten (proven: a filled text field, checked box and flipped radio all
-// rendered unchanged, only the reader-baked /AP showed). Worse, radio
-// set_checked() silently no-ops once another document's form environment has
-// been initialized in the same process — PDFium keeps global form state, and
-// the crate even ships stray debug println!s on that path. FPDFAnnot_SetAP and
-// NeedAppearances would fix it but need the pub(crate) raw handle (rule 6/9).
+/// Sets a form field's state: checkbox, radio, combo box or list box.
+///
+/// ⚠️ THE ONLY WAY THIS CAN BE DONE. PDFium cannot write a PDF **name**, and a
+/// button's `/V` and a widget's `/AS` are both names; writing them as strings
+/// was measured to destroy the widget's appearance rather than merely fail. So
+/// the document is serialized, rewritten with lopdf (see `form_state`), and
+/// reopened IN PLACE under the same handle, which is the same snapshot-and-
+/// replace the document-scope undo path already uses.
+///
+/// `field_name` is the FULLY QUALIFIED field name, exactly as `get_form_fields`
+/// reported it. `index` is the widget's position among its field's kids for a
+/// checkbox or radio, and the option's position in `/Opt` for a choice field:
+/// both are stable identities, unlike a page or annotation index, which every
+/// write in this library renumbers.
+///
+/// `on` applies only to a checkbox. A radio is always a selection, and a choice
+/// field always has one.
+///
+/// THE FIELD STAYS A REAL FORM FIELD. Nothing is deleted and nothing of ours is
+/// drawn over it; only its own value and appearance state change, so it is still
+/// interactive when the file is opened anywhere else.
+///
+/// Returns STATUS_OK_PDFIUM, STATUS_INVALID_INPUT for a request that names no
+/// such field or option, STATUS_UNSUPPORTED when the file cannot be rewritten or
+/// a button widget has no appearance to select, and STATUS_PANIC.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_form_field_state(
+    doc_handle: u64,
+    field_name_utf8: *const u8,
+    field_name_len: usize,
+    kind: i32,
+    index: i32,
+    on: i32,
+) -> i32 {
+    if doc_handle == 0 || field_name_utf8.is_null() || field_name_len == 0 || index < 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let name = match std::str::from_utf8(unsafe {
+        std::slice::from_raw_parts(field_name_utf8, field_name_len)
+    }) {
+        Ok(s) => s.to_owned(),
+        Err(_) => return STATUS_INVALID_INPUT,
+    };
+
+    panic::catch_unwind(|| set_form_field_state_inner(doc_handle, &name, kind, index, on != 0))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn set_form_field_state_inner(
+    doc_handle: u64,
+    field_name: &str,
+    kind: i32,
+    index: i32,
+    on: bool,
+) -> i32 {
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // Serialize, then LET GO. The rewrite happens on bytes, and the replacement
+    // below needs this document dropped, so the guard must not outlive the read.
+    let bytes = {
+        let doc_guard = lock(&doc);
+        match doc_guard.save_to_bytes() {
+            Ok(bytes) => bytes,
+            Err(_) => return STATUS_UNSUPPORTED,
+        }
+    };
+    drop(doc);
+
+    let rewritten = match crate::form_state::apply(&bytes, field_name, kind, index, on) {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+
+    let Some(pdfium) = pdfium() else {
+        return STATUS_UNSUPPORTED;
+    };
+    let Ok(document) = pdfium.load_pdf_from_byte_vec(rewritten, None) else {
+        return STATUS_UNSUPPORTED;
+    };
+
+    // IN PLACE, under the same handle. Every index the app holds is invalidated
+    // either way, and the alternative (handing back a new handle) would make
+    // every caller responsible for swapping it, which is how a stale handle gets
+    // used once and crashes.
+    let previous = lock(&core().documents).insert(doc_handle, Arc::new(Mutex::new(document)));
+    drop(previous);
+
+    drop(_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
+// No set_checkbox_field / set_radio_field HERE: PDFium cannot write the PDF
+// names a button's /V and a widget's /AS are, and the crate's own setters are
+// wrong in ways visible in its source (checkbox hard-codes "/Yes"; radio writes
+// the widget's CURRENT /AS as the group value, so selecting an unselected radio
+// sets the group to Off). The whole measurement, and the lopdf rewrite that
+// does work, live in `form_state`, and `set_form_field_state` above is the way
+// in. get_form_fields stays: reading a field's kind/rect/current state is
+// reliable, and it is what the writer is told to change.
 //
-// So the app fills forms by DRAWING its own annotations at the rects that
-// get_form_fields reports (a text box for a text field, a check glyph for a
-// checkbox) — the proven pipeline that renders, saves, flattens and re-edits.
-// get_form_fields stays: reading a field's kind/rect/current state is reliable.
+// TEXT fields are still filled by DRAWING one of our text boxes at the rect
+// get_form_fields reports, which is a different bargain and deliberately
+// unchanged: a text value has no ready-made appearance to select, the drawn box
+// is editable afterwards the way every other mark of ours is, and that pipeline
+// already renders, saves, flattens and re-edits.
 //
 // One catch the drawing approach hits: PDFium's form layer (FPDF_FFLDraw) paints
 // the widget appearance ON TOP of the page content and regular annotations, so a
@@ -9991,6 +10175,564 @@ mod tests {
 
         close_document(handle);
         let _ = std::fs::remove_file(&out);
+    }
+
+    // ---------------- form field state ----------------
+
+    /// One widget, as get_form_fields reports it.
+    #[derive(Debug, Clone)]
+    struct DecodedField {
+        page: i32,
+        kind: i32,
+        flags: i32,
+        group_index: i32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        name: String,
+        value: String,
+        options: Vec<(String, bool)>,
+    }
+
+    impl DecodedField {
+        fn checked(&self) -> bool {
+            (self.flags & 2) != 0
+        }
+    }
+
+    fn decode_fields(handle: u64) -> Vec<DecodedField> {
+        let buffer = get_form_fields(handle);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "get_form_fields refused");
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+
+        let mut at = 0usize;
+        let mut i32_at = |p: &mut usize| {
+            let v = i32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let count = i32_at(&mut at) as usize;
+
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let page = i32_at(&mut at);
+            let kind = i32_at(&mut at);
+            let flags = i32_at(&mut at);
+            let group_index = i32_at(&mut at);
+
+            let mut f = |p: &mut usize| {
+                let v = f32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+                *p += 4;
+                v
+            };
+            let (left, top, right, bottom) = (f(&mut at), f(&mut at), f(&mut at), f(&mut at));
+
+            let mut s = |p: &mut usize| {
+                let n = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
+                *p += 4;
+                let v = String::from_utf8_lossy(&bytes[*p..*p + n]).into_owned();
+                *p += n;
+                v
+            };
+            let name = s(&mut at);
+            let value = s(&mut at);
+
+            let option_count = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            let mut options = Vec::with_capacity(option_count);
+            for _ in 0..option_count {
+                let label = s(&mut at);
+                let selected = bytes[at] != 0;
+                at += 1;
+                options.push((label, selected));
+            }
+
+            out.push(DecodedField {
+                page, kind, flags, group_index, left, top, right, bottom,
+                name, value, options,
+            });
+        }
+        out
+    }
+
+    fn field_named<'a>(fields: &'a [DecodedField], name: &str) -> &'a DecodedField {
+        fields.iter().find(|f| f.name == name).expect("no such field")
+    }
+
+    fn set_state(handle: u64, name: &str, kind: i32, index: i32, on: bool) -> i32 {
+        set_form_field_state(
+            handle, name.as_ptr(), name.len(), kind, index, if on { 1 } else { 0 })
+    }
+
+    fn open_choice_form() -> u64 {
+        open_fixture_named("tests/fixtures/sample_form_choice.pdf")
+    }
+
+    /// Dark pixels inside a widget's own rectangle, rendered the way the APP
+    /// renders, with the form layer on. The only thing that settles whether a
+    /// state change actually SHOWS.
+    fn widget_ink(handle: u64, field: &DecodedField, width_px: i32) -> usize {
+        let result = render_uncached(handle, field.page, width_px);
+        assert_eq!(result.status, STATUS_OK_PDFIUM, "render failed");
+
+        let (w, h) = (result.width, result.height);
+        let bytes = unsafe { std::slice::from_raw_parts(result.buffer, result.len) }.to_vec();
+        free_render_result(result);
+
+        let x0 = ((field.left * width_px as f32) as i32).max(0);
+        let x1 = ((field.right * width_px as f32) as i32).min(w - 1);
+        let y0 = ((field.top * width_px as f32) as i32).max(0);
+        let y1 = ((field.bottom * width_px as f32) as i32).min(h - 1);
+
+        let mut n = 0usize;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let i = ((y * w + x) * 4) as usize;
+                if i + 3 >= bytes.len() { continue; }
+                if (bytes[i] as u32 + bytes[i + 1] as u32 + bytes[i + 2] as u32) < 330 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Saves and reopens, the way the app does. Returns the new handle.
+    fn round_trip(handle: u64, name: &str) -> u64 {
+        let file = scratch_pdf(name);
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let reopened = open_document(c.as_ptr());
+        assert_ne!(reopened, 0, "PDFium refused the saved form");
+        let _ = std::fs::remove_file(&file);
+        reopened
+    }
+
+    // ---- reading ----
+
+    #[test]
+    fn every_field_type_reads_back_with_its_kind_and_name() {
+        let handle = open_choice_form();
+
+        let fields = decode_fields(handle);
+
+        assert_eq!(field_named(&fields, "Notes").kind, FIELD_TEXT);
+        assert_eq!(field_named(&fields, "Agree").kind, FIELD_CHECKBOX);
+        assert_eq!(field_named(&fields, "Country").kind, FIELD_COMBO);
+        assert_eq!(field_named(&fields, "Size").kind, FIELD_LISTBOX);
+
+        let radios: Vec<_> = fields.iter().filter(|f| f.name == "Colour").collect();
+        assert_eq!(radios.len(), 3, "{fields:#?}");
+        assert!(radios.iter().all(|r| r.kind == FIELD_RADIO));
+        assert_eq!(
+            radios.iter().map(|r| r.group_index).collect::<Vec<_>>(),
+            vec![0, 1, 2]);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_choice_fields_options_arrive_with_their_labels_and_the_one_selected() {
+        // What the picker is built from. The labels are the DISPLAY halves of
+        // /Opt; the export values never leave the core, which is what stops the
+        // app writing "United Kingdom" where the form wants "UK".
+        let handle = open_choice_form();
+        let fields = decode_fields(handle);
+
+        let combo = field_named(&fields, "Country");
+        assert_eq!(
+            combo.options,
+            vec![
+                ("United States".to_owned(), false),
+                ("United Kingdom".to_owned(), true),
+                ("Myanmar".to_owned(), false),
+            ]);
+
+        let list = field_named(&fields, "Size");
+        assert_eq!(
+            list.options,
+            vec![
+                ("Small".to_owned(), false),
+                ("Medium".to_owned(), true),
+                ("Large".to_owned(), false),
+            ]);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_field_with_no_options_reports_none_rather_than_something_borrowed() {
+        let handle = open_choice_form();
+        let fields = decode_fields(handle);
+
+        assert!(field_named(&fields, "Agree").options.is_empty());
+        assert!(field_named(&fields, "Notes").options.is_empty());
+
+        close_document(handle);
+    }
+
+    // ---- checkbox ----
+
+    #[test]
+    fn a_checkbox_ticks_and_unticks_and_the_tick_is_visible() {
+        const W: i32 = 800;
+        let handle = open_choice_form();
+
+        let before = field_named(&decode_fields(handle), "Agree").clone();
+        assert!(!before.checked());
+        let empty = widget_ink(handle, &before, W);
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+        let ticked = field_named(&decode_fields(handle), "Agree").clone();
+        let ticked_ink = widget_ink(handle, &ticked, W);
+
+        assert!(ticked.checked(), "the box did not tick");
+        assert!(ticked_ink > empty,
+                "nothing was drawn: {empty} then {ticked_ink} dark pixels");
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, false), STATUS_OK_PDFIUM);
+        let cleared = field_named(&decode_fields(handle), "Agree").clone();
+
+        assert!(!cleared.checked(), "the box did not clear");
+        assert_eq!(widget_ink(handle, &cleared, W), empty);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_checkbox_uses_the_on_state_the_file_actually_names() {
+        // ⚠️ THE ASSUMPTION THAT BREAKS REAL FORMS. The vendored crate hard-codes
+        // "/Yes"; this fixture's checkbox is deliberately "/On", so anything that
+        // assumes fails here rather than in a user's document.
+        let handle = open_choice_form();
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+
+        let reopened = round_trip(handle, "form-checkbox-onstate");
+        let raw = {
+            let file = scratch_pdf("form-checkbox-bytes");
+            let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+            assert_eq!(save_document(reopened, c.as_ptr()), STATUS_OK_PDFIUM);
+            let bytes = std::fs::read(&file).unwrap();
+            let _ = std::fs::remove_file(&file);
+            bytes
+        };
+
+        let (value, states) = crate::form_state::read_state(&raw, "Agree").unwrap();
+        assert_eq!(value, "On");
+        assert_eq!(states, vec!["On".to_owned()]);
+
+        close_document(reopened);
+    }
+
+    #[test]
+    fn a_ticked_checkbox_is_still_ticked_after_a_save_and_reopen() {
+        const W: i32 = 800;
+        let handle = open_choice_form();
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+        let ink_before = widget_ink(handle, field_named(&decode_fields(handle), "Agree"), W);
+
+        let reopened = round_trip(handle, "form-checkbox-round-trip");
+        let after = field_named(&decode_fields(reopened), "Agree").clone();
+
+        assert!(after.checked());
+        assert_eq!(widget_ink(reopened, &after, W), ink_before);
+
+        close_document(reopened);
+    }
+
+    // ---- radio ----
+
+    #[test]
+    fn selecting_a_radio_selects_that_one_and_clears_the_others() {
+        const W: i32 = 800;
+        let handle = open_choice_form();
+
+        let start: Vec<_> = decode_fields(handle).into_iter()
+            .filter(|f| f.name == "Colour").collect();
+        assert!(start.iter().all(|r| !r.checked()), "the fixture starts with none selected");
+        let blank: Vec<usize> = start.iter().map(|r| widget_ink(handle, r, W)).collect();
+
+        // Green.
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 1, true), STATUS_OK_PDFIUM);
+        let picked: Vec<_> = decode_fields(handle).into_iter()
+            .filter(|f| f.name == "Colour").collect();
+
+        assert_eq!(picked.iter().filter(|r| r.checked()).count(), 1);
+        assert!(picked[1].checked(), "the wrong button is selected: {picked:#?}");
+        assert!(widget_ink(handle, &picked[1], W) > blank[1], "the dot did not appear");
+        assert_eq!(widget_ink(handle, &picked[0], W), blank[0]);
+        assert_eq!(widget_ink(handle, &picked[2], W), blank[2]);
+
+        // Blue: Green must clear.
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 2, true), STATUS_OK_PDFIUM);
+        let moved: Vec<_> = decode_fields(handle).into_iter()
+            .filter(|f| f.name == "Colour").collect();
+
+        assert_eq!(moved.iter().filter(|r| r.checked()).count(), 1);
+        assert!(moved[2].checked());
+        assert_eq!(widget_ink(handle, &moved[1], W), blank[1], "Green did not clear");
+        assert!(widget_ink(handle, &moved[2], W) > blank[2]);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn each_radio_keeps_its_own_on_state_name() {
+        // The three buttons are /Red, /Green and /Blue. A group written with one
+        // shared on-state would select the wrong button, or none.
+        let handle = open_choice_form();
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 1, true), STATUS_OK_PDFIUM);
+
+        let file = scratch_pdf("form-radio-states");
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let raw = std::fs::read(&file).unwrap();
+        let (value, states) = crate::form_state::read_state(&raw, "Colour").unwrap();
+
+        assert_eq!(value, "Green");
+        assert_eq!(states, vec!["Off".to_owned(), "Green".to_owned(), "Off".to_owned()]);
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_selected_radio_survives_a_save_and_reopen() {
+        const W: i32 = 800;
+        let handle = open_choice_form();
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 2, true), STATUS_OK_PDFIUM);
+        let before: Vec<usize> = decode_fields(handle).iter()
+            .filter(|f| f.name == "Colour")
+            .map(|r| widget_ink(handle, r, W))
+            .collect();
+
+        let reopened = round_trip(handle, "form-radio-round-trip");
+        let after: Vec<_> = decode_fields(reopened).into_iter()
+            .filter(|f| f.name == "Colour").collect();
+
+        assert!(after[2].checked());
+        assert_eq!(after.iter().filter(|r| r.checked()).count(), 1);
+        assert_eq!(
+            after.iter().map(|r| widget_ink(reopened, r, W)).collect::<Vec<_>>(),
+            before);
+
+        close_document(reopened);
+    }
+
+    // ---- combo and list ----
+
+    #[test]
+    fn choosing_a_combo_option_changes_what_the_field_displays() {
+        const W: i32 = 800;
+        let handle = open_choice_form();
+
+        let before = field_named(&decode_fields(handle), "Country").clone();
+        assert_eq!(before.value, "United Kingdom");
+        let before_ink = widget_ink(handle, &before, W);
+
+        assert_eq!(set_state(handle, "Country", FIELD_COMBO, 2, true), STATUS_OK_PDFIUM);
+
+        let after = field_named(&decode_fields(handle), "Country").clone();
+        assert_eq!(after.value, "Myanmar");
+        assert_eq!(after.options[2].1, true, "the new option is not marked selected");
+        assert_ne!(widget_ink(handle, &after, W), before_ink,
+                   "the appearance still draws the old label");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_combo_stores_the_export_value_and_not_the_label() {
+        // ⚠️ THE MISTAKE THIS EXISTS TO PREVENT. /Opt here is the pair form,
+        // [(MM) (Myanmar)]. A form that submits "Myanmar" where the server
+        // expects "MM" is broken in a way nothing on screen shows.
+        let handle = open_choice_form();
+        assert_eq!(set_state(handle, "Country", FIELD_COMBO, 2, true), STATUS_OK_PDFIUM);
+
+        let file = scratch_pdf("form-combo-export");
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let raw = std::fs::read(&file).unwrap();
+        let (value, _) = crate::form_state::read_state(&raw, "Country").unwrap();
+
+        assert_eq!(value, "MM");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn choosing_a_list_option_changes_the_selection() {
+        const W: i32 = 800;
+        let handle = open_choice_form();
+
+        let before = field_named(&decode_fields(handle), "Size").clone();
+        assert_eq!(before.value, "Medium");
+        let before_ink = widget_ink(handle, &before, W);
+
+        assert_eq!(set_state(handle, "Size", FIELD_LISTBOX, 2, true), STATUS_OK_PDFIUM);
+
+        let after = field_named(&decode_fields(handle), "Size").clone();
+        assert_eq!(after.value, "Large");
+        assert_eq!(after.options[2].1, true);
+        assert_ne!(widget_ink(handle, &after, W), before_ink);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_choice_field_keeps_its_value_and_index_through_a_save_and_reopen() {
+        let handle = open_choice_form();
+        assert_eq!(set_state(handle, "Country", FIELD_COMBO, 0, true), STATUS_OK_PDFIUM);
+        assert_eq!(set_state(handle, "Size", FIELD_LISTBOX, 0, true), STATUS_OK_PDFIUM);
+
+        let reopened = round_trip(handle, "form-choice-round-trip");
+        let fields = decode_fields(reopened);
+
+        let combo = field_named(&fields, "Country");
+        assert_eq!(combo.value, "United States");
+        assert_eq!(combo.options[0].1, true, "the index did not survive");
+
+        let list = field_named(&fields, "Size");
+        assert_eq!(list.value, "Small");
+        assert_eq!(list.options[0].1, true);
+
+        close_document(reopened);
+    }
+
+    // ---- what must not happen ----
+
+    #[test]
+    fn the_widget_is_still_a_real_form_field_afterwards() {
+        // ⚠️ THE WHOLE POINT of doing this properly rather than drawing a tick.
+        // A form we have "filled" by replacing its controls with pictures is not
+        // a form any more: nobody else can change it, and no reader can submit
+        // it. Everything must still be there, still typed, still named.
+        let handle = open_choice_form();
+        let before = decode_fields(handle).len();
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 0, true), STATUS_OK_PDFIUM);
+        assert_eq!(set_state(handle, "Country", FIELD_COMBO, 2, true), STATUS_OK_PDFIUM);
+        assert_eq!(set_state(handle, "Size", FIELD_LISTBOX, 0, true), STATUS_OK_PDFIUM);
+
+        let reopened = round_trip(handle, "form-still-a-form");
+        let fields = decode_fields(reopened);
+
+        assert_eq!(fields.len(), before, "widgets were lost: {fields:#?}");
+        assert_eq!(field_named(&fields, "Agree").kind, FIELD_CHECKBOX);
+        assert_eq!(field_named(&fields, "Country").kind, FIELD_COMBO);
+        assert_eq!(field_named(&fields, "Size").kind, FIELD_LISTBOX);
+        assert_eq!(fields.iter().filter(|f| f.name == "Colour").count(), 3);
+        assert_eq!(get_form_field_count(reopened), before as i32);
+
+        close_document(reopened);
+    }
+
+    #[test]
+    fn a_text_field_is_left_alone_by_all_of_this() {
+        // Text fields keep the drawn-text-box path. Nothing here may touch one.
+        let handle = open_choice_form();
+        let before = field_named(&decode_fields(handle), "Notes").clone();
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+
+        let after = field_named(&decode_fields(handle), "Notes").clone();
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.value, before.value);
+        assert!((after.left - before.left).abs() < 1e-5);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_request_naming_no_field_changes_nothing() {
+        let handle = open_choice_form();
+        let before = decode_fields(handle);
+
+        assert_eq!(set_state(handle, "NoSuchField", FIELD_CHECKBOX, 0, true),
+                   STATUS_INVALID_INPUT);
+
+        let after = decode_fields(handle);
+        assert_eq!(after.len(), before.len());
+        assert!(!field_named(&after, "Agree").checked());
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_widget_or_option_index_past_the_end_is_refused() {
+        let handle = open_choice_form();
+
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 9, true), STATUS_INVALID_INPUT);
+        assert_eq!(set_state(handle, "Country", FIELD_COMBO, 9, true), STATUS_INVALID_INPUT);
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 9, true), STATUS_INVALID_INPUT);
+
+        let fields = decode_fields(handle);
+        assert!(!field_named(&fields, "Agree").checked());
+        assert_eq!(field_named(&fields, "Country").value, "United Kingdom");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_document_with_no_form_refuses_without_being_rewritten() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_INVALID_INPUT);
+        assert_eq!(get_page_count(handle), 20, "the document was replaced anyway");
+
+        close_document(handle);
+    }
+
+    // ---- living beside our own work ----
+
+    #[test]
+    fn our_shapes_and_gradients_and_links_survive_a_form_edit() {
+        // ⚠️ A FORM EDIT REPLACES THE WHOLE DOCUMENT. Everything else in it has
+        // to come through that, which is not something reading the code proves.
+        let handle = open_choice_form();
+
+        let fill = across();
+        let mut spec = shape(SHAPE_RECTANGLE, 100.0, 40.0, 350.0, 110.0);
+        spec.fill_rgba = 0xFF00FF00;
+        spec.effects_utf8 = fill.as_ptr();
+        spec.effects_len = fill.len();
+        assert_eq!(add_shape_annotations(handle, 1000, &spec, 1), STATUS_OK_PDFIUM);
+        assert_eq!(add_link(handle, 0, 100.0, 20.0, 300.0, 35.0, "https://form.example").0,
+                   STATUS_OK_PDFIUM);
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+        assert_eq!(set_state(handle, "Colour", FIELD_RADIO, 0, true), STATUS_OK_PDFIUM);
+
+        let (file, gradients) = save_like_the_app(handle, "form-with-our-work");
+        assert_eq!(gradients, 1, "the gradient writer found nothing to paint");
+
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        let reopened = open_document(c.as_ptr());
+        assert_ne!(reopened, 0);
+
+        let links = decode_links(reopened, 0);
+        assert_eq!(links.len(), 1, "{links:#?}");
+        assert_eq!(links[0].uri, "https://form.example");
+
+        let fields = decode_fields(reopened);
+        assert!(field_named(&fields, "Agree").checked());
+        assert!(fields.iter().filter(|f| f.name == "Colour").any(|r| r.checked()));
+
+        let raw = std::fs::read(&file).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("AyaanTag"), "the shape's tag did not survive");
+        assert!(text.contains("ShadingType"), "the gradient did not survive");
+
+        close_document(reopened);
+        let _ = std::fs::remove_file(&file);
     }
 
     // ---------------- links ----------------
@@ -18226,87 +18968,17 @@ p={spread_px:.4},c={rgba:08X})"
 
     // ---- Form field enumeration + checkbox/radio setters -------------
 
-    /// One field parsed out of the get_form_fields ByteBuffer, so the tests can
-    /// assert on structured data rather than raw bytes.
-    struct ParsedField {
-        page_index: i32,
-        kind: i32,
-        flags: i32,
-        group_index: i32,
-        left: f32,
-        top: f32,
-        right: f32,
-        bottom: f32,
-        name: String,
-        value: String,
-    }
-
-    fn parse_form_fields(buf: &ByteBuffer) -> Vec<ParsedField> {
-        assert_eq!(buf.status, STATUS_OK_PDFIUM);
-        let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
-        let mut p = 0usize;
-        let rd_u32 = |b: &[u8], p: &mut usize| {
-            let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
-            *p += 4;
-            v
-        };
-        let rd_i32 = |b: &[u8], p: &mut usize| {
-            let v = i32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
-            *p += 4;
-            v
-        };
-        let rd_f32 = |b: &[u8], p: &mut usize| {
-            let v = f32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
-            *p += 4;
-            v
-        };
-        let count = rd_u32(bytes, &mut p);
-        let mut out = Vec::new();
-        for _ in 0..count {
-            let page_index = rd_i32(bytes, &mut p);
-            let kind = rd_i32(bytes, &mut p);
-            let flags = rd_i32(bytes, &mut p);
-            let group_index = rd_i32(bytes, &mut p);
-            let left = rd_f32(bytes, &mut p);
-            let top = rd_f32(bytes, &mut p);
-            let right = rd_f32(bytes, &mut p);
-            let bottom = rd_f32(bytes, &mut p);
-            let nlen = rd_u32(bytes, &mut p) as usize;
-            let name = String::from_utf8(bytes[p..p + nlen].to_vec()).unwrap();
-            p += nlen;
-            let vlen = rd_u32(bytes, &mut p) as usize;
-            let value = String::from_utf8(bytes[p..p + vlen].to_vec()).unwrap();
-            p += vlen;
-            out.push(ParsedField {
-                page_index,
-                kind,
-                flags,
-                group_index,
-                left,
-                top,
-                right,
-                bottom,
-                name,
-                value,
-            });
-        }
-        assert_eq!(p, buf.len, "parser consumed exactly the whole buffer");
-        out
-    }
-
     #[test]
     fn get_form_fields_enumerates_every_kind_with_name_rect_and_value() {
         let handle = open_fixture_named("tests/fixtures/sample_form_rich.pdf");
-        let buf = get_form_fields(handle);
-        let fields = parse_form_fields(&buf);
-        free_byte_buffer(buf);
+        let fields = decode_fields(handle);
 
         // Text, checkbox, two radio widgets, one choice = five widgets.
         assert_eq!(fields.len(), 5, "expected one widget per control (radio has two)");
 
         let text = fields.iter().find(|f| f.name == "FullName").unwrap();
         assert_eq!(text.kind, FIELD_TEXT);
-        assert_eq!(text.page_index, 0);
+        assert_eq!(text.page, 0);
         // Rect is normalized top-left / page width, so within [0, ~1.3] and
         // ordered left<right, top<bottom.
         assert!(text.left > 0.0 && text.left < 1.0, "left {}", text.left);
@@ -19154,9 +19826,7 @@ p={spread_px:.4},c={rgba:08X})"
         assert_eq!(delete_form_field_widget(handle, name.as_ptr()), STATUS_OK_PDFIUM);
 
         // FullName is gone; the other fields remain.
-        let buf = get_form_fields(handle);
-        let fields = parse_form_fields(&buf);
-        free_byte_buffer(buf);
+        let fields = decode_fields(handle);
         assert!(!fields.iter().any(|f| f.name == "FullName"), "FullName widget removed");
         assert!(fields.iter().any(|f| f.name == "Subscribe"), "other fields untouched");
 
@@ -19174,10 +19844,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         // A document with no form: enumeration succeeds and is empty.
         let handle = open_fixture_named("tests/fixtures/sample.pdf");
-        let buf = get_form_fields(handle);
-        let fields = parse_form_fields(&buf);
-        free_byte_buffer(buf);
-        assert_eq!(fields.len(), 0);
+        assert_eq!(decode_fields(handle).len(), 0);
         close_document(handle);
     }
 

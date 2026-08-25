@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace PdfEditorApp.Viewport;
@@ -16,6 +16,17 @@ public enum FormFieldKind
     PushButton = 6,
     Signature = 7,
 }
+
+/// <summary>
+/// One choice a combo box or list box offers.
+///
+/// The label is the DISPLAY half of the field's /Opt entry, which is all the
+/// picker needs. The export half never crosses the FFI boundary on purpose: the
+/// app sends back an <paramref name="Index"/> and the core resolves the value
+/// from the file, so there is no way for the app to write "United Kingdom" into
+/// a field whose form expects "UK".
+/// </summary>
+public readonly record struct FormFieldOption(int Index, string Label, bool Selected);
 
 /// <summary>
 /// One form-field widget read from a PDF. Rects are in the same normalized
@@ -38,12 +49,34 @@ public readonly record struct FormField(
     double Right,
     double Bottom,
     string Name,
-    string Value)
+    string Value,
+    IReadOnlyList<FormFieldOption> Options)
 {
-    /// <summary>True for the kinds this app can currently fill: text and
-    /// checkbox. Radio, choice, signature and buttons are enumerated and shown
-    /// but not yet editable.</summary>
-    public bool IsFillable => !ReadOnly && Kind is FormFieldKind.Text or FormFieldKind.Checkbox;
+    /// <summary>
+    /// The kinds this app can edit: a text field, the two button kinds and the
+    /// two choice kinds.
+    ///
+    /// Signature fields are read-only by decision, not by limitation, and
+    /// pushbuttons do nothing to fill. Anything the core could not classify is
+    /// left alone rather than guessed at.
+    /// </summary>
+    public bool IsFillable => !ReadOnly && Kind is FormFieldKind.Text
+        or FormFieldKind.Checkbox or FormFieldKind.Radio
+        or FormFieldKind.Combo or FormFieldKind.ListBox;
+
+    /// <summary>
+    /// True when clicking simply flips a state, with nothing to ask the user.
+    /// </summary>
+    public bool IsToggle => Kind is FormFieldKind.Checkbox or FormFieldKind.Radio;
+
+    /// <summary>
+    /// True when clicking has to offer a list of choices first.
+    /// </summary>
+    public bool IsChoice => Kind is FormFieldKind.Combo or FormFieldKind.ListBox;
+
+    /// <summary>Whether a normalized page-local point falls inside this widget.</summary>
+    public bool Contains(double x, double y)
+        => x >= Left && x <= Right && y >= Top && y <= Bottom;
 }
 
 /// <summary>
@@ -87,6 +120,19 @@ public static class FormFieldReader
             string name = ReadString(bytes, ref p);
             string value = ReadString(bytes, ref p);
 
+            int optionCount = (int)ReadU32(bytes, ref p);
+            var options = optionCount == 0
+                ? (IReadOnlyList<FormFieldOption>)Array.Empty<FormFieldOption>()
+                : new List<FormFieldOption>(optionCount);
+            for (int o = 0; o < optionCount; o++)
+            {
+                string label = ReadString(bytes, ref p);
+                Require(bytes, p, 1);
+                bool selected = bytes[p] != 0;
+                p += 1;
+                ((List<FormFieldOption>)options).Add(new FormFieldOption(o, label, selected));
+            }
+
             fields.Add(new FormField(
                 pageIndex,
                 ToKind(kind),
@@ -94,7 +140,7 @@ public static class FormFieldReader
                 (flags & FlagChecked) != 0,
                 groupIndex,
                 left, top, right, bottom,
-                name, value));
+                name, value, options));
         }
 
         return fields;

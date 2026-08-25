@@ -829,6 +829,97 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Ticks a checkbox, picks a radio button, or chooses an option in a combo
+    /// box or list box. One undoable action.
+    ///
+    /// ⚠️ NOT the text path. A text field is filled by DRAWING one of our text
+    /// boxes over it, because a typed value has no ready-made appearance to
+    /// select. These four do: a checkbox and a radio already carry a stream for
+    /// every state, and a choice field's is rebuilt by the reader. So the
+    /// widget is left exactly where it is and only its own state changes, and
+    /// the field is still a real, interactive form field afterwards. A form we
+    /// had "filled" by covering its controls with pictures would not be one.
+    ///
+    /// <paramref name="index"/> is the widget's position within its group for a
+    /// button, and the option's position for a choice field. The core is told
+    /// the field's NAME and that index, never a page or annotation index: it
+    /// rewrites the whole document, so every index the app is holding is stale
+    /// the moment this returns.
+    ///
+    /// The history entry is document scope, the same as Fill field and page
+    /// operations, because a whole-document rewrite is what it is.
+    /// </summary>
+    public bool SetFormFieldState(FormField field, int index, bool on)
+    {
+        if (_documentHandle == 0 || field.ReadOnly) { return false; }
+        if (field.Kind is not (FormFieldKind.Checkbox or FormFieldKind.Radio
+                               or FormFieldKind.Combo or FormFieldKind.ListBox))
+        {
+            return false;
+        }
+
+        string label = DescribeFormEdit(field, index, on);
+
+        // Captured BEFORE the write, because that is the state undo restores,
+        // but only PUSHED after it succeeds. The core leaves the document
+        // untouched when it refuses, and an entry pushed anyway would be a
+        // Ctrl+Z that appears to do nothing.
+        var before = Capture(HistoryScope.Document, label, null);
+
+        byte[] name = System.Text.Encoding.UTF8.GetBytes(field.Name);
+        int status = RenderCoreNative.set_form_field_state(
+            _documentHandle, name, (nuint)name.Length,
+            (int)field.Kind, index, on ? 1 : 0);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Status = "That field could not be changed.";
+            Diag.Log($"SetFormFieldState {field.Name} kind={field.Kind} index={index} -> {status}");
+            return false;
+        }
+
+        _history.Push(before);
+        NotifyHistoryChanged();
+
+        // ⚠️ THE DOCUMENT IS A DIFFERENT ONE NOW, behind the same handle. Every
+        // per-page cache describes the document that was replaced.
+        _textLayers.Clear();
+        ClearSelection();
+        ClearLoadedAnnotations();
+        LoadFormFields();
+        DistributeFormOutlines();
+        RenderCurrentPage();
+        IsDirty = true;
+
+        Status = label + ".";
+        return true;
+    }
+
+    /// <summary>What the status bar and the history entry call this edit.</summary>
+    private static string DescribeFormEdit(FormField field, int index, bool on) => field.Kind switch
+    {
+        FormFieldKind.Checkbox => on ? $"Tick {field.Name}" : $"Clear {field.Name}",
+        FormFieldKind.Radio => $"Select {field.Name}",
+        _ => index >= 0 && index < field.Options.Count
+            ? $"Set {field.Name} to {field.Options[index].Label}"
+            : $"Set {field.Name}",
+    };
+
+    /// <summary>
+    /// The state a click on this widget should produce.
+    ///
+    /// A checkbox flips. A radio only ever turns ON: clicking the selected one
+    /// again does nothing, which is what a radio group means and what every
+    /// other reader does.
+    /// </summary>
+    public bool? ToggleStateFor(FormField field) => field.Kind switch
+    {
+        FormFieldKind.Checkbox => !field.Checked,
+        FormFieldKind.Radio => field.Checked ? null : true,
+        _ => null,
+    };
+
+    /// <summary>
     /// The shape being dragged out, or null. Redrawn on every pointer move, so
     /// the preview is the same polyline the finished shape will be and the two
     /// cannot disagree.
@@ -11388,6 +11479,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _textLayers.Clear();
         ClearSelection();
         ClearLoadedAnnotations();
+        // The form goes with it. Undoing a form edit restores the document's
+        // bytes, so the fields the app is holding describe the state that was
+        // just undone.
+        LoadFormFields();
+        DistributeFormOutlines();
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
         Thumbnails.Clear();
         for (int i = 0; i < PageCount; i++)
