@@ -664,7 +664,7 @@
                                                         paper, not against the
                                                         app around it.
                                                     -->
-                                                    <Rectangle Stroke="#FF2D6FC4"
+                                                    <Rectangle Stroke="{x:Bind local:MainPage.HexBrush(ColorHex)}"
                                                                StrokeThickness="1"
                                                                Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"

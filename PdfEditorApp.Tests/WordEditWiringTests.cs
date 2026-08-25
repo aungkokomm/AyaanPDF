@@ -110,24 +110,6 @@ public class WordEditWiringTests
     }
 
     [Fact]
-    public void a_double_click_tries_our_own_marks_before_the_documents_words()
-    {
-        // Annotations are painted OVER the finished page, so anything of ours
-        // under the pointer is on top of the words and is what the click meant.
-        string code = Page();
-
-        int handler = code.IndexOf(
-            "private void ViewportHost_DoubleTapped(", StringComparison.Ordinal);
-        Assert.True(handler > 0);
-
-        int ours = code.IndexOf("HitLoadedTextBox(", handler, StringComparison.Ordinal);
-        int theirs = code.IndexOf("SelectPageTextAt(", handler, StringComparison.Ordinal);
-
-        Assert.True(ours > 0 && theirs > ours,
-            "the document's words are tried before our own text boxes");
-    }
-
-    [Fact]
     public void a_word_that_cannot_be_edited_is_refused_before_the_editor_opens()
     {
         // Being told before typing is the difference between a limitation and a
@@ -135,16 +117,16 @@ public class WordEditWiringTests
         // cases measured on real documents.
         string code = Page();
 
-        int open = code.IndexOf("private bool OpenWordEditor(", StringComparison.Ordinal);
+        int open = code.IndexOf("private bool OpenUnitEditor(", StringComparison.Ordinal);
         Assert.True(open > 0);
 
         int next = code.IndexOf("\n    /// <summary>", open, StringComparison.Ordinal);
         string body = code[open..next];
 
-        int guard = body.IndexOf("!word.CanEdit", StringComparison.Ordinal);
+        int guard = body.IndexOf("!unit.CanEdit", StringComparison.Ordinal);
         int build = body.IndexOf("new TextBox", StringComparison.Ordinal);
 
-        Assert.True(guard > 0 && guard < build, "the editor is built before the word is checked");
+        Assert.True(guard > 0 && guard < build, "the editor is built before the unit is checked");
     }
 
     [Fact]
@@ -155,11 +137,11 @@ public class WordEditWiringTests
         // editor that is already being torn down.
         string code = Page();
 
-        int tear = code.IndexOf("private void TearDownWordEditor()", StringComparison.Ordinal);
+        int tear = code.IndexOf("private void TearDownUnitEditor()", StringComparison.Ordinal);
         Assert.True(tear > 0);
 
         string body = code[tear..(tear + 900)];
-        int unhook = body.IndexOf("LostFocus -= WordEditor_LostFocus", StringComparison.Ordinal);
+        int unhook = body.IndexOf("LostFocus -= UnitEditor_LostFocus", StringComparison.Ordinal);
         int remove = body.IndexOf("EditCanvas.Children.Remove", StringComparison.Ordinal);
 
         Assert.True(unhook > 0 && remove > unhook,
@@ -202,10 +184,10 @@ public class WordEditWiringTests
         // until an edit begins. An editor added to it without showing it is
         // built, focused and typed into entirely invisibly: every unit test
         // passes, the core does the right thing, and the reader sees nothing
-        // happen when they double-click.
+        // happen when they click.
         string code = Page();
 
-        int open = code.IndexOf("private bool OpenWordEditor(", StringComparison.Ordinal);
+        int open = code.IndexOf("private bool OpenUnitEditor(", StringComparison.Ordinal);
         int next = code.IndexOf("/// <summary>", open, StringComparison.Ordinal);
         string body = code[open..next];
 
@@ -225,7 +207,7 @@ public class WordEditWiringTests
         // layer, though, so hiding it unconditionally would close that one too.
         string code = Page();
 
-        int tear = code.IndexOf("private void TearDownWordEditor()", StringComparison.Ordinal);
+        int tear = code.IndexOf("private void TearDownUnitEditor()", StringComparison.Ordinal);
         string body = code[tear..(tear + 1200)];
 
         Assert.Contains("_textEditor is null", body, StringComparison.Ordinal);
@@ -245,7 +227,7 @@ public class WordEditWiringTests
         string body = code[scrim..(scrim + 600)];
 
         Assert.Contains("CommitTextEdit();", body, StringComparison.Ordinal);
-        Assert.Contains("CommitWordEdit();", body, StringComparison.Ordinal);
+        Assert.Contains("CommitUnitEdit();", body, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -259,16 +241,16 @@ public class WordEditWiringTests
         // two letters, which is exactly what happened.
         string code = Page();
 
-        int open = code.IndexOf("private bool OpenWordEditor(", StringComparison.Ordinal);
+        int open = code.IndexOf("private bool OpenUnitEditor(", StringComparison.Ordinal);
         int next = code.IndexOf("/// <summary>", open, StringComparison.Ordinal);
         string body = code[open..next];
 
-        Assert.Contains("DipsPerPointOn(page)", body, StringComparison.Ordinal);
+        Assert.Contains("DipsPerPointOn(unit.Page)", body, StringComparison.Ordinal);
 
         // The font size must come from the point converter, never from the
         // normalized one. Asserted as an exact string so the two cannot be
         // swapped back without this failing.
-        Assert.Contains("FontSize = System.Math.Max(8, fontDip)",
+        Assert.Contains("FontSize = Math.Max(8, fontDip)",
             body, StringComparison.Ordinal);
 
         // And an unreadable page size means "cannot size this", not "scale by

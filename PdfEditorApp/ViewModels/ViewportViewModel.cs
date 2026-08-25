@@ -1265,6 +1265,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _linesByPage.Clear();
         _selectedLine = null;
         _selectedLinePage = -1;
+        SelectedTextUnit = null;
     }
 
     /// <summary>
@@ -4378,9 +4379,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // The document's own text, which is not one of ours and gets its own
         // frame. No grips: nothing here is draggable, and a handle that does
         // nothing is worse than no handle.
-        if (_selectedWord is { } word && _selectedWordPage >= 0)
+        //
+        // ⚠️ THE UNIT, whichever it turned out to be. This used to draw only a
+        // word, because a word was the only thing a click could select. It is a
+        // whole line now unless the line refused, and the frame has to say which
+        // it is: the reader is about to click inside it to type, and the box is
+        // the only thing on screen that tells them what they are about to
+        // change.
+        if (_selectedTextUnit is { } word && word.Page >= 0)
         {
-            var textSlot = SlotFor(_selectedWordPage);
+            var textSlot = SlotFor(word.Page);
 
             // PADDED, and the frame is the ONLY thing padded. The word's bounds
             // are the tight box around its glyphs, which is what the hit test
@@ -4393,9 +4401,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // zoom, and slightly deeper than it is wide because the crowding is
             // worst above and below. This is what makes the frame sit off the
             // text the way the reader's own selection does.
+            // ⚠️ THE SAME NUMBERS THE HIT TEST USES, taken from it rather than
+            // repeated, because a frame the reader can see and a box the pointer
+            // can enter that disagree by a few points is a click that lands
+            // inside the rule and dismisses the selection.
             double h = (word.Bottom - word.Top) * SlotLayoutWidth;
-            double padX = h * 0.22;
-            double padY = h * 0.30;
+            double padX = h * TextUnitSelection.FramePadXFactor;
+            double padY = h * TextUnitSelection.FramePadYFactor;
 
             double tl = (word.Left * SlotLayoutWidth) - padX;
             double tt = (word.Top * SlotLayoutWidth) - padY;
@@ -4403,7 +4415,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 tl, tt,
                 (word.Right * SlotLayoutWidth) - tl + padX,
                 (word.Bottom * SlotLayoutWidth) - tt + padY,
-                string.Empty));
+                word.CanEdit ? EditableUnitColor : RefusedUnitColor));
         }
 
         if (_selectedLoaded is LoadedSelection sel)
@@ -5122,6 +5134,163 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Status = "Line changed.";
         return true;
     }
+
+    // ---------------- The selected unit of the document's own text ----------------
+    //
+    // ⚠️ THE GESTURE, AND WHY IT IS TWO CLICKS. The first selects and shows what
+    // it selected; the second says where in it to type. Nothing is guessed from
+    // how fast the clicks arrive, and nothing is hidden behind a count of them.
+    //
+    // The unit is the LINE when the line can be edited and the WORD under the
+    // click when it cannot. That fallback is load-bearing rather than tidy: a
+    // justified line refuses by design, and so do a mixed-style line and two
+    // labels sharing a baseline, but every WORD on those lines is editable. A
+    // line-only rule would make a typo in justified body text uncorrectable.
+
+    private TextUnitSelection? _selectedTextUnit;
+
+    /// <summary>The piece of the document's own text that is selected, or null.</summary>
+    public TextUnitSelection? SelectedTextUnit
+    {
+        get => _selectedTextUnit;
+        private set
+        {
+            if (ReferenceEquals(_selectedTextUnit, value)) { return; }
+
+            _selectedTextUnit = value;
+            OnPropertyChanged(nameof(SelectedTextUnit));
+            OnPropertyChanged(nameof(HasSelectedTextUnit));
+
+            // The frame the page already draws round selected page text, which
+            // is where the padding rule lives. Adding a second overlay for this
+            // would have drawn an unpadded rule straight through the feet of
+            // the type.
+            RefreshSelectionOutline();
+        }
+    }
+
+    public bool HasSelectedTextUnit => _selectedTextUnit is not null;
+
+    /// <summary>
+    /// Selects the unit of the document's own text under a point: the line if
+    /// the line can be retyped, otherwise the word.
+    ///
+    /// A unit that can be edited by NEITHER route is still selected and still
+    /// boxed. Showing the reader what they clicked and saying why it cannot be
+    /// changed is the difference between a limitation and a click that did
+    /// nothing.
+    /// </summary>
+    public bool SelectTextUnitAt(int pageIndex, double normX, double normY)
+    {
+        if (_documentHandle == 0) { return false; }
+
+        var line = LineAt(pageIndex, normX, normY);
+        var word = WordAt(pageIndex, normX, normY);
+
+        TextUnitSelection? picked =
+            line is { CanEdit: true } ? TextUnitSelection.From(pageIndex, line)
+            : word is { CanEdit: true } ? TextUnitSelection.From(pageIndex, word)
+            : line is not null ? TextUnitSelection.From(pageIndex, line)
+            : word is not null ? TextUnitSelection.From(pageIndex, word)
+            : null;
+
+        SelectedTextUnit = picked;
+
+        // The two older fields stay in step, because the commit paths still read
+        // them: EditSelectedLine and EditSelectedWord are unchanged and this is
+        // deliberately not a third way to write text.
+        SelectedLine = picked?.Line;
+        _selectedLinePage = picked?.Line is null ? -1 : pageIndex;
+        SelectedWord = picked?.Word;
+        _selectedWordPage = picked?.Word is null ? -1 : pageIndex;
+
+        if (picked is not null)
+        {
+            Diag.Log(
+                $"SelectTextUnitAt p{pageIndex} kind={picked.Kind} canEdit={picked.CanEdit} "
+                + $"text={picked.Text}");
+            Status = picked.Description;
+        }
+
+        return picked is not null;
+    }
+
+    /// <summary>Drops the selected unit and its box.</summary>
+    public void ClearTextUnitSelection()
+    {
+        if (_selectedTextUnit is null) { return; }
+
+        SelectedTextUnit = null;
+        ClearLineSelection();
+        ClearPageTextSelection();
+    }
+
+    /// <summary>Whether a point falls inside the selected unit's box.</summary>
+    public bool TextUnitBoxContains(int pageIndex, double normX, double normY) =>
+        _selectedTextUnit?.Contains(pageIndex, normX, normY) ?? false;
+
+    /// <summary>
+    /// Where the caret goes for a click inside the selected unit: how many of
+    /// its characters lie to the left of the point.
+    ///
+    /// Measured against the page's own character boxes rather than guessed from
+    /// the fraction of the width, because a proportional font's letters are not
+    /// the same width and the caret would drift along the line.
+    /// </summary>
+    public int CaretOffsetFor(int pageIndex, double contentX)
+    {
+        if (_selectedTextUnit is not { } unit) { return 0; }
+        if (TextLayerFor(pageIndex) is not { } layer) { return 0; }
+
+        int at = layer.CaretOffsetOnLine(
+            contentX, unit.Top * OverlayScale, unit.Bottom * OverlayScale);
+
+        // A WORD's box covers part of its line, so the count includes whatever
+        // came before it on that line. What the editor holds is the word alone.
+        if (unit.Kind == TextUnitKind.Word)
+        {
+            int leading = layer.CaretOffsetOnLine(
+                unit.Left * OverlayScale, unit.Top * OverlayScale, unit.Bottom * OverlayScale);
+            at -= leading;
+        }
+
+        return Math.Clamp(at, 0, unit.Text.Length);
+    }
+
+    /// <summary>
+    /// Commits typed text to whichever unit is selected, through the core call
+    /// that unit needs.
+    ///
+    /// Both writes are exactly as they were: this chooses between them and does
+    /// nothing else. A third way to write a document's text is the one thing
+    /// this interaction change must not become.
+    /// </summary>
+    public bool CommitTextUnit(string newText)
+    {
+        if (_selectedTextUnit is not { } unit) { return false; }
+        if (!unit.CanEdit)
+        {
+            Status = unit.RefusalReason;
+            return false;
+        }
+
+        bool wrote = unit.Kind == TextUnitKind.Line
+            ? EditSelectedLine(newText)
+            : EditSelectedWord(newText);
+
+        SelectedTextUnit = null;
+        return wrote;
+    }
+
+    /// <summary>
+    /// A unit that can be retyped, and one that can only be read.
+    ///
+    /// Eight digits, alpha first, like every other colour constant here:
+    /// HexBrush goes through InkPresets.ParseHex and the six-digit form is not
+    /// what the rest of the app writes.
+    /// </summary>
+    private const string EditableUnitColor = "#FF2D6FC4";
+    private const string RefusedUnitColor = "#FFB0700F";
 
     // ---------------- Links ----------------
     //

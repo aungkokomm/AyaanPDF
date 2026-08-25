@@ -98,9 +98,9 @@ public class LineEditWiringTests
         string body = Body(ViewModel(), "public bool EditSelectedLine(");
         Assert.Contains("!line.CanEdit", body, StringComparison.Ordinal);
 
-        string open = Body(Page(), "private bool OpenLineEditor(int page)");
-        Assert.Contains("!line.CanEdit", open, StringComparison.Ordinal);
-        Assert.Contains("line.RefusalReason", open, StringComparison.Ordinal);
+        string open = Body(Page(), "private bool OpenUnitEditor(int caretAt)");
+        Assert.Contains("!unit.CanEdit", open, StringComparison.Ordinal);
+        Assert.Contains("unit.RefusalReason", open, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -168,89 +168,10 @@ public class LineEditWiringTests
     // ---------------- the gesture ----------------
 
     [Fact]
-    public void a_triple_click_is_checked_before_anything_else_a_press_could_mean()
+    public void the_word_edit_core_is_untouched()
     {
-        // Every check below it would treat the third click as an ordinary
-        // press: a link would be followed, a form field operated, an object
-        // picked up, a text selection started.
-        string page = Page();
-        int at = page.IndexOf("case ToolMode.Select:", StringComparison.Ordinal);
-        Assert.True(at > 0);
-
-        int next = page.IndexOf("\n            case ToolMode.", at + 10, StringComparison.Ordinal);
-        string body = page[at..(next > at ? next : page.Length)];
-
-        int triple = body.IndexOf("TakeTripleClick(", StringComparison.Ordinal);
-        int link = body.IndexOf("ViewModel.LinkAt(", StringComparison.Ordinal);
-        int form = body.IndexOf("ViewModel.FillableFieldAt(", StringComparison.Ordinal);
-        int select = body.IndexOf("ViewModel.SelectAnnotationAt(", StringComparison.Ordinal);
-
-        Assert.True(triple > 0, "a triple click is not recognised at all");
-        Assert.True(triple < link, "a link is followed before the line is taken");
-        Assert.True(triple < form, "a form field is operated before the line is taken");
-        Assert.True(triple < select, "an object is picked up before the line is taken");
-    }
-
-    [Fact]
-    public void the_third_click_is_caught_on_the_word_editor_too()
-    {
-        // ⚠️ THE ROUTE THAT IS EASY TO MISS. The second click of a triple click
-        // opens the word editor directly over the word, so the third one lands
-        // on that TextBox and never reaches the viewport. Without this hook the
-        // gesture just places a caret and the line is unreachable.
-        string page = Page();
-
-        Assert.Contains("_wordEditor.PointerPressed += WordEditor_PointerPressed;",
-                        page, StringComparison.Ordinal);
-        Assert.Contains("editor.PointerPressed -= WordEditor_PointerPressed;",
-                        page, StringComparison.Ordinal);
-
-        string body = Body(page, "private void WordEditor_PointerPressed(");
-        Assert.Contains("TakeTripleClick(", body, StringComparison.Ordinal);
-        Assert.Contains("CancelWordEdit()", body, StringComparison.Ordinal);
-        Assert.Contains("EscalateToLine()", body, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void a_double_click_is_remembered_even_when_no_word_editor_opens()
-    {
-        // Because that is exactly when the third click reaches the viewport. A
-        // word can refuse while the line it sits on is perfectly editable: a
-        // word split across two objects is a measured case.
-        string page = Page();
-        int at = page.IndexOf("private void ViewportHost_DoubleTapped(", StringComparison.Ordinal);
-        Assert.True(at > 0);
-
-        int next = page.IndexOf("\n    // ----------------", at, StringComparison.Ordinal);
-        string body = page[at..(next > at ? next : page.Length)];
-
-        int remember = body.IndexOf("RememberDoubleTap(", StringComparison.Ordinal);
-        int open = body.IndexOf("OpenWordEditor(", StringComparison.Ordinal);
-
-        Assert.True(remember > 0, "the double click is not remembered");
-        Assert.True(remember < open, "it is only remembered when a word editor opens");
-    }
-
-    [Fact]
-    public void one_triple_click_is_one_gesture()
-    {
-        // Consumed when taken, so a fourth and fifth click do not each re-open
-        // the editor on top of the one already there.
-        string body = Body(Page(), "private bool TakeTripleClick(");
-
-        Assert.Contains("_lastDoubleTapAt = DateTimeOffset.MinValue;", body, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void the_word_gesture_is_untouched()
-    {
-        // Double-click still means the word. The line is the click after it,
-        // and adding it must not have moved anything.
-        string page = Page();
-
-        Assert.Contains("ViewModel.SelectPageTextAt(content.Page, nx, ny)\n            && OpenWordEditor(content.Page)",
-                        page, StringComparison.Ordinal);
-
+        // The gesture that reaches it has now changed twice; the write behind
+        // it has not changed at all, and this is what says so.
         string vm = ViewModel();
         Assert.Contains("public bool EditSelectedWord(", vm, StringComparison.Ordinal);
         Assert.Contains("RecordEdit(new WordTextRecord(", vm, StringComparison.Ordinal);
@@ -263,37 +184,14 @@ public class LineEditWiringTests
     {
         string page = Page();
 
-        Assert.Contains("private void LineEditor_LostFocus(object sender, RoutedEventArgs e) => CommitLineEdit();",
+        Assert.Contains("private void UnitEditor_LostFocus(object sender, RoutedEventArgs e) => CommitUnitEdit();",
                         page, StringComparison.Ordinal);
 
-        string keys = Body(page, "private void LineEditor_KeyDown(");
+        string keys = Body(page, "private void UnitEditor_KeyDown(");
         Assert.Contains("VirtualKey.Enter", keys, StringComparison.Ordinal);
-        Assert.Contains("CommitLineEdit()", keys, StringComparison.Ordinal);
+        Assert.Contains("CommitUnitEdit()", keys, StringComparison.Ordinal);
         Assert.Contains("VirtualKey.Escape", keys, StringComparison.Ordinal);
-        Assert.Contains("CancelLineEdit()", keys, StringComparison.Ordinal);
-    }
-
-    [Fact]
-    public void the_editor_is_unhooked_before_it_is_removed()
-    {
-        // Removing a focused TextBox raises LostFocus, which would re-enter the
-        // commit that is already running.
-        string body = Body(Page(), "private void TearDownLineEditor()");
-
-        int unhook = body.IndexOf("editor.LostFocus -= LineEditor_LostFocus;", StringComparison.Ordinal);
-        int remove = body.IndexOf("EditCanvas.Children.Remove(editor);", StringComparison.Ordinal);
-
-        Assert.True(unhook > 0 && remove > unhook, "the editor is removed while still hooked");
-    }
-
-    [Fact]
-    public void closing_one_editor_does_not_hide_the_layer_under_another()
-    {
-        // Three editors share EditOverlay now. Hiding it from under one would
-        // take the others with it.
-        string body = Body(Page(), "private void TearDownLineEditor()");
-
-        Assert.Contains("_textEditor is null && _wordEditor is null", body, StringComparison.Ordinal);
+        Assert.Contains("CancelUnitEdit()", keys, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -301,9 +199,9 @@ public class LineEditWiringTests
     {
         // It is sized to the line plus room to type past its end, and a long
         // line near the right margin would otherwise put the box off screen.
-        string body = Body(Page(), "private bool OpenLineEditor(int page)");
+        string body = Body(Page(), "private bool OpenUnitEditor(int caretAt)");
 
-        Assert.Contains("Math.Min(", body, StringComparison.Ordinal);
-        Assert.Contains("ViewModel.OverlayScale,", body, StringComparison.Ordinal);
+        Assert.Contains("Math.Min(scale,", body, StringComparison.Ordinal);
+        Assert.Contains("scale = ViewModel.OverlayScale", body, StringComparison.Ordinal);
     }
 }

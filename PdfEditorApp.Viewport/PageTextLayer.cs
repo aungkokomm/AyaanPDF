@@ -130,6 +130,60 @@ public sealed class PageTextLayer
     }
 
     /// <summary>
+    /// Where the caret goes when a reader clicks at <paramref name="x"/> on the
+    /// line lying between <paramref name="top"/> and <paramref name="bottom"/>:
+    /// the number of that line's characters sitting to the left of the click.
+    ///
+    /// ⚠️ GEOMETRIC, AND THAT IS THE POINT. It would be easier to hit-test a
+    /// character and use its index, but the index would be into THIS layer's
+    /// string, and the editor is opened on the text a WORD or LINE reported,
+    /// which is assembled from the page objects instead. The two agree on the
+    /// visible characters and disagree about the separators: a line built from
+    /// several objects has its doubled space collapsed, so an index carried
+    /// across lands one place out for every join. Counting what is to the left
+    /// needs no correspondence between the two strings at all.
+    ///
+    /// A character counts as on the line when its vertical centre is inside the
+    /// band, so the tall and short glyphs of one line all belong to it, and as
+    /// left of the click when its own centre is. Using the centre rather than an
+    /// edge is what puts the caret on the nearer side of the letter clicked.
+    ///
+    /// Everything is in the space this layer was built in, which is the same
+    /// space the overlay draws in and the same one a pointer arrives in.
+    /// </summary>
+    public int CaretOffsetOnLine(double x, double top, double bottom)
+    {
+        if (bottom < top)
+        {
+            (top, bottom) = (bottom, top);
+        }
+
+        int before = 0;
+        foreach (var c in _chars)
+        {
+            double centreY = (c.Top + c.Bottom) / 2.0;
+            if (centreY < top || centreY > bottom)
+            {
+                continue;
+            }
+
+            // A line break carries a rect of its own and is not a character the
+            // reader can put a caret in front of.
+            if (c.Character == '\n' || c.Character == '\r')
+            {
+                continue;
+            }
+
+            if ((c.Left + c.Right) / 2.0 < x)
+            {
+                before++;
+            }
+        }
+
+        return before;
+    }
+
+    /// <summary>
     /// One rect per visual line covered by [start, start + length): contiguous
     /// characters are grouped by row (near-equal Top), so a selection or
     /// match wrapping across lines highlights as separate per-line
