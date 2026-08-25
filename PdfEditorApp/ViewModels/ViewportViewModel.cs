@@ -3004,6 +3004,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// How many DIPs one PDF POINT covers on this page at the current zoom.
+    ///
+    /// ⚠️ The converter for anything whose size is an absolute point size, which
+    /// a page's own text is. It is NOT <see cref="OverlayScale"/>: that turns
+    /// NORMALIZED units (0..1 across the page) into DIPs, so it is roughly the
+    /// page width in DIPs. Multiplying a 22pt word by it asked for a font size
+    /// in the thousands and filled the window with two letters.
+    ///
+    /// Zero when the page size cannot be read, which callers must treat as
+    /// "cannot size this" rather than scaling by nothing.
+    /// </summary>
+    public double DipsPerPointOn(int pageIndex)
+    {
+        var (widthPts, _) = PagePointsFor(pageIndex);
+        return widthPts > 0 ? SlotLayoutWidth / widthPts : 0;
+    }
+
     /// <summary>Point-space dimensions of the given page. Same source
     /// <see cref="CurrentPagePoints"/> uses, exposed per-index so the margin
     /// / column presets can handle mixed-size documents correctly (a legal

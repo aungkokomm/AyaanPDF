@@ -248,6 +248,34 @@ public class WordEditWiringTests
         Assert.Contains("CommitWordEdit();", body, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void the_editor_sizes_type_in_points_and_geometry_in_normalized_units()
+    {
+        // ⚠️ TWO DIFFERENT SCALES SHARE THIS METHOD. A word's BOUNDS are
+        // normalized (0..1 across the page) and convert with OverlayScale; its
+        // FONT SIZE is an absolute point size and converts with DIPs-per-point.
+        // Mixing them is not a small error: a 22pt word scaled by OverlayScale
+        // asked for a font size of about 14,850 DIPs and filled the window with
+        // two letters, which is exactly what happened.
+        string code = Page();
+
+        int open = code.IndexOf("private bool OpenWordEditor(", StringComparison.Ordinal);
+        int next = code.IndexOf("/// <summary>", open, StringComparison.Ordinal);
+        string body = code[open..next];
+
+        Assert.Contains("DipsPerPointOn(page)", body, StringComparison.Ordinal);
+
+        // The font size must come from the point converter, never from the
+        // normalized one. Asserted as an exact string so the two cannot be
+        // swapped back without this failing.
+        Assert.Contains("FontSize = System.Math.Max(8, fontDip)",
+            body, StringComparison.Ordinal);
+
+        // And an unreadable page size means "cannot size this", not "scale by
+        // nothing", which would collapse the editor to a sliver.
+        Assert.Contains("dipsPerPoint <= 0", body, StringComparison.Ordinal);
+    }
+
     private static int Count(string haystack, string needle)
     {
         int n = 0, at = 0;

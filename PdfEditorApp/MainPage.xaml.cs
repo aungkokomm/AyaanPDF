@@ -7206,7 +7206,16 @@ public sealed partial class MainPage : Page
         double scale = ViewModel.OverlayScale;
         double pageTop = ViewModel.SlotTopOf(page);
         double widthDip = (word.Right - word.Left) * scale;
-        double heightDip = (word.Bottom - word.Top) * scale;
+
+        // ⚠️ TWO DIFFERENT SCALES, and mixing them is what filled the window
+        // with two enormous letters. The word's BOUNDS are normalized (0..1
+        // across the page), so they convert with OverlayScale. Its FONT SIZE is
+        // an absolute point size, so it converts with DIPs-per-point. Using
+        // OverlayScale on the size asked for a font of several thousand pixels.
+        double dipsPerPoint = ViewModel.DipsPerPointOn(page);
+        if (dipsPerPoint <= 0) { return false; }
+
+        double fontDip = word.FontSizePts * dipsPerPoint;
 
         _wordBeingEdited = word;
         _wordEditorPage = page;
@@ -7217,14 +7226,16 @@ public sealed partial class MainPage : Page
             // "done" here rather than "new paragraph".
             AcceptsReturn = false,
             TextWrapping = TextWrapping.NoWrap,
-            Width = System.Math.Max(48, widthDip + (12 * scale / 4)),
-            MinHeight = System.Math.Max(20, heightDip * 1.5),
+            // Room for a couple more characters than the word has, so typing a
+            // longer one does not immediately scroll inside the box.
+            Width = System.Math.Max(48, widthDip + (fontDip * 2)),
+            MinHeight = System.Math.Max(20, fontDip * 1.6),
             Padding = new Thickness(2, 0, 2, 0),
             BorderThickness = new Thickness(1.5),
             BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2D, 0x6F, 0xC4)),
             CornerRadius = new CornerRadius(2),
             Background = new SolidColorBrush(Colors.White),
-            FontSize = System.Math.Max(8, word.FontSizePts * scale * 0.75),
+            FontSize = System.Math.Max(8, fontDip),
             Text = word.Text,
         };
 
