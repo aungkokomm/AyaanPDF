@@ -64,6 +64,7 @@ internal static class WordClusterGateway
         return RenderCoreNative.set_word_cluster_text(
             docHandle, pageIndex,
             objects, (nuint)objects.Length,
+            (uint)cluster.PrefixChars,
             text, (nuint)text.Length,
             font, (nuint)(font?.Length ?? 0));
     }

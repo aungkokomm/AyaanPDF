@@ -19,6 +19,10 @@ public class WordClusterTests
 {
     /// <summary>Builds a buffer the way render_core lays one out.</summary>
     private static byte[] Buffer(params (int[] Objects, string Text, string Font, uint Refusal)[] words)
+        => Buffer(0, words);
+
+    private static byte[] Buffer(
+        uint prefix, params (int[] Objects, string Text, string Font, uint Refusal)[] words)
     {
         var bytes = new List<byte>();
         bytes.AddRange(BitConverter.GetBytes((uint)words.Length));
@@ -40,6 +44,7 @@ public class WordClusterTests
             bytes.AddRange(BitConverter.GetBytes(12.5f));  // size
             bytes.AddRange(BitConverter.GetBytes(0x00AABBCCu));
             bytes.AddRange(BitConverter.GetBytes(refusal));
+            bytes.AddRange(BitConverter.GetBytes(prefix));
 
             byte[] t = Encoding.UTF8.GetBytes(text);
             bytes.AddRange(BitConverter.GetBytes((uint)t.Length));
@@ -72,6 +77,29 @@ public class WordClusterTests
         Assert.Equal(12.5, w.FontSizePts, 5);
         Assert.Equal(0x00AABBCCu, w.ColorRgb);
         Assert.True(w.CanEdit);
+    }
+
+    [Fact]
+    public void the_offset_that_identifies_a_word_survives_the_trip()
+    {
+        // ⚠️ AN OBJECT LIST DOES NOT NAME A WORD. A producer that emits one text
+        // object per LINE gives every word on it the same list: a real invoice
+        // had TELECOM, INTERNATIONAL, MYANMAR and COMPANY all claiming object
+        // 15. The offset inside that object is what tells them apart, and the
+        // write sends it back, so losing it here would edit the wrong word.
+        var found = WordClusterReader.Parse(
+            Buffer(8, ([15], "One", "Helvetica", 0)));
+
+        Assert.Equal(8, Assert.Single(found).PrefixChars);
+    }
+
+    [Fact]
+    public void a_word_split_across_two_objects_refuses()
+    {
+        var w = Assert.Single(WordClusterReader.Parse(Buffer(([0, 1], "x", "Arial", 6))));
+
+        Assert.Equal(ClusterRefusal.PartialSpan, w.Refusal);
+        Assert.False(w.CanEdit);
     }
 
     [Fact]

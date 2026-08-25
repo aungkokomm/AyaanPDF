@@ -26,6 +26,10 @@ public enum ClusterRefusal
 
     /// <summary>No text object owns these characters.</summary>
     NoObjects = 5,
+
+    /// <summary>The word begins part-way through one object and ends part-way
+    /// through another, so there is no single string to splice it into.</summary>
+    PartialSpan = 6,
 }
 
 /// <summary>
@@ -54,6 +58,15 @@ public enum ClusterRefusal
 /// groups words into lines, and later into paragraphs, without needing a second
 /// pass over the page.
 /// </param>
+/// <param name="PrefixChars">
+/// How many characters of the first object come BEFORE this word.
+///
+/// ⚠️ THIS IS WHAT IDENTIFIES THE WORD, together with the object list and not
+/// instead of it. A producer that emits one text object per LINE gives every
+/// word on that line the same objects: a real invoice had TELECOM,
+/// INTERNATIONAL, MYANMAR and COMPANY all claiming object 15. Sending only the
+/// objects back would edit whichever of them came first.
+/// </param>
 /// <param name="Refusal">
 /// Why this word cannot be rewritten, or <see cref="ClusterRefusal.None"/>. It
 /// travels WITH the word because a word that cannot be edited can still be
@@ -70,6 +83,7 @@ public sealed record WordClusterSnapshot(
     double FontSizePts,
     uint ColorRgb,
     ClusterRefusal Refusal,
+    int PrefixChars,
     string Text,
     string FontName)
 {
@@ -87,6 +101,7 @@ public sealed record WordClusterSnapshot(
         ClusterRefusal.MixedStyle => "This word is set in more than one font or size.",
         ClusterRefusal.SplitObjects => "This script stores its marks out of order, and editing it would scramble the text.",
         ClusterRefusal.NoFontName => "This text does not name its font, so there is no way to match it.",
+        ClusterRefusal.PartialSpan => "This word is split across two pieces of the page and cannot be replaced cleanly.",
         _ => "This text cannot be edited.",
     };
 }

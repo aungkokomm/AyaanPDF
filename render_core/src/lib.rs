@@ -7870,6 +7870,10 @@ const CLUSTER_SPLIT_OBJECTS: u32 = 3;
 const CLUSTER_NO_FONT_NAME: u32 = 4;
 /// No text object owns these characters, so there is nothing to write to.
 const CLUSTER_NO_OBJECTS: u32 = 5;
+/// The word begins part-way through one object and ends part-way through
+/// another. Splicing it would mean editing two strings at once and getting the
+/// join right; refusing is honest and this has not been seen on a real file.
+const CLUSTER_PARTIAL_SPAN: u32 = 6;
 
 /// One word of a page's own text, and the objects that draw it.
 struct WordCluster {
@@ -7888,6 +7892,16 @@ struct WordCluster {
     /// Kept as its own flag rather than folded into the font name, so the
     /// reader is told the real objection.
     mixed: bool,
+    /// Characters of the FIRST object that come before this word, and of the
+    /// LAST object that come after it.
+    ///
+    /// ⚠️ USUALLY ZERO AND SOMETIMES NOT, which is the whole point. Plenty of
+    /// producers emit ONE TEXT OBJECT PER LINE: a real invoice put TELECOM,
+    /// INTERNATIONAL, MYANMAR and COMPANY all in object 15. Writing one word
+    /// into that object replaces the entire line with that word, so a word that
+    /// shares its object has to be spliced into the existing string instead.
+    prefix: usize,
+    suffix: usize,
 }
 
 impl WordCluster {
@@ -7910,6 +7924,11 @@ impl WordCluster {
         }
         if self.objects.windows(2).any(|p| p[1] != p[0] + 1) {
             return CLUSTER_SPLIT_OBJECTS;
+        }
+        // Sharing an object is fine, and is spliced. Starting inside one and
+        // ending inside another is not: that is two strings to edit at once.
+        if self.objects.len() > 1 && (self.prefix > 0 || self.suffix > 0) {
+            return CLUSTER_PARTIAL_SPAN;
         }
         CLUSTER_OK
     }
@@ -7958,19 +7977,60 @@ fn page_word_clusters(
         return Vec::new();
     };
 
+    // How many characters each object draws in total, so a word can tell how
+    // much of its object sits after it. Counted first because the answer is
+    // needed at the moment a word ENDS, which is before the rest of the object
+    // has been walked.
+    let mut total_in_object: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for c in text_page.chars().iter() {
+        if let Some(i) = c
+            .text_object()
+            .ok()
+            .and_then(|t| index_of.get(&(t.object_handle() as usize)).copied())
+        {
+            *total_in_object.entry(i).or_insert(0) += 1;
+        }
+    }
+
+    // How many characters of each object have been passed so far.
+    let mut seen_in_object: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
     let mut out: Vec<WordCluster> = Vec::new();
     let mut cur: Option<WordCluster> = None;
+    let mut last_owner_position: Option<(usize, usize)> = None;
 
     for c in text_page.chars().iter() {
         let ch = c.unicode_char().unwrap_or('\u{fffd}');
+
+        let owner = c
+            .text_object()
+            .ok()
+            .and_then(|t| index_of.get(&(t.object_handle() as usize)).copied());
+
+        // COUNTED BEFORE THE WHITESPACE CHECK, and that order is the whole
+        // point. This offset is used to find the word inside its object's OWN
+        // string, so every character that string contains has to advance it.
+        // Counting only the non-blank ones put "One" at 7 in "Chapter One"
+        // instead of 8; the write then verified the span it was about to
+        // replace, found " On" rather than "One", and refused.
+        let position = owner.map(|i| {
+            let seen = seen_in_object.entry(i).or_insert(0);
+            let at = *seen;
+            *seen += 1;
+            (i, at)
+        });
 
         // A word ends at whitespace. PDFium inserts its own spaces and line
         // breaks between objects that only LOOK adjacent, which is exactly the
         // judgement wanted here and is why the split is on the char stream.
         if ch.is_whitespace() {
-            if let Some(w) = cur.take() {
+            if let Some(mut w) = cur.take() {
+                w.suffix = trailing_room(&total_in_object, last_owner_position);
                 out.push(w);
             }
+            last_owner_position = None;
             continue;
         }
 
@@ -7978,13 +8038,10 @@ fn page_word_clusters(
             break;
         }
 
-        let owner = c
-            .text_object()
-            .ok()
-            .and_then(|t| index_of.get(&(t.object_handle() as usize)).copied());
-
         let font = c.font_name();
         let size = c.scaled_font_size().value;
+
+        let starting = cur.is_none();
 
         let w = cur.get_or_insert(WordCluster {
             text: String::new(),
@@ -8002,7 +8059,16 @@ fn page_word_clusters(
             top: f32::MIN,
             upright: true,
             mixed: false,
+            prefix: 0,
+            suffix: 0,
         });
+
+        if starting {
+            w.prefix = position.map(|(_, at)| at).unwrap_or(0);
+        }
+        if position.is_some() {
+            last_owner_position = position;
+        }
 
         w.text.push(ch);
 
@@ -8030,12 +8096,26 @@ fn page_word_clusters(
         }
     }
 
-    if let Some(w) = cur.take() {
+    if let Some(mut w) = cur.take() {
+        w.suffix = trailing_room(&total_in_object, last_owner_position);
         out.push(w);
     }
 
     out.retain(|w| !w.text.is_empty() && w.left <= w.right);
     out
+}
+
+/// Characters of an object that come AFTER the position given.
+fn trailing_room(
+    totals: &std::collections::HashMap<usize, usize>,
+    last: Option<(usize, usize)>,
+) -> usize {
+    let Some((object, at)) = last else { return 0 };
+    totals
+        .get(&object)
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(at + 1)
 }
 
 /// Every word on a page, for the app's model.
@@ -8102,6 +8182,13 @@ fn get_page_word_clusters_inner(doc_handle: u64, page_index: i32) -> ByteBuffer 
         out.extend_from_slice(&w.color.to_le_bytes());
         out.extend_from_slice(&w.refusal().to_le_bytes());
 
+        // ⚠️ WHAT IDENTIFIES THIS WORD. Its object list does not: a producer
+        // that emits one object per line gives every word on that line the same
+        // one, and a real invoice had four words all claiming object 15. The
+        // offset of the word inside that object is what tells them apart, and
+        // the write takes it back so it edits the word that was asked for.
+        out.extend_from_slice(&(w.prefix as u32).to_le_bytes());
+
         out.extend_from_slice(&(w.text.len() as u32).to_le_bytes());
         out.extend_from_slice(w.text.as_bytes());
         out.extend_from_slice(&(w.font.len() as u32).to_le_bytes());
@@ -8158,6 +8245,7 @@ pub extern "C" fn set_word_cluster_text(
     page_index: i32,
     objects: *const u32,
     object_count: usize,
+    prefix_chars: u32,
     new_text_utf8: *const u8,
     new_text_len: usize,
     fallback_font_path_utf8: *const u8,
@@ -8184,7 +8272,9 @@ pub extern "C" fn set_word_cluster_text(
     let fallback = utf8_arg(fallback_font_path_utf8, fallback_font_path_len);
 
     panic::catch_unwind(|| {
-        set_word_cluster_text_inner(doc_handle, page_index, &wanted, &new_text, fallback.as_deref())
+        set_word_cluster_text_inner(
+            doc_handle, page_index, &wanted, prefix_chars as usize,
+            &new_text, fallback.as_deref())
     })
     .unwrap_or(STATUS_PANIC)
 }
@@ -8202,6 +8292,7 @@ fn set_word_cluster_text_inner(
     doc_handle: u64,
     page_index: i32,
     wanted: &[usize],
+    wanted_prefix: usize,
     new_text: &str,
     fallback_font_path: Option<&str>,
 ) -> i32 {
@@ -8228,6 +8319,11 @@ fn set_word_cluster_text_inner(
         size: f32,
         right: f32,
         shift: Vec<usize>,
+        /// The word's own text, and where it sits inside its object. When the
+        /// object holds more than this word, only this span may be replaced.
+        word: String,
+        prefix: usize,
+        suffix: usize,
     }
 
     let plan = {
@@ -8236,7 +8332,14 @@ fn set_word_cluster_text_inner(
         };
         let clusters = page_word_clusters(&doc_guard, &page);
 
-        let Some(target) = clusters.iter().find(|c| c.objects == wanted) else {
+        // BOTH, because neither alone identifies a word. The object list is
+        // shared by every word on a line when the producer writes one object per
+        // line; the offset alone would match the same position in a different
+        // object.
+        let Some(target) = clusters
+            .iter()
+            .find(|c| c.objects == wanted && c.prefix == wanted_prefix)
+        else {
             return STATUS_INVALID_INPUT;
         };
         if target.refusal() != CLUSTER_OK {
@@ -8280,14 +8383,29 @@ fn set_word_cluster_text_inner(
             .bindings()
             .FPDFPageObj_GetMatrix(ft.object_handle(), &mut m);
 
+        // WHERE TO MEASURE THE WIDTH CHANGE FROM. When the word is spliced into
+        // a longer string, the thing that grows is the whole OBJECT, so that is
+        // what has to be compared before and after. When the word owns its
+        // objects outright, the first one ends up holding all of it, so the
+        // word's own right edge is the comparable figure.
+        let shares_object = target.prefix > 0 || target.suffix > 0;
+        let right = if shares_object {
+            char_right_edge(&page, target.objects[0]).unwrap_or(target.right)
+        } else {
+            target.right
+        };
+
         Plan {
             objects: target.objects.clone(),
             originals,
             matrix: m,
             color: ft.fill_color().ok(),
             size: ft.unscaled_font_size().value,
-            right: target.right,
+            right,
             shift,
+            word: target.text.clone(),
+            prefix: target.prefix,
+            suffix: target.suffix,
         }
     };
 
@@ -8298,17 +8416,28 @@ fn set_word_cluster_text_inner(
         };
         page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
 
-        write_cluster_objects(&page, &plan.objects, new_text);
+        let wrote = write_cluster_objects(
+            &page, &plan.objects, new_text, &plan.word, plan.prefix, plan.suffix);
+        if !wrote {
+            // The object does not read the way the cluster said it does, so
+            // there is no span anyone can safely replace.
+            return STATUS_UNSUPPORTED;
+        }
         let said = cluster_text_of(&page, &plan.objects);
 
         // REGENERATE BEFORE THIS PAGE GOES OUT OF SCOPE. Object edits live on
         // the page wrapper; letting it drop without rebuilding the content
         // stream throws them away, and the next caller to take the page sees
         // the document exactly as it was.
-        if same_text(&said, new_text) && page.regenerate_content().is_err() {
+        // What the objects should now say: the whole replacement when the word
+        // owned them, or the original string with just this word swapped when
+        // it shares one.
+        let expected = spliced_expectation(&plan.originals, new_text, plan.prefix, plan.suffix);
+
+        if same_text(&said, &expected) && page.regenerate_content().is_err() {
             return STATUS_UNSUPPORTED;
         }
-        same_text(&said, new_text)
+        same_text(&said, &expected)
     };
 
     if path_one {
@@ -8438,18 +8567,82 @@ fn same_text(said: &str, wanted: &str) -> bool {
     said.trim() == wanted.trim()
 }
 
-/// The first object carries the whole word; the rest are emptied.
+/// Puts the replacement where the word was.
+///
+/// TWO SHAPES, and the difference is not cosmetic. When the word owns its
+/// objects outright, the first takes the whole replacement and the rest are
+/// emptied. When it SHARES an object with other words, which many producers do
+/// by emitting one object per line, only the word's own span may be touched:
+/// writing the replacement over the whole object would replace the entire line
+/// with one word.
+///
+/// Returns false when the object does not read the way the cluster said it
+/// does, which means nobody can say which characters are safe to replace.
 fn write_cluster_objects(
     page: &pdfium_render::prelude::PdfPage,
     objects: &[usize],
     new_text: &str,
-) {
+    word: &str,
+    prefix: usize,
+    suffix: usize,
+) -> bool {
     use pdfium_render::prelude::*;
-    for (n, &i) in objects.iter().enumerate() {
-        let Ok(mut o) = page.objects().get(i) else { continue };
-        let PdfPageObject::Text(t) = &mut o else { continue };
-        let _ = t.set_text(if n == 0 { new_text } else { "" });
+
+    if prefix == 0 && suffix == 0 {
+        for (n, &i) in objects.iter().enumerate() {
+            let Ok(mut o) = page.objects().get(i) else { continue };
+            let PdfPageObject::Text(t) = &mut o else { continue };
+            let _ = t.set_text(if n == 0 { new_text } else { "" });
+        }
+        return true;
     }
+
+    let Some(&only) = objects.first() else { return false };
+    let Ok(mut o) = page.objects().get(only) else { return false };
+    let PdfPageObject::Text(t) = &mut o else { return false };
+
+    let existing: Vec<char> = t.text().chars().collect();
+    let word_len = word.chars().count();
+
+    // VERIFIED BEFORE ANYTHING IS WRITTEN. The span is computed from the text
+    // page and applied to the object's own string, and the two are allowed to
+    // disagree; if the characters there are not the word this edit is about,
+    // the write would land on the wrong part of the line.
+    if prefix + word_len > existing.len() {
+        return false;
+    }
+    if existing[prefix..prefix + word_len].iter().collect::<String>() != word {
+        return false;
+    }
+
+    let mut spliced: String = existing[..prefix].iter().collect();
+    spliced.push_str(new_text);
+    spliced.extend(&existing[prefix + word_len..]);
+
+    t.set_text(&spliced).is_ok()
+}
+
+/// What the cluster's objects should say once the replacement has gone in.
+fn spliced_expectation(
+    originals: &[String],
+    new_text: &str,
+    prefix: usize,
+    suffix: usize,
+) -> String {
+    if prefix == 0 && suffix == 0 {
+        return new_text.to_string();
+    }
+
+    let Some(first) = originals.first() else {
+        return new_text.to_string();
+    };
+    let existing: Vec<char> = first.chars().collect();
+    let keep_after = existing.len().saturating_sub(suffix);
+
+    let mut out: String = existing[..prefix.min(existing.len())].iter().collect();
+    out.push_str(new_text);
+    out.extend(&existing[keep_after.min(existing.len())..]);
+    out
 }
 
 /// Puts every object back to the text it held.
@@ -9432,6 +9625,7 @@ mod tests {
         size_pts: f32,
         color: u32,
         refusal: u32,
+        prefix: usize,
         text: String,
         font: String,
     }
@@ -9487,6 +9681,7 @@ mod tests {
                 size_pts: f32_at(&bytes, &mut at),
                 color: u32_at(&bytes, &mut at),
                 refusal: u32_at(&bytes, &mut at),
+                prefix: u32_at(&bytes, &mut at) as usize,
                 text: str_at(&bytes, &mut at),
                 font: str_at(&bytes, &mut at),
             });
@@ -9674,6 +9869,12 @@ mod tests {
 
     /// Asks the core to rewrite one word, the way the app will.
     fn rewrite(handle: u64, objects: &[usize], new_text: &str, font: Option<&str>) -> i32 {
+        rewrite_at(handle, objects, 0, new_text, font)
+    }
+
+    fn rewrite_at(
+        handle: u64, objects: &[usize], prefix: usize, new_text: &str, font: Option<&str>,
+    ) -> i32 {
         let objs: Vec<u32> = objects.iter().map(|&i| i as u32).collect();
         let text = new_text.as_bytes();
         let (fptr, flen) = match font {
@@ -9681,13 +9882,74 @@ mod tests {
             None => (std::ptr::null(), 0),
         };
         set_word_cluster_text(
-            handle, 0, objs.as_ptr(), objs.len(),
+            handle, 0, objs.as_ptr(), objs.len(), prefix as u32,
             text.as_ptr(), text.len(), fptr, flen)
     }
 
     /// The words a page reads as, in order.
     fn words_of(handle: u64) -> Vec<String> {
         decode_clusters(handle, 0).into_iter().map(|c| c.text).collect()
+    }
+
+    #[test]
+    fn the_word_that_was_asked_for_is_the_one_that_changes() {
+        // ⚠️ AN OBJECT LIST DOES NOT IDENTIFY A WORD. A producer that writes one
+        // object per line gives every word on it the same list: a real invoice
+        // had TELECOM, INTERNATIONAL, MYANMAR and COMPANY all claiming object
+        // 15. Matching on the list alone edits whichever came first, so asking
+        // for the second word here must not change the first.
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+
+        let before = decode_clusters(handle, 0);
+        let one = before.iter().find(|c| c.text == "One").expect("no One");
+        let chapter = before.iter().find(|c| c.text == "Chapter").expect("no Chapter");
+        assert_eq!(one.objects, chapter.objects, "fixture must share an object");
+        assert_ne!(one.prefix, chapter.prefix, "the offsets are what tell them apart");
+
+        assert_eq!(
+            rewrite_at(handle, &one.objects, one.prefix, "Two", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let after = words_of(handle);
+        assert!(after.iter().any(|w| w == "Two"), "the edit did not take: {after:?}");
+        assert!(
+            after.iter().any(|w| w == "Chapter"),
+            "the wrong word was edited: {after:?}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn editing_one_word_leaves_the_other_words_in_its_object_alone() {
+        // ⚠️ THE ONE THAT MATTERS ON REAL DOCUMENTS. Plenty of producers emit
+        // ONE TEXT OBJECT PER LINE: the user's invoice put "TELECOM",
+        // "INTERNATIONAL", "MYANMAR" and "COMPANY" all in object 15. Writing a
+        // single word into that object replaces the whole line with one word.
+        //
+        // This fixture is the same shape in miniature: object 0 holds
+        // "Chapter One", so rewriting "Chapter" must not take "One" with it.
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+
+        let before = decode_clusters(handle, 0);
+        let chapter = before.iter().find(|c| c.text == "Chapter").expect("no Chapter");
+        let one = before.iter().find(|c| c.text == "One").expect("no One");
+        assert_eq!(
+            chapter.objects, one.objects,
+            "this fixture is meant to have both words in ONE object");
+
+        assert_eq!(
+            rewrite(handle, &chapter.objects, "Zwolf", Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+
+        let after = words_of(handle);
+        assert!(
+            after.iter().any(|w| w == "Zwolf"),
+            "the edit did not take: {after:?}");
+        assert!(
+            after.iter().any(|w| w == "One"),
+            "editing one word destroyed the rest of its object: {after:?}");
+
+        close_document(handle);
     }
 
     #[test]

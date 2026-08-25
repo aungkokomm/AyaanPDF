@@ -523,10 +523,14 @@ internal static partial class RenderCoreNative
     /// <summary>
     /// Rewrites one word, or changes nothing at all.
     ///
-    /// <paramref name="objects"/> must be exactly the object indices the word
-    /// was read with; the core re-derives the page's words and refuses if they
-    /// no longer describe one, so a stale list cannot edit whatever happens to
-    /// sit at those indices now.
+    /// <paramref name="objects"/> and <paramref name="prefixChars"/> must be
+    /// exactly what the word was read with; the core re-derives the page's words
+    /// and refuses if they no longer describe one, so a stale selection cannot
+    /// edit whatever happens to sit there now.
+    ///
+    /// ⚠️ BOTH are needed to name a word. A producer that emits one object per
+    /// LINE gives every word on it the same object list, so the offset is what
+    /// tells them apart.
     ///
     /// <paramref name="fallbackFontPath"/> is used only when the word's own font
     /// cannot spell the replacement, which for a subset font is the common case.
@@ -542,6 +546,7 @@ internal static partial class RenderCoreNative
         int pageIndex,
         uint[] objects,
         nuint objectCount,
+        uint prefixChars,
         byte[] newTextUtf8,
         nuint newTextLen,
         byte[]? fallbackFontPathUtf8,

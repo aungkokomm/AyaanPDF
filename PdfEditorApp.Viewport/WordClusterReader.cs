@@ -19,7 +19,7 @@ namespace PdfEditorApp.Viewport;
 public static class WordClusterReader
 {
     /// <summary>The fixed fields between the object list and the first string.</summary>
-    private const int FixedFieldBytes = 28;
+    private const int FixedFieldBytes = 32;
 
     /// <summary>
     /// Decodes the buffer, stopping at the first thing that does not make sense
@@ -71,13 +71,14 @@ public static class WordClusterReader
             double size = ReadF32(bytes, ref at);
             uint color = ReadU32(bytes, ref at);
             uint refusal = ReadU32(bytes, ref at);
+            int prefix = (int)ReadU32(bytes, ref at);
 
             if (!ReadString(bytes, ref at, out string text)) { break; }
             if (!ReadString(bytes, ref at, out string font)) { break; }
 
             found.Add(new WordClusterSnapshot(
                 first, objects, left, top, right, bottom, baseline, size, color,
-                AsRefusal(refusal), text, font));
+                AsRefusal(refusal), prefix, text, font));
         }
 
         return found;
@@ -98,6 +99,7 @@ public static class WordClusterReader
         3 => ClusterRefusal.SplitObjects,
         4 => ClusterRefusal.NoFontName,
         5 => ClusterRefusal.NoObjects,
+        6 => ClusterRefusal.PartialSpan,
         _ => ClusterRefusal.NoObjects,
     };
 
