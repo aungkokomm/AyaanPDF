@@ -7041,7 +7041,24 @@ public sealed partial class MainPage : Page
             return null;
         }
 
-        return ViewModel.GripUnder(content.Page, nx, ny) switch
+        var grip = ViewModel.GripUnder(content.Page, nx, ny);
+
+        // A LINK reads as a link. Nothing in the PDF draws one, so without this
+        // the pointer says "select text" over the one place a click will not
+        // select text, which is the whole reason this function exists.
+        //
+        // Asked of the same LinkAt the overlay and the click both use, so the
+        // cursor cannot disagree with either. After the grips, because a grip
+        // belongs to something the reader has already selected and is drawn over
+        // the page; before everything else, because a link owns its pointer.
+        if (grip == LoadedAnnotationPicker.Grip.None
+            && ViewModel.ShowLinks
+            && ViewModel.LinkAt(content.Page, nx, ny) is not null)
+        {
+            return InputSystemCursorShape.Hand;
+        }
+
+        return grip switch
         {
             // Diagonals matching the corner, as every editor does, so the
             // cursor says which way the drag will go.
@@ -7680,12 +7697,24 @@ public sealed partial class MainPage : Page
                 if (ViewModel.ShowLinks
                     && ViewModel.LinkAt(content.Page, nx, ny) is { } clicked)
                 {
+                    Diag.Log($"link press p{content.Page} kind={clicked.Kind} "
+                             + $"index={clicked.AnnotationIndex} uri={clicked.Uri}");
                     ViewModel.SelectLinkAt(content.Page, nx, ny);
                     // Fire and forget: the dialog is async and a pointer handler
                     // cannot await without letting the gesture run on underneath.
                     _ = FollowLinkAsync(clicked);
                     e.Handled = true;
                     break;
+                }
+
+                if (!ViewModel.ShowLinks
+                    && ViewModel.LinkAt(content.Page, nx, ny) is not null)
+                {
+                    // Not an error: with the overlay off a link is just page,
+                    // and a click on it selects text as it always has. Logged
+                    // because "I clicked the link and nothing happened" and
+                    // "Show Links is off" look identical from outside.
+                    Diag.Log($"link press p{content.Page} IGNORED, Show Links is off");
                 }
 
                 // A click on an existing mark picks it up; a click on empty

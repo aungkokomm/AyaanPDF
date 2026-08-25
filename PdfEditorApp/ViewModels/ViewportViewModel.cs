@@ -1115,11 +1115,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // A link's handle is an annotation index, so one held over from the
         // last document would aim a delete at whatever now sits at that
-        // position. Show Links goes off with it: it is a question about the
-        // document that was open, not a preference.
+        // position.
+        //
+        // ⚠️ SHOW LINKS IS NOT CLEARED HERE, and it used to be. This runs on a
+        // document open, on a page-structure change and on two undo paths, so
+        // turning the toggle off here switched the whole feature off underneath
+        // a reader who had asked for it: the outlines stayed on screen from
+        // before, every later click sailed past the link test and landed in
+        // ordinary text selection, and nothing said why. Traced from one real
+        // press in diag.log, at a point provably inside a link's rectangle,
+        // whose very next line was SelectPageTextAt.
+        //
+        // It is a VIEW setting. Only the reader turns it off.
         _linksByPage.Clear();
         ClearSelectedLink();
-        ShowLinks = false;
 
         // ⚠️ The page's WORDS are the same case and were not being cleared at
         // all, so a page of the previous document's text could survive an open.
@@ -2862,6 +2871,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         //
         // Cheap: it derives a handful of rectangles for ONE page, and returns
         // immediately when nothing is being searched for.
+        // Link outlines are drawn onto a card too, so they go back for the same
+        // reason and immediately after: a document reopened with Show Links on
+        // would otherwise come up with the toggle ticked and no boxes.
+        RefreshLinkOutlines();
+
         OnPropertyChanged(nameof(ContentWidth));
         OnPropertyChanged(nameof(ContentHeight));
         LayoutRebuilt?.Invoke();
