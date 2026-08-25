@@ -4196,12 +4196,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_selectedWord is { } word && _selectedWordPage >= 0)
         {
             var textSlot = SlotFor(_selectedWordPage);
-            double tl = word.Left * SlotLayoutWidth;
-            double tt = word.Top * SlotLayoutWidth;
+
+            // PADDED, and the frame is the ONLY thing padded. The word's bounds
+            // are the tight box around its glyphs, which is what the hit test
+            // and the reflow measurement need and must keep. Drawn at that size
+            // the rule lands ON the letterforms: an all-caps word has no
+            // descenders, so its box stops at the baseline and the stroke cuts
+            // straight through the feet of the type.
+            //
+            // Scaled from the word's own height so it holds at any size and any
+            // zoom, and slightly deeper than it is wide because the crowding is
+            // worst above and below. This is what makes the frame sit off the
+            // text the way the reader's own selection does.
+            double h = (word.Bottom - word.Top) * SlotLayoutWidth;
+            double padX = h * 0.22;
+            double padY = h * 0.30;
+
+            double tl = (word.Left * SlotLayoutWidth) - padX;
+            double tt = (word.Top * SlotLayoutWidth) - padY;
             textSlot?.PageTextOutline.Add(new ScaledRect(
                 tl, tt,
-                (word.Right * SlotLayoutWidth) - tl,
-                (word.Bottom * SlotLayoutWidth) - tt,
+                (word.Right * SlotLayoutWidth) - tl + padX,
+                (word.Bottom * SlotLayoutWidth) - tt + padY,
                 string.Empty));
         }
 

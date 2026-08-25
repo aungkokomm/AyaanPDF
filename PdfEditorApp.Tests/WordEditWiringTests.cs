@@ -166,6 +166,35 @@ public class WordEditWiringTests
             "the editor is removed before its handlers are unhooked");
     }
 
+    [Fact]
+    public void the_frame_is_padded_but_the_words_bounds_are_not()
+    {
+        // A word's bounds are the TIGHT box around its glyphs, which is what the
+        // hit test and the reflow measurement need. Drawn at that size the rule
+        // lands on the letterforms: an all-caps word has no descenders, so its
+        // box stops at the baseline and the stroke cuts through the feet of the
+        // type. The padding therefore belongs to the FRAME and nowhere else.
+        string code = ViewModel();
+
+        int outline = code.IndexOf("PageTextOutline.Add(", StringComparison.Ordinal);
+        Assert.True(outline > 0, "the word frame is no longer drawn");
+
+        // Look back over the block that builds the rect.
+        string block = code[Math.Max(0, outline - 1200)..outline];
+        Assert.Contains("padX", block, StringComparison.Ordinal);
+        Assert.Contains("padY", block, StringComparison.Ordinal);
+
+        // And the padding must be derived from the word, not a fixed number of
+        // pixels, or it would swamp small type and vanish on large.
+        Assert.Contains("word.Bottom - word.Top", block, StringComparison.Ordinal);
+
+        // And the geometry handed to the core stays the tight box: the write
+        // takes the cluster straight from the model, so a padded rect could
+        // only get there by someone padding the model itself.
+        Assert.Contains("WordClusterGateway.Write(_documentHandle, page, word, newText)",
+            code, StringComparison.Ordinal);
+    }
+
     private static int Count(string haystack, string needle)
     {
         int n = 0, at = 0;
