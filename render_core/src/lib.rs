@@ -10606,6 +10606,83 @@ mod tests {
         close_document(reopened);
     }
 
+    // ---- the real world, reduced ----
+    //
+    // ⚠️ THESE THREE ARE THE REPRODUCTION of the failure a real form showed and
+    // both synthetic fixtures missed. They are #[ignore]d, and un-ignoring them
+    // is the acceptance criterion for the fix, NOT something to do before it.
+    //
+    // sample_form_utf16.pdf is OoPdfFormExample_2.pdf reduced to the smallest
+    // file that still fails: /Opt and /V in UTF-16BE with a byte order mark, a
+    // checkbox whose /AP /N carries only its on state, and an inline /AcroForm.
+
+    fn open_utf16_form() -> u64 {
+        open_fixture_named("tests/fixtures/sample_form_utf16.pdf")
+    }
+
+    #[test]
+    #[ignore = "reproduction of the real-form failure; un-ignore with the fix"]
+    fn a_utf16_combo_takes_the_option_that_was_asked_for() {
+        // Today: /V comes back EMPTY, because export_value reads the UTF-16
+        // bytes as UTF-8, turns the BOM into two replacement characters and
+        // writes those back as six bytes. PDFium can then match no option at
+        // all, so the field is silently blanked.
+        let handle = open_utf16_form();
+
+        let before = field_named(&decode_fields(handle), "Gender").clone();
+        assert_eq!(before.value, "Man");
+        assert_eq!(
+            before.options,
+            vec![("Man".to_owned(), true), ("Woman".to_owned(), false)]);
+
+        assert_eq!(set_state(handle, "Gender", FIELD_COMBO, 1, true), STATUS_OK_PDFIUM);
+
+        let after = field_named(&decode_fields(handle), "Gender").clone();
+        assert_eq!(after.value, "Woman", "the value was not written as UTF-16");
+        assert!(after.options[1].1, "the new option is not marked selected");
+
+        close_document(handle);
+    }
+
+    #[test]
+    #[ignore = "reproduction of the real-form failure; un-ignore with the fix"]
+    fn a_utf16_pair_option_stores_the_export_half_and_not_the_label() {
+        // Both halves of /Opt are UTF-16 here, so the writer has to pick the
+        // right one AND decode it. Writing the label would submit
+        // "United Kingdom" where the form expects "UK".
+        let handle = open_utf16_form();
+        assert_eq!(set_state(handle, "Country", FIELD_COMBO, 1, true), STATUS_OK_PDFIUM);
+
+        let file = scratch_pdf("utf16-export");
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let raw = std::fs::read(&file).unwrap();
+        let (value, _) = crate::form_state::read_state(&raw, "Country").unwrap();
+
+        assert_eq!(value, "MM");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_checkbox_with_no_off_appearance_still_ticks_and_clears() {
+        // Every checkbox in the real file has /AP /N << /Yes ... >> and no /Off
+        // entry at all, which is legal: a widget with no appearance for a state
+        // simply draws nothing in it.
+        let handle = open_utf16_form();
+        assert!(!field_named(&decode_fields(handle), "Agree").checked());
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, true), STATUS_OK_PDFIUM);
+        assert!(field_named(&decode_fields(handle), "Agree").checked());
+
+        assert_eq!(set_state(handle, "Agree", FIELD_CHECKBOX, 0, false), STATUS_OK_PDFIUM);
+        assert!(!field_named(&decode_fields(handle), "Agree").checked());
+
+        close_document(handle);
+    }
+
     // ---- what must not happen ----
 
     #[test]
