@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -23,6 +23,8 @@ public enum ToolMode
     Shape,
     /// <summary>Click places an editable text box.</summary>
     Text,
+    /// <summary>Drag draws the clickable area of a hyperlink.</summary>
+    Link,
 }
 
 /// <summary>Which extra controls a tool needs in the property bar.</summary>
@@ -92,6 +94,10 @@ public static class ToolCatalog
         new(ToolMode.Text, "Text", "", 'T', ToolOptions.Color | ToolOptions.FontSize),
         new(ToolMode.Note, "Note", "", 'N', ToolOptions.None),
         new(ToolMode.Stamp, "Stamp", "", 'S', ToolOptions.Stamp, StampIcon),
+        // No options of its own: a link has no appearance to style. Measured in
+        // every real file, a link carries no /AP and a zero-width border, so
+        // colour and thickness would be settings that change nothing.
+        new(ToolMode.Link, "Link", "", 'L', ToolOptions.None),
     ];
 
     /// <summary>

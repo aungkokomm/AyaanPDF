@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.UI.Xaml.Media.Imaging;
@@ -116,6 +116,19 @@ public partial class PageSlot : ObservableObject
     /// that do not exist.
     /// </summary>
     public ObservableCollection<ScaledRect> PageTextOutline { get; } = new();
+
+    /// <summary>
+    /// The page's links, outlined, when Show Links is on.
+    ///
+    /// A link draws NOTHING in the PDF: no appearance stream, a zero-width
+    /// border, measured in every real file. So this is the only thing that makes
+    /// one visible, and it is off unless the reader asks, because boxes drawn
+    /// over someone's document are not an improvement to it.
+    ///
+    /// ColorHex separates a link whose address can be edited from one that jumps
+    /// inside the document and is shown but never rewritten.
+    /// </summary>
+    public ObservableCollection<ScaledRect> LinkOutlines { get; } = new();
 
     /// <summary>Marquees for the objects that are ALSO in the multi-selection
     /// besides the anchor. Drawn as thinner accent outlines so the anchor stays

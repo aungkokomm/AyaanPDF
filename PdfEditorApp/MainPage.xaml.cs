@@ -119,6 +119,13 @@ public sealed partial class MainPage : Page
                 SyncPageJumpBox();
             }
 
+            // Adding a link turns the overlay on by itself, so the menu's tick
+            // follows the view model rather than the other way round.
+            if (args.PropertyName == nameof(ViewModel.ShowLinks))
+            {
+                SyncShowLinksToggle();
+            }
+
             // A document arriving or leaving decides which chrome makes sense.
             if (args.PropertyName == nameof(ViewModel.PageCount))
             {
@@ -7409,7 +7416,7 @@ public sealed partial class MainPage : Page
         // over either would act on a selection that is still being changed.
         if (ViewModel.PageCount == 0 || _textEditor is not null
             || _isPanning || _isMovingAnnotation || _isMarqueeing || _isSelectingText
-            || _isDrawing || _isDrawingShape || _isSizingText)
+            || _isDrawing || _isDrawingShape || _isSizingText || _isSizingLink)
         {
             return;
         }
@@ -7424,6 +7431,15 @@ public sealed partial class MainPage : Page
         // and the reason for the first half is Group: without it, right-clicking
         // one of three selected objects would collapse the selection to that one
         // and then offer a greyed-out Group.
+        // A link's menu, and nothing else's. The object menu moves, restyles
+        // and reorders one of OUR marks, and none of that applies to something
+        // the document owns.
+        if (TryShowLinkMenu(content.Page, nx, ny, e.GetPosition(ViewportHost)))
+        {
+            e.Handled = true;
+            return;
+        }
+
         bool onObject = ViewModel.IsOverSelectedObject(content.Page, nx, ny)
                      || ViewModel.SelectAnnotationAt(content.Page, nx, ny);
 
@@ -7656,6 +7672,22 @@ public sealed partial class MainPage : Page
         switch (ViewModel.ActiveTool)
         {
             case ToolMode.Select:
+                // A LINK first, and only while Show Links is on. A link is the
+                // document's, not ours: the reader who has asked to see links
+                // and then clicks one is asking to follow it, not to select a
+                // rectangle. Gated on the toggle so an ordinary click on a page
+                // still selects text the way it always has.
+                if (ViewModel.ShowLinks
+                    && ViewModel.LinkAt(content.Page, nx, ny) is { } clicked)
+                {
+                    ViewModel.SelectLinkAt(content.Page, nx, ny);
+                    // Fire and forget: the dialog is async and a pointer handler
+                    // cannot await without letting the gesture run on underneath.
+                    _ = FollowLinkAsync(clicked);
+                    e.Handled = true;
+                    break;
+                }
+
                 // A click on an existing mark picks it up; a click on empty
                 // space falls through to text selection. That is what makes
                 // annotations objects rather than paint.
@@ -7762,6 +7794,20 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
                 break;
 
+            case ToolMode.Link:
+                // Drag out the clickable area; the address is asked for on
+                // release. Same shape as the text tool, and for the same
+                // reason: what is being placed has a size, not a point.
+                _isSizingLink = true;
+                _dragPointerId = current.PointerId;
+                _linkDragPage = content.Page;
+                _linkDragStartX = nx;
+                _linkDragStartY = ny;
+                BeginLinkPreview(content.Page, nx, ny);
+                ViewportHost.CapturePointer(e.Pointer);
+                e.Handled = true;
+                break;
+
             case ToolMode.Note:
                 ViewModel.AddNoteAt(content.Page, content.X, content.Y);
                 e.Handled = true;
@@ -7864,6 +7910,10 @@ public sealed partial class MainPage : Page
             ViewModel.ExtendShape(content.X, content.Y, constrain: IsShiftDown());
             e.Handled = true;
         }
+        else if (_isSizingLink)
+        {
+            UpdateLinkPreview(content.X / ViewModel.OverlayScale, content.Y / ViewModel.OverlayScale);
+        }
         else if (_isSizingText)
         {
             UpdateTextBoxPreview(content.X / ViewModel.OverlayScale, content.Y / ViewModel.OverlayScale);
@@ -7959,6 +8009,284 @@ public sealed partial class MainPage : Page
             EndTextBoxSizing(end.X / ViewModel.OverlayScale, end.Y / ViewModel.OverlayScale);
             e.Handled = true;
         }
+        else if (_isSizingLink)
+        {
+            _isSizingLink = false;
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            var end = ContentPoint(e);
+            _ = EndLinkSizingAsync(
+                end.X / ViewModel.OverlayScale, end.Y / ViewModel.OverlayScale);
+            e.Handled = true;
+        }
+    }
+
+    // ---------------- Links ----------------
+
+    private bool _isSizingLink;
+    private int _linkDragPage;
+    private double _linkDragStartX;   // normalized
+    private double _linkDragStartY;   // normalized
+    private Rectangle? _linkPreview;
+
+    /// <summary>Show links on or off, from the View menu.</summary>
+    private void ShowLinksToggle_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ShowLinks = ShowLinksToggle.IsChecked;
+    }
+
+    /// <summary>Keeps the menu's tick in step when something else turns links on.</summary>
+    private void SyncShowLinksToggle()
+    {
+        if (ShowLinksToggle.IsChecked != ViewModel.ShowLinks)
+        {
+            ShowLinksToggle.IsChecked = ViewModel.ShowLinks;
+        }
+    }
+
+    private void BeginLinkPreview(int page, double nx, double ny)
+    {
+        _linkPreview = new Rectangle
+        {
+            Stroke = new SolidColorBrush(Color.FromArgb(0xFF, 0x2D, 0x6F, 0xC4)),
+            StrokeThickness = 1,
+            StrokeDashArray = new DoubleCollection { 3, 2 },
+            Fill = new SolidColorBrush(Color.FromArgb(0x14, 0x1A, 0x73, 0xE8)),
+            IsHitTestVisible = false,
+        };
+
+        var box = CardRect(page, nx, ny, nx, ny);
+        Canvas.SetLeft(_linkPreview, box.Left);
+        Canvas.SetTop(_linkPreview, box.Top);
+        InkCanvas.Children.Add(_linkPreview);
+    }
+
+    private void UpdateLinkPreview(double nx, double ny)
+    {
+        if (_linkPreview is null) { return; }
+
+        var box = CardRect(_linkDragPage, _linkDragStartX, _linkDragStartY, nx, ny);
+        Canvas.SetLeft(_linkPreview, box.Left);
+        Canvas.SetTop(_linkPreview, box.Top);
+        _linkPreview.Width = box.Width;
+        _linkPreview.Height = box.Height;
+    }
+
+    /// <summary>
+    /// The drag is over: ask for the address, then make the link.
+    ///
+    /// Async and fire-and-forget from the pointer handler, which cannot await
+    /// without letting the gesture run on underneath it. Nothing later in that
+    /// handler depends on the answer.
+    /// </summary>
+    private async System.Threading.Tasks.Task EndLinkSizingAsync(double nx, double ny)
+    {
+        if (_linkPreview is not null)
+        {
+            InkCanvas.Children.Remove(_linkPreview);
+            _linkPreview = null;
+        }
+
+        var rect = new EditRect(_linkDragStartX, _linkDragStartY, nx, ny);
+
+        // A stray click is not a request for a link. Refusing here rather than
+        // after the dialog means the user is not asked for an address and then
+        // told the area was too small.
+        if (System.Math.Abs(nx - _linkDragStartX) < MinLinkDrag
+            || System.Math.Abs(ny - _linkDragStartY) < MinLinkDrag)
+        {
+            ViewModel.Status = "Drag over the area you want to make clickable.";
+            return;
+        }
+
+        if (await AskForUrlAsync("Add link", string.Empty) is not { } url) { return; }
+
+        ViewModel.AddLink(_linkDragPage, rect, url);
+        SyncShowLinksToggle();
+    }
+
+    /// <summary>A drag shorter than this in either direction is a click, not a link.</summary>
+    private const double MinLinkDrag = 0.008;
+
+    /// <summary>
+    /// Asks for a web address. Null if the user cancelled or left it empty.
+    ///
+    /// The box is pre-filled when a link is being retargeted, so changing one
+    /// character does not mean retyping the whole address.
+    /// </summary>
+    private async System.Threading.Tasks.Task<string?> AskForUrlAsync(string title, string current)
+    {
+        var input = new TextBox
+        {
+            Text = current,
+            PlaceholderText = "https://example.com",
+            SelectionStart = current.Length,
+        };
+
+        var stack = new StackPanel { Spacing = 8, Width = 380 };
+        stack.Children.Add(new TextBlock { Text = "Address:" });
+        stack.Children.Add(input);
+
+        var dlg = new ContentDialog
+        {
+            Title = title,
+            Content = stack,
+            PrimaryButtonText = "OK",
+            SecondaryButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = this.XamlRoot,
+        };
+
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) { return null; }
+
+        string typed = input.Text.Trim();
+        return typed.Length == 0 ? null : typed;
+    }
+
+    /// <summary>
+    /// Follows a link, but only after the reader has seen where it goes and
+    /// said yes.
+    ///
+    /// ⚠️ A LINK IN A DOCUMENT IS UNTRUSTED INPUT. The file came from somewhere
+    /// and its address can say anything, so two things stand between a click and
+    /// the operating system: <see cref="LinkTarget"/> refuses any scheme that is
+    /// not plainly web or mail, and the FULL address is shown before anything
+    /// opens. Link text can say one thing and point at another; showing the
+    /// address is the only defence against that which does not depend on the
+    /// document being honest.
+    ///
+    /// An internal link needs neither: it goes to a page of this same document,
+    /// so it is simply followed.
+    /// </summary>
+    private async System.Threading.Tasks.Task FollowLinkAsync(LinkSnapshot link)
+    {
+        if (link.Kind == LinkKind.Internal)
+        {
+            if (link.TargetPage >= 0)
+            {
+                ViewModel.GoToPage(link.TargetPage);
+            }
+            return;
+        }
+
+        if (!LinkTarget.CanOpen(link.Uri))
+        {
+            await ShowLinkRefusalAsync(link);
+            return;
+        }
+
+        var body = new StackPanel { Spacing = 8, Width = 420 };
+        body.Children.Add(new TextBlock
+        {
+            Text = "This link will open outside Ayaan PDF:",
+            TextWrapping = TextWrapping.Wrap,
+        });
+        body.Children.Add(new TextBlock
+        {
+            Text = link.Uri,
+            TextWrapping = TextWrapping.Wrap,
+            IsTextSelectionEnabled = true,
+            FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Consolas"),
+        });
+
+        var dlg = new ContentDialog
+        {
+            Title = "Open this link?",
+            Content = body,
+            PrimaryButtonText = "Open",
+            SecondaryButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Secondary,
+            XamlRoot = this.XamlRoot,
+        };
+
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        // Launcher, not a shell execute of the string. It hands the URI to
+        // whatever the user has set as their browser or mail client and will
+        // not run a program.
+        bool opened = await Windows.System.Launcher.LaunchUriAsync(new Uri(link.Uri));
+        ViewModel.Status = opened ? $"Opened {link.Uri}" : "Windows could not open that link.";
+    }
+
+    private async System.Threading.Tasks.Task ShowLinkRefusalAsync(LinkSnapshot link)
+    {
+        var body = new StackPanel { Spacing = 8, Width = 420 };
+        body.Children.Add(new TextBlock
+        {
+            Text = LinkTarget.RefusalReason(link.Uri),
+            TextWrapping = TextWrapping.Wrap,
+        });
+        if (link.Uri.Length > 0)
+        {
+            body.Children.Add(new TextBlock
+            {
+                Text = link.Uri,
+                TextWrapping = TextWrapping.Wrap,
+                IsTextSelectionEnabled = true,
+                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Consolas"),
+            });
+        }
+
+        await new ContentDialog
+        {
+            Title = "This link was not opened",
+            Content = body,
+            CloseButtonText = "Close",
+            XamlRoot = this.XamlRoot,
+        }.ShowAsync();
+    }
+
+    /// <summary>Asks for a new address for a link and applies it.</summary>
+    private async System.Threading.Tasks.Task EditLinkAsync(int page, LinkSnapshot link)
+    {
+        if (!link.CanEditUrl)
+        {
+            ViewModel.Status = link.Kind == LinkKind.Internal
+                ? "This link jumps inside the document. Its target cannot be changed here."
+                : "This link's action is not one Ayaan can change.";
+            return;
+        }
+
+        if (await AskForUrlAsync("Edit link", link.Uri) is not { } url) { return; }
+
+        ViewModel.EditLink(page, link, url);
+    }
+
+    /// <summary>
+    /// The menu offered on a right-click over a link, or false when there is
+    /// none there.
+    ///
+    /// Its own flyout rather than entries in the object menu, because the two
+    /// are about different things: that one moves, restyles and reorders one of
+    /// OUR marks, and none of it applies to something the document owns.
+    /// </summary>
+    private bool TryShowLinkMenu(int page, double nx, double ny, Point at)
+    {
+        if (!ViewModel.ShowLinks) { return false; }
+        if (ViewModel.LinkAt(page, nx, ny) is not { } link) { return false; }
+
+        ViewModel.SelectLinkAt(page, nx, ny);
+
+        var flyout = new MenuFlyout();
+
+        var open = new MenuFlyoutItem { Text = "Open link" };
+        open.Click += (_, _) => _ = FollowLinkAsync(link);
+        flyout.Items.Add(open);
+
+        flyout.Items.Add(new MenuFlyoutSeparator());
+
+        var edit = new MenuFlyoutItem { Text = "Edit link…", IsEnabled = link.CanEditUrl };
+        edit.Click += (_, _) => _ = EditLinkAsync(page, link);
+        flyout.Items.Add(edit);
+
+        var remove = new MenuFlyoutItem { Text = "Remove link", IsEnabled = link.CanEditUrl };
+        remove.Click += (_, _) => ViewModel.DeleteLink(page, link);
+        flyout.Items.Add(remove);
+
+        flyout.ShowAt(ViewportHost, new FlyoutShowOptions { Position = at });
+        return true;
     }
 
     // ---------------- Text box sizing (drag to set width) ----------------

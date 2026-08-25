@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace PdfEditorApp.Viewport;
 
@@ -53,6 +53,14 @@ public static class ObjectHitTest
             // text object has no annotation index; letting one through would
             // not fail, it would silently edit a different mark.
             if (objects[i].Kind == DocumentObjectKind.PageText) { continue; }
+
+            // A LINK is skipped for a related reason. It is an annotation and
+            // does have an index, so nothing would fail, but it is the
+            // DOCUMENT'S link and not one of our marks: handing it back here
+            // made a real file's hyperlinks into anonymous rectangles that
+            // could be dragged around and restyled. Links are picked by the
+            // link path, which knows what one is and offers following it.
+            if (objects[i].Kind == DocumentObjectKind.Link) { continue; }
 
             if (Hit(objects[i], x, y, tolerance)) { return objects[i]; }
         }

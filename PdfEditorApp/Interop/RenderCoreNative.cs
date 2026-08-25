@@ -133,6 +133,7 @@ internal static class AnnotSubtype
     public const int Underline = 7;
     public const int Strikeout = 8;
     public const int Squiggly = 9;
+    public const int Link = 10;
 }
 
 /// <summary>
@@ -519,6 +520,69 @@ internal static partial class RenderCoreNative
     /// </summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern ByteBuffer get_page_word_clusters(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// Every LINK on a page, as a self-describing byte buffer (annotation index,
+    /// kind, four bounds, target page, URI per link). Parsed by
+    /// <see cref="Viewport.LinkReader"/>. Free with
+    /// <see cref="free_byte_buffer"/>.
+    ///
+    /// ⚠️ The core finds these by WALKING THE ANNOTATIONS, not through PDFium's
+    /// own link collection. That collection indexes the /Annots array rather
+    /// than a dense list of links, and on a page holding a stamp and two links
+    /// it was measured to report three and to hand back the first one twice.
+    ///
+    /// Internal and unrecognised links are reported too, so the app can show
+    /// them and refuse to retarget them.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_page_links(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// Adds a URI link over a rectangle in capture coordinates, writing the
+    /// annotation index it landed at to <paramref name="outIndex"/>.
+    ///
+    /// The index cannot be predicted by the caller: PDFium appends, but a page
+    /// can already hold anything, so every following call (retarget, move,
+    /// delete) needs the one the core actually used.
+    ///
+    /// The link is marked printable, which is what every real producer sets. It
+    /// has no appearance of its own and draws NOTHING; the rectangle is a hit
+    /// area and making it visible is the app's job.
+    ///
+    /// Returns OkPdfium only when the link is in the document afterwards.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_uri_link(
+        ulong docHandle,
+        int pageIndex,
+        int captureWidth,
+        float left,
+        float top,
+        float right,
+        float bottom,
+        byte[] uriUtf8,
+        nuint uriLen,
+        out int outIndex);
+
+    /// <summary>
+    /// Re-points an existing URI link at a different URI.
+    ///
+    /// Refuses anything that is not a URI link. PDFium has no setter for an
+    /// internal destination, so writing a URI action over one would leave the
+    /// document holding both and disagreeing with itself.
+    ///
+    /// Returns OkPdfium when the link now says exactly what was asked,
+    /// Unsupported when it is not a URI link, and InvalidInput when the index
+    /// does not name a link at all.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int set_uri_link(
+        ulong docHandle,
+        int pageIndex,
+        int index,
+        byte[] uriUtf8,
+        nuint uriLen);
 
     /// <summary>
     /// Rewrites one word, or changes nothing at all.

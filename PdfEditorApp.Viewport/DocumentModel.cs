@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -24,6 +24,7 @@ public static class PdfAnnotationSubtype
     public const int Underline = 7;
     public const int Strikeout = 8;
     public const int Squiggly = 9;
+    public const int Link = 10;
 }
 
 /// <summary>What an object in the model is.</summary>
@@ -50,6 +51,21 @@ public enum DocumentObjectKind
     /// foreign annotations were dropped would report the wrong stacking for
     /// everything above them.</summary>
     Unknown,
+
+    /// <summary>
+    /// A hyperlink.
+    ///
+    /// Named rather than left in <see cref="Unknown"/> because the app has to be
+    /// able to tell one: a click on a link is a request to FOLLOW it, not to
+    /// select a box, and only a page that knows which of its marks are links can
+    /// draw them or offer to edit one. A real document's links were arriving
+    /// here as anonymous rectangles that could be dragged around.
+    ///
+    /// Its URL is not carried here. Links are read separately, by
+    /// <see cref="LinkReader"/>, because what a link points at is not geometry
+    /// and the annotation snapshot has no room for it.
+    /// </summary>
+    Link,
 
     /// <summary>
     /// A piece of the document's own text, out of the page's CONTENT stream

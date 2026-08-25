@@ -1112,6 +1112,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _pageModelByPage.Clear();   // same lifetime as the cache it projects
         _selectedLoaded = null;
         _loadedDrag = null;
+
+        // A link's handle is an annotation index, so one held over from the
+        // last document would aim a delete at whatever now sits at that
+        // position. Show Links goes off with it: it is a question about the
+        // document that was open, not a preference.
+        _linksByPage.Clear();
+        ClearSelectedLink();
+        ShowLinks = false;
+
+        // ⚠️ The page's WORDS are the same case and were not being cleared at
+        // all, so a page of the previous document's text could survive an open.
+        // Noticed while adding the line above; the two have identical lifetimes.
+        _clustersByPage.Clear();
+        _selectedWord = null;
+        _selectedWordPage = -1;
     }
 
     /// <summary>
@@ -3237,6 +3252,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // build a new one. In continuous view the page changes constantly as
         // the reader scrolls and there is nothing to do.
         RelayoutForPageTurn(value);
+
+        // Only the pages around this one carry link outlines, so turning the
+        // page moves them.
+        if (_showLinks) { RefreshLinkOutlines(); }
     }
 
     partial void OnPageCountChanged(int value)
@@ -4208,6 +4227,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
         }
 
+        // Links are not a selection, but they share the overlay and this runs
+        // after every edit, so rebuilding them here is what keeps a box from
+        // hanging over a link that has just been removed.
+        RefreshLinkOutlines();
+
         // The document's own text, which is not one of ours and gets its own
         // frame. No grips: nothing here is draggable, and a handle that does
         // nothing is worse than no handle.
@@ -4745,6 +4769,439 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         Status = $"Changed \u201c{word.Text}\u201d to \u201c{newText}\u201d.";
         return true;
+    }
+
+    // ---------------- Links ----------------
+    //
+    // A link is not one of our marks. It belongs to the document, it draws
+    // NOTHING of its own (no appearance stream, a zero-width border: measured in
+    // every real file), and following one leaves the app. So it gets its own
+    // field and its own commands rather than being threaded through the
+    // annotation selection, which carries thirty-odd operations that all mean
+    // "the mark at this index" and none of which apply.
+
+    private readonly Dictionary<int, IReadOnlyList<LinkSnapshot>> _linksByPage = new();
+
+    private bool _showLinks;
+    private LinkSnapshot? _selectedLink;
+    private int _selectedLinkPage = -1;
+
+    /// <summary>
+    /// Whether the page's links are outlined.
+    ///
+    /// Off by default and off after a reload. A link is invisible in the PDF
+    /// itself, so showing them is a deliberate act: the reader is asking what is
+    /// clickable, not asking for boxes over their document.
+    /// </summary>
+    public bool ShowLinks
+    {
+        get => _showLinks;
+        set
+        {
+            if (_showLinks == value) { return; }
+
+            _showLinks = value;
+            if (!value)
+            {
+                ClearSelectedLink();
+            }
+            OnPropertyChanged(nameof(ShowLinks));
+            OnPropertyChanged(nameof(LinkOverlay));
+            RefreshLinkOutlines();
+            LinksChanged?.Invoke();
+        }
+    }
+
+    /// <summary>Raised when the link overlay needs redrawing.</summary>
+    public event Action? LinksChanged;
+
+    /// <summary>
+    /// The page's links, read once and cached until the page changes.
+    ///
+    /// ⚠️ The core finds these by WALKING THE ANNOTATIONS. PDFium's own link
+    /// collection indexes the /Annots array rather than a dense list of links,
+    /// and on a page holding a stamp and two links it was measured to report
+    /// three and to hand back the first one twice.
+    /// </summary>
+    public IReadOnlyList<LinkSnapshot> LinksFor(int pageIndex)
+    {
+        if (_documentHandle == 0) { return Array.Empty<LinkSnapshot>(); }
+
+        if (!_linksByPage.TryGetValue(pageIndex, out var found))
+        {
+            found = Interop.LinkGateway.Load(_documentHandle, pageIndex);
+            _linksByPage[pageIndex] = found;
+        }
+
+        return found;
+    }
+
+    /// <summary>The links to outline right now, or nothing.</summary>
+    public IReadOnlyList<LinkSnapshot> LinkOverlay
+        => _showLinks && _documentHandle != 0
+            ? LinksFor(CurrentPageIndex)
+            : Array.Empty<LinkSnapshot>();
+
+    /// <summary>The link the reader has picked, or null.</summary>
+    public LinkSnapshot? SelectedLink
+    {
+        get => _selectedLink;
+        private set
+        {
+            if (ReferenceEquals(_selectedLink, value)) { return; }
+
+            _selectedLink = value;
+            OnPropertyChanged(nameof(SelectedLink));
+            OnPropertyChanged(nameof(HasSelectedLink));
+        }
+    }
+
+    public bool HasSelectedLink => _selectedLink is not null;
+
+    /// <summary>The page the selected link is on, or -1.</summary>
+    public int SelectedLinkPage => _selectedLinkPage;
+
+    public void ClearSelectedLink()
+    {
+        SelectedLink = null;
+        _selectedLinkPage = -1;
+    }
+
+    /// <summary>
+    /// The topmost link under a normalized page-local point, or null.
+    ///
+    /// Searched BACKWARDS so the last one wins where two overlap, the same rule
+    /// the annotation and word picks use. No tolerance: a link's rectangle is
+    /// generous already, it is drawn for the reader to see, and growing it would
+    /// make a click near a link open something the reader did not point at.
+    /// </summary>
+    public LinkSnapshot? LinkAt(int pageIndex, double normX, double normY)
+    {
+        var links = LinksFor(pageIndex);
+        for (int i = links.Count - 1; i >= 0; i--)
+        {
+            if (links[i].Contains(normX, normY)) { return links[i]; }
+        }
+
+        return null;
+    }
+
+    /// <summary>Picks the link under a point and remembers it. False if none.</summary>
+    public bool SelectLinkAt(int pageIndex, double normX, double normY)
+    {
+        if (LinkAt(pageIndex, normX, normY) is not { } link)
+        {
+            ClearSelectedLink();
+            return false;
+        }
+
+        SelectedLink = link;
+        _selectedLinkPage = pageIndex;
+        return true;
+    }
+
+    /// <summary>
+    /// Adds a URI link over a rectangle, as ONE undoable action.
+    ///
+    /// The URL is normalized first, which adds <c>https://</c> to a bare host
+    /// and refuses anything that is not web or mail. Refusing HERE rather than
+    /// when the link is followed is what stops the app writing a link into a
+    /// document that it will afterwards decline to open.
+    /// </summary>
+    public bool AddLink(int pageIndex, EditRect rect, string typedUrl)
+    {
+        const int CaptureWidth = 1000;
+
+        if (_documentHandle == 0 || pageIndex < 0) { return false; }
+
+        if (LinkTarget.Normalize(typedUrl) is not { } url)
+        {
+            Status = LinkTarget.RefusalReason(typedUrl?.Trim());
+            return false;
+        }
+
+        var box = Normalized(rect);
+        if (box.Right - box.Left < MinLinkSize || box.Bottom - box.Top < MinLinkSize)
+        {
+            Status = "That area is too small to be a link.";
+            return false;
+        }
+
+        BeginEdit("Add link");
+        RecordEdit(new LinkRecord(pageIndex, box, null, url));
+
+        int status = Interop.LinkGateway.Add(
+            _documentHandle, pageIndex, CaptureWidth,
+            box.Left * CaptureWidth, box.Top * CaptureWidth,
+            box.Right * CaptureWidth, box.Bottom * CaptureWidth,
+            url, out int index);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            AbandonEdit();
+            Status = "That link could not be added.";
+            Diag.Log($"AddLink refused status={status} url={url}");
+            return false;
+        }
+
+        CommitEdit();
+
+        InvalidateLoadedPage(pageIndex);
+        RenderCurrentPage();
+        IsDirty = true;
+
+        SelectedLink = LinksFor(pageIndex).FirstOrDefault(l => l.AnnotationIndex == index);
+        _selectedLinkPage = pageIndex;
+        ShowLinks = true;
+        RefreshLinkOutlines();
+        LinksChanged?.Invoke();
+
+        Status = $"Linked to {url}.";
+        return true;
+    }
+
+    /// <summary>
+    /// Re-points an existing URI link, as ONE undoable action.
+    ///
+    /// Refuses an internal link rather than converting it. PDFium has no setter
+    /// for a destination, so writing a URI action over one would leave the
+    /// document holding both and disagreeing with itself about where it goes.
+    /// </summary>
+    public bool EditLink(int pageIndex, LinkSnapshot link, string typedUrl)
+    {
+        if (_documentHandle == 0 || pageIndex < 0) { return false; }
+
+        if (!link.CanEditUrl)
+        {
+            Status = link.Kind == LinkKind.Internal
+                ? "This link jumps inside the document. Its target cannot be changed here."
+                : "This link's action is not one Ayaan can change.";
+            return false;
+        }
+
+        if (LinkTarget.Normalize(typedUrl) is not { } url)
+        {
+            Status = LinkTarget.RefusalReason(typedUrl?.Trim());
+            return false;
+        }
+        if (url == link.Uri) { return false; }
+
+        var box = new EditRect(link.Left, link.Top, link.Right, link.Bottom);
+
+        BeginEdit("Edit link");
+        RecordEdit(new LinkRecord(pageIndex, box, link.Uri, url));
+
+        int status = Interop.LinkGateway.SetUri(
+            _documentHandle, pageIndex, link.AnnotationIndex, url);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            AbandonEdit();
+            Status = status == RenderStatus.Unsupported
+                ? "That link's target cannot be changed."
+                : "That link no longer matches the page. Select it again.";
+            Diag.Log($"EditLink refused status={status} index={link.AnnotationIndex}");
+            return false;
+        }
+
+        CommitEdit();
+
+        InvalidateLoadedPage(pageIndex);
+        IsDirty = true;
+
+        SelectedLink = LinksFor(pageIndex)
+            .FirstOrDefault(l => l.AnnotationIndex == link.AnnotationIndex);
+        RefreshLinkOutlines();
+        LinksChanged?.Invoke();
+
+        Status = $"Link now goes to {url}.";
+        return true;
+    }
+
+    /// <summary>
+    /// Removes a link, as ONE undoable action.
+    ///
+    /// Only a URI link, because undo puts one back by re-adding it and a
+    /// destination cannot be re-added: PDFium has no setter for one. Deleting
+    /// something that could not be restored would be a one-way door dressed up
+    /// as an undoable command.
+    /// </summary>
+    public bool DeleteLink(int pageIndex, LinkSnapshot link)
+    {
+        if (_documentHandle == 0 || pageIndex < 0) { return false; }
+
+        if (!link.CanEditUrl)
+        {
+            Status = "This link belongs to the document's own navigation and is not removed here.";
+            return false;
+        }
+
+        var box = new EditRect(link.Left, link.Top, link.Right, link.Bottom);
+
+        BeginEdit("Remove link");
+        RecordEdit(new LinkRecord(pageIndex, box, link.Uri, null));
+
+        int status = RenderCoreNative.delete_annotation(
+            _documentHandle, pageIndex, link.AnnotationIndex);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            AbandonEdit();
+            Status = "That link could not be removed.";
+            Diag.Log($"DeleteLink refused status={status} index={link.AnnotationIndex}");
+            return false;
+        }
+
+        CommitEdit();
+
+        InvalidateLoadedPage(pageIndex);
+        RenderCurrentPage();
+        IsDirty = true;
+
+        ClearSelectedLink();
+        RefreshLinkOutlines();
+        LinksChanged?.Invoke();
+
+        Status = "Link removed.";
+        return true;
+    }
+
+    /// <summary>
+    /// Puts a link back the way it was, or takes it away again.
+    ///
+    /// One method for all three commands, because the record describes them all:
+    /// null to a URL is a creation, a URL to null is a deletion, one URL to
+    /// another is a retarget, and undo is the same record read the other way.
+    ///
+    /// ⚠️ VERIFIED BEFORE WRITING. The link is found by its rectangle and has to
+    /// still say what the record expects; an annotation index would name
+    /// something else by now, because every write in this app renumbers them.
+    /// </summary>
+    private void ApplyLink(LinkRecord record, bool backwards)
+    {
+        const int CaptureWidth = 1000;
+
+        string? from = backwards ? record.After : record.Before;
+        string? to = backwards ? record.Before : record.After;
+
+        _linksByPage.Remove(record.Page);
+
+        if (from is null && to is not null)
+        {
+            int status = Interop.LinkGateway.Add(
+                _documentHandle, record.Page, CaptureWidth,
+                record.Rect.Left * CaptureWidth, record.Rect.Top * CaptureWidth,
+                record.Rect.Right * CaptureWidth, record.Rect.Bottom * CaptureWidth,
+                to, out _);
+
+            if (status != RenderStatus.OkPdfium)
+            {
+                Diag.Log($"history link: could not put back {to}, status={status}");
+                Status = "That link could not be put back.";
+            }
+
+            _linksByPage.Remove(record.Page);
+            return;
+        }
+
+        var found = LinkAtRect(record.Page, record.Rect, from);
+        if (found is null)
+        {
+            Diag.Log($"history link: page {record.Page} has no link saying {from} at {record.Rect}, refusing");
+            Status = "That link has changed since, so this step could not be undone.";
+            return;
+        }
+
+        int result = to is null
+            ? RenderCoreNative.delete_annotation(_documentHandle, record.Page, found.AnnotationIndex)
+            : Interop.LinkGateway.SetUri(_documentHandle, record.Page, found.AnnotationIndex, to);
+
+        if (result != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"history link: the core refused with {result}");
+            Status = "That link could not be put back.";
+        }
+
+        _linksByPage.Remove(record.Page);
+    }
+
+    /// <summary>
+    /// The link on a page whose rectangle matches and which says what is
+    /// expected, or null.
+    ///
+    /// The rectangle is compared loosely because it makes a round trip through
+    /// PDF points and back, so it returns near enough rather than equal.
+    /// </summary>
+    private LinkSnapshot? LinkAtRect(int pageIndex, EditRect rect, string? uri)
+    {
+        const double Slack = 0.002;
+
+        foreach (var link in LinksFor(pageIndex))
+        {
+            if (uri is not null && link.Uri != uri) { continue; }
+
+            if (Math.Abs(link.Left - rect.Left) <= Slack
+                && Math.Abs(link.Top - rect.Top) <= Slack
+                && Math.Abs(link.Right - rect.Right) <= Slack
+                && Math.Abs(link.Bottom - rect.Bottom) <= Slack)
+            {
+                return link;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>The smallest link worth making, in normalized page width.</summary>
+    private const double MinLinkSize = 0.004;
+
+    /// <summary>A drag has a direction; a rectangle does not.</summary>
+    private static EditRect Normalized(EditRect r) => new(
+        Math.Min(r.Left, r.Right), Math.Min(r.Top, r.Bottom),
+        Math.Max(r.Left, r.Right), Math.Max(r.Top, r.Bottom));
+
+    /// <summary>Outline colour for a link whose address the app can change.</summary>
+    private const string EditableLinkColor = "#FF2D6FC4";
+
+    /// <summary>Outline colour for one it can only show: an internal jump.</summary>
+    private const string ReadOnlyLinkColor = "#FF7A7A7A";
+
+    /// <summary>
+    /// Fills in the link outlines for the pages the reader can actually see.
+    ///
+    /// ⚠️ NOT every slot. Reading a page's links means asking PDFium for the
+    /// page, and ASKING FOR A PAGE PARSES IT: doing that for all of them turned
+    /// a 3352-page book into a 69-second wait once already. The current page and
+    /// its two neighbours are what a reader can have on screen, and each answer
+    /// is cached, so scrolling costs one page at a time.
+    /// </summary>
+    public void RefreshLinkOutlines()
+    {
+        foreach (var slot in PageSlots)
+        {
+            slot.LinkOutlines.Clear();
+        }
+
+        if (!_showLinks || _documentHandle == 0) { return; }
+
+        int first = Math.Max(0, CurrentPageIndex - 1);
+        int last = Math.Min(PageCount - 1, CurrentPageIndex + 1);
+
+        for (int page = first; page <= last; page++)
+        {
+            if (SlotFor(page) is not { } slot) { continue; }
+
+            foreach (var link in LinksFor(page))
+            {
+                double left = link.Left * SlotLayoutWidth;
+                double top = link.Top * SlotLayoutWidth;
+                slot.LinkOutlines.Add(new ScaledRect(
+                    left, top,
+                    (link.Right * SlotLayoutWidth) - left,
+                    (link.Bottom * SlotLayoutWidth) - top,
+                    link.CanEditUrl ? EditableLinkColor : ReadOnlyLinkColor));
+            }
+        }
     }
 
     /// <summary>
@@ -8540,6 +8997,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // showing the reader the truth rather than about safety.
         _clustersByPage.Remove(pageIndex);
 
+        // So do its links. They ARE annotations, so an edit that renumbers the
+        // page renumbers them, and a cached link would hand a stale annotation
+        // index to a delete.
+        _linksByPage.Remove(pageIndex);
+
         // The model is a projection of the annotation cache, so it is dropped
         // with it and can never be staler than the data everything else already
         // trusts. Giving it a lifetime of its own is how a second source of
@@ -10703,6 +11165,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 case WordTextRecord w:
                     ApplyWordText(w, backwards);
                     touched.Add(w.Page);
+                    break;
+
+                case LinkRecord l:
+                    ApplyLink(l, backwards);
+                    touched.Add(l.Page);
                     break;
 
                 case GroupsRecord g:

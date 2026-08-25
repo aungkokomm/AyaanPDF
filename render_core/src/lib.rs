@@ -1,4 +1,4 @@
-//! Render/interaction core for the PDF editor. Exposes a thin C ABI so the
+﻿//! Render/interaction core for the PDF editor. Exposes a thin C ABI so the
 //! WinUI 3 (C#) shell can call into PDFium via `pdfium-render` without a GC
 //! in the hot render path.
 //!
@@ -7512,6 +7512,12 @@ pub const ANNOT_UNDERLINE: i32 = 7;
 pub const ANNOT_STRIKEOUT: i32 = 8;
 pub const ANNOT_SQUIGGLY: i32 = 9;
 
+/// A hyperlink. Reported so the app can classify one as a LINK rather than
+/// as an annotation it does not recognise: left as "other", a link is not
+/// rebuildable, so a page carrying one refuses to reorder, and it is still
+/// selectable and movable as an anonymous box.
+pub const ANNOT_LINK: i32 = 10;
+
 #[repr(C)]
 pub struct AnnotationInfo {
     /// Position in the page's annotation list. This is the handle passed back
@@ -7607,6 +7613,7 @@ fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
             PdfPageAnnotationType::Underline => ANNOT_UNDERLINE,
             PdfPageAnnotationType::Strikeout => ANNOT_STRIKEOUT,
             PdfPageAnnotationType::Squiggly => ANNOT_SQUIGGLY,
+            PdfPageAnnotationType::Link => ANNOT_LINK,
             _ => ANNOT_OTHER,
         };
 
@@ -7677,6 +7684,381 @@ pub extern "C" fn free_annotation_array(array: AnnotationArray) {
     unsafe {
         let _ = Box::from_raw(std::slice::from_raw_parts_mut(array.items, array.len));
     }
+}
+
+/// A link whose action opens a URI.
+pub const LINK_URI: u32 = 0;
+
+/// A link that jumps somewhere inside this document. Readable, and preserved
+/// on save, but this build does not create or retarget one.
+pub const LINK_INTERNAL: u32 = 1;
+
+/// A link annotation carrying neither: a launch action, an embedded file, or
+/// nothing at all. Shown so the user can see it is there; not editable.
+pub const LINK_OTHER: u32 = 2;
+
+/// What one link annotation on a page is, in the app's own terms.
+struct LinkInfo {
+    /// Position in the page's ANNOTATION list, which is the handle every other
+    /// call here takes. Deliberately not a position in a list of links: the
+    /// rest of the app addresses annotations by index and nothing else.
+    index: usize,
+    kind: u32,
+    uri: String,
+    /// Where an internal link goes, or -1. Read for display only.
+    target_page: i32,
+    /// PDF points, bottom-left origin, as PDFium reports them.
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+/// Every link annotation on a page, found by WALKING THE ANNOTATIONS.
+///
+/// ⚠️ NOT `page.links()`. That collection indexes the `/Annots` ARRAY rather
+/// than a dense list of links, because `FPDFLink_Enumerate` is seeded with an
+/// annotation index and reports the next link at or after it. On a page holding
+/// a stamp and two links it was measured to report THREE links and to hand back
+/// the first one twice. It is only ever right on a page that holds nothing but
+/// links, which is exactly what a browser produces and exactly not what a page
+/// we have drawn on looks like.
+///
+/// Reading takes TWO questions, not one. A link written as `/A <</S /URI ...>>`
+/// answers `action()`; a link written as `/Dest ...` answers `destination()`
+/// and returns None from `action()`. Chromium emits both forms in one file, so
+/// asking only the first makes every internal link look empty.
+fn page_links(page: &pdfium_render::prelude::PdfPage) -> Vec<LinkInfo> {
+    use pdfium_render::prelude::*;
+
+    let mut out = Vec::new();
+    let annotations = page.annotations();
+
+    for i in 0..annotations.len() {
+        let Ok(annotation) = annotations.get(i) else {
+            continue;
+        };
+        let PdfPageAnnotation::Link(ref link) = annotation else {
+            continue;
+        };
+        let Ok(bounds) = annotation.bounds() else {
+            continue;
+        };
+        let Ok(inner) = link.link() else {
+            continue;
+        };
+
+        let uri = inner
+            .action()
+            .and_then(|a| a.as_uri_action().and_then(|u| u.uri().ok()))
+            .unwrap_or_default();
+
+        let target_page = inner
+            .destination()
+            .and_then(|d| d.page_index().ok())
+            .map(|p| p as i32)
+            .unwrap_or(-1);
+
+        let kind = if !uri.is_empty() {
+            LINK_URI
+        } else if target_page >= 0 {
+            LINK_INTERNAL
+        } else {
+            LINK_OTHER
+        };
+
+        out.push(LinkInfo {
+            index: i as usize,
+            kind,
+            uri,
+            target_page,
+            left: bounds.left().value,
+            top: bounds.top().value,
+            right: bounds.right().value,
+            bottom: bounds.bottom().value,
+        });
+    }
+
+    out
+}
+
+/// Every link on a page, for the app's model.
+///
+/// Little-endian. A count, then per link: the ANNOTATION index, the kind
+/// (`LINK_*`), the bounds normalized top-left and divided by the page WIDTH
+/// (the convention the whole app draws in), the target page or -1, and a
+/// length-prefixed UTF-8 URI which is empty for anything but a URI link.
+///
+/// Internal and unrecognised links are reported too. The app shows them so a
+/// document's own navigation is visible, and refuses to retarget them, which is
+/// only possible if it can tell them apart from the ones it can edit.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_page_links(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_page_links_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_page_links_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (page_left, page_top) = page_origin(&page);
+
+    let links = page_links(&page);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(links.len() as u32).to_le_bytes());
+
+    for link in &links {
+        out.extend_from_slice(&(link.index as u32).to_le_bytes());
+        out.extend_from_slice(&link.kind.to_le_bytes());
+
+        // PDF is bottom-left origin and Y-up; the app is top-left and Y-down.
+        out.extend_from_slice(&((link.left - page_left) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - link.top) / page_w).to_le_bytes());
+        out.extend_from_slice(&((link.right - page_left) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - link.bottom) / page_w).to_le_bytes());
+
+        out.extend_from_slice(&link.target_page.to_le_bytes());
+
+        out.extend_from_slice(&(link.uri.len() as u32).to_le_bytes());
+        out.extend_from_slice(link.uri.as_bytes());
+    }
+
+    drop(page);
+    drop(doc_guard);
+    drop(doc);
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Adds a URI link over the given rectangle, in capture coordinates.
+///
+/// Writes the annotation index it landed at to `out_index`, because every
+/// following call (retarget, move, delete) addresses it by that and the caller
+/// cannot know it: PDFium appends, but a page can already hold anything.
+///
+/// The link is marked PRINTABLE (`/F 4`), which is what every real producer
+/// sets and what viewers expect; a link without it is treated as screen-only by
+/// some of them.
+///
+/// A link has NO APPEARANCE STREAM, by design and in every file measured. It
+/// draws nothing. The rectangle is a hit area, and making it visible is the
+/// app's job, not the document's.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn add_uri_link(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    uri_utf8: *const u8,
+    uri_len: usize,
+    out_index: *mut i32,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || capture_width <= 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if uri_utf8.is_null() || uri_len == 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let uri = match std::str::from_utf8(unsafe { std::slice::from_raw_parts(uri_utf8, uri_len) }) {
+        Ok(s) => s.to_owned(),
+        Err(_) => return STATUS_INVALID_INPUT,
+    };
+
+    panic::catch_unwind(|| {
+        add_uri_link_inner(
+            doc_handle, page_index, capture_width, left, top, right, bottom, &uri, out_index,
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_uri_link_inner(
+    doc_handle: u64,
+    page_index: i32,
+    capture_width: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    uri: &str,
+    out_index: *mut i32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return STATUS_INVALID_INPUT;
+    }
+    let (origin_x, origin_top) = page_origin(&page);
+    let scale = page_w / capture_width as f32;
+
+    // Drawn corner to corner, so the drag can have gone any direction.
+    let x0 = origin_x + left.min(right) * scale;
+    let x1 = origin_x + left.max(right) * scale;
+    let y1 = origin_top - top.min(bottom) * scale;
+    let y0 = origin_top - top.max(bottom) * scale;
+    if (x1 - x0).abs() < 1e-4 || (y1 - y0).abs() < 1e-4 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let Ok(mut link) = page.annotations_mut().create_link_annotation(uri) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let bounds = PdfRect::new(
+        PdfPoints::new(y0),
+        PdfPoints::new(x0),
+        PdfPoints::new(y1),
+        PdfPoints::new(x1),
+    );
+    if link.set_bounds(bounds).is_err() {
+        return STATUS_INVALID_INPUT;
+    }
+    let _ = link.set_is_printed(true);
+
+    drop(link);
+
+    // READ BACK before reporting success. PDFium answers OK for writes that did
+    // not take, and a link the app believes it created but that is not in the
+    // document is worse than a refusal: the overlay would show one and the file
+    // would not have it.
+    let found = page_links(&page)
+        .into_iter()
+        .rev()
+        .find(|l| l.kind == LINK_URI && l.uri == uri);
+
+    let Some(found) = found else {
+        return STATUS_UNSUPPORTED;
+    };
+    if !out_index.is_null() {
+        unsafe { *out_index = found.index as i32 };
+    }
+
+    drop(page);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
+}
+
+/// Re-points an existing URI link at a different URI.
+///
+/// Refuses anything that is not a URI link. An internal `/Dest` link has no
+/// PDFium setter, and writing a `/A <</S /URI>>` over one would leave the
+/// document holding both, so the two would disagree about where the link goes.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_uri_link(
+    doc_handle: u64,
+    page_index: i32,
+    index: i32,
+    uri_utf8: *const u8,
+    uri_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || index < 0 {
+        return STATUS_INVALID_INPUT;
+    }
+    if uri_utf8.is_null() || uri_len == 0 {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let uri = match std::str::from_utf8(unsafe { std::slice::from_raw_parts(uri_utf8, uri_len) }) {
+        Ok(s) => s.to_owned(),
+        Err(_) => return STATUS_INVALID_INPUT,
+    };
+
+    panic::catch_unwind(|| set_uri_link_inner(doc_handle, page_index, index, &uri))
+        .unwrap_or(STATUS_PANIC)
+}
+
+fn set_uri_link_inner(doc_handle: u64, page_index: i32, index: i32, uri: &str) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let existing = page_links(&page);
+    let Some(target) = existing.iter().find(|l| l.index == index as usize) else {
+        return STATUS_INVALID_INPUT;
+    };
+    if target.kind != LINK_URI {
+        return STATUS_UNSUPPORTED;
+    }
+
+    {
+        let annotations = page.annotations();
+        let Ok(mut annotation) = annotations.get(index as usize) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let PdfPageAnnotation::Link(ref mut link) = annotation else {
+            return STATUS_INVALID_INPUT;
+        };
+        if link.set_link(uri).is_err() {
+            return STATUS_INVALID_INPUT;
+        }
+    }
+
+    // Read back, for the same reason the create path does.
+    let now = page_links(&page);
+    let Some(after) = now.iter().find(|l| l.index == index as usize) else {
+        return STATUS_UNSUPPORTED;
+    };
+    if after.uri != uri {
+        return STATUS_UNSUPPORTED;
+    }
+
+    drop(page);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    STATUS_OK_PDFIUM
 }
 
 #[repr(C)]
@@ -9609,6 +9991,537 @@ mod tests {
 
         close_document(handle);
         let _ = std::fs::remove_file(&out);
+    }
+
+    // ---------------- links ----------------
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct DecodedLink {
+        index: usize,
+        kind: u32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        target_page: i32,
+        uri: String,
+    }
+
+    fn decode_links(handle: u64, page_index: i32) -> Vec<DecodedLink> {
+        let buffer = get_page_links(handle, page_index);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "get_page_links refused");
+        if buffer.data.is_null() {
+            return Vec::new();
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+
+        let mut at = 0usize;
+        let mut u32_at = |p: &mut usize| {
+            let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let count = u32_at(&mut at) as usize;
+
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let index = u32_at(&mut at) as usize;
+            let kind = u32_at(&mut at);
+            let f = |p: &mut usize| {
+                let v = f32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+                *p += 4;
+                v
+            };
+            let (left, top, right, bottom) = (f(&mut at), f(&mut at), f(&mut at), f(&mut at));
+            let target_page = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            at += 4;
+            let uri_len = u32_at(&mut at) as usize;
+            let uri = String::from_utf8_lossy(&bytes[at..at + uri_len]).into_owned();
+            at += uri_len;
+
+            out.push(DecodedLink {
+                index, kind, left, top, right, bottom, target_page, uri,
+            });
+        }
+        out
+    }
+
+    /// Saves the way the APP saves, gradients or not.
+    ///
+    /// ⚠️ Not `save_and_write`. That helper belongs to the gradient tests and
+    /// assumes there is a gradient: the writer deliberately does not create its
+    /// destination when it has nothing to paint, so a link-only document came
+    /// out of it as a missing file. The app handles that case by keeping the
+    /// PDFium save and only replacing it when the writer wrote something, and
+    /// this does the same.
+    fn save_like_the_app(handle: u64, name: &str) -> (std::path::PathBuf, i32) {
+        let file = scratch_pdf(name);
+        let temp = scratch_pdf(&format!("{name}-gradients"));
+
+        let c_file = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(handle, c_file.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let c_temp = std::ffi::CString::new(temp.to_str().unwrap()).unwrap();
+        let mut written = -1;
+        let status = unsafe {
+            crate::gradient::write_gradients(c_file.as_ptr(), c_temp.as_ptr(), &mut written)
+        };
+        assert_eq!(status, STATUS_OK_PDFIUM, "the gradient writer refused the file");
+
+        if written > 0 {
+            std::fs::rename(&temp, &file).expect("could not replace the saved file");
+        }
+
+        (file, written)
+    }
+
+    fn add_link(handle: u64, page: i32, l: f32, t: f32, r: f32, b: f32, uri: &str) -> (i32, i32) {
+        let mut index = -1;
+        let status = add_uri_link(
+            handle, page, 1000, l, t, r, b, uri.as_ptr(), uri.len(), &mut index);
+        (status, index)
+    }
+
+    fn retarget(handle: u64, page: i32, index: i32, uri: &str) -> i32 {
+        set_uri_link(handle, page, index, uri.as_ptr(), uri.len())
+    }
+
+    /// Every link on a page, read from a FILE rather than from a live handle.
+    fn links_in_file(path: &std::path::Path, page: i32) -> Vec<DecodedLink> {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let handle = open_document(c.as_ptr());
+        assert_ne!(handle, 0, "PDFium refused to reopen {}", path.display());
+        let links = decode_links(handle, page);
+        close_document(handle);
+        links
+    }
+
+    // 1. URI LINK READ.
+
+    #[test]
+    fn a_real_documents_uri_links_read_back_with_their_urls() {
+        // Edge's own output. Two URI links and one internal jump on page 1,
+        // which is the shape of nearly every linked PDF a user will open.
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+
+        let links = decode_links(handle, 0);
+
+        assert_eq!(links.len(), 3, "{links:#?}");
+        assert_eq!(links[0].kind, LINK_URI);
+        assert_eq!(links[0].uri, "https://example.com/path?q=1");
+        assert_eq!(links[1].kind, LINK_URI);
+        assert_eq!(links[1].uri, "mailto:someone@example.com");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_links_box_arrives_in_the_coordinates_the_app_draws_in() {
+        // The overlay is drawn from these numbers, so being merely "about
+        // right" would put the box off the words. The fixture's first link sits
+        // at PDF x 190.5..273.75, y 640.5..656.25 on a 612x792 page, and the
+        // app's space is top-left origin with BOTH axes over the page WIDTH.
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+
+        let link = decode_links(handle, 0).remove(0);
+
+        assert!((link.left - 190.5 / 612.0).abs() < 1e-4, "{link:?}");
+        assert!((link.right - 273.75 / 612.0).abs() < 1e-4, "{link:?}");
+        assert!((link.top - (792.0 - 656.25) / 612.0).abs() < 1e-4, "{link:?}");
+        assert!((link.bottom - (792.0 - 640.5) / 612.0).abs() < 1e-4, "{link:?}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_link_is_reported_as_a_link_and_not_as_something_unrecognised() {
+        // ⚠️ WHY THIS MATTERS beyond tidiness. An annotation the app cannot name
+        // is classified Unknown, and Unknown is not rebuildable, so a page
+        // holding one refuses to reorder. Reported as ANNOT_LINK it gets its own
+        // rules instead of the catch-all's.
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+
+        let array = get_annotations(handle, 0);
+        let items = unsafe { std::slice::from_raw_parts(array.items, array.len) };
+        let subtypes: Vec<i32> = items.iter().map(|a| a.subtype).collect();
+        free_annotation_array(array);
+
+        assert_eq!(subtypes, vec![ANNOT_LINK, ANNOT_LINK, ANNOT_LINK]);
+
+        close_document(handle);
+    }
+
+    // 2. ENUMERATION WITH MIXED ANNOTATIONS.
+
+    #[test]
+    fn links_mixed_with_other_annotations_are_each_reported_once() {
+        // ⚠️ THE DEFECT THIS FEATURE IS BUILT AROUND. PdfPageLinks indexes the
+        // /Annots ARRAY, not a dense list of links, so on this exact page it
+        // reports THREE links and hands back the first one twice. Walking the
+        // annotations is the only enumeration that is right, and it is right
+        // for the additional reason that it yields the ANNOTATION index, which
+        // is what every other call here takes.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let spec = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        assert_eq!(add_shape_annotations(handle, 1000, &spec, 1), STATUS_OK_PDFIUM);
+        assert_eq!(add_link(handle, 0, 10.0, 10.0, 200.0, 40.0, "https://one.example").0,
+                   STATUS_OK_PDFIUM);
+        assert_eq!(add_link(handle, 0, 10.0, 60.0, 200.0, 90.0, "https://two.example").0,
+                   STATUS_OK_PDFIUM);
+
+        let links = decode_links(handle, 0);
+
+        assert_eq!(links.len(), 2, "{links:#?}");
+        assert_eq!(links[0].uri, "https://one.example");
+        assert_eq!(links[1].uri, "https://two.example");
+        // The shape is annotation 0, so the links must NOT claim to be.
+        assert_eq!(links[0].index, 1);
+        assert_eq!(links[1].index, 2);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_with_no_links_is_an_empty_answer_and_not_a_failure() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        assert!(decode_links(handle, 3).is_empty());
+
+        close_document(handle);
+    }
+
+    // 3. CREATE, SAVE, REOPEN.
+
+    #[test]
+    fn a_created_uri_link_keeps_its_url_and_its_box_through_save_and_reopen() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let (status, index) = add_link(
+            handle, 0, 100.0, 200.0, 400.0, 240.0, "https://example.org/made");
+        assert_eq!(status, STATUS_OK_PDFIUM);
+        assert_eq!(index, 0, "the first annotation on an empty page");
+
+        let before = decode_links(handle, 0);
+        let (file, _) = save_like_the_app(handle, "link-create");
+
+        let after = links_in_file(&file, 0);
+
+        assert_eq!(after.len(), 1, "{after:#?}");
+        assert_eq!(after[0].uri, "https://example.org/made");
+        assert_eq!(after[0].kind, LINK_URI);
+        // Same rectangle, not merely a rectangle.
+        assert!((after[0].left - before[0].left).abs() < 1e-4, "{before:?} {after:?}");
+        assert!((after[0].top - before[0].top).abs() < 1e-4, "{before:?} {after:?}");
+        assert!((after[0].right - before[0].right).abs() < 1e-4, "{before:?} {after:?}");
+        assert!((after[0].bottom - before[0].bottom).abs() < 1e-4, "{before:?} {after:?}");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_link_reads_back_at_the_rectangle_it_was_asked_for() {
+        // ⚠️ WHAT UNDO STANDS ON. A link has no identity we put there, so the
+        // app finds one again by its RECTANGLE: an annotation index would name
+        // something else by then, because every write renumbers the page. That
+        // only works if the box asked for and the box reported are the same
+        // box, within far less than the slack the lookup allows.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        const CAP: f32 = 1000.0;
+        let (l, t, r, b) = (137.0, 402.5, 486.25, 441.0);
+        assert_eq!(add_link(handle, 0, l, t, r, b, "https://roundtrip.example").0,
+                   STATUS_OK_PDFIUM);
+
+        let link = decode_links(handle, 0).remove(0);
+
+        assert!((link.left - l / CAP).abs() < 1e-4, "{link:?}");
+        assert!((link.top - t / CAP).abs() < 1e-4, "{link:?}");
+        assert!((link.right - r / CAP).abs() < 1e-4, "{link:?}");
+        assert!((link.bottom - b / CAP).abs() < 1e-4, "{link:?}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_created_link_is_marked_printable_the_way_real_producers_write_them() {
+        // /F 4. Every link measured in a browser's output carries it, and a link
+        // without it is treated as screen-only by some viewers.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        assert_eq!(add_link(handle, 0, 10.0, 10.0, 200.0, 40.0, "https://f.example").0,
+                   STATUS_OK_PDFIUM);
+
+        let (file, _) = save_like_the_app(handle, "link-flags");
+        let raw = std::fs::read(&file).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+
+        assert!(text.contains("/F 4"), "no print flag on the written link");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_link_drawn_upwards_and_leftwards_gets_the_same_box_as_one_drawn_down() {
+        // A drag has a direction and a rectangle does not.
+        let a = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let b = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        assert_eq!(add_link(a, 0, 100.0, 200.0, 300.0, 260.0, "https://x.example").0,
+                   STATUS_OK_PDFIUM);
+        assert_eq!(add_link(b, 0, 300.0, 260.0, 100.0, 200.0, "https://x.example").0,
+                   STATUS_OK_PDFIUM);
+
+        assert_eq!(decode_links(a, 0), decode_links(b, 0));
+
+        close_document(a);
+        close_document(b);
+    }
+
+    #[test]
+    fn a_link_with_no_area_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        assert_eq!(add_link(handle, 0, 100.0, 200.0, 100.0, 260.0, "https://x.example").0,
+                   STATUS_INVALID_INPUT);
+        assert!(decode_links(handle, 0).is_empty());
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_link_with_no_url_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let mut index = -1;
+        assert_eq!(
+            add_uri_link(handle, 0, 1000, 10.0, 10.0, 200.0, 40.0,
+                         std::ptr::null(), 0, &mut index),
+            STATUS_INVALID_INPUT);
+        assert!(decode_links(handle, 0).is_empty());
+
+        close_document(handle);
+    }
+
+    // 4. EDIT, SAVE, REOPEN.
+
+    #[test]
+    fn retargeting_a_uri_link_keeps_the_new_url_through_save_and_reopen() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let (_, index) = add_link(handle, 0, 100.0, 200.0, 400.0, 240.0, "https://before.example");
+
+        assert_eq!(retarget(handle, 0, index, "https://after.example"), STATUS_OK_PDFIUM);
+
+        let live = decode_links(handle, 0);
+        assert_eq!(live[0].uri, "https://after.example");
+
+        let (file, _) = save_like_the_app(handle, "link-edit");
+        let after = links_in_file(&file, 0);
+
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].uri, "https://after.example");
+        // The box is untouched by a retarget.
+        assert!((after[0].left - live[0].left).abs() < 1e-4);
+        assert!((after[0].right - live[0].right).abs() < 1e-4);
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn retargeting_edits_the_link_that_was_asked_for() {
+        // Three links on one page. Editing the middle one must leave the other
+        // two exactly as they were.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        add_link(handle, 0, 10.0, 10.0, 200.0, 40.0, "https://one.example");
+        let (_, middle) = add_link(handle, 0, 10.0, 60.0, 200.0, 90.0, "https://two.example");
+        add_link(handle, 0, 10.0, 110.0, 200.0, 140.0, "https://three.example");
+
+        assert_eq!(retarget(handle, 0, middle, "https://changed.example"), STATUS_OK_PDFIUM);
+
+        let urls: Vec<String> = decode_links(handle, 0).into_iter().map(|l| l.uri).collect();
+        assert_eq!(urls, vec![
+            "https://one.example".to_owned(),
+            "https://changed.example".to_owned(),
+            "https://three.example".to_owned(),
+        ]);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn retargeting_something_that_is_not_a_link_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let spec = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        assert_eq!(add_shape_annotations(handle, 1000, &spec, 1), STATUS_OK_PDFIUM);
+
+        assert_eq!(retarget(handle, 0, 0, "https://nope.example"), STATUS_INVALID_INPUT);
+
+        close_document(handle);
+    }
+
+    // 5. DELETE, AND THE RE-ADD THAT UNDO IS BUILT ON.
+
+    #[test]
+    fn deleting_a_link_removes_it_and_leaves_its_neighbours_alone() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        add_link(handle, 0, 10.0, 10.0, 200.0, 40.0, "https://one.example");
+        let (_, middle) = add_link(handle, 0, 10.0, 60.0, 200.0, 90.0, "https://two.example");
+        add_link(handle, 0, 10.0, 110.0, 200.0, 140.0, "https://three.example");
+
+        assert_eq!(delete_annotation(handle, 0, middle), STATUS_OK_PDFIUM);
+
+        let urls: Vec<String> = decode_links(handle, 0).into_iter().map(|l| l.uri).collect();
+        assert_eq!(urls, vec![
+            "https://one.example".to_owned(),
+            "https://three.example".to_owned(),
+        ]);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_deleted_link_can_be_put_back_exactly_where_it_was() {
+        // What undo actually does: a delete is undone by re-adding the same URL
+        // over the same rectangle. It has to come back with the same box, or
+        // undo would move the link.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let (_, index) = add_link(handle, 0, 100.0, 200.0, 400.0, 240.0, "https://back.example");
+        let before = decode_links(handle, 0).remove(0);
+
+        assert_eq!(delete_annotation(handle, 0, index), STATUS_OK_PDFIUM);
+        assert!(decode_links(handle, 0).is_empty());
+
+        assert_eq!(add_link(handle, 0, 100.0, 200.0, 400.0, 240.0, "https://back.example").0,
+                   STATUS_OK_PDFIUM);
+        let after = decode_links(handle, 0).remove(0);
+
+        assert_eq!(before.uri, after.uri);
+        assert!((before.left - after.left).abs() < 1e-4, "{before:?} {after:?}");
+        assert!((before.top - after.top).abs() < 1e-4, "{before:?} {after:?}");
+        assert!((before.right - after.right).abs() < 1e-4, "{before:?} {after:?}");
+        assert!((before.bottom - after.bottom).abs() < 1e-4, "{before:?} {after:?}");
+
+        close_document(handle);
+    }
+
+    // 6. INTERNAL DESTINATIONS: READ AND PRESERVED, NEVER WRITTEN.
+
+    #[test]
+    fn an_internal_link_is_reported_with_the_page_it_goes_to() {
+        // ⚠️ TWO QUESTIONS, NOT ONE. Chromium writes internal jumps as
+        // `/Dest /name` with no `/A` at all, so action() answers None and only
+        // destination() knows anything. Asking only the first makes every
+        // internal link in a real document look empty.
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+
+        let page0 = decode_links(handle, 0);
+        let page1 = decode_links(handle, 1);
+
+        assert_eq!(page0[2].kind, LINK_INTERNAL);
+        assert_eq!(page0[2].target_page, 1);
+        assert_eq!(page0[2].uri, "");
+        assert_eq!(page1[0].kind, LINK_INTERNAL);
+        assert_eq!(page1[0].target_page, 0);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_internal_link_cannot_be_retargeted_as_a_url() {
+        // PDFium has no destination setter, so writing a URI action over one
+        // would leave the document holding BOTH and disagreeing with itself.
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+        let internal = decode_links(handle, 0).remove(2);
+
+        assert_eq!(retarget(handle, 0, internal.index as i32, "https://hijack.example"),
+                   STATUS_UNSUPPORTED);
+        assert_eq!(decode_links(handle, 0)[2], internal);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn internal_links_still_point_at_the_right_pages_after_our_save() {
+        // The destinations live in the CATALOG's /Dests tree, not in the
+        // annotation, so this is really asking whether our save keeps a part of
+        // the document nothing here ever touches.
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+        assert_eq!(add_link(handle, 0, 10.0, 400.0, 200.0, 430.0, "https://added.example").0,
+                   STATUS_OK_PDFIUM);
+
+        let (file, _) = save_like_the_app(handle, "link-internal");
+
+        let page0 = links_in_file(&file, 0);
+        let page1 = links_in_file(&file, 1);
+
+        assert_eq!(page0.len(), 4, "{page0:#?}");
+        assert_eq!(page0[0].uri, "https://example.com/path?q=1");
+        assert_eq!(page0[1].uri, "mailto:someone@example.com");
+        assert_eq!(page0[2].kind, LINK_INTERNAL);
+        assert_eq!(page0[2].target_page, 1);
+        assert_eq!(page0[3].uri, "https://added.example");
+        assert_eq!(page1[0].target_page, 0);
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    // 7. AYAAN'S OWN WORK AND LINKS IN THE SAME FILE.
+
+    #[test]
+    fn a_gradient_shape_and_a_link_survive_the_same_save() {
+        // The real save path: PDFium writes the file, then the lopdf pass paints
+        // the gradients into it. Either half could quietly drop the other's
+        // work, which is the only reason this is worth a test.
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let fill = across();
+        let mut spec = shape(SHAPE_RECTANGLE, 100.0, 100.0, 400.0, 300.0);
+        spec.fill_rgba = 0xFF00FF00;
+        spec.effects_utf8 = fill.as_ptr();
+        spec.effects_len = fill.len();
+        assert_eq!(add_shape_annotations(handle, 1000, &spec, 1), STATUS_OK_PDFIUM);
+
+        assert_eq!(add_link(handle, 0, 100.0, 500.0, 400.0, 540.0, "https://with-shape.example").0,
+                   STATUS_OK_PDFIUM);
+
+        let (file, gradients) = save_like_the_app(handle, "link-with-gradient");
+        assert_eq!(gradients, 1, "the gradient writer found nothing to paint");
+
+        let links = links_in_file(&file, 0);
+        assert_eq!(links.len(), 1, "{links:#?}");
+        assert_eq!(links[0].uri, "https://with-shape.example");
+
+        let raw = std::fs::read(&file).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("AyaanTag"), "the shape's tag did not survive");
+        assert!(text.contains("ShadingType"), "the gradient did not survive");
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_link_added_to_a_real_linked_document_leaves_its_own_links_alone() {
+        let handle = open_fixture_named("tests/fixtures/sample_links.pdf");
+
+        let fill = across();
+        let mut spec = shape(SHAPE_RECTANGLE, 100.0, 500.0, 400.0, 700.0);
+        spec.fill_rgba = 0xFF00FF00;
+        spec.effects_utf8 = fill.as_ptr();
+        spec.effects_len = fill.len();
+        assert_eq!(add_shape_annotations(handle, 1000, &spec, 1), STATUS_OK_PDFIUM);
+
+        let (file, gradients) = save_like_the_app(handle, "link-real-doc");
+        assert_eq!(gradients, 1);
+
+        let links = links_in_file(&file, 0);
+        assert_eq!(links.len(), 3, "{links:#?}");
+        assert_eq!(links[0].uri, "https://example.com/path?q=1");
+        assert_eq!(links[1].uri, "mailto:someone@example.com");
+        assert_eq!(links[2].target_page, 1);
+
+        let _ = std::fs::remove_file(&file);
     }
 
     // ---------------- word clusters, the editing unit ----------------

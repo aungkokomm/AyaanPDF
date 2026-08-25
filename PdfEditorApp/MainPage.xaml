@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8" ?>
+﻿<?xml version="1.0" encoding="utf-8" ?>
 <Page
     x:Class="PdfEditorApp.MainPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -470,6 +470,46 @@
                                                     <Rectangle Fill="#332563EB"
                                                                Stroke="#CC2563EB" StrokeThickness="1.5"
                                                                StrokeDashArray="3,2" RadiusX="1" RadiusY="1"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <!--
+                                            LINKS, when Show Links is on.
+
+                                            The only thing that makes a link
+                                            visible at all. Measured in every
+                                            real file: a link annotation carries
+                                            no appearance stream and a
+                                            zero-width border, so the document
+                                            draws nothing and a reader cannot
+                                            tell what is clickable.
+
+                                            Stroke comes from the rect, because
+                                            a link whose address can be changed
+                                            and one that jumps inside the
+                                            document are not the same offer.
+
+                                            Not hit-testable: the viewport host
+                                            works out what was clicked from the
+                                            coordinates, and letting these take
+                                            the pointer would steal the press
+                                            from the code that decides what a
+                                            click on a link means.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind LinkOutlines}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Fill="#141A73E8"
+                                                               Stroke="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                               StrokeThickness="1" StrokeDashArray="3,2"
+                                                               RadiusX="1" RadiusY="1"
                                                                Width="{x:Bind Width}" Height="{x:Bind Height}"
                                                                Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
                                                                HorizontalAlignment="Left" VerticalAlignment="Top" />
@@ -1445,6 +1485,8 @@
                                                      GroupName="pageViewMode"
                                                      Click="SinglePageView_Click" />
                                 <MenuFlyoutSeparator />
+                                <ToggleMenuFlyoutItem x:Name="ShowLinksToggle" Text="Show links"
+                                                      Click="ShowLinksToggle_Click" />
                                 <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
                                                       IsChecked="True" Click="RulersToggle_Click">
                                     <ToggleMenuFlyoutItem.KeyboardAccelerators>

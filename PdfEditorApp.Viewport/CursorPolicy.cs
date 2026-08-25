@@ -1,4 +1,4 @@
-namespace PdfEditorApp.Viewport;
+﻿namespace PdfEditorApp.Viewport;
 
 /// <summary>
 /// The cursor the viewport wants, independent of how the platform draws it.
@@ -43,7 +43,8 @@ public static class CursorPolicy
         return tool switch
         {
             ToolMode.Select or ToolMode.Highlight or ToolMode.Text => ViewportCursor.IBeam,
-            ToolMode.Draw or ToolMode.Shape or ToolMode.Note or ToolMode.Stamp => ViewportCursor.Cross,
+            ToolMode.Draw or ToolMode.Shape or ToolMode.Note or ToolMode.Stamp
+                or ToolMode.Link => ViewportCursor.Cross,
             _ => ViewportCursor.Arrow,
         };
     }

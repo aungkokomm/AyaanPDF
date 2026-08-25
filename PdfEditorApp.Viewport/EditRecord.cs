@@ -103,3 +103,29 @@ public sealed record WordTextRecord(
     string Before,
     string After)
     : EditRecord(Guid.Empty, Page);
+
+/// <summary>
+/// A URI link was created, retargeted or removed.
+///
+/// <paramref name="Before"/> and <paramref name="After"/> are the URL on each
+/// side, and null means the link is not there: null to a URL is a creation, a
+/// URL to null is a deletion, and one URL to another is a retarget. So all three
+/// commands share one record and one reversal.
+///
+/// ⚠️ KEYED BY RECTANGLE AND URL, not by Guid, for the same reason
+/// <see cref="WordTextRecord"/> is keyed by object index: a link is often not
+/// ours. A document's own links carry no identity we put there, and stamping one
+/// would mean writing to a link the user only wanted to follow.
+///
+/// An annotation index would not do either. Every write in this app renumbers
+/// them, so an index recorded at edit time names something else by the time undo
+/// runs. The rectangle survives all of that, and the URL is checked as well as
+/// restored: if the link at that rectangle no longer says what the record
+/// expects, the step refuses rather than retargeting a link it was never about.
+/// </summary>
+public sealed record LinkRecord(
+    int Page,
+    EditRect Rect,
+    string? Before,
+    string? After)
+    : EditRecord(Guid.Empty, Page);
