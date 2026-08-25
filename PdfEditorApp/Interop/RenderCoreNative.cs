@@ -375,6 +375,15 @@ internal static class RenderStatus
     /// thing either way.
     /// </summary>
     public const int NeedsPassword = 5;
+
+    /// <summary>
+    /// Well formed, but it would not fit on the page. Distinct from
+    /// <see cref="Unsupported"/> because it is the one refusal the user can act
+    /// on: the same edit with fewer words goes through. Measured before the
+    /// check existed, a three-hundred-character replacement was accepted and
+    /// left the text four and a half page widths off the paper.
+    /// </summary>
+    public const int TooWide = 6;
 }
 
 /// <summary>Mirrors render_core::{POLL_*} (src/lib.rs).</summary>
@@ -642,6 +651,55 @@ internal static partial class RenderCoreNative
         int pageIndex,
         uint[] objects,
         nuint objectCount,
+        uint prefixChars,
+        byte[] newTextUtf8,
+        nuint newTextLen,
+        byte[]? fallbackFontPathUtf8,
+        nuint fallbackFontPathLen);
+
+    /// <summary>
+    /// Every visual LINE on a page, as a self-describing byte buffer. Parsed by
+    /// <see cref="Viewport.LineReader"/>. Free with
+    /// <see cref="free_byte_buffer"/>.
+    ///
+    /// ⚠️ A line is PDFium's own line, not a group of words that share a
+    /// baseline. Grouping by baseline was measured giving 25 groups on a page
+    /// with 20 lines: a rotated line shattered into six fragments in reverse
+    /// reading order and two columns interleaved.
+    ///
+    /// Lines that cannot be retyped are reported too, carrying the reason, so
+    /// the app can show them and say why.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern ByteBuffer get_page_lines(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// Replaces one visual line with one string, or changes nothing at all.
+    ///
+    /// The three identifying arguments must be exactly what the line was read
+    /// with; the core re-derives the page's lines and refuses if they no longer
+    /// describe one, so a stale selection cannot overwrite whatever sits there
+    /// now.
+    ///
+    /// ⚠️ The whole object RANGE is rewritten, including the whitespace-only
+    /// objects producers scatter between words. That is what makes the word
+    /// count free: the line becomes one string in one object.
+    ///
+    /// <paramref name="fallbackFontPathUtf8"/> is used only when the line's own
+    /// font cannot spell the replacement, which for a subset font is the common
+    /// case. Pass null to refuse rather than substitute.
+    ///
+    /// Returns OkPdfium when the page now says exactly what was asked, TooWide
+    /// when the replacement would leave the page and the page was put back,
+    /// Unsupported when it refused and left the page as it found it, and
+    /// InvalidInput for a request that does not describe a line.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int set_line_text(
+        ulong docHandle,
+        int pageIndex,
+        uint firstObject,
+        uint lastObject,
         uint prefixChars,
         byte[] newTextUtf8,
         nuint newTextLen,

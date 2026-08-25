@@ -7250,6 +7250,12 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // Remembered whatever happens next, because the click AFTER this one
+        // is a triple click and means the whole line. It has to be recorded
+        // even when no word editor opens: a word can refuse while the line it
+        // sits on is perfectly editable.
+        RememberDoubleTap(content.Page, e.GetPosition(ViewportHost), nx, ny);
+
         // Nothing of OURS under the pointer, so try the document's own words.
         // This order is the safe one and the one the reader expects: our marks
         // are painted over the finished page, so anything of ours here is on top
@@ -7258,6 +7264,232 @@ public sealed partial class MainPage : Page
             && OpenWordEditor(content.Page))
         {
             e.Handled = true;
+        }
+    }
+
+    // ---------------- Editing one of the document's own LINES ----------------
+    //
+    // ⚠️ THE THIRD CLICK REACHES TWO DIFFERENT PLACES, and both have to be
+    // handled. The second click of a triple click opens the word editor
+    // directly over the word, so the third one lands on that TextBox and never
+    // reaches the viewport at all. When the word underneath refused to be
+    // edited no editor opened, and then the third click DOES reach the
+    // viewport. Neither route can be dropped: the second is how a line gets
+    // retyped when one of its words is unusable on its own, which is a real
+    // case (a word split across two objects sits inside a perfectly good line).
+
+    /// <summary>How long after a double click a further click still counts as
+    /// part of the same gesture. Windows' own double-click time is 500ms.</summary>
+    private static readonly TimeSpan TripleClickWindow = TimeSpan.FromMilliseconds(600);
+
+    /// <summary>How far the third click may stray and still be the same gesture.</summary>
+    private const double TripleClickSlopDip = 8.0;
+
+    private DateTimeOffset _lastDoubleTapAt = DateTimeOffset.MinValue;
+    private Windows.Foundation.Point _lastDoubleTapAtPoint;
+    private double _lastDoubleTapNormX;
+    private double _lastDoubleTapNormY;
+    private int _lastDoubleTapPage = -1;
+
+    private TextBox? _lineEditor;
+    private LineSnapshot? _lineBeingEdited;
+    private int _lineEditorPage = -1;
+
+    /// <summary>Remembers a double click, so the one after it can be recognised.</summary>
+    private void RememberDoubleTap(int page, Windows.Foundation.Point at, double nx, double ny)
+    {
+        _lastDoubleTapAt = DateTimeOffset.UtcNow;
+        _lastDoubleTapAtPoint = at;
+        _lastDoubleTapNormX = nx;
+        _lastDoubleTapNormY = ny;
+        _lastDoubleTapPage = page;
+    }
+
+    /// <summary>
+    /// Whether this press is the third click of a triple click, and consumes
+    /// the double click if it is.
+    ///
+    /// Consumed so a fourth and fifth click do not each re-open the editor: one
+    /// triple click is one gesture.
+    /// </summary>
+    private bool TakeTripleClick(Windows.Foundation.Point at)
+    {
+        if (DateTimeOffset.UtcNow - _lastDoubleTapAt > TripleClickWindow) { return false; }
+        if (Math.Abs(at.X - _lastDoubleTapAtPoint.X) > TripleClickSlopDip) { return false; }
+        if (Math.Abs(at.Y - _lastDoubleTapAtPoint.Y) > TripleClickSlopDip) { return false; }
+
+        _lastDoubleTapAt = DateTimeOffset.MinValue;
+        return true;
+    }
+
+    /// <summary>
+    /// Selects the line under the remembered double click and opens the editor
+    /// on it. Both third-click routes end here so there is one behaviour.
+    /// </summary>
+    private bool EscalateToLine()
+    {
+        if (_lastDoubleTapPage < 0) { return false; }
+
+        int page = _lastDoubleTapPage;
+        if (!ViewModel.SelectLineAt(page, _lastDoubleTapNormX, _lastDoubleTapNormY))
+        {
+            return false;
+        }
+
+        return OpenLineEditor(page);
+    }
+
+    /// <summary>
+    /// Opens a one-line editor over the selected line.
+    ///
+    /// Refuses up front for a line the core will not retype, because being told
+    /// before typing is the difference between a limitation and a bug. Every
+    /// reason is real and measured: a justified line whose spacing would be
+    /// evened out, a line set in three styles, a rotated line, a script PDFium
+    /// does not read back faithfully, and two labels that merely share a
+    /// baseline.
+    /// </summary>
+    private bool OpenLineEditor(int page)
+    {
+        if (ViewModel.SelectedLine is not LineSnapshot line) { return false; }
+
+        if (!line.CanEdit)
+        {
+            ViewModel.Status = line.RefusalReason;
+            return false;
+        }
+
+        CommitTextEdit();
+        CancelWordEdit();
+        CancelLineEdit();
+        ResetPointerInteraction();
+
+        // Reaching a line takes clicks, and clicks on page text start a text
+        // selection, so without this the reader's blue highlight sits under the
+        // editor and the same line looks selected two different ways.
+        ViewModel.ClearReaderTextSelection();
+
+        double scale = ViewModel.OverlayScale;
+        double pageTop = ViewModel.SlotTopOf(page);
+        double widthDip = (line.Right - line.Left) * scale;
+
+        // ⚠️ TWO DIFFERENT SCALES. The line's BOUNDS are normalized (0..1 across
+        // the page) and convert with OverlayScale; its FONT SIZE is an absolute
+        // point size and converts with DIPs-per-point. Mixing them once filled
+        // the window with two enormous letters.
+        double dipsPerPoint = ViewModel.DipsPerPointOn(page);
+        if (dipsPerPoint <= 0) { return false; }
+
+        double fontDip = line.FontSizePts * dipsPerPoint;
+
+        _lineBeingEdited = line;
+        _lineEditorPage = page;
+
+        _lineEditor = new TextBox
+        {
+            // ONE LINE, still. Enter means "done"; a line that could grow into
+            // two would be a paragraph edit, which this is not, and the core
+            // refuses a replacement containing a break anyway.
+            AcceptsReturn = false,
+            TextWrapping = TextWrapping.NoWrap,
+            // Room to type past the end of the line without it scrolling away
+            // under the cursor, but never wider than the page.
+            Width = Math.Min(
+                ViewModel.OverlayScale,
+                Math.Max(120, widthDip + (fontDip * 6))),
+            MinHeight = Math.Max(20, fontDip * 1.6),
+            Padding = new Thickness(2, 0, 2, 0),
+            BorderThickness = new Thickness(1.5),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2D, 0x6F, 0xC4)),
+            CornerRadius = new CornerRadius(2),
+            Background = new SolidColorBrush(Colors.White),
+            FontSize = Math.Max(8, fontDip),
+            Text = line.Text,
+        };
+
+        Canvas.SetLeft(_lineEditor, (line.Left * scale) - 2);
+        Canvas.SetTop(_lineEditor, (line.Top * scale) + pageTop - 2);
+        EditCanvas.Children.Add(_lineEditor);
+
+        // THE LAYER HAS TO BE SHOWN. EditOverlay is Collapsed until an edit
+        // begins, so an editor added to it without this is built, focused and
+        // typed into entirely invisibly.
+        EditOverlay.Visibility = Visibility.Visible;
+
+        _lineEditor.KeyDown += LineEditor_KeyDown;
+        _lineEditor.LostFocus += LineEditor_LostFocus;
+
+        _lineEditor.Focus(FocusState.Programmatic);
+        _lineEditor.SelectAll();
+        return true;
+    }
+
+    /// <summary>Enter commits, Escape abandons. Nothing else is special.</summary>
+    private void LineEditor_KeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key == Windows.System.VirtualKey.Enter)
+        {
+            e.Handled = true;
+            CommitLineEdit();
+        }
+        else if (e.Key == Windows.System.VirtualKey.Escape)
+        {
+            e.Handled = true;
+            CancelLineEdit();
+        }
+    }
+
+    /// <summary>Clicking away commits, the way every in-place rename does.</summary>
+    private void LineEditor_LostFocus(object sender, RoutedEventArgs e) => CommitLineEdit();
+
+    /// <summary>
+    /// Sends the typed line to the core, then closes the editor either way.
+    ///
+    /// The editor closes even when the core refuses, because it has already put
+    /// the page back as it found it and said why: leaving a box open over
+    /// unchanged text would suggest the edit was still pending.
+    /// </summary>
+    private void CommitLineEdit()
+    {
+        if (_lineEditor is not TextBox editor) { return; }
+
+        string typed = editor.Text;
+        var line = _lineBeingEdited;
+
+        TearDownLineEditor();
+
+        if (line is null || typed.Trim() == line.Text.Trim()) { return; }
+
+        ViewModel.EditSelectedLine(typed);
+    }
+
+    /// <summary>Closes the editor and changes nothing.</summary>
+    private void CancelLineEdit()
+    {
+        if (_lineEditor is null) { return; }
+        TearDownLineEditor();
+    }
+
+    private void TearDownLineEditor()
+    {
+        if (_lineEditor is not TextBox editor) { return; }
+
+        // Unhooked BEFORE removal: removing a focused TextBox raises LostFocus,
+        // which would re-enter the commit that is already running.
+        editor.KeyDown -= LineEditor_KeyDown;
+        editor.LostFocus -= LineEditor_LostFocus;
+
+        _lineEditor = null;
+        _lineBeingEdited = null;
+        _lineEditorPage = -1;
+
+        EditCanvas.Children.Remove(editor);
+
+        // Only if nothing else is being edited: the other editors share this
+        // layer, and hiding it from under one would take the others with it.
+        if (_textEditor is null && _wordEditor is null)
+        {
+            EditOverlay.Visibility = Visibility.Collapsed;
         }
     }
 
@@ -7347,6 +7579,10 @@ public sealed partial class MainPage : Page
 
         _wordEditor.KeyDown += WordEditor_KeyDown;
         _wordEditor.LostFocus += WordEditor_LostFocus;
+        // ⚠️ The editor sits directly over the word, so the third click of a
+        // triple click hits IT and never reaches the viewport. Without this the
+        // gesture simply places a caret and the line is unreachable.
+        _wordEditor.PointerPressed += WordEditor_PointerPressed;
 
         _wordEditor.Focus(FocusState.Programmatic);
         _wordEditor.SelectAll();
@@ -7370,6 +7606,25 @@ public sealed partial class MainPage : Page
 
     /// <summary>Clicking away commits, the way every in-place rename does.</summary>
     private void WordEditor_LostFocus(object sender, RoutedEventArgs e) => CommitWordEdit();
+
+    /// <summary>
+    /// The third click of a triple click, arriving on the word editor rather
+    /// than on the page because the editor is sitting on top of the word.
+    ///
+    /// The word edit is ABANDONED rather than committed: nothing has been typed
+    /// into it yet, and the reader is asking for the line instead.
+    /// </summary>
+    private void WordEditor_PointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (!TakeTripleClick(e.GetCurrentPoint(ViewportHost).Position)) { return; }
+
+        CancelWordEdit();
+
+        if (EscalateToLine())
+        {
+            e.Handled = true;
+        }
+    }
 
     /// <summary>
     /// Sends the typed word to the core, then closes the editor either way.
@@ -7407,6 +7662,7 @@ public sealed partial class MainPage : Page
         // which would re-enter the commit that is already running.
         editor.KeyDown -= WordEditor_KeyDown;
         editor.LostFocus -= WordEditor_LostFocus;
+        editor.PointerPressed -= WordEditor_PointerPressed;
 
         _wordEditor = null;
         _wordBeingEdited = null;
@@ -7760,6 +8016,19 @@ public sealed partial class MainPage : Page
         switch (ViewModel.ActiveTool)
         {
             case ToolMode.Select:
+                // A TRIPLE CLICK means the whole line, and comes first because
+                // every check below would treat it as an ordinary press.
+                //
+                // This is the route taken when the double click did NOT open a
+                // word editor, either because the word under it refused or
+                // because there was no word there. When one did open, the third
+                // click lands on the editor instead and is handled there.
+                if (TakeTripleClick(current.Position) && EscalateToLine())
+                {
+                    e.Handled = true;
+                    break;
+                }
+
                 // A LINK first, and only while Show Links is on. A link is the
                 // document's, not ours: the reader who has asked to see links
                 // and then clicks one is asking to follow it, not to select a

@@ -829,6 +829,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Throws away every page's pixels, because the document behind them is not
+    /// the document they were rendered from.
+    ///
+    /// ⚠️ WHAT A DOCUMENT REPLACEMENT NEEDS AND AN ANNOTATION EDIT DOES NOT.
+    /// <see cref="InvalidateAnnotationCache"/> drops what was READ from a page;
+    /// this drops what was DRAWN of it. Form fields are painted by PDFium into
+    /// the page bitmap, so a form edit that skipped this wrote the right value
+    /// into the file and left the reader looking at the old picture: measured on
+    /// a real form, where ticking a box and choosing from a list both changed
+    /// nothing on screen and the log carried no repaint at all.
+    ///
+    /// The visible page is redrawn now; the rest are simply released, and the
+    /// scroll pass renders each one again when it comes back into view. That is
+    /// what keeps this affordable on a document with three thousand pages.
+    /// </summary>
+    private void InvalidateAllPageRasters()
+    {
+        foreach (var slot in PageSlots)
+        {
+            slot.ClearTiles();
+            slot.ReleaseBitmap();
+        }
+
+        RedrawPage(CurrentPageIndex);
+    }
+
+    /// <summary>
     /// Ticks a checkbox, picks a radio button, or chooses an option in a combo
     /// box or list box. One undoable action.
     ///
@@ -888,6 +915,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         ClearLoadedAnnotations();
         LoadFormFields();
         DistributeFormOutlines();
+
+        // ⚠️ THE PIXELS TOO. RenderCurrentPage refreshes the annotation OVERLAY
+        // and nothing else, so on its own the value changed in the file and the
+        // page went on showing what it showed before.
+        InvalidateAllPageRasters();
         RenderCurrentPage();
         IsDirty = true;
 
@@ -1227,6 +1259,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _clustersByPage.Clear();
         _selectedWord = null;
         _selectedWordPage = -1;
+
+        // The LINES have the same lifetime as the words: both are read from the
+        // page's content and both describe the document that is being closed.
+        _linesByPage.Clear();
+        _selectedLine = null;
+        _selectedLinePage = -1;
     }
 
     /// <summary>
@@ -4873,6 +4911,215 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         IsDirty = true;
 
         Status = $"Changed \u201c{word.Text}\u201d to \u201c{newText}\u201d.";
+        return true;
+    }
+
+    // ---------------- The document's own text, one LINE at a time ----------------
+    //
+    // Above the words and deliberately not built out of them. A word can only
+    // ever be swapped for a word; a line is one string, so retyping it may
+    // change how many words there are, which is the reason it exists as a unit.
+    //
+    // Its own fields, like the words and the links, because none of the thirty
+    // operations hanging off the annotation selection mean anything here.
+
+    private readonly Dictionary<int, IReadOnlyList<LineSnapshot>> _linesByPage = new();
+
+    private LineSnapshot? _selectedLine;
+    private int _selectedLinePage = -1;
+
+    /// <summary>
+    /// The page's own text as VISUAL LINES, read once and cached until the page
+    /// changes.
+    /// </summary>
+    private IReadOnlyList<LineSnapshot> LinesFor(int pageIndex)
+    {
+        if (_documentHandle == 0) { return Array.Empty<LineSnapshot>(); }
+
+        if (!_linesByPage.TryGetValue(pageIndex, out var found))
+        {
+            found = Interop.LineGateway.Load(_documentHandle, pageIndex);
+            _linesByPage[pageIndex] = found;
+        }
+
+        return found;
+    }
+
+    /// <summary>The line of the document's own text that is selected, or null.</summary>
+    public LineSnapshot? SelectedLine
+    {
+        get => _selectedLine;
+        private set
+        {
+            if (ReferenceEquals(_selectedLine, value)) { return; }
+
+            _selectedLine = value;
+            OnPropertyChanged(nameof(SelectedLine));
+            OnPropertyChanged(nameof(HasSelectedLine));
+            OnPropertyChanged(nameof(SelectedLineDescription));
+        }
+    }
+
+    public bool HasSelectedLine => _selectedLine is not null;
+
+    /// <summary>The page the selected line is on, or -1.</summary>
+    public int SelectedLinePage => _selectedLinePage;
+
+    /// <summary>
+    /// What the status bar says about the selected line.
+    ///
+    /// A line that cannot be retyped says so HERE, before the reader tries and
+    /// is turned away. Every reason is real and measured on a real document.
+    /// </summary>
+    public string SelectedLineDescription
+    {
+        get
+        {
+            if (_selectedLine is not { } l) { return string.Empty; }
+
+            string shown = l.Text.Length > 48 ? l.Text[..48] + "…" : l.Text;
+            string head = $"“{shown}”  •  {l.FontName} {l.FontSizePts:0.#}pt";
+
+            return l.CanEdit ? head : head + "  •  " + l.RefusalReason;
+        }
+    }
+
+    /// <summary>Drops the line selection, if there is one.</summary>
+    public void ClearLineSelection()
+    {
+        SelectedLine = null;
+        _selectedLinePage = -1;
+    }
+
+    /// <summary>
+    /// Selects the visual line of the document's own text under a point.
+    ///
+    /// ONLY REACHED WHEN NO MARK OF OURS WAS HIT, the same order the word
+    /// selection uses and for the same reason: our annotations are painted over
+    /// the finished page, so anything of ours under the pointer is on top of
+    /// the words and is what the gesture meant.
+    /// </summary>
+    public bool SelectLineAt(int pageIndex, double normX, double normY)
+    {
+        if (_documentHandle == 0) { return false; }
+
+        var picked = LineAt(pageIndex, normX, normY);
+
+        SelectedLine = picked;
+        _selectedLinePage = picked is null ? -1 : pageIndex;
+
+        if (picked is not null)
+        {
+            Diag.Log(
+                $"SelectLineAt p{pageIndex} obj[{picked.FirstObject}..{picked.LastObject}] "
+                + $"pre={picked.PrefixChars} words={picked.Words} "
+                + $"refusal={picked.Refusal} text={picked.Text}");
+
+            Status = SelectedLineDescription;
+        }
+
+        return picked is not null;
+    }
+
+    /// <summary>
+    /// The line under a point, or null.
+    ///
+    /// Searched BACKWARDS so the last one painted wins where two overlap, the
+    /// same rule the annotation and word picks use. The tolerance is the word
+    /// pick's, because a line's bounds hug its glyphs just as tightly and
+    /// clicking just under a baseline is still clicking the line.
+    /// </summary>
+    private LineSnapshot? LineAt(int pageIndex, double normX, double normY)
+    {
+        const double Tolerance = 0.004;
+
+        var lines = LinesFor(pageIndex);
+        for (int i = lines.Count - 1; i >= 0; i--)
+        {
+            var l = lines[i];
+            if (normX >= l.Left - Tolerance && normX <= l.Right + Tolerance
+                && normY >= l.Top - Tolerance && normY <= l.Bottom + Tolerance)
+            {
+                return l;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Retypes the selected line, as ONE undoable action.
+    ///
+    /// The core does the deciding: it re-derives the page's lines, refuses if
+    /// the selection no longer describes one, writes through the line's own font
+    /// where that font can spell the replacement and through a stand-in where it
+    /// cannot, reads back what the page now says, checks the result still fits
+    /// on the paper, and puts the original text back if any of that fails.
+    /// Nothing here second-guesses it; this turns one answer into one history
+    /// entry and one message.
+    /// </summary>
+    public bool EditSelectedLine(string newText)
+    {
+        if (_documentHandle == 0 || _selectedLine is not { } line) { return false; }
+        if (_selectedLinePage < 0) { return false; }
+
+        newText = newText.Trim();
+        if (newText.Length == 0)
+        {
+            Status = "A line cannot be made empty. Delete is a different edit.";
+            return false;
+        }
+        if (newText == line.Text.Trim()) { return false; }
+
+        if (!line.CanEdit)
+        {
+            Status = line.RefusalReason;
+            return false;
+        }
+
+        int page = _selectedLinePage;
+
+        // ONE ENTRY, opened before the write and closed after it, so undo puts
+        // the line back in a single step however many objects the core touched.
+        BeginEdit("Edit line");
+        RecordEdit(new LineTextRecord(
+            page, line.FirstObject, line.LastObject, line.PrefixChars, line.Text, newText));
+
+        int status = Interop.LineGateway.Write(
+            _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
+            line.FontName, newText);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            // The core leaves the page as it found it when it refuses, so the
+            // entry is abandoned rather than committed: there is nothing to undo.
+            AbandonEdit();
+
+            Status = status switch
+            {
+                RenderStatus.TooWide =>
+                    "That is too long to fit on the line. Try fewer words.",
+                RenderStatus.Unsupported =>
+                    SystemFontMatch.PathFor(line.FontName) is null
+                        ? $"“{line.FontName}” is not a font this app can match, so the line cannot be retyped."
+                        : "This line cannot be rewritten with the letters it needs.",
+                _ => "That line no longer matches the page. Select it again.",
+            };
+
+            Diag.Log($"EditSelectedLine refused status={status} font={line.FontName}");
+            return false;
+        }
+
+        CommitEdit();
+
+        InvalidateLoadedPage(page);
+        ClearLineSelection();
+        ClearPageTextSelection();
+        RefreshSelectionOutline();
+        RenderCurrentPage();
+        IsDirty = true;
+
+        Status = "Line changed.";
         return true;
     }
 
@@ -9102,6 +9349,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // showing the reader the truth rather than about safety.
         _clustersByPage.Remove(pageIndex);
 
+        // And its lines, which are built from those same words and carry an
+        // object RANGE that an edit renumbers.
+        _linesByPage.Remove(pageIndex);
+
         // So do its links. They ARE annotations, so an edit that renumbers the
         // page renumbers them, and a cached link would hand a stale annotation
         // index to a delete.
@@ -11272,6 +11523,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     touched.Add(w.Page);
                     break;
 
+                case LineTextRecord n:
+                    ApplyLineText(n, backwards);
+                    touched.Add(n.Page);
+                    break;
+
                 case LinkRecord l:
                     ApplyLink(l, backwards);
                     touched.Add(l.Page);
@@ -11337,6 +11593,57 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        _clustersByPage.Remove(record.Page);
+    }
+
+    /// <summary>
+    /// Puts one visual line back to what it said, in either direction.
+    ///
+    /// ⚠️ VERIFIES BEFORE IT WRITES, exactly as the word reversal does and for
+    /// the same reason: a page's own text carries no identity we put there, so
+    /// the record is keyed by where the line sits in the content. The page is
+    /// asked what that range says now, and the record is applied only if it
+    /// says what this record expects to find.
+    ///
+    /// ⚠️ AND IT LOOKS THE LINE UP BY TEXT, not by range. Retyping a line
+    /// changes its word count and can change how many objects draw it, so after
+    /// the edit the range is not what it was. The text is the only handle that
+    /// survives the operation this is undoing.
+    ///
+    /// The write goes through the same core call the edit used, so undo cannot
+    /// take a path the edit did not.
+    /// </summary>
+    private void ApplyLineText(LineTextRecord record, bool backwards)
+    {
+        string expected = backwards ? record.After : record.Before;
+        string wanted = backwards ? record.Before : record.After;
+
+        _linesByPage.Remove(record.Page);
+        _clustersByPage.Remove(record.Page);
+
+        var line = LinesFor(record.Page)
+            .FirstOrDefault(l => l.Text.Trim() == expected.Trim());
+
+        if (line is null)
+        {
+            Diag.Log(
+                $"undo line: page {record.Page} expected {expected.Trim()} and no line says it, refusing");
+            Status = "That text has changed since, so this step could not be undone.";
+            return;
+        }
+
+        int status = Interop.LineGateway.Write(
+            _documentHandle, record.Page, line.FirstObject, line.LastObject,
+            line.PrefixChars, line.FontName, wanted);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"undo line: the core refused with {status}");
+            Status = "That text could not be put back.";
+            return;
+        }
+
+        _linesByPage.Remove(record.Page);
         _clustersByPage.Remove(record.Page);
     }
 
@@ -11484,6 +11791,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // just undone.
         LoadFormFields();
         DistributeFormOutlines();
+
+        // And so do the pixels. A document-scope entry carries no per-page
+        // records, so the repaint the record loop performs never fires for one,
+        // and an undone form edit was as invisible as the edit had been.
+        InvalidateAllPageRasters();
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
         Thumbnails.Clear();
         for (int i = 0; i < PageCount; i++)

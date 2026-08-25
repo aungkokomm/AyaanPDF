@@ -90,6 +90,14 @@ pub const STATUS_UNSUPPORTED: i32 = 4;
 /// does any reader's prompt.
 pub const STATUS_NEEDS_PASSWORD: i32 = 5;
 
+/// The replacement was well formed but would not fit on the page.
+///
+/// Distinct from STATUS_UNSUPPORTED because it is the one refusal the user can
+/// act on: the same edit with fewer words goes through. Measured before the
+/// check existed, a three-hundred-character replacement was accepted and left
+/// the text four and a half page widths off the paper.
+pub const STATUS_TOO_WIDE: i32 = 6;
+
 pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
 pub const POLL_CANCELLED: i32 = 2;
@@ -2616,13 +2624,17 @@ fn resolve_text_font(
 fn needs_shaping(text: &str) -> bool {
     text.chars().any(|c| {
         let u = c as u32;
-        (0x0600..=0x06FF).contains(&u)      // Arabic
+        (0x0590..=0x05FF).contains(&u)      // Hebrew
+            || (0x0600..=0x06FF).contains(&u) // Arabic
             || (0x0700..=0x074F).contains(&u) // Syriac
             || (0x0750..=0x077F).contains(&u) // Arabic Supplement
             || (0x0900..=0x0DFF).contains(&u) // Devanagari .. Malayalam .. Sinhala (Indic)
             || (0x0E00..=0x0FFF).contains(&u) // Thai, Lao, Tibetan
             || (0x1000..=0x109F).contains(&u) // Myanmar
             || (0x1780..=0x17FF).contains(&u) // Khmer
+            || (0x0780..=0x07BF).contains(&u) // Thaana
+            || (0xFB1D..=0xFDFF).contains(&u) // Hebrew and Arabic presentation forms
+            || (0xFE70..=0xFEFF).contains(&u)
     })
 }
 
@@ -8490,6 +8502,15 @@ struct WordCluster {
     /// shares its object has to be spliced into the existing string instead.
     prefix: usize,
     suffix: usize,
+    /// Which VISUAL LINE this word sits on, counted from PDFium's own line
+    /// breaks rather than from the baselines.
+    ///
+    /// ⚠️ Measured against baseline grouping on the same page: 20 real lines
+    /// against 25 groups. A rotated line shattered into six fragments in
+    /// reverse reading order and two columns interleaved. The stream carries
+    /// CR/LF where the producer put a line end, and this walk is already
+    /// reading it.
+    line: usize,
 }
 
 impl WordCluster {
@@ -8588,6 +8609,7 @@ fn page_word_clusters(
     let mut out: Vec<WordCluster> = Vec::new();
     let mut cur: Option<WordCluster> = None;
     let mut last_owner_position: Option<(usize, usize)> = None;
+    let mut line = 0usize;
 
     for c in text_page.chars().iter() {
         let ch = c.unicode_char().unwrap_or('\u{fffd}');
@@ -8619,6 +8641,12 @@ fn page_word_clusters(
                 out.push(w);
             }
             last_owner_position = None;
+            // A LINE ends where PDFium says it does. Only the feed counts: the
+            // stream carries CR and LF as a pair, and counting both would put
+            // every line of the page two apart.
+            if ch == '\n' {
+                line += 1;
+            }
             continue;
         }
 
@@ -8649,6 +8677,7 @@ fn page_word_clusters(
             mixed: false,
             prefix: 0,
             suffix: 0,
+            line,
         });
 
         if starting {
@@ -8935,18 +8964,10 @@ fn set_word_cluster_text_inner(
         }
 
         // Words further along the SAME LINE, which have to move by whatever the
-        // replacement's width changes by. A word's baseline is what puts it on
-        // a line; a third of the type size is comfortably inside the leading of
-        // any normal setting and well outside the wobble within one line.
-        let tolerance = (target.size_pts * 0.3).max(0.5);
-        let shift: Vec<usize> = clusters
-            .iter()
-            .filter(|c| {
-                (c.baseline - target.baseline).abs() < tolerance && c.left > target.right
-            })
-            .flat_map(|c| c.objects.iter().copied())
-            .filter(|i| !target.objects.contains(i))
-            .collect();
+        // replacement's width changes by, and NOT whatever sits in the next
+        // column.
+        let shift = words_to_shift(
+            &clusters, target.baseline, target.size_pts, target.right, &target.objects);
 
         let objs = page.objects();
         let mut originals = Vec::with_capacity(target.objects.len());
@@ -9280,6 +9301,47 @@ fn cluster_text_of(page: &pdfium_render::prelude::PdfPage, objects: &[usize]) ->
     out
 }
 
+/// The objects that must move when something on a line changes width.
+///
+/// ⚠️ STOPS AT A COLUMN. Everything on the baseline to the right of the edit
+/// used to qualify, and on a two-cell table row that is the whole of the next
+/// cell: measured, editing the left cell slid the right cell 0.074 of the page
+/// across, which is a defect nobody had looked for because a word edit rarely
+/// changes width by enough to see.
+///
+/// Words are taken from the edit outwards and the walk stops at the first hole
+/// too wide to be a space. The limit is the same one that decides whether a
+/// line is one line, because it is the same question asked twice.
+fn words_to_shift(
+    clusters: &[WordCluster],
+    baseline: f32,
+    size_pts: f32,
+    from_right: f32,
+    exclude: &[usize],
+) -> Vec<usize> {
+    // A word's baseline is what puts it on a line; a third of the type size is
+    // comfortably inside the leading of any normal setting and well outside the
+    // wobble within one line.
+    let tolerance = (size_pts * 0.3).max(0.5);
+    let mut on_line: Vec<&WordCluster> = clusters
+        .iter()
+        .filter(|c| (c.baseline - baseline).abs() < tolerance && c.left > from_right)
+        .collect();
+    on_line.sort_by(|a, b| a.left.partial_cmp(&b.left).unwrap_or(std::cmp::Ordering::Equal));
+
+    let limit = size_pts * LINE_GAP_LIMIT_EM;
+    let mut out: Vec<usize> = Vec::new();
+    let mut edge = from_right;
+    for w in on_line {
+        if w.left - edge > limit {
+            break;
+        }
+        edge = w.right;
+        out.extend(w.objects.iter().copied().filter(|i| !exclude.contains(i)));
+    }
+    out
+}
+
 /// Moves the rest of the line by however much the word's width changed, then
 /// regenerates the page.
 ///
@@ -9333,6 +9395,825 @@ fn finish_cluster_write(
         return STATUS_UNSUPPORTED;
     }
     STATUS_OK_PDFIUM
+}
+
+// ---------------- lines, the second editing unit ----------------
+
+/// The most lines one page may offer.
+const MAX_LINES: u32 = 4_000;
+
+/// Why a line refuses to be retyped. `LINE_OK` means it does not.
+///
+/// The first six deliberately share their numbers with the `CLUSTER_*` codes,
+/// because they are the same objections read at a different scale and the app
+/// says the same thing about them.
+const LINE_OK: u32 = 0;
+/// Some word on the line is rotated or skewed.
+const LINE_NOT_UPRIGHT: u32 = 1;
+/// The line is not set in ONE font at ONE size. Measured on a real page: three
+/// styles on one line, and not one of its words mixed on its own. Writing such
+/// a line as a single string would silently reset the bold and the larger run.
+const LINE_MIXED_STYLE: u32 = 2;
+/// The objects that draw the line do not run left to right in index order.
+/// Measured on Arabic (descending) and Burmese (interleaved).
+const LINE_OUT_OF_ORDER: u32 = 3;
+/// PDFium reports no font name, so nothing could stand in for it.
+const LINE_NO_FONT_NAME: u32 = 4;
+/// No text object owns the line.
+const LINE_NO_OBJECTS: u32 = 5;
+/// The line starts part-way through one object and ends part-way through
+/// another, so there is no single string to splice it into.
+const LINE_PARTIAL_SPAN: u32 = 6;
+/// The line is justified: its right edge is shared with other lines of the
+/// same block, which means its spaces were stretched to reach it. Retyping it
+/// sets every space to the font's own width and the margin stops lining up, so
+/// it is refused rather than quietly degraded.
+const LINE_JUSTIFIED: u32 = 7;
+/// Two runs of text that merely share a baseline. A table row, a tab stop or a
+/// row of spread-out labels reads as one line and is not one.
+const LINE_GAPPED: u32 = 8;
+/// Some text object between the line's first and last belongs to a different
+/// line, so the range cannot be rewritten without destroying that one.
+const LINE_FOREIGN_OBJECT: u32 = 9;
+
+/// The line is set in a script that has to be SHAPED to be read: Arabic,
+/// Hebrew, Myanmar, the Indic scripts, Thai, Lao, Khmer.
+///
+/// ⚠️ NOT a guess about difficulty. PDFium's extraction of these was measured
+/// not to reproduce the source: one Burmese line came back as a different
+/// sequence of syllables from the one the file draws. Retyping starts from what
+/// the reader was shown, so offering a mangled reading as the starting point
+/// would write mangled text back with every appearance of having worked.
+const LINE_COMPLEX_SCRIPT: u32 = 11;
+
+/// How far apart two words may be before they are not one line, as a multiple
+/// of the type size.
+///
+/// MEASURED, not chosen. Ordinary interword gaps reach 0.6 of the type size on
+/// every file tested. The things that are not lines measured 4.5 (a row of
+/// checkbox labels), 6.3 (a table cell boundary), 15 (a tab stop) and 20 (two
+/// labels either side of a form field). Two sits in the empty middle.
+const LINE_GAP_LIMIT_EM: f32 = 2.0;
+
+/// How close two lines' right edges must be to count as the same margin, as a
+/// fraction of the page width.
+///
+/// MEASURED. Four lines of one justified paragraph agreed to within 0.0006.
+/// The closest any two ragged lines came, on three different documents, was
+/// 0.0016, and no three ragged lines ever agreed at all.
+const JUSTIFIED_RIGHT_TOLERANCE: f32 = 0.0015;
+
+/// How close two lines' left edges must be to belong to the same block.
+const JUSTIFIED_LEFT_TOLERANCE: f32 = 0.005;
+
+/// How many lines must share a right margin before it is a margin rather than
+/// a coincidence. THREE, including the line being judged: two ragged lines
+/// were measured agreeing by accident, three never were.
+const JUSTIFIED_MIN_LINES: usize = 3;
+
+/// One visual line of a page's own text, and the objects that draw it.
+struct LineCluster {
+    /// What the objects between `first_object` and `last_object` actually
+    /// hold, between `prefix` and `suffix`.
+    ///
+    /// ⚠️ FROM THE OBJECTS, not from the character stream. PDFium synthesizes
+    /// separators when it reads a page back, so the stream's version of a line
+    /// can contain characters no object holds. The write verifies the span it
+    /// is about to replace against the object's own string, exactly as the word
+    /// write does, and it can only do that if this is that string.
+    text: String,
+    first_object: usize,
+    last_object: usize,
+    /// Characters of `first_object` before the line, and of `last_object`
+    /// after it. Usually 0 and 0; not when one object holds several lines.
+    prefix: usize,
+    suffix: usize,
+    words: usize,
+    font: String,
+    size_pts: f32,
+    color: u32,
+    baseline: f32,
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+    upright: bool,
+    mixed: bool,
+    ascending: bool,
+    /// The widest gap between two consecutive words, in page points.
+    widest_gap: f32,
+    /// Set once every line is known, because it is a fact about the block this
+    /// line sits in rather than about the line.
+    justified: bool,
+    /// Set once every line is known: some object inside this line's range is
+    /// drawn by a different line.
+    foreign: bool,
+}
+
+impl LineCluster {
+    /// The one reason this line cannot be retyped, or `LINE_OK`.
+    fn refusal(&self) -> u32 {
+        if self.words == 0 || self.last_object < self.first_object {
+            return LINE_NO_OBJECTS;
+        }
+        if !self.upright {
+            return LINE_NOT_UPRIGHT;
+        }
+        if needs_shaping(&self.text) {
+            return LINE_COMPLEX_SCRIPT;
+        }
+        if !self.ascending {
+            return LINE_OUT_OF_ORDER;
+        }
+        if self.mixed {
+            return LINE_MIXED_STYLE;
+        }
+        if self.font.is_empty() {
+            return LINE_NO_FONT_NAME;
+        }
+        if self.first_object != self.last_object && (self.prefix > 0 || self.suffix > 0) {
+            return LINE_PARTIAL_SPAN;
+        }
+        if self.widest_gap > self.size_pts * LINE_GAP_LIMIT_EM {
+            return LINE_GAPPED;
+        }
+        if self.foreign {
+            return LINE_FOREIGN_OBJECT;
+        }
+        if self.justified {
+            return LINE_JUSTIFIED;
+        }
+        LINE_OK
+    }
+}
+
+/// Every visual line on a page, built from the words and from PDFium's own
+/// line breaks.
+///
+/// WHY PDFIUM'S BREAKS AND NOT THE BASELINES. Grouping words by baseline was
+/// measured against the character stream on the same page: 25 groups against
+/// 20 real lines. One rotated line shattered into six fragments in reverse
+/// reading order, and two columns interleaved. The stream already carries
+/// CR/LF where the producer put a line end, and `page_word_clusters` already
+/// walks it, so the answer is free and it is the right one.
+fn page_lines(
+    doc_guard: &pdfium_render::prelude::PdfDocument,
+    page: &pdfium_render::prelude::PdfPage,
+    page_w: f32,
+) -> Vec<LineCluster> {
+    use pdfium_render::prelude::*;
+
+    let words = page_word_clusters(doc_guard, page);
+    if words.is_empty() {
+        return Vec::new();
+    }
+
+    // Grouped in the order the words arrived, which is reading order.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current = usize::MAX;
+    for (i, w) in words.iter().enumerate() {
+        if w.line != current {
+            current = w.line;
+            groups.push(Vec::new());
+            if groups.len() as u32 > MAX_LINES {
+                groups.pop();
+                break;
+            }
+        }
+        groups.last_mut().unwrap().push(i);
+    }
+
+    let objects = page.objects();
+    let mut out: Vec<LineCluster> = Vec::new();
+
+    for group in &groups {
+        let members: Vec<&WordCluster> = group.iter().map(|&i| &words[i]).collect();
+        let first = members[0];
+
+        let mut all_objects: Vec<usize> =
+            members.iter().flat_map(|w| w.objects.iter().copied()).collect();
+        if all_objects.is_empty() {
+            continue;
+        }
+        let ascending = all_objects.windows(2).all(|p| p[1] >= p[0]);
+        all_objects.sort_unstable();
+        let first_object = all_objects[0];
+        let last_object = *all_objects.last().unwrap();
+
+        // The widest hole between two consecutive words, which is what tells a
+        // line from two things that share a baseline.
+        let mut widest_gap: f32 = 0.0;
+        for pair in members.windows(2) {
+            widest_gap = widest_gap.max(pair[1].left - pair[0].right);
+        }
+
+        let mixed = members.iter().any(|w| {
+            w.mixed || w.font != first.font || (w.size_pts - first.size_pts).abs() > 0.01
+        });
+
+        // What the range actually holds. Whitespace-only objects between the
+        // words are included: they are part of the run being replaced, and the
+        // replacement carries its own spaces.
+        let mut text = String::new();
+        for i in first_object..=last_object {
+            let Ok(o) = objects.get(i) else { continue };
+            if let PdfPageObject::Text(t) = &o {
+                text.push_str(&t.text());
+            }
+        }
+        let prefix = first.prefix;
+        let suffix = members.last().unwrap().suffix;
+        let chars: Vec<char> = text.chars().collect();
+        let keep_to = chars.len().saturating_sub(suffix);
+        let mut text: String = if prefix <= keep_to {
+            chars[prefix.min(chars.len())..keep_to].iter().collect()
+        } else {
+            String::new()
+        };
+
+        // ⚠️ ONLY WHEN THE LINE WAS ASSEMBLED FROM SEVERAL OBJECTS. Producers
+        // put the separator in BOTH neighbours: one page's objects read "A "
+        // and " ragged", so joining them gives a space the page does not draw.
+        // A line that lives in ONE object is left exactly as it is, because
+        // that string is what the write verifies its span against and a
+        // doubled space there is real.
+        if first_object != last_object {
+            let squeezed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            text = squeezed;
+        }
+
+        out.push(LineCluster {
+            text,
+            first_object,
+            last_object,
+            prefix,
+            suffix,
+            words: members.len(),
+            font: first.font.clone(),
+            size_pts: first.size_pts,
+            color: first.color,
+            baseline: first.baseline,
+            left: members.iter().map(|w| w.left).fold(f32::MAX, f32::min),
+            bottom: members.iter().map(|w| w.bottom).fold(f32::MAX, f32::min),
+            right: members.iter().map(|w| w.right).fold(f32::MIN, f32::max),
+            top: members.iter().map(|w| w.top).fold(f32::MIN, f32::max),
+            upright: members.iter().all(|w| w.upright),
+            mixed,
+            ascending,
+            widest_gap,
+            justified: false,
+            foreign: false,
+        });
+    }
+
+    mark_justified_lines(&mut out, page_w);
+    mark_foreign_ranges(&mut out);
+    out
+}
+
+/// Marks every line whose right margin is shared with the rest of its block.
+///
+/// ⚠️ THIS IS WHAT JUSTIFICATION LOOKS LIKE FROM THE OUTSIDE. There is no flag
+/// in the file saying a paragraph was justified; the producer simply moves the
+/// words. What survives is the evidence: several lines of one block ending at
+/// exactly the same x. A ragged block cannot do that, because where its lines
+/// end is decided by the last word that fitted.
+///
+/// The LAST line of a justified paragraph is not stretched and does not share
+/// the margin, so it stays editable, which is correct.
+fn mark_justified_lines(lines: &mut [LineCluster], page_w: f32) {
+    if page_w <= 0.0 {
+        return;
+    }
+    let right_tolerance = JUSTIFIED_RIGHT_TOLERANCE * page_w;
+    let left_tolerance = JUSTIFIED_LEFT_TOLERANCE * page_w;
+
+    let snapshot: Vec<(f32, f32, f32, String)> = lines
+        .iter()
+        .map(|l| (l.left, l.right, l.size_pts, l.font.clone()))
+        .collect();
+
+    for i in 0..lines.len() {
+        let (left, right, size, ref font) = snapshot[i];
+        let agreeing = snapshot
+            .iter()
+            .filter(|(l, r, s, f)| {
+                (l - left).abs() < left_tolerance
+                    && (s - size).abs() < 0.01
+                    && f == font
+                    && (r - right).abs() < right_tolerance
+            })
+            .count();
+        lines[i].justified = agreeing >= JUSTIFIED_MIN_LINES;
+    }
+}
+
+/// Marks every line whose object range swallows part of another line.
+///
+/// A line is rewritten by giving its whole index range to one replacement, so
+/// anything else drawn inside that range would be destroyed. Refusing is the
+/// only honest answer: the alternative is deciding which of two lines the
+/// reader meant.
+fn mark_foreign_ranges(lines: &mut [LineCluster]) {
+    let spans: Vec<(usize, usize)> = lines.iter().map(|l| (l.first_object, l.last_object)).collect();
+
+    for i in 0..lines.len() {
+        let (first, last) = spans[i];
+        lines[i].foreign = spans
+            .iter()
+            .enumerate()
+            .any(|(j, &(f, l))| j != i && f <= last && l >= first);
+    }
+}
+
+/// Every visual line on a page, for the app's model.
+///
+/// Little-endian. A count, then per line: the first and last object indices,
+/// the character offset of the line inside the first object, the number of
+/// words, the bounds normalized top-left and divided by the page WIDTH, the
+/// baseline in the same units, the font size in points, the fill colour packed
+/// as 0x00RRGGBB, a refusal code, and two length-prefixed UTF-8 strings, the
+/// text and the font name.
+///
+/// The refusal travels WITH the line for the same reason it travels with a
+/// word: a line that cannot be retyped can still be selected and read, and the
+/// app can say why rather than doing nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_page_lines(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| get_page_lines_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn get_page_lines_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (page_left, page_top) = page_origin(&page);
+
+    let lines = page_lines(&doc_guard, &page, page_w);
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+
+    for l in &lines {
+        out.extend_from_slice(&(l.first_object as u32).to_le_bytes());
+        out.extend_from_slice(&(l.last_object as u32).to_le_bytes());
+        out.extend_from_slice(&(l.prefix as u32).to_le_bytes());
+        out.extend_from_slice(&(l.words as u32).to_le_bytes());
+
+        // PDF is bottom-left origin and Y-up; the app is top-left and Y-down.
+        out.extend_from_slice(&((l.left - page_left) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - l.top) / page_w).to_le_bytes());
+        out.extend_from_slice(&((l.right - page_left) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - l.bottom) / page_w).to_le_bytes());
+        out.extend_from_slice(&((page_top - l.baseline) / page_w).to_le_bytes());
+
+        out.extend_from_slice(&l.size_pts.to_le_bytes());
+        out.extend_from_slice(&l.color.to_le_bytes());
+        out.extend_from_slice(&l.refusal().to_le_bytes());
+
+        out.extend_from_slice(&(l.text.len() as u32).to_le_bytes());
+        out.extend_from_slice(l.text.as_bytes());
+        out.extend_from_slice(&(l.font.len() as u32).to_le_bytes());
+        out.extend_from_slice(l.font.as_bytes());
+    }
+
+    drop(page);
+    drop(doc_guard);
+    drop(doc);
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Replaces one visual line with one string, or changes nothing at all.
+///
+/// THE SAME TWO PATHS AS A WORD, for the same measured reason: a page's font is
+/// usually a subset containing only the glyphs that page already uses, so the
+/// line's own font is tried first and a matching system font stands in when it
+/// cannot spell the replacement.
+///
+/// WHAT IS DIFFERENT FROM A WORD. The unit is the whole index range from the
+/// line's first object to its last, not a list of the objects that draw one
+/// word. That range includes the whitespace-only objects producers scatter
+/// between words (measured: 34 of 352 objects on one page, 93 of 565 on
+/// another), which are emptied along with the rest because the replacement
+/// carries its own spaces. Taking the range is what makes the word COUNT free:
+/// the line becomes one string in one object and nothing has to line up.
+///
+/// The line is re-derived and must still refuse nothing, which is where
+/// justified, mixed-style, rotated, right-to-left, gapped and overlapping lines
+/// are turned away, all of them before the page is touched.
+///
+/// Returns `STATUS_OK_PDFIUM` when the page now says exactly `new_text`,
+/// `STATUS_TOO_WIDE` when the replacement would not fit on the page and the
+/// page was put back, `STATUS_UNSUPPORTED` when it refused and left the page as
+/// it found it, and `STATUS_INVALID_INPUT` for a request that does not describe
+/// a line.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_line_text(
+    doc_handle: u64,
+    page_index: i32,
+    first_object: u32,
+    last_object: u32,
+    prefix_chars: u32,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+    fallback_font_path_utf8: *const u8,
+    fallback_font_path_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || last_object < first_object {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let Some(new_text) = utf8_arg(new_text_utf8, new_text_len) else {
+        return STATUS_INVALID_INPUT;
+    };
+    // An empty replacement would delete the line, which this operation does
+    // not do; deleting is a different edit with a different undo.
+    if new_text.trim().is_empty() {
+        return STATUS_INVALID_INPUT;
+    }
+    // A line is one line. Anything that would add one is a paragraph edit.
+    if new_text.contains('\n') || new_text.contains('\r') {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let fallback = utf8_arg(fallback_font_path_utf8, fallback_font_path_len);
+
+    panic::catch_unwind(|| {
+        set_line_text_inner(
+            doc_handle,
+            page_index,
+            first_object as usize,
+            last_object as usize,
+            prefix_chars as usize,
+            &new_text,
+            fallback.as_deref(),
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn set_line_text_inner(
+    doc_handle: u64,
+    page_index: i32,
+    first_object: usize,
+    last_object: usize,
+    wanted_prefix: usize,
+    new_text: &str,
+    fallback_font_path: Option<&str>,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let mut doc_guard = lock(&doc);
+
+    struct Plan {
+        range: Vec<usize>,
+        originals: Vec<String>,
+        matrix: FS_MATRIX,
+        color: Option<PdfColor>,
+        size: f32,
+        right: f32,
+        page_right: f32,
+        shift: Vec<usize>,
+        text: String,
+        prefix: usize,
+        suffix: usize,
+    }
+
+    let plan = {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let page_w = page.width().value;
+        if page_w <= 0.0 {
+            return STATUS_INVALID_INPUT;
+        }
+        let (page_left, _) = page_origin(&page);
+
+        let lines = page_lines(&doc_guard, &page, page_w);
+        let Some(target) = lines.iter().find(|l| {
+            l.first_object == first_object
+                && l.last_object == last_object
+                && l.prefix == wanted_prefix
+        }) else {
+            return STATUS_INVALID_INPUT;
+        };
+        if target.refusal() != LINE_OK {
+            return STATUS_UNSUPPORTED;
+        }
+
+        // Every TEXT object in the range, which is what gets rewritten. A
+        // shape or an image inside the range is left exactly alone.
+        let objs = page.objects();
+        let mut range = Vec::new();
+        let mut originals = Vec::new();
+        for i in target.first_object..=target.last_object {
+            let Ok(o) = objs.get(i) else { continue };
+            if let PdfPageObject::Text(t) = &o {
+                range.push(i);
+                originals.push(t.text());
+            }
+        }
+        if range.is_empty() || range[0] != target.first_object {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let Ok(first) = objs.get(target.first_object) else {
+            return STATUS_INVALID_INPUT;
+        };
+        let PdfPageObject::Text(ft) = &first else {
+            return STATUS_INVALID_INPUT;
+        };
+        let mut m = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
+        doc_guard
+            .bindings()
+            .FPDFPageObj_GetMatrix(ft.object_handle(), &mut m);
+
+        // Where to measure the width change from, exactly as the word write
+        // decides it: the OBJECT grows when the line is spliced into a longer
+        // string, and the line's own right edge is the comparable figure when
+        // it owns its objects outright.
+        let shares_object = target.prefix > 0 || target.suffix > 0;
+        let right = if shares_object {
+            char_right_edge(&page, target.first_object).unwrap_or(target.right)
+        } else {
+            target.right
+        };
+
+        let words = page_word_clusters(&doc_guard, &page);
+        let shift = words_to_shift(
+            &words, target.baseline, target.size_pts, target.right, &range);
+
+        Plan {
+            range,
+            originals,
+            matrix: m,
+            color: ft.fill_color().ok(),
+            size: ft.unscaled_font_size().value,
+            right,
+            page_right: page_left + page_w,
+            shift,
+            text: target.text.clone(),
+            prefix: target.prefix,
+            suffix: target.suffix,
+        }
+    };
+
+    // ---- path 1: the line's own font ----
+    let path_one = {
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+        let wrote = write_line_objects(
+            &page, &plan.range, new_text, &plan.text, plan.prefix, plan.suffix);
+        if !wrote {
+            return STATUS_UNSUPPORTED;
+        }
+
+        let said = cluster_text_of(&page, &plan.range);
+        let expected = spliced_expectation(&plan.originals, new_text, plan.prefix, plan.suffix);
+
+        if same_text(&said, &expected) && page.regenerate_content().is_err() {
+            return STATUS_UNSUPPORTED;
+        }
+        same_text(&said, &expected)
+    };
+
+    if path_one {
+        // ⚠️ THE WIDTH IS ONLY KNOWABLE NOW. Both the object box and the text
+        // page keep answering with the size the page had when it was loaded,
+        // so the only way to learn how wide the replacement came out is to take
+        // the page again and ask the characters.
+        if line_overflows(&doc_guard, page_index, plan.range[0], plan.page_right) {
+            let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+                return STATUS_INVALID_INPUT;
+            };
+            restore_cluster_objects(&page, &plan.range, &plan.originals);
+            let _ = page.regenerate_content();
+            return STATUS_TOO_WIDE;
+        }
+        return finish_cluster_write(
+            &mut doc_guard, page_index, plan.range[0], plan.right, &plan.shift);
+    }
+
+    // The font could not spell it. Put the line back before trying anything
+    // else, so a failure from here leaves the page exactly as it was found.
+    {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        restore_cluster_objects(&page, &plan.range, &plan.originals);
+    }
+
+    // ---- path 2: a replacement in the stand-in font ----
+    let Some(font_path) = fallback_font_path else {
+        return STATUS_UNSUPPORTED;
+    };
+    if font_file_bytes(font_path).is_none() {
+        return STATUS_UNSUPPORTED;
+    }
+
+    // A line that shares its object with another line cannot take this path:
+    // the replacement is a new object, and the characters that were to stay
+    // behind live in the old one.
+    if plan.prefix > 0 || plan.suffix > 0 {
+        return STATUS_UNSUPPORTED;
+    }
+
+    let token = resolve_text_font(&mut doc_guard, Some(font_path));
+
+    let inserted = {
+        let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+        for &i in &plan.range {
+            if let Ok(mut o) = page.objects().get(i) {
+                if let PdfPageObject::Text(t) = &mut o {
+                    let _ = t.set_text("");
+                }
+            }
+        }
+
+        let Some(font) = doc_guard.fonts().get(token) else {
+            return STATUS_UNSUPPORTED;
+        };
+        let Ok(mut obj) =
+            PdfPageTextObject::new(&doc_guard, new_text, font, PdfPoints::new(plan.size))
+        else {
+            restore_cluster_objects(&page, &plan.range, &plan.originals);
+            return STATUS_UNSUPPORTED;
+        };
+        if let Some(c) = plan.color {
+            let _ = obj.set_fill_color(c);
+        }
+        doc_guard
+            .bindings()
+            .FPDFPageObj_SetMatrix(obj.object_handle(), &plan.matrix);
+
+        // AT THE FIRST OBJECT'S INDEX, so PDFium's reading order survives.
+        let ok = page
+            .objects_mut()
+            .insert_object_at_index(plan.range[0], PdfPageObject::Text(obj))
+            .is_ok();
+        ok && page.regenerate_content().is_ok()
+    };
+
+    // Everything at or after the insertion moved up by one.
+    let moved: Vec<usize> = plan.range.iter().map(|&i| i + 1).collect();
+    let shift_after: Vec<usize> = plan
+        .shift
+        .iter()
+        .map(|&i| if i >= plan.range[0] { i + 1 } else { i })
+        .collect();
+
+    let put_back = |doc_guard: &pdfium_render::prelude::PdfDocument| {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return;
+        };
+        if let Ok(mut o) = page.objects().get(plan.range[0]) {
+            if let PdfPageObject::Text(t) = &mut o {
+                let _ = t.set_text("");
+            }
+        }
+        restore_cluster_objects(&page, &moved, &plan.originals);
+        let mut page = page;
+        let _ = page.regenerate_content();
+    };
+
+    if !inserted {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        restore_cluster_objects(&page, &plan.range, &plan.originals);
+        return STATUS_UNSUPPORTED;
+    }
+
+    let said = {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        cluster_text_of(&page, &[plan.range[0]])
+    };
+
+    if !same_text(&said, new_text) {
+        put_back(&doc_guard);
+        return STATUS_UNSUPPORTED;
+    }
+
+    if line_overflows(&doc_guard, page_index, plan.range[0], plan.page_right) {
+        put_back(&doc_guard);
+        return STATUS_TOO_WIDE;
+    }
+
+    finish_cluster_write(
+        &mut doc_guard, page_index, plan.range[0], plan.right, &shift_after)
+}
+
+/// Whether what one object now draws runs off the right of the page.
+///
+/// ⚠️ THIS IS THE ONLY THING STOPPING A LINE LEAVING THE PAGE. Measured before
+/// it existed: replacing a five-letter word with three hundred characters was
+/// accepted, and the text ended four and a half page widths to the right of the
+/// paper, invisible and unrecoverable except by undo.
+///
+/// Measured on a FRESHLY TAKEN page, because both the object's bounding box and
+/// the text page keep answering with the size the page had when it was loaded.
+fn line_overflows(
+    doc_guard: &pdfium_render::prelude::PdfDocument,
+    page_index: i32,
+    anchor: usize,
+    page_right: f32,
+) -> bool {
+    let Ok(fresh) = doc_guard.pages().get(page_index as u16) else {
+        return false;
+    };
+    let right = char_right_edge(&fresh, anchor);
+    drop(fresh);
+    right.map(|r| r > page_right).unwrap_or(false)
+}
+
+/// Puts the replacement where the line was.
+///
+/// When the line owns its objects outright the first takes the whole string and
+/// every other text object in the range is emptied, which is what makes the
+/// word count free. When the line SHARES an object with another line, only its
+/// own span may be touched, and the span is verified against the object's own
+/// characters before anything is written.
+fn write_line_objects(
+    page: &pdfium_render::prelude::PdfPage,
+    range: &[usize],
+    new_text: &str,
+    line_text: &str,
+    prefix: usize,
+    suffix: usize,
+) -> bool {
+    use pdfium_render::prelude::*;
+
+    if prefix == 0 && suffix == 0 {
+        for (n, &i) in range.iter().enumerate() {
+            let Ok(mut o) = page.objects().get(i) else { continue };
+            let PdfPageObject::Text(t) = &mut o else { continue };
+            let _ = t.set_text(if n == 0 { new_text } else { "" });
+        }
+        return true;
+    }
+
+    let Some(&only) = range.first() else { return false };
+    if range.len() != 1 {
+        return false;
+    }
+    let Ok(mut o) = page.objects().get(only) else { return false };
+    let PdfPageObject::Text(t) = &mut o else { return false };
+
+    let existing: Vec<char> = t.text().chars().collect();
+    let line_len = line_text.chars().count();
+
+    if prefix + line_len > existing.len() {
+        return false;
+    }
+    if existing[prefix..prefix + line_len].iter().collect::<String>() != line_text {
+        return false;
+    }
+
+    let mut spliced: String = existing[..prefix].iter().collect();
+    spliced.push_str(new_text);
+    spliced.extend(&existing[prefix + line_len..]);
+
+    t.set_text(&spliced).is_ok()
 }
 
 /// Extracts every character's position and codepoint for a page, scaled to
@@ -12197,6 +13078,551 @@ mod tests {
         for t in &found {
             assert_ne!(t.text, text, "the text box's invisible run was offered");
         }
+
+        close_document(handle);
+    }
+
+    // ---------------- lines, the second editing unit ----------------
+
+    const TIMES: &str = r"C:\Windows\Fonts\times.ttf";
+
+    #[derive(Debug, Clone)]
+    struct DecodedLine {
+        first_object: usize,
+        last_object: usize,
+        prefix: usize,
+        words: usize,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        baseline: f32,
+        size_pts: f32,
+        color: u32,
+        refusal: u32,
+        text: String,
+        font: String,
+    }
+
+    fn decode_lines(handle: u64, page_index: i32) -> Vec<DecodedLine> {
+        let buffer = get_page_lines(handle, page_index);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "the core refused the page");
+        assert!(!buffer.data.is_null());
+
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+
+        let mut at = 0usize;
+        let u32_at = |b: &[u8], p: &mut usize| {
+            let v = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let f32_at = |b: &[u8], p: &mut usize| {
+            let v = f32::from_le_bytes(b[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            v
+        };
+        let str_at = |b: &[u8], p: &mut usize| {
+            let n = u32::from_le_bytes(b[*p..*p + 4].try_into().unwrap()) as usize;
+            *p += 4;
+            let s = String::from_utf8(b[*p..*p + n].to_vec()).unwrap();
+            *p += n;
+            s
+        };
+
+        let count = u32_at(&bytes, &mut at);
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            out.push(DecodedLine {
+                first_object: u32_at(&bytes, &mut at) as usize,
+                last_object: u32_at(&bytes, &mut at) as usize,
+                prefix: u32_at(&bytes, &mut at) as usize,
+                words: u32_at(&bytes, &mut at) as usize,
+                left: f32_at(&bytes, &mut at),
+                top: f32_at(&bytes, &mut at),
+                right: f32_at(&bytes, &mut at),
+                bottom: f32_at(&bytes, &mut at),
+                baseline: f32_at(&bytes, &mut at),
+                size_pts: f32_at(&bytes, &mut at),
+                color: u32_at(&bytes, &mut at),
+                refusal: u32_at(&bytes, &mut at),
+                text: str_at(&bytes, &mut at),
+                font: str_at(&bytes, &mut at),
+            });
+        }
+
+        assert_eq!(at, bytes.len(), "the line buffer did not decode exactly");
+        out
+    }
+
+    /// Asks the core to retype one line, the way the app will.
+    fn retype(handle: u64, line: &DecodedLine, new_text: &str, font: Option<&str>) -> i32 {
+        let text = new_text.as_bytes();
+        let (fptr, flen) = match font {
+            Some(f) => (f.as_ptr(), f.len()),
+            None => (std::ptr::null(), 0),
+        };
+        set_line_text(
+            handle, 0,
+            line.first_object as u32, line.last_object as u32, line.prefix as u32,
+            text.as_ptr(), text.len(), fptr, flen)
+    }
+
+    fn line_starting(lines: &[DecodedLine], head: &str) -> DecodedLine {
+        lines
+            .iter()
+            .find(|l| l.text.starts_with(head))
+            .unwrap_or_else(|| panic!("no line starting {head:?} in {:?}",
+                                     lines.iter().map(|l| &l.text).collect::<Vec<_>>()))
+            .clone()
+    }
+
+    fn texts_of(handle: u64) -> Vec<String> {
+        decode_lines(handle, 0).into_iter().map(|l| l.text).collect()
+    }
+
+    // ---- what a line IS ----
+
+    #[test]
+    fn a_line_is_the_producers_line_and_not_a_guess_from_the_baselines() {
+        // ⚠️ THE MEASUREMENT THAT CHOSE THE DESIGN. Grouping words by baseline
+        // gave 25 groups on this page against the 20 lines it really has. The
+        // rotated line was the worst of it: every one of its words sits at a
+        // different height, so it shattered into SIX fragments in reverse
+        // reading order. PDFium's own stream carries the breaks and gets it
+        // right, and the walk that builds the words is already reading it.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let lines = decode_lines(handle, 0);
+
+        assert_eq!(lines.len(), 20, "{:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+
+        let rotated = line_starting(&lines, "Rotated");
+        assert_eq!(rotated.words, 8, "the rotated line came apart: {rotated:?}");
+        assert_eq!(rotated.text, "Rotated line of text at minus fourteen degrees");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_carries_the_object_range_that_draws_it() {
+        // The range, not a list of the objects that draw the words: the write
+        // takes everything between the ends, including the whitespace-only
+        // objects producers scatter in between.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let lines = decode_lines(handle, 0);
+
+        // One object holds this whole line, which is what most real producers
+        // do, and what the user's own invoice did.
+        let alone = line_starting(&lines, "breaks where");
+        assert_eq!(alone.first_object, alone.last_object);
+        assert_eq!(alone.words, 14);
+
+        // This one is spread over a great many, one per glyph.
+        let heading = line_starting(&lines, "Chapter One:");
+        assert!(heading.last_object - heading.first_object >= 20, "{heading:?}");
+        assert_eq!(heading.words, 4);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_text_of_a_line_is_what_it_draws_and_not_a_join_artefact() {
+        // ⚠️ Producers put the separator in BOTH neighbours: this line's two
+        // objects read "A " and " ragged right...", so concatenating them gives
+        // a space the page does not draw. The reader retypes what they are
+        // shown, so being shown a phantom space writes one back.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "A ragged");
+
+        assert!(line.first_object != line.last_object, "fixture must span objects");
+        assert!(!line.text.contains("  "), "a doubled space survived: {:?}", line.text);
+        assert!(line.text.starts_with("A ragged right paragraph"), "{:?}", line.text);
+
+        close_document(handle);
+    }
+
+    fn lines_of(handle: u64) -> Vec<DecodedLine> {
+        decode_lines(handle, 0)
+    }
+
+    #[test]
+    fn a_page_with_no_text_offers_no_lines() {
+        let handle = open_fixture_named("tests/fixtures/blank.pdf");
+        assert!(decode_lines(handle, 0).is_empty());
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_page_that_is_not_there_and_a_handle_that_is_not_open_are_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let buffer = get_page_lines(handle, 999);
+        assert_eq!(buffer.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(buffer);
+        close_document(handle);
+
+        let buffer = get_page_lines(0, 0);
+        assert_eq!(buffer.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(buffer);
+    }
+
+    // ---- what a line REFUSES ----
+
+    #[test]
+    fn a_justified_line_is_refused_rather_than_quietly_degraded() {
+        // ⚠️ There is no flag in a PDF saying a paragraph was justified. What
+        // survives is the evidence: four lines of this block end within 0.0006
+        // of each other, which a ragged block cannot do because where its lines
+        // end is decided by the last word that fitted. Retyping one sets every
+        // space to the font's own width, and the margin stops lining up.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let lines = decode_lines(handle, 0);
+
+        for head in ["The quick", "continues onto", "several lines", "unevenly across"] {
+            assert_eq!(line_starting(&lines, head).refusal, LINE_JUSTIFIED, "{head}");
+        }
+
+        // The LAST line of that paragraph was never stretched, so it stays
+        // editable. Refusing it would be refusing a line with nothing wrong.
+        assert_eq!(line_starting(&lines, "here.").refusal, LINE_OK);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_ragged_line_in_the_same_font_at_the_same_indent_is_offered() {
+        // The other half of the justification measurement. These four sit
+        // directly under the justified paragraph, in the same font, at the same
+        // left edge, and they must NOT be caught by it.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let lines = decode_lines(handle, 0);
+
+        for head in ["A ragged", "breaks where", "same width", "justified one"] {
+            assert_eq!(line_starting(&lines, head).refusal, LINE_OK, "{head}");
+        }
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_set_in_more_than_one_style_is_refused() {
+        // ⚠️ MEASURED, AND NOT WHAT YOU WOULD GUESS. Three styles run across
+        // this line and NOT ONE of its words is mixed on its own, so the word
+        // path has nothing to object to. Written as a single string the line
+        // would come back entirely in the first style, silently losing the bold
+        // run and the larger one.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        assert_eq!(line_starting(&lines_of(handle), "This line has").refusal, LINE_MIXED_STYLE);
+        close_document(handle);
+
+        // The same objection at a second producer: one line, roman and italic.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+        assert_eq!(line_starting(&lines_of(handle), "na\u{ef}ve,").refusal, LINE_MIXED_STYLE);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_rotated_line_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        assert_eq!(line_starting(&lines_of(handle), "Rotated").refusal, LINE_NOT_UPRIGHT);
+        close_document(handle);
+
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let lines = decode_lines(handle, 0);
+        let rotated: Vec<&DecodedLine> =
+            lines.iter().filter(|l| l.refusal == LINE_NOT_UPRIGHT).collect();
+        assert_eq!(rotated.len(), 1, "{lines:#?}");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_script_that_has_to_be_shaped_is_refused() {
+        // ⚠️ NOT A JUDGEMENT ABOUT DIFFICULTY. PDFium's reading of these was
+        // measured against the source and does not reproduce it: the Burmese
+        // comes back as a different sequence of syllables from the one the file
+        // draws. Retyping starts from what the reader was shown, so offering a
+        // mangled reading writes mangled text back and looks like it worked.
+        let handle = open_fixture_named("tests/fixtures/sample_complex_script.pdf");
+        let lines = decode_lines(handle, 0);
+
+        let shaped: Vec<&DecodedLine> = lines
+            .iter()
+            .filter(|l| l.text.chars().any(|c| ('\u{1000}'..='\u{109f}').contains(&c)
+                                            || ('\u{0900}'..='\u{097f}').contains(&c)))
+            .collect();
+        assert!(shaped.len() >= 5, "{lines:#?}");
+        for l in &shaped {
+            assert_eq!(l.refusal, LINE_COMPLEX_SCRIPT, "{:?}", l.text);
+        }
+
+        // Latin with accents is not a complex script and stays editable.
+        assert_eq!(line_starting(&lines, "caf\u{e9}").refusal, LINE_OK);
+        close_document(handle);
+
+        // Arabic, on a page that is otherwise ordinary English.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let arabic = decode_lines(handle, 0)
+            .into_iter()
+            .find(|l| l.text.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c)))
+            .expect("no arabic line");
+        assert_eq!(arabic.refusal, LINE_COMPLEX_SCRIPT);
+        close_document(handle);
+    }
+
+    #[test]
+    fn two_things_that_merely_share_a_baseline_are_not_one_line() {
+        // A label either side of a form field reads as one line and is not one.
+        // Replacing it would put one string where two runs were and slide the
+        // second back against the first.
+        let handle = open_fixture_named("tests/fixtures/sample_gapped_line.pdf");
+        let lines = decode_lines(handle, 0);
+
+        assert_eq!(line_starting(&lines, "Postcode:").refusal, LINE_GAPPED);
+        assert_eq!(line_starting(&lines, "Address one:").refusal, LINE_GAPPED);
+
+        // And the ordinary line between them is untouched by the rule.
+        assert_eq!(line_starting(&lines, "An ordinary").refusal, LINE_OK);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_whose_range_swallows_another_line_is_refused() {
+        // Reading order and object order are not always the same, and where
+        // they disagree one line's range can contain another's objects. The
+        // range is what gets rewritten, so that line cannot be offered.
+        fn at(first: usize, last: usize) -> LineCluster {
+            LineCluster {
+                text: "x".into(), first_object: first, last_object: last,
+                prefix: 0, suffix: 0, words: 1, font: "F".into(), size_pts: 10.0,
+                color: 0, baseline: 0.0, left: 0.0, bottom: 0.0, right: 1.0, top: 1.0,
+                upright: true, mixed: false, ascending: true, widest_gap: 0.0,
+                justified: false, foreign: false,
+            }
+        }
+
+        let mut lines = vec![at(0, 3), at(2, 2), at(10, 12)];
+        mark_foreign_ranges(&mut lines);
+
+        assert!(lines[0].foreign, "a range holding another line is not editable");
+        assert!(lines[1].foreign, "the line inside it is not editable either");
+        assert!(!lines[2].foreign, "a range of its own is fine");
+        assert_eq!(lines[0].refusal(), LINE_FOREIGN_OBJECT);
+    }
+
+    // ---- retyping a line ----
+
+    #[test]
+    fn a_line_becomes_however_many_words_were_typed() {
+        // ⚠️ THE POINT OF THE WHOLE FEATURE. The word path can only ever swap a
+        // word for a word; a line is one string, so the count is free.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        assert_eq!(line.words, 14);
+
+        assert_eq!(retype(handle, &line, "Three words now.", Some(TIMES)), STATUS_OK_PDFIUM);
+
+        let after = line_starting(&lines_of(handle), "Three words");
+        assert_eq!(after.text, "Three words now.");
+        assert_eq!(after.words, 3);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_spread_across_many_objects_is_replaced_whole() {
+        // One object per GLYPH, plus the whitespace-only objects between the
+        // words that belong to no word at all. All of them are emptied and the
+        // first takes the replacement.
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+
+        let line = line_starting(&lines_of(handle), "Chapter Three");
+        assert!(line.last_object > line.first_object + 5, "{line:?}");
+
+        assert_eq!(retype(handle, &line, "Chapter Four", Some(TIMES)), STATUS_OK_PDFIUM);
+
+        let texts = texts_of(handle);
+        assert!(texts.iter().any(|t| t == "Chapter Four"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Chapter Three")), "{texts:?}");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn longer_and_shorter_replacements_both_land() {
+        for (label, replacement) in [
+            ("shorter", "Short."),
+            ("longer", "A replacement that is a good deal longer than the line it replaces."),
+        ] {
+            let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+            let line = line_starting(&lines_of(handle), "same width");
+
+            assert_eq!(retype(handle, &line, replacement, Some(TIMES)), STATUS_OK_PDFIUM, "{label}");
+            assert!(texts_of(handle).iter().any(|t| t == replacement), "{label}");
+
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn a_replacement_that_would_leave_the_page_is_refused_and_nothing_changes() {
+        // ⚠️ MEASURED BEFORE THE CHECK EXISTED, on the word path: three hundred
+        // characters was accepted and the text ended four and a half page
+        // widths to the right of the paper, invisible, recoverable only by
+        // undo. A line edit makes that ordinary rather than exotic.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "same width");
+        let before = texts_of(handle);
+
+        assert_eq!(retype(handle, &line, &"Q".repeat(300), Some(TIMES)), STATUS_TOO_WIDE);
+
+        assert_eq!(texts_of(handle), before, "the page was not put back");
+        close_document(handle);
+    }
+
+    #[test]
+    fn every_refusal_leaves_the_page_exactly_as_it_was() {
+        for (fixture, head) in [
+            ("sample_lines.pdf", "The quick"),        // justified
+            ("sample_lines.pdf", "This line has"),    // mixed style
+            ("sample_lines.pdf", "Rotated"),          // rotated
+            ("sample_gapped_line.pdf", "Postcode:"),  // two things on one baseline
+        ] {
+            let handle = open_fixture_named(&format!("tests/fixtures/{fixture}"));
+            let line = line_starting(&lines_of(handle), head);
+            let before = texts_of(handle);
+
+            assert_eq!(retype(handle, &line, "Replaced.", Some(TIMES)),
+                       STATUS_UNSUPPORTED, "{fixture} {head}");
+            assert_eq!(texts_of(handle), before, "{fixture} {head} was touched");
+
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn a_replacement_that_is_empty_or_more_than_one_line_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let line = line_starting(&lines_of(handle), "breaks where");
+
+        assert_eq!(retype(handle, &line, "   ", Some(TIMES)), STATUS_INVALID_INPUT);
+        // Adding a line is a paragraph edit, which this is not.
+        assert_eq!(retype(handle, &line, "one\ntwo", Some(TIMES)), STATUS_INVALID_INPUT);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_request_that_does_not_describe_a_line_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let mut line = line_starting(&lines_of(handle), "breaks where");
+        let before = texts_of(handle);
+
+        line.last_object += 4;
+        assert_eq!(retype(handle, &line, "Replaced.", Some(TIMES)), STATUS_INVALID_INPUT);
+        assert_eq!(texts_of(handle), before);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_edit_can_be_put_back_exactly() {
+        // Which is what undo does: it comes back through this same call with
+        // the old text, so anything the edit could write the reversal can too.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let before = line_starting(&lines_of(handle), "breaks where");
+        let original = before.text.clone();
+
+        assert_eq!(retype(handle, &before, "Something else entirely.", Some(TIMES)),
+                   STATUS_OK_PDFIUM);
+
+        let edited = line_starting(&lines_of(handle), "Something else");
+        assert_eq!(retype(handle, &edited, &original, Some(TIMES)), STATUS_OK_PDFIUM);
+
+        assert!(texts_of(handle).iter().any(|t| *t == original),
+                "{:?}", texts_of(handle));
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_edit_survives_the_apps_own_save_and_reopen() {
+        // Through the real save path, on a page that also carries one of our
+        // gradient shapes, because that path rewrites the file with lopdf after
+        // PDFium has written it and a line edit must survive both halves.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        assert_eq!(retype(handle, &line, "Saved and reopened.", Some(TIMES)), STATUS_OK_PDFIUM);
+
+        let (file, _) = save_like_the_app(handle, "line-edit");
+        close_document(handle);
+
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        let reopened = open_document(c.as_ptr());
+        assert_ne!(reopened, 0);
+
+        let texts = texts_of(reopened);
+        assert!(texts.iter().any(|t| t == "Saved and reopened."), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("breaks where")), "{texts:?}");
+
+        close_document(reopened);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    // ---- the reflow that a line edit made reachable ----
+
+    #[test]
+    fn editing_one_column_does_not_drag_the_next_one_across() {
+        // ⚠️ A LIVE DEFECT IN WORD EDITING, found while measuring for lines.
+        // Everything on the baseline to the right of an edit was shifted by the
+        // width change, and on a two-cell table row that is the whole of the
+        // next cell: measured, editing "Alpha" in the left cell moved "Uniform"
+        // in the right cell from 0.5061 to 0.5803 of the page across.
+        let handle = open_fixture_named("tests/fixtures/sample_columns.pdf");
+
+        let before = decode_clusters(handle, 0);
+        let alpha = before.iter().find(|c| c.text == "Alpha").expect("no Alpha");
+        let uniform = before.iter().find(|c| c.text == "Uniform").expect("no Uniform");
+        assert!((alpha.baseline - uniform.baseline).abs() < 1e-4,
+                "the fixture must put both cells on one baseline");
+        let was = uniform.left;
+
+        assert_eq!(
+            rewrite_at(handle, &alpha.objects, alpha.prefix, "Alphabetical", Some(TIMES)),
+            STATUS_OK_PDFIUM);
+
+        let after = decode_clusters(handle, 0);
+        let moved = after.iter().find(|c| c.text == "Uniform").expect("Uniform vanished");
+        assert!((moved.left - was).abs() < 1e-3,
+                "the next column moved from {was:.4} to {:.4}", moved.left);
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn editing_a_word_still_moves_the_rest_of_its_own_line() {
+        // The other half of the same rule. Stopping at a column must not stop
+        // the reflow that makes word editing work at all.
+        let handle = open_fixture_named("tests/fixtures/sample_columns.pdf");
+
+        let before = decode_clusters(handle, 0);
+        let alpha = before.iter().find(|c| c.text == "Alpha").unwrap().clone();
+        let bravo = before.iter().find(|c| c.text == "bravo").unwrap().clone();
+
+        assert_eq!(
+            rewrite_at(handle, &alpha.objects, alpha.prefix, "Alphabetical", Some(TIMES)),
+            STATUS_OK_PDFIUM);
+
+        let after = decode_clusters(handle, 0);
+        let moved = after.iter().find(|c| c.text == "bravo").expect("bravo vanished");
+        assert!(moved.left > bravo.left + 0.01,
+                "the next word did not move: {:.4} then {:.4}", bravo.left, moved.left);
 
         close_document(handle);
     }

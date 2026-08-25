@@ -105,6 +105,29 @@ public sealed record WordTextRecord(
     : EditRecord(Guid.Empty, Page);
 
 /// <summary>
+/// One VISUAL LINE of the document's own text was retyped.
+///
+/// ⚠️ KEYED BY OBJECT RANGE, for the same reason
+/// <see cref="WordTextRecord"/> is keyed by object index: a page's own text is
+/// not an annotation and carries no identity we put there.
+///
+/// <see cref="Before"/> is both what to restore and what the range must still
+/// SAY for the record to be applied at all. If the page no longer reads that
+/// way, the step refuses rather than overwriting text it was never about.
+///
+/// The word count is not recorded because it is not preserved: retyping a line
+/// may change it, which is the whole reason the line is an editing unit at all.
+/// </summary>
+public sealed record LineTextRecord(
+    int Page,
+    int FirstObject,
+    int LastObject,
+    int PrefixChars,
+    string Before,
+    string After)
+    : EditRecord(Guid.Empty, Page);
+
+/// <summary>
 /// A URI link was created, retargeted or removed.
 ///
 /// <paramref name="Before"/> and <paramref name="After"/> are the URL on each

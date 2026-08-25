@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using PdfEditorApp.Viewport;
 using Xunit;
@@ -182,6 +182,68 @@ public class FormInteractionTests
 
         Assert.Contains("public partial bool FormFillMode", vm, StringComparison.Ordinal);
         Assert.Contains("private void DistributeFormOutlines()", vm, StringComparison.Ordinal);
+    }
+
+    // ---------------- the repaint ----------------
+
+    /// <summary>
+    /// One method's CODE. Comment lines are dropped, so that commenting a call
+    /// out counts as removing it: without that these read a commented-out line
+    /// as the call still being made, which was measured.
+    /// </summary>
+    private static string ViewModelBody(string signature)
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int at = vm.IndexOf(signature, StringComparison.Ordinal);
+        Assert.True(at > 0, $"there is no {signature}");
+
+        int next = vm.IndexOf("\n    /// <summary>", at, StringComparison.Ordinal);
+        string body = vm[at..(next > at ? next : vm.Length)];
+
+        return string.Join('\n', Array.FindAll(
+            body.Split('\n'), line => !line.TrimStart().StartsWith("//", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void a_form_edit_throws_away_the_pixels_as_well_as_the_caches()
+    {
+        // ⚠️ THE SECOND REAL-FORM FAILURE. The write was correct all along: on
+        // the user's own file a checkbox went from 16 dark pixels to 113 and a
+        // combo from 0 to 349 showing its new label. What never happened was the
+        // repaint, so the file changed and the screen did not. Their log carried
+        // no repaint line for the entire session.
+        //
+        // RenderCurrentPage refreshes the annotation OVERLAY. Form fields are
+        // painted by PDFium into the page BITMAP, which only this releases.
+        string body = ViewModelBody("public bool SetFormFieldState(");
+
+        Assert.Contains("InvalidateAllPageRasters()", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void undoing_a_form_edit_throws_away_the_pixels_too()
+    {
+        // A document-scope entry carries no per-page records, so the repaint the
+        // record loop performs never fires for one. Undo was as invisible as the
+        // edit had been.
+        string body = ViewModelBody("private void RestoreDocumentBytes(byte[] bytes)");
+
+        Assert.Contains("InvalidateAllPageRasters()", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_raster_invalidation_releases_every_page_and_redraws_the_visible_one()
+    {
+        // Releasing every page is what makes it correct after a whole-document
+        // rewrite; redrawing only the visible one is what keeps it affordable on
+        // a document with three thousand pages. The scroll pass renders the
+        // others again when they come back into view.
+        string body = ViewModelBody("private void InvalidateAllPageRasters()");
+
+        Assert.Contains("foreach (var slot in PageSlots)", body, StringComparison.Ordinal);
+        Assert.Contains("slot.ReleaseBitmap()", body, StringComparison.Ordinal);
+        Assert.Contains("slot.ClearTiles()", body, StringComparison.Ordinal);
+        Assert.Contains("RedrawPage(CurrentPageIndex)", body, StringComparison.Ordinal);
     }
 
     // ---------------- the refusals ----------------
