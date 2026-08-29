@@ -100,6 +100,7 @@ public static class WordClusterReader
         4 => ClusterRefusal.NoFontName,
         5 => ClusterRefusal.NoObjects,
         6 => ClusterRefusal.PartialSpan,
+        7 => ClusterRefusal.Justified,
         _ => ClusterRefusal.NoObjects,
     };
 

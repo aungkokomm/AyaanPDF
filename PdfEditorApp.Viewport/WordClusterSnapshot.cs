@@ -30,6 +30,18 @@ public enum ClusterRefusal
     /// <summary>The word begins part-way through one object and ends part-way
     /// through another, so there is no single string to splice it into.</summary>
     PartialSpan = 6,
+
+    /// <summary>
+    /// The line this word sits on is JUSTIFIED, and re-spacing one is not
+    /// built.
+    ///
+    /// ⚠️ THE SAME OBJECTION AS THE LINE'S, AND THE SAME NUMBER. The word is
+    /// the app's fallback when a line declines, so without this the reader is
+    /// handed the word instead and edits a justified paragraph one word at a
+    /// time, leaving the right margin ragged. The word is told this by the
+    /// line; it measures nothing of its own.
+    /// </summary>
+    Justified = 7,
 }
 
 /// <summary>
@@ -102,6 +114,7 @@ public sealed record WordClusterSnapshot(
         ClusterRefusal.SplitObjects => "This script stores its marks out of order, and editing it would scramble the text.",
         ClusterRefusal.NoFontName => "This text does not name its font, so there is no way to match it.",
         ClusterRefusal.PartialSpan => "This word is split across two pieces of the page and cannot be replaced cleanly.",
+        ClusterRefusal.Justified => "This line is justified, and editing justified text is not supported yet.",
         _ => "This text cannot be edited.",
     };
 }

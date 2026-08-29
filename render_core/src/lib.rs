@@ -8474,6 +8474,20 @@ const CLUSTER_NO_OBJECTS: u32 = 5;
 /// another. Splicing it would mean editing two strings at once and getting the
 /// join right; refusing is honest and this has not been seen on a real file.
 const CLUSTER_PARTIAL_SPAN: u32 = 6;
+/// The word sits on a JUSTIFIED line, whose words a producer moved apart to
+/// make both margins flush.
+///
+/// ⚠️ THE SAME OBJECTION AS `LINE_JUSTIFIED`, DELIBERATELY THE SAME NUMBER.
+/// The line refuses because re-spacing one is not built. Without this the app
+/// walks straight round that refusal: the line declines, the reader is offered
+/// the WORD instead, the ordinary shift reflow moves the rest of the line by
+/// the width delta, and the right margin stops being flush. Which is the
+/// degraded justification the line refusal exists to prevent, arriving by the
+/// back door.
+///
+/// Read from the line rather than measured again: `mark_justified_words`
+/// copies the answer `mark_justified_lines` already gave.
+const CLUSTER_JUSTIFIED: u32 = 7;
 
 /// One word of a page's own text, and the objects that draw it.
 struct WordCluster {
@@ -8511,6 +8525,9 @@ struct WordCluster {
     /// CR/LF where the producer put a line end, and this walk is already
     /// reading it.
     line: usize,
+    /// Whether the line this word sits on is justified. Copied from the line,
+    /// never measured here; see `CLUSTER_JUSTIFIED`.
+    justified: bool,
 }
 
 impl WordCluster {
@@ -8538,6 +8555,12 @@ impl WordCluster {
         // ending inside another is not: that is two strings to edit at once.
         if self.objects.len() > 1 && (self.prefix > 0 || self.suffix > 0) {
             return CLUSTER_PARTIAL_SPAN;
+        }
+        // LAST, because it is the only objection that is not about this word.
+        // The word itself is perfectly writable; its LINE is what cannot take
+        // the edit. A rotated or split word should still say what it is.
+        if self.justified {
+            return CLUSTER_JUSTIFIED;
         }
         CLUSTER_OK
     }
@@ -8678,6 +8701,9 @@ fn page_word_clusters(
             prefix: 0,
             suffix: 0,
             line,
+            // Not knowable yet: it is a fact about the line, and the line is
+            // not built until every word on the page is.
+            justified: false,
         });
 
         if starting {
@@ -8775,7 +8801,10 @@ fn get_page_word_clusters_inner(doc_handle: u64, page_index: i32) -> ByteBuffer 
     }
     let (page_left, page_top) = page_origin(&page);
 
-    let clusters = page_word_clusters(&doc_guard, &page);
+    // The LINE is what knows whether its block was justified, so the words are
+    // told before their refusals are reported.
+    let mut clusters = page_word_clusters(&doc_guard, &page);
+    mark_justified_words(&mut clusters, &page_lines(&doc_guard, &page, page_w));
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&(clusters.len() as u32).to_le_bytes());
@@ -8947,7 +8976,12 @@ fn set_word_cluster_text_inner(
         let Ok(page) = doc_guard.pages().get(page_index as u16) else {
             return STATUS_INVALID_INPUT;
         };
-        let clusters = page_word_clusters(&doc_guard, &page);
+        let mut clusters = page_word_clusters(&doc_guard, &page);
+        // ⚠️ HERE TOO, AND NOT ONLY IN THE READ. This is the check that keeps a
+        // justified margin flush; a caller that never asked the read path would
+        // otherwise walk straight past it and write.
+        let page_w = page.width().value;
+        mark_justified_words(&mut clusters, &page_lines(&doc_guard, &page, page_w));
 
         // BOTH, because neither alone identifies a word. The object list is
         // shared by every word on a line when the producer writes one object per
@@ -9489,6 +9523,9 @@ struct LineCluster {
     prefix: usize,
     suffix: usize,
     words: usize,
+    /// Which visual line this is, the same number its words carry. Kept so a
+    /// word can be told what its own line turned out to be.
+    line: usize,
     font: String,
     size_pts: f32,
     color: u32,
@@ -9649,6 +9686,7 @@ fn page_lines(
             prefix,
             suffix,
             words: members.len(),
+            line: first.line,
             font: first.font.clone(),
             size_pts: first.size_pts,
             color: first.color,
@@ -9705,6 +9743,22 @@ fn mark_justified_lines(lines: &mut [LineCluster], page_w: f32) {
             })
             .count();
         lines[i].justified = agreeing >= JUSTIFIED_MIN_LINES;
+    }
+}
+
+/// Copies each line's justification onto the words that sit on it.
+///
+/// ⚠️ NOT A SECOND DETECTOR. `mark_justified_lines` has already decided, from
+/// the only evidence a PDF carries, and this hands the same answer to the
+/// words so that both units refuse for one reason rather than two.
+///
+/// It exists because the word is the app's FALLBACK: when a line declines, the
+/// reader is offered the word under the pointer instead. Without this, that
+/// fallback edits a justified line one word at a time and leaves the margin
+/// ragged, which is the outcome the line refusal was written to prevent.
+fn mark_justified_words(words: &mut [WordCluster], lines: &[LineCluster]) {
+    for w in words.iter_mut() {
+        w.justified = lines.iter().any(|l| l.line == w.line && l.justified);
     }
 }
 
@@ -13389,6 +13443,97 @@ mod tests {
     }
 
     #[test]
+    fn a_word_on_a_justified_line_cannot_be_edited_round_its_lines_refusal() {
+        // ⚠️ THE HOLE THIS CLOSES, and it was open in the shipped app. When a
+        // line declines, the app offers the WORD under the pointer instead. So
+        // a justified line refused as a line and was then edited one word at a
+        // time, and the shift reflow moved the rest of the line by the width
+        // delta and left the right margin no longer flush. That is exactly the
+        // degraded justification the line refusal was written to prevent.
+        //
+        // The word does not measure anything of its own here: it is told what
+        // its line was found to be.
+        // The saved document, WITHOUT the trailer.
+        //
+        // ⚠️ MEASURED, and it is why this is not a whole-file comparison.
+        // PDFium mints a fresh random /ID on every save, so two snapshots of a
+        // document nobody touched are the same length, agree for 78682 bytes,
+        // and differ inside `trailer <</Info ... /ID[<..><..>]`. Comparing the
+        // whole file would therefore fail on an untouched document and prove
+        // nothing. Cutting at the trailer keeps every object the page is built
+        // from, which is what "the file did not change" has to mean here.
+        fn body_of(handle: u64) -> Vec<u8> {
+            let snap = snapshot_document(handle);
+            assert_eq!(snap.status, STATUS_OK_PDFIUM);
+            let all = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+            free_byte_buffer(snap);
+
+            let cut = all.windows(7).rposition(|w| w == b"trailer").unwrap_or(all.len());
+            all[..cut].to_vec()
+        }
+
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let lines = decode_lines(handle, 0);
+        let justified = line_starting(&lines, "The quick");
+        let ragged = line_starting(&lines, "A ragged");
+        assert_eq!(justified.refusal, LINE_JUSTIFIED);
+        assert_eq!(ragged.refusal, LINE_OK, "the control line must still be editable");
+
+        let clusters = decode_clusters(handle, 0);
+        let on = |line: &DecodedLine| -> Vec<&DecodedCluster> {
+            clusters
+                .iter()
+                .filter(|c| (c.baseline - line.baseline).abs() < 0.001)
+                .collect()
+        };
+
+        // AN ORDINARY WORD IS UNTOUCHED. The guard is about the line a word
+        // sits on, and a guard that also caught ragged text would have taken
+        // ordinary editing away with it.
+        let ordinary = on(&ragged);
+        assert!(!ordinary.is_empty(), "no words found on the ragged line");
+        assert!(
+            ordinary.iter().any(|c| c.refusal == CLUSTER_OK),
+            "the ragged line lost its editable words: {:?}",
+            ordinary.iter().map(|c| (&c.text, c.refusal)).collect::<Vec<_>>());
+
+        // NO WORD OF THE JUSTIFIED LINE IS OFFERED, and the reason given is the
+        // line's reason rather than something incidental.
+        let refused = on(&justified);
+        assert!(!refused.is_empty(), "no words found on the justified line");
+        assert!(
+            refused.iter().all(|c| c.refusal != CLUSTER_OK),
+            "a justified line still offers a word: {:?}",
+            refused.iter().map(|c| (&c.text, c.refusal)).collect::<Vec<_>>());
+        assert!(refused.iter().any(|c| c.refusal == CLUSTER_JUSTIFIED));
+
+        // ⚠️ AND THE WRITE REFUSES, not only the read. A caller that never asked
+        // what the refusal was must not get past it, which is the difference
+        // between a message and a guarantee. The font is supplied so that
+        // nothing but the justification can explain the answer.
+        let target = refused
+            .iter()
+            .find(|c| c.refusal == CLUSTER_JUSTIFIED)
+            .expect("no justified word to try");
+
+        let before = body_of(handle);
+
+        // The control, before the comparison is used to prove anything: saving
+        // the same document twice has to give the same body, or the assertion
+        // below would be measuring the saver rather than the edit.
+        assert_eq!(body_of(handle), before, "two saves of one document disagree");
+
+        assert_eq!(
+            rewrite_at(handle, &target.objects, target.prefix, "ZZZ", Some(ARIAL_BOLD)),
+            STATUS_UNSUPPORTED);
+
+        assert_eq!(body_of(handle), before, "a refused edit still changed the document");
+
+        close_document(handle);
+    }
+
+    #[test]
     fn a_line_set_in_more_than_one_style_is_refused() {
         // ⚠️ MEASURED, AND NOT WHAT YOU WOULD GUESS. Three styles run across
         // this line and NOT ONE of its words is mixed on its own, so the word
@@ -13478,7 +13623,7 @@ mod tests {
         fn at(first: usize, last: usize) -> LineCluster {
             LineCluster {
                 text: "x".into(), first_object: first, last_object: last,
-                prefix: 0, suffix: 0, words: 1, font: "F".into(), size_pts: 10.0,
+                prefix: 0, suffix: 0, words: 1, line: first, font: "F".into(), size_pts: 10.0,
                 color: 0, baseline: 0.0, left: 0.0, bottom: 0.0, right: 1.0, top: 1.0,
                 upright: true, mixed: false, ascending: true, widest_gap: 0.0,
                 justified: false, foreign: false,
