@@ -13726,6 +13726,59 @@ mod tests {
         close_document(handle);
     }
 
+    #[test]
+    fn a_deletion_survives_a_save_and_a_reopen_and_so_does_putting_it_back() {
+        // Test 8, and the half that matters more: a delete that only holds
+        // until the file is written is not a delete. The restore is checked the
+        // same way, because a positional anchor that stops addressing the right
+        // objects after a round trip would be worse than no anchor.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let original = line.text.clone();
+
+        assert_eq!(at_range(handle, &line, &original, ""), STATUS_OK_PDFIUM);
+
+        let snap = snapshot_document(handle);
+        assert_eq!(snap.status, STATUS_OK_PDFIUM);
+        let reopened = open_document_from_bytes(snap.data, snap.len);
+        free_byte_buffer(snap);
+        assert_ne!(reopened, 0);
+
+        assert!(lines_of(reopened).iter().all(|l| !l.text.starts_with("breaks where")),
+            "the deleted line came back when the file was reopened");
+
+        // And the anchor still addresses those objects in the reopened file.
+        let empty = DecodedLine { ..line.clone() };
+        assert_eq!(at_range(reopened, &empty, "", &original), STATUS_OK_PDFIUM);
+        assert_eq!(line_starting(&lines_of(reopened), "breaks where").text, original);
+
+        close_document(reopened);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_deletion_can_be_undone_and_then_done_again() {
+        // Tests 2 and 3 at the level that performs them. Both directions are
+        // the same call with the two strings swapped, so redo is not a second
+        // mechanism that could disagree with undo.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let original = line.text.clone();
+
+        assert_eq!(at_range(handle, &line, &original, ""), STATUS_OK_PDFIUM);
+        assert_eq!(at_range(handle, &line, "", &original), STATUS_OK_PDFIUM);
+        assert_eq!(line_starting(&lines_of(handle), "breaks where").text, original,
+            "undo did not restore the text exactly");
+
+        assert_eq!(at_range(handle, &line, &original, ""), STATUS_OK_PDFIUM);
+        assert!(lines_of(handle).iter().all(|l| !l.text.starts_with("breaks where")),
+            "redo did not delete it again");
+
+        close_document(handle);
+    }
+
     /// How many objects the page holds, for the index-stability check.
     fn object_count(handle: u64) -> usize {
         use pdfium_render::prelude::*;

@@ -128,6 +128,28 @@ public sealed record LineTextRecord(
     : EditRecord(Guid.Empty, Page);
 
 /// <summary>
+/// A run of the document's own text was DELETED.
+///
+/// ⚠️ KEYED BY POSITION, and it has to be. Every other text record is found
+/// again by what the page says, which works for a retype and cannot work for
+/// this: a deleted word leaves no cluster and a deleted line leaves no line,
+/// because both are built from characters. So undo addresses the objects
+/// themselves, and what makes that safe is <see cref="Text"/> doubling as the
+/// expectation: putting it back requires the range to still be empty, and
+/// taking it away again requires the range to still say it.
+///
+/// One record covers both directions. Undo writes <see cref="Text"/> back into
+/// an empty range; redo empties a range that says it.
+/// </summary>
+public sealed record TextDeleteRecord(
+    int Page,
+    int FirstObject,
+    int LastObject,
+    int PrefixChars,
+    string Text)
+    : EditRecord(Guid.Empty, Page);
+
+/// <summary>
 /// A URI link was created, retargeted or removed.
 ///
 /// <paramref name="Before"/> and <paramref name="After"/> are the URL on each

@@ -400,6 +400,13 @@ internal static class RenderStatus
     /// left the text four and a half page widths off the paper.
     /// </summary>
     public const int TooWide = 6;
+
+    /// <summary>
+    /// The objects at the recorded indices no longer hold what the caller says
+    /// they hold, so the write was refused rather than landing on text it was
+    /// never about.
+    /// </summary>
+    public const int StaleAnchor = 7;
 }
 
 /// <summary>Mirrors render_core::{POLL_*} (src/lib.rs).</summary>
@@ -721,6 +728,28 @@ internal static partial class RenderCoreNative
         nuint newTextLen,
         byte[]? fallbackFontPathUtf8,
         nuint fallbackFontPathLen);
+
+    /// <summary>
+    /// Writes into the objects at the given indices, addressed BY POSITION.
+    ///
+    /// ⚠️ THE ONE CALL THAT DOES NOT FIND ITS TARGET BY WHAT IT SAYS, which is
+    /// what makes deleting undoable: an emptied range has no cluster and no
+    /// line to look up. What keeps it safe is expectedUtf8, which the range
+    /// must still hold; anything else returns StaleAnchor and nothing is
+    /// written. No font argument, because the stand-in path inserts an object
+    /// and shifts the very indices this addresses by.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int set_object_range_text(
+        ulong docHandle,
+        int pageIndex,
+        uint firstObject,
+        uint lastObject,
+        uint prefixChars,
+        byte[] expectedUtf8,
+        nuint expectedLen,
+        byte[] newTextUtf8,
+        nuint newTextLen);
 
     /// <summary>
     /// Rewrites the searchable text layer on the given pages.

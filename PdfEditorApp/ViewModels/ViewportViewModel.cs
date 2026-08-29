@@ -5269,6 +5269,117 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    // ---------------- deleting a unit of the document's own text ----------------
+
+    /// <summary>
+    /// Where the selected unit sits, or null when nothing editable is selected.
+    ///
+    /// A LINE already knows its object range. A WORD carries the objects that
+    /// draw it and the offset it starts at inside the first one, which is the
+    /// same triple the word write identifies itself by.
+    /// </summary>
+    private (int First, int Last, int Prefix, string Text)? SelectedUnitAnchor()
+    {
+        if (_selectedTextUnit is not { CanEdit: true } unit)
+        {
+            return null;
+        }
+
+        if (unit.Line is { } line)
+        {
+            return (line.FirstObject, line.LastObject, line.PrefixChars, line.Text);
+        }
+
+        if (unit.Word is { } word && word.ObjectIndices.Count > 0)
+        {
+            return (word.ObjectIndices[0], word.ObjectIndices[^1], word.PrefixChars, word.Text);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Removes the selected unit's text from the page.
+    ///
+    /// ⚠️ THE RECORD IS POSITIONAL, and it has to be: once the range is empty
+    /// there is no cluster and no line to find it by, so every other text
+    /// record's way of locating itself would fail. The core is told what the
+    /// run must still say, so a page that has moved on refuses rather than
+    /// taking away text this was never about.
+    ///
+    /// The vertical space stays where it was. Closing the gap is paragraph
+    /// reflow, which is not built and is not being invented here.
+    /// </summary>
+    public bool DeleteSelectedTextUnit()
+    {
+        if (_documentHandle == 0) { return false; }
+        if (SelectedUnitAnchor() is not var (first, last, prefix, text)) { return false; }
+        if (string.IsNullOrWhiteSpace(text)) { return false; }
+
+        int page = _selectedTextUnit!.Page;
+
+        // ONE ENTRY, opened before the write and closed after it, exactly as a
+        // retype does, so however many objects the core empties it is one step.
+        BeginEdit("Delete text");
+        RecordEdit(new TextDeleteRecord(page, first, last, prefix, text));
+
+        int status = Interop.LineGateway.WriteAtAnchor(
+            _documentHandle, page, first, last, prefix, text, string.Empty);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            // The core leaves the page as it found it when it refuses, so the
+            // entry is abandoned rather than committed: there is nothing to undo.
+            AbandonEdit();
+
+            Diag.Log($"DeleteSelectedTextUnit refused status={status}");
+            ShowUnitNotice(status == RenderStatus.StaleAnchor
+                ? "That text has changed since it was selected. Select it again."
+                : "That text could not be deleted.");
+            return false;
+        }
+
+        CommitEdit();
+
+        _linesByPage.Remove(page);
+        _clustersByPage.Remove(page);
+        InvalidateLoadedPage(page);
+        ClearTextUnitSelection();
+        RefreshSelectionOutline();
+        RenderCurrentPage();
+        IsDirty = true;
+
+        Status = "Text deleted.";
+        return true;
+    }
+
+    /// <summary>
+    /// Puts a deletion back, or performs it again.
+    ///
+    /// Both directions are the same positional write with the two strings
+    /// swapped: undo writes the text into a range that must still be empty,
+    /// redo empties a range that must still say it.
+    /// </summary>
+    private void ApplyTextDelete(TextDeleteRecord record, bool backwards)
+    {
+        string expected = backwards ? string.Empty : record.Text;
+        string wanted = backwards ? record.Text : string.Empty;
+
+        int status = Interop.LineGateway.WriteAtAnchor(
+            _documentHandle, record.Page,
+            record.FirstObject, record.LastObject, record.PrefixChars, expected, wanted);
+
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"undo delete: the core refused with {status}");
+            Status = "That text has changed since, so this step could not be undone.";
+            return;
+        }
+
+        _linesByPage.Remove(record.Page);
+        _clustersByPage.Remove(record.Page);
+    }
+
     // ---------------- The selected unit of the document's own text ----------------
     //
     // ⚠️ THE GESTURE, AND WHY IT IS TWO CLICKS. The first selects and shows what
@@ -11932,6 +12043,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 case LineTextRecord n:
                     ApplyLineText(n, backwards);
                     touched.Add(n.Page);
+                    break;
+
+                case TextDeleteRecord d:
+                    ApplyTextDelete(d, backwards);
+                    touched.Add(d.Page);
                     break;
 
                 case LinkRecord l:

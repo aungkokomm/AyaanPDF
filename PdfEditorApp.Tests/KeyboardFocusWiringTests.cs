@@ -153,6 +153,9 @@ public class KeyboardFocusWiringTests
         int at = source.IndexOf(chord, StringComparison.Ordinal);
         Assert.True(at >= 0, $"nothing handles {chord}");
 
-        Assert.Contains(command, source[at..Math.Min(source.Length, at + 400)], StringComparison.Ordinal);
+        // The window was 400 and the Delete case outgrew it when a selected
+        // text unit became the first thing Delete reaches. The chord still runs
+        // the command; it is simply further down the case now.
+        Assert.Contains(command, source[at..Math.Min(source.Length, at + 1200)], StringComparison.Ordinal);
     }
 }

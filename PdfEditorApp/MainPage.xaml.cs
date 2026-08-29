@@ -7134,9 +7134,17 @@ public sealed partial class MainPage : Page
                 break;
             case VirtualKey.Delete:
             case VirtualKey.Back:
-                // Selected guide wins over selected annotation: a user who
-                // just clicked a guide expects Delete to remove THAT.
-                if (!ViewModel.DeleteSelectedGuide())
+                // ⚠️ THE ORDER IS THE BEHAVIOUR, and each step is what the
+                // reader just clicked. A selected text unit wins over both of
+                // the others because selecting one is the most recent thing
+                // they did, and neither of the others can be selected at the
+                // same time.
+                //
+                // Never reached while the editor is open: this whole handler
+                // returns early on IsTextInputFocused, so Delete inside a text
+                // box still means what it means in a text box.
+                if (!ViewModel.DeleteSelectedTextUnit()
+                    && !ViewModel.DeleteSelectedGuide())
                 {
                     ViewModel.DeleteSelectedAnnotation();
                 }

@@ -40,6 +40,26 @@ internal static class LineGateway
     }
 
     /// <summary>
+    /// Writes into a recorded range of objects, addressed by position.
+    ///
+    /// No font is resolved here, unlike <see cref="Write"/>: this path exists
+    /// so that a deletion can be undone, and the stand-in font would shift the
+    /// indices it is addressing by.
+    /// </summary>
+    public static int WriteAtAnchor(
+        ulong docHandle, int pageIndex, int firstObject, int lastObject, int prefixChars,
+        string expected, string newText)
+    {
+        byte[] want = Encoding.UTF8.GetBytes(expected);
+        byte[] text = Encoding.UTF8.GetBytes(newText);
+
+        return RenderCoreNative.set_object_range_text(
+            docHandle, pageIndex,
+            (uint)firstObject, (uint)lastObject, (uint)prefixChars,
+            want, (nuint)want.Length, text, (nuint)text.Length);
+    }
+
+    /// <summary>
     /// Retypes one line.
     ///
     /// The stand-in font is resolved HERE rather than in the core, because
