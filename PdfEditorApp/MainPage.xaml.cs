@@ -457,6 +457,18 @@ public sealed partial class MainPage : Page
     /// </summary>
     public static Thickness Offset(double left, double top) => new(left, top, 0, 0);
 
+    /// <summary>
+    /// Where a page notice sits: ABOVE the frame it explains, measured from the
+    /// bottom of the page so that the label's own height never has to be known,
+    /// or below it and measured from the top when there was no room above.
+    /// </summary>
+    public static Thickness NoticeMargin(double left, double top, double bottom, bool above) =>
+        above ? new Thickness(left, 0, 0, bottom) : new Thickness(left, top, 0, 0);
+
+    /// <summary>The alignment that makes the margin above mean what it says.</summary>
+    public static VerticalAlignment NoticeAlign(bool above) =>
+        above ? VerticalAlignment.Bottom : VerticalAlignment.Top;
+
     /// <summary>Cyan for an unselected guide, accent-red for the selected
     /// one, bright yellow while a shape is snapping onto it. Snap wins over
     /// selection - a selected guide getting snapped to is a rare-but-real
@@ -7377,6 +7389,11 @@ public sealed partial class MainPage : Page
         if (!unit.CanEdit)
         {
             ViewModel.Status = unit.RefusalReason;
+
+            // SAID AGAIN, because by now the label from the selecting click may
+            // have taken itself away, and a click that appears to do nothing is
+            // the complaint this whole thing answers.
+            ViewModel.ShowUnitNotice(unit.RefusalReason);
             return false;
         }
 

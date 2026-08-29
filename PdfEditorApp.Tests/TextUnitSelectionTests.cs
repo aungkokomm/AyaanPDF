@@ -146,6 +146,104 @@ public class TextUnitSelectionTests
         Assert.Contains("TextUnitSelection.FramePadYFactor", vm, StringComparison.Ordinal);
     }
 
+    // ---------------- saying why it cannot be edited ----------------
+
+    /// <summary>One method's CODE, comment lines dropped, so that commenting a
+    /// call out counts as removing it.</summary>
+    private static string Body(string signature)
+    {
+        string src = System.IO.File.ReadAllText(
+            FindUp("PdfEditorApp", "ViewModels", "ViewportViewModel.cs")).Replace("\r\n", "\n");
+        int at = src.IndexOf(signature, StringComparison.Ordinal);
+        Assert.True(at > 0, $"there is no {signature}");
+
+        int next = src.IndexOf("\n    /// <summary>", at, StringComparison.Ordinal);
+        string body = src[at..(next > at ? next : src.Length)];
+
+        return string.Join('\n', Array.FindAll(
+            body.Split('\n'), l => !l.TrimStart().StartsWith("//", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void a_refusal_is_shown_on_the_page_and_not_only_written_to_status()
+    {
+        // ⚠️ THE REAL FAILURE THIS ANSWERS. A reader clicked justified text, the
+        // core refused it correctly, the app assigned the sentence to Status,
+        // and NOTHING ON SCREEN SHOWS Status: the full-width status bar became
+        // the compact pill carrying page, zoom, fit and find, and eighty
+        // messages were left writing into a void. The frame appeared and the
+        // reader was told nothing.
+        string vm = System.IO.File.ReadAllText(
+            FindUp("PdfEditorApp", "ViewModels", "ViewportViewModel.cs"));
+
+        Assert.Contains("PageTextNotice.Add(new PageNotice(", vm, StringComparison.Ordinal);
+        Assert.Contains("ShowUnitNotice(", Body("public bool SelectTextUnitAt("), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void only_a_refusal_is_explained_and_an_editable_unit_says_nothing()
+    {
+        // A label over every click would be noise. An editable unit already
+        // says what it is by being framed in the editable colour.
+        string select = Body("public bool SelectTextUnitAt(");
+
+        Assert.Contains("CanEdit: false", select, StringComparison.Ordinal);
+        Assert.Contains("RefusalReason", select, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_label_takes_itself_away()
+    {
+        // It explains a click that has just been made. Left on the page it
+        // would be one more thing to dismiss, sitting over the words it is
+        // about.
+        string body = Body("private DispatcherQueueTimer? CreateUnitNoticeTimer()");
+
+        Assert.Contains("UnitNoticeSeconds", body, StringComparison.Ordinal);
+        Assert.Contains("_unitNotice = null;", body, StringComparison.Ordinal);
+        Assert.Contains("RefreshSelectionOutline();", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_label_cannot_swallow_the_click_it_is_explaining()
+    {
+        // ⚠️ THE GESTURE RUNS THROUGH WHERE THIS SITS. The reader's next click
+        // has to reach the page, and the label is drawn right beside the box
+        // they are aiming at. The frame itself is not hit-testable for exactly
+        // this reason; a label that ate the click would break the gesture it
+        // exists to explain.
+        string xaml = System.IO.File.ReadAllText(FindUp("PdfEditorApp", "MainPage.xaml"));
+
+        int at = xaml.IndexOf("x:Bind PageTextNotice}", StringComparison.Ordinal);
+        Assert.True(at > 0, "the notice overlay is gone");
+
+        int lineEnd = xaml.IndexOf('\n', at);
+        Assert.Contains("IsHitTestVisible=\"False\"", xaml[at..lineEnd], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_label_is_placed_without_having_to_know_how_tall_it_is()
+    {
+        // It goes ABOVE the frame, and how tall it is depends on where its
+        // sentence wraps, so it is measured from the BOTTOM of the page and
+        // bottom-aligned. A frame on the first line of a page has no room above
+        // it and takes the other anchor. Estimating the height instead would
+        // drop the label onto the words it is about whenever the guess came out
+        // short.
+        string page = System.IO.File.ReadAllText(FindUp("PdfEditorApp", "MainPage.xaml.cs"));
+
+        Assert.Contains("public static Thickness NoticeMargin(", page, StringComparison.Ordinal);
+        Assert.Contains("public static VerticalAlignment NoticeAlign(", page, StringComparison.Ordinal);
+
+        var above = new PageNotice(10, 0, 400, 360, true, "why", "#FFB0700F");
+        var below = new PageNotice(10, 250, 0, 360, false, "why", "#FFB0700F");
+
+        Assert.True(above.Above);
+        Assert.Equal(400, above.BottomMargin);
+        Assert.False(below.Above);
+        Assert.Equal(250, below.TopMargin);
+    }
+
     private static string FindUp(params string[] relative)
     {
         var dir = new System.IO.DirectoryInfo(AppContext.BaseDirectory);

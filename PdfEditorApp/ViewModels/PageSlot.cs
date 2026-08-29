@@ -118,6 +118,20 @@ public partial class PageSlot : ObservableObject
     public ObservableCollection<ScaledRect> PageTextOutline { get; } = new();
 
     /// <summary>
+    /// Why the framed piece of the document's own text cannot be edited. At
+    /// most one entry, and empty whenever it can be.
+    ///
+    /// ⚠️ IT IS HERE BECAUSE NOTHING SHOWED `Status`. The refusal was written
+    /// to that property by both the selection and the editor, and the property
+    /// is displayed nowhere: the full-width status bar became the compact pill
+    /// that carries page, zoom, fit and find, and the message was left behind.
+    /// So the app knew exactly why it would not edit a line and said it into a
+    /// void. This puts the sentence where the reader is already looking, beside
+    /// the box they just clicked.
+    /// </summary>
+    public ObservableCollection<PageNotice> PageTextNotice { get; } = new();
+
+    /// <summary>
     /// The page's links, outlined, when Show Links is on.
     ///
     /// A link draws NOTHING in the PDF: no appearance stream, a zero-width

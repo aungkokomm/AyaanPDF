@@ -692,6 +692,48 @@
                                             </ItemsControl.ItemTemplate>
                                         </ItemsControl>
 
+                                        <!--
+                                            WHY that text cannot be edited, said
+                                            beside the frame that says which text.
+
+                                            ⚠️ IT IS HERE BECAUSE NOTHING SHOWS
+                                            `Status`. The app wrote the refusal
+                                            to that property and to the log, and
+                                            the property is displayed nowhere: a
+                                            reader clicking justified text saw a
+                                            frame appear and was told nothing.
+
+                                            NOT HIT-TESTABLE, for the same reason
+                                            the frame is not. The reader's next
+                                            click has to reach the page, and a
+                                            label that ate it would break the
+                                            gesture it is explaining.
+
+                                            Fixed colours, like the frame: this
+                                            is read against white paper in both
+                                            themes.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind PageTextNotice}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:PageNotice">
+                                                    <Border Background="#FFFFF8E7"
+                                                            BorderBrush="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                            BorderThickness="1" CornerRadius="4" Padding="8,5"
+                                                            MaxWidth="{x:Bind MaxWidth}"
+                                                            Margin="{x:Bind local:MainPage.NoticeMargin(Left, TopMargin, BottomMargin, Above)}"
+                                                            HorizontalAlignment="Left"
+                                                            VerticalAlignment="{x:Bind local:MainPage.NoticeAlign(Above)}">
+                                                        <TextBlock Text="{x:Bind Text}" TextWrapping="Wrap"
+                                                                   FontSize="12" LineHeight="16"
+                                                                   Foreground="{x:Bind local:MainPage.HexBrush(ColorHex)}" />
+                                                    </Border>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <!-- Frame + handles, turned as ONE about the box centre for a rotated text box. -->
                                         <Grid>
                                             <Grid.RenderTransform>

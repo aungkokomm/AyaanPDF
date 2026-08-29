@@ -4471,6 +4471,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.SelectionGrips.Clear();
             slot.ExtraSelectionOutlines.Clear();
             slot.PageTextOutline.Clear();
+            slot.PageTextNotice.Clear();
             slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
         }
 
@@ -4514,11 +4515,35 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             double tl = (word.Left * SlotLayoutWidth) - padX;
             double tt = (word.Top * SlotLayoutWidth) - padY;
+            double frameBottom = (word.Bottom * SlotLayoutWidth) + padY;
             textSlot?.PageTextOutline.Add(new ScaledRect(
                 tl, tt,
                 (word.Right * SlotLayoutWidth) - tl + padX,
-                (word.Bottom * SlotLayoutWidth) - tt + padY,
+                frameBottom - tt,
                 word.CanEdit ? EditableUnitColor : RefusedUnitColor));
+
+            // AND WHY, when it cannot be edited. Beside the box rather than in
+            // the status bar, because the status bar does not exist: `Status`
+            // is written in eighty places and displayed in none, which is why a
+            // reader clicking justified text saw a frame appear and was told
+            // nothing at all.
+            if (_unitNotice is { Length: > 0 } why && textSlot is not null)
+            {
+                double maxWidth = Math.Min(UnitNoticeMaxWidth, SlotLayoutWidth * 0.7);
+
+                // Above unless the frame is too near the top of the page to
+                // leave room, which happens on the first line of every page.
+                bool above = tt > UnitNoticeRoom;
+
+                textSlot.PageTextNotice.Add(new PageNotice(
+                    Left: Math.Clamp(tl, 0, Math.Max(0, SlotLayoutWidth - maxWidth)),
+                    TopMargin: above ? 0 : frameBottom + UnitNoticeGap,
+                    BottomMargin: above ? textSlot.SlotHeight - tt + UnitNoticeGap : 0,
+                    MaxWidth: maxWidth,
+                    Above: above,
+                    Text: why,
+                    ColorHex: RefusedUnitColor));
+            }
         }
 
         if (_selectedLoaded is LoadedSelection sel)
@@ -5315,6 +5340,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Status = picked.Description;
         }
 
+        // ⚠️ SHOWN, not merely recorded. Status above is written for the log and
+        // for whatever one day displays it; this is the sentence the reader
+        // actually sees, and only when there is a refusal to explain.
+        ShowUnitNotice(picked is { CanEdit: false } ? picked.RefusalReason : null);
+
         return picked is not null;
     }
 
@@ -5394,6 +5424,75 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private const string EditableUnitColor = "#FF2D6FC4";
     private const string RefusedUnitColor = "#FFB0700F";
+
+    /// <summary>How wide the refusal label may run before it wraps.</summary>
+    private const double UnitNoticeMaxWidth = 360.0;
+
+    /// <summary>The gap between the label and the frame it explains.</summary>
+    private const double UnitNoticeGap = 6.0;
+
+    /// <summary>
+    /// How much room above the frame counts as enough for the label. Below
+    /// this it goes underneath instead, which is what a heading on the first
+    /// line of a page needs.
+    /// </summary>
+    private const double UnitNoticeRoom = 52.0;
+
+    /// <summary>How long the label stays before it takes itself away.</summary>
+    private const int UnitNoticeSeconds = 6;
+
+    /// <summary>
+    /// Why the selected unit cannot be edited, or null when it can be or when
+    /// the label's time is up.
+    ///
+    /// ⚠️ HELD SEPARATELY FROM THE SELECTION, so that the label going away does
+    /// not take the frame with it and, more importantly, so that the next
+    /// scroll does not bring it back: the overlay is rebuilt constantly, and a
+    /// label read off the selection alone would reappear every time.
+    /// </summary>
+    private string? _unitNotice;
+
+    private DispatcherQueueTimer? _unitNoticeTimer;
+
+    /// <summary>
+    /// Shows a sentence beside the framed text, or takes it away with null.
+    ///
+    /// Said once and briefly: it explains a click the reader has just made, and
+    /// a permanent label over the page would be one more thing to dismiss.
+    /// </summary>
+    public void ShowUnitNotice(string? message)
+    {
+        _unitNotice = string.IsNullOrWhiteSpace(message) ? null : message;
+
+        _unitNoticeTimer?.Stop();
+        if (_unitNotice is not null)
+        {
+            _unitNoticeTimer ??= CreateUnitNoticeTimer();
+            _unitNoticeTimer?.Start();
+        }
+
+        RefreshSelectionOutline();
+    }
+
+    private DispatcherQueueTimer? CreateUnitNoticeTimer()
+    {
+        var queue = _dispatcherQueue;
+        if (queue is null)
+        {
+            return null;
+        }
+
+        var timer = queue.CreateTimer();
+        timer.Interval = TimeSpan.FromSeconds(UnitNoticeSeconds);
+        timer.IsRepeating = false;
+        timer.Tick += (t, _) =>
+        {
+            t.Stop();
+            _unitNotice = null;
+            RefreshSelectionOutline();
+        };
+        return timer;
+    }
 
     // ---------------- Links ----------------
     //

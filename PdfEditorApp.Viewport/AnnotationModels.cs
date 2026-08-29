@@ -57,6 +57,31 @@ public readonly record struct ScaledRect(double Left, double Top, double Width, 
 }
 
 /// <summary>
+/// A short sentence pinned beside something on the page. At most one per page.
+///
+/// ⚠️ IT CARRIES BOTH ANCHORS, and that is the whole design rather than an
+/// oversight. The label belongs ABOVE the frame it explains, and how tall it
+/// is not known until its text has wrapped, so the margin that puts it there
+/// is measured from the BOTTOM of the page and the element is bottom-aligned.
+/// A frame near the top of the page has nothing above it, so that one is
+/// placed below and top-aligned instead. The alternative was to estimate the
+/// height and always anchor at the top, and an estimate that comes out short
+/// drops the label onto the very words it is about.
+/// </summary>
+/// <param name="Left">From the page's left edge, in the overlay's own units.</param>
+/// <param name="TopMargin">Used when <paramref name="Above"/> is false.</param>
+/// <param name="BottomMargin">Used when <paramref name="Above"/> is true.</param>
+/// <param name="MaxWidth">How wide the text may run before it wraps.</param>
+public readonly record struct PageNotice(
+    double Left,
+    double TopMargin,
+    double BottomMargin,
+    double MaxWidth,
+    bool Above,
+    string Text,
+    string ColorHex);
+
+/// <summary>
 /// One highlight rectangle paired with its colour.
 ///
 /// Exists because the inner item template is per-RECT while the colour lives
