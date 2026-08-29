@@ -72,6 +72,31 @@ public class WordEditWiringTests
     }
 
     [Fact]
+    public void a_word_too_long_for_the_line_says_so_rather_than_blaming_the_page()
+    {
+        // ⚠️ THE MESSAGE THE WIDTH GUARD NEEDS. The core refuses a
+        // replacement that would run off the right of the paper, which matters
+        // most for INSERTING: typing inside a word only ever makes the run
+        // longer. It is also the one refusal with a remedy, since the same edit
+        // with fewer letters goes through, and reporting it as "that word no
+        // longer matches the page" would send the reader off to re-select a
+        // word that is exactly where they left it.
+        string code = ViewModel();
+
+        int edit = code.IndexOf("public bool EditSelectedWord(", StringComparison.Ordinal);
+        int next = code.IndexOf("\n    /// <summary>", edit, StringComparison.Ordinal);
+        string body = code[edit..(next > edit ? next : code.Length)];
+
+        Assert.Contains("RenderStatus.TooWide", body, StringComparison.Ordinal);
+        Assert.Contains("too long to fit", body, StringComparison.Ordinal);
+
+        // And the line's own message is untouched, so the two cannot drift into
+        // one another.
+        int line = code.IndexOf("public bool EditSelectedLine(", StringComparison.Ordinal);
+        Assert.True(line > 0 && line != edit);
+    }
+
+    [Fact]
     public void undo_checks_what_the_page_says_before_it_writes()
     {
         // ⚠️ THE ONE REAL HAZARD. Every other record is keyed by a Guid that

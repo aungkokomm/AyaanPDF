@@ -5038,11 +5038,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // entry is abandoned rather than committed: there is nothing to undo.
             AbandonEdit();
 
-            Status = status == RenderStatus.Unsupported
-                ? SystemFontMatch.PathFor(word.FontName) is null
-                    ? $"\u201c{word.FontName}\u201d is not a font this app can match, so the word cannot be retyped."
-                    : "This word cannot be rewritten with the letters it needs."
-                : "That word no longer matches the page. Select it again.";
+            Status = status switch
+            {
+                RenderStatus.TooWide =>
+                    "That is too long to fit on the line. Try fewer letters.",
+                RenderStatus.Unsupported =>
+                    SystemFontMatch.PathFor(word.FontName) is null
+                        ? $"\u201c{word.FontName}\u201d is not a font this app can match, so the word cannot be retyped."
+                        : "This word cannot be rewritten with the letters it needs.",
+                _ => "That word no longer matches the page. Select it again.",
+            };
 
             Diag.Log($"EditSelectedWord refused status={status} font={word.FontName}");
             return false;

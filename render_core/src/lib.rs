@@ -8945,8 +8945,10 @@ fn get_page_word_clusters_inner(doc_handle: u64, page_index: i32) -> ByteBuffer 
 /// text and returns `STATUS_UNSUPPORTED`.
 ///
 /// Returns `STATUS_OK_PDFIUM` when the page now says exactly `new_text`,
-/// `STATUS_UNSUPPORTED` when it refused and left the page as it found it, and
-/// `STATUS_INVALID_INPUT` for a request that does not describe a cluster.
+/// `STATUS_UNSUPPORTED` when it refused and left the page as it found it,
+/// `STATUS_TOO_WIDE` when the replacement would run off the right of the page
+/// and the original has been put back, and `STATUS_INVALID_INPUT` for a request
+/// that does not describe a cluster.
 #[unsafe(no_mangle)]
 pub extern "C" fn set_word_cluster_text(
     doc_handle: u64,
@@ -9026,6 +9028,10 @@ fn set_word_cluster_text_inner(
         color: Option<PdfColor>,
         size: f32,
         right: f32,
+        /// Where the paper ends, so a replacement that would leave it can be
+        /// refused. The line write has carried this since a three-hundred
+        /// character retype was measured landing four page widths to the right.
+        page_right: f32,
         shift: Vec<usize>,
         /// The word's own text, and where it sits inside its object. When the
         /// object holds more than this word, only this span may be replaced.
@@ -9044,6 +9050,7 @@ fn set_word_cluster_text_inner(
         // otherwise walk straight past it and write.
         let page_w = page.width().value;
         mark_justified_words(&mut clusters, &page_lines(&doc_guard, &page, page_w));
+        let (page_left, _) = page_origin(&page);
 
         // BOTH, because neither alone identifies a word. The object list is
         // shared by every word on a line when the producer writes one object per
@@ -9107,6 +9114,7 @@ fn set_word_cluster_text_inner(
             color: ft.fill_color().ok(),
             size: ft.unscaled_font_size().value,
             right,
+            page_right: page_left + page_w,
             shift,
             word: target.text.clone(),
             prefix: target.prefix,
@@ -9146,6 +9154,25 @@ fn set_word_cluster_text_inner(
     };
 
     if path_one {
+        // ⚠️ THE SAME GUARD THE LINE WRITE HAS, and the word write needs it for
+        // the same reason: nothing else stops text leaving the page. It matters
+        // most for INSERTING, because text put inside a word only ever makes
+        // the run longer, and a long enough insertion was accepted here and
+        // pushed the rest of the line past the right edge of the paper, where
+        // it is invisible and recoverable only by undo.
+        //
+        // THE WIDTH IS ONLY KNOWABLE NOW. Both the object box and the text page
+        // keep answering with the size the page had when it was loaded, so the
+        // only way to learn how wide the replacement came out is to take the
+        // page again and ask the characters.
+        if line_overflows(&doc_guard, page_index, plan.objects[0], plan.page_right) {
+            let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+                return STATUS_INVALID_INPUT;
+            };
+            restore_cluster_objects(&page, &plan.objects, &plan.originals);
+            let _ = page.regenerate_content();
+            return STATUS_TOO_WIDE;
+        }
         return finish_cluster_write(
             &mut doc_guard, page_index, plan.objects[0], plan.right, &plan.shift);
     }
@@ -9227,19 +9254,12 @@ fn set_word_cluster_text_inner(
         .map(|&i| if i >= plan.objects[0] { i + 1 } else { i })
         .collect();
 
-    let said = {
+    // Empty the failed replacement rather than removing it, and put the
+    // original word back. The page reads as it did; one invisible empty object
+    // is the price of never calling FPDFPage_RemoveObject.
+    let put_back = |doc_guard: &pdfium_render::prelude::PdfDocument| {
         let Ok(page) = doc_guard.pages().get(page_index as u16) else {
-            return STATUS_INVALID_INPUT;
-        };
-        cluster_text_of(&page, &[plan.objects[0]])
-    };
-
-    if !same_text(&said, new_text) {
-        // Empty the failed replacement rather than removing it, and put the
-        // original word back. The page reads as it did; one invisible empty
-        // object is the price of never calling FPDFPage_RemoveObject.
-        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
-            return STATUS_INVALID_INPUT;
+            return;
         };
         if let Ok(mut o) = page.objects().get(plan.objects[0]) {
             if let PdfPageObject::Text(t) = &mut o {
@@ -9249,7 +9269,26 @@ fn set_word_cluster_text_inner(
         restore_cluster_objects(&page, &moved, &plan.originals);
         let mut page = page;
         let _ = page.regenerate_content();
+    };
+
+    let said = {
+        let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+            return STATUS_INVALID_INPUT;
+        };
+        cluster_text_of(&page, &[plan.objects[0]])
+    };
+
+    if !same_text(&said, new_text) {
+        put_back(&doc_guard);
         return STATUS_UNSUPPORTED;
+    }
+
+    // The stand-in font is a different font, so it is free to come out wider
+    // than the word's own would have; this path can leave the page just as the
+    // other one can.
+    if line_overflows(&doc_guard, page_index, plan.objects[0], plan.page_right) {
+        put_back(&doc_guard);
+        return STATUS_TOO_WIDE;
     }
 
     finish_cluster_write(
@@ -14011,6 +14050,129 @@ mod tests {
         assert_eq!(body_of(handle), before, "a refused edit still changed the document");
 
         close_document(handle);
+    }
+
+    #[test]
+    fn a_word_cannot_be_made_long_enough_to_leave_the_page() {
+        // ⚠️ THE GUARD THE WORD WRITE WAS MISSING. The line write has refused a
+        // replacement that runs off the paper since a three-hundred character
+        // retype was measured landing four and a half page widths to the right,
+        // invisible and recoverable only by undo. The word write had no such
+        // check, and it is the path that needs it most: INSERTING into a word
+        // only ever makes the run longer, so the reader who types in the middle
+        // of a line is the one who pushes the rest of it off the page.
+        //
+        // The word here SHARES ITS OBJECT with the rest of its line, which is
+        // what most producers emit and what makes the overflow real: the object
+        // that grows is the whole line.
+
+        /// EVERYTHING THE PAGE DRAWS: its lines, and every word with where it
+        /// sits. This is what "unchanged" has to mean here, and it is not the
+        /// saved bytes.
+        ///
+        /// ⚠️ MEASURED, and it is why. A refusal that got as far as writing has
+        /// to rebuild the content stream to put the text back, and PDFium
+        /// appends a fresh ExtGState object every time it does: the same page
+        /// with the same fonts and the same text came back 128 bytes longer,
+        /// with `/FXE2 50 0 R` become `/FXE3 51 0 R`. Comparing files would
+        /// report that as a changed document when nothing the reader can see
+        /// has changed, and would hide a word that really did move.
+        fn page_state(handle: u64) -> (Vec<String>, Vec<(String, i64, i64, i64)>) {
+            let words = decode_clusters(handle, 0)
+                .into_iter()
+                .map(|c| (
+                    c.text,
+                    (c.left * 100.0) as i64,
+                    (c.right * 100.0) as i64,
+                    (c.baseline * 100.0) as i64))
+                .collect();
+            (texts_of(handle), words)
+        }
+
+        /// The first word of the ragged line that may be edited at all, so
+        /// nothing but the width can explain a refusal.
+        fn editable_word(handle: u64) -> DecodedCluster {
+            let ragged = line_starting(&decode_lines(handle, 0), "A ragged");
+            decode_clusters(handle, 0)
+                .into_iter()
+                .find(|c| (c.baseline - ragged.baseline).abs() < 0.001
+                    && c.refusal == CLUSTER_OK
+                    && c.text.chars().count() >= 4)
+                .expect("no editable word on the ragged line")
+        }
+
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let target = editable_word(handle);
+        let original = target.text.clone();
+        let sharing = decode_clusters(handle, 0)
+            .into_iter()
+            .filter(|c| c.objects == target.objects)
+            .count();
+        assert!(sharing > 1,
+            "the fixture word must share its object for this to measure a line");
+
+        // ---- an insertion that fits is written ----
+        let inserted = insert_into(&original, "ing");
+        assert_eq!(
+            rewrite_at(handle, &target.objects, target.prefix, &inserted, Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+        assert!(words_of(handle).iter().any(|w| w == &inserted),
+            "the insertion did not take: {:?}", words_of(handle));
+
+        // ---- and undoing it puts the original word back ----
+        //
+        // Which is the same write with the strings swapped, exactly as the app's
+        // history entry replays it.
+        let back = decode_clusters(handle, 0)
+            .into_iter()
+            .find(|c| c.text == inserted)
+            .expect("the inserted word cannot be found again");
+        assert_eq!(
+            rewrite_at(handle, &back.objects, back.prefix, &original, Some(ARIAL_BOLD)),
+            STATUS_OK_PDFIUM);
+        assert!(words_of(handle).iter().any(|w| w == &original),
+            "undo did not restore the word: {:?}", words_of(handle));
+
+        // ---- an insertion that would leave the page is refused ----
+        let before = page_state(handle);
+
+        // The control, before the comparison is used to prove anything: reading
+        // the same page twice has to give the same answer, or the assertion
+        // below would be measuring the reader rather than the edit.
+        assert_eq!(page_state(handle), before, "two reads of one page disagree");
+
+        let target = editable_word(handle);
+        // ⚠️ BUILT FROM THE WORD'S OWN LETTERS, and that is not decoration. The
+        // fixture's font is a SUBSET, so a run of some letter it never embedded
+        // fails to be written at all and the answer would be the stand-in
+        // font's rather than the width's. Repeating the word itself is spellable
+        // by definition, so the only thing left to refuse is the length.
+        let too_long = insert_into(&original, &original.repeat(80));
+        assert_eq!(
+            rewrite_at(handle, &target.objects, target.prefix, &too_long, Some(ARIAL_BOLD)),
+            STATUS_TOO_WIDE);
+
+        // ---- and it left the document exactly as it found it ----
+        // ---- and it left the page exactly as it found it ----
+        //
+        // Not only the word: every line still reads as it did and every other
+        // word is still where it was, which is what says the reflow that
+        // follows a successful write did not run.
+        assert_eq!(page_state(handle), before, "a refused insertion still changed the page");
+
+        close_document(handle);
+    }
+
+    /// Puts `added` in the MIDDLE of `word`, which is what typing inside a
+    /// selected word gives the core: one string with more in it than before.
+    fn insert_into(word: &str, added: &str) -> String {
+        let chars: Vec<char> = word.chars().collect();
+        let at = chars.len() / 2;
+        let mut out: String = chars[..at].iter().collect();
+        out.push_str(added);
+        out.extend(&chars[at..]);
+        out
     }
 
     #[test]

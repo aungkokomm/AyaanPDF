@@ -664,7 +664,8 @@ internal static partial class RenderCoreNative
     /// cannot spell the replacement, which for a subset font is the common case.
     /// Pass null to refuse rather than substitute.
     ///
-    /// Returns OkPdfium when the page now says exactly what was asked,
+    /// Returns OkPdfium when the page now says exactly what was asked, TooWide
+    /// when the replacement would leave the page and the page was put back,
     /// Unsupported when it refused and left the page as it found it, and
     /// InvalidInput for a request that does not describe a word.
     /// </summary>
