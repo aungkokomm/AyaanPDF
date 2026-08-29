@@ -49,6 +49,18 @@ public readonly record struct ScaledRect(double Left, double Top, double Width, 
         new(r.Left * scale, r.Top * scale, (r.Right - r.Left) * scale, (r.Bottom - r.Top) * scale, colorHex);
 
     /// <summary>
+    /// From a rect that already carries its colour, which is what a markup
+    /// annotation hands over once it has decided what to DRAW.
+    ///
+    /// ⚠️ THE OVERLAY MUST COME THROUGH HERE. Taking the marked band instead
+    /// draws every kind as a full-width wash: underline and strikeout were
+    /// shipped invisible that way, because the geometry that told them apart
+    /// was computed by a property nothing on screen called.
+    /// </summary>
+    public static ScaledRect From(ColoredRect r, double scale) =>
+        new(r.Left * scale, r.Top * scale, r.Width * scale, r.Height * scale, r.ColorHex);
+
+    /// <summary>
     /// False for degenerate rects. Line breaks and zero-width joiners produce
     /// empty glyph boxes, and a rect with no area is an invisible element that
     /// still costs a container to lay out.

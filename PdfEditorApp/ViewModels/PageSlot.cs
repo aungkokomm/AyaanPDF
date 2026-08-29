@@ -192,9 +192,16 @@ public partial class PageSlot : ObservableObject
         HighlightRects.Clear();
         foreach (var h in Highlights)
         {
-            foreach (var r in h.Rects)
+            // ⚠️ ColoredRects, NOT Rects. Rects is the marked text BAND, which
+            // is what the hit test and the write to the core need; what to DRAW
+            // is a different rectangle for two of the three kinds, and only
+            // this property knows which. Reading the band here is how underline
+            // and strikeout shipped invisible: both drew the full wash of a
+            // highlight, and the property that told them apart was called by
+            // nothing but its own tests.
+            foreach (var r in h.ColoredRects)
             {
-                var sr = ScaledRect.From(r, SlotWidth, h.ColorHex);
+                var sr = ScaledRect.From(r, SlotWidth);
                 if (sr.IsVisible)
                 {
                     HighlightRects.Add(sr);

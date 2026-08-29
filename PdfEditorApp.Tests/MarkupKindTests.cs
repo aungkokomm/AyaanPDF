@@ -171,6 +171,56 @@ public class MarkupKindTests
         Assert.Contains("defaultAlpha: 0x88", vm, StringComparison.Ordinal);
     }
 
+
+    // ---------------- what actually reaches the screen ----------------
+
+    [Fact]
+    public void the_overlay_draws_the_kind_and_not_the_marked_band()
+    {
+        // ⚠️ THE DEFECT THIS TEST EXISTS FOR, and it shipped. ColoredRects was
+        // correct and NOTHING CALLED IT: the overlay flattened the marked band
+        // instead, so all three kinds drew the same full wash and neither
+        // underline nor strikeout was ever visible while working. Asserting
+        // that geometry is computed proves nothing if no one asks for it.
+        string slot = Read("PdfEditorApp", "ViewModels", "PageSlot.cs");
+        int at = slot.IndexOf("public void RebuildHighlightRects()", StringComparison.Ordinal);
+        Assert.True(at > 0, "the overlay no longer flattens the marks here");
+
+        int next = slot.IndexOf("/// <summary>", at, StringComparison.Ordinal);
+        string body = slot[at..(next > at ? next : slot.Length)];
+
+        Assert.Contains("h.ColoredRects", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("h.Rects", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_coloured_rect_scales_into_the_overlay_keeping_its_own_colour()
+    {
+        // The step the overlay takes straight after asking for the geometry.
+        // The colour travels WITH the rect now, because the rect being drawn is
+        // no longer the one the annotation was built from.
+        var drawn = Mark(MarkupKind.Underline).ColoredRects[0];
+        var scaled = ScaledRect.From(drawn, 1000);
+
+        Assert.Equal(drawn.Left * 1000, scaled.Left, 6);
+        Assert.Equal(drawn.Width * 1000, scaled.Width, 6);
+        Assert.Equal(drawn.Height * 1000, scaled.Height, 6);
+        Assert.Equal("#66FFD400", scaled.ColorHex);
+    }
+
+    [Fact]
+    public void a_rule_is_thick_enough_to_survive_the_degenerate_rect_filter()
+    {
+        // ⚠️ THE OVERLAY DROPS ANYTHING UNDER HALF A PIXEL, which is right for
+        // the empty boxes a line break leaves behind and would be fatal here: a
+        // rule is thin by design. Checked narrow as well as wide.
+        var rule = Mark(MarkupKind.Strikeout).ColoredRects[0];
+
+        Assert.True(ScaledRect.From(rule, 400).IsVisible,
+            "a strikeout vanishes on a narrow page");
+        Assert.True(ScaledRect.From(rule, 1000).IsVisible);
+    }
+
     // ---------------- the picker ----------------
 
     [Fact]

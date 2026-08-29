@@ -20530,6 +20530,18 @@ p={spread_px:.4},c={rgba:08X})"
             assert_eq!(after.len(), 1, "kind {kind} after reopen");
             assert_eq!(after[0].1, expected, "kind {kind} after reopen");
 
+            // ⚠️ AND IT STILL DRAWS. A subtype read back proves the object
+            // survived the save; only pixels prove the mark did. A markup
+            // annotation whose appearance PDFium declines to regenerate is a
+            // perfectly well formed object that shows nothing, which is a
+            // failure this project has already shipped once.
+            let pristine = open_fixture_named("tests/fixtures/sample_lines.pdf");
+            let clean = dark_pixels_in(pristine, 0.1, 0.1, 0.5, 0.14);
+            let marked = dark_pixels_in(reopened, 0.1, 0.1, 0.5, 0.14);
+            assert!(marked > clean,
+                "kind {kind} reopened without drawing: {marked} against {clean}");
+            close_document(pristine);
+
             close_document(reopened);
             close_document(handle);
         }
