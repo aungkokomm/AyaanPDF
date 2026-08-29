@@ -47,6 +47,12 @@ public enum DocumentObjectKind
     /// <summary>A text highlight.</summary>
     Highlight,
 
+    /// <summary>A rule under a run of text.</summary>
+    Underline,
+
+    /// <summary>A rule through a run of text.</summary>
+    Strikeout,
+
     /// <summary>An annotation this app did not create, or one it cannot
     /// describe. Present in the model so that Z-ORDER is accurate; a page whose
     /// foreign annotations were dropped would report the wrong stacking for

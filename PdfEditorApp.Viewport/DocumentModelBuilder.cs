@@ -323,6 +323,13 @@ public static class DocumentModelBuilder
             PdfAnnotationSubtype.Stamp => DocumentObjectKind.Stamp,
             PdfAnnotationSubtype.Ink => DocumentObjectKind.Ink,
             PdfAnnotationSubtype.Highlight => DocumentObjectKind.Highlight,
+
+            // NAMED, not left in Unknown. They are ours, made by the same tool,
+            // and they behave like a highlight in every way that matters:
+            // selected, moved, deleted. Left unknown they would carry z-order
+            // and nothing else.
+            PdfAnnotationSubtype.Underline => DocumentObjectKind.Underline,
+            PdfAnnotationSubtype.Strikeout => DocumentObjectKind.Strikeout,
             PdfAnnotationSubtype.Link => DocumentObjectKind.Link,
             PdfAnnotationSubtype.Widget => DocumentObjectKind.FormField,
             _ => DocumentObjectKind.Unknown,

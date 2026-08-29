@@ -53,6 +53,17 @@ public class AnnotationInteropTests
         public float Bottom;
     }
 
+    /// <summary>
+    /// The THIRD copy of this layout, and the only one that can be measured:
+    /// the app's is internal to an assembly these tests cannot reference, so
+    /// this one exists to exercise the boundary directly.
+    ///
+    /// ⚠️ WHICH MAKES IT A THIRD PLACE TO FORGET. It was: adding `kind` to Rust
+    /// and to the app left this one at sixteen bytes, the core read the kind
+    /// from past the end of what was sent, and three tests here failed with a
+    /// refusal nobody had written. That is exactly the failure the size
+    /// assertion below now names in one line.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     private struct HighlightSpec
     {
@@ -63,7 +74,9 @@ public class AnnotationInteropTests
         public byte G;
         public byte B;
         public byte A;
+        public uint Kind;
     }
+
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern ulong open_document([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
@@ -151,7 +164,14 @@ public class AnnotationInteropTests
         Assert.Equal(32, Marshal.SizeOf<AnnotationInfo>());
         Assert.Equal(IntPtr.Size == 8 ? 24 : 12, Marshal.SizeOf<AnnotationArray>());
         Assert.Equal(16, Marshal.SizeOf<HighlightQuad>());
-        Assert.Equal(16, Marshal.SizeOf<HighlightSpec>());
+
+        // ⚠️ TWENTY SINCE THE MARKUP KIND, and this test is how that was found.
+        // Adding `kind` to Rust and to the app left the copy below at sixteen,
+        // the core read the kind from past the end of what was sent and refused
+        // every write, and three tests failed with a refusal nobody had
+        // written. The core asserts the same twenty from Rust, in
+        // MARKUP_SPEC_BYTES.
+        Assert.Equal(20, Marshal.SizeOf<HighlightSpec>());
     }
 
     [Fact]

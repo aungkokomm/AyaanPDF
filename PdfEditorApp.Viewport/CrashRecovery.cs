@@ -41,8 +41,16 @@ public sealed record RecoveryRecord(
     public List<RecoveredNote> Notes { get; init; } = new();
 }
 
-/// <summary>One highlight, flattened to what it takes to put it back.</summary>
-public sealed record RecoveredHighlight(int PageIndex, string ColorHex, List<RecoveredRect> Rects);
+/// <summary>One text markup, flattened to what it takes to put it back.</summary>
+///
+/// <remarks>
+/// The kind is carried, with a default, or a recovered strikeout would come
+/// back a highlight: the rects are the same either way and only this says which
+/// mark they were.
+/// </remarks>
+public sealed record RecoveredHighlight(
+    int PageIndex, string ColorHex, List<RecoveredRect> Rects,
+    MarkupKind Kind = MarkupKind.Highlight);
 
 public sealed record RecoveredRect(double Left, double Top, double Right, double Bottom);
 

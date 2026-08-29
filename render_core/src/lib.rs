@@ -1564,7 +1564,32 @@ pub struct HighlightSpec {
     pub g: u8,
     pub b: u8,
     pub a: u8,
+    /// Which mark this is: `MARKUP_HIGHLIGHT`, `MARKUP_UNDERLINE` or
+    /// `MARKUP_STRIKEOUT`.
+    ///
+    /// ⚠️ ADDED TO A STRUCT THAT CROSSES THE FFI. C# mirrors this field by
+    /// field, and a field added on one side only is silent corruption rather
+    /// than a compile error: every colour and count after the divergence is
+    /// read from the wrong offset. `MARKUP_SPEC_BYTES` and the C# test beside
+    /// it assert the same size from both languages so a divergence fails a
+    /// test rather than a document.
+    pub kind: u32,
 }
+
+/// A run of text painted behind, `/Highlight`.
+pub const MARKUP_HIGHLIGHT: u32 = 0;
+/// A rule under the text, `/Underline`.
+pub const MARKUP_UNDERLINE: u32 = 1;
+/// A rule through the text, `/StrikeOut`.
+pub const MARKUP_STRIKEOUT: u32 = 2;
+
+/// What `HighlightSpec` measures, asserted from BOTH languages.
+///
+/// i32 + u32 + u32 + four u8 + u32, all four-aligned, so twenty bytes with no
+/// padding anywhere. The C# side asserts the same number against
+/// `Marshal.SizeOf`, which is the cheapest thing that catches a field added to
+/// one language and not the other.
+pub const MARKUP_SPEC_BYTES: usize = 20;
 
 /// A sticky note: a position in render-pixel space plus its text.
 ///
@@ -6673,56 +6698,82 @@ fn add_highlight_annotations_inner(
             ));
         }
 
-        let Ok(mut annotation) = page.annotations_mut().create_highlight_annotation() else {
-            return STATUS_INVALID_INPUT;
-        };
-
         let bounds = PdfRect::new(
             PdfPoints::new(min_y),
             PdfPoints::new(min_x),
             PdfPoints::new(max_y),
             PdfPoints::new(max_x),
         );
-        if annotation.set_bounds(bounds).is_err() {
-            return STATUS_INVALID_INPUT;
+
+        // ONE TAIL, THREE SUBTYPES. The three creators return three different
+        // types, so a single binding will not typecheck across them, and the
+        // work after the creation is identical for all three: the same bounds,
+        // the same /C colour, the same quad points in the same order. A macro
+        // repeating that tail is how `move_quads!` already handles the same
+        // problem, and it is the only way to keep the three from drifting.
+        macro_rules! write_markup {
+            ($create:ident) => {{
+                let Ok(mut annotation) = page.annotations_mut().$create() else {
+                    return STATUS_INVALID_INPUT;
+                };
+                if annotation.set_bounds(bounds).is_err() {
+                    return STATUS_INVALID_INPUT;
+                }
+
+                // set_STROKE_color, despite a highlight being a fill, because
+                // that is the one that writes the annotation's /C entry.
+                // set_fill_color writes /IC, the interior colour, and PDFium
+                // generates a markup annotation's appearance from /C. The same
+                // entry carries the colour of all three subtypes, so the
+                // colour and alpha reaching here are used exactly as they were
+                // for a highlight and nothing about the palette changes.
+                if annotation
+                    .set_stroke_color(PdfColor::new(spec.r, spec.g, spec.b, spec.a))
+                    .is_err()
+                {
+                    return STATUS_INVALID_INPUT;
+                }
+
+                for rect in &rects {
+                    // Corners in the order PDF actually defines for
+                    // /QuadPoints: top-left, top-right, bottom-left,
+                    // bottom-right.
+                    //
+                    // NOT PdfQuadPoints::from_rect, which winds them
+                    // counter-clockwise from the bottom-left instead. PDFium
+                    // reads pair 1 as the top-right corner and pair 2 as the
+                    // bottom-left, so a rectangle built that way hands it two
+                    // corners with the same x, it computes a zero-width
+                    // rectangle, and the mark draws NOTHING at all while
+                    // remaining a perfectly well formed annotation with correct
+                    // bounds, colour and quad count. That is what it did.
+                    let quad = PdfQuadPoints::new_from_values(
+                        rect.left().value,  rect.top().value,     // top-left
+                        rect.right().value, rect.top().value,     // top-right
+                        rect.left().value,  rect.bottom().value,  // bottom-left
+                        rect.right().value, rect.bottom().value,  // bottom-right
+                    );
+
+                    if annotation
+                        .attachment_points_mut()
+                        .create_attachment_point_at_end(quad)
+                        .is_err()
+                    {
+                        return STATUS_INVALID_INPUT;
+                    }
+                }
+            }};
         }
 
-        // set_STROKE_color, despite this being a fill, because that is the one
-        // that writes the annotation's /C entry. set_fill_color writes /IC,
-        // the interior colour, and PDFium generates a markup annotation's
-        // appearance from /C.
-        if annotation
-            .set_stroke_color(PdfColor::new(spec.r, spec.g, spec.b, spec.a))
-            .is_err()
-        {
-            return STATUS_INVALID_INPUT;
-        }
-
-        for rect in &rects {
-            // Corners in the order PDF actually defines for /QuadPoints:
-            // top-left, top-right, bottom-left, bottom-right.
-            //
-            // NOT PdfQuadPoints::from_rect, which winds them counter-clockwise
-            // from the bottom-left instead. PDFium reads pair 1 as the
-            // top-right corner and pair 2 as the bottom-left, so a rectangle
-            // built that way hands it two corners with the same x, it computes
-            // a zero-width rectangle, and the highlight draws NOTHING at all
-            // while remaining a perfectly well formed annotation with correct
-            // bounds, colour and quad count. That is what it did.
-            let quad = PdfQuadPoints::new_from_values(
-                rect.left().value,  rect.top().value,     // top-left
-                rect.right().value, rect.top().value,     // top-right
-                rect.left().value,  rect.bottom().value,  // bottom-left
-                rect.right().value, rect.bottom().value,  // bottom-right
-            );
-
-            if annotation
-                .attachment_points_mut()
-                .create_attachment_point_at_end(quad)
-                .is_err()
-            {
-                return STATUS_INVALID_INPUT;
-            }
+        match spec.kind {
+            MARKUP_HIGHLIGHT => write_markup!(create_highlight_annotation),
+            MARKUP_UNDERLINE => write_markup!(create_underline_annotation),
+            MARKUP_STRIKEOUT => write_markup!(create_strikeout_annotation),
+            // Refused rather than drawn as something else. A caller sending a
+            // kind this does not know is a caller whose idea of the struct has
+            // drifted from this one, and marking the document with a guess
+            // would hide exactly that.
+            _ => return STATUS_INVALID_INPUT,
         }
     }
 
@@ -15271,7 +15322,7 @@ mod tests {
             r: 255,
             g: 235,
             b: 59,
-            a: 128,
+            a: 128, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), specs.len(),
@@ -19743,7 +19794,7 @@ p={spread_px:.4},c={rgba:08X})"
         let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
         let specs = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 1,
-            r: 255, g: 235, b: 59, a: 200,
+            r: 255, g: 235, b: 59, a: 200, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -19911,7 +19962,7 @@ p={spread_px:.4},c={rgba:08X})"
             let quads = [HighlightQuad { left: 500.0, top: 500.0, right: 600.0, bottom: 600.0 }];
             let specs = [HighlightSpec {
                 page_index: 0, quad_offset: 0, quad_count: 1,
-                r: 255, g: 235, b: 59, a: 255,
+                r: 255, g: 235, b: 59, a: 255, kind: MARKUP_HIGHLIGHT,
             }];
             add_highlight_annotations(h, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1);
         });
@@ -19961,7 +20012,7 @@ p={spread_px:.4},c={rgba:08X})"
         let quads = [HighlightQuad { left: 500.0, top: 500.0, right: 600.0, bottom: 600.0 }];
         let specs = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 1,
-            r: 255, g: 235, b: 59, a: 255,
+            r: 255, g: 235, b: 59, a: 255, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -20010,7 +20061,7 @@ p={spread_px:.4},c={rgba:08X})"
         let quads = [HighlightQuad { left: 500.0, top: 500.0, right: 600.0, bottom: 600.0 }];
         let specs = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 1,
-            r: 255, g: 235, b: 59, a: 255,
+            r: 255, g: 235, b: 59, a: 255, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -20046,7 +20097,7 @@ p={spread_px:.4},c={rgba:08X})"
         let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
         let specs = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 1,
-            r: 255, g: 235, b: 59, a: 200,
+            r: 255, g: 235, b: 59, a: 200, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -20087,7 +20138,7 @@ p={spread_px:.4},c={rgba:08X})"
             let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
             let specs = [HighlightSpec {
                 page_index: 0, quad_offset: 0, quad_count: 1,
-                r: 255, g: 235, b: 59, a: 200,
+                r: 255, g: 235, b: 59, a: 200, kind: MARKUP_HIGHLIGHT,
             }];
             assert_eq!(
                 add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -20166,7 +20217,7 @@ p={spread_px:.4},c={rgba:08X})"
         let quads = [HighlightQuad { left: 300.0, top: 300.0, right: 700.0, bottom: 380.0 }];
         let specs = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 1,
-            r: 255, g: 235, b: 59, a: 200,
+            r: 255, g: 235, b: 59, a: 200, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -20239,7 +20290,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         let quads = [HighlightQuad { left: 100.0, top: 100.0, right: 200.0, bottom: 140.0 }];
         let specs = [HighlightSpec {
-            page_index: 0, quad_offset: 0, quad_count: 1, r: 0, g: 255, b: 0, a: 128,
+            page_index: 0, quad_offset: 0, quad_count: 1, r: 0, g: 255, b: 0, a: 128, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), 1, quads.as_ptr(), 1),
@@ -20399,7 +20450,7 @@ p={spread_px:.4},c={rgba:08X})"
         ];
         let specs = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 3,
-            r: 0, g: 255, b: 0, a: 100,
+            r: 0, g: 255, b: 0, a: 100, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, specs.as_ptr(), specs.len(),
@@ -20422,6 +20473,136 @@ p={spread_px:.4},c={rgba:08X})"
         close_document(handle);
     }
 
+    // ---- underline and strikeout, the same writer with a different subtype ----
+
+    /// Marks a rectangle of page 0, given in the app's normalized coordinates.
+    fn mark(handle: u64, kind: u32, l: f32, t: f32, r: f32, b: f32) -> i32 {
+        const CAPTURE: i32 = 1000;
+        let quads = [HighlightQuad {
+            left: l * CAPTURE as f32,
+            top: t * CAPTURE as f32,
+            right: r * CAPTURE as f32,
+            bottom: b * CAPTURE as f32,
+        }];
+        // BLACK AND OPAQUE, so the ink is measurable. The colour reaching the
+        // annotation is whatever the caller sends, exactly as before; nothing
+        // about the palette differs by kind.
+        let specs = [HighlightSpec {
+            page_index: 0, quad_offset: 0, quad_count: 1,
+            r: 0, g: 0, b: 0, a: 255, kind,
+        }];
+        add_highlight_annotations(
+            handle, CAPTURE, specs.as_ptr(), specs.len(), quads.as_ptr(), quads.len())
+    }
+
+    #[test]
+    fn the_markup_spec_is_the_size_both_languages_agree_on() {
+        // ⚠️ THE ONE THING THAT CATCHES A FIELD ADDED TO ONE LANGUAGE ONLY.
+        // C# mirrors this struct field by field and asserts the same number
+        // against Marshal.SizeOf. A divergence is not a compile error on
+        // either side: it reads every colour and count after it from the wrong
+        // offset and marks the document with rubbish.
+        assert_eq!(std::mem::size_of::<HighlightSpec>(), MARKUP_SPEC_BYTES);
+    }
+
+    #[test]
+    fn each_markup_kind_is_written_as_its_own_subtype_and_survives_a_reopen() {
+        // The whole point of reusing this writer: three subtypes, one path.
+        for (kind, expected) in [
+            (MARKUP_HIGHLIGHT, ANNOT_HIGHLIGHT),
+            (MARKUP_UNDERLINE, ANNOT_UNDERLINE),
+            (MARKUP_STRIKEOUT, ANNOT_STRIKEOUT),
+        ] {
+            let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+            assert_eq!(mark(handle, kind, 0.1, 0.1, 0.5, 0.13), STATUS_OK_PDFIUM);
+
+            let live = read_annotations(handle, 0);
+            assert_eq!(live.len(), 1, "kind {kind}");
+            assert_eq!(live[0].1, expected, "kind {kind} in the live document");
+
+            let snap = snapshot_document(handle);
+            assert_eq!(snap.status, STATUS_OK_PDFIUM);
+            let reopened = open_document_from_bytes(snap.data, snap.len);
+            free_byte_buffer(snap);
+            assert_ne!(reopened, 0);
+
+            let after = read_annotations(reopened, 0);
+            assert_eq!(after.len(), 1, "kind {kind} after reopen");
+            assert_eq!(after[0].1, expected, "kind {kind} after reopen");
+
+            close_document(reopened);
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn each_markup_kind_puts_its_ink_where_that_kind_belongs() {
+        // ⚠️ PIXELS, NOT PROPERTIES. A markup annotation with correct bounds,
+        // correct colour and the right number of quads can still draw NOTHING,
+        // which is exactly what the highlight did when its quad points were
+        // wound the other way. Reading the subtype back proves the object; only
+        // the render proves the mark.
+        //
+        // Black and opaque over a band of the page: an underline lands at the
+        // foot of the band and leaves the top of it alone, a strikeout crosses
+        // the middle, and a highlight covers the lot.
+        let (l, t, r, b) = (0.15f32, 0.30f32, 0.55f32, 0.33f32);
+        let h = b - t;
+        let top_band = (l, t, r, t + h * 0.25);
+        let mid_band = (l, t + h * 0.4, r, t + h * 0.6);
+        let low_band = (l, b - h * 0.25, r, b + h * 0.15);
+
+        let measure = |kind: u32| {
+            let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+            let before = [
+                dark_pixels_in(handle, top_band.0, top_band.1, top_band.2, top_band.3),
+                dark_pixels_in(handle, mid_band.0, mid_band.1, mid_band.2, mid_band.3),
+                dark_pixels_in(handle, low_band.0, low_band.1, low_band.2, low_band.3),
+            ];
+            assert_eq!(mark(handle, kind, l, t, r, b), STATUS_OK_PDFIUM);
+            let after = [
+                dark_pixels_in(handle, top_band.0, top_band.1, top_band.2, top_band.3),
+                dark_pixels_in(handle, mid_band.0, mid_band.1, mid_band.2, mid_band.3),
+                dark_pixels_in(handle, low_band.0, low_band.1, low_band.2, low_band.3),
+            ];
+            close_document(handle);
+            [
+                after[0] as i64 - before[0] as i64,
+                after[1] as i64 - before[1] as i64,
+                after[2] as i64 - before[2] as i64,
+            ]
+        };
+
+        let underline = measure(MARKUP_UNDERLINE);
+        assert!(underline[2] > 0, "an underline drew nothing: {underline:?}");
+        assert!(underline[2] > underline[0],
+            "an underline put more ink at the top of the band than the foot: {underline:?}");
+
+        let strikeout = measure(MARKUP_STRIKEOUT);
+        assert!(strikeout[1] > 0, "a strikeout drew nothing: {strikeout:?}");
+        assert!(strikeout[1] > strikeout[0],
+            "a strikeout put more ink at the top of the band than through it: {strikeout:?}");
+
+        let highlight = measure(MARKUP_HIGHLIGHT);
+        assert!(highlight[0] > 0 && highlight[1] > 0 && highlight[2] > 0,
+            "a highlight is a fill and must darken the whole band: {highlight:?}");
+        assert!(highlight[0] > underline[0],
+            "a highlight covers the top of the band and an underline does not:              {highlight:?} vs {underline:?}");
+    }
+
+    #[test]
+    fn a_markup_kind_this_writer_does_not_know_is_refused() {
+        // A caller sending a kind this does not recognise is a caller whose
+        // idea of the struct has drifted from this one. Drawing a guess would
+        // hide the divergence inside a document.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        assert_eq!(mark(handle, 3, 0.1, 0.1, 0.5, 0.13), STATUS_INVALID_INPUT);
+        assert!(read_annotations(handle, 0).is_empty(), "a refused kind still marked the page");
+
+        close_document(handle);
+    }
+
     #[test]
     fn highlight_input_that_does_not_add_up_is_rejected() {
         // The offset/count pair indexes a shared flat array, so a bad pair
@@ -20431,7 +20612,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         let overrun = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 5,
-            r: 255, g: 0, b: 0, a: 255,
+            r: 255, g: 0, b: 0, a: 255, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, overrun.as_ptr(), overrun.len(),
@@ -20441,7 +20622,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         let empty = [HighlightSpec {
             page_index: 0, quad_offset: 0, quad_count: 0,
-            r: 255, g: 0, b: 0, a: 255,
+            r: 255, g: 0, b: 0, a: 255, kind: MARKUP_HIGHLIGHT,
         }];
         assert_eq!(
             add_highlight_annotations(handle, 1000, empty.as_ptr(), empty.len(),

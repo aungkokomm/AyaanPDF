@@ -70,6 +70,8 @@ public enum ToolOptions
     Shape = 8,
     /// <summary>Offers the font-size picker.</summary>
     FontSize = 16,
+    /// <summary>Offers the markup picker: highlight, underline, strikeout.</summary>
+    Markup = 32,
 }
 
 /// <summary>
@@ -116,7 +118,10 @@ public static class ToolCatalog
     [
         new(ToolMode.Hand, "Hand", "", 'H', ToolOptions.None, HandIcon),
         new(ToolMode.Select, "Select", "", 'V', ToolOptions.None),
-        new(ToolMode.Highlight, "Highlight", "", 'U', ToolOptions.Color),
+        // ONE ROW FOR THREE MARKS, the way the shape tool holds four. They are
+        // the same gesture over the same text and differ only in what gets
+        // drawn, and the rail is already nine rows deep.
+        new(ToolMode.Highlight, "Highlight", "", 'U', ToolOptions.Color | ToolOptions.Markup),
         new(ToolMode.Draw, "Draw", "", 'D', ToolOptions.Color | ToolOptions.Width),
         new(ToolMode.Shape, "Shape", "", 'R', ToolOptions.Color | ToolOptions.Width | ToolOptions.Shape),
         new(ToolMode.Text, "Text", "", 'T', ToolOptions.Color | ToolOptions.FontSize),

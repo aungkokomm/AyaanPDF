@@ -95,15 +95,70 @@ public readonly record struct ColoredRect(double Left, double Top, double Right,
     public double Height => Bottom - Top;
 }
 
-/// <summary>A committed highlight over a run of text, as normalized rects.</summary>
+/// <summary>Which mark a text markup annotation is. Mirrors the core's MARKUP_ codes.</summary>
+public enum MarkupKind
+{
+    /// <summary>A wash behind the words, `/Highlight`.</summary>
+    Highlight = 0,
+
+    /// <summary>A rule under them, `/Underline`.</summary>
+    Underline = 1,
+
+    /// <summary>A rule through them, `/StrikeOut`.</summary>
+    Strikeout = 2,
+}
+
+/// <summary>A committed markup over a run of text, as normalized rects.</summary>
 public sealed record HighlightAnnotation(int PageIndex, IReadOnlyList<TextRect> Rects, string ColorHex)
     : IAnnotation
 {
     public Guid Id { get; init; } = Guid.NewGuid();
 
-    /// <summary>The rects with the colour attached, for binding.</summary>
+    /// <summary>
+    /// Which of the three marks this is.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// An init property with a default rather than a fourth positional
+    /// parameter: every existing construction site and every existing test
+    /// means Highlight, and saying so in one place beats saying it in all of
+    /// them.
+    /// </remarks>
+    public MarkupKind Kind { get; init; } = MarkupKind.Highlight;
+
+    /// <summary>How much of the text band an underline or a strikeout inks, as
+    /// a fraction of that band's height.</summary>
+    public const double RuleThickness = 0.09;
+
+    /// <summary>
+    /// WHAT TO DRAW, which is not the same as what was marked.
+    ///
+    /// ⚠️ THE ONE MOVE THAT KEPT THIS SMALL. `Rects` stays the text band: it is
+    /// what the hit test, the selection frame and the write to the core all
+    /// need, and a two-pixel line would be impossible to click. What changes
+    /// per kind is only the rectangle DRAWN, so the overlay keeps its one
+    /// filled-rectangle template and gains no code at all: a highlight fills
+    /// the band, an underline is a rule at its foot, a strikeout one across its
+    /// middle.
+    ///
+    /// The colour and its alpha are used exactly as they were: nothing about
+    /// the palette varies by kind.
+    /// </summary>
     public IReadOnlyList<ColoredRect> ColoredRects =>
-        Rects.Select(r => new ColoredRect(r.Left, r.Top, r.Right, r.Bottom, ColorHex)).ToList();
+        Rects.Select(r =>
+        {
+            double rule = Math.Max((r.Bottom - r.Top) * RuleThickness, 0.001);
+            return Kind switch
+            {
+                MarkupKind.Underline =>
+                    new ColoredRect(r.Left, r.Bottom - rule, r.Right, r.Bottom, ColorHex),
+                MarkupKind.Strikeout =>
+                    new ColoredRect(
+                        r.Left, ((r.Top + r.Bottom) / 2) - (rule / 2),
+                        r.Right, ((r.Top + r.Bottom) / 2) + (rule / 2), ColorHex),
+                _ => new ColoredRect(r.Left, r.Top, r.Right, r.Bottom, ColorHex),
+            };
+        }).ToList();
 
     public TextRect Bounds => Rects.Count == 0
         ? new TextRect(0, 0, 0, 0)

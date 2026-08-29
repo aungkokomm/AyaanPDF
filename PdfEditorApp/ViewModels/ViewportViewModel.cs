@@ -2369,7 +2369,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 rects.Add(new RecoveredRect(r.Left, r.Top, r.Right, r.Bottom));
             }
-            list.Add(new RecoveredHighlight(h.PageIndex, h.ColorHex, rects));
+            list.Add(new RecoveredHighlight(h.PageIndex, h.ColorHex, rects, h.Kind));
         }
         return list;
     }
@@ -2416,7 +2416,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 rects.Add(new TextRect(r.Left, r.Top, r.Right, r.Bottom));
             }
-            _allHighlights.Add(new HighlightAnnotation(h.PageIndex, rects, h.ColorHex));
+            _allHighlights.Add(
+                new HighlightAnnotation(h.PageIndex, rects, h.ColorHex) { Kind = h.Kind });
         }
 
         foreach (var n in record.Notes)
@@ -2676,6 +2677,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 QuadOffset = (uint)quads.Count,
                 QuadCount = (uint)h.Rects.Count,
                 R = r, G = g, B = b, A = a,
+
+                // The colour and its alpha above are read exactly as they were
+                // for a highlight; this is the only thing that differs, and the
+                // core turns it into the matching subtype.
+                Kind = (uint)h.Kind,
             });
 
             foreach (var rect in h.Rects)
@@ -10399,8 +10405,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        PushHistory(HistoryScope.Annotations, "Highlight");
-        var highlight = new HighlightAnnotation(_marqueePage, new[] { rect }, HighlightColorHex);
+        PushHistory(HistoryScope.Annotations, MarkupLabel(ActiveMarkupKind));
+        var highlight = new HighlightAnnotation(_marqueePage, new[] { rect }, HighlightColorHex)
+        {
+            Kind = ActiveMarkupKind,
+        };
         _allHighlights.Add(highlight);
         var mSlot = SlotFor(_marqueePage);
         mSlot?.Highlights.Add(highlight);
@@ -10593,7 +10602,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 continue;
             }
 
-            created.Add(new HighlightAnnotation(page, rects.Select(NormRect).ToList(), HighlightColorHex));
+            created.Add(
+                new HighlightAnnotation(page, rects.Select(NormRect).ToList(), HighlightColorHex)
+                {
+                    Kind = ActiveMarkupKind,
+                });
         }
 
         if (created.Count == 0)
@@ -10602,7 +10615,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         // One undo step for the whole gesture, not one per page.
-        PushHistory(HistoryScope.Annotations, created.Count > 1 ? "Highlight pages" : "Highlight");
+        PushHistory(
+            HistoryScope.Annotations,
+            created.Count > 1
+                ? MarkupLabel(ActiveMarkupKind) + " pages"
+                : MarkupLabel(ActiveMarkupKind));
         foreach (var highlight in created)
         {
             _allHighlights.Add(highlight);
@@ -10737,6 +10754,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Which shape the tool draws. Chosen in the property bar.</summary>
     [ObservableProperty]
     public partial ShapeKind ActiveShapeKind { get; set; } = ShapeKind.Rectangle;
+
+    /// <summary>What an undo entry for this mark is called.</summary>
+    private static string MarkupLabel(MarkupKind kind) => kind switch
+    {
+        MarkupKind.Underline => "Underline",
+        MarkupKind.Strikeout => "Strikeout",
+        _ => "Highlight",
+    };
+
+    /// <summary>
+    /// Which mark the Highlight tool makes: a wash, an underline or a
+    /// strikeout. Chosen in the property bar, exactly as the shape kind is.
+    ///
+    /// One tool rather than three, because all three are the same gesture over
+    /// the same text and the rail is already nine rows deep.
+    /// </summary>
+    [ObservableProperty]
+    public partial MarkupKind ActiveMarkupKind { get; set; } = MarkupKind.Highlight;
 
     public void BeginShape(int pageIndex, double x, double y)
     {

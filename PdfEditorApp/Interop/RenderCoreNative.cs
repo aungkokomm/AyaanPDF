@@ -81,6 +81,22 @@ internal struct HighlightSpec
     public byte G;
     public byte B;
     public byte A;
+
+    /// <summary>
+    /// Which mark: 0 highlight, 1 underline, 2 strikeout. Mirrors the core's
+    /// MARKUP_ constants.
+    ///
+    /// ⚠️ A FIELD ADDED HERE AND NOT IN RUST, OR THE OTHER WAY ROUND, IS SILENT
+    /// CORRUPTION. Neither compiler can see across the boundary, and every
+    /// colour and count after the divergence would be read from the wrong
+    /// offset. Both languages assert the same size, twenty bytes, so the
+    /// mistake fails a test instead of a document.
+    /// </summary>
+    public uint Kind;
+
+    /// <summary>What this measures, asserted against the core's own constant
+    /// by the interop tests.</summary>
+    public const int Bytes = 20;
 }
 
 /// <summary>Mirrors render_core::AnnotationInfo (src/lib.rs).</summary>

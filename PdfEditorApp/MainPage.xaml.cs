@@ -4628,6 +4628,25 @@ public sealed partial class MainPage : Page
     /// its own write is not read as the user choosing a shape.</summary>
     private bool _suppressShapeKindChange;
 
+    private bool _suppressMarkupKindChange;
+
+    /// <summary>
+    /// Which mark the highlighter makes. The same shape as the shape picker,
+    /// re-entry guard included: assigning the selection raises this again, and
+    /// without the guard that is an infinite loop.
+    /// </summary>
+    private void MarkupKind_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressMarkupKindChange) { return; }
+
+        if (MarkupChoices.SelectedItem is FrameworkElement { Tag: string tag }
+            && Enum.TryParse(tag, out MarkupKind kind))
+        {
+            ViewModel.ActiveMarkupKind = kind;
+            ReturnFocusAfterPointerUse();
+        }
+    }
+
     private void ShapeKind_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_suppressShapeKindChange) { return; }
@@ -4691,6 +4710,7 @@ public sealed partial class MainPage : Page
         AlignSection.Visibility = Show(sections.Align);
         CornerRadiusSection.Visibility = Show(sections.CornerRadius);
         ShapeSection.Visibility = Show(sections.Shape);
+        MarkupSection.Visibility = Show(sections.Markup);
         FontSizeSection.Visibility = Show(sections.FontSize);
         FontSection.Visibility = Show(sections.Font);
         TextStyleSection.Visibility = Show(sections.TextStyle);
@@ -4710,6 +4730,12 @@ public sealed partial class MainPage : Page
             _suppressShapeKindChange = true;
             ShapeChoices.SelectedIndex = (int)ViewModel.ActiveShapeKind;
             _suppressShapeKindChange = false;
+        }
+        if (sections.Markup)
+        {
+            _suppressMarkupKindChange = true;
+            MarkupChoices.SelectedIndex = (int)ViewModel.ActiveMarkupKind;
+            _suppressMarkupKindChange = false;
         }
         if (sections.FontSize)
         {

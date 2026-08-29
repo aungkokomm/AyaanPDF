@@ -34,6 +34,8 @@ public readonly record struct PropertyBarSections(
     bool Align,
     bool CornerRadius,
     bool Shape,
+    /// <summary>The markup picker: highlight, underline, strikeout.</summary>
+    bool Markup,
     bool FontSize,
     bool Font,
     bool TextStyle,
@@ -79,6 +81,11 @@ public static class PropertyBarLayout
 
         bool shape = s.ToolOptions.HasFlag(ToolOptions.Shape);
 
+        // Which of the three marks the highlighter makes. Tool-driven only:
+        // unlike a shape, an existing mark's kind is not something this offers
+        // to change.
+        bool markup = s.ToolOptions.HasFlag(ToolOptions.Markup);
+
         // Effects belong to a SHAPE, so the section shows for a selected one
         // under any tool and for the shape tool before anything is drawn. The
         // second half is what lets a shadow be set up once and drawn with,
@@ -115,6 +122,7 @@ public static class PropertyBarLayout
             Align: align,
             CornerRadius: cornerRadius,
             Shape: shape,
+            Markup: markup,
             FontSize: textSections,
             Font: textSections,
             TextStyle: textStyle,
