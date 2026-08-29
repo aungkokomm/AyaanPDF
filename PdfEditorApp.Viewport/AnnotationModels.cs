@@ -118,6 +118,9 @@ public enum MarkupKind
 
     /// <summary>A rule through them, `/StrikeOut`.</summary>
     Strikeout = 2,
+
+    /// <summary>A wavy rule under them, `/Squiggly`.</summary>
+    Squiggly = 3,
 }
 
 /// <summary>A committed markup over a run of text, as normalized rects.</summary>
@@ -143,6 +146,14 @@ public sealed record HighlightAnnotation(int PageIndex, IReadOnlyList<TextRect> 
     public const double RuleThickness = 0.09;
 
     /// <summary>
+    /// The most pieces a squiggle is built from.
+    ///
+    /// A cap, not a target: a mark across a whole page would otherwise emit one
+    /// element per step and the overlay lays each one out.
+    /// </summary>
+    public const int MaxSquigglySegments = 48;
+
+    /// <summary>
     /// WHAT TO DRAW, which is not the same as what was marked.
     ///
     /// ⚠️ THE ONE MOVE THAT KEPT THIS SMALL. `Rects` stays the text band: it is
@@ -157,20 +168,59 @@ public sealed record HighlightAnnotation(int PageIndex, IReadOnlyList<TextRect> 
     /// the palette varies by kind.
     /// </summary>
     public IReadOnlyList<ColoredRect> ColoredRects =>
-        Rects.Select(r =>
+        Rects.SelectMany(r =>
         {
             double rule = Math.Max((r.Bottom - r.Top) * RuleThickness, 0.001);
             return Kind switch
             {
-                MarkupKind.Underline =>
+                MarkupKind.Underline => new[]
+                {
                     new ColoredRect(r.Left, r.Bottom - rule, r.Right, r.Bottom, ColorHex),
-                MarkupKind.Strikeout =>
+                },
+                MarkupKind.Strikeout => new[]
+                {
                     new ColoredRect(
                         r.Left, ((r.Top + r.Bottom) / 2) - (rule / 2),
                         r.Right, ((r.Top + r.Bottom) / 2) + (rule / 2), ColorHex),
-                _ => new ColoredRect(r.Left, r.Top, r.Right, r.Bottom, ColorHex),
+                },
+
+                // The one kind that is not a single rectangle, which is why the
+                // whole property became a SelectMany.
+                MarkupKind.Squiggly => Squiggle(r, rule),
+
+                _ => new[] { new ColoredRect(r.Left, r.Top, r.Right, r.Bottom, ColorHex) },
             };
         }).ToList();
+
+    /// <summary>
+    /// A squiggle, as a run of small rectangles stepped alternately up and down
+    /// along the foot of the band.
+    ///
+    /// ⚠️ AN APPROXIMATION, DELIBERATELY. The overlay draws filled rectangles
+    /// and nothing else, and there is no rectangle that is a wave. The two
+    /// honest options were a flat rule, which shows the reader an underline for
+    /// a mark that is not one, or this: still pure geometry, still the same one
+    /// template, and it reads as a zigzag rather than as a line. What the SAVED
+    /// file carries is PDFium's own squiggle, so the two will not match stroke
+    /// for stroke.
+    /// </summary>
+    private IEnumerable<ColoredRect> Squiggle(TextRect r, double rule)
+    {
+        double height = r.Bottom - r.Top;
+        double amplitude = rule * 1.4;
+        double width = r.Right - r.Left;
+        double step = Math.Max(height * 0.16, 0.0015);
+
+        int count = Math.Clamp((int)Math.Ceiling(width / step), 2, MaxSquigglySegments);
+        step = width / count;
+
+        for (int i = 0; i < count; i++)
+        {
+            double left = r.Left + (i * step);
+            double top = r.Bottom - rule - (i % 2 == 0 ? amplitude : 0);
+            yield return new ColoredRect(left, top, left + step, top + rule, ColorHex);
+        }
+    }
 
     public TextRect Bounds => Rects.Count == 0
         ? new TextRect(0, 0, 0, 0)

@@ -1582,6 +1582,8 @@ pub const MARKUP_HIGHLIGHT: u32 = 0;
 pub const MARKUP_UNDERLINE: u32 = 1;
 /// A rule through the text, `/StrikeOut`.
 pub const MARKUP_STRIKEOUT: u32 = 2;
+/// A wavy rule under the text, `/Squiggly`.
+pub const MARKUP_SQUIGGLY: u32 = 3;
 
 /// What `HighlightSpec` measures, asserted from BOTH languages.
 ///
@@ -6769,6 +6771,7 @@ fn add_highlight_annotations_inner(
             MARKUP_HIGHLIGHT => write_markup!(create_highlight_annotation),
             MARKUP_UNDERLINE => write_markup!(create_underline_annotation),
             MARKUP_STRIKEOUT => write_markup!(create_strikeout_annotation),
+            MARKUP_SQUIGGLY => write_markup!(create_squiggly_annotation),
             // Refused rather than drawn as something else. A caller sending a
             // kind this does not know is a caller whose idea of the struct has
             // drifted from this one, and marking the document with a guess
@@ -20512,6 +20515,7 @@ p={spread_px:.4},c={rgba:08X})"
             (MARKUP_HIGHLIGHT, ANNOT_HIGHLIGHT),
             (MARKUP_UNDERLINE, ANNOT_UNDERLINE),
             (MARKUP_STRIKEOUT, ANNOT_STRIKEOUT),
+            (MARKUP_SQUIGGLY, ANNOT_SQUIGGLY),
         ] {
             let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
             assert_eq!(mark(handle, kind, 0.1, 0.1, 0.5, 0.13), STATUS_OK_PDFIUM);
@@ -20595,6 +20599,11 @@ p={spread_px:.4},c={rgba:08X})"
         assert!(strikeout[1] > strikeout[0],
             "a strikeout put more ink at the top of the band than through it: {strikeout:?}");
 
+        let squiggly = measure(MARKUP_SQUIGGLY);
+        assert!(squiggly[2] > 0, "a squiggle drew nothing: {squiggly:?}");
+        assert!(squiggly[2] > squiggly[0],
+            "a squiggle put more ink at the top of the band than the foot: {squiggly:?}");
+
         let highlight = measure(MARKUP_HIGHLIGHT);
         assert!(highlight[0] > 0 && highlight[1] > 0 && highlight[2] > 0,
             "a highlight is a fill and must darken the whole band: {highlight:?}");
@@ -20609,7 +20618,7 @@ p={spread_px:.4},c={rgba:08X})"
         // hide the divergence inside a document.
         let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
 
-        assert_eq!(mark(handle, 3, 0.1, 0.1, 0.5, 0.13), STATUS_INVALID_INPUT);
+        assert_eq!(mark(handle, 4, 0.1, 0.1, 0.5, 0.13), STATUS_INVALID_INPUT);
         assert!(read_annotations(handle, 0).is_empty(), "a refused kind still marked the page");
 
         close_document(handle);

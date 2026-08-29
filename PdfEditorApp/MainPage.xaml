@@ -1901,6 +1901,18 @@
                                            Fill="{ThemeResource TextFillColorPrimaryBrush}" />
                             </Grid>
                         </ListViewItem>
+                        <ListViewItem Tag="Squiggly" ToolTipService.ToolTip="Squiggly"
+                                      AutomationProperties.Name="Squiggly">
+                            <Grid Width="24" Height="18">
+                                <TextBlock Text="Ab" FontSize="12"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                           Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
+                                <Path Data="M0,3 L2,0 L4,3 L6,0 L8,3 L10,0 L12,3 L14,0 L16,3 L18,0"
+                                      Stroke="{ThemeResource TextFillColorPrimaryBrush}"
+                                      StrokeThickness="1.2" Margin="0,0,0,1"
+                                      VerticalAlignment="Bottom" HorizontalAlignment="Center" />
+                            </Grid>
+                        </ListViewItem>
                     </ListView>
                 </StackPanel>
 

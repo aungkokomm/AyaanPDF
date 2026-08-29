@@ -96,6 +96,7 @@ public class MarkupKindTests
         Assert.Equal(0, (int)MarkupKind.Highlight);
         Assert.Equal(1, (int)MarkupKind.Underline);
         Assert.Equal(2, (int)MarkupKind.Strikeout);
+        Assert.Equal(3, (int)MarkupKind.Squiggly);
     }
 
     [Fact]
@@ -171,6 +172,66 @@ public class MarkupKindTests
         Assert.Contains("defaultAlpha: 0x88", vm, StringComparison.Ordinal);
     }
 
+
+    // ---------------- the squiggle ----------------
+
+    [Fact]
+    public void a_squiggle_is_several_pieces_and_not_one_rule()
+    {
+        // ⚠️ AN APPROXIMATION, DELIBERATELY. The overlay draws filled
+        // rectangles and there is no rectangle that is a wave. A flat rule
+        // would have been one line of geometry and would show the reader an
+        // underline for a mark that is not one.
+        var pieces = Mark(MarkupKind.Squiggly).ColoredRects;
+
+        Assert.True(pieces.Count > 2, $"a squiggle drawn as {pieces.Count} pieces");
+        Assert.All(pieces, p => Assert.Equal("#66FFD400", p.ColorHex));
+    }
+
+    [Fact]
+    public void the_pieces_step_up_and_down_along_the_foot_of_the_band()
+    {
+        // The alternation IS the squiggle. Pieces all at one height would be a
+        // dashed line, which is a different mark meaning a different thing.
+        var pieces = Mark(MarkupKind.Squiggly).ColoredRects;
+        double middle = (0.20 + 0.24) / 2;
+
+        Assert.All(pieces, p => Assert.True(p.Top >= middle,
+            $"a piece strayed into the upper half of the band: {p.Top}"));
+
+        Assert.NotEqual(pieces[0].Top, pieces[1].Top);
+        Assert.Equal(pieces[0].Top, pieces[2].Top, 9);
+
+        // And they tile the band rather than leaving it half marked.
+        Assert.Equal(0.10, pieces[0].Left, 6);
+        Assert.Equal(0.50, pieces[^1].Right, 6);
+    }
+
+    [Fact]
+    public void a_squiggle_across_a_whole_page_is_capped()
+    {
+        // A mark the width of a page would otherwise emit one element per step
+        // and the overlay lays every one of them out.
+        var wide = new HighlightAnnotation(
+            0, new[] { new TextRect(0.0, 0.20, 1.0, 0.205) }, "#66FFD400")
+        {
+            Kind = MarkupKind.Squiggly,
+        };
+
+        Assert.True(wide.ColoredRects.Count <= HighlightAnnotation.MaxSquigglySegments);
+    }
+
+    [Fact]
+    public void every_piece_of_a_squiggle_survives_the_degenerate_rect_filter()
+    {
+        // Same trap as the thin rule, multiplied: a squiggle is many small
+        // pieces, and one that rounds away leaves a gap in the wave.
+        foreach (var piece in Mark(MarkupKind.Squiggly).ColoredRects)
+        {
+            Assert.True(ScaledRect.From(piece, 400).IsVisible,
+                $"a piece vanishes on a narrow page: {piece.Height}");
+        }
+    }
 
     // ---------------- what actually reaches the screen ----------------
 

@@ -330,6 +330,7 @@ public static class DocumentModelBuilder
             // and nothing else.
             PdfAnnotationSubtype.Underline => DocumentObjectKind.Underline,
             PdfAnnotationSubtype.Strikeout => DocumentObjectKind.Strikeout,
+            PdfAnnotationSubtype.Squiggly => DocumentObjectKind.Squiggly,
             PdfAnnotationSubtype.Link => DocumentObjectKind.Link,
             PdfAnnotationSubtype.Widget => DocumentObjectKind.FormField,
             _ => DocumentObjectKind.Unknown,
