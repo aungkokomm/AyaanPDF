@@ -98,6 +98,14 @@ pub const STATUS_NEEDS_PASSWORD: i32 = 5;
 /// the text four and a half page widths off the paper.
 pub const STATUS_TOO_WIDE: i32 = 6;
 
+/// The objects at the recorded indices no longer hold what the caller says
+/// they hold, so a write would land on text it was never about.
+///
+/// Distinct from STATUS_UNSUPPORTED because it means "the page has moved on",
+/// not "this cannot be done": the caller can say so plainly instead of
+/// reporting a failure.
+pub const STATUS_STALE_ANCHOR: i32 = 7;
+
 pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
 pub const POLL_CANCELLED: i32 = 2;
@@ -10409,6 +10417,179 @@ fn write_line_objects(
 /// `target_width` — the same width a caller would pass to `render_low_res`/
 /// `request_high_res` for that page, so the boxes line up with whatever
 /// bitmap is currently displayed at that width.
+/// Writes text into a range of page objects addressed BY INDEX, not by what
+/// they say.
+///
+/// ⚠️ THE ONE PLACE THAT TRUSTS A POSITION. Everything else in page-text
+/// editing finds its target by content, because content was the only identity
+/// a page's own text has: `set_word_cluster_text` re-derives the clusters and
+/// matches on text, `set_line_text` re-derives the lines. That works until the
+/// text is GONE. A deleted word leaves no cluster and a deleted line leaves no
+/// line, because both are built from characters, so undoing a deletion has
+/// nothing to search for. This is the address that survives an empty range.
+///
+/// The safety is not the index, which anything could invalidate. It is
+/// `expected`: the caller says what the range must still hold, and the write is
+/// refused with `STATUS_STALE_ANCHOR` if it holds anything else. An index that
+/// has shifted onto different text says different text, and is caught here.
+///
+/// NO FONT ARGUMENT, deliberately. The stand-in-font path inserts a new object
+/// and shifts every index after it, which is precisely what would invalidate
+/// the anchors this exists to keep. A restore its own font cannot spell is
+/// refused and rolled back rather than written some other way.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_object_range_text(
+    doc_handle: u64,
+    page_index: i32,
+    first_object: u32,
+    last_object: u32,
+    prefix_chars: u32,
+    expected_utf8: *const u8,
+    expected_len: usize,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || last_object < first_object {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let Some(expected) = arg_or_empty(expected_utf8, expected_len) else {
+        return STATUS_INVALID_INPUT;
+    };
+    let Some(new_text) = arg_or_empty(new_text_utf8, new_text_len) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // A range is one line's worth of objects. Anything that would add a line is
+    // a paragraph edit, which this does no more than the line writer does.
+    if new_text.contains('\n') || new_text.contains('\r') {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        set_object_range_text_inner(
+            doc_handle,
+            page_index,
+            first_object as usize,
+            last_object as usize,
+            prefix_chars as usize,
+            &expected,
+            &new_text,
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// An FFI string argument that is allowed to be EMPTY, which is the whole point
+/// of this path: `utf8_arg` treats a zero length as nothing to read.
+fn arg_or_empty(ptr: *const u8, len: usize) -> Option<String> {
+    if len == 0 {
+        return Some(String::new());
+    }
+    utf8_arg(ptr, len)
+}
+
+fn set_object_range_text_inner(
+    doc_handle: u64,
+    page_index: i32,
+    first_object: usize,
+    last_object: usize,
+    prefix: usize,
+    expected: &str,
+    new_text: &str,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+
+    let Ok(mut page) = doc_guard.pages().get(page_index as u16) else {
+        return STATUS_INVALID_INPUT;
+    };
+    page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+    if last_object >= page.objects().len() {
+        return STATUS_STALE_ANCHOR;
+    }
+
+    // Every TEXT object in the range, in page order. Anything else inside the
+    // span is left exactly where it is: the reason the line writer takes a
+    // range rather than one object is that a producer may draw in the middle of
+    // one.
+    let mut range: Vec<usize> = Vec::new();
+    let mut originals: Vec<String> = Vec::new();
+    let mut matrix: Option<FS_MATRIX> = None;
+    for i in first_object..=last_object {
+        let Ok(o) = page.objects().get(i) else {
+            return STATUS_STALE_ANCHOR;
+        };
+        let PdfPageObject::Text(t) = &o else { continue };
+
+        if matrix.is_none() {
+            let mut m = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
+            doc_guard.bindings().FPDFPageObj_GetMatrix(t.object_handle(), &mut m);
+            matrix = Some(m);
+        }
+
+        range.push(i);
+        originals.push(t.text());
+    }
+
+    if range.is_empty() {
+        return STATUS_STALE_ANCHOR;
+    }
+
+    // ⚠️ THE CHECK THAT MAKES A POSITION SAFE TO TRUST. The objects at these
+    // indices must still hold what the caller was told they hold. An index that
+    // has shifted onto other text fails here rather than overwriting it.
+    let current: String = originals.concat();
+    let chars: Vec<char> = current.chars().collect();
+    let wanted: Vec<char> = expected.chars().collect();
+    let end = match prefix.checked_add(wanted.len()) {
+        Some(e) if e <= chars.len() => e,
+        _ => return STATUS_STALE_ANCHOR,
+    };
+    if chars[prefix..end] != wanted[..] {
+        return STATUS_STALE_ANCHOR;
+    }
+    let suffix = chars.len() - end;
+
+    if !write_line_objects(&page, &range, new_text, &current, prefix, suffix) {
+        return STATUS_UNSUPPORTED;
+    }
+
+    // The text now lives in the range's LAST object, which was sitting wherever
+    // the end of the run was. Left alone the replacement would start there, so
+    // it takes the first object's matrix, exactly as the line write does.
+    if prefix == 0 && suffix == 0 {
+        if let (Some(m), Some(&anchor)) = (matrix.as_ref(), range.last()) {
+            restore_matrix(&doc_guard, &page, anchor, m);
+        }
+    }
+
+    // Read back what the page now says. A font that cannot spell the
+    // replacement writes nothing, or writes something else, and this is where
+    // that is caught: there is no stand-in font to fall back to.
+    let said = cluster_text_of(&page, &range);
+    let after = spliced_expectation(&originals, new_text, prefix, suffix);
+    if !same_text(&said, &after) {
+        restore_cluster_objects(&page, &range, &originals);
+        let _ = page.regenerate_content();
+        return STATUS_UNSUPPORTED;
+    }
+
+    if page.regenerate_content().is_err() {
+        return STATUS_UNSUPPORTED;
+    }
+
+    STATUS_OK_PDFIUM
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn get_page_chars(doc_handle: u64, page_index: i32, target_width: i32) -> CharInfoArray {
     if doc_handle == 0 || target_width <= 0 {
@@ -13432,6 +13613,127 @@ mod tests {
         assert!(line.text.starts_with("A ragged right paragraph"), "{:?}", line.text);
 
         close_document(handle);
+    }
+
+    // ---- addressing text by position, which is what survives an empty range ----
+
+    /// Writes through the positional path, in the app's own terms.
+    fn at_range(handle: u64, line: &DecodedLine, expected: &str, new_text: &str) -> i32 {
+        let e = expected.as_bytes();
+        let t = new_text.as_bytes();
+        set_object_range_text(
+            handle, 0,
+            line.first_object as u32, line.last_object as u32, line.prefix as u32,
+            e.as_ptr(), e.len(), t.as_ptr(), t.len())
+    }
+
+    #[test]
+    fn a_range_can_be_emptied_and_put_back_by_its_position_alone() {
+        // ⚠️ THE WHOLE POINT. Once a range is empty there is no cluster and no
+        // line to find, because both are built from characters. Every other
+        // write in this file locates its target by what it says, so none of
+        // them could put this text back. The index is the only address left.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let original = line.text.clone();
+        let (first, last, prefix) = (line.first_object, line.last_object, line.prefix);
+
+        assert_eq!(at_range(handle, &line, &original, ""), STATUS_OK_PDFIUM);
+
+        // Gone, and gone in the way that defeats every content-based lookup:
+        // the line no longer exists to be found at all.
+        let after = lines_of(handle);
+        assert!(after.iter().all(|l| !l.text.starts_with("breaks where")),
+            "the line still reads back after being emptied");
+
+        // Put back by position. The empty range cannot describe itself, so the
+        // expectation is emptiness.
+        let empty = DecodedLine { first_object: first, last_object: last, prefix, ..line.clone() };
+        assert_eq!(at_range(handle, &empty, "", &original), STATUS_OK_PDFIUM);
+
+        let restored = line_starting(&lines_of(handle), "breaks where");
+        assert_eq!(restored.text, original);
+    }
+
+    #[test]
+    fn the_object_indices_still_point_at_that_text_after_it_is_emptied() {
+        // The invariant the whole anchor rests on: emptying a text object does
+        // not remove it, so the indices recorded before the delete still
+        // address the same objects afterwards. If PDFium ever dropped empty
+        // objects on regeneration, every index after them would shift and this
+        // test is what would say so.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let before = object_count(handle);
+
+        assert_eq!(at_range(handle, &line, &line.text, ""), STATUS_OK_PDFIUM);
+
+        assert_eq!(object_count(handle), before,
+            "emptying the range changed how many objects the page has");
+    }
+
+    #[test]
+    fn a_position_holding_something_else_is_refused_rather_than_overwritten() {
+        // ⚠️ THE CHECK THAT MAKES AN INDEX SAFE TO TRUST. A recorded position is
+        // worth nothing on its own; what makes it safe is that the caller says
+        // what should be there. Here the caller is wrong, and the text it was
+        // never about must survive untouched.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let original = line.text.clone();
+
+        assert_eq!(
+            at_range(handle, &line, "some other line entirely", "REPLACED"),
+            STATUS_STALE_ANCHOR);
+
+        assert_eq!(line_starting(&lines_of(handle), "breaks where").text, original);
+
+        // And a range that runs off the end of the page is the same answer.
+        let past = DecodedLine { last_object: 100_000, ..line.clone() };
+        assert_eq!(at_range(handle, &past, &original, "REPLACED"), STATUS_STALE_ANCHOR);
+        assert_eq!(line_starting(&lines_of(handle), "breaks where").text, original);
+    }
+
+    #[test]
+    fn text_the_range_s_own_font_cannot_spell_is_refused_and_rolled_back() {
+        // ⚠️ NO STAND-IN FONT HERE, and that is deliberate rather than missing.
+        // The stand-in path INSERTS an object, which shifts every index after
+        // it, which is exactly what would invalidate the anchors this exists to
+        // keep. So this path can only write what the run's own font can spell,
+        // and anything else has to leave the page as it found it.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        let original = line.text.clone();
+
+        assert_eq!(at_range(handle, &line, &original, "\u{6f22}\u{5b57}"), STATUS_UNSUPPORTED);
+        assert_eq!(line_starting(&lines_of(handle), "breaks where").text, original,
+            "a refused write left the page changed");
+    }
+
+    #[test]
+    fn a_replacement_that_would_add_a_line_is_refused() {
+        // The same boundary the line writer keeps: this addresses one run of
+        // objects, and paragraph work is not built.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+
+        let line = line_starting(&lines_of(handle), "breaks where");
+        assert_eq!(at_range(handle, &line, &line.text, "two\nlines"), STATUS_INVALID_INPUT);
+
+        close_document(handle);
+    }
+
+    /// How many objects the page holds, for the index-stability check.
+    fn object_count(handle: u64) -> usize {
+        use pdfium_render::prelude::*;
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+        let g = lock(&doc);
+        let page = g.pages().get(0).unwrap();
+        page.objects().len()
     }
 
     fn lines_of(handle: u64) -> Vec<DecodedLine> {
