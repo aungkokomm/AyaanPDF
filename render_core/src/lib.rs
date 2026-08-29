@@ -10559,7 +10559,14 @@ fn set_object_range_text_inner(
     }
     let suffix = chars.len() - end;
 
-    if !write_line_objects(&page, &range, new_text, &current, prefix, suffix) {
+    // ⚠️ `expected`, NOT the whole range. That parameter is the SPAN BEING
+    // REPLACED: the writer looks for it at `prefix` inside the object and
+    // splices over exactly it. Passing the concatenated range made
+    // `prefix + len` run past the end of the object, so every deletion of a
+    // unit whose object held anything else was refused as unsupported. The
+    // whole-range path never reads it, which is why a fixture whose line sits
+    // alone in its objects could not show this.
+    if !write_line_objects(&page, &range, new_text, expected, prefix, suffix) {
         return STATUS_UNSUPPORTED;
     }
 
@@ -13775,6 +13782,70 @@ mod tests {
         assert_eq!(at_range(handle, &line, &original, ""), STATUS_OK_PDFIUM);
         assert!(lines_of(handle).iter().all(|l| !l.text.starts_with("breaks where")),
             "redo did not delete it again");
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_unit_that_shares_its_object_with_other_text_can_be_deleted_and_put_back() {
+        // ⚠️ THE CASE THAT SHIPPED BROKEN, and the one the other tests could not
+        // see. Where a unit sits ALONE in its objects the writer replaces the
+        // whole range and never looks at which span it was asked to replace; it
+        // is only when the object holds something else too that the span
+        // matters. Passing the concatenated range instead of the span made
+        // prefix + len run past the end of the object, and every deletion on a
+        // producer that packs a line into one object was refused as unsupported.
+        //
+        // Real files do this constantly: an invoice had TELECOM, INTERNATIONAL,
+        // MYANMAR and COMPANY all in object 15.
+        let handle = open_fixture_named("tests/fixtures/sample_styled.pdf");
+
+        let before = decode_clusters(handle, 0);
+        let one = before.iter().find(|c| c.text == "One").expect("no One");
+        let chapter = before.iter().find(|c| c.text == "Chapter").expect("no Chapter");
+
+        assert_eq!(one.objects, chapter.objects, "fixture must share an object");
+        assert!(one.prefix > 0, "fixture must put One part way into its object");
+
+        let (first, last, prefix) = (
+            one.objects[0] as u32, one.objects[one.objects.len() - 1] as u32, one.prefix as u32);
+
+        let empty: [u8; 0] = [];
+        let word = "One".as_bytes();
+
+        // Deleted, and only it: the word sharing the object stays.
+        assert_eq!(
+            set_object_range_text(handle, 0, first, last, prefix,
+                                  word.as_ptr(), word.len(), empty.as_ptr(), 0),
+            STATUS_OK_PDFIUM);
+
+        let after = words_of(handle);
+        assert!(after.iter().any(|w| w == "Chapter"), "the neighbour went too: {after:?}");
+        assert!(!after.iter().any(|w| w == "One"), "the word is still there: {after:?}");
+
+        // ⚠️ AND A STALE ANCHOR IS STILL REFUSED on this path. The span is gone,
+        // so asking to take it away again must not splice over its neighbour.
+        assert_eq!(
+            set_object_range_text(handle, 0, first, last, prefix,
+                                  word.as_ptr(), word.len(), empty.as_ptr(), 0),
+            STATUS_STALE_ANCHOR);
+
+        // Undo: the same call with the strings swapped.
+        assert_eq!(
+            set_object_range_text(handle, 0, first, last, prefix,
+                                  empty.as_ptr(), 0, word.as_ptr(), word.len()),
+            STATUS_OK_PDFIUM);
+
+        let restored = words_of(handle);
+        assert!(restored.iter().any(|w| w == "One"), "undo did not put it back: {restored:?}");
+        assert!(restored.iter().any(|w| w == "Chapter"));
+
+        // Redo.
+        assert_eq!(
+            set_object_range_text(handle, 0, first, last, prefix,
+                                  word.as_ptr(), word.len(), empty.as_ptr(), 0),
+            STATUS_OK_PDFIUM);
+        assert!(!words_of(handle).iter().any(|w| w == "One"), "redo did not delete it again");
 
         close_document(handle);
     }
