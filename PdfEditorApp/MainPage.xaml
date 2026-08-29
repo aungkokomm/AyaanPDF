@@ -66,6 +66,25 @@
         <x:String x:Key="BookmarkAddPath">F0 M0,0 L9,0 L9,13 L4.5,9.5 L0,13 Z M1.1,1.1 L7.9,1.1 L7.9,10.9 L4.5,8.2 L1.1,10.9 Z M13.4,3 L14.6,3 L14.6,5.9 L17.5,5.9 L17.5,7.1 L14.6,7.1 L14.6,10 L13.4,10 L13.4,7.1 L10.5,7.1 L10.5,5.9 L13.4,5.9 Z</x:String>
 
         <!--
+            AN OPEN BOOK, for the Reading half of the mode control.
+
+            Drawn rather than picked, because Segoe Fluent Icons has no plain
+            open book: its whole private-use range was rendered and read, and
+            the nearest are a shelf of spines (E8F1, which says "library", a
+            collection of documents rather than the one on screen) and an open
+            book wearing a graduation cap (F7DB, which says "course"). Neither
+            says "read THIS", which is the one thing this button has to say.
+
+            Same rules as the ribbon above: the box CLIPS rather than scales,
+            so the path is authored at its final size and given a slightly
+            roomier box; and the wall is a real distance, 0.97 against a 14-tall
+            path, which was compared at five times magnification against the
+            E932 glyph on the other half so the two do not read as one heavy
+            icon beside one light one.
+        -->
+        <x:String x:Key="OpenBookPath">F0 M7.56,2.46 C5.54,0.88 2.9,0 0,0 L0,11.52 C2.9,11.52 5.54,12.4 7.56,13.98 Z M6.86,3.3 C5.1,2.15 2.9,1.36 0.97,1.05 L0.97,10.73 C2.99,11.03 5.1,11.82 6.86,12.97 Z M8.44,2.46 C10.46,0.88 13.1,0 16,0 L16,11.52 C13.1,11.52 10.46,12.4 8.44,13.98 Z M9.14,3.3 C10.9,2.15 13.1,1.36 15.03,1.05 L15.03,10.73 C13.01,11.03 10.9,11.82 9.14,12.97 Z</x:String>
+
+        <!--
             Text that sits directly on the CANVAS, not on app chrome.
 
             These are fixed light values rather than ThemeResource, and that is
@@ -1245,21 +1264,30 @@
                     one of them lit say what the app IS.
 
                     At the top of the rail, because the rail is what changes
-                    underneath it: two tools in View and nine in Edit, which is
-                    the loudest signal available and costs nothing.
+                    underneath it: the two that change the document itself, the
+                    text box and the hyperlink, appear under Edit and under
+                    nothing else. Everything a reader marks a page with stays
+                    put across both.
                 -->
                 <StackPanel Grid.Row="0" Orientation="Vertical" Spacing="2" Margin="0,22,0,6">
                     <Button x:Name="ViewModeButton" Click="ViewMode_Click"
-                            ToolTipService.ToolTip="View: read, select text, follow links, fill forms"
+                            AutomationProperties.Name="Reading mode"
+                            ToolTipService.ToolTip="Reading: read the document, and mark it up with the highlighter, pen, shapes, notes and stamps"
                             HorizontalAlignment="Stretch" Height="30" Padding="0"
                             BorderThickness="1" CornerRadius="4,4,0,0">
-                        <FontIcon Glyph="&#xE890;" FontSize="14" />
+                        <!-- Roomier than the path's 16x14, because the box clips. -->
+                        <PathIcon Data="{StaticResource OpenBookPath}" Width="17" Height="15" />
                     </Button>
                     <Button x:Name="EditModeButton" Click="EditMode_Click"
-                            ToolTipService.ToolTip="Edit: change text, place marks, move objects"
+                            AutomationProperties.Name="Edit mode"
+                            ToolTipService.ToolTip="Edit: change the document itself, its own text and its objects"
                             HorizontalAlignment="Stretch" Height="30" Padding="0"
                             BorderThickness="1" CornerRadius="0,0,4,4">
-                        <FontIcon Glyph="&#xE70F;" FontSize="14" />
+                        <!-- A page with a pencil ON it, not a bare pencil: the
+                             app has a pen, a highlighter and shapes, so a lone
+                             pencil here would read as one more drawing tool
+                             rather than as "change this document". -->
+                        <FontIcon Glyph="&#xE932;" FontSize="16" />
                     </Button>
                 </StackPanel>
 

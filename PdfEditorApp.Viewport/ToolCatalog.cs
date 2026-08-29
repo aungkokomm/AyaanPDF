@@ -14,17 +14,21 @@ namespace PdfEditorApp.Viewport;
 /// mode splits it in two, so each half only has to decide among things that
 /// belong together.
 ///
-/// View is the default on every document open. A reader who never presses Edit
-/// gets a viewer, and nothing they click can change the file.
+/// View is the default on every document open, and it is READING rather than
+/// read-only: the reader keeps the highlighter, the pen, shapes, notes and
+/// stamps, because marking up a page is part of reading one. What it withholds
+/// is changing the document itself, which is the whole of what Edit adds.
 /// </summary>
 public enum AppMode
 {
-    /// <summary>Read, select text, follow links, fill forms. Ayaan's own marks
-    /// are drawn but cannot be picked up.</summary>
+    /// <summary>Read, select text, follow links, fill forms, and mark the page
+    /// up. Marks already on the page are drawn but cannot be picked up, and the
+    /// document's own words are not editable by clicking them.</summary>
     View,
 
-    /// <summary>Everything View does, plus the tools and the selections that
-    /// change the document.</summary>
+    /// <summary>Everything View does, plus the two tools that change the
+    /// document rather than mark it up, and the selections that reach the
+    /// page's own text and the marks already on it.</summary>
     Edit,
 }
 
@@ -161,13 +165,25 @@ public static class ToolCatalog
     /// armed it would be the worst of both: the reader sees a viewer and one
     /// keystroke puts them in a drawing tool with no way to tell.
     ///
-    /// View keeps only the two that change nothing: the hand pans and Select
-    /// reads. Everything else places a mark, and placing a mark is editing.
+    /// ⚠️ READING IS NOT "NOTHING CAN BE MARKED". A reader marks up what they
+    /// are reading: they highlight a sentence, draw a ring round a figure, pin
+    /// a note to a paragraph, stamp a page approved. None of that touches the
+    /// document's own content, so none of it is withheld here. An earlier cut
+    /// kept only the hand and Select, which read as "reading means you may not
+    /// touch it" and made marking up something you had to leave reading to do.
+    ///
+    /// What Edit adds is the two that change the DOCUMENT rather than mark it
+    /// up: the text box, which only Edit can reopen once it is placed, so
+    /// offering it here would leave a reader with a box they cannot retype;
+    /// and the hyperlink, which is document structure. The other half of the
+    /// difference is not a tool at all and is not decided here: picking up a
+    /// mark already on the page, and editing the page's own words, are guarded
+    /// at the pointer.
     /// </summary>
     public static IReadOnlyList<ToolDefinition> ForMode(AppMode mode) =>
         mode == AppMode.Edit
             ? All
-            : All.Where(t => t.Mode is ToolMode.Hand or ToolMode.Select).ToList();
+            : All.Where(t => t.Mode is not (ToolMode.Text or ToolMode.Link)).ToList();
 
     /// <summary>Whether a mode offers a tool at all.</summary>
     public static bool Offers(AppMode mode, ToolMode tool) =>

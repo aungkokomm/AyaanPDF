@@ -60,11 +60,21 @@ public class AppModeTests
     // ---------------- which tools a mode offers ----------------
 
     [Fact]
-    public void view_offers_only_the_two_tools_that_change_nothing()
+    public void reading_keeps_every_tool_that_marks_a_page_up()
     {
+        // ⚠️ READING IS NOT READ-ONLY, and this is the test that says so. The
+        // first cut of the mode left a reader holding the hand and Select,
+        // which made highlighting a sentence something you had to leave
+        // reading to do. Marking a page up is part of reading it.
         var tools = ToolCatalog.ForMode(AppMode.View).Select(t => t.Mode).ToList();
 
-        Assert.Equal(new[] { ToolMode.Hand, ToolMode.Select }, tools);
+        Assert.Equal(
+            new[]
+            {
+                ToolMode.Hand, ToolMode.Select, ToolMode.Highlight, ToolMode.Draw,
+                ToolMode.Shape, ToolMode.Note, ToolMode.Stamp,
+            },
+            tools);
     }
 
     [Fact]
@@ -77,12 +87,24 @@ public class AppModeTests
     [InlineData(ToolMode.Highlight)]
     [InlineData(ToolMode.Draw)]
     [InlineData(ToolMode.Shape)]
-    [InlineData(ToolMode.Text)]
     [InlineData(ToolMode.Note)]
     [InlineData(ToolMode.Stamp)]
-    [InlineData(ToolMode.Link)]
-    public void every_tool_that_places_a_mark_is_edit_only(ToolMode tool)
+    public void a_tool_that_marks_the_page_is_offered_in_both_modes(ToolMode tool)
     {
+        // None of these touch the document's own content. They lay a mark over
+        // it, which is what a reader does to a page they are reading.
+        Assert.True(ToolCatalog.Offers(AppMode.View, tool));
+        Assert.True(ToolCatalog.Offers(AppMode.Edit, tool));
+    }
+
+    [Theory]
+    [InlineData(ToolMode.Text)]
+    [InlineData(ToolMode.Link)]
+    public void only_the_tools_that_change_the_document_are_edit_only(ToolMode tool)
+    {
+        // The text box, because only Edit can reopen one once it is placed, so
+        // a reader offered it would end up with a box they cannot retype. The
+        // hyperlink, because that is document structure and not a mark.
         Assert.False(ToolCatalog.Offers(AppMode.View, tool));
         Assert.True(ToolCatalog.Offers(AppMode.Edit, tool));
     }
@@ -101,17 +123,13 @@ public class AppModeTests
     // ---------------- the keyboard cannot get round it ----------------
 
     [Theory]
-    [InlineData('D')]
-    [InlineData('U')]
-    [InlineData('R')]
     [InlineData('T')]
-    [InlineData('N')]
-    [InlineData('S')]
     [InlineData('L')]
     public void a_shortcut_cannot_arm_a_tool_the_rail_is_hiding(char key)
     {
-        // ⚠️ THE WORST OF BOTH OTHERWISE: the reader sees a viewer, presses one
-        // key, and is in a drawing tool with nothing on screen saying so.
+        // ⚠️ THE WORST OF BOTH OTHERWISE: the rail shows one set of tools and a
+        // keystroke arms one that is not in it, with nothing on screen saying
+        // so. The hiding is now down to two, but the rule is the same rule.
         Assert.Null(ToolCatalog.ForShortcut(key, AppMode.View));
         Assert.NotNull(ToolCatalog.ForShortcut(key, AppMode.Edit));
     }
@@ -119,8 +137,15 @@ public class AppModeTests
     [Theory]
     [InlineData('H', ToolMode.Hand)]
     [InlineData('V', ToolMode.Select)]
-    public void the_two_reader_tools_keep_their_shortcuts_in_both_modes(char key, ToolMode tool)
+    [InlineData('U', ToolMode.Highlight)]
+    [InlineData('D', ToolMode.Draw)]
+    [InlineData('R', ToolMode.Shape)]
+    [InlineData('N', ToolMode.Note)]
+    [InlineData('S', ToolMode.Stamp)]
+    public void a_reading_tool_keeps_its_shortcut_in_both_modes(char key, ToolMode tool)
     {
+        // The other half of the rule above: a tool the rail IS showing must be
+        // reachable from the keyboard in the mode showing it.
         Assert.Equal(tool, ToolCatalog.ForShortcut(key, AppMode.View)?.Mode);
         Assert.Equal(tool, ToolCatalog.ForShortcut(key, AppMode.Edit)?.Mode);
     }
@@ -217,6 +242,46 @@ public class AppModeTests
         Assert.Contains("ViewModeButton.Background", body, StringComparison.Ordinal);
         Assert.Contains("EditModeButton.Background", body, StringComparison.Ordinal);
         Assert.Contains("IsEditMode", body, StringComparison.Ordinal);
+    }
+
+    // ---------------- what the control draws ----------------
+
+    /// <summary>The two mode buttons, as the markup writes them.</summary>
+    private static string ModeControl()
+    {
+        string xaml = Source("PdfEditorApp", "MainPage.xaml");
+        int at = xaml.IndexOf("x:Name=\"ViewModeButton\"", StringComparison.Ordinal);
+        Assert.True(at > 0, "there is no View button");
+
+        int end = xaml.IndexOf("</StackPanel>", at, StringComparison.Ordinal);
+        return xaml[at..(end > at ? end : xaml.Length)];
+    }
+
+    [Fact]
+    public void the_reading_half_is_drawn_as_a_book()
+    {
+        // ⚠️ THE ICON IS THE LABEL. There is no room for a word beside it in a
+        // 36-wide rail, so whatever it draws is the whole of what the half
+        // says. It used to be E890, an eye, which says "look at something" and
+        // could as easily have meant preview, presentation or a page layout.
+        string control = ModeControl();
+        string xaml = Source("PdfEditorApp", "MainPage.xaml");
+
+        Assert.Contains("{StaticResource OpenBookPath}", control, StringComparison.Ordinal);
+        Assert.Contains("<x:String x:Key=\"OpenBookPath\">", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("&#xE890;", control, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_edit_half_is_drawn_as_a_page_with_a_pencil_on_it()
+    {
+        // A BARE PENCIL WAS THE WRONG PICTURE. This app has a pen, a
+        // highlighter and shapes of its own, so a pencil on the mode control
+        // read as one more drawing tool rather than as "change this document".
+        string control = ModeControl();
+
+        Assert.Contains("&#xE932;", control, StringComparison.Ordinal);
+        Assert.DoesNotContain("&#xE70F;", control, StringComparison.Ordinal);
     }
 
     // ---------------- what a reader can and cannot do ----------------

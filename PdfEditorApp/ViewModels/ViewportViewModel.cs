@@ -353,8 +353,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>
     /// Whether the app is being read or edited. View on every document open.
     ///
-    /// A reader who never presses Edit gets a viewer, and nothing they click
-    /// can change the file.
+    /// View is READING rather than read-only: the highlighter, pen, shapes,
+    /// notes and stamps all stay, because marking up a page is part of reading
+    /// one. What a reader cannot do is change the document itself.
     /// </summary>
     public AppMode Mode
     {
@@ -372,10 +373,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             if (_mode == AppMode.View)
             {
-                // ⚠️ EVERYTHING EDITING GOES WITH IT. A selection that outlived
-                // the mode would still be drawn, still be moved by the arrow
-                // keys and still be deleted by Backspace, none of which View
-                // mode has any way to undo or even to show.
+                // ⚠️ EVERY EDITING SELECTION GOES WITH IT. A selection that
+                // outlived the mode would still be drawn, still be moved by the
+                // arrow keys and still be deleted by Backspace, none of which
+                // View mode has any way to show. The TOOLS are a separate
+                // question and most of them stay; this is about what was
+                // already picked up when the mode changed.
                 ClearTextUnitSelection();
                 ClearAnnotationSelection();
                 ClearGuideSelection();
@@ -392,7 +395,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             Status = _mode == AppMode.Edit
                 ? "Edit mode. Click text to select it, then click again to type."
-                : "View mode.";
+                : "Reading mode. Highlight, draw, note and stamp as you read.";
         }
     }
 
