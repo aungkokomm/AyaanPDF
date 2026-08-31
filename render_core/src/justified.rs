@@ -166,14 +166,15 @@ fn to_unicode_inverse(doc: &Document, font: &lopdf::Dictionary) -> BTreeMap<char
 }
 
 /// One `<hex>` token, an array bracket, or a bare word.
-enum CmapToken {
+pub(crate) enum CmapToken {
     Hex(Vec<u8>),
     Open,
+    #[allow(dead_code)]
     Close,
     Word(String),
 }
 
-fn tokenize_cmap(cmap: &[u8]) -> Vec<CmapToken> {
+pub(crate) fn tokenize_cmap(cmap: &[u8]) -> Vec<CmapToken> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < cmap.len() {
@@ -221,7 +222,7 @@ fn tokenize_cmap(cmap: &[u8]) -> Vec<CmapToken> {
 }
 
 /// UTF-16BE, but only when it says exactly one character.
-fn one_char_utf16be(bytes: &[u8]) -> Option<char> {
+pub(crate) fn one_char_utf16be(bytes: &[u8]) -> Option<char> {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|p| u16::from_be_bytes([p[0], p[1]]))

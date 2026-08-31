@@ -37,6 +37,7 @@ pub mod form_state;
 pub mod gradient;
 mod block;
 mod justified;
+mod pieces;
 mod provision;
 mod shaped;
 pub mod outline;
@@ -183,6 +184,27 @@ pub const STATUS_SELECTION_NOT_ADDRESSABLE: i32 = 16;
 /// lays text back over the lines it came from and no further; a different
 /// number of lines is refused rather than approximated.
 pub const STATUS_BLOCK_NEEDS_REFLOW: i32 = 17;
+
+/// The page draws an INLINE IMAGE, so its content stream cannot be rewritten.
+///
+/// ⚠️ MEASURED, NOT SUSPECTED. Decoding and re-encoding such a page through
+/// lopdf changes what it draws even when nothing is edited: 4 of 119 corpus
+/// pages came back different with no reconstruction at all. Editing text there
+/// would quietly damage the picture, so it is refused until the writer can
+/// leave the rest of the stream untouched.
+pub const STATUS_INLINE_IMAGE_PAGE: i32 = 18;
+
+/// The producer positions every glyph of this line itself, so there is nowhere
+/// to put a glyph that was not there before.
+///
+/// ⚠️ INSERTING IS THE PROBLEM, NOT DELETING. Where a line carries a `TJ`
+/// adjustment after each glyph, a deleted glyph leaves both of its neighbours'
+/// adjustments behind and the line closes up exactly. An INSERTED glyph has no
+/// adjustment of its own, so it sits at its natural width where the producer
+/// had tightened everything around it: the gap shows, and the text reads back
+/// with a space inside the word. Choosing an adjustment for it would be a
+/// guess about what the producer meant.
+pub const STATUS_PRODUCER_POSITIONS_EACH_GLYPH: i32 = 19;
 
 pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
@@ -12176,6 +12198,14 @@ fn emit_block(
         return STATUS_BLOCK_NOT_EDITABLE;
     }
 
+    // How far right the paragraph is already allowed to reach. A line may grow
+    // into it, but not past it, because past it is reflow's problem.
+    let right_limit = target
+        .lines
+        .iter()
+        .map(|l| l.right as f64)
+        .fold(f64::MIN, f64::max);
+
     let changes = match block::lay_out(target, edited, STATUS_BLOCK_NEEDS_REFLOW) {
         Ok(c) => c,
         Err(status) => return status,
@@ -12222,6 +12252,20 @@ fn emit_block(
             }
             Err(status) => status,
         };
+
+        // ⚠️ SECOND, NOT FIRST. Path A keeps every line it already handles,
+        // byte for byte, because it also re-solves the justification slots and
+        // its 76-line baseline says exactly what it produces. The piece writer
+        // is here for the lines Path A will not take: one drawn in several
+        // pieces, or one with no slots to solve. It changes a single piece's
+        // array and leaves every other operator alone.
+        if let Ok(next) = pieces::rewrite_bytes(
+            &bytes, page_index, plan.baseline, &plan.expected,
+            plan.at, plan.len, &change.text, Some(right_limit),
+        ) {
+            bytes = next;
+            continue;
+        }
         // ⚠️ ONLY THIS ONE REASON FALLS THROUGH. `STATUS_UNSUPPORTED` from Path
         // A means the document's own font cannot spell what was typed, which is
         // exactly and only what Path B is for. Every other refusal is about the
@@ -27935,6 +27979,409 @@ p={spread_px:.4},c={rgba:08X})"
         free_byte_buffer(buf);
         assert_ne!(status, STATUS_OK_PDFIUM, "Path A accepted a line it used to refuse");
         close_document(handle);
+    }
+
+    // ================= D1-C: EDITING A DOCUMENT'S OWN TEXT =================
+
+    /// The pieces of one block line, and the text they draw.
+    ///
+    /// Returns `None` when the line cannot be read the way the writer reads it,
+    /// which is the same refusal the writer would make.
+    fn line_pieces(
+        doc: &lopdf::Document,
+        pid: lopdf::ObjectId,
+        content: &lopdf::content::Content,
+        baseline: f32,
+        why: &mut std::collections::BTreeMap<&'static str, usize>,
+    ) -> Option<(String, Vec<(usize, usize)>)> {
+        let all = pieces::read(content);
+        let mine: Vec<&pieces::Piece> = all.iter()
+            .filter(|r| (r.y - baseline as f64).abs() < 0.05)
+            .collect();
+        if mine.is_empty() {
+            *why.entry("no piece sits on the line").or_insert(0) += 1;
+            return None;
+        }
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        for r in &mine {
+            if r.operator == "'" || r.operator == "\"" {
+                *why.entry("drawn with ' or \"").or_insert(0) += 1;
+                return None;
+            }
+            let Some(coding) = pieces::Coding::of(doc, pid, &r.font) else {
+                *why.entry("the font's codes cannot be read at all").or_insert(0) += 1;
+                return None;
+            };
+            let Some(chunks) = coding.decode(&r.codes) else {
+                *why.entry(if coding.is_empty() {
+                    "the font carries no /ToUnicode"
+                } else {
+                    "/ToUnicode does not cover every code drawn"
+                }).or_insert(0) += 1;
+                return None;
+            };
+            let start = text.len();
+            for c in &chunks { text.push_str(c); }
+            spans.push((start, text.len() - start));
+        }
+        Some((text, spans))
+    }
+
+    /// D1-C GATE. Can the writer put a document's own text back, and change it?
+    ///
+    /// ⚠️ THE IDENTITY CASE IS THE HARD ONE. Replacing a piece's text with the
+    /// same text has to come back pixel-identical, because it exercises the
+    /// whole path: read the pieces, decode the codes through the font's own
+    /// map, encode them again, splice them into the array, and emit. Anything
+    /// less than identical means one of those five is wrong.
+    ///
+    /// `cargo test --release d1c_edit_gate -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn d1c_edit_gate() {
+        use lopdf::content::Content;
+        use std::collections::BTreeMap;
+
+        let roots = [
+            r"D:\Ayaan PDF Test file",
+            r"%USERPROFILE%\Downloads",
+            r"%USERPROFILE%\Downloads\Telegram Desktop",
+        ];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("pdf") { continue; }
+                if e.metadata().map(|m| m.len() > 20_000_000).unwrap_or(true) { continue; }
+                files.push(path);
+            }
+        }
+        files.sort();
+
+        const W: i32 = 700;
+        let render = |handle: u64, page: i32| -> Option<(i32, i32, Vec<u8>)> {
+            let r = render_uncached(handle, page, W);
+            if r.status != STATUS_OK_PDFIUM || r.buffer.is_null() {
+                free_render_result(r);
+                return None;
+            }
+            let px = unsafe { std::slice::from_raw_parts(r.buffer, r.len) }.to_vec();
+            let wh = (r.width, r.height);
+            free_render_result(r);
+            Some((wh.0, wh.1, px))
+        };
+
+        // The identity case.
+        let (mut seen, mut identical) = (0usize, 0usize);
+        let mut refused: BTreeMap<i32, usize> = BTreeMap::new();
+        let mut codes_match = 0usize;
+        let mut codes_seen = 0usize;
+        // The shorter and longer cases.
+        let (mut short_ok, mut short_seen) = (0usize, 0usize);
+        let (mut long_ok, mut long_seen) = (0usize, 0usize);
+        let mut moved: Vec<String> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
+        let mut lost: Vec<String> = Vec::new();
+        let mut not_identical: Vec<(f64, String)> = Vec::new();
+        let mut why: BTreeMap<&'static str, usize> = BTreeMap::new();
+
+        for path in &files {
+            let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let handle = open_document(c.as_ptr());
+            if handle == 0 { continue; }
+            for page in 0..3.min(get_page_count(handle)) {
+                let Ok((blocks, _)) = page_blocks(handle, page) else { continue };
+                if !blocks.iter().any(|b| b.lines.len() >= 2 && b.editable()) { continue; }
+                let snap = snapshot_document(handle);
+                if snap.status != STATUS_OK_PDFIUM { free_byte_buffer(snap); continue; }
+                let original = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+                free_byte_buffer(snap);
+                let Ok(doc) = lopdf::Document::load_mem(&original) else { continue };
+                let ids = doc.get_pages();
+                let Some(&pid) = ids.get(&(page as u32 + 1)) else { continue };
+                let Ok(content) = Content::decode(&doc.get_page_content(pid)) else { continue };
+                // The writer refuses these outright, so they are not population.
+                if content.operations.iter().any(|o| o.operator == "BI") { continue; }
+
+                let before_h = open_document_from_bytes(original.as_ptr(), original.len());
+                let before = render(before_h, page);
+                close_document(before_h);
+                let Some((w1, h1, a)) = before else { continue };
+
+                let pixels = |bytes: &[u8]| -> Option<(usize, Vec<u8>)> {
+                    let h = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+                    let r = render(h, page);
+                    close_document(h);
+                    let (w2, h2, bpx) = r?;
+                    if (w1, h1) != (w2, h2) || a.len() != bpx.len() { return None; }
+                    let n = a.chunks_exact(4).zip(bpx.chunks_exact(4))
+                        .filter(|(x, y)| x != y).count();
+                    Some((n, bpx))
+                };
+
+                for b in blocks.iter() {
+                    if b.lines.len() < 2 || !b.editable() { continue; }
+                    let name = format!("{}#p{page} b{:.2}",
+                        path.file_name().unwrap().to_string_lossy(), b.lines[0].baseline);
+                    let right_limit = b.lines.iter().map(|l| l.right as f64)
+                        .fold(f64::MIN, f64::max);
+
+                    // ---- 1. the same text, every piece of every line --------
+                    //
+                    // ⚠️ ONE CHARACTER, NOT THE WHOLE PIECE. `block::narrow`
+                    // reduces every real edit to the smallest span that
+                    // actually changed, so production never replaces a whole
+                    // piece wholesale. Doing so here would delete the
+                    // producer's kerning numbers from inside the span, which is
+                    // the codes-only cost the D1 gate already measures at 24%,
+                    // and would be testing something no edit does.
+                    seen += 1;
+                    let mut bytes = original.clone();
+                    let mut failed: Option<i32> = None;
+                    for l in &b.lines {
+                        let Some((text, spans)) = line_pieces(&doc, pid, &content, l.baseline, &mut why)
+                            else { failed = Some(-1); break };
+                        for (start, len) in &spans {
+                            if *len == 0 { continue; }
+                            let Some(first) = text[*start..*start + *len].chars().next()
+                                else { continue };
+                            let span = first.len_utf8();
+                            codes_seen += 1;
+                            let same = &text[*start..*start + span];
+                            match pieces::rewrite_bytes(
+                                &bytes, page, l.baseline, &text, *start, span, same,
+                                Some(right_limit),
+                            ) {
+                                Ok(next) => { bytes = next; codes_match += 1; }
+                                Err(status) => { failed = Some(status); break; }
+                            }
+                        }
+                        if failed.is_some() { break; }
+                    }
+                    if let Some(status) = failed {
+                        *refused.entry(status).or_insert(0) += 1;
+                        continue;
+                    }
+                    match pixels(&bytes) {
+                        Some((0, _)) => identical += 1,
+                        Some((n, _)) => {
+                            let share = n as f64 / (w1 as usize * h1 as usize) as f64 * 100.0;
+                            not_identical.push((share, name.clone()));
+                        }
+                        None => { *refused.entry(STATUS_DOC_NOT_REWRITABLE).or_insert(0) += 1; }
+                    }
+
+                    // ---- 2 and 3. shorter, then longer ----------------------
+                    // Only the LAST piece of a line may change width, so that
+                    // is where the test edits.
+                    let mut chosen: Option<(f32, String, usize, usize, String)> = None;
+                    for l in &b.lines {
+                        let Some((text, spans)) = line_pieces(&doc, pid, &content, l.baseline, &mut why)
+                            else { continue };
+                        let Some((start, len)) = spans.last().copied() else { continue };
+                        if len < 4 { continue; }
+                        let tail = &text[start..start + len];
+                        // A stretch of plain letters, so the replacement is
+                        // certainly spellable by the same font.
+                        let Some(word) = tail.split(|c: char| !c.is_ascii_alphabetic())
+                            .find(|w| w.len() >= 3) else { continue };
+                        let at = start + tail.find(word).unwrap();
+                        chosen = Some((l.baseline, text.clone(), at, word.len(), word.to_string()));
+                        break;
+                    }
+                    let Some((baseline, text, at, len, word)) = chosen else { continue };
+
+                    for (label, replacement) in [
+                        ("shorter", word[..word.len() - 1].to_string()),
+                        ("longer", format!("{word}{}", &word[..1])),
+                    ] {
+                        if label == "shorter" { short_seen += 1; } else { long_seen += 1; }
+                        // ⚠️ THE SMALLEST SPAN THAT ACTUALLY CHANGED, which is
+                        // what `block::narrow` hands the writer in production.
+                        // Replacing a whole word instead would throw away the
+                        // producer's own per-glyph positioning from inside the
+                        // span: on a producer that adjusts after EVERY glyph,
+                        // that reopens the gap it had closed and the text reads
+                        // back as "R e" instead of "Re".
+                        let old_b = word.as_bytes();
+                        let new_b = replacement.as_bytes();
+                        let mut pre = 0;
+                        while pre < old_b.len() && pre < new_b.len()
+                            && old_b[pre] == new_b[pre] { pre += 1; }
+                        let mut suf = 0;
+                        while suf < old_b.len() - pre && suf < new_b.len() - pre
+                            && old_b[old_b.len() - 1 - suf] == new_b[new_b.len() - 1 - suf]
+                        { suf += 1; }
+                        let (mut a0, b0) = (pre, old_b.len() - suf);
+                        let (mut c0, d0) = (pre, new_b.len() - suf);
+                        // A span of nothing matches nothing, so an insertion is
+                        // widened into a replacement.
+                        if a0 == b0 && a0 > 0 { a0 -= 1; c0 -= 1; }
+                        if a0 == b0 { continue; }
+                        let span_at = at + a0;
+                        let span_len = b0 - a0;
+                        let span_new = replacement[c0..d0].to_string();
+
+                        let edited = match pieces::rewrite_bytes(
+                            &original, page, baseline, &text, span_at, span_len, &span_new,
+                            Some(right_limit),
+                        ) {
+                            Ok(v) => v,
+                            Err(status) => {
+                                *refused.entry(status).or_insert(0) += 1;
+                                continue;
+                            }
+                        };
+                        let Some((_, after_px)) = pixels(&edited) else { continue };
+
+                        // Nothing outside the block's own rows may change.
+                        // ⚠️ THE TALLEST LINE, not the first. A block can hold
+                        // a 98pt drop cap and 8pt body text, and measuring its
+                        // extent by the first line's height puts the drop cap
+                        // outside its own block.
+                        let tall = b.lines.iter().map(|l| l.height)
+                            .fold(0.0f32, f32::max) as f64;
+                        let top = b.lines.iter().map(|l| l.baseline)
+                            .fold(f32::MIN, f32::max) as f64 + tall;
+                        let bot = b.lines.iter().map(|l| l.baseline)
+                            .fold(f32::MAX, f32::min) as f64 - tall;
+                        // ⚠️ THE CROP BOX IS WHAT GETS RENDERED. Mapping user
+                        // space to pixel rows through the media box puts every
+                        // row at the wrong height on any page that crops, and
+                        // then a change inside the block reads as a change
+                        // outside it.
+                        let boxed = doc.get_dictionary(pid).ok().and_then(|d| {
+                            d.get(b"CropBox").ok().cloned()
+                                .or_else(|| d.get(b"MediaBox").ok().cloned())
+                        });
+                        let bounds = match boxed {
+                            Some(lopdf::Object::Array(v)) if v.len() == 4 => {
+                                let n: Vec<f64> = v.iter().filter_map(|o| match o {
+                                    lopdf::Object::Integer(i) => Some(*i as f64),
+                                    lopdf::Object::Real(r) => Some(*r as f64),
+                                    _ => None }).collect();
+                                if n.len() == 4 { Some((n[1], n[3])) } else { None }
+                            }
+                            _ => None,
+                        };
+                        let mut clean = true;
+                        if let Some((lo, hi)) = bounds {
+                            let span = (hi - lo).max(1.0);
+                            let r0 = (((hi - top) / span * h1 as f64).floor().max(0.0) as usize)
+                                .saturating_sub(3);
+                            let r1 = (((hi - bot) / span * h1 as f64).ceil() as usize + 3)
+                                .min(h1 as usize);
+                            for (i, (x, y)) in a.chunks_exact(4)
+                                .zip(after_px.chunks_exact(4)).enumerate()
+                            {
+                                if x == y { continue; }
+                                let row = i / w1 as usize;
+                                if row < r0 || row >= r1 { clean = false; break; }
+                            }
+                        }
+                        if !clean { outside.push(format!("{name} [{label}]")); continue; }
+
+                        // Every OTHER piece of the page must still be where the
+                        // producer put it.
+                        let Ok(after_doc) = lopdf::Document::load_mem(&edited) else { continue };
+                        let Some(&apid) = after_doc.get_pages().get(&(page as u32 + 1))
+                            else { continue };
+                        let Ok(after_content) = Content::decode(&after_doc.get_page_content(apid))
+                            else { continue };
+                        let was = pieces::read(&content);
+                        let now = pieces::read(&after_content);
+                        let mut fixed = was.len() == now.len();
+                        if fixed {
+                            for (x, y) in was.iter().zip(now.iter()) {
+                                let (p, q) = (x.tm.then(x.ctm).0, y.tm.then(y.ctm).0);
+                                if (p[4] - q[4]).abs() > 1e-6 || (p[5] - q[5]).abs() > 1e-6 {
+                                    fixed = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !fixed { moved.push(format!("{name} [{label}]")); continue; }
+
+                        // And the document must read back what was typed.
+                        let h = open_document_from_bytes(edited.as_ptr(), edited.len());
+                        // Editing the text can change how the page groups into
+                        // blocks, so the old index is not a reliable handle.
+                        let reads = page_blocks(h, page).ok()
+                            .map(|(bs, _)| bs.iter().any(|nb| nb.text.contains(&replacement)))
+                            .unwrap_or(false);
+                        close_document(h);
+                        if !reads {
+                            // Did we fail to WRITE it, or only to read it back?
+                            // The stream is the authority on the first.
+                            let stream = lopdf::Document::load_mem(&edited).ok()
+                                .and_then(|d| {
+                                    let q = *d.get_pages().get(&(page as u32 + 1))?;
+                                    let c = Content::decode(&d.get_page_content(q)).ok()?;
+                                    let mut ignore = std::collections::BTreeMap::new();
+                                    line_pieces(&d, q, &c, baseline, &mut ignore).map(|(t, _)| t)
+                                })
+                                .unwrap_or_else(|| "<the line no longer decodes>".into());
+                            lost.push(format!(
+                                "{name} [{label}] wanted {replacement:?}; the stream now reads {stream:?}"));
+                            continue;
+                        }
+
+                        if label == "shorter" { short_ok += 1; } else { long_ok += 1; }
+                    }
+                }
+            }
+            close_document(handle);
+        }
+
+        let pct = |v: usize, of: usize| if of == 0 { 0.0 } else { v as f64 / of as f64 * 100.0 };
+        println!("D1-C EDIT GATE");
+        println!("\n1. THE SAME TEXT, written back through our own encoder");
+        println!("  blocks attempted     {seen}");
+        println!("  pixel-identical      {identical} ({:.1}%)", pct(identical, seen));
+        println!("  pieces re-encoded    {codes_match} of {codes_seen}");
+        println!("  refused, by status:");
+        if refused.is_empty() { println!("    none"); }
+        for (k, v) in &refused {
+            let why = match *k {
+                -1 => "the line cannot be decoded through its font's own map",
+                4 => "the font cannot spell the replacement",
+                6 => "the line would grow past the paragraph",
+                9 => "the font has no width table",
+                16 => "the span is not inside one piece",
+                17 => "a piece other than the last would change width",
+                18 => "the page draws an inline image",
+                19 => "the producer positions every glyph itself",
+                _ => "",
+            };
+            println!("    {v:5}  status {k:3}  {why}");
+        }
+        println!("  why a line could not be decoded:");
+        for (k, v) in &why { println!("    {v:5}  {k}"); }
+        if !not_identical.is_empty() {
+            not_identical.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+            println!("  NOT IDENTICAL:");
+            for (share, n) in not_identical.iter().take(10) {
+                println!("    {share:8.4}%  {n}");
+            }
+        }
+
+        println!("\n2. SHORTER  {short_ok}/{short_seen} clean ({:.1}%)", pct(short_ok, short_seen));
+        println!("3. LONGER   {long_ok}/{long_seen} clean ({:.1}%)", pct(long_ok, long_seen));
+        println!("\n  changed pixels outside the block : {}", outside.len());
+        for n in outside.iter().take(5) { println!("      {n}"); }
+        println!("  an untouched piece moved         : {}", moved.len());
+        for n in moved.iter().take(5) { println!("      {n}"); }
+        println!("  text did not read back           : {}", lost.len());
+        for n in lost.iter().take(5) { println!("      {n}"); }
+
+        assert!(not_identical.is_empty(),
+            "writing a block's own text back changed {} of {seen} blocks",
+            not_identical.len());
+        assert!(outside.is_empty(), "an edit changed pixels outside its block");
+        assert!(moved.is_empty(), "an edit moved a piece it did not touch");
+        assert!(lost.is_empty(), "an edit did not read back");
     }
 
     /// A 3x2 PDF matrix, `[a b c d e f]`.
