@@ -12161,6 +12161,137 @@ fn edit_block_line(
     status
 }
 
+/// Runs of whitespace count as one.
+///
+/// The two readers disagree about spaces and neither is wrong: `get_page_lines`
+/// publishes what the producer drew, and the block model squeezes the run it
+/// joins two objects across. An anchor has to survive that difference or no
+/// selection the app makes would ever match.
+fn squeezed(text: &str) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for c in text.trim().chars() {
+        if c.is_whitespace() {
+            if !space {
+                out.push(' ');
+            }
+            space = true;
+        } else {
+            out.push(c);
+            space = false;
+        }
+    }
+    out
+}
+
+/// Retypes one line of a page's own text through the BLOCK model.
+///
+/// ⚠️ THE SECOND ATTEMPT, NOT THE FIRST. `set_line_text` rewrites a line by
+/// replacing the PDFium text objects that draw it, and it keeps every line it
+/// already handles; this is for the ones it refuses. A real document's body
+/// text is mostly drawn in several pieces per line, and this route goes through
+/// the block emitter, which does not re-lay-out the line at all: the smallest
+/// span that actually changed is spliced into the one piece that draws it, and
+/// every other operator on the page is left exactly as the producer wrote it.
+///
+/// The line is named by the same object range `get_page_lines` publishes, and
+/// `expected` is checked against what the block model says that line says now,
+/// so a selection that has gone stale refuses instead of writing somewhere
+/// else.
+///
+/// ⚠️ NO STAND-IN FONT, DELIBERATELY. `set_line_text` already offers one and is
+/// tried first, so a line that needs one has had its chance at it. Accepting
+/// one here would open a second way into Path B that nothing has measured.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_block_line_text(
+    doc_handle: u64,
+    page_index: i32,
+    first_object: u32,
+    last_object: u32,
+    expected_utf8: *const u8,
+    expected_len: usize,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+) -> i32 {
+    if doc_handle == 0 || page_index < 0 || last_object < first_object {
+        return STATUS_INVALID_INPUT;
+    }
+    let (Some(expected), Some(new_text)) = (
+        utf8_arg(expected_utf8, expected_len),
+        utf8_arg(new_text_utf8, new_text_len),
+    ) else {
+        return STATUS_INVALID_INPUT;
+    };
+    // The same two refusals `set_line_text` makes, for the same two reasons:
+    // emptying a line is a delete, and adding one is a paragraph edit.
+    if new_text.trim().is_empty() {
+        return STATUS_INVALID_INPUT;
+    }
+    if new_text.contains('\n') || new_text.contains('\r') {
+        return STATUS_INVALID_INPUT;
+    }
+
+    panic::catch_unwind(|| {
+        set_block_line_text_inner(
+            doc_handle,
+            page_index,
+            first_object as usize,
+            last_object as usize,
+            &expected,
+            &new_text,
+        )
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn set_block_line_text_inner(
+    doc_handle: u64,
+    page_index: i32,
+    first_object: usize,
+    last_object: usize,
+    expected: &str,
+    new_text: &str,
+) -> i32 {
+    let (blocks, _) = match page_blocks(doc_handle, page_index) {
+        Ok(b) => b,
+        Err(status) => return status,
+    };
+
+    let want = squeezed(expected);
+    let mut found: Option<(usize, usize)> = None;
+    'outer: for (bi, b) in blocks.iter().enumerate() {
+        for (li, l) in b.lines.iter().enumerate() {
+            if l.first_object != first_object || l.last_object != last_object {
+                continue;
+            }
+            let says: String = b.text.chars().skip(l.start).take(l.end - l.start).collect();
+            if squeezed(&says) != want {
+                continue;
+            }
+            found = Some((bi, li));
+            break 'outer;
+        }
+    }
+    // The objects are right but the words are not, or no block claims them at
+    // all. Either way this is not the line the caller is looking at.
+    let Some((bi, li)) = found else {
+        return STATUS_STALE_ANCHOR;
+    };
+
+    // The block's text with this one line retyped, which is what the emitter
+    // takes: it diffs that against what the block says now and writes only the
+    // characters that actually moved. Keeping every other line, and every `\n`,
+    // is what keeps the paragraph the same shape.
+    let block = &blocks[bi];
+    let line = &block.lines[li];
+    let chars: Vec<char> = block.text.chars().collect();
+    let mut edited: String = chars[..line.start].iter().collect();
+    edited.push_str(new_text);
+    edited.extend(chars[line.end..].iter());
+
+    emit_block(doc_handle, page_index, bi, &edited, None)
+}
+
 /// Rewrites a whole block from its edited logical text, and commits once.
 ///
 /// ⚠️ THE BLOCK IS THE SOURCE OF TRUTH, NOT THE LINE. The caller hands back
@@ -28383,6 +28514,212 @@ p={spread_px:.4},c={rgba:08X})"
         assert!(outside.is_empty(), "an edit changed pixels outside its block");
         assert!(moved.is_empty(), "an edit moved a piece it did not touch");
         assert!(lost.is_empty(), "an edit did not read back");
+    }
+
+    // ========== D1-C: RETYPING A LINE THROUGH THE BLOCK MODEL ==========
+    //
+    // The line the app hands over is named by the object range
+    // `get_page_lines` publishes, so these read it the same way the app does
+    // and then ask the same question the app asks.
+
+    /// What the block model says the line drawn by `first..=last` says.
+    fn block_line_text(handle: u64, page: i32, first: usize, last: usize) -> String {
+        let (blocks, _) = page_blocks(handle, page).expect("the page has blocks");
+        for b in &blocks {
+            for l in &b.lines {
+                if l.first_object == first && l.last_object == last {
+                    return b.text.chars().skip(l.start).take(l.end - l.start).collect();
+                }
+            }
+        }
+        panic!("no block line is drawn by objects {first}..={last}");
+    }
+
+    /// Where every text-showing operator on the page starts, in user space.
+    ///
+    /// ⚠️ THE WHOLE PAGE, NOT THE LINE. What makes this writer worth having is
+    /// that it leaves the producer's other pieces exactly where they were, and
+    /// the only way to say so is to look at all of them.
+    fn piece_origins(handle: u64, page: i32) -> Vec<(f64, f64)> {
+        let snap = snapshot_document(handle);
+        assert_eq!(snap.status, STATUS_OK_PDFIUM, "the document would not snapshot");
+        let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+        let doc = lopdf::Document::load_mem(&bytes).expect("the snapshot parses");
+        let pid = *doc.get_pages().get(&(page as u32 + 1)).expect("the page is there");
+        let content = lopdf::content::Content::decode(&doc.get_page_content(pid))
+            .expect("the content stream decodes");
+        pieces::read(&content).iter()
+            .map(|r| { let m = r.tm.then(r.ctm).0; (m[4], m[5]) })
+            .collect()
+    }
+
+    fn document_bytes(handle: u64) -> Vec<u8> {
+        let snap = snapshot_document(handle);
+        assert_eq!(snap.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+        bytes
+    }
+
+    /// Everything the page DRAWS: where each text operator starts, in what font
+    /// and size, and the codes it shows.
+    ///
+    /// ⚠️ COMPARE THIS, NEVER THE FILE'S BYTES. Measured: two snapshots of
+    /// one untouched document come back the same length and different bytes, so
+    /// "the refusal changed nothing" cannot be asked of the serialisation. It
+    /// can be asked of the drawing, which is what the question actually means.
+    fn page_drawing(handle: u64, page: i32) -> Vec<(i64, i64, Vec<u8>, i64, Vec<u8>)> {
+        let bytes = document_bytes(handle);
+        let doc = lopdf::Document::load_mem(&bytes).expect("the snapshot parses");
+        let pid = *doc.get_pages().get(&(page as u32 + 1)).expect("the page is there");
+        let content = lopdf::content::Content::decode(&doc.get_page_content(pid))
+            .expect("the content stream decodes");
+        pieces::read(&content).iter()
+            .map(|r| {
+                let m = r.tm.then(r.ctm).0;
+                // Rounded so the comparison is about the drawing rather than
+                // about the last bit of a float that survived a round trip.
+                (
+                    (m[4] * 1e6).round() as i64,
+                    (m[5] * 1e6).round() as i64,
+                    r.font.clone(),
+                    (r.size * 1e6).round() as i64,
+                    r.codes.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether any block on the page now says this.
+    fn page_says(handle: u64, page: i32, want: &str) -> bool {
+        page_blocks(handle, page).ok()
+            .map(|(bs, _)| bs.iter().any(|b| b.text.contains(want)))
+            .unwrap_or(false)
+    }
+
+    fn retype_via_block(handle: u64, page: i32, first: usize, last: usize, was: &str, now: &str) -> i32 {
+        let e = was.as_bytes();
+        let t = now.as_bytes();
+        set_block_line_text(handle, page, first as u32, last as u32,
+            e.as_ptr(), e.len(), t.as_ptr(), t.len())
+    }
+
+    /// A line drawn in 22 separate pieces, shortened by one letter, with every
+    /// other piece on the page left where the producer put it.
+    #[test]
+    fn the_block_route_shortens_a_line_drawn_in_many_pieces() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let says = block_line_text(handle, 0, 0, 21);
+        assert_eq!(says.trim(), "Kerning arial ordinary");
+
+        let before = piece_origins(handle, 0);
+        assert!(before.len() > 20, "expected a page drawn in many pieces, got {}", before.len());
+
+        let status = retype_via_block(handle, 0, 0, 21, &says, "Kerning arial ordinar");
+        assert_eq!(status, STATUS_OK_PDFIUM, "the block route refused a line it should take");
+        assert!(page_says(handle, 0, "Kerning arial ordinar"), "the page does not say it");
+
+        // ⚠️ SAME COUNT, SAME PLACES. A writer that re-laid the line out would
+        // move the pieces after the edit even when the words came out right.
+        let after = piece_origins(handle, 0);
+        assert_eq!(before.len(), after.len(), "the edit added or dropped a piece");
+        for (i, (was, now)) in before.iter().zip(after.iter()).enumerate() {
+            assert!((was.0 - now.0).abs() < 1e-6 && (was.1 - now.1).abs() < 1e-6,
+                "piece {i} moved from {was:?} to {now:?}");
+        }
+        close_document(handle);
+    }
+
+    /// The same line, one letter longer. The writer allows a line to grow to
+    /// the right as long as it does not pass the paragraph.
+    #[test]
+    fn the_block_route_lengthens_a_line_where_it_fits() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let says = block_line_text(handle, 0, 0, 21);
+        let before = piece_origins(handle, 0);
+
+        let status = retype_via_block(handle, 0, 0, 21, &says, "Kerning arial ordinaryy");
+        assert_eq!(status, STATUS_OK_PDFIUM, "the block route refused to lengthen the line");
+        assert!(page_says(handle, 0, "Kerning arial ordinaryy"), "the page does not say it");
+
+        let after = piece_origins(handle, 0);
+        assert_eq!(before.len(), after.len(), "the edit added or dropped a piece");
+        close_document(handle);
+    }
+
+    /// The case the route exists for: the object-replacing writer refuses this
+    /// line outright, and the block route takes it.
+    #[test]
+    fn the_block_route_takes_a_line_the_object_route_will_not() {
+        let path = "tests/fixtures/sample_font_metrics.pdf";
+        let says = {
+            let h = open_fixture_named(path);
+            let t = block_line_text(h, 0, 31, 58);
+            close_document(h);
+            t
+        };
+        assert_eq!(says.trim(), "Kerning variablefont metrics");
+        let shorter = "Kerning variablefont metric";
+
+        // The old route, on its own copy, with no stand-in font offered.
+        let old = open_fixture_named(path);
+        let was = page_drawing(old, 0);
+        let t = shorter.as_bytes();
+        let refused = set_line_text(old, 0, 31, 58, 0, t.as_ptr(), t.len(),
+            std::ptr::null(), 0);
+        assert_ne!(refused, STATUS_OK_PDFIUM, "the object route was expected to refuse");
+        assert_eq!(was, page_drawing(old, 0), "a refusal must leave the page as it was");
+        close_document(old);
+
+        // The block route, on a fresh copy.
+        let new = open_fixture_named(path);
+        assert_eq!(retype_via_block(new, 0, 31, 58, &says, shorter), STATUS_OK_PDFIUM);
+        assert!(page_says(new, 0, shorter), "the page does not say it");
+        close_document(new);
+    }
+
+    /// A selection that no longer describes the line refuses, and refusing
+    /// leaves the document byte for byte as it was.
+    #[test]
+    fn a_stale_selection_refuses_without_touching_the_document() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let was = page_drawing(handle, 0);
+
+        // Right objects, wrong words.
+        assert_eq!(
+            retype_via_block(handle, 0, 0, 21, "Kerning arial extraordinary", "Kerning arial ordinar"),
+            STATUS_STALE_ANCHOR);
+        assert_eq!(was, page_drawing(handle, 0), "a stale anchor changed the page");
+
+        // Right words, objects that draw nothing of the sort.
+        let says = block_line_text(handle, 0, 0, 21);
+        assert_eq!(retype_via_block(handle, 0, 900, 901, &says, "Kerning arial ordinar"),
+            STATUS_STALE_ANCHOR);
+        assert_eq!(was, page_drawing(handle, 0), "a bad object range changed the page");
+
+        // Emptying a line is a delete, and adding one is a paragraph edit.
+        assert_eq!(retype_via_block(handle, 0, 0, 21, &says, "   "), STATUS_INVALID_INPUT);
+        assert_eq!(retype_via_block(handle, 0, 0, 21, &says, "one\ntwo"), STATUS_INVALID_INPUT);
+        assert_eq!(was, page_drawing(handle, 0), "a rejected argument changed the page");
+        close_document(handle);
+    }
+
+    /// Saving and opening the saved bytes again finds the edit still there.
+    #[test]
+    fn a_block_edit_survives_saving_and_reopening() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let says = block_line_text(handle, 0, 0, 21);
+        assert_eq!(retype_via_block(handle, 0, 0, 21, &says, "Kerning arial ordinar"), STATUS_OK_PDFIUM);
+
+        let saved = document_bytes(handle);
+        close_document(handle);
+
+        let reopened = open_document_from_bytes(saved.as_ptr(), saved.len());
+        assert_ne!(reopened, 0, "the saved document would not open");
+        assert!(page_says(reopened, 0, "Kerning arial ordinar"),
+            "the edit did not survive being saved and opened again");
+        close_document(reopened);
     }
 
     /// A 3x2 PDF matrix, `[a b c d e f]`.

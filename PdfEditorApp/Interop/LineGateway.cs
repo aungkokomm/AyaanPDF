@@ -69,17 +69,49 @@ internal static class LineGateway
     /// </summary>
     public static int Write(
         ulong docHandle, int pageIndex, int firstObject, int lastObject, int prefixChars,
-        string fontName, string newText)
+        string fontName, string newText, string? expected = null)
     {
         byte[] text = Encoding.UTF8.GetBytes(newText);
 
         string? fontPath = SystemFontMatch.PathFor(fontName);
         byte[]? font = fontPath is null ? null : Encoding.UTF8.GetBytes(fontPath);
 
-        return RenderCoreNative.set_line_text(
+        int status = RenderCoreNative.set_line_text(
             docHandle, pageIndex,
             (uint)firstObject, (uint)lastObject, (uint)prefixChars,
             text, (nuint)text.Length,
             font, (nuint)(font?.Length ?? 0));
+
+        if (status == RenderStatus.OkPdfium || expected is null)
+        {
+            return status;
+        }
+
+        // The object-replacing writer would not take this line. Ask the block
+        // writer, which splices the line where it stands instead of rebuilding
+        // it, and takes the multi-piece lines the first one cannot.
+        //
+        // ⚠️ THE FIRST REFUSAL IS THE ONE REPORTED. When both decline, the
+        // caller gets exactly the status it would have got before this fallback
+        // existed, so every message it already shows still means what it meant.
+        int spliced = WriteAsBlock(docHandle, pageIndex, firstObject, lastObject, expected, newText);
+        return spliced == RenderStatus.OkPdfium ? spliced : status;
+    }
+
+    /// <summary>
+    /// Retypes one line by splicing it, leaving the producer's own pieces where
+    /// they are. See <see cref="RenderCoreNative.set_block_line_text"/>.
+    /// </summary>
+    public static int WriteAsBlock(
+        ulong docHandle, int pageIndex, int firstObject, int lastObject,
+        string expected, string newText)
+    {
+        byte[] want = Encoding.UTF8.GetBytes(expected);
+        byte[] text = Encoding.UTF8.GetBytes(newText);
+
+        return RenderCoreNative.set_block_line_text(
+            docHandle, pageIndex,
+            (uint)firstObject, (uint)lastObject,
+            want, (nuint)want.Length, text, (nuint)text.Length);
     }
 }

@@ -60,6 +60,17 @@
       [export display] pair form, so anything that assumes /Yes or writes
       the label instead of the export value fails here.
     -->
+    <!--
+      Ten headings, each drawn one glyph at a time in a different face, so a
+      line here really is the many-piece kind a producer emits and not the
+      single-object kind our own writers make. The block line writer is proved
+      against it end to end.
+    -->
+    <Content Include="..\render_core\tests\fixtures\sample_font_cases.pdf"
+             Condition="Exists('..\render_core\tests\fixtures\sample_font_cases.pdf')">
+      <Link>sample_font_cases.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="..\render_core\tests\fixtures\sample_form_choice.pdf"
              Condition="Exists('..\render_core\tests\fixtures\sample_form_choice.pdf')">
       <Link>sample_form_choice.pdf</Link>

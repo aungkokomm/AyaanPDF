@@ -142,6 +142,67 @@ public class LineEditWiringTests
         Assert.True(missing < write, "undo writes before it checks");
     }
 
+    // ---------------- the second writer ----------------
+
+    [Fact]
+    public void both_call_sites_hand_over_what_the_line_says()
+    {
+        // ⚠️ WITHOUT IT THE SECOND WRITER IS UNREACHABLE. `LineGateway.Write`
+        // only tries the block writer when it is told what the line currently
+        // says, because that is the anchor the core checks before splicing. A
+        // call site that drops the argument silently loses every multi-piece
+        // line again, and nothing else would notice.
+        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
+        Assert.Contains("line.FontName, newText, line.Text);", edit, StringComparison.Ordinal);
+
+        string undo = Body(ViewModel(), "private void ApplyLineText(LineTextRecord record, bool backwards)");
+        Assert.Contains("line.FontName, wanted, line.Text);", undo, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void undo_takes_the_same_route_the_edit_took()
+    {
+        // Both go through the one gateway method, so undo cannot reach a writer
+        // the edit did not, whichever of the two wrote it.
+        string code = ViewModel();
+        Assert.Equal(2, Count(code, "Interop.LineGateway.Write("));
+        Assert.DoesNotContain("Interop.LineGateway.WriteAsBlock(", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_object_writer_is_still_asked_first()
+    {
+        // ⚠️ ORDER IS THE COMPATIBILITY GUARANTEE. Every line the existing
+        // writer takes today it must still take, so the block writer is only
+        // reached after that one has refused, and the first refusal is the one
+        // reported when both decline.
+        string gateway = Source("PdfEditorApp", "Interop", "LineGateway.cs");
+        string body = Body(gateway, "public static int Write(");
+
+        int first = body.IndexOf("RenderCoreNative.set_line_text(", StringComparison.Ordinal);
+        int second = body.IndexOf("WriteAsBlock(", StringComparison.Ordinal);
+
+        Assert.True(first > 0, "the object writer is not called at all");
+        Assert.True(second > first, "the block writer is asked before the object writer");
+        Assert.Contains("status == RenderStatus.OkPdfium || expected is null", body,
+            StringComparison.Ordinal);
+        Assert.Contains("spliced == RenderStatus.OkPdfium ? spliced : status", body,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_block_writer_is_never_offered_a_stand_in_font()
+    {
+        // The object writer already offers one and runs first, so a line that
+        // needs one has had its chance. Handing one here would open a second
+        // way into Path B that nothing has measured.
+        string gateway = Source("PdfEditorApp", "Interop", "LineGateway.cs");
+        string body = Body(gateway, "public static int WriteAsBlock(");
+
+        Assert.DoesNotContain("SystemFontMatch", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("fontName", body, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void the_history_knows_about_a_line_record()
     {

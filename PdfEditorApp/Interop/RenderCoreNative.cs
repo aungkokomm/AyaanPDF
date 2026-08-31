@@ -731,6 +731,37 @@ internal static partial class RenderCoreNative
         nuint fallbackFontPathLen);
 
     /// <summary>
+    /// Replaces one visual line by splicing it, rather than by replacing the
+    /// objects that draw it.
+    ///
+    /// ⚠️ THE SECOND ATTEMPT, NOT A REPLACEMENT FOR THE FIRST.
+    /// <see cref="set_line_text"/> rewrites a line into a single object and
+    /// keeps every line it already handles; this is for the ones it refuses,
+    /// which in a real document is most body text, because producers draw a
+    /// line in many separate pieces. Here the producer's pieces are left
+    /// exactly as they are and only the characters that actually changed are
+    /// written into the one piece that draws them.
+    ///
+    /// The line is named by the same object range <c>get_page_lines</c>
+    /// publishes, and <paramref name="expectedUtf8"/> must still be what that
+    /// line says, so a stale selection returns StaleAnchor and writes nothing.
+    ///
+    /// No font argument, deliberately: <see cref="set_line_text"/> already
+    /// offers a stand-in and runs first, so a line that needs one has had its
+    /// chance at it.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int set_block_line_text(
+        ulong docHandle,
+        int pageIndex,
+        uint firstObject,
+        uint lastObject,
+        byte[] expectedUtf8,
+        nuint expectedLen,
+        byte[] newTextUtf8,
+        nuint newTextLen);
+
+    /// <summary>
     /// Writes into the objects at the given indices, addressed BY POSITION.
     ///
     /// ⚠️ THE ONE CALL THAT DOES NOT FIND ITS TARGET BY WHAT IT SAYS, which is

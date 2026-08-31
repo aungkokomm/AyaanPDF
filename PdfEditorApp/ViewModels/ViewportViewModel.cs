@@ -5238,7 +5238,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         int status = Interop.LineGateway.Write(
             _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
-            line.FontName, newText);
+            line.FontName, newText, line.Text);
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -12161,7 +12161,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         int status = Interop.LineGateway.Write(
             _documentHandle, record.Page, line.FirstObject, line.LastObject,
-            line.PrefixChars, line.FontName, wanted);
+            line.PrefixChars, line.FontName, wanted, line.Text);
 
         if (status != RenderStatus.OkPdfium)
         {
