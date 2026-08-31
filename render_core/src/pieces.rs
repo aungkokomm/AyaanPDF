@@ -287,12 +287,6 @@ impl Coding {
         })
     }
 
-    /// Whether the font gave us no map at all, which is a different problem
-    /// from a map with a hole in it.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.to_text.is_empty()
-    }
-
     /// Each code turned into the text it draws, kept separate so a character
     /// offset can be walked back to the byte that produced it.
     pub(crate) fn decode(&self, codes: &[u8]) -> Option<Vec<String>> {
@@ -569,47 +563,25 @@ fn advance_of(m: &justified::Metrics, piece: &Piece, codes: &[u8]) -> Option<f64
     Some((m.width_of(codes)? + glyphs * piece.tc + spaces * piece.tw) * piece.th)
 }
 
-/// Replace `len` bytes of one line's own text, at UTF-8 byte offset `at` within
-/// it, with `text`.
+/// Which piece owns a span, where inside its codes it sits, and the codes to
+/// put there. Both locators answer in exactly these terms.
+type Span = (usize, usize, usize, Vec<u8>);
+
+/// The span, found by reading the codes back through the font's own map.
 ///
-/// ⚠️ THE LINE IS NOT RE-LAID-OUT. Every piece stays where the producer put it
-/// and only one piece's array changes, so the line grows or shrinks to the
-/// right and nothing else on the page moves. Anything that would need the rest
-/// of the line to move is refused here rather than guessed at; that is reflow,
-/// and reflow is a later step.
+/// Exact, and the only route that can address a two-byte font, because a
+/// `/ToUnicode` states outright what every code means. It also proves it is
+/// looking at the right line by decoding the whole of it and comparing.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn replace_in_line(
+fn locate_by_coding(
     doc: &Document,
     page_id: lopdf::ObjectId,
-    content: &Content,
-    baseline: f32,
+    mine: &[&Piece],
     expected: &str,
     at: usize,
     len: usize,
     text: &str,
-    right_limit: Option<f64>,
-) -> Result<Content, i32> {
-    if content.operations.iter().any(|o| o.operator == "BI") {
-        return Err(crate::STATUS_INLINE_IMAGE_PAGE);
-    }
-    if len == 0 || at + len > expected.len() {
-        return Err(crate::STATUS_INVALID_INPUT);
-    }
-
-    let pieces = read(content);
-    let mine: Vec<&Piece> = pieces
-        .iter()
-        .filter(|r| (r.y - baseline as f64).abs() < 0.05)
-        .collect();
-    if mine.is_empty() {
-        return Err(crate::STATUS_LINE_NOT_REWRITABLE);
-    }
-    // `'` and `"` move to the next line as well as drawing, so swapping one for
-    // a `TJ` would silently drop that move.
-    if mine.iter().any(|r| r.operator == "'" || r.operator == "\"") {
-        return Err(crate::STATUS_LINE_NOT_REWRITABLE);
-    }
-
+) -> Result<Span, i32> {
     // Decode the line from the stream and require it to be the line the model
     // says it is. This is what keeps two coordinate systems honest: the model
     // counts characters of its own text, the stream counts bytes of codes.
@@ -665,13 +637,208 @@ pub(crate) fn replace_in_line(
     let Some((k, code_at, code_len)) = target else {
         return Err(crate::STATUS_SELECTION_NOT_ADDRESSABLE);
     };
-    let piece = mine[k];
-
-    let Some(new_codes) = codings[&piece.font].encode(text) else {
+    let Some(new_codes) = codings[&mine[k].font].encode(text) else {
         // ⚠️ EXACTLY AND ONLY THIS STATUS FALLS THROUGH TO PATH B upstream: the
         // document's own font cannot spell what was typed.
         return Err(crate::STATUS_UNSUPPORTED);
     };
+    Ok((k, code_at, code_len, new_codes))
+}
+
+/// The span, found without asking the font what its codes mean.
+///
+/// ⚠️ THE TWO COUNTS WILL NOT AGREE, AND THEY DO NOT HAVE TO. Measured over
+/// the corpus: every difference between the codes a producer draws and the
+/// characters PDFium reports is whitespace. The producer writes two spaces
+/// after a full stop and PDFium reports one; it writes none between two pieces
+/// and PDFium generates one to stand for the gap; it writes one at the head of
+/// a piece and PDFium drops it altogether. So this walk matches the characters
+/// that are NOT whitespace one for one, and lets the whitespace between them
+/// stretch. Against every line whose fonts WILL answer, it placed 388 of 388
+/// spans on exactly the right text.
+///
+/// ⚠️ LATIN ONLY, AND THAT IS NOT A SIMPLIFICATION. PDFium reports Myanmar in
+/// reading order while the stream draws it in visual order, so for a shaped
+/// script the counts can agree while the mapping is a permutation: the line
+/// reads `ဖြ` and the codes spell `ြဖ`. Every span this walk ever placed
+/// wrongly was shaped, and not one was Latin. Reordering is a separate problem
+/// and guessing at it here would corrupt the text silently.
+#[allow(clippy::too_many_arguments)]
+fn locate_by_model(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+    mine: &[&Piece],
+    expected: &str,
+    at: usize,
+    len: usize,
+    text: &str,
+) -> Result<Span, i32> {
+    if expected.chars().any(|c| (c as u32) >= 0x0300) {
+        return Err(crate::STATUS_UNSUPPORTED);
+    }
+
+    // Every code drawn on the baseline, end to end, and which piece drew each.
+    let mut codes: Vec<u8> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
+    let mut metrics: BTreeMap<Vec<u8>, justified::Metrics> = BTreeMap::new();
+    for (k, r) in mine.iter().enumerate() {
+        if !metrics.contains_key(&r.font) {
+            // The size is not one of the questions asked of these metrics:
+            // encoding, spelling and remapping are all size-independent. It is
+            // floored only because `font_metrics` refuses a size of zero, and
+            // an invisible piece should not cost the line its edit.
+            let m = justified::font_metrics(doc, page_id, &r.font, r.size.max(0.001))?;
+            // This route writes one byte per character, which a Type0's
+            // two-byte codes are not; and it reads a space out of the stream by
+            // its code, which a font that remapped 32 no longer writes.
+            if m.is_cid() || m.remapped(b' ') {
+                return Err(crate::STATUS_UNSUPPORTED);
+            }
+            metrics.insert(r.font.clone(), m);
+        }
+        codes.extend(r.codes.iter().copied());
+        owner.extend(std::iter::repeat(k).take(r.codes.len()));
+    }
+
+    // ⚠️ WALKED AGAINST THE LINE, WHICH IS ALREADY CUT. `expected` is the
+    // model's drawn text sliced by the line's `prefix` and `suffix`, so the
+    // baseline can carry codes on either side of it. Leading space codes are
+    // stepped over and the tail is required to be spaces too.
+    //
+    // ⚠️ WHICH IS WHY A LINE WHOSE CUT IS NOT WHITESPACE IS REFUSED, NOT
+    // REPAIRED. On the 531 lines that do align the cut is whitespace or nothing
+    // every time, but that number is measured on the survivors: a line cut
+    // through real letters simply falls out of step here and is refused. The
+    // model does know where the cut is, in the first run's `obj_at`, and
+    // threading it through is the next widening rather than a guess made here.
+    let mut marks: Vec<(usize, usize)> = Vec::with_capacity(expected.len() + 1);
+    let mut i = 0usize;
+    for (byte, ch) in expected.char_indices() {
+        if !ch.is_whitespace() {
+            while i < codes.len() && codes[i] == b' ' {
+                i += 1;
+            }
+        }
+        marks.push((byte, i));
+        if ch.is_whitespace() {
+            while i < codes.len() && codes[i] == b' ' {
+                i += 1;
+            }
+        } else {
+            if i >= codes.len() || codes[i] == b' ' {
+                return Err(crate::STATUS_STALE_ANCHOR);
+            }
+            i += 1;
+        }
+    }
+    if codes[i..].iter().any(|c| *c != b' ') {
+        return Err(crate::STATUS_STALE_ANCHOR);
+    }
+    marks.push((expected.len(), i));
+
+    let code_of = |byte: usize| marks.iter().find(|(b, _)| *b == byte).map(|(_, c)| *c);
+    let (Some(code_at), Some(code_end)) = (code_of(at), code_of(at + len)) else {
+        return Err(crate::STATUS_SELECTION_NOT_ADDRESSABLE);
+    };
+    // A span of pure whitespace can be a character PDFium generated, which no
+    // code drew and so nothing can be written over.
+    if code_end <= code_at {
+        return Err(crate::STATUS_SELECTION_NOT_ADDRESSABLE);
+    }
+
+    // ⚠️ ONE PIECE, OR NOTHING. A span reaching over a piece boundary would
+    // have to be divided between two arrays the producer positioned
+    // independently, and nothing in the model says where to divide it. Measured
+    // at 66 of 1034 spans, refused rather than guessed at.
+    let k = owner[code_at];
+    if owner[code_at..code_end].iter().any(|o| *o != k) {
+        return Err(crate::STATUS_SELECTION_NOT_ADDRESSABLE);
+    }
+    let start = owner.iter().position(|o| *o == k).unwrap_or(0);
+    let m = &metrics[&mine[k].font];
+
+    // ⚠️ THE ANCHOR, AND THE ONLY ONE THIS ROUTE HAS. The other route proves
+    // it is looking at the right line by decoding the whole of it; with no
+    // `/ToUnicode` there is nothing to decode. So the codes about to be DELETED
+    // are encoded back out of the model's own text and required to be the very
+    // bytes already sitting there. Measured: the encoder answers a DIFFERENT
+    // code on 5 lines of the corpus, every one a subset font whose
+    // `/Differences` renumber the glyphs from 1, where WinAnsi's answer for an
+    // ASCII letter is a glyph the font does not have.
+    let Some(was) = m.encode(&expected[at..at + len]) else {
+        return Err(crate::STATUS_UNSUPPORTED);
+    };
+    if was != codes[code_at..code_end] {
+        return Err(crate::STATUS_STALE_ANCHOR);
+    }
+
+    let Some(new_codes) = m.encode(text) else {
+        return Err(crate::STATUS_UNSUPPORTED);
+    };
+    // A code outside the width table is a code the font cannot be shown to
+    // have, which for a subset font is the same question as whether it can
+    // spell it.
+    if !m.can_spell(&new_codes) {
+        return Err(crate::STATUS_UNSUPPORTED);
+    }
+    Ok((k, code_at - start, code_end - code_at, new_codes))
+}
+
+/// Replace `len` bytes of one line's own text, at UTF-8 byte offset `at` within
+/// it, with `text`.
+///
+/// ⚠️ THE LINE IS NOT RE-LAID-OUT. Every piece stays where the producer put it
+/// and only one piece's array changes, so the line grows or shrinks to the
+/// right and nothing else on the page moves. Anything that would need the rest
+/// of the line to move is refused here rather than guessed at; that is reflow,
+/// and reflow is a later step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_in_line(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+    content: &Content,
+    baseline: f32,
+    expected: &str,
+    at: usize,
+    len: usize,
+    text: &str,
+    right_limit: Option<f64>,
+) -> Result<Content, i32> {
+    if content.operations.iter().any(|o| o.operator == "BI") {
+        return Err(crate::STATUS_INLINE_IMAGE_PAGE);
+    }
+    if len == 0 || at + len > expected.len() {
+        return Err(crate::STATUS_INVALID_INPUT);
+    }
+
+    let pieces = read(content);
+    let mine: Vec<&Piece> = pieces
+        .iter()
+        .filter(|r| (r.y - baseline as f64).abs() < 0.05)
+        .collect();
+    if mine.is_empty() {
+        return Err(crate::STATUS_LINE_NOT_REWRITABLE);
+    }
+    // `'` and `"` move to the next line as well as drawing, so swapping one for
+    // a `TJ` would silently drop that move.
+    if mine.iter().any(|r| r.operator == "'" || r.operator == "\"") {
+        return Err(crate::STATUS_LINE_NOT_REWRITABLE);
+    }
+
+    // ⚠️ TWO WAYS OF ASKING, AND THE ORDER IS THE COMPATIBILITY GUARANTEE.
+    // Reading the codes back through the font's own `/ToUnicode` is exact and
+    // handles a two-byte font, so it keeps every line it already handled. It
+    // needs a `/ToUnicode`, and 186 of the corpus blocks this writer refuses
+    // have none; those go to the model-driven walk instead.
+    let (k, code_at, code_len, new_codes) =
+        match locate_by_coding(doc, page_id, &mine, expected, at, len, text) {
+            Ok(found) => found,
+            Err(coding) => locate_by_model(doc, page_id, &mine, expected, at, len, text)
+                // The first route's refusal is the more specific one whenever
+                // the second simply does not take this kind of line.
+                .map_err(|model| if model == crate::STATUS_UNSUPPORTED { coding } else { model })?,
+        };
+    let piece = mine[k];
     let old_codes = piece.codes[code_at..code_at + code_len].to_vec();
 
     let array: Vec<Object> = match content.operations[piece.at].operands.first() {

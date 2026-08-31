@@ -712,17 +712,23 @@ impl Metrics {
 
     /// The whole replacement as character codes, or nothing if any character
     /// has no code this font can be shown to produce.
-    fn encode(&self, text: &str) -> Option<Vec<u8>> {
+    pub(crate) fn encode(&self, text: &str) -> Option<Vec<u8>> {
         text.chars().map(|c| self.encode_char(c)).collect()
     }
 
     /// Whether this font can measure every byte, which for a subset font is
     /// the same question as whether it can spell them.
-    fn can_spell(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn can_spell(&self, bytes: &[u8]) -> bool {
         bytes.iter().all(|b| {
             let i = *b as i64 - self.first_char;
             i >= 0 && (i as usize) < self.widths.len()
         })
+    }
+
+    /// Whether the font's `/Differences` gave this code a meaning of its own,
+    /// so it can no longer be read as the base encoding says.
+    pub(crate) fn remapped(&self, code: u8) -> bool {
+        self.differences.contains(&(code as i64))
     }
 
     /// Whether this is a Type0 font, whose codes are two bytes.

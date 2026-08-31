@@ -27983,58 +27983,19 @@ p={spread_px:.4},c={rgba:08X})"
 
     // ================= D1-C: EDITING A DOCUMENT'S OWN TEXT =================
 
-    /// The pieces of one block line, and the text they draw.
-    ///
-    /// Returns `None` when the line cannot be read the way the writer reads it,
-    /// which is the same refusal the writer would make.
-    fn line_pieces(
-        doc: &lopdf::Document,
-        pid: lopdf::ObjectId,
-        content: &lopdf::content::Content,
-        baseline: f32,
-        why: &mut std::collections::BTreeMap<&'static str, usize>,
-    ) -> Option<(String, Vec<(usize, usize)>)> {
-        let all = pieces::read(content);
-        let mine: Vec<&pieces::Piece> = all.iter()
-            .filter(|r| (r.y - baseline as f64).abs() < 0.05)
-            .collect();
-        if mine.is_empty() {
-            *why.entry("no piece sits on the line").or_insert(0) += 1;
-            return None;
-        }
-        let mut text = String::new();
-        let mut spans = Vec::new();
-        for r in &mine {
-            if r.operator == "'" || r.operator == "\"" {
-                *why.entry("drawn with ' or \"").or_insert(0) += 1;
-                return None;
-            }
-            let Some(coding) = pieces::Coding::of(doc, pid, &r.font) else {
-                *why.entry("the font's codes cannot be read at all").or_insert(0) += 1;
-                return None;
-            };
-            let Some(chunks) = coding.decode(&r.codes) else {
-                *why.entry(if coding.is_empty() {
-                    "the font carries no /ToUnicode"
-                } else {
-                    "/ToUnicode does not cover every code drawn"
-                }).or_insert(0) += 1;
-                return None;
-            };
-            let start = text.len();
-            for c in &chunks { text.push_str(c); }
-            spans.push((start, text.len() - start));
-        }
-        Some((text, spans))
-    }
-
     /// D1-C GATE. Can the writer put a document's own text back, and change it?
     ///
-    /// ⚠️ THE IDENTITY CASE IS THE HARD ONE. Replacing a piece's text with the
-    /// same text has to come back pixel-identical, because it exercises the
-    /// whole path: read the pieces, decode the codes through the font's own
-    /// map, encode them again, splice them into the array, and emit. Anything
-    /// less than identical means one of those five is wrong.
+    /// ⚠️ THE IDENTITY CASE IS THE HARD ONE. Replacing a character with itself
+    /// has to come back pixel-identical, because it exercises the whole path:
+    /// find the character in the stream, encode it again, splice it into the
+    /// array, and emit. Anything less than identical means one of those is
+    /// wrong.
+    ///
+    /// ⚠️ DRIVEN BY THE MODEL'S OWN TEXT, WHICH IS THE POINT. `expected` is
+    /// `BlockLine::drawn` and the offsets are into it, exactly as `emit_block`
+    /// hands them over. Asking the font to decode the line first, as this gate
+    /// used to, would only ever test the lines that have a `/ToUnicode`, which
+    /// is the population the model-driven locator exists to get past.
     ///
     /// `cargo test --release d1c_edit_gate -- --ignored --nocapture`
     #[test]
@@ -28073,11 +28034,29 @@ p={spread_px:.4},c={rgba:08X})"
             Some((wh.0, wh.1, px))
         };
 
+        // ⚠️ SPREAD ACROSS THE LINE, NOT ALL OF IT. Every character would mean
+        // a full load-and-save of the document per character. Four positions
+        // spread over the line reach several of the producer's pieces, which is
+        // what the identity case is actually testing.
+        let probes = |text: &str| -> Vec<(usize, usize)> {
+            let all: Vec<(usize, char)> = text.char_indices()
+                .filter(|(_, c)| !c.is_whitespace()).collect();
+            if all.is_empty() { return Vec::new(); }
+            let step = (all.len() / 4).max(1);
+            all.iter().step_by(step).take(4)
+                .map(|(at, c)| (*at, c.len_utf8())).collect()
+        };
+
         // The identity case.
         let (mut seen, mut identical) = (0usize, 0usize);
         let mut refused: BTreeMap<i32, usize> = BTreeMap::new();
-        let mut codes_match = 0usize;
-        let mut codes_seen = 0usize;
+        // ⚠️ KEPT APART FROM THE IDENTITY REFUSALS. A width change is refused
+        // for reasons an identity edit never meets, so pooling the two makes it
+        // impossible to read either.
+        let mut refused_wider: BTreeMap<i32, usize> = BTreeMap::new();
+        let (mut chars_seen, mut chars_written) = (0usize, 0usize);
+        // Coverage, as the three separate questions they are.
+        let (mut located, mut writable, mut accepted) = (0usize, 0usize, 0usize);
         // The shorter and longer cases.
         let (mut short_ok, mut short_seen) = (0usize, 0usize);
         let (mut long_ok, mut long_seen) = (0usize, 0usize);
@@ -28085,7 +28064,6 @@ p={spread_px:.4},c={rgba:08X})"
         let mut outside: Vec<String> = Vec::new();
         let mut lost: Vec<String> = Vec::new();
         let mut not_identical: Vec<(f64, String)> = Vec::new();
-        let mut why: BTreeMap<&'static str, usize> = BTreeMap::new();
 
         for path in &files {
             let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
@@ -28128,39 +28106,56 @@ p={spread_px:.4},c={rgba:08X})"
                     let right_limit = b.lines.iter().map(|l| l.right as f64)
                         .fold(f64::MIN, f64::max);
 
-                    // ---- 1. the same text, every piece of every line --------
+                    // ---- 1. the same text, spread across every line ---------
                     //
-                    // ⚠️ ONE CHARACTER, NOT THE WHOLE PIECE. `block::narrow`
-                    // reduces every real edit to the smallest span that
-                    // actually changed, so production never replaces a whole
-                    // piece wholesale. Doing so here would delete the
-                    // producer's kerning numbers from inside the span, which is
-                    // the codes-only cost the D1 gate already measures at 24%,
-                    // and would be testing something no edit does.
+                    // ⚠️ ONE CHARACTER AT A TIME, NOT A WHOLE PIECE.
+                    // `block::narrow` reduces every real edit to the smallest
+                    // span that actually changed, so production never replaces
+                    // a whole piece wholesale. Doing so here would delete the
+                    // producer's kerning numbers from inside the span and test
+                    // something no edit does.
                     seen += 1;
                     let mut bytes = original.clone();
-                    let mut failed: Option<i32> = None;
+                    let mut failed: Option<(i32, bool)> = None;
                     for l in &b.lines {
-                        let Some((text, spans)) = line_pieces(&doc, pid, &content, l.baseline, &mut why)
-                            else { failed = Some(-1); break };
-                        for (start, len) in &spans {
-                            if *len == 0 { continue; }
-                            let Some(first) = text[*start..*start + *len].chars().next()
-                                else { continue };
-                            let span = first.len_utf8();
-                            codes_seen += 1;
-                            let same = &text[*start..*start + span];
+                        for (at, span) in probes(&l.drawn) {
+                            chars_seen += 1;
+                            let same = &l.drawn[at..at + span];
                             match pieces::rewrite_bytes(
-                                &bytes, page, l.baseline, &text, *start, span, same,
+                                &bytes, page, l.baseline, &l.drawn, at, span, same,
                                 Some(right_limit),
                             ) {
-                                Ok(next) => { bytes = next; codes_match += 1; }
-                                Err(status) => { failed = Some(status); break; }
+                                Ok(next) => { bytes = next; chars_written += 1; }
+                                Err(status) => {
+                                    let latin = l.drawn.chars().all(|c| (c as u32) < 0x0300);
+                                    failed = Some((status, latin));
+                                    break;
+                                }
                             }
                         }
                         if failed.is_some() { break; }
                     }
-                    if let Some(status) = failed {
+
+                    // ⚠️ THREE DIFFERENT QUESTIONS, KEPT APART. Finding the
+                    // span, being able to write it, and the writer agreeing to
+                    // are not the same thing, and reporting them as one number
+                    // hides which of the three is the wall.
+                    match failed {
+                        None => { located += 1; writable += 1; accepted += 1; }
+                        // The span was never found: the walk fell out of step,
+                        // or it reached over a piece boundary. A shaped line is
+                        // refused for its ordering, which is also not finding it.
+                        Some((STATUS_STALE_ANCHOR, _))
+                        | Some((STATUS_SELECTION_NOT_ADDRESSABLE, _))
+                        | Some((STATUS_UNSUPPORTED, false)) => {}
+                        // Found, but the font will not write it back.
+                        Some((STATUS_UNSUPPORTED, true))
+                        | Some((STATUS_FONT_METRICS_UNAVAILABLE, _)) => { located += 1; }
+                        // Found and writable; the writer refused on its own
+                        // terms, which are reflow, width and glyph positioning.
+                        Some(_) => { located += 1; writable += 1; }
+                    }
+                    if let Some((status, _)) = failed {
                         *refused.entry(status).or_insert(0) += 1;
                         continue;
                     }
@@ -28174,24 +28169,21 @@ p={spread_px:.4},c={rgba:08X})"
                     }
 
                     // ---- 2 and 3. shorter, then longer ----------------------
-                    // Only the LAST piece of a line may change width, so that
-                    // is where the test edits.
-                    let mut chosen: Option<(f32, String, usize, usize, String)> = None;
+                    //
+                    // ⚠️ THE LAST WORD OF A LINE, because only the last piece
+                    // of a line may change width. The last characters of a line
+                    // are drawn by its last piece, so the line's own last word
+                    // is the one place a width change is legal.
+                    let mut chosen: Option<(f32, String, usize, String)> = None;
                     for l in &b.lines {
-                        let Some((text, spans)) = line_pieces(&doc, pid, &content, l.baseline, &mut why)
-                            else { continue };
-                        let Some((start, len)) = spans.last().copied() else { continue };
-                        if len < 4 { continue; }
-                        let tail = &text[start..start + len];
-                        // A stretch of plain letters, so the replacement is
-                        // certainly spellable by the same font.
-                        let Some(word) = tail.split(|c: char| !c.is_ascii_alphabetic())
-                            .find(|w| w.len() >= 3) else { continue };
-                        let at = start + tail.find(word).unwrap();
-                        chosen = Some((l.baseline, text.clone(), at, word.len(), word.to_string()));
+                        let last = l.drawn.split(|c: char| !c.is_ascii_alphabetic())
+                            .filter(|w| w.len() >= 3).next_back();
+                        let Some(word) = last else { continue };
+                        let Some(at) = l.drawn.rfind(word) else { continue };
+                        chosen = Some((l.baseline, l.drawn.clone(), at, word.to_string()));
                         break;
                     }
-                    let Some((baseline, text, at, len, word)) = chosen else { continue };
+                    let Some((baseline, text, at, word)) = chosen else { continue };
 
                     for (label, replacement) in [
                         ("shorter", word[..word.len() - 1].to_string()),
@@ -28230,7 +28222,7 @@ p={spread_px:.4},c={rgba:08X})"
                         ) {
                             Ok(v) => v,
                             Err(status) => {
-                                *refused.entry(status).or_insert(0) += 1;
+                                *refused_wider.entry(status).or_insert(0) += 1;
                                 continue;
                             }
                         };
@@ -28313,18 +28305,7 @@ p={spread_px:.4},c={rgba:08X})"
                             .unwrap_or(false);
                         close_document(h);
                         if !reads {
-                            // Did we fail to WRITE it, or only to read it back?
-                            // The stream is the authority on the first.
-                            let stream = lopdf::Document::load_mem(&edited).ok()
-                                .and_then(|d| {
-                                    let q = *d.get_pages().get(&(page as u32 + 1))?;
-                                    let c = Content::decode(&d.get_page_content(q)).ok()?;
-                                    let mut ignore = std::collections::BTreeMap::new();
-                                    line_pieces(&d, q, &c, baseline, &mut ignore).map(|(t, _)| t)
-                                })
-                                .unwrap_or_else(|| "<the line no longer decodes>".into());
-                            lost.push(format!(
-                                "{name} [{label}] wanted {replacement:?}; the stream now reads {stream:?}"));
+                            lost.push(format!("{name} [{label}] wanted {replacement:?}"));
                             continue;
                         }
 
@@ -28337,18 +28318,27 @@ p={spread_px:.4},c={rgba:08X})"
 
         let pct = |v: usize, of: usize| if of == 0 { 0.0 } else { v as f64 / of as f64 * 100.0 };
         println!("D1-C EDIT GATE");
+        println!("\nCOVERAGE, on {seen} blocks");
+        println!("  located   {located:5}  ({:5.1}%)  the span was found in the stream",
+            pct(located, seen));
+        println!("  writable  {writable:5}  ({:5.1}%)  and the font will write it back",
+            pct(writable, seen));
+        println!("  accepted  {accepted:5}  ({:5.1}%)  and the writer agreed to every edit",
+            pct(accepted, seen));
+
         println!("\n1. THE SAME TEXT, written back through our own encoder");
-        println!("  blocks attempted     {seen}");
-        println!("  pixel-identical      {identical} ({:.1}%)", pct(identical, seen));
-        println!("  pieces re-encoded    {codes_match} of {codes_seen}");
+        println!("  pixel-identical      {identical} of {accepted} accepted ({:.1}%)",
+            pct(identical, accepted));
+        println!("  characters re-encoded {chars_written} of {chars_seen}");
         println!("  refused, by status:");
         if refused.is_empty() { println!("    none"); }
         for (k, v) in &refused {
             let why = match *k {
-                -1 => "the line cannot be decoded through its font's own map",
-                4 => "the font cannot spell the replacement",
+                4 => "the font cannot spell it, or the line is not this route's kind",
                 6 => "the line would grow past the paragraph",
+                7 => "the line is not the line the model says it is",
                 9 => "the font has no width table",
+                10 => "the line is drawn with ' or \", or its operand is not a string",
                 16 => "the span is not inside one piece",
                 17 => "a piece other than the last would change width",
                 18 => "the page draws an inline image",
@@ -28357,8 +28347,6 @@ p={spread_px:.4},c={rgba:08X})"
             };
             println!("    {v:5}  status {k:3}  {why}");
         }
-        println!("  why a line could not be decoded:");
-        for (k, v) in &why { println!("    {v:5}  {k}"); }
         if !not_identical.is_empty() {
             not_identical.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
             println!("  NOT IDENTICAL:");
@@ -28369,6 +28357,19 @@ p={spread_px:.4},c={rgba:08X})"
 
         println!("\n2. SHORTER  {short_ok}/{short_seen} clean ({:.1}%)", pct(short_ok, short_seen));
         println!("3. LONGER   {long_ok}/{long_seen} clean ({:.1}%)", pct(long_ok, long_seen));
+        println!("  the rest were REFUSED, not written wrongly:");
+        for (k, v) in &refused_wider {
+            let why = match *k {
+                6 => "the line would grow past the paragraph",
+                17 => "a piece other than the last would change width",
+                19 => "the producer positions every glyph itself",
+                _ => "",
+            };
+            println!("    {v:5}  status {k:3}  {why}");
+        }
+        assert_eq!(short_seen + long_seen,
+            short_ok + long_ok + refused_wider.values().sum::<usize>(),
+            "a width change neither succeeded nor was refused");
         println!("\n  changed pixels outside the block : {}", outside.len());
         for n in outside.iter().take(5) { println!("      {n}"); }
         println!("  an untouched piece moved         : {}", moved.len());
@@ -28377,7 +28378,7 @@ p={spread_px:.4},c={rgba:08X})"
         for n in lost.iter().take(5) { println!("      {n}"); }
 
         assert!(not_identical.is_empty(),
-            "writing a block's own text back changed {} of {seen} blocks",
+            "writing a block's own text back changed {} of {accepted} blocks",
             not_identical.len());
         assert!(outside.is_empty(), "an edit changed pixels outside its block");
         assert!(moved.is_empty(), "an edit moved a piece it did not touch");
