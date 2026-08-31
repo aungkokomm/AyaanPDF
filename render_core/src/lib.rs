@@ -27441,6 +27441,1313 @@ p={spread_px:.4},c={rgba:08X})"
         close_document(handle);
     }
 
+    /// STEP D SURVEY. What would reflow actually have to work with?
+    ///
+    /// Read-only, `#[ignore]`d, run with
+    /// `cargo test --release step_d_survey -- --ignored --nocapture`.
+    ///
+    /// ⚠️ REFLOW REWRITES EVERY LINE OF A BLOCK, not one, so every reach
+    /// figure measured so far is the wrong shape for it. This asks the
+    /// questions the design turns on: can the existing emitter write ALL of a
+    /// block's lines; is there a column to break against; and is there any room
+    /// to absorb text without needing another line.
+    #[test]
+    #[ignore]
+    fn step_d_survey() {
+        use lopdf::content::Content;
+        use lopdf::Object;
+        use std::collections::BTreeMap;
+
+        let roots = [
+            r"D:\Ayaan PDF Test file",
+            r"%USERPROFILE%\Downloads",
+            r"%USERPROFILE%\Downloads\Telegram Desktop",
+        ];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("pdf") { continue; }
+                if e.metadata().map(|m| m.len() > 20_000_000).unwrap_or(true) { continue; }
+                files.push(path);
+            }
+        }
+        files.sort();
+
+        // What sits at one baseline in the content stream.
+        #[derive(Default, Clone)]
+        struct AtBaseline { runs: usize, tj: usize, slotted: usize }
+
+        let (mut docs, mut multi_blocks, mut multi_lines) = (0usize, 0usize, 0usize);
+        let mut shape: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut encodable = 0usize;
+        let mut ideal_lines = 0usize;            // one slotted TJ AND WinAnsi
+        let mut ideal_blocks = 0usize;           // every line of the block ideal
+        let mut objects_per_line: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut left_agrees = 0usize;
+        let mut right_agrees = 0usize;
+        let mut slack_but_last: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut room_below: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut contiguous_blocks = 0usize;
+
+        for path in &files {
+            let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let handle = open_document(c.as_ptr());
+            if handle == 0 { continue; }
+            docs += 1;
+            for page in 0..3.min(get_page_count(handle)) {
+                let Ok((blocks, _)) = page_blocks(handle, page) else { continue };
+                if blocks.iter().all(|b| b.lines.len() < 2) { continue; }
+
+                let snap = snapshot_document(handle);
+                if snap.status != STATUS_OK_PDFIUM { free_byte_buffer(snap); continue; }
+                let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+                free_byte_buffer(snap);
+                let Ok(doc) = lopdf::Document::load_mem(&bytes) else { continue };
+                let pages = doc.get_pages();
+                let Some(&pid) = pages.get(&(page as u32 + 1)) else { continue };
+                let Ok(content) = Content::decode(&doc.get_page_content(pid)) else { continue };
+
+                // ⚠️ Tm AND Td/TD, because a great many producers place a line
+                // by moving the cursor rather than by setting a matrix. `T*`
+                // needs the leading and is not tracked; lines it places show up
+                // as "nothing at this baseline", which is itself the answer
+                // `locate` gives them today.
+                let mut at: BTreeMap<i64, AtBaseline> = BTreeMap::new();
+                let key = |y: f64| (y * 100.0).round() as i64;
+                let mut y = 0.0f64;
+                let mut leading = 0.0f64;
+                for op in &content.operations {
+                    let num = |i: usize| op.operands.get(i).and_then(|o| match o {
+                        Object::Integer(n) => Some(*n as f64),
+                        Object::Real(r) => Some(*r as f64),
+                        _ => None,
+                    });
+                    match op.operator.as_str() {
+                        "Tm" => y = num(5).unwrap_or(y),
+                        "TL" => leading = num(0).unwrap_or(leading),
+                        "Td" => y += num(1).unwrap_or(0.0),
+                        // `TD` sets the leading as a side effect, which is how
+                        // most producers establish it before using `T*`.
+                        "TD" => {
+                            leading = -num(1).unwrap_or(0.0);
+                            y += num(1).unwrap_or(0.0);
+                        }
+                        "T*" => y -= leading,
+                        _ => {}
+                    }
+                    // `'` and `"` move to the next line BEFORE showing text.
+                    if op.operator == "'" || op.operator == "\"" {
+                        y -= leading;
+                    }
+                    match op.operator.as_str() {
+                        "TJ" | "Tj" | "'" | "\"" => {
+                            let e = at.entry(key(y)).or_default();
+                            e.runs += 1;
+                            if op.operator == "TJ" {
+                                e.tj += 1;
+                                if let Some(Object::Array(a)) = op.operands.first() {
+                                    let mut after_space = false;
+                                    let mut slots = 0usize;
+                                    for o in a {
+                                        match o {
+                                            Object::String(b, _) => after_space = b.last() == Some(&b' '),
+                                            _ => { if after_space { slots += 1; } after_space = false; }
+                                        }
+                                    }
+                                    if slots > 0 { e.slotted += 1; }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut baselines: Vec<f32> =
+                    blocks.iter().flat_map(|b| b.lines.iter().map(|l| l.baseline)).collect();
+                baselines.sort_by(|a, b| b.partial_cmp(a).unwrap());
+
+                for b in &blocks {
+                    if b.lines.len() < 2 { continue; }
+                    multi_blocks += 1;
+                    multi_lines += b.lines.len();
+                    if b.lines.windows(2).all(|w| w[1].first_object > w[0].last_object) {
+                        contiguous_blocks += 1;
+                    }
+
+                    let mut all_ideal = true;
+                    for l in &b.lines {
+                        let found = at.get(&key(l.baseline as f64)).cloned().unwrap_or_default();
+                        let shape_key = match (found.runs, found.tj, found.slotted) {
+                            (0, _, _) => "nothing at this baseline (placed relatively)",
+                            (1, 1, 1) => "ONE TJ WITH SLOTS  (what the emitter wants)",
+                            (1, 1, 0) => "one TJ, no slots (ragged)",
+                            (1, 0, _) => "one run, but a Tj not a TJ",
+                            _ => "several runs at this baseline",
+                        };
+                        *shape.entry(shape_key).or_insert(0) += 1;
+
+                        let enc = l.drawn.chars().all(|c| (c as u32) < 0x100);
+                        if enc { encodable += 1; }
+                        let ideal = found.runs == 1 && found.slotted == 1 && enc;
+                        if ideal { ideal_lines += 1; } else { all_ideal = false; }
+
+                        let n = l.last_object - l.first_object + 1;
+                        let ob = match n { 1 => "1 object", 2..=4 => "2-4", 5..=16 => "5-16", _ => "17+" };
+                        *objects_per_line.entry(ob).or_insert(0) += 1;
+                    }
+                    if all_ideal { ideal_blocks += 1; }
+
+                    let h = b.lines[0].height.max(1e-6);
+                    let lefts: Vec<f32> = b.lines.iter().map(|l| l.left).collect();
+                    let rights: Vec<f32> = b.lines.iter().map(|l| l.right).collect();
+                    let spread = |v: &[f32]| {
+                        let lo = v.iter().cloned().fold(f32::MAX, f32::min);
+                        let hi = v.iter().cloned().fold(f32::MIN, f32::max);
+                        (hi - lo) / h
+                    };
+                    if spread(&lefts) <= 0.25 { left_agrees += 1; }
+                    if spread(&rights[..rights.len() - 1]) <= 0.25 { right_agrees += 1; }
+
+                    let column = rights.iter().cloned().fold(f32::MIN, f32::max)
+                        - lefts.iter().cloned().fold(f32::MAX, f32::min);
+                    let chars: usize = b.lines.iter().map(|l| l.drawn.chars().count()).sum();
+                    let ink: f32 = b.lines.iter().map(|l| l.right - l.left).sum();
+                    let per_char = if chars > 0 { ink / chars as f32 } else { 0.0 };
+                    let free: f32 = b.lines[..b.lines.len() - 1]
+                        .iter().map(|l| column - (l.right - l.left)).sum();
+                    let bucket = if per_char <= 0.0 { "unknown" } else {
+                        match (free / per_char) as i64 {
+                            i64::MIN..=0 => "0 characters",
+                            1..=4 => "1-4",
+                            5..=19 => "5-19",
+                            20..=79 => "20-79",
+                            _ => "80+",
+                        }
+                    };
+                    *slack_but_last.entry(bucket).or_insert(0) += 1;
+
+                    let lowest = b.lines.iter().map(|l| l.baseline).fold(f32::MAX, f32::min);
+                    let next = baselines.iter().cloned().find(|v| *v < lowest - 0.01);
+                    let rk = match next {
+                        None => "nothing below it",
+                        Some(v) => match ((lowest - v) / h) as i64 {
+                            i64::MIN..=1 => "under 2 line heights",
+                            2 => "2-3",
+                            3..=5 => "3-5",
+                            _ => "6+",
+                        },
+                    };
+                    *room_below.entry(rk).or_insert(0) += 1;
+                }
+            }
+            close_document(handle);
+        }
+
+        let pct = |v: usize, of: usize| if of == 0 { 0.0 } else { v as f64 / of as f64 * 100.0 };
+        println!("STEP D SURVEY  documents {docs}");
+        println!("blocks with 2+ lines {multi_blocks}, lines {multi_lines}\n");
+
+        println!("1. HOW EACH LINE IS DRAWN  (from the content stream, not inferred)");
+        let mut rows: Vec<(&&str, &usize)> = shape.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, v) in rows { println!("   {v:6}  {:5.1}%  {k}", pct(*v, multi_lines)); }
+
+        println!("\n2. WHAT THE EXISTING EMITTER NEEDS, ALL OF IT AT ONCE");
+        println!("   lines that are one slotted TJ and WinAnsi-encodable {ideal_lines:6}  ({:.1}%)",
+            pct(ideal_lines, multi_lines));
+        println!("   WinAnsi-encodable lines, ignoring shape             {encodable:6}  ({:.1}%)",
+            pct(encodable, multi_lines));
+        println!("   BLOCKS where EVERY line qualifies                   {ideal_blocks:6}  ({:.1}%)",
+            pct(ideal_blocks, multi_blocks));
+
+        println!("\n3. OBJECTS PER LINE  (a regenerating emitter does not care; a patching one does)");
+        for (k, v) in &objects_per_line { println!("   {k:<10} {v:6}  {:5.1}%", pct(*v, multi_lines)); }
+
+        println!("\n4. IS THERE A COLUMN TO BREAK AGAINST?");
+        println!("   left edges agree                      {left_agrees:5}  ({:.1}%)",
+            pct(left_agrees, multi_blocks));
+        println!("   right edges agree bar the last line   {right_agrees:5}  ({:.1}%)",
+            pct(right_agrees, multi_blocks));
+        println!("   object range strictly ascending       {contiguous_blocks:5}  ({:.1}%)",
+            pct(contiguous_blocks, multi_blocks));
+
+        println!("\n5. SLACK before another line is needed (ignoring the last line)");
+        for (k, v) in &slack_but_last { println!("   {k:<14} {v:5}  ({:.1}%)", pct(*v, multi_blocks)); }
+
+        println!("\n6. VERTICAL ROOM BELOW THE BLOCK");
+        for (k, v) in &room_below { println!("   {k:<24} {v:5}  ({:.1}%)", pct(*v, multi_blocks)); }
+    }
+
+    /// STEP D GATE, PART 0. Can a block's lines be FOUND in the content
+    /// stream at all?
+    ///
+    /// ⚠️ A REGENERATING EMITTER CANNOT START WITHOUT THIS. It has to replace
+    /// the operators that draw a block, and the block model knows only where
+    /// the lines are on the page. The survey said 54.5% of lines have nothing
+    /// at their baseline; this asks whether that is the page or whether it is a
+    /// COORDINATE SPACE difference, because the model's baseline comes from
+    /// PDFium after the CTM and the stream's `Tm` is before it. A page with a
+    /// `cm` would miss on every single line by the same amount.
+    // ---------------- font metrics ----------------
+
+    /// A one-page document whose `/F1` is whatever `font` says it is.
+    fn page_with_font(font: lopdf::Dictionary) -> (lopdf::Document, lopdf::ObjectId) {
+        use lopdf::{dictionary, Document, Object};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(font);
+        let resources = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        });
+        let content = doc.add_object(lopdf::Stream::new(dictionary! {}, b"".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }));
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+        (doc, page_id)
+    }
+
+    /// A Type0 font whose descendant carries `w` as its `/W` and `dw` as `/DW`.
+    fn type0_font(doc: &mut lopdf::Document, w: Vec<lopdf::Object>, dw: Option<i64>)
+        -> lopdf::Dictionary
+    {
+        use lopdf::{dictionary, Object};
+        let mut descendant = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "Test",
+            "W" => w,
+        };
+        if let Some(dw) = dw { descendant.set("DW", dw); }
+        let descendant_id = doc.add_object(descendant);
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Test",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(descendant_id)],
+        }
+    }
+
+    /// Two-byte Identity-H codes.
+    fn cids(list: &[u16]) -> Vec<u8> {
+        list.iter().flat_map(|c| c.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn a_type0_font_is_measured_from_its_descendant_s_w_ranges() {
+        use lopdf::Object;
+        // ⚠️ BOTH FORMS OF `/W`. `c [w ...]` lists consecutive CIDs; `c1 c2 w`
+        // gives a whole span one width. A reader that knows only one of them
+        // silently measures the other as the default.
+        let mut doc = lopdf::Document::with_version("1.5");
+        let font = type0_font(&mut doc, vec![
+            Object::Integer(1), Object::Array(vec![500.into(), 600.into()]),
+            Object::Integer(10), Object::Integer(12), Object::Integer(250),
+        ], Some(1000));
+        let (doc, page) = {
+            let (mut d, p) = page_with_font(font);
+            // Carry the descendant across into the document the page lives in.
+            let ids: Vec<_> = doc.objects.keys().copied().collect();
+            for id in ids { d.objects.insert(id, doc.objects[&id].clone()); }
+            (d, p)
+        };
+        let m = justified::font_metrics(&doc, page, b"F1", 10.0).expect("no metrics");
+
+        // The list form: CID 1 and 2.
+        assert_eq!(m.width_of(&cids(&[1])), Some(500.0 / 1000.0 * 10.0));
+        assert_eq!(m.width_of(&cids(&[2])), Some(600.0 / 1000.0 * 10.0));
+        // The span form: 10 through 12 inclusive.
+        for cid in 10..=12u16 {
+            assert_eq!(m.width_of(&cids(&[cid])), Some(250.0 / 1000.0 * 10.0), "cid {cid}");
+        }
+        // And they add up.
+        assert_eq!(m.width_of(&cids(&[1, 2])), Some((500.0 + 600.0) / 1000.0 * 10.0));
+    }
+
+    #[test]
+    fn a_cid_outside_w_falls_back_to_dw_and_never_refuses() {
+        use lopdf::Object;
+        let mut doc = lopdf::Document::with_version("1.5");
+        let font = type0_font(&mut doc,
+            vec![Object::Integer(1), Object::Array(vec![500.into()])], Some(742));
+        let (doc, page) = {
+            let (mut d, p) = page_with_font(font);
+            let ids: Vec<_> = doc.objects.keys().copied().collect();
+            for id in ids { d.objects.insert(id, doc.objects[&id].clone()); }
+            (d, p)
+        };
+        let m = justified::font_metrics(&doc, page, b"F1", 10.0).expect("no metrics");
+        assert_eq!(m.width_of(&cids(&[9999])), Some(742.0 / 1000.0 * 10.0),
+            "a CID outside /W must take /DW");
+        // ⚠️ AND THE SPEC'S OWN DEFAULT WHEN /DW IS ABSENT, which is 1000, not
+        // zero. Guessing zero here is the same defect as a missing /Widths.
+        let mut doc2 = lopdf::Document::with_version("1.5");
+        let font2 = type0_font(&mut doc2,
+            vec![Object::Integer(1), Object::Array(vec![500.into()])], None);
+        let (doc2, page2) = {
+            let (mut d, p) = page_with_font(font2);
+            let ids: Vec<_> = doc2.objects.keys().copied().collect();
+            for id in ids { d.objects.insert(id, doc2.objects[&id].clone()); }
+            (d, p)
+        };
+        let m2 = justified::font_metrics(&doc2, page2, b"F1", 10.0).expect("no metrics");
+        assert_eq!(m2.width_of(&cids(&[9999])), Some(1000.0 / 1000.0 * 10.0));
+    }
+
+    #[test]
+    fn a_type0_font_without_a_reachable_descendant_is_refused() {
+        use lopdf::{dictionary, Object};
+        // No /DescendantFonts at all: there is nowhere for the widths to be.
+        let (doc, page) = page_with_font(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Test",
+            "Encoding" => "Identity-H",
+        });
+        assert_eq!(justified::font_metrics(&doc, page, b"F1", 10.0).err(),
+            Some(STATUS_FONT_METRICS_UNAVAILABLE));
+
+        // ⚠️ AND A CMAP THAT IS NOT IDENTITY-H. A code is then not its own CID,
+        // and mapping it needs the CMap; guessing is the drift this change
+        // exists to stop.
+        let mut doc = lopdf::Document::with_version("1.5");
+        let mut font = type0_font(&mut doc,
+            vec![Object::Integer(1), Object::Array(vec![500.into()])], Some(1000));
+        font.set("Encoding", "UniGB-UCS2-H");
+        let (doc, page) = {
+            let (mut d, p) = page_with_font(font);
+            let ids: Vec<_> = doc.objects.keys().copied().collect();
+            for id in ids { d.objects.insert(id, doc.objects[&id].clone()); }
+            (d, p)
+        };
+        assert_eq!(justified::font_metrics(&doc, page, b"F1", 10.0).err(),
+            Some(STATUS_FONT_METRICS_UNAVAILABLE));
+    }
+
+    #[test]
+    fn an_odd_number_of_bytes_is_not_a_whole_cid() {
+        use lopdf::Object;
+        let mut doc = lopdf::Document::with_version("1.5");
+        let font = type0_font(&mut doc,
+            vec![Object::Integer(1), Object::Array(vec![500.into()])], Some(1000));
+        let (doc, page) = {
+            let (mut d, p) = page_with_font(font);
+            let ids: Vec<_> = doc.objects.keys().copied().collect();
+            for id in ids { d.objects.insert(id, doc.objects[&id].clone()); }
+            (d, p)
+        };
+        let m = justified::font_metrics(&doc, page, b"F1", 10.0).expect("no metrics");
+        assert_eq!(m.width_of(&[0x00]), None, "half a two-byte code is not measurable");
+    }
+
+    /// A simple font with `/Widths` for codes 65..=66 only.
+    fn simple_font(missing_width: Option<i64>) -> lopdf::Dictionary {
+        use lopdf::dictionary;
+        let mut descriptor = dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Test",
+            "Flags" => 32,
+        };
+        if let Some(mw) = missing_width { descriptor.set("MissingWidth", mw); }
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "Test",
+            "FirstChar" => 65,
+            "LastChar" => 66,
+            "Widths" => vec![500.into(), 600.into()],
+            "Encoding" => "WinAnsiEncoding",
+            "FontDescriptor" => descriptor,
+        }
+    }
+
+    #[test]
+    fn a_code_with_no_width_refuses_and_cannot_drift() {
+        // ⚠️ THE REGRESSION THIS EXISTS FOR. A code outside `/Widths` used to
+        // contribute 0.0, which is indistinguishable from a zero-width glyph:
+        // the measurement came back confidently WRONG and everything after it
+        // moved. The proof is that the refusal and the in-table answer are not
+        // the same thing, and that adding the unknown code does not simply
+        // leave the total alone.
+        let (doc, page) = page_with_font(simple_font(None));
+        let m = justified::font_metrics(&doc, page, b"F1", 10.0).expect("no metrics");
+
+        let known = m.width_of(b"AB").expect("A and B are in the table");
+        assert_eq!(known, (500.0 + 600.0) / 1000.0 * 10.0);
+
+        // 'Z' is outside 65..=66 and the font declares no /MissingWidth.
+        assert_eq!(m.width_of(b"Z"), None, "an unknown code must refuse");
+        assert_eq!(m.width_of(b"ABZ"), None, "one unknown code refuses the whole run");
+        assert_ne!(m.width_of(b"ABZ"), Some(known),
+            "the unknown code silently contributed nothing, which is the drift");
+
+        // And it travels: an array containing it cannot be advanced either.
+        let array = vec![lopdf::Object::String(b"ABZ".to_vec(), lopdf::StringFormat::Literal)];
+        assert_eq!(m.advance(&array), None);
+    }
+
+    #[test]
+    fn a_declared_missing_width_is_used_instead_of_refusing() {
+        let (doc, page) = page_with_font(simple_font(Some(333)));
+        let m = justified::font_metrics(&doc, page, b"F1", 10.0).expect("no metrics");
+        assert_eq!(m.width_of(b"Z"), Some(333.0 / 1000.0 * 10.0),
+            "a font that declares the fallback should be believed");
+        assert_eq!(m.width_of(b"ABZ"),
+            Some((500.0 + 600.0 + 333.0) / 1000.0 * 10.0));
+    }
+
+    #[test]
+    fn path_a_still_refuses_a_type0_line_exactly_as_it_always_has() {
+        // ⚠️ `font_metrics` LEARNED TO READ TYPE0; PATH A DID NOT. Letting the
+        // new capability widen what Path A accepts would change its answer on
+        // lines it has refused since it was written, and the 76-line
+        // byte-identical baseline is what says it has not.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        // A Path B edit leaves a Type0 font on the page, set in the line.
+        let edited = shaped_ffi(handle, at, 5, "\u{915}", DEVANAGARI_FONT).expect("refused");
+        swap_in(handle, &edited).expect("the swap was refused");
+
+        // Path A on that line: it must still decline, and for the font reason.
+        let line = "The quick ";
+        let buf = rewrite_justified_line(
+            handle, 0, EMBEDDED_BASELINE,
+            line.as_bytes().as_ptr(), line.len(), 0, 1, b"T".as_ptr(), 1);
+        let status = buf.status;
+        free_byte_buffer(buf);
+        assert_ne!(status, STATUS_OK_PDFIUM, "Path A accepted a line it used to refuse");
+        close_document(handle);
+    }
+
+    /// A 3x2 PDF matrix, `[a b c d e f]`.
+    #[derive(Clone, Copy, Debug)]
+    struct M([f64; 6]);
+
+    impl M {
+        const ID: M = M([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        /// `self` applied first, then `n`.
+        fn then(self, n: M) -> M {
+            let (s, t) = (self.0, n.0);
+            M([
+                s[0] * t[0] + s[1] * t[2],
+                s[0] * t[1] + s[1] * t[3],
+                s[2] * t[0] + s[3] * t[2],
+                s[2] * t[1] + s[3] * t[3],
+                s[4] * t[0] + s[5] * t[2] + t[4],
+                s[4] * t[1] + s[5] * t[3] + t[5],
+            ])
+        }
+        /// Where this matrix puts the text-space origin, in y.
+        fn origin_y(self) -> f64 {
+            self.0[5]
+        }
+        fn translated(self, tx: f64, ty: f64) -> M {
+            M([1.0, 0.0, 0.0, 1.0, tx, ty]).then(self)
+        }
+    }
+
+    /// Every baseline a text-showing operator draws on, in USER SPACE.
+    ///
+    /// ⚠️ THROUGH THE FULL CTM, NOT JUST `Tm`. Measured: 58.7% of the corpus's
+    /// pages carry a `cm`, and a `cm` can scale as well as move, which is why
+    /// looking for a single constant offset rescued only 3% of lines. The
+    /// model's baselines come from PDFium with the transform already applied,
+    /// so the stream has to be read the same way or nothing lines up.
+    fn shown_baselines(content: &lopdf::content::Content) -> Vec<f64> {
+        use lopdf::Object;
+        let mut out = Vec::new();
+        let mut ctm = M::ID;
+        let mut stack: Vec<M> = Vec::new();
+        // The text matrix and the text LINE matrix, which `Td`/`T*` move.
+        let (mut tm, mut tlm) = (M::ID, M::ID);
+        let mut leading = 0.0f64;
+
+        for op in &content.operations {
+            let num = |i: usize| op.operands.get(i).and_then(|o| match o {
+                Object::Integer(n) => Some(*n as f64),
+                Object::Real(r) => Some(*r as f64),
+                _ => None,
+            });
+            let six = || -> Option<M> {
+                let mut v = [0.0f64; 6];
+                for (i, slot) in v.iter_mut().enumerate() {
+                    *slot = num(i)?;
+                }
+                Some(M(v))
+            };
+            match op.operator.as_str() {
+                "q" => stack.push(ctm),
+                "Q" => ctm = stack.pop().unwrap_or(M::ID),
+                "cm" => { if let Some(m) = six() { ctm = m.then(ctm); } }
+                "BT" => { tm = M::ID; tlm = M::ID; }
+                "Tm" => { if let Some(m) = six() { tm = m; tlm = m; } }
+                "TL" => leading = num(0).unwrap_or(leading),
+                "Td" => {
+                    tlm = tlm.translated(num(0).unwrap_or(0.0), num(1).unwrap_or(0.0));
+                    tm = tlm;
+                }
+                "TD" => {
+                    leading = -num(1).unwrap_or(0.0);
+                    tlm = tlm.translated(num(0).unwrap_or(0.0), num(1).unwrap_or(0.0));
+                    tm = tlm;
+                }
+                "T*" => { tlm = tlm.translated(0.0, -leading); tm = tlm; }
+                _ => {}
+            }
+            if op.operator == "'" || op.operator == "\"" {
+                tlm = tlm.translated(0.0, -leading);
+                tm = tlm;
+            }
+            if matches!(op.operator.as_str(), "TJ" | "Tj" | "'" | "\"") {
+                out.push(tm.then(ctm).origin_y());
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn step_d_anchor_probe() {
+        use lopdf::content::Content;
+        use std::collections::BTreeMap;
+
+        let roots = [
+            r"D:\Ayaan PDF Test file",
+            r"%USERPROFILE%\Downloads",
+            r"%USERPROFILE%\Downloads\Telegram Desktop",
+        ];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("pdf") { continue; }
+                if e.metadata().map(|m| m.len() > 20_000_000).unwrap_or(true) { continue; }
+                files.push(path);
+            }
+        }
+        files.sort();
+
+        let mut pages = 0usize;
+        let mut verdict: BTreeMap<&str, usize> = BTreeMap::new();
+        let (mut found, mut lost, mut total) = (0usize, 0usize, 0usize);
+        let mut unique = 0usize;
+
+        for path in &files {
+            let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let handle = open_document(c.as_ptr());
+            if handle == 0 { continue; }
+            for page in 0..3.min(get_page_count(handle)) {
+                let Ok((blocks, _)) = page_blocks(handle, page) else { continue };
+                let wanted: Vec<f32> = blocks.iter().filter(|b| b.lines.len() >= 2)
+                    .flat_map(|b| b.lines.iter().map(|l| l.baseline)).collect();
+                if wanted.is_empty() { continue; }
+
+                let snap = snapshot_document(handle);
+                if snap.status != STATUS_OK_PDFIUM { free_byte_buffer(snap); continue; }
+                let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+                free_byte_buffer(snap);
+                let Ok(doc) = lopdf::Document::load_mem(&bytes) else { continue };
+                let ids = doc.get_pages();
+                let Some(&pid) = ids.get(&(page as u32 + 1)) else { continue };
+                let Ok(content) = Content::decode(&doc.get_page_content(pid)) else { continue };
+
+                let shown = shown_baselines(&content);
+                if shown.is_empty() { continue; }
+                pages += 1;
+                total += wanted.len();
+
+                let hits = |t: f64| shown.iter().filter(|v| (**v - t).abs() < 0.05).count();
+                let ok = wanted.iter().filter(|b| hits(**b as f64) > 0).count();
+                // ⚠️ AND HOW MANY RUNS SIT THERE. One is what a rewriter wants;
+                // several means the line is drawn in pieces.
+                unique += wanted.iter().filter(|b| hits(**b as f64) == 1).count();
+                found += ok;
+                lost += wanted.len() - ok;
+
+                let key = if ok == wanted.len() { "every line found" }
+                    else if ok * 10 >= wanted.len() * 9 { "90%+ found" }
+                    else if ok * 2 >= wanted.len() { "half or more found" }
+                    else { "most lines still not found" };
+                *verdict.entry(key).or_insert(0) += 1;
+            }
+            close_document(handle);
+        }
+
+        let pct = |v: usize, of: usize| if of == 0 { 0.0 } else { v as f64 / of as f64 * 100.0 };
+        println!("STEP D ANCHOR PROBE, through the full CTM   pages {pages}, lines {total}\n");
+        println!("PER PAGE");
+        let mut rows: Vec<(&&str, &usize)> = verdict.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, v) in rows { println!("  {v:5}  {:5.1}%  {k}", pct(*v, pages)); }
+        println!("\nPER LINE");
+        println!("  found          {found:6}  ({:.1}%)", pct(found, total));
+        println!("  not found      {lost:6}  ({:.1}%)", pct(lost, total));
+        println!("  found, and drawn by exactly ONE run  {unique:6}  ({:.1}%)",
+            pct(unique, total));
+    }
+
+    /// One text-showing operator, and everything needed to redraw it.
+    struct ShownRun {
+        at: usize,
+        /// The baseline in USER space, which is what the block model reports.
+        y: f64,
+        /// The text matrix in force, which is what has to be re-emitted to put
+        /// the replacement back in the same place.
+        tm: M,
+        font: Vec<u8>,
+        size: f64,
+        /// The character codes drawn, with the positioning numbers dropped.
+        codes: Vec<u8>,
+        /// ⚠️ ALL THREE CHANGE THE ADVANCE and all three are graphics state, so
+        /// they have to be tracked rather than assumed: character spacing, word
+        /// spacing, and horizontal scaling as a fraction.
+        tc: f64,
+        tw: f64,
+        th: f64,
+    }
+
+    /// Every text-showing operator of a page, located through the full CTM.
+    fn shown_runs(content: &lopdf::content::Content) -> Vec<ShownRun> {
+        use lopdf::Object;
+        let mut out = Vec::new();
+        let mut ctm = M::ID;
+        let mut stack: Vec<M> = Vec::new();
+        let (mut tm, mut tlm) = (M::ID, M::ID);
+        let mut leading = 0.0f64;
+        let mut font: Vec<u8> = Vec::new();
+        let mut size = 0.0f64;
+        let (mut tc, mut tw, mut th) = (0.0f64, 0.0f64, 1.0f64);
+        let mut font_stack: Vec<(Vec<u8>, f64)> = Vec::new();
+
+        for (i, op) in content.operations.iter().enumerate() {
+            let num = |k: usize| op.operands.get(k).and_then(|o| match o {
+                Object::Integer(n) => Some(*n as f64),
+                Object::Real(r) => Some(*r as f64),
+                _ => None,
+            });
+            let six = || -> Option<M> {
+                let mut v = [0.0f64; 6];
+                for (k, slot) in v.iter_mut().enumerate() { *slot = num(k)?; }
+                Some(M(v))
+            };
+            match op.operator.as_str() {
+                "q" => { stack.push(ctm); font_stack.push((font.clone(), size)); }
+                "Q" => {
+                    ctm = stack.pop().unwrap_or(M::ID);
+                    if let Some((f, sz)) = font_stack.pop() { font = f; size = sz; }
+                }
+                "cm" => { if let Some(m) = six() { ctm = m.then(ctm); } }
+                "BT" => { tm = M::ID; tlm = M::ID; }
+                "Tf" => {
+                    if let Some(Object::Name(n)) = op.operands.first() { font = n.clone(); }
+                    size = num(1).unwrap_or(size);
+                }
+                "Tm" => { if let Some(m) = six() { tm = m; tlm = m; } }
+                "Tc" => tc = num(0).unwrap_or(tc),
+                "Tw" => tw = num(0).unwrap_or(tw),
+                "Tz" => th = num(0).unwrap_or(th * 100.0) / 100.0,
+                "TL" => leading = num(0).unwrap_or(leading),
+                "Td" => { tlm = tlm.translated(num(0).unwrap_or(0.0), num(1).unwrap_or(0.0)); tm = tlm; }
+                "TD" => {
+                    leading = -num(1).unwrap_or(0.0);
+                    tlm = tlm.translated(num(0).unwrap_or(0.0), num(1).unwrap_or(0.0));
+                    tm = tlm;
+                }
+                "T*" => { tlm = tlm.translated(0.0, -leading); tm = tlm; }
+                _ => {}
+            }
+            if op.operator == "'" || op.operator == "\"" {
+                tlm = tlm.translated(0.0, -leading);
+                tm = tlm;
+            }
+            if !matches!(op.operator.as_str(), "TJ" | "Tj" | "'" | "\"") { continue; }
+
+            // ⚠️ THE CODES ONLY, POSITIONING DROPPED. That is the whole point:
+            // reflow cannot keep per-glyph kerning it is about to invalidate,
+            // so the gate has to find out whether a line survives without it.
+            let mut codes = Vec::new();
+            match op.operands.first() {
+                Some(Object::Array(a)) => {
+                    for o in a {
+                        if let Object::String(b, _) = o { codes.extend_from_slice(b); }
+                    }
+                }
+                Some(Object::String(b, _)) => codes.extend_from_slice(b),
+                _ => {}
+            }
+            // `"` carries word and char spacing before the string.
+            if op.operator == "\"" {
+                if let Some(Object::String(b, _)) = op.operands.get(2) {
+                    codes.clear();
+                    codes.extend_from_slice(b);
+                }
+            }
+            out.push(ShownRun {
+                at: i, y: tm.then(ctm).origin_y(), tm, font: font.clone(), size, codes,
+                tc, tw, th,
+            });
+        }
+        out
+    }
+
+    /// Why a block will not be regenerated.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum NoRegen {
+        LineNotFound,
+        MixedStyleWithinLine,
+        NoCodes,
+        /// The font has no width table, so where one piece of the line ends
+        /// cannot be known.
+        NoMetrics,
+        /// Two pieces of one line are set at different scales or angles.
+        MixedMatrixWithinLine,
+    }
+
+    /// How much of the producer's own positioning the rebuild keeps.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fidelity {
+        /// Re-emit the original arrays verbatim at an explicit `Tm`.
+        /// ⚠️ A CONTROL, NOT A CANDIDATE. It changes nothing about what is
+        /// drawn, so anything it moves is a bug in the anchoring and not a cost
+        /// of reflow.
+        Replay,
+        /// Keep every adjustment except the justification slots, which are the
+        /// ones a reflow would have to recompute anyway.
+        KeepKerning,
+        /// Codes only. What redrawing a line plainly would produce.
+        CodesOnly,
+    }
+
+    /// ONE run's array, at the requested fidelity.
+    fn array_of(run: &ShownRun, content: &lopdf::content::Content, how: Fidelity)
+        -> Vec<lopdf::Object>
+    {
+        use lopdf::{Object, StringFormat};
+        let op = &content.operations[run.at];
+        if how == Fidelity::CodesOnly {
+            return vec![Object::String(run.codes.clone(), StringFormat::Hexadecimal)];
+        }
+        match op.operands.first() {
+            Some(Object::Array(a)) => {
+                let mut out = Vec::with_capacity(a.len());
+                // A slot is a number straight after a string ending in a space:
+                // exactly what `slots_of` calls one, and exactly what a reflow
+                // would have to recompute.
+                let mut after_space = false;
+                for o in a {
+                    match o {
+                        Object::String(b, _) => {
+                            after_space = b.last() == Some(&b' ');
+                            out.push(Object::String(b.clone(), StringFormat::Hexadecimal));
+                        }
+                        other => {
+                            if how == Fidelity::Replay || !after_space {
+                                out.push(other.clone());
+                            }
+                            after_space = false;
+                        }
+                    }
+                }
+                out
+            }
+            _ => vec![Object::String(run.codes.clone(), StringFormat::Hexadecimal)],
+        }
+    }
+
+    /// How far one run moves the text matrix, in the units its own `Tm`
+    /// translation is measured in.
+    ///
+    /// ⚠️ THE WHOLE POINT OF THE METRICS WORK. Half the corpus draws a line in
+    /// several pieces, and merging them into one run means knowing where each
+    /// piece ended. That is the glyph advance, which is exactly what the
+    /// generalized `font_metrics` now answers for any font at any size.
+    fn run_advance(m: &justified::Metrics, run: &ShownRun, op: &lopdf::content::Operation)
+        -> Option<f64>
+    {
+        use lopdf::Object;
+        let array: Vec<Object> = match op.operands.first() {
+            Some(Object::Array(a)) => a.clone(),
+            Some(Object::String(b, f)) => vec![Object::String(b.clone(), *f)],
+            _ => Vec::new(),
+        };
+        let glyphs = run.codes.len() as f64;
+        let spaces = run.codes.iter().filter(|b| **b == b' ').count() as f64;
+        // Per the spec: ((w0 - Tj/1000) * Tfs + Tc + Tw) * Th, summed.
+        Some((m.advance(&array)? + glyphs * run.tc + spaces * run.tw) * run.th)
+    }
+
+    fn regenerate_block(
+        content: &lopdf::content::Content,
+        runs: &[ShownRun],
+        advances: &[Option<f64>],
+        block: &block::Block,
+        how: Fidelity,
+    ) -> Result<lopdf::content::Content, NoRegen> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::Object;
+
+        let mut replace: std::collections::BTreeMap<usize, Vec<Operation>> =
+            std::collections::BTreeMap::new();
+        let mut drop: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
+        for line in &block.lines {
+            let mine: Vec<&ShownRun> = runs.iter()
+                .filter(|r| (r.y - line.baseline as f64).abs() < 0.05)
+                .collect();
+            let Some(first) = mine.first() else { return Err(NoRegen::LineNotFound) };
+            if mine.iter().any(|r| r.font != first.font || (r.size - first.size).abs() > 1e-6) {
+                return Err(NoRegen::MixedStyleWithinLine);
+            }
+            if mine.iter().all(|r| r.codes.is_empty()) { return Err(NoRegen::NoCodes); }
+
+            let place = |m: &M| Operation::new(
+                "Tm", m.0.iter().map(|v| Object::Real(*v as f32)).collect());
+
+            // ⚠️ ONE RUN FOR THE WHOLE LINE, in every mode. That is what a
+            // re-broken line is, so the control has to survive it too or it is
+            // not controlling for anything reflow will actually do. Where the
+            // producer left a gap between pieces, the gap is put back as a `TJ`
+            // adjustment computed from the MEASURED advance.
+            if mine.iter().any(|r| {
+                let (a, b) = (r.tm.0, first.tm.0);
+                (a[0] - b[0]).abs() > 1e-9 || (a[1] - b[1]).abs() > 1e-9
+                    || (a[2] - b[2]).abs() > 1e-9 || (a[3] - b[3]).abs() > 1e-9
+            }) {
+                return Err(NoRegen::MixedMatrixWithinLine);
+            }
+            let scale = first.tm.0[0];
+            let step = first.size * first.th * scale;
+            let mut merged: Vec<Object> = Vec::new();
+            for (k, r) in mine.iter().enumerate() {
+                if k > 0 {
+                    let prev = mine[k - 1];
+                    let Some(adv) = advances[prev.at] else { return Err(NoRegen::NoMetrics) };
+                    let landed = prev.tm.0[4] + adv * scale;
+                    let gap = r.tm.0[4] - landed;
+                    if gap.abs() > 1e-6 {
+                        if step.abs() < 1e-9 { return Err(NoRegen::NoMetrics); }
+                        merged.push(Object::Real((-gap / step * 1000.0) as f32));
+                    }
+                }
+                merged.extend(array_of(r, content, how));
+            }
+            let seq: Vec<Operation> =
+                vec![place(&first.tm), Operation::new("TJ", vec![Object::Array(merged)])];
+            replace.insert(first.at, seq);
+            for r in &mine[1..] { drop.insert(r.at); }
+        }
+
+        let mut ops = Vec::with_capacity(content.operations.len() + block.lines.len());
+        for (i, op) in content.operations.iter().enumerate() {
+            if let Some(sub) = replace.get(&i) {
+                ops.extend(sub.iter().cloned());
+            } else if !drop.contains(&i) {
+                ops.push(op.clone());
+            }
+        }
+        Ok(Content { operations: ops })
+    }
+
+    /// STEP D GATE. Can a block be redrawn from what the model knows, and still
+    /// look the same?
+    ///
+    /// ⚠️ THE QUESTION BEFORE REFLOW IS ALLOWED TO EXIST. Reflow discards the
+    /// producer's per-glyph positioning, because it is about to move the words.
+    /// If a paragraph cannot survive being redrawn with its OWN text, it will
+    /// not survive being redrawn with different text.
+    #[test]
+    #[ignore]
+    fn step_d_regeneration_gate() {
+        use lopdf::content::Content;
+        use lopdf::Object;
+        use std::collections::BTreeMap;
+
+        let roots = [
+            r"D:\Ayaan PDF Test file",
+            r"%USERPROFILE%\Downloads",
+            r"%USERPROFILE%\Downloads\Telegram Desktop",
+        ];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("pdf") { continue; }
+                if e.metadata().map(|m| m.len() > 20_000_000).unwrap_or(true) { continue; }
+                files.push(path);
+            }
+        }
+        files.sort();
+
+        const W: i32 = 700;
+        let modes = [
+            ("REPLAY  (control: same drawing, our anchor)", Fidelity::Replay),
+            ("KEEP KERNING, drop justification slots     ", Fidelity::KeepKerning),
+            ("CODES ONLY                                 ", Fidelity::CodesOnly),
+        ];
+        let mut identical = [0usize; 3];
+        let mut measured = [0usize; 3];
+        let mut inside_only = [0usize; 3];
+        let mut shares: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut worst: Vec<(f64, String)> = Vec::new();
+        let mut refused: BTreeMap<String, usize> = BTreeMap::new();
+        let mut multi_run_blocks = 0usize;
+        // Replay, split by whether the block has a line drawn in pieces. The
+        // single-run half needs no measured advance at all, so any difference
+        // between the two halves is the cost of MERGING.
+        let mut single_seen = 0usize;
+        let mut single_ok = 0usize;
+        let mut multi_seen = 0usize;
+        let mut multi_ok = 0usize;
+        let mut no_widths: BTreeMap<String, usize> = BTreeMap::new();
+        let mut type0_seen = 0usize;
+        let mut type0_ok = 0usize;
+        let mut simple_seen = 0usize;
+        let mut simple_ok = 0usize;
+        let mut error_bands: BTreeMap<&str, usize> = BTreeMap::new();
+
+        let render = |handle: u64, page: i32| -> Option<(i32, i32, Vec<u8>)> {
+            let r = render_uncached(handle, page, W);
+            if r.status != STATUS_OK_PDFIUM || r.buffer.is_null() {
+                free_render_result(r);
+                return None;
+            }
+            let px = unsafe { std::slice::from_raw_parts(r.buffer, r.len) }.to_vec();
+            let wh = (r.width, r.height);
+            free_render_result(r);
+            Some((wh.0, wh.1, px))
+        };
+
+        for path in &files {
+            let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let handle = open_document(c.as_ptr());
+            if handle == 0 { continue; }
+            for page in 0..3.min(get_page_count(handle)) {
+                let Ok((blocks, _)) = page_blocks(handle, page) else { continue };
+                if !blocks.iter().any(|b| b.lines.len() >= 2 && b.editable()) { continue; }
+
+                let snap = snapshot_document(handle);
+                if snap.status != STATUS_OK_PDFIUM { free_byte_buffer(snap); continue; }
+                let original = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+                free_byte_buffer(snap);
+                let Ok(doc) = lopdf::Document::load_mem(&original) else { continue };
+                let ids = doc.get_pages();
+                let Some(&pid) = ids.get(&(page as u32 + 1)) else { continue };
+                let Ok(content) = Content::decode(&doc.get_page_content(pid)) else { continue };
+                let runs = shown_runs(&content);
+                // ⚠️ ONE TABLE PER FONT AND SIZE, not per run. Resolving a font
+                // walks the page resources, and a page can draw thousands of
+                // runs in a handful of faces.
+                let mut tables: std::collections::BTreeMap<(Vec<u8>, u64), Option<justified::Metrics>> =
+                    std::collections::BTreeMap::new();
+                let mut advances: Vec<Option<f64>> = vec![None; content.operations.len()];
+                let mut is_cid: Vec<bool> = vec![false; content.operations.len()];
+                for r in &runs {
+                    let key = (r.font.clone(), r.size.to_bits());
+                    let table = tables.entry(key).or_insert_with(|| {
+                        justified::font_metrics(&doc, pid, &r.font, r.size).ok()
+                    });
+                    match table {
+                        Some(m) => {
+                            is_cid[r.at] = m.is_cid();
+                            advances[r.at] = run_advance(m, r, &content.operations[r.at]);
+                        }
+                        None => {
+                            // What KIND of font has no width table? The answer
+                            // decides whether this is a gap worth closing.
+                            let sub = doc.get_dictionary(pid).ok()
+                                .and_then(|d| d.get(b"Resources").ok().cloned())
+                                .and_then(|o| match o {
+                                    lopdf::Object::Reference(i) => doc.get_dictionary(i).ok().cloned(),
+                                    lopdf::Object::Dictionary(d) => Some(d),
+                                    _ => None,
+                                })
+                                .and_then(|res| res.get(b"Font").ok().cloned())
+                                .and_then(|o| match o {
+                                    lopdf::Object::Reference(i) => doc.get_dictionary(i).ok().cloned(),
+                                    lopdf::Object::Dictionary(d) => Some(d),
+                                    _ => None,
+                                })
+                                .and_then(|fonts| fonts.get(&r.font).ok().cloned())
+                                .and_then(|o| match o {
+                                    lopdf::Object::Reference(i) => doc.get_dictionary(i).ok().cloned(),
+                                    lopdf::Object::Dictionary(d) => Some(d),
+                                    _ => None,
+                                })
+                                .and_then(|f| f.get(b"Subtype").ok().cloned())
+                                .map(|o| match o {
+                                    lopdf::Object::Name(n) => String::from_utf8_lossy(&n).to_string(),
+                                    _ => "?".into(),
+                                })
+                                .unwrap_or_else(|| "font not resolvable".into());
+                            *no_widths.entry(sub).or_insert(0) += 1;
+                        }
+                    }
+                }
+
+                // The page box, for turning user-space y into a pixel row.
+                let media = doc.get_dictionary(pid).ok()
+                    .and_then(|d| d.get(b"MediaBox").ok().cloned())
+                    .or_else(|| doc.get_dictionary(pid).ok()
+                        .and_then(|d| d.get(b"Parent").ok().cloned()));
+                let bounds = match media {
+                    Some(Object::Array(a)) if a.len() == 4 => {
+                        let v: Vec<f64> = a.iter().filter_map(|o| match o {
+                            Object::Integer(n) => Some(*n as f64),
+                            Object::Real(r) => Some(*r as f64),
+                            _ => None,
+                        }).collect();
+                        if v.len() == 4 { Some((v[1], v[3])) } else { None }
+                    }
+                    _ => None,
+                };
+
+                let before_h = open_document_from_bytes(original.as_ptr(), original.len());
+                let before = render(before_h, page);
+                close_document(before_h);
+                let Some((w1, h1, a)) = before else { continue };
+
+                for b in blocks.iter().filter(|b| b.lines.len() >= 2 && b.editable()) {
+                    // ⚠️ NO LONGER RESTRICTED TO SINGLE-RUN LINES. The advance
+                    // of every run is measured above, so a line drawn in
+                    // several pieces can be merged with its gaps put back.
+                    let has_multi = b.lines.iter().any(|l| runs.iter()
+                        .filter(|r| (r.y - l.baseline as f64).abs() < 0.05).count() > 1);
+                    if has_multi { multi_run_blocks += 1; }
+                    // ⚠️ NEWLY MEASURABLE MEANS TYPE0, and nothing else. Before
+                    // this round a Type0 run had no width table at all, so the
+                    // block could not be attempted; separating them keeps the
+                    // old population comparable instead of quietly moving it.
+                    let newly = b.lines.iter().any(|l| runs.iter()
+                        .filter(|r| (r.y - l.baseline as f64).abs() < 0.05)
+                        .any(|r| is_cid[r.at]));
+                    for (mi, (_, how)) in modes.iter().enumerate() {
+                        let rebuilt = match regenerate_block(&content, &runs, &advances, b, *how) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                if mi == 0 { *refused.entry(format!("{e:?}")).or_insert(0) += 1; }
+                                continue;
+                            }
+                        };
+                        let Ok(encoded) = rebuilt.encode() else { continue };
+                        let mut out = doc.clone();
+                        if out.change_page_content(pid, encoded).is_err() { continue; }
+                        let mut bytes = Vec::new();
+                        if out.save_to(&mut bytes).is_err() { continue; }
+                        let after_h = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+                        let after = render(after_h, page);
+                        close_document(after_h);
+                        let Some((w2, h2, bpx)) = after else { continue };
+                        if (w1, h1) != (w2, h2) || a.len() != bpx.len() { continue; }
+
+                        // Which pixel rows the block covers.
+                        let band = bounds.map(|(lo, hi)| {
+                            // The block's band, from its baselines plus a
+                            // line height either side for ascenders and
+                            // descenders.
+                            let h = b.lines[0].height as f64;
+                            let top = b.lines.iter().map(|l| l.baseline)
+                                .fold(f32::MIN, f32::max) as f64 + h;
+                            let bot = b.lines.iter().map(|l| l.baseline)
+                                .fold(f32::MAX, f32::min) as f64 - h;
+                            let span = (hi - lo).max(1.0);
+                            let r0 = ((hi - top) / span * h1 as f64).floor().max(0.0) as usize;
+                            let r1 = ((hi - bot) / span * h1 as f64).ceil().min(h1 as f64) as usize;
+                            (r0.saturating_sub(2), (r1 + 2).min(h1 as usize))
+                        });
+
+                        let mut changed = 0usize;
+                        let mut outside = 0usize;
+                        for (i, (x, y)) in a.chunks_exact(4).zip(bpx.chunks_exact(4)).enumerate() {
+                            if x == y { continue; }
+                            changed += 1;
+                            let row = i / w1 as usize;
+                            if let Some((r0, r1)) = band {
+                                if row < r0 || row >= r1 { outside += 1; }
+                            }
+                        }
+                        let total = (w1 as usize) * (h1 as usize);
+                        let share = if total == 0 { 0.0 } else { changed as f64 / total as f64 * 100.0 };
+                        measured[mi] += 1;
+                        shares[mi].push(share);
+                        if changed == 0 { identical[mi] += 1; }
+                        if mi == 0 {
+                            if has_multi {
+                                multi_seen += 1;
+                                if changed == 0 { multi_ok += 1; }
+                            } else {
+                                single_seen += 1;
+                                if changed == 0 { single_ok += 1; }
+                            }
+                            if newly {
+                                type0_seen += 1;
+                                if changed == 0 { type0_ok += 1; }
+                            } else {
+                                simple_seen += 1;
+                                if changed == 0 { simple_ok += 1; }
+                            }
+                            let band = match share {
+                                x if x == 0.0 => "exact",
+                                x if x < 0.01 => "under 0.01% of the page",
+                                x if x < 0.1 => "0.01-0.1%",
+                                x if x < 0.5 => "0.1-0.5%",
+                                x if x < 2.0 => "0.5-2%",
+                                _ => "over 2%",
+                            };
+                            *error_bands.entry(band).or_insert(0) += 1;
+                        }
+                        if outside == 0 { inside_only[mi] += 1; }
+                        if mi == 0 && share > 0.0 {
+                            worst.push((share, format!("{}#p{page}",
+                                path.file_name().unwrap().to_string_lossy())));
+                        }
+                    }
+                }
+            }
+            close_document(handle);
+        }
+
+        let pct = |v: usize, of: usize| if of == 0 { 0.0 } else { v as f64 / of as f64 * 100.0 };
+        println!("STEP D REGENERATION GATE");
+        println!("of them, blocks with a line drawn in several pieces: {multi_run_blocks}");
+        println!("\nREFUSED BEFORE RENDERING");
+        if refused.is_empty() { println!("  none"); }
+        for (k, v) in &refused { println!("  {v:5}  {k}"); }
+
+        for (mi, (name, _)) in modes.iter().enumerate() {
+            let m = measured[mi];
+            let mut v = shares[mi].clone();
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let median = if v.is_empty() { 0.0 } else { v[v.len() / 2] };
+            let p90 = if v.is_empty() { 0.0 } else { v[v.len() * 9 / 10] };
+            println!("\n{name}");
+            println!("  blocks measured        {m}");
+            println!("  pixel-identical        {} ({:.1}%)", identical[mi], pct(identical[mi], m));
+            println!("  changed only INSIDE the block   {} ({:.1}%)",
+                inside_only[mi], pct(inside_only[mi], m));
+            println!("  median page difference {median:.4}%   p90 {p90:.4}%");
+        }
+
+        println!("\nTHE CONTROL, BY POPULATION");
+        println!("  previously measurable (simple fonts) : {simple_ok}/{simple_seen} exact ({:.1}%)",
+            pct(simple_ok, simple_seen));
+        println!("  newly measurable (a Type0 run)       : {type0_ok}/{type0_seen} exact ({:.1}%)",
+            pct(type0_ok, type0_seen));
+
+        println!("\nREPLAY ERROR DISTRIBUTION");
+        for (k, v) in &error_bands {
+            println!("  {k:<24} {v:5}  ({:.1}%)", pct(*v, measured[0]));
+        }
+
+        println!("\nTHE CONTROL, SPLIT BY WHETHER MERGING WAS NEEDED");
+        println!("  every line in one piece : {single_ok}/{single_seen} identical ({:.1}%)",
+            pct(single_ok, single_seen));
+        println!("  some line in pieces     : {multi_ok}/{multi_seen} identical ({:.1}%)",
+            pct(multi_ok, multi_seen));
+
+        println!("\nRUNS WHOSE FONT HAS NO WIDTH TABLE, BY SUBTYPE");
+        if no_widths.is_empty() { println!("  none"); }
+        for (k, v) in &no_widths { println!("  {v:6}  {k}"); }
+
+        worst.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+        println!("\nWORST CONTROL FAILURES (Replay should have been identical)");
+        if worst.is_empty() { println!("  none: the control reproduced every block exactly"); }
+        for (share, who) in worst.iter().take(8) { println!("  {share:7.3}%  {who}"); }
+    }
+
+    /// STEP D GATE, PART 0b. If the lines are not in the page's own stream,
+    /// where are they?
+    #[test]
+    #[ignore]
+    fn step_d_where_is_the_text() {
+        use lopdf::content::Content;
+        use std::collections::BTreeMap;
+        let roots = [
+            r"D:\Ayaan PDF Test file",
+            r"%USERPROFILE%\Downloads",
+            r"%USERPROFILE%\Downloads\Telegram Desktop",
+        ];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("pdf") { continue; }
+                if e.metadata().map(|m| m.len() > 20_000_000).unwrap_or(true) { continue; }
+                files.push(path);
+            }
+        }
+        files.sort();
+        let mut kind: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut lines_by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut pages = 0usize;
+        for path in &files {
+            let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let handle = open_document(c.as_ptr());
+            if handle == 0 { continue; }
+            for page in 0..3.min(get_page_count(handle)) {
+                let Ok((blocks, _)) = page_blocks(handle, page) else { continue };
+                let want: usize = blocks.iter().filter(|b| b.lines.len() >= 2)
+                    .map(|b| b.lines.len()).sum();
+                if want == 0 { continue; }
+                let snap = snapshot_document(handle);
+                if snap.status != STATUS_OK_PDFIUM { free_byte_buffer(snap); continue; }
+                let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+                free_byte_buffer(snap);
+                let Ok(doc) = lopdf::Document::load_mem(&bytes) else { continue };
+                let ids = doc.get_pages();
+                let Some(&pid) = ids.get(&(page as u32 + 1)) else { continue };
+                let Ok(content) = Content::decode(&doc.get_page_content(pid)) else { continue };
+                pages += 1;
+                let shows = content.operations.iter()
+                    .filter(|o| matches!(o.operator.as_str(), "TJ"|"Tj"|"'"|"\"")).count();
+                let dos = content.operations.iter().filter(|o| o.operator == "Do").count();
+                let cms = content.operations.iter().filter(|o| o.operator == "cm").count();
+                let k = if shows == 0 && dos > 0 {
+                    "page stream draws NO text, only XObjects"
+                } else if shows == 0 {
+                    "page stream draws no text and no XObjects"
+                } else if shows < want {
+                    "fewer runs in the page stream than lines on the page"
+                } else if cms > 0 {
+                    "text in the page stream, but the page is transformed (cm)"
+                } else {
+                    "text in the page stream, untransformed"
+                };
+                *kind.entry(k).or_insert(0) += 1;
+                *lines_by_kind.entry(k).or_insert(0) += want;
+            }
+            close_document(handle);
+        }
+        let pct = |v: usize, of: usize| if of == 0 { 0.0 } else { v as f64 / of as f64 * 100.0 };
+        println!("WHERE THE TEXT IS  pages {pages}");
+        let mut rows: Vec<(&&str, &usize)> = kind.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        for (k, v) in rows {
+            println!("  {v:5} pages ({:5.1}%)  {:6} lines   {k}",
+                pct(*v, pages), lines_by_kind[*k]);
+        }
+    }
+
     /// THE STEP A/B CORPUS, against the model as it actually shipped.
     ///
     /// Not a regression test in CI: it reads the machine's own PDF folders and

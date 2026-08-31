@@ -48,7 +48,7 @@ pub(crate) struct CidWidths {
 }
 
 impl CidWidths {
-    fn of(&self, cid: u16) -> f64 {
+    pub(crate) fn of(&self, cid: u16) -> f64 {
         self.by_cid.get(&cid).copied().unwrap_or(self.default)
     }
 }

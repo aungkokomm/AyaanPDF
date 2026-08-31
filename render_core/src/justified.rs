@@ -362,7 +362,7 @@ struct EditPlan {
 }
 
 /// The font metrics the line is set in, read from the document itself.
-struct Metrics {
+pub(crate) struct Metrics {
     first_char: i64,
     widths: Vec<f64>,
     /// Type size times the text matrix's horizontal scale. It CANCELS out of
@@ -379,6 +379,18 @@ struct Metrics {
     /// writes it. Empty when the font has none, or when nothing in it was
     /// unambiguous.
     inverse: BTreeMap<char, u8>,
+    /// The width for a code `/Widths` does not cover, from the descriptor's
+    /// `/MissingWidth`.
+    ///
+    /// ⚠️ `None` MEANS UNANSWERABLE, NOT ZERO. A code outside the table used to
+    /// contribute nothing, so a font that simply failed to declare a width
+    /// moved everything after it and said nothing. Measured on the corpus: 282
+    /// runs are set in a simple font with no width table at all.
+    missing_width: Option<f64>,
+    /// A Type0 font's CID widths. `None` for a simple font, whose codes are one
+    /// byte; `Some` means codes are TWO bytes and widths come from the
+    /// descendant's `/W` and `/DW`.
+    cid: Option<crate::shaped::CidWidths>,
 }
 
 fn number(o: &Object) -> Option<f64> {
@@ -552,15 +564,40 @@ fn plan(doc: &Document, page_index: i32, baseline: f32, expected: &[u8])
 }
 
 fn metrics(doc: &Document, plan: &EditPlan) -> Result<Metrics, i32> {
-    let font_name = &plan.font_name;
-
     // The text matrix scales the type as well as placing it.
     let scale = plan
         .tm
         .as_ref()
         .and_then(|operands| operands.first().and_then(number))
         .unwrap_or(1.0);
-    let size = plan.font_size * scale;
+    let m = font_metrics(doc, plan.located.page_id, &plan.font_name, plan.font_size * scale)?;
+    // ⚠️ PATH A STILL REFUSES TYPE0, EXACTLY AS IT ALWAYS HAS. `font_metrics`
+    // learned to read them so the measurement could; letting that widen what
+    // Path A accepts would change its answer on lines it has refused since the
+    // day it was written, and the 76-line byte-identical baseline is what says
+    // it has not.
+    if m.cid.is_some() {
+        return Err(STATUS_FONT_METRICS_UNAVAILABLE);
+    }
+    Ok(m)
+}
+
+/// The same table, for any font resource named on any page, at any size.
+///
+/// ⚠️ THE SAME CODE PATH `metrics` ALWAYS USED, lifted out so it can be asked
+/// about a font rather than about an anchored line. `metrics` is now a wrapper
+/// that works out the size and calls this; nothing about what Path A resolves,
+/// accepts or refuses changed, and the 76-line byte-identical baseline is what
+/// says so.
+///
+/// `size` is the type size with the text matrix's horizontal scale already
+/// folded in, exactly as `metrics` computed it.
+pub(crate) fn font_metrics(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+    font_name: &[u8],
+    size: f64,
+) -> Result<Metrics, i32> {
     if size <= 0.0 {
         return Err(STATUS_FONT_METRICS_UNAVAILABLE);
     }
@@ -573,13 +610,55 @@ fn metrics(doc: &Document, plan: &EditPlan) -> Result<Metrics, i32> {
         }
     };
     let fail = |_| STATUS_FONT_METRICS_UNAVAILABLE;
-    let page = doc.get_dictionary(plan.located.page_id).map_err(fail)?;
+    let page = doc.get_dictionary(page_id).map_err(fail)?;
     let resources = deref(page.get(b"Resources").map_err(fail)?)
         .ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
     let fonts = deref(resources.get(b"Font").map_err(fail)?)
         .ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
-    let font = deref(fonts.get(font_name).map_err(fail)?)
-        .ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
+    let entry = fonts.get(font_name).map_err(fail)?;
+    let font = deref(entry).ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
+
+    // ⚠️ TYPE0 KEEPS ITS WIDTHS SOMEWHERE ELSE ENTIRELY: on the descendant
+    // font, as `/W` and `/DW`, and its codes are two bytes rather than one.
+    // Read with the module this app already uses for exactly that, rather than
+    // with a second idea of what a font is.
+    let subtype = font.get(b"Subtype").ok().and_then(|o| match o {
+        Object::Name(n) => Some(n.clone()),
+        _ => None,
+    });
+    if subtype.as_deref() == Some(b"Type0".as_slice()) {
+        // ⚠️ IDENTITY-H ONLY. Under any other CMap a code is not its own CID,
+        // and guessing the mapping is exactly the silent drift the other half
+        // of this change exists to stop.
+        let identity = matches!(font.get(b"Encoding"), Ok(Object::Name(n)) if n == b"Identity-H");
+        let Object::Reference(font_id) = entry else {
+            return Err(STATUS_FONT_METRICS_UNAVAILABLE);
+        };
+        let Some(cid) = crate::shaped::cid_widths(doc, *font_id).filter(|_| identity) else {
+            return Err(STATUS_FONT_METRICS_UNAVAILABLE);
+        };
+        let (base_winansi, differences) = encoding_of(doc, &font);
+        return Ok(Metrics {
+            first_char: 0,
+            widths: Vec::new(),
+            size,
+            base_winansi,
+            differences,
+            inverse: to_unicode_inverse(doc, &font),
+            missing_width: None,
+            cid: Some(cid),
+        });
+    }
+
+    // A simple font's own fallback for codes its `/Widths` does not reach.
+    //
+    // ⚠️ OPTIONAL AT EVERY STEP. Plenty of fonts carry no
+    // `/FontDescriptor` at all, the base-14 among them, and demanding one here
+    // turned "this font declares no fallback" into "this font cannot be
+    // measured" for 23 tests' worth of perfectly ordinary type.
+    let missing_width = font.get(b"FontDescriptor").ok()
+        .and_then(deref)
+        .and_then(|d| d.get(b"MissingWidth").ok().and_then(number));
 
     let first_char = font.get(b"FirstChar").map_err(fail)?.as_i64().map_err(fail)?;
     let widths: Vec<f64> = match font.get(b"Widths").map_err(fail)? {
@@ -601,7 +680,10 @@ fn metrics(doc: &Document, plan: &EditPlan) -> Result<Metrics, i32> {
     let (base_winansi, differences) = encoding_of(doc, &font);
     let inverse = to_unicode_inverse(doc, &font);
 
-    Ok(Metrics { first_char, widths, size, base_winansi, differences, inverse })
+    Ok(Metrics {
+        first_char, widths, size, base_winansi, differences, inverse,
+        missing_width, cid: None,
+    })
 }
 
 impl Metrics {
@@ -642,33 +724,56 @@ impl Metrics {
         })
     }
 
-    fn width_of(&self, bytes: &[u8]) -> f64 {
-        bytes
-            .iter()
-            .map(|b| {
+    /// Whether this is a Type0 font, whose codes are two bytes.
+    pub(crate) fn is_cid(&self) -> bool {
+        self.cid.is_some()
+    }
+
+    /// What these codes advance by, or `None` if any of them has no width this
+    /// font can be asked for.
+    ///
+    /// ⚠️ NEVER 0.0 FOR AN UNKNOWN CODE. A missing width used to contribute
+    /// nothing, which is indistinguishable from a zero-width glyph and moves
+    /// everything after it. Refusing turns a silent positional error into a
+    /// refusal, which is what every other unanswerable question in this module
+    /// already does.
+    pub(crate) fn width_of(&self, bytes: &[u8]) -> Option<f64> {
+        let mut sum = 0.0;
+        if let Some(cid) = &self.cid {
+            // Two-byte codes, and `/DW` covers everything `/W` does not, so a
+            // CID is never unanswerable.
+            if bytes.len() % 2 != 0 {
+                return None;
+            }
+            for pair in bytes.chunks_exact(2) {
+                sum += cid.of(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+        } else {
+            for b in bytes {
                 let i = *b as i64 - self.first_char;
-                if i >= 0 && (i as usize) < self.widths.len() {
-                    self.widths[i as usize]
+                let w = if i >= 0 && (i as usize) < self.widths.len() {
+                    Some(self.widths[i as usize])
                 } else {
-                    0.0
-                }
-            })
-            .sum::<f64>()
-            / 1000.0
-            * self.size
+                    self.missing_width
+                };
+                sum += w?;
+            }
+        }
+        Some(sum / 1000.0 * self.size)
     }
 
     /// What the array advances by: glyph widths, less what the adjustments
     /// take back. A `TJ` number is SUBTRACTED from the position, so a negative
     /// one widens.
-    fn advance(&self, array: &[Object]) -> f64 {
-        array
-            .iter()
-            .map(|o| match o {
-                Object::String(b, _) => self.width_of(b),
-                other => number(other).map(|n| -n / 1000.0 * self.size).unwrap_or(0.0),
-            })
-            .sum()
+    pub(crate) fn advance(&self, array: &[Object]) -> Option<f64> {
+        let mut sum = 0.0;
+        for o in array {
+            match o {
+                Object::String(b, _) => sum += self.width_of(b)?,
+                other => sum += number(other).map(|n| -n / 1000.0 * self.size).unwrap_or(0.0),
+            }
+        }
+        Some(sum)
     }
 }
 
@@ -777,10 +882,11 @@ fn solve(array: &[Object], slots: &[bool], target: f64, m: &Metrics) -> Result<V
         .enumerate()
         .map(|(i, o)| match o {
             Object::String(b, _) => m.width_of(b),
-            other if !slots[i] => number(other).map(|n| -n / 1000.0 * m.size).unwrap_or(0.0),
-            _ => 0.0,
+            other if !slots[i] => Some(number(other).map(|n| -n / 1000.0 * m.size).unwrap_or(0.0)),
+            _ => Some(0.0),
         })
-        .sum();
+        .sum::<Option<f64>>()
+        .ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
 
     let each = (target - natural) / count as f64;
     if each < 0.0 {
@@ -858,7 +964,8 @@ pub(crate) fn rewrite_bytes(
 
     // The width this line must still have when the edit is done. Taken BEFORE
     // the splice, from the line as it stands.
-    let target = m.advance(&plan.located.array);
+    let target = m.advance(&plan.located.array)
+        .ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
 
     let spliced = splice(&plan.located.array, at, len, &new);
     let slots = slots_of(&spliced);
@@ -976,21 +1083,23 @@ fn solve_shaped(
         return Err(STATUS_UNSUPPORTED);
     }
 
-    let natural_of = |array: &[Object], slots: &[bool]| -> f64 {
+    let natural_of = |array: &[Object], slots: &[bool]| -> Option<f64> {
         array
             .iter()
             .enumerate()
             .map(|(i, o)| match o {
                 Object::String(b, _) => m.width_of(b),
-                other if !slots[i] => number(other).map(|n| -n / 1000.0 * m.size).unwrap_or(0.0),
-                _ => 0.0,
+                other if !slots[i] => Some(number(other).map(|n| -n / 1000.0 * m.size).unwrap_or(0.0)),
+                _ => Some(0.0),
             })
-            .sum()
+            .sum::<Option<f64>>()
     };
     // ⚠️ THE REPLACEMENT ARRIVES AS A NUMBER, NOT AN ARRAY. Its strings are
     // two-byte CID codes in a font this `Metrics` knows nothing about, so
     // measuring them here would read each byte as a code in the wrong font.
-    let natural = natural_of(before, slots_before) + natural_of(after, slots_after) + replacement;
+    let natural = natural_of(before, slots_before).ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?
+        + natural_of(after, slots_after).ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?
+        + replacement;
 
     let each = (target - natural) / count as f64;
     if each < 0.0 {
@@ -1057,7 +1166,8 @@ pub(crate) fn rewrite_bytes_shaped(
     let m = metrics(&doc, &plan)?;
 
     // Taken BEFORE anything changes, from the line as it stands.
-    let target = m.advance(&plan.located.array);
+    let target = m.advance(&plan.located.array)
+        .ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
 
     let Some(widths) = crate::shaped::cid_widths(&doc, font_id) else {
         return Err(STATUS_FONT_METRICS_UNAVAILABLE);
@@ -1092,7 +1202,7 @@ pub(crate) fn rewrite_bytes_shaped(
 
     // Where the replacement will actually sit, measured from the SOLVED array
     // because the slots either side of it have just moved.
-    let offset_pt = m.advance(&before);
+    let offset_pt = m.advance(&before).ok_or(STATUS_FONT_METRICS_UNAVAILABLE)?;
 
     // Built BEFORE the operator vector is taken out of the plan, because it
     // reads the line's own font and matrix off it.
