@@ -5236,9 +5236,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RecordEdit(new LineTextRecord(
             page, line.FirstObject, line.LastObject, line.PrefixChars, line.Text, newText));
 
-        int status = Interop.LineGateway.Write(
-            _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
-            line.FontName, newText, line.Text);
+        // ⚠️ THE OBJECT WRITER IS NEVER HANDED A LINE ROUTED PAST IT. Its own
+        // rule set is what refused this line in the first place, so offering it
+        // one anyway would be asking it to do the thing it declined. A block
+        // line goes straight to the writer that takes it.
+        int status = line.Route == LineWriter.BlockWriter
+            ? Interop.LineGateway.WriteAsBlock(
+                _documentHandle, page, line.FirstObject, line.LastObject,
+                line.Text, newText)
+            : Interop.LineGateway.Write(
+                _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
+                line.FontName, newText, line.Text);
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -5250,6 +5258,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             {
                 RenderStatus.TooWide =>
                     "That is too long to fit on the line. Try fewer words.",
+                // The block writer never asks for a stand-in font, so naming
+                // one would be explaining a refusal that did not happen.
+                RenderStatus.Unsupported when line.Route == LineWriter.BlockWriter =>
+                    "This line cannot be rewritten with the letters it needs.",
                 RenderStatus.Unsupported =>
                     SystemFontMatch.PathFor(line.FontName) is null
                         ? $"“{line.FontName}” is not a font this app can match, so the line cannot be retyped."
@@ -5391,11 +5403,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // it selected; the second says where in it to type. Nothing is guessed from
     // how fast the clicks arrive, and nothing is hidden behind a count of them.
     //
-    // The unit is the LINE when the line can be edited and the WORD under the
-    // click when it cannot. That fallback is load-bearing rather than tidy: a
-    // justified line refuses by design, and so do a mixed-style line and two
-    // labels sharing a baseline, but every WORD on those lines is editable. A
-    // line-only rule would make a typo in justified body text uncorrectable.
+    // The unit is the LINE when some writer will take the line, and the WORD
+    // under the click when none will. The fallback is load-bearing rather than
+    // tidy: a rotated line, or two labels sharing a baseline, cannot be retyped
+    // whole, and offering the reader the word is the difference between a
+    // limitation and a click that did nothing.
+    //
+    // ⚠️ AND THE WORD IS NOT A WAY ROUND A JUSTIFIED LINE. It reads as though
+    // it were, so it is worth saying plainly: the core copies a line's
+    // justified flag onto every word on it, precisely so that editing one word
+    // cannot leave the margin ragged. Justified lines are reached through
+    // `LineWriter.BlockWriter` instead, which keeps the spacing.
 
     private TextUnitSelection? _selectedTextUnit;
 
@@ -12159,9 +12177,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        int status = Interop.LineGateway.Write(
-            _documentHandle, record.Page, line.FirstObject, line.LastObject,
-            line.PrefixChars, line.FontName, wanted, line.Text);
+        // The same dispatch the edit made, so undo cannot reach a writer the
+        // edit did not.
+        int status = line.Route == LineWriter.BlockWriter
+            ? Interop.LineGateway.WriteAsBlock(
+                _documentHandle, record.Page, line.FirstObject, line.LastObject,
+                line.Text, wanted)
+            : Interop.LineGateway.Write(
+                _documentHandle, record.Page, line.FirstObject, line.LastObject,
+                line.PrefixChars, line.FontName, wanted, line.Text);
 
         if (status != RenderStatus.OkPdfium)
         {

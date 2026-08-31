@@ -56,7 +56,11 @@ public class TextUnitSelectionTests
         // It is still selected and still boxed. Showing the reader what they
         // clicked and saying why it cannot change is the difference between a
         // limitation and a click that did nothing.
-        var unit = TextUnitSelection.From(0, Line("justified text", 0.10, 0.60, LineRefusal.Justified));
+        //
+        // ⚠️ SHAPED TEXT, NOT JUSTIFIED TEXT, because a justified line is no
+        // longer refused: it is routed to the writer that splices it. This
+        // needs a line NO writer will take, and shaped text is that line.
+        var unit = TextUnitSelection.From(0, Line("မြန်မာစာ", 0.10, 0.60, LineRefusal.ComplexScript));
 
         Assert.False(unit.CanEdit);
         Assert.NotEqual(string.Empty, unit.RefusalReason);

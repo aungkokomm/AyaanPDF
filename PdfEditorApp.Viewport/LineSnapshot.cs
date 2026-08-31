@@ -47,6 +47,31 @@ public enum LineRefusal
     ComplexScript = 11,
 }
 
+/// <summary>Which writer, if any, will be asked to retype a line.</summary>
+///
+/// <remarks>
+/// ⚠️ THE ONE CAPABILITY DECISION, AND EVERYTHING READS IT. The frame colour,
+/// what a click selects, and which core call the edit makes are all derived
+/// from this and from nothing else. They used to be derived from
+/// <see cref="LineRefusal"/> directly, which is the OBJECT writer's rule set,
+/// and that made the app paint a line "refused" and refuse to write it while a
+/// writer that handles it sat behind the gate untried.
+/// </remarks>
+public enum LineWriter
+{
+    /// <summary>No writer will take it. This is the only state that refuses.</summary>
+    None = 0,
+
+    /// <summary>The writer that replaces the objects drawing the line.</summary>
+    ObjectWriter = 1,
+
+    /// <summary>
+    /// The writer that splices the line where it stands, leaving the
+    /// producer's own pieces alone.
+    /// </summary>
+    BlockWriter = 2,
+}
+
 /// <summary>
 /// ONE VISUAL LINE of the document's own text, and the range of page objects
 /// that draws it.
@@ -93,8 +118,42 @@ public sealed record LineSnapshot(
     string Text,
     string FontName)
 {
-    /// <summary>Whether the core would accept a retype of this line.</summary>
-    public bool CanEdit => Refusal == LineRefusal.None;
+    /// <summary>Which writer will be asked to retype this line.</summary>
+    ///
+    /// <remarks>
+    /// ⚠️ <see cref="LineRefusal"/> IS THE OBJECT WRITER'S RULE SET, NOT THE
+    /// APP'S. Four of its refusals are only refusals for that writer, because
+    /// it rebuilds a line into a single object and so needs one font, one size,
+    /// whole objects, and even spacing. The block writer needs none of that: it
+    /// changes the characters that moved inside the one piece that draws them
+    /// and leaves every other operator as the producer wrote it. Justified is
+    /// the plainest case of all, since Path A exists precisely to re-solve a
+    /// justified line's spacing.
+    ///
+    /// ⚠️ AND THE REST STAY REFUSED ON PURPOSE. A shaped script is read back
+    /// by PDFium in reading order while the stream draws it in visual order, so
+    /// the two can agree on length and disagree on meaning; that was measured,
+    /// and it is why complex script is refused here rather than attempted.
+    /// Rotated, gapped, out-of-order and foreign-object lines are refused
+    /// because neither writer handles them.
+    /// </remarks>
+    public LineWriter Route => Refusal switch
+    {
+        LineRefusal.None => LineWriter.ObjectWriter,
+
+        LineRefusal.Justified => LineWriter.BlockWriter,
+        LineRefusal.MixedStyle => LineWriter.BlockWriter,
+        LineRefusal.PartialSpan => LineWriter.BlockWriter,
+        LineRefusal.NoFontName => LineWriter.BlockWriter,
+
+        _ => LineWriter.None,
+    };
+
+    /// <summary>Whether any writer will accept a retype of this line.</summary>
+    ///
+    /// ⚠️ DERIVED FROM <see cref="Route"/> AND NOT FROM THE REFUSAL, so the
+    /// frame the reader sees and the call the edit makes cannot disagree.
+    public bool CanEdit => Route != LineWriter.None;
 
     /// <summary>
     /// What to tell a reader who tried to retype this line, in their terms

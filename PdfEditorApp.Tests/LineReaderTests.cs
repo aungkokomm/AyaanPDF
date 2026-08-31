@@ -106,7 +106,7 @@ public class LineReaderTests
         Assert.Equal(2, lines.Count);
         Assert.Equal("Chapter One", lines[0].Text);
         Assert.Equal(LineRefusal.Justified, lines[1].Refusal);
-        Assert.False(lines[1].CanEdit);
+        Assert.Equal(LineWriter.BlockWriter, lines[1].Route);
     }
 
     [Fact]
@@ -185,8 +185,12 @@ public class LineReaderTests
         var line = Assert.Single(LineReader.Parse(bytes));
 
         Assert.Equal(expected, line.Refusal);
-        Assert.False(line.CanEdit);
         Assert.NotEqual(string.Empty, line.RefusalReason);
+
+        // Whether a refusal means the app gives up is not a wire question and
+        // is not asked here: four of these are only the OBJECT writer's
+        // objections and the block writer takes them. `LineRouteTests` owns
+        // that table, value by value.
     }
 
     [Fact]

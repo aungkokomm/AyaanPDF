@@ -162,11 +162,49 @@ public class LineEditWiringTests
     [Fact]
     public void undo_takes_the_same_route_the_edit_took()
     {
-        // Both go through the one gateway method, so undo cannot reach a writer
-        // the edit did not, whichever of the two wrote it.
-        string code = ViewModel();
-        Assert.Equal(2, Count(code, "Interop.LineGateway.Write("));
-        Assert.DoesNotContain("Interop.LineGateway.WriteAsBlock(", code, StringComparison.Ordinal);
+        // ⚠️ THE SAME DISPATCH, WRITTEN THE SAME WAY, in both places. Undo
+        // reaching a writer the edit did not is how a line comes back subtly
+        // different from the one that was there.
+        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
+        string undo = Body(ViewModel(), "private void ApplyLineText(LineTextRecord record, bool backwards)");
+
+        foreach (string body in new[] { edit, undo })
+        {
+            Assert.Contains("line.Route == LineWriter.BlockWriter", body, StringComparison.Ordinal);
+            Assert.Contains("Interop.LineGateway.WriteAsBlock(", body, StringComparison.Ordinal);
+            Assert.Contains("Interop.LineGateway.Write(", body, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void the_object_writer_is_never_handed_a_block_routed_line()
+    {
+        // Its own rule set is what refused the line, so offering it one anyway
+        // asks it to do the thing it declined. The ternary is the guarantee:
+        // the block branch is the one that runs, and it does not fall through.
+        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
+
+        int test = edit.IndexOf("line.Route == LineWriter.BlockWriter", StringComparison.Ordinal);
+        int block = edit.IndexOf("Interop.LineGateway.WriteAsBlock(", StringComparison.Ordinal);
+        int old = edit.IndexOf("Interop.LineGateway.Write(", StringComparison.Ordinal);
+
+        Assert.True(test > 0, "the edit does not ask which writer the line is routed to");
+        Assert.True(test < block, "it writes before it asks");
+        Assert.True(block < old, "the block branch is not the one the test selects");
+    }
+
+    [Fact]
+    public void the_frame_and_the_writer_read_one_decision()
+    {
+        // ⚠️ THE WHOLE POINT OF THE ROUTING LAYER. The frame is painted from
+        // CanEdit and the writer chosen from Route; if CanEdit carried a rule of
+        // its own, the app could paint a line refused and write it anyway, which
+        // is the bug this replaced. CanEdit is DERIVED, and this says so.
+        string snapshot = Source("PdfEditorApp.Viewport", "LineSnapshot.cs");
+
+        Assert.Contains("public bool CanEdit => Route != LineWriter.None;", snapshot,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("CanEdit => Refusal ==", snapshot, StringComparison.Ordinal);
     }
 
     [Fact]

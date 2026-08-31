@@ -66,6 +66,17 @@
       single-object kind our own writers make. The block line writer is proved
       against it end to end.
     -->
+    <!--
+      One page carrying most of the routing table at once: four justified lines
+      and a mixed-style one, which the app used to paint refused and never offer
+      to any writer, next to an Arabic line and a rotated line, which stay
+      refused. Ordinary ragged-right paragraphs sit between them as the control.
+    -->
+    <Content Include="..\render_core\tests\fixtures\sample_lines.pdf"
+             Condition="Exists('..\render_core\tests\fixtures\sample_lines.pdf')">
+      <Link>sample_lines.pdf</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="..\render_core\tests\fixtures\sample_font_cases.pdf"
              Condition="Exists('..\render_core\tests\fixtures\sample_font_cases.pdf')">
       <Link>sample_font_cases.pdf</Link>

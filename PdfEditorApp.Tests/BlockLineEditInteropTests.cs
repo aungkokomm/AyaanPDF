@@ -176,6 +176,177 @@ public class BlockLineEditInteropTests
         }
     }
 
+    // ============ the case the routing layer exists for ============
+
+    /// <summary>
+    /// A justified line, which the app painted "refused" and never offered to
+    /// any writer until the routing layer went in.
+    ///
+    /// ⚠️ THE MARGIN IS THE POINT, not just the words. Justification is the
+    /// object writer's objection for a real reason: rebuilding the line would
+    /// set every space to the font's own width and the right edge would stop
+    /// lining up with the rest of the paragraph. Path A re-solves the spacing
+    /// instead, so this asserts the right edge held, and would fail if the line
+    /// had been rebuilt rather than spliced.
+    /// </summary>
+    [Fact]
+    public void a_justified_line_routes_to_the_block_writer_and_keeps_its_margin()
+    {
+        ulong handle = open_document(Fixture("sample_lines.pdf"));
+        Assert.NotEqual(0ul, handle);
+        try
+        {
+            var lines = LinesOf(handle, 0);
+            var line = lines.First(l => l.Refusal == LineRefusal.Justified);
+
+            // What the app decides before it writes anything.
+            Assert.Equal(LineWriter.BlockWriter, line.Route);
+            Assert.True(line.CanEdit, "a justified line is still painted refused");
+
+            string word = line.Text.Split(' ').Last(w => w.Length >= 4);
+            string retyped = line.Text.Replace(word, word[..^1]);
+
+            byte[] want = Encoding.UTF8.GetBytes(line.Text);
+            byte[] text = Encoding.UTF8.GetBytes(retyped);
+            Assert.Equal(OkPdfium, set_block_line_text(handle, 0,
+                (uint)line.FirstObject, (uint)line.LastObject,
+                want, (nuint)want.Length, text, (nuint)text.Length));
+
+            var after = LinesOf(handle, 0);
+            Assert.Contains(after, l => l.Text.Trim() == retyped.Trim());
+
+            // The line starts where it started. Everything about this writer
+            // rests on it changing the characters that moved and nothing else,
+            // so a shifted left edge would mean the line had been rebuilt.
+            var samePlace = after.First(l => l.Text.Trim() == retyped.Trim());
+            Assert.True(Math.Abs(samePlace.Left - line.Left) < 1e-6,
+                $"the line moved: left edge {line.Left} became {samePlace.Left}");
+
+            // MEASURED, AND NOT WHAT YOU MIGHT EXPECT OF A JUSTIFIED LINE. Path
+            // A re-solves justification slots and holds the right edge, but it
+            // needs the line to be ONE run and this one is drawn by thirteen
+            // objects, so it declines and the piece writer takes it instead.
+            // That writer shortens the line rather than redistributing its
+            // spaces, so the right edge MOVES, by exactly what was removed. The
+            // paragraph's other lines are what must not move, and they are
+            // asserted below.
+            Assert.True(samePlace.Right < line.Right,
+                "a shortened line did not get shorter");
+
+            foreach (var untouched in lines.Where(l => l.Text != line.Text))
+            {
+                var now = after.FirstOrDefault(l => l.Text == untouched.Text);
+                Assert.True(now is not null, $"a line went missing: {untouched.Text}");
+                Assert.True(Math.Abs(now!.Right - untouched.Right) < 1e-6,
+                    "an untouched line of the paragraph moved");
+            }
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    /// <summary>The same justified edit, through a file on disk.</summary>
+    [Fact]
+    public void a_justified_edit_survives_saving_closing_and_opening_again()
+    {
+        string saved = Path.Combine(Path.GetTempPath(),
+            $"justified_line_edit_{Guid.NewGuid():N}.pdf");
+        string retyped;
+
+        ulong handle = open_document(Fixture("sample_lines.pdf"));
+        Assert.NotEqual(0ul, handle);
+        try
+        {
+            var line = LinesOf(handle, 0).First(l => l.Refusal == LineRefusal.Justified);
+            string word = line.Text.Split(' ').Last(w => w.Length >= 4);
+            retyped = line.Text.Replace(word, word[..^1]);
+
+            byte[] want = Encoding.UTF8.GetBytes(line.Text);
+            byte[] text = Encoding.UTF8.GetBytes(retyped);
+            Assert.Equal(OkPdfium, set_block_line_text(handle, 0,
+                (uint)line.FirstObject, (uint)line.LastObject,
+                want, (nuint)want.Length, text, (nuint)text.Length));
+            Assert.Equal(OkPdfium, save_document(handle, saved));
+        }
+        finally
+        {
+            close_document(handle);
+        }
+
+        try
+        {
+            ulong reopened = open_document(saved);
+            Assert.NotEqual(0ul, reopened);
+            try
+            {
+                Assert.Contains(LinesOf(reopened, 0), l => l.Text.Trim() == retyped.Trim());
+            }
+            finally
+            {
+                close_document(reopened);
+            }
+        }
+        finally
+        {
+            if (File.Exists(saved)) { File.Delete(saved); }
+        }
+    }
+
+    /// <summary>
+    /// The rows that must never move. A shaped line and a rotated line reach no
+    /// writer, and the app says so before anyone types.
+    ///
+    /// ⚠️ THIS IS THE HALF THAT PROTECTS THE DOCUMENT. Widening the routing
+    /// table is a one-line change, and one line is all it would take to hand
+    /// Arabic to a writer that was measured reordering it.
+    /// </summary>
+    [Fact]
+    public void a_shaped_line_and_a_rotated_line_still_reach_no_writer()
+    {
+        ulong handle = open_document(Fixture("sample_lines.pdf"));
+        Assert.NotEqual(0ul, handle);
+        try
+        {
+            var lines = LinesOf(handle, 0);
+
+            var arabic = lines.First(l => l.Refusal == LineRefusal.ComplexScript);
+            Assert.Equal(LineWriter.None, arabic.Route);
+            Assert.False(arabic.CanEdit);
+
+            var rotated = lines.First(l => l.Refusal == LineRefusal.NotUpright);
+            Assert.Equal(LineWriter.None, rotated.Route);
+            Assert.False(rotated.CanEdit);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
+    /// <summary>
+    /// An ordinary ragged-right line is still the object writer's, untouched by
+    /// the routing layer. The control for every other test here.
+    /// </summary>
+    [Fact]
+    public void an_ordinary_line_still_belongs_to_the_object_writer()
+    {
+        ulong handle = open_document(Fixture("sample_lines.pdf"));
+        Assert.NotEqual(0ul, handle);
+        try
+        {
+            var ordinary = LinesOf(handle, 0).First(l => l.Refusal == LineRefusal.None);
+
+            Assert.Equal(LineWriter.ObjectWriter, ordinary.Route);
+            Assert.True(ordinary.CanEdit);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
+
     /// <summary>
     /// A selection that has gone stale refuses, and the page still says what it
     /// said. Never a wrong write.
