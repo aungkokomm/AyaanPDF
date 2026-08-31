@@ -35,6 +35,10 @@
 /// API to create them, so the /Outlines tree is built as PDF objects directly.
 pub mod form_state;
 pub mod gradient;
+mod block;
+mod justified;
+mod provision;
+mod shaped;
 pub mod outline;
 
 use std::collections::HashMap;
@@ -105,6 +109,80 @@ pub const STATUS_TOO_WIDE: i32 = 6;
 /// not "this cannot be done": the caller can say so plainly instead of
 /// reporting a failure.
 pub const STATUS_STALE_ANCHOR: i32 = 7;
+
+/// lopdf cannot load this document, so its content stream cannot be
+/// rewritten. Measured across 153 real documents: PDFium opened all of them
+/// and lopdf loaded 152, so this is rare but real, and it is a clean refusal
+/// rather than a partial load.
+pub const STATUS_DOC_NOT_REWRITABLE: i32 = 8;
+
+/// The line is set in a font whose widths this path cannot read: no
+/// `/FirstChar` and `/Widths`, which is every CID font. Refused rather
+/// than measured wrongly. CID `/W` support is deliberately not built yet.
+pub const STATUS_FONT_METRICS_UNAVAILABLE: i32 = 9;
+
+/// The line is on the page but not in a shape this path can rewrite: the
+/// producer gave it no `Tm` of its own, or the block at that baseline draws
+/// several runs rather than one.
+///
+/// ⚠️ Distinct from STATUS_STALE_ANCHOR, which says "the page has moved on"
+/// and would have the caller tell the user their text changed underneath them
+/// when nothing changed at all. Distinct from STATUS_UNSUPPORTED, which here
+/// already means "this character cannot be written in this font" and so
+/// invites the user to try a different character, which would not help.
+pub const STATUS_LINE_NOT_REWRITABLE: i32 = 10;
+
+/// The font a shaped edit was asked to use cannot be used: the file is not
+/// there, it is not a face, or PDFium would not embed it.
+///
+/// Distinct from `STATUS_UNSUPPORTED` because the remedy is different. The
+/// text is fine and the line is fine; the FONT is the problem, and the answer
+/// is to choose another one.
+pub const STATUS_FONT_UNUSABLE: i32 = 11;
+
+/// The font's own `OS/2` table says it must not be embedded.
+///
+/// ⚠️ NOT A TECHNICAL FAILURE. The file is readable, it is a valid face, and it
+/// could be embedded perfectly well. Its licence says not to, so this is not a
+/// condition to work around: it needs a message saying the font may not be
+/// embedded and asking for a different one.
+pub const STATUS_FONT_NOT_EMBEDDABLE: i32 = 12;
+
+/// PDFium would not open the bytes offered as a document's new contents.
+///
+/// ⚠️ USUALLY A BUG, NOT A USER ERROR. Whatever produced those bytes said it
+/// had succeeded and produced something unopenable, which is worth surfacing
+/// loudly rather than folding into a general "bad input". The live document is
+/// untouched when this is returned.
+pub const STATUS_REPLACEMENT_REJECTED: i32 = 13;
+
+/// The selection crosses a line break.
+///
+/// ⚠️ NOT A FAILURE, A MISSING FEATURE. Replacing text across a break decides
+/// where everything after it goes, which is reflow; until that exists, refusing
+/// is the only answer that does not silently damage the paragraph.
+pub const STATUS_SELECTION_SPANS_LINES: i32 = 14;
+
+/// The block this selection is in will not be edited, and its own refusal code
+/// says which of the measured conditions it hit.
+pub const STATUS_BLOCK_NOT_EDITABLE: i32 = 15;
+
+/// The selection lands inside a run whose logical characters have no
+/// one-for-one place on the page.
+///
+/// ⚠️ THE PATH B CEILING, ARRIVING FROM THE READ SIDE. A shaped replacement is
+/// four codepoints drawn by two glyphs; asking which glyph is the third
+/// character is not a question with an answer, so the run is offered whole or
+/// not at all.
+pub const STATUS_SELECTION_NOT_ADDRESSABLE: i32 = 16;
+
+/// The edited block does not have the lines the original did.
+///
+/// ⚠️ REFLOW, AND IT IS NOT BUILT. Adding or removing a break decides where
+/// every line after it goes and how wide each one may be. The block emitter
+/// lays text back over the lines it came from and no further; a different
+/// number of lines is refused rather than approximated.
+pub const STATUS_BLOCK_NEEDS_REFLOW: i32 = 17;
 
 pub const POLL_PENDING: i32 = 0;
 pub const POLL_READY: i32 = 1;
@@ -784,6 +862,81 @@ fn mint_object_id() -> String {
     format!("{nanos:016x}{n:016x}")
 }
 
+/// The Path B edit an invisible run belongs to, or None if it is not one.
+///
+/// ⚠️ A DELIBERATE DUPLICATE OF `search_mark_id`, NOT A GENERALISATION OF IT.
+/// That function belongs to the frozen text-box searchable layer, whose
+/// lifecycle, ownership and regeneration rules were accepted and verified by
+/// hand. Twenty repeated lines are a smaller price than a shared helper that
+/// gives two subsystems a reason to change together.
+fn path_b_mark_id(
+    bindings: &dyn pdfium_render::prelude::PdfiumLibraryBindings,
+    handle: pdfium_render::prelude::FPDF_PAGEOBJECT,
+) -> Option<String> {
+    for i in 0..bindings.FPDFPageObj_CountMarks(handle).max(0) {
+        let mark = bindings.FPDFPageObj_GetMark(handle, i as std::os::raw::c_ulong);
+        if mark.is_null() {
+            continue;
+        }
+        // Length is in BYTES and includes the UTF-16 terminator.
+        let mut out: std::os::raw::c_ulong = 0;
+        bindings.FPDFPageObjMark_GetName(mark, std::ptr::null_mut(), 0, &mut out);
+        if out <= 2 {
+            continue;
+        }
+        let mut buf = vec![0u16; out as usize / 2];
+        bindings.FPDFPageObjMark_GetName(mark, buf.as_mut_ptr(), out, &mut out);
+        while buf.last() == Some(&0) {
+            buf.pop();
+        }
+        let name = String::from_utf16_lossy(&buf);
+        if let Some(id) = name.strip_prefix(shaped::PATH_B_MARK_PREFIX) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// The logical text a Path B invisible run RECORDED on itself, if it did.
+///
+/// ⚠️ THE RECORDED VALUE, NEVER THE DECODED GLYPHS. What the run draws is one
+/// stand-in glyph per character squeezed to the visible replacement's width,
+/// and reading that back through a text page was measured to give four
+/// characters on one line and three on another for byte-identical runs. The
+/// text is known exactly at write time; this is that value coming back.
+///
+/// `None` for a run written before the property existed. Such a run is still a
+/// Path B run and is still identified by its mark; only what it says has to be
+/// guessed at.
+fn path_b_mark_text(
+    bindings: &dyn pdfium_render::prelude::PdfiumLibraryBindings,
+    handle: pdfium_render::prelude::FPDF_PAGEOBJECT,
+) -> Option<String> {
+    for i in 0..bindings.FPDFPageObj_CountMarks(handle).max(0) {
+        let mark = bindings.FPDFPageObj_GetMark(handle, i as std::os::raw::c_ulong);
+        if mark.is_null() {
+            continue;
+        }
+        let mut out: std::os::raw::c_ulong = 0;
+        bindings.FPDFPageObjMark_GetParamBlobValue(
+            mark, shaped::PATH_B_TEXT_KEY, std::ptr::null_mut(), 0, &mut out);
+        if out == 0 {
+            continue;
+        }
+        let mut buf = vec![0u8; out as usize];
+        if bindings.FPDFPageObjMark_GetParamBlobValue(
+            mark, shaped::PATH_B_TEXT_KEY, buf.as_mut_ptr(), out, &mut out) == 0
+        {
+            continue;
+        }
+        buf.truncate(out as usize);
+        // ⚠️ RAW UTF-8, written as a hex string. Anything else in there is not
+        // ours and guessing at it would put mojibake in the page's own text.
+        return String::from_utf8(buf).ok();
+    }
+    None
+}
+
 /// Gives every Ayaan text box on the page a stable id, writing it back.
 ///
 /// A freshly created box has no id: the tag is written at creation and the app
@@ -1445,6 +1598,439 @@ fn snapshot_document_inner(doc_handle: u64) -> ByteBuffer {
     let buffer = ByteBuffer { data: boxed.as_mut_ptr(), len: boxed.len(), status: STATUS_OK_PDFIUM };
     std::mem::forget(boxed);
     buffer
+}
+
+/// Rewrites ONE justified line's content-stream operators, returning the whole
+/// document's new bytes.
+///
+/// ⚠️ THIS DOES NOT TOUCH THE LIVE DOCUMENT. It takes a snapshot, rewrites the
+/// bytes, and hands them back. The caller opens them as a fresh document,
+/// checks the result, and only then swaps. A failure here has nothing to roll
+/// back, because nothing was changed.
+///
+/// The line is identified by `page_index`, `baseline` and `expected_utf8`, the
+/// text it must still spell. Both are needed: a baseline alone does not
+/// identify a line, because two columns share one. An offset `at` and length
+/// `len` say which bytes of that text to replace, and `new_text_utf8` is what
+/// to put there. An empty replacement is a deletion.
+///
+/// ⚠️ THE CALLER'S TEXT IS UNICODE, THE STREAM'S IS NOT. A PDF simple font's
+/// character codes are single bytes in an encoding of the font's choosing, and
+/// `at`/`len` are offsets into the caller's UTF-8.
+///
+/// FINDING the line maps the text through WinAnsi, which is self-checking: a
+/// line whose codes do not mean what WinAnsi says fails the anchor comparison
+/// and is refused. WRITING has no such check, so each character's code has to
+/// come from the file. It is taken from the declared encoding first, where a
+/// character above 127 needs a font that declares WinAnsi and did not remap
+/// that code in its `/Differences`; failing that, from the font's own
+/// `/ToUnicode`, inverted, which is how a remapped font can be written at all.
+/// A character two codes both claim is ambiguous and is refused rather than
+/// guessed at, and a mapping is still not a glyph: the font must have a width
+/// for the code either way.
+///
+/// Returns the new bytes with `STATUS_OK_PDFIUM`, or a null buffer carrying
+/// the reason. The caller must pass the result to `free_byte_buffer` either
+/// way.
+#[unsafe(no_mangle)]
+pub extern "C" fn rewrite_justified_line(
+    doc_handle: u64,
+    page_index: i32,
+    baseline: f32,
+    expected_utf8: *const u8,
+    expected_len: usize,
+    at: u32,
+    len: u32,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let Some(expected) = bytes_arg(expected_utf8, expected_len) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let Some(new_text) = bytes_arg(new_text_utf8, new_text_len) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    if expected.is_empty() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+
+    panic::catch_unwind(move || {
+        // The authoritative bytes, from the document as it stands.
+        let snap = snapshot_document(doc_handle);
+        if snap.status != STATUS_OK_PDFIUM {
+            return ByteBuffer::err(snap.status);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+
+        match justified::rewrite_bytes(
+            &bytes,
+            page_index,
+            baseline,
+            &expected,
+            at as usize,
+            len as usize,
+            &new_text,
+        ) {
+            Ok(out) => {
+                let mut boxed = out.into_boxed_slice();
+                let buffer = ByteBuffer {
+                    data: boxed.as_mut_ptr(),
+                    len: boxed.len(),
+                    status: STATUS_OK_PDFIUM,
+                };
+                std::mem::forget(boxed);
+                buffer
+            }
+            Err(status) => ByteBuffer::err(status),
+        }
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+/// Rewrites ONE justified line, setting the replacement in a font the document
+/// does not have, and returns the whole document's new bytes.
+///
+/// ⚠️ THE SIBLING OF `rewrite_justified_line`, NOT A MODE OF IT. That one
+/// preserves the document's own type and is what should be tried first; this
+/// one is for when the document's font simply has no glyph for what the user
+/// typed, and it is only ever entered because the caller chose a font. The two
+/// share how a line is FOUND and nothing of how one is written.
+///
+/// ⚠️ AND THIS DOES NOT TOUCH THE LIVE DOCUMENT EITHER. The font has to be
+/// embedded by PDFium and the line has to be written by lopdf, so the snapshot
+/// is opened as a SECOND document, the font goes into that, and its bytes are
+/// what get rewritten. Nothing is swapped until the caller decides.
+///
+/// Only the replacement is set in the new font. The words either side of it
+/// keep the document's own, and the original `Tf` is restored immediately
+/// afterwards, because `Tf` outlives the `ET` and would otherwise re-set every
+/// later line on the page.
+///
+/// `font_path_utf8` names a font file. There is no default: a missing or
+/// unusable font is refused rather than quietly substituted, because a
+/// substituted face draws Latin letters where Devanagari was asked for and
+/// reports success.
+///
+/// Returns the new bytes with `STATUS_OK_PDFIUM`, or a null buffer carrying the
+/// reason: `STATUS_FONT_NOT_EMBEDDABLE` when the font's licence forbids it,
+/// `STATUS_FONT_UNUSABLE` when the file is no good, `STATUS_UNSUPPORTED` when
+/// the font has no glyph for the text. The caller must pass the result to
+/// `free_byte_buffer` either way.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn rewrite_justified_line_shaped(
+    doc_handle: u64,
+    page_index: i32,
+    baseline: f32,
+    expected_utf8: *const u8,
+    expected_len: usize,
+    at: u32,
+    len: u32,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+    font_path_utf8: *const u8,
+    font_path_len: usize,
+) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (Some(expected), Some(new_text), Some(font_path)) = (
+        bytes_arg(expected_utf8, expected_len),
+        bytes_arg(new_text_utf8, new_text_len),
+        bytes_arg(font_path_utf8, font_path_len),
+    ) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    // A deletion needs no font and no shaping, so it is not this call's job.
+    if expected.is_empty() || new_text.is_empty() || font_path.is_empty() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (Ok(new_text), Ok(font_path)) = (
+        String::from_utf8(new_text),
+        String::from_utf8(font_path),
+    ) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    panic::catch_unwind(move || {
+        let snap = snapshot_document(doc_handle);
+        if snap.status != STATUS_OK_PDFIUM {
+            return ByteBuffer::err(snap.status);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+
+        // Shaped in GLYPH SPACE, not at the line's type size: the emitter
+        // compares advances against /W in thousandths of an em, where the size
+        // cancels out, so it never needs to know what the line is set in.
+        let provisioned = match provision::provision(
+            Some(&font_path), &new_text, shaped::SHAPING_SIZE)
+        {
+            Ok(p) => p,
+            Err(refusal) => return ByteBuffer::err(status_of(refusal)),
+        };
+
+        let (bytes, font_id) = match embed_for_shaping(&bytes, &provisioned) {
+            Some(pair) => pair,
+            None => return ByteBuffer::err(STATUS_FONT_UNUSABLE),
+        };
+
+        match justified::rewrite_bytes_shaped(
+            &bytes,
+            page_index,
+            baseline,
+            &expected,
+            at as usize,
+            len as usize,
+            &provisioned,
+            &new_text,
+            font_id,
+        ) {
+            Ok(out) => {
+                let mut boxed = out.into_boxed_slice();
+                let buffer = ByteBuffer {
+                    data: boxed.as_mut_ptr(),
+                    len: boxed.len(),
+                    status: STATUS_OK_PDFIUM,
+                };
+                std::mem::forget(boxed);
+                buffer
+            }
+            Err(status) => ByteBuffer::err(status),
+        }
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+/// The length of the font program a Type0 font carries.
+fn font_file_len(bytes: &[u8], font_id: lopdf::ObjectId) -> Option<usize> {
+    use lopdf::Object;
+    let doc = lopdf::Document::load_mem(bytes).ok()?;
+    let resolve = |o: &Object| -> Option<lopdf::Dictionary> {
+        match o {
+            Object::Reference(id) => doc.get_dictionary(*id).ok().cloned(),
+            Object::Dictionary(d) => Some(d.clone()),
+            _ => None,
+        }
+    };
+    let first = match doc.get_dictionary(font_id).ok()?.get(b"DescendantFonts").ok()? {
+        Object::Array(a) => a.first().cloned(),
+        Object::Reference(r) => doc.get_object(*r).ok()
+            .and_then(|x| x.as_array().ok()).and_then(|a| a.first().cloned()),
+        _ => None,
+    }?;
+    let descriptor = resolve(&first)?.get(b"FontDescriptor").ok().and_then(resolve)?;
+    let Ok(Object::Reference(file)) = descriptor.get(b"FontFile2") else {
+        return None;
+    };
+    let stream = doc.get_object(*file).ok()?.as_stream().ok()?;
+    Some(stream.decompressed_content().unwrap_or_else(|_| stream.content.clone()).len())
+}
+
+/// What the caller is told when a font cannot be used.
+fn status_of(refusal: provision::Refusal) -> i32 {
+    use provision::Refusal::*;
+    match refusal {
+        // The caller has to name one; there is deliberately no default.
+        NoFontNamed => STATUS_INVALID_INPUT,
+        EmbeddingProhibited => STATUS_FONT_NOT_EMBEDDABLE,
+        // The text is fine and the line is fine: this font cannot set it.
+        CannotSpell => STATUS_UNSUPPORTED,
+        FileUnreadable | NotAFace | NotEmbeddable => STATUS_FONT_UNUSABLE,
+    }
+}
+
+/// The document's bytes with the provisioned font embedded, and that font's id.
+///
+/// ⚠️ THE COPY IS THE POINT. Embedding mutates a document, and the live one
+/// must not change until the caller swaps, so the snapshot is opened as a
+/// second document and the font goes in there.
+///
+/// The font is found by DIFFING THE OBJECT IDS either side of the embed.
+/// Measured: PDFium keeps every pre-existing id across a save, and writes the
+/// font out even though nothing references it yet, so the one id that appears
+/// is the one that was added. Identifying it by `/BaseFont` instead is a
+/// heuristic that happens to work on one file.
+fn embed_for_shaping(
+    bytes: &[u8],
+    provisioned: &provision::Provisioned,
+) -> Option<(Vec<u8>, lopdf::ObjectId)> {
+    let take = |handle: u64| -> Option<Vec<u8>> {
+        let buf = snapshot_document(handle);
+        if buf.status != STATUS_OK_PDFIUM {
+            free_byte_buffer(buf);
+            return None;
+        }
+        let out = unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec();
+        free_byte_buffer(buf);
+        Some(out)
+    };
+    let type0_ids = |b: &[u8]| -> Vec<lopdf::ObjectId> {
+        let Ok(doc) = lopdf::Document::load_mem(b) else {
+            return Vec::new();
+        };
+        doc.objects
+            .iter()
+            .filter(|(_, o)| {
+                matches!(o, lopdf::Object::Dictionary(d)
+                    if d.get(b"Subtype").ok().and_then(|x| x.as_name().ok()) == Some(b"Type0"))
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    };
+
+    let copy = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+    if copy == 0 {
+        return None;
+    }
+    // ⚠️ SURVEYED FROM THE COPY, NOT FROM THE INPUT. The ids are stable across
+    // a save (measured), but these bytes have not been through THIS document
+    // yet, and picking the wrong font object is the failure that once drew
+    // "Replacement text" as "5eSlaFePent text".
+    let Some(before) = take(copy).map(|b| type0_ids(&b)) else {
+        close_document(copy);
+        return None;
+    };
+    {
+        let _guard = lock(&CALL_LOCK);
+        let doc = lock(&core().documents).get(&copy).cloned();
+        let Some(doc) = doc else {
+            close_document(copy);
+            return None;
+        };
+        let mut doc_guard = lock(&doc);
+        if provision::embed(&mut doc_guard, provisioned).is_err() {
+            drop(doc_guard);
+            close_document(copy);
+            return None;
+        }
+    }
+    let after = take(copy);
+    close_document(copy);
+    let after = after?;
+
+    let mut added = type0_ids(&after)
+        .into_iter()
+        .filter(|id| !before.contains(id));
+    let font_id = added.next()?;
+    // More than one appearing means the diff did not identify anything.
+    if added.next().is_some() {
+        return None;
+    }
+    // ⚠️ AND THE OUTLINES ARE CHECKED, NOT ASSUMED. A glyph id means nothing
+    // except against its own font file, so the object that was found has to
+    // carry the very bytes the glyphs were shaped against.
+    if font_file_len(&after, font_id) != Some(provisioned.bytes.len()) {
+        return None;
+    }
+    Some((after, font_id))
+}
+
+/// Makes `data` the contents of the document behind `doc_handle`, atomically,
+/// and hands back what it held before.
+///
+/// ⚠️ THE COMMIT POINT, AND IT KNOWS NOTHING ABOUT EDITING. It has no idea
+/// whether the bytes came from a rewritten line, a regenerated block of text,
+/// or something not yet written. Everything upstream ends the same way, and
+/// keeping this seam ignorant of lines, operators and fonts is what lets the
+/// next editing model reuse it unchanged.
+///
+/// ⚠️ AND THE HANDLE DOES NOT CHANGE. The viewport, the caches, the annotation
+/// state and the undo history all key off it; handing back a new one would put
+/// the whole blast radius into the caller and make every consumer learn about
+/// swaps.
+///
+/// VALIDATED BEFORE ANYTHING IS COMMITTED. The bytes are opened and their page
+/// count checked first, so a failure is never a state the caller has to
+/// recover from: it returns a reason and the live document is exactly as it
+/// was.
+///
+/// On success the returned buffer carries the document's PREVIOUS bytes, so
+/// undoing is this same call with them. Pass the result to `free_byte_buffer`
+/// either way.
+#[unsafe(no_mangle)]
+pub extern "C" fn replace_document_contents(
+    doc_handle: u64,
+    data: *const u8,
+    len: usize,
+) -> ByteBuffer {
+    if doc_handle == 0 || data.is_null() || len == 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| replace_document_contents_inner(doc_handle, data, len))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn replace_document_contents_inner(doc_handle: u64, data: *const u8, len: usize) -> ByteBuffer {
+    let candidate = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+
+    // ⚠️ ONE ACQUISITION FOR THE WHOLE OPERATION, and that is why none of the
+    // existing helpers are called here. `snapshot_document` and
+    // `open_document_from_bytes` each take `CALL_LOCK` themselves, so building
+    // this out of them would either deadlock or leave a window between reading
+    // the old document and replacing it.
+    let _guard = lock(&CALL_LOCK);
+    let core = core();
+
+    let existing = lock(&core.documents).get(&doc_handle).cloned();
+    let Some(existing) = existing else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    // What it holds now, read before anything is disturbed.
+    let (previous, page_count) = {
+        let guard = lock(&existing);
+        let Ok(bytes) = guard.save_to_bytes() else {
+            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+        };
+        (bytes, guard.pages().len())
+    };
+
+    let Some(pdfium) = pdfium() else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let Ok(replacement) = pdfium.load_pdf_from_byte_vec(candidate, None) else {
+        return ByteBuffer::err(STATUS_REPLACEMENT_REJECTED);
+    };
+    if replacement.pages().len() != page_count {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+
+    // The swap. Inserting drops the map's reference to the old document, and
+    // `existing` is the only one left; it goes out of scope below, and the
+    // document owns the bytes it was loaded from, so they are freed with it.
+    lock(&core.documents).insert(doc_handle, Arc::new(Mutex::new(replacement)));
+    drop(existing);
+
+    // ⚠️ BOTH, NOT JUST THE TILES. A render already in flight when the swap
+    // happened was started against the old document; without clearing the
+    // generation it would be recognised as current and its tile delivered.
+    evict_all_cache_for_doc(doc_handle);
+    lock(&core.generations).retain(|(d, _), _| *d != doc_handle);
+
+    let mut boxed = previous.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// An FFI byte argument that is allowed to be empty, which a deletion needs.
+fn bytes_arg(ptr: *const u8, len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
 }
 
 /// Releases a buffer returned by `snapshot_document`. Safe to call on an
@@ -8453,6 +9039,19 @@ fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
             continue;
         }
 
+        // OURS TOO, for the same reason and by its own mark. A Path B edit
+        // leaves an invisible run carrying the LOGICAL characters so the shaped
+        // replacement can be found; it sits almost exactly on top of the glyphs
+        // it stands for, so offering it would put a second, transparent target
+        // over one the user can already select.
+        //
+        // ⚠️ BY THE MARK, NEVER BY RENDER MODE 3. A scanned page's OCR layer is
+        // render mode 3, and so is the text-box layer above; hiding every
+        // invisible run would hide someone else's text.
+        if path_b_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
+            continue;
+        }
+
         let text = t.text();
         if text.trim().is_empty() {
             continue;
@@ -8654,11 +9253,19 @@ fn page_word_clusters(
     // PDFium per character instead would parse the page repeatedly.
     let mut index_of = std::collections::HashMap::new();
     let mut upright_of = std::collections::HashMap::new();
+    // ⚠️ IDENTIFIED BY ITS MARK, NEVER BY RENDER MODE 3. A scanned page's OCR
+    // layer is render mode 3, and so is the text-box searchable layer; hiding
+    // every invisible run would hide those too. Only what Path B wrote, wearing
+    // the mark Path B put on it, is ours to withhold.
+    let mut path_b_runs: std::collections::HashSet<usize> = Default::default();
     for i in 0..objects.len() {
         let Ok(o) = objects.get(i) else { continue };
         let PdfPageObject::Text(t) = &o else { continue };
         let handle = t.object_handle() as usize;
         index_of.insert(handle, i as usize);
+        if path_b_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
+            path_b_runs.insert(i as usize);
+        }
 
         let mut m = FS_MATRIX { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 };
         doc_guard
@@ -8716,6 +9323,24 @@ fn page_word_clusters(
             *seen += 1;
             (i, at)
         });
+
+        // ⚠️ PATH B'S OWN INVISIBLE RUN IS NOT THE USER'S TEXT. It stands in the
+        // page's content so a reader can FIND the shaped replacement, and it
+        // draws nothing. Offering it as a line would offer an edit on nothing,
+        // sitting exactly on top of a line that is already editable.
+        //
+        // It also ENDS a word, not merely skipped: the run sits on the same
+        // baseline as the glyphs it stands for, so PDFium has no reason to put
+        // a separator between them, and without this the invisible characters
+        // would run into the visible word beside them.
+        if owner.is_some_and(|i| path_b_runs.contains(&i)) {
+            if let Some(mut w) = cur.take() {
+                w.suffix = trailing_room(&total_in_object, last_owner_position);
+                out.push(w);
+            }
+            last_owner_position = None;
+            continue;
+        }
 
         // A word ends at whitespace. PDFium inserts its own spaces and line
         // breaks between objects that only LOOK adjacent, which is exactly the
@@ -11229,6 +11854,409 @@ fn buffer_to_result(width: i32, height: i32, buf: Vec<u8>, status: i32) -> Rende
     std::mem::forget(boxed);
 
     RenderResult { width: w, height: h, buffer: ptr, len, status }
+}
+
+// ---------------- blocks ----------------
+
+/// How far apart two runs' edges may be and still be the same replacement, in
+/// points.
+///
+/// ⚠️ MEASURED, NOT PICKED. The invisible logical run is stretched to the
+/// visible replacement's advance, and Phase 7 proved a highlight drawn on it
+/// lands within 1.0 pt of the drawn glyphs. This is that number with a little
+/// room; two unrelated runs agreeing on BOTH edges to within it would have to
+/// be stacked on each other.
+const PATH_B_PAIRING_TOLERANCE: f32 = 1.5;
+
+/// Every text object of a page, and the lines over them, in the terms the block
+/// model takes.
+///
+/// ⚠️ EVERY TEXT OBJECT, INCLUDING THE ONES `get_page_text_objects` DROPS.
+/// That reader hides blank objects and our own invisible runs because it feeds
+/// selection, and offering either as a target would be offering a hit on
+/// nothing. The block model needs the opposite: `prefix` and `suffix` are
+/// offsets into a concatenation that CONTAINS the blank objects, so leaving one
+/// out moves every offset after it.
+fn page_block_inputs(
+    doc_guard: &pdfium_render::prelude::PdfDocument,
+    page: &pdfium_render::prelude::PdfPage,
+    page_w: f32,
+) -> (Vec<block::RawLine>, std::collections::BTreeMap<usize, block::RawObject>, bool, usize) {
+    use pdfium_render::prelude::*;
+
+    let lines: Vec<block::RawLine> = page_lines(doc_guard, page, page_w)
+        .iter()
+        .map(|l| block::RawLine {
+            first: l.first_object,
+            last: l.last_object,
+            prefix: l.prefix,
+            // ⚠️ THE HALF THE FFI DOES NOT PUBLISH. `get_page_lines` serializes
+            // `prefix` and not its partner, so anything reading a line through
+            // it has to work the tail cut out by trial; inside, both are simply
+            // here.
+            suffix: l.suffix,
+            left: l.left,
+            top: l.top,
+            right: l.right,
+            bottom: l.bottom,
+            baseline: l.baseline,
+            size: l.size_pts,
+            refusal: l.refusal(),
+            font: l.font.clone(),
+        })
+        .collect();
+
+    let mut objects: std::collections::BTreeMap<usize, block::RawObject> =
+        std::collections::BTreeMap::new();
+    // index -> (left, right, top, bottom), for the pairing below.
+    let mut boxes: std::collections::BTreeMap<usize, (f32, f32, f32, f32)> =
+        std::collections::BTreeMap::new();
+
+    let page_objects = page.objects();
+    for index in 0..page_objects.len() {
+        let Ok(obj) = page_objects.get(index) else { continue };
+        let PdfPageObject::Text(t) = &obj else { continue };
+
+        let kind = if path_b_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
+            block::ObjectKind::LogicalRun
+        } else if search_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
+            block::ObjectKind::SearchRun
+        } else {
+            block::ObjectKind::Ordinary
+        };
+
+        if let Ok(b) = obj.bounds() {
+            boxes.insert(
+                index as usize,
+                (b.left().value, b.right().value, b.top().value, b.bottom().value),
+            );
+        }
+
+        let font = t.font();
+        objects.insert(
+            index as usize,
+            block::RawObject {
+                drawn: t.text(),
+                logical: None,
+                kind,
+                font: font.name(),
+                size: t.unscaled_font_size().value,
+                color: t
+                    .fill_color()
+                    .map(|f| ((f.red() as u32) << 16) | ((f.green() as u32) << 8) | f.blue() as u32)
+                    .unwrap_or(0),
+            },
+        );
+    }
+
+    // ---- pair each invisible logical run with the glyphs it stands for ----
+    //
+    // ⚠️ BY GEOMETRY, BECAUSE THERE IS NO BACK-REFERENCE. The emitter marks the
+    // invisible run with a fresh id and leaves the visible one unmarked, so the
+    // only thing tying them together is that the first was placed at the
+    // second's left edge and stretched to its advance. Pairing here rather than
+    // changing the emitter also means files Path B has ALREADY written are
+    // understood.
+    let logical_runs: Vec<usize> = objects
+        .iter()
+        .filter(|(_, o)| o.kind == block::ObjectKind::LogicalRun)
+        .map(|(i, _)| *i)
+        .collect();
+    // What each invisible run says it stands for. ⚠️ ASKED OF THE OBJECT, not
+    // of its decoded glyphs; a run written before the property existed answers
+    // `None` and falls back to the old, unreliable reading rather than to
+    // nothing.
+    let recorded: std::collections::BTreeMap<usize, Option<String>> = logical_runs
+        .iter()
+        .map(|i| {
+            let text = page_objects
+                .get(*i as PdfPageObjectIndex)
+                .ok()
+                .and_then(|o| match &o {
+                    PdfPageObject::Text(t) => path_b_mark_text(doc_guard.bindings(), t.object_handle()),
+                    _ => None,
+                });
+            (*i, text)
+        })
+        .collect();
+    let logical_run_count = logical_runs.len();
+    let mut unpaired = false;
+    for run in logical_runs {
+        let Some(&(rl, rr, rt, rb)) = boxes.get(&run) else {
+            unpaired = true;
+            continue;
+        };
+        let candidates: Vec<usize> = boxes
+            .iter()
+            .filter(|(i, (l, r, t, b))| {
+                **i != run
+                    && objects.get(*i).is_some_and(|o| o.kind == block::ObjectKind::Ordinary)
+                    && (l - rl).abs() <= PATH_B_PAIRING_TOLERANCE
+                    && (r - rr).abs() <= PATH_B_PAIRING_TOLERANCE
+                    // Overlapping vertically, which two runs on different lines
+                    // that happen to share both edges would not.
+                    && *t >= rb && *b <= rt
+            })
+            .map(|(i, _)| *i)
+            .collect();
+
+        match candidates.as_slice() {
+            [only] => {
+                let logical = recorded
+                    .get(&run)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| objects[&run].drawn.clone());
+                if let Some(o) = objects.get_mut(only) {
+                    o.kind = block::ObjectKind::ShapedRun;
+                    o.logical = Some(logical);
+                }
+            }
+            // Nothing to pair with, or several. Either way some run on this
+            // page may be reading back as shaped glyphs and the model cannot
+            // say which, so it says so instead of guessing.
+            _ => unpaired = true,
+        }
+    }
+
+    (lines, objects, unpaired, logical_run_count)
+}
+
+/// The page's blocks, read through one acquisition and handed back detached
+/// from the document.
+/// The page's blocks, and how many Path B logical runs the page already
+/// carries. ⚠️ THE SECOND HALF MATTERS TO WRITERS: emitting a shaped
+/// replacement drops every one of them.
+fn page_blocks(doc_handle: u64, page_index: i32)
+    -> Result<(Vec<block::Block>, usize), i32> {
+    let _guard = lock(&CALL_LOCK);
+
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return Err(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = lock(&doc);
+    let Ok(page) = doc_guard.pages().get(page_index as u16) else {
+        return Err(STATUS_INVALID_INPUT);
+    };
+    let page_w = page.width().value;
+    if page_w <= 0.0 {
+        return Err(STATUS_INVALID_INPUT);
+    }
+
+    let (lines, objects, unpaired, logical_runs) =
+        page_block_inputs(&doc_guard, &page, page_w);
+    Ok((block::assemble(lines, &objects, unpaired), logical_runs))
+}
+
+/// Replaces `len` LOGICAL characters from `at` in one block, and commits.
+///
+/// ⚠️ AN ADDRESSING LAYER, NOT AN EMITTER. It works out which line the
+/// selection is on and what byte span of that line it means, then hands the
+/// result to the Path A or Path B rewrite exactly as they already expect it and
+/// swaps the result in through the transaction. Nothing about how a line is
+/// written changed, and nothing about how a document is committed changed;
+/// what changed is that a caller can now say "these characters of this
+/// paragraph" instead of "these bytes at this baseline".
+///
+/// ⚠️ SO THE EMITTERS' OWN LIMITS STILL APPLY. `locate` wants the line to be a
+/// single `TJ` run, and a line that is not one is refused here exactly as it is
+/// today. Reaching the rest is a block-level emitter, which this is not.
+///
+/// `font_path` chooses the fork: without one the document's own type is
+/// preserved (Path A), with one the replacement is set in that font (Path B).
+fn edit_block_line(
+    doc_handle: u64,
+    page_index: i32,
+    block_index: usize,
+    at: usize,
+    len: usize,
+    new_text: &str,
+    font_path: Option<&str>,
+) -> i32 {
+    let (blocks, _) = match page_blocks(doc_handle, page_index) {
+        Ok(b) => b,
+        Err(status) => return status,
+    };
+    let Some(target) = blocks.get(block_index) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    let plan = match block::plan(
+        target,
+        at,
+        len,
+        STATUS_SELECTION_SPANS_LINES,
+        STATUS_SELECTION_NOT_ADDRESSABLE,
+        STATUS_BLOCK_NOT_EDITABLE,
+        STATUS_INVALID_INPUT,
+    ) {
+        Ok(p) => p,
+        Err(status) => return status,
+    };
+
+    // ⚠️ THE EXISTING CALLS, UNCHANGED. They snapshot the document themselves
+    // and hand back candidate bytes without touching it, which is what makes it
+    // safe to fail here with nothing to undo.
+    let expected = plan.expected.as_bytes();
+    let new = new_text.as_bytes();
+    let candidate = match font_path {
+        None => rewrite_justified_line(
+            doc_handle,
+            page_index,
+            plan.baseline,
+            expected.as_ptr(),
+            expected.len(),
+            plan.at as u32,
+            plan.len as u32,
+            new.as_ptr(),
+            new.len(),
+        ),
+        Some(path) => rewrite_justified_line_shaped(
+            doc_handle,
+            page_index,
+            plan.baseline,
+            expected.as_ptr(),
+            expected.len(),
+            plan.at as u32,
+            plan.len as u32,
+            new.as_ptr(),
+            new.len(),
+            path.as_ptr(),
+            path.len(),
+        ),
+    };
+    if candidate.status != STATUS_OK_PDFIUM || candidate.data.is_null() {
+        let status = candidate.status;
+        free_byte_buffer(candidate);
+        return status;
+    }
+
+    let swapped = replace_document_contents(doc_handle, candidate.data, candidate.len);
+    free_byte_buffer(candidate);
+    let status = swapped.status;
+    free_byte_buffer(swapped);
+    status
+}
+
+/// Rewrites a whole block from its edited logical text, and commits once.
+///
+/// ⚠️ THE BLOCK IS THE SOURCE OF TRUTH, NOT THE LINE. The caller hands back
+/// what the paragraph now says, in the logical characters the model published,
+/// and this works out which lines that means and what each of them has to
+/// become. Nothing outside the block is consulted and no anchor is invented:
+/// every line's anchor comes from the model that produced the text being
+/// edited.
+///
+/// ⚠️ AND IT IS ALL OR NOTHING. The lines are emitted one after another onto
+/// ACCUMULATING BYTES, never onto the live document, so a block whose second
+/// line cannot be written leaves the first unwritten too. Only when every line
+/// has succeeded does the result reach the transaction, which is the same
+/// transaction and the same swap as everything else.
+///
+/// ⚠️ THE EMITTERS ARE THE ONES THAT ALREADY EXIST. Path A is tried first
+/// because it preserves the document's own type; Path B is tried only when Path
+/// A says it cannot spell the replacement AND the caller has offered a font to
+/// set it in. Which is to say the choice is measured rather than guessed.
+fn emit_block(
+    doc_handle: u64,
+    page_index: i32,
+    block_index: usize,
+    edited: &str,
+    font_path: Option<&str>,
+) -> i32 {
+    let (blocks, _) = match page_blocks(doc_handle, page_index) {
+        Ok(b) => b,
+        Err(status) => return status,
+    };
+    let Some(target) = blocks.get(block_index) else {
+        return STATUS_INVALID_INPUT;
+    };
+    if !target.editable() {
+        return STATUS_BLOCK_NOT_EDITABLE;
+    }
+
+    let changes = match block::lay_out(target, edited, STATUS_BLOCK_NEEDS_REFLOW) {
+        Ok(c) => c,
+        Err(status) => return status,
+    };
+    // Nothing was typed. Committing an identical document would still burn an
+    // undo step and throw away every tile, so it does not happen.
+    if changes.is_empty() {
+        return STATUS_OK_PDFIUM;
+    }
+
+    let snap = snapshot_document(doc_handle);
+    if snap.status != STATUS_OK_PDFIUM {
+        return snap.status;
+    }
+    let mut bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+    free_byte_buffer(snap);
+
+    for change in &changes {
+        let plan = match block::plan(
+            target,
+            change.at,
+            change.len,
+            STATUS_SELECTION_SPANS_LINES,
+            STATUS_SELECTION_NOT_ADDRESSABLE,
+            STATUS_BLOCK_NOT_EDITABLE,
+            STATUS_INVALID_INPUT,
+        ) {
+            Ok(p) => p,
+            Err(status) => return status,
+        };
+        // The layout said which line this was; the map has to agree.
+        if plan.line != change.line {
+            return STATUS_INVALID_INPUT;
+        }
+
+        let expected = plan.expected.as_bytes();
+        let status = match justified::rewrite_bytes(
+            &bytes, page_index, plan.baseline, expected,
+            plan.at, plan.len, change.text.as_bytes(),
+        ) {
+            Ok(next) => {
+                bytes = next;
+                continue;
+            }
+            Err(status) => status,
+        };
+        // ⚠️ ONLY THIS ONE REASON FALLS THROUGH. `STATUS_UNSUPPORTED` from Path
+        // A means the document's own font cannot spell what was typed, which is
+        // exactly and only what Path B is for. Every other refusal is about the
+        // line rather than the letters, and a second attempt would fail the
+        // same way.
+        if status != STATUS_UNSUPPORTED {
+            return status;
+        }
+        let Some(path) = font_path else {
+            return STATUS_UNSUPPORTED;
+        };
+
+        // Shaped in GLYPH SPACE, so the emitter never needs the line's size.
+        let provisioned = match provision::provision(
+            Some(path), &change.text, shaped::SHAPING_SIZE)
+        {
+            Ok(p) => p,
+            Err(refusal) => return status_of(refusal),
+        };
+        let Some((embedded, font_id)) = embed_for_shaping(&bytes, &provisioned) else {
+            return STATUS_FONT_UNUSABLE;
+        };
+        match justified::rewrite_bytes_shaped(
+            &embedded, page_index, plan.baseline, expected,
+            plan.at, plan.len, &provisioned, &change.text, font_id,
+        ) {
+            Ok(next) => bytes = next,
+            Err(status) => return status,
+        }
+    }
+
+    let swapped = replace_document_contents(doc_handle, bytes.as_ptr(), bytes.len());
+    let status = swapped.status;
+    free_byte_buffer(swapped);
+    status
 }
 
 /// A SPIKE, test-only and called by nothing. See the file for what it asks.
@@ -22341,6 +23369,4513 @@ p={spread_px:.4},c={rgba:08X})"
         }
 
         close_document(h);
+    }
+
+
+    // ---------------- rewriting a justified line in the content stream ----------------
+
+    /// A page shaped like the Word document this was measured against: a
+    /// justified paragraph whose FIRST LINE IS ONE TEXT OBJECT carrying a `TJ`
+    /// array, with per-glyph kerning inside the words and one large negative
+    /// adjustment after each space doing the justification, both lines inside a
+    /// single marked-content sequence, and a second paragraph that must never
+    /// move.
+    ///
+    /// Built rather than committed, and every property here is one the rewrite
+    /// depends on. The font is given an explicit `/Widths` array so the
+    /// arithmetic does not depend on a system font being installed.
+    fn justified_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let path = "tests/fixtures/sample_justified.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        // Every code the same width but the space, so an expected width can be
+        // worked out by hand when a test fails.
+        let mut widths: Vec<Object> = Vec::new();
+        for code in 32u8..=126 {
+            widths.push(Object::Integer(if code == b' ' { 278 } else { 500 }));
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "AAAAAA+TestSans",
+            "FirstChar" => 32,
+            "LastChar" => 126,
+            "Widths" => widths,
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+
+        // ⚠️ THE SHAPE THAT MATTERS. Words are split by kerning, so no word is
+        // a single array element, and the justification lives in the -180s
+        // after each space. A rewrite that assumed either would fail here.
+        let justified_line = vec![
+            Object::string_literal("Th"), Object::Integer(-8),
+            Object::string_literal("e "), Object::Integer(-180),
+            Object::string_literal("qui"), Object::Integer(5),
+            Object::string_literal("ck "), Object::Integer(-180),
+            Object::string_literal("brown "), Object::Integer(-180),
+            Object::string_literal("fox "), Object::Integer(-180),
+            Object::string_literal("jum"), Object::Integer(-3),
+            Object::string_literal("ps "), Object::Integer(-180),
+            Object::string_literal("over "), Object::Integer(-180),
+            Object::string_literal("the "), Object::Integer(-180),
+            Object::string_literal("lazy "), Object::Integer(-180),
+            Object::string_literal("dog"),
+        ];
+
+        let operations = vec![
+            Operation::new("BDC", vec!["P".into(), Object::Dictionary(dictionary! { "MCID" => 0 })]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 700.into()]),
+            Operation::new("TJ", vec![Object::Array(justified_line)]),
+            Operation::new("ET", vec![]),
+            // The paragraph's last line, ragged, in the SAME sequence.
+            Operation::new("BT", vec![]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 686.into()]),
+            Operation::new("TJ", vec![Object::Array(vec![Object::string_literal("and rests.")])]),
+            Operation::new("ET", vec![]),
+            Operation::new("EMC", vec![]),
+            // A second paragraph that must never move.
+            Operation::new("BDC", vec!["P".into(), Object::Dictionary(dictionary! { "MCID" => 1 })]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 650.into()]),
+            Operation::new("TJ", vec![Object::Array(vec![Object::string_literal("Untouched second paragraph.")])]),
+            Operation::new("ET", vec![]),
+            Operation::new("EMC", vec![]),
+        ];
+
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let staging = format!("tests/fixtures/.justified_fixture_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the justified fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the justified fixture into place");
+        path
+    }
+
+    const JUSTIFIED_BASELINE: f32 = 700.0;
+    const JUSTIFIED_TEXT: &str = "The quick brown fox jumps over the lazy dog";
+    /// The page the fixture is drawn on, for turning normalised edges into points.
+    const JUSTIFIED_PAGE_W: f32 = 612.0;
+
+    fn justified_bytes() -> Vec<u8> {
+        std::fs::read(justified_fixture()).unwrap()
+    }
+
+    /// One edit, in the terms the core takes them.
+    fn edit_line(bytes: &[u8], expected: &str, at: usize, len: usize, new: &str)
+        -> Result<Vec<u8>, i32>
+    {
+        justified::rewrite_bytes(
+            bytes, 0, JUSTIFIED_BASELINE, expected.as_bytes(), at, len, new.as_bytes())
+    }
+
+    /// Replaces the first occurrence of a word, the way the app will.
+    fn edit_word(bytes: &[u8], expected: &str, old: &str, new: &str) -> Result<Vec<u8>, i32> {
+        let at = expected.find(old).expect("the word is not on that line");
+        edit_line(bytes, expected, at, old.len(), new)
+    }
+
+    /// Where the fixture's justified line sits, in the NORMALISED space the
+    /// readers report. `JUSTIFIED_BASELINE` is the same line in PDF points,
+    /// which is what the core takes; the two are not interchangeable.
+    fn justified_norm_baseline() -> f32 {
+        let bytes = justified_bytes();
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let b = decode_lines(handle, 0)
+            .iter()
+            .find(|l| l.text.starts_with("The quick"))
+            .expect("the fixture has no justified line")
+            .baseline;
+        close_document(handle);
+        b
+    }
+
+    /// What PDFium makes of those bytes: the edited line, read back.
+    ///
+    /// FOUND BY BASELINE, NOT BY TEXT. The text is what the edits change, so
+    /// matching on it would lose the line at the first successful edit.
+    fn line_from(bytes: &[u8]) -> DecodedLine {
+        let want = justified_norm_baseline();
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the rewritten document");
+        let lines = decode_lines(handle, 0);
+        let line = lines.iter().find(|l| (l.baseline - want).abs() < 1e-4).cloned();
+        close_document(handle);
+        line.expect("the edited line is gone")
+    }
+
+    fn all_lines_from(bytes: &[u8]) -> Vec<DecodedLine> {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let lines = decode_lines(handle, 0);
+        close_document(handle);
+        lines
+    }
+
+    fn words_on_line(bytes: &[u8], baseline: f32) -> Vec<DecodedCluster> {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let mut w: Vec<DecodedCluster> = decode_clusters(handle, 0)
+            .into_iter()
+            .filter(|c| (c.baseline - baseline).abs() < 0.01)
+            .collect();
+        close_document(handle);
+        w.sort_by(|a, b| a.left.partial_cmp(&b.left).unwrap());
+        w
+    }
+
+    /// The drawn gaps between consecutive words, in points.
+    fn gaps_of(words: &[DecodedCluster]) -> Vec<f32> {
+        words.windows(2)
+            .map(|p| (p[1].left - p[0].right) * JUSTIFIED_PAGE_W)
+            .collect()
+    }
+
+    #[test]
+    fn replacing_a_word_keeps_both_edges_exactly_where_they_were() {
+        // ⚠️ THE WHOLE POINT OF THE CONTENT-STREAM PATH. Doing this through
+        // PDFium destroys the line's TJ adjustments and the right edge walks
+        // in by tens of points. Here the arithmetic puts it back exactly.
+        let before = justified_bytes();
+        let base = line_from(&before);
+
+        let after = edit_word(&before, JUSTIFIED_TEXT, "brown", "red").expect("the edit was refused");
+        let edited = line_from(&after);
+
+        assert!(edited.text.contains("red"), "the edit did not take: {:?}", edited.text);
+        assert!(!edited.text.contains("brown"), "the old word is still there");
+
+        let left_pt = (edited.left - base.left).abs() * JUSTIFIED_PAGE_W;
+        let right_pt = (edited.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(left_pt < 0.001, "the left edge moved {left_pt} pt");
+        assert!(right_pt < 0.001, "the right edge moved {right_pt} pt");
+    }
+
+    #[test]
+    fn the_line_stays_one_text_object_in_its_own_font() {
+        // The reason this design was chosen over splitting the line into one
+        // object per word: the producer's structure is left alone.
+        let before = justified_bytes();
+        let base = line_from(&before);
+        let after = edit_word(&before, JUSTIFIED_TEXT, "quick", "slow").unwrap();
+        let edited = line_from(&after);
+
+        assert_eq!(edited.first_object, base.first_object);
+        assert_eq!(edited.last_object, base.last_object);
+        assert_eq!(edited.first_object, edited.last_object, "the line was split into objects");
+        assert_eq!(edited.font, base.font);
+        assert_eq!(edited.size_pts, base.size_pts);
+    }
+
+    #[test]
+    fn repeated_edits_do_not_accumulate_drift() {
+        // ⚠️ THE MANDATORY TEST, AND THE ONE THAT CAUGHT EVERYTHING. A single
+        // edit passed while a three-edit sequence was 38.5pt wrong, because
+        // slots were being found by magnitude and the stretch had been driven
+        // to zero. Nothing short of a SEQUENCE is evidence.
+        let original = justified_bytes();
+        let base = line_from(&original);
+
+        let mut bytes = original.clone();
+        let mut first_cycle_drift = f32::NAN;
+
+        // 20 replace/restore cycles: after each pair the line spells exactly
+        // what it spelled before, so its edges must be back where they were.
+        for cycle in 0..20 {
+            bytes = edit_word(&bytes, JUSTIFIED_TEXT, "brown", "red").expect("replace refused");
+            let mid = line_from(&bytes);
+            assert!(mid.text.contains("red"));
+
+            let restored_text = mid.text.clone();
+            bytes = edit_word(&bytes, &restored_text, "red", "brown").expect("restore refused");
+            let back = line_from(&bytes);
+
+            assert_eq!(back.text, base.text, "the text did not come back on cycle {cycle}");
+            let drift = (back.right - base.right).abs() * JUSTIFIED_PAGE_W;
+            if cycle == 0 {
+                first_cycle_drift = drift;
+            }
+            assert!(drift < 0.001, "cycle {cycle} left the right edge {drift} pt out");
+        }
+
+        // 10 insert/delete cycles on top, which exercise the slot COUNT
+        // changing rather than just the values.
+        for cycle in 0..10 {
+            let text = line_from(&bytes).text;
+            bytes = edit_word(&bytes, &text, "fox", "fox a").expect("insert refused");
+            let text = line_from(&bytes).text;
+            bytes = edit_word(&bytes, &text, "fox a", "fox").expect("delete refused");
+            let back = line_from(&bytes);
+            let drift = (back.right - base.right).abs() * JUSTIFIED_PAGE_W;
+            assert!(drift < 0.001, "insert/delete cycle {cycle} left {drift} pt of drift");
+        }
+
+        // ⚠️ AND IT IS THE SAME AT THE END AS AT THE START. A bounded error is
+        // fine; an error that grows with every edit is not, and only comparing
+        // the two ends can tell them apart.
+        let end = line_from(&bytes);
+        let end_drift = (end.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(
+            (end_drift - first_cycle_drift).abs() < 0.0005,
+            "drift grew from {first_cycle_drift} pt to {end_drift} pt over 60 edits");
+        assert_eq!(end.text, base.text);
+    }
+
+    #[test]
+    fn an_inserted_space_stretches_like_every_other_gap() {
+        // ⚠️ MEASURED FAILURE THIS PREVENTS. Text pushed in as one string gives
+        // its spaces no adjustment to stretch, and on the real document the
+        // gaps either side of an inserted phrase came out at 4.24 and 4.48
+        // points against 6.8 elsewhere on the same line. Splitting the
+        // insertion so each space ends a fragment, and solving every slot to
+        // the same value, is what makes them match.
+        //
+        // ASSERTED ON THE SLOTS, NOT ON RENDERED GAPS. This fixture declares
+        // uniform widths but has no embedded font, so PDFium draws a
+        // substitute whose glyph shapes make tight-bounds gaps vary by up to
+        // 1.7pt for reasons that have nothing to do with justification. The
+        // slot values are the thing the algorithm actually controls, and they
+        // are exact. The rendered evidence is on the real document, where an
+        // inserted phrase measured 6.46 and 6.7pt inside the line's own
+        // 5.49..6.97pt.
+        let before = justified_bytes();
+        let after = edit_word(&before, JUSTIFIED_TEXT, "fox", "fox a").unwrap();
+
+        let slots_before = justification_slots(&before);
+        let slots_after = justification_slots(&after);
+
+        assert_eq!(slots_before.len(), 8, "the fixture should have eight gaps");
+        assert_eq!(slots_after.len(), 9, "the inserted space did not become a slot");
+
+        let first = slots_after[0];
+        for (i, v) in slots_after.iter().enumerate() {
+            assert!((v - first).abs() < 0.002,
+                "slot {i} is {v} against {first}: the line is not evenly justified");
+        }
+
+        // And the words really are there, in order, with the new one among them.
+        let words = words_on_line(&after, justified_norm_baseline());
+        assert_eq!(words.len(), 10);
+        assert_eq!(words[4].text, "a");
+    }
+
+    /// Every justification slot's value in the page's justified line: the
+    /// adjustments that follow a space.
+    fn justification_slots(bytes: &[u8]) -> Vec<f64> {
+        let doc = lopdf::Document::load_mem(bytes).unwrap();
+        let (_, &page_id) = doc.get_pages().iter().next().unwrap();
+        let content = lopdf::content::Content::decode(&doc.get_page_content(page_id)).unwrap();
+        let array = content.operations.iter()
+            .filter(|o| o.operator == "TJ")
+            .filter_map(|o| match o.operands.first() {
+                Some(lopdf::Object::Array(a)) => Some(a.clone()),
+                _ => None,
+            })
+            .find(|a| a.len() > 3)
+            .expect("no justified line in the document");
+
+        let mut out = Vec::new();
+        let mut after_space = false;
+        for o in &array {
+            match o {
+                lopdf::Object::String(b, _) => after_space = b.last() == Some(&b' '),
+                other => {
+                    if after_space {
+                        let v = match other {
+                            lopdf::Object::Integer(i) => *i as f64,
+                            lopdf::Object::Real(r) => *r as f64,
+                            _ => continue,
+                        };
+                        out.push(v);
+                    }
+                    after_space = false;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nothing_but_the_edited_line_changes() {
+        let before = justified_bytes();
+        let base = all_lines_from(&before);
+        let after = edit_word(&before, JUSTIFIED_TEXT, "lazy", "idle").unwrap();
+        let now = all_lines_from(&after);
+
+        assert_eq!(base.len(), now.len(), "the page gained or lost a line");
+        for (a, b) in base.iter().zip(now.iter()) {
+            if (a.baseline - justified_norm_baseline()).abs() < 1e-4 {
+                continue;
+            }
+            assert_eq!(a.text, b.text, "an untouched line changed its text");
+            assert!((a.left - b.left).abs() < 1e-6, "an untouched line moved");
+            assert!((a.right - b.right).abs() < 1e-6, "an untouched line moved");
+            assert!((a.baseline - b.baseline).abs() < 1e-6, "an untouched line moved");
+        }
+    }
+
+    #[test]
+    fn the_marked_content_sequence_is_left_alone() {
+        // The line lives inside `/P <</MCID 0>> BDC ... EMC` with the line
+        // below it. Rewriting one TJ must not disturb either.
+        let before = justified_bytes();
+        let after = edit_word(&before, JUSTIFIED_TEXT, "dog", "cat").unwrap();
+
+        let mcids = |bytes: &[u8]| -> Vec<i64> {
+            let doc = lopdf::Document::load_mem(bytes).unwrap();
+            let (_, &page_id) = doc.get_pages().iter().next().unwrap();
+            let content = lopdf::content::Content::decode(&doc.get_page_content(page_id)).unwrap();
+            content.operations.iter()
+                .filter(|o| o.operator == "BDC")
+                .filter_map(|o| match o.operands.get(1) {
+                    Some(lopdf::Object::Dictionary(d)) => d.get(b"MCID").ok()?.as_i64().ok(),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(mcids(&before), mcids(&after), "the marked-content sequence changed");
+    }
+
+    // ---------------- what it refuses ----------------
+
+    #[test]
+    fn a_replacement_too_wide_for_the_line_is_refused() {
+        // The words would have to be set tighter than the font's own spaces.
+        let bytes = justified_bytes();
+        assert_eq!(
+            edit_word(&bytes, JUSTIFIED_TEXT, "fox", &"wide ".repeat(40)),
+            Err(STATUS_TOO_WIDE));
+    }
+
+    #[test]
+    fn text_the_font_cannot_spell_is_refused_before_anything_is_written() {
+        // ⚠️ CHECKED AGAINST /Widths FIRST, which the PDFium path cannot do:
+        // it has to write and read back to find out.
+        let bytes = justified_bytes();
+        assert_eq!(
+            justified::rewrite_bytes(&bytes, 0, JUSTIFIED_BASELINE,
+                JUSTIFIED_TEXT.as_bytes(), 4, 5, &[0x7f, 0x7f]),
+            Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn a_line_that_no_longer_says_what_the_caller_thinks_is_refused() {
+        let bytes = justified_bytes();
+        assert_eq!(
+            edit_line(&bytes, "Some other line entirely", 0, 4, "X"),
+            Err(STATUS_STALE_ANCHOR));
+    }
+
+    /// A justified fixture written the way the typesetters in the sampled
+    /// library actually write: one `Tm` for the paragraph and `T*` for every
+    /// line after the first, so all but one line has no `Tm` to be found by.
+    ///
+    /// Measured on real files before this existed: of the justified lines this
+    /// path refused across the library, that shape is nearly all of them, and
+    /// they were all being reported as a stale anchor.
+    fn justified_relative_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let path = "tests/fixtures/sample_justified_relative.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        let mut widths: Vec<Object> = Vec::new();
+        for code in 32u8..=126 {
+            widths.push(Object::Integer(if code == b' ' { 278 } else { 500 }));
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "AAAAAA+TestSans",
+            "FirstChar" => 32,
+            "LastChar" => 126,
+            "Widths" => widths,
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+
+        let justified = |words: &[&str]| {
+            let mut a: Vec<Object> = Vec::new();
+            for (i, w) in words.iter().enumerate() {
+                a.push(Object::string_literal(*w));
+                if i + 1 < words.len() {
+                    a.push(Object::Integer(-180));
+                }
+            }
+            Object::Array(a)
+        };
+
+        let operations = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("TL", vec![20.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 700.into()]),
+            Operation::new("TJ", vec![justified(&["The ", "first ", "line ", "of ", "the ", "block"])]),
+            Operation::new("T*", vec![]),
+            Operation::new("TJ", vec![justified(&["The ", "second ", "line ", "of ", "the ", "block"])]),
+            Operation::new("ET", vec![]),
+        ];
+
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let staging = format!("tests/fixtures/.justified_relative_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the relative fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the relative fixture into place");
+        path
+    }
+
+    const RELATIVE_FIRST: &str = "The first line of the block";
+    const RELATIVE_SECOND: &str = "The second line of the block";
+
+    #[test]
+    fn a_line_the_producer_never_gave_a_tm_is_refused_as_unrewritable() {
+        // ⚠️ THE DISTINCTION THIS STATUS EXISTS FOR. Nothing about this line is
+        // stale: it says exactly what the caller thinks it says. It simply sits
+        // where `T*` left the cursor, so there is no `Tm` at its baseline to
+        // find it by, and telling the user their text had changed would be a
+        // plain untruth.
+        let bytes = std::fs::read(justified_relative_fixture()).unwrap();
+        let out = justified::rewrite_bytes(
+            &bytes, 0, 680.0, RELATIVE_SECOND.as_bytes(), 4, 6, b"third");
+        assert_eq!(out, Err(STATUS_LINE_NOT_REWRITABLE));
+    }
+
+    #[test]
+    fn a_baseline_holding_several_runs_is_refused_as_unrewritable() {
+        // The `Tm` is exactly where the caller says. What hangs off it is two
+        // lines, so what could be read back from it was never this line.
+        let bytes = std::fs::read(justified_relative_fixture()).unwrap();
+        let out = justified::rewrite_bytes(
+            &bytes, 0, 700.0, RELATIVE_FIRST.as_bytes(), 4, 5, b"front");
+        assert_eq!(out, Err(STATUS_LINE_NOT_REWRITABLE));
+    }
+
+    #[test]
+    fn text_that_really_has_changed_is_still_a_stale_anchor() {
+        // The other half of the pair, on a page that does write one `Tm` per
+        // line: here the line genuinely does not say what the caller thinks, and
+        // that must not be dressed up as an unsupported shape.
+        let out = edit_line(
+            &justified_bytes(), "The quick brown cat jumps over the lazy dog", 16, 3, "fox");
+        assert_eq!(out, Err(STATUS_STALE_ANCHOR));
+    }
+
+    #[test]
+    fn neither_refusal_touches_the_live_document() {
+        // ⚠️ Both paths refuse BEFORE anything is written, and the proof is the
+        // document itself rather than the absence of an error: the file on disk
+        // and the page PDFium is showing are both compared, before and after.
+        let stale_path = justified_fixture();
+        let shape_path = justified_relative_fixture();
+
+        for (path, baseline, expected, want) in [
+            (stale_path, JUSTIFIED_BASELINE, "The quick brown cat jumps over the lazy dog",
+             STATUS_STALE_ANCHOR),
+            (shape_path, 680.0, RELATIVE_SECOND, STATUS_LINE_NOT_REWRITABLE),
+        ] {
+            let before_file = std::fs::read(&path).unwrap();
+            let handle = open_fixture_named(&path);
+            let before_text: Vec<String> =
+                decode_lines(handle, 0).into_iter().map(|l| l.text).collect();
+
+            let e = expected.as_bytes();
+            let new = b"zzz";
+            let buf = rewrite_justified_line(
+                handle, 0, baseline, e.as_ptr(), e.len(), 4, 3, new.as_ptr(), new.len());
+            assert_eq!(buf.status, want, "wrong status for {path}");
+            assert!(buf.data.is_null(), "a refusal handed back bytes for {path}");
+            free_byte_buffer(buf);
+
+            let after_text: Vec<String> =
+                decode_lines(handle, 0).into_iter().map(|l| l.text).collect();
+            close_document(handle);
+
+            assert_eq!(before_text, after_text, "the open document changed for {path}");
+            assert_eq!(before_file, std::fs::read(&path).unwrap(),
+                "the file on disk changed for {path}");
+        }
+    }
+
+    #[test]
+    fn a_line_break_is_refused_because_wrapping_is_not_built() {
+        let bytes = justified_bytes();
+        assert_eq!(
+            edit_word(&bytes, JUSTIFIED_TEXT, "fox", "fox\nand"),
+            Err(STATUS_INVALID_INPUT));
+    }
+
+    #[test]
+    fn an_offset_past_the_end_of_the_line_is_refused() {
+        let bytes = justified_bytes();
+        assert_eq!(
+            edit_line(&bytes, JUSTIFIED_TEXT, JUSTIFIED_TEXT.len(), 5, "X"),
+            Err(STATUS_INVALID_INPUT));
+    }
+
+    #[test]
+    fn a_document_lopdf_cannot_load_is_refused_rather_than_guessed_at() {
+        assert_eq!(
+            justified::rewrite_bytes(b"%PDF-1.7 not a document", 0, 700.0, b"x", 0, 1, b"y"),
+            Err(STATUS_DOC_NOT_REWRITABLE));
+    }
+
+    /// A justified fixture whose font can actually spell above 127, which the
+    /// plain one cannot: real subset fonts stop at the codes their document
+    /// used, so `sample_justified.pdf` refuses an accented letter for want of
+    /// a width rather than for want of an encoding.
+    ///
+    /// It carries TWO justified lines: one in a WinAnsi font holding a curly
+    /// quote and an e-acute, and one in a MacRoman font holding nothing but
+    /// ASCII. The second exists so the encoding guard can be shown to refuse
+    /// on the encoding and not on the byte.
+    fn justified_high_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+        let path = "tests/fixtures/sample_justified_high.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        let mut widths: Vec<Object> = Vec::new();
+        for code in 32u16..=255 {
+            widths.push(Object::Integer(if code == 32 { 278 } else { 500 }));
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut a_font = |encoding: &str, widths: &[Object]| {
+            doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "TrueType",
+                "BaseFont" => "AAAAAA+TestSans",
+                "FirstChar" => 32,
+                "LastChar" => 255,
+                "Widths" => widths.to_vec(),
+                "Encoding" => encoding,
+            })
+        };
+        let win = a_font("WinAnsiEncoding", &widths);
+        let mac = a_font("MacRomanEncoding", &widths);
+        let resources = doc.add_object(
+            dictionary! { "Font" => dictionary! { "F1" => win, "F2" => mac } },
+        );
+
+        let lit = |b: &[u8]| Object::String(b.to_vec(), StringFormat::Literal);
+
+        // 0xE9 is e-acute and 0x92 is a right single quote: both ordinary
+        // one-byte codes, and both above 127.
+        let win_line = vec![
+            lit(b"Th"), Object::Integer(-8),
+            lit(b"e "), Object::Integer(-180),
+            lit(b"caf\xE9\x92s "), Object::Integer(-180),
+            lit(b"qui"), Object::Integer(5),
+            lit(b"ck "), Object::Integer(-180),
+            lit(b"brown "), Object::Integer(-180),
+            lit(b"fox "), Object::Integer(-180),
+            lit(b"jum"), Object::Integer(-3),
+            lit(b"ps "), Object::Integer(-180),
+            lit(b"over "), Object::Integer(-180),
+            lit(b"the "), Object::Integer(-180),
+            lit(b"lazy "), Object::Integer(-180),
+            lit(b"dog"),
+        ];
+        let mac_line = vec![
+            lit(b"A "), Object::Integer(-180),
+            lit(b"second "), Object::Integer(-180),
+            lit(b"justified "), Object::Integer(-180),
+            lit(b"line "), Object::Integer(-180),
+            lit(b"set "), Object::Integer(-180),
+            lit(b"in "), Object::Integer(-180),
+            lit(b"a "), Object::Integer(-180),
+            lit(b"MacRoman "), Object::Integer(-180),
+            lit(b"font"),
+        ];
+
+        let operations = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 700.into()]),
+            Operation::new("TJ", vec![Object::Array(win_line)]),
+            Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F2".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 660.into()]),
+            Operation::new("TJ", vec![Object::Array(mac_line)]),
+            Operation::new("ET", vec![]),
+        ];
+
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let staging = format!("tests/fixtures/.justified_high_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the high-byte fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the high-byte fixture into place");
+        path
+    }
+
+    const HIGH_WIN_BASELINE: f32 = 700.0;
+    const HIGH_MAC_BASELINE: f32 = 660.0;
+    const HIGH_WIN_TEXT: &str = "The caf\u{e9}\u{2019}s quick brown fox jumps over the lazy dog";
+    const HIGH_MAC_TEXT: &str = "A second justified line set in a MacRoman font";
+
+    fn high_bytes() -> Vec<u8> {
+        std::fs::read(justified_high_fixture()).unwrap()
+    }
+
+    fn high_edit(bytes: &[u8], baseline: f32, expected: &str, old: &str, new: &str)
+        -> Result<Vec<u8>, i32>
+    {
+        let at = expected.find(old).expect("that text is not on the line");
+        justified::rewrite_bytes(
+            bytes, 0, baseline, expected.as_bytes(), at, old.len(), new.as_bytes())
+    }
+
+    /// Where one of the fixture's lines sits in the NORMALISED space the
+    /// readers report, looked up on the untouched fixture. The PDF-points
+    /// baseline the core takes is a different number entirely.
+    fn high_norm_baseline(starts_with: &str) -> f32 {
+        let bytes = high_bytes();
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let b = decode_lines(handle, 0)
+            .iter()
+            .find(|l| l.text.starts_with(starts_with))
+            .expect("the high fixture has no such line")
+            .baseline;
+        close_document(handle);
+        b
+    }
+
+    /// That line as PDFium reads it now. FOUND BY BASELINE, not by text: the
+    /// text is what the edits change.
+    fn high_line(bytes: &[u8], starts_with: &str) -> DecodedLine {
+        let want = high_norm_baseline(starts_with);
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the rewritten document");
+        let lines = decode_lines(handle, 0);
+        let line = lines.iter().find(|l| (l.baseline - want).abs() < 1e-4).cloned();
+        close_document(handle);
+        line.expect("the edited line is gone")
+    }
+
+    #[test]
+    fn pdfium_and_the_rewriter_agree_on_what_a_high_byte_says() {
+        // The premise the whole encoding boundary rests on, and the one that
+        // was measured on real files first: 14 of 14 justified lines carrying
+        // a byte >= 0x80 decoded to exactly the text PDFium reports.
+        let line = high_line(&high_bytes(), "The caf");
+        assert_eq!(line.text.trim(), HIGH_WIN_TEXT);
+    }
+
+    #[test]
+    fn a_high_byte_on_the_line_does_not_stop_an_ascii_edit() {
+        // ⚠️ THE COST OF THE OLD ASCII GUARD. It refused this edit, which
+        // touches nothing but ASCII, purely because the line elsewhere holds a
+        // curly quote. Measured across the sampled library, that is 14 of the
+        // 36 justified lines found.
+        let before = high_bytes();
+        let base = high_line(&before, "The caf");
+
+        let after = high_edit(&before, HIGH_WIN_BASELINE, HIGH_WIN_TEXT, "brown", "green")
+            .expect("the edit was refused");
+        let edited = high_line(&after, "The caf");
+
+        assert_eq!(edited.text.trim(), "The caf\u{e9}\u{2019}s quick green fox jumps over the lazy dog");
+        let right_pt = (edited.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        let left_pt = (edited.left - base.left).abs() * JUSTIFIED_PAGE_W;
+        assert!(left_pt < 0.001, "the left edge moved {left_pt} pt");
+        assert!(right_pt < 0.001, "the right edge moved {right_pt} pt");
+        assert_eq!(edited.first_object, edited.last_object, "the line was split into objects");
+        assert_eq!(edited.first_object, base.first_object);
+    }
+
+    #[test]
+    fn a_high_byte_character_can_be_deleted_and_typed_back() {
+        // Deletion and insertion of the two non-ASCII characters themselves,
+        // one after the other on the same line, ending where it started.
+        let before = high_bytes();
+        let base = high_line(&before, "The caf");
+
+        let deleted = high_edit(&before, HIGH_WIN_BASELINE, HIGH_WIN_TEXT, "caf\u{e9}\u{2019}s", "cafes")
+            .expect("deleting the accented letter and the quote was refused");
+        let after_delete = high_line(&deleted, "The caf");
+        assert_eq!(after_delete.text.trim(), "The cafes quick brown fox jumps over the lazy dog");
+        let drift = (after_delete.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 0.001, "the right edge moved {drift} pt after the deletion");
+
+        let back = high_edit(&deleted, HIGH_WIN_BASELINE, after_delete.text.trim(), "cafes", "caf\u{e9}\u{2019}s")
+            .expect("typing them back was refused");
+        let restored = high_line(&back, "The caf");
+        assert_eq!(restored.text.trim(), HIGH_WIN_TEXT);
+        let drift = (restored.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 0.001, "the right edge moved {drift} pt after typing them back");
+        assert_eq!(restored.first_object, restored.last_object, "the line was split into objects");
+    }
+
+    #[test]
+    fn an_accented_letter_can_be_typed_where_the_line_had_none() {
+        // Not merely preserved: WRITTEN, into a word that never held one.
+        let before = high_bytes();
+        let base = high_line(&before, "The caf");
+
+        let after = high_edit(&before, HIGH_WIN_BASELINE, HIGH_WIN_TEXT, "lazy", "laz\u{e9}")
+            .expect("writing an accented letter was refused");
+        let edited = high_line(&after, "The caf");
+
+        assert_eq!(edited.text.trim(), "The caf\u{e9}\u{2019}s quick brown fox jumps over the laz\u{e9} dog");
+        let drift = (edited.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 0.001, "the right edge moved {drift} pt");
+    }
+
+    #[test]
+    fn a_high_character_is_refused_on_a_font_that_is_not_winansi() {
+        // ⚠️ THE BOUNDARY, AND WHY IT IS ABOUT THE ENCODING RATHER THAN THE
+        // BYTE. 0xE9 is e-acute in WinAnsi and an entirely different glyph in
+        // MacRoman, and nothing in the line proves which the font means. So an
+        // ASCII edit goes through and a high one does not.
+        let before = high_bytes();
+
+        let ascii = high_edit(&before, HIGH_MAC_BASELINE, HIGH_MAC_TEXT, "line", "lion");
+        assert!(ascii.is_ok(), "an ASCII edit should still work: {ascii:?}");
+
+        let high = high_edit(&before, HIGH_MAC_BASELINE, HIGH_MAC_TEXT, "line", "lin\u{e9}");
+        assert_eq!(high, Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn a_character_with_no_winansi_code_at_all_is_refused() {
+        // Devanagari has no single-byte code in any of these encodings, and
+        // this path has no way to add a font that would give it one.
+        let before = high_bytes();
+        let out = high_edit(&before, HIGH_WIN_BASELINE, HIGH_WIN_TEXT, "dog", "\u{915}");
+        assert_eq!(out, Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn a_character_the_subset_font_has_no_width_for_is_still_refused() {
+        // The original fixture's font stops at 126, exactly as a real subset
+        // font stops at the codes its document used. The encoding work does
+        // not make an absent glyph appear.
+        let out = edit_word(&justified_bytes(), JUSTIFIED_TEXT, "quick", "caf\u{e9}");
+        assert_eq!(out, Err(STATUS_UNSUPPORTED));
+    }
+
+    /// A justified fixture whose font can only be written through its OWN
+    /// `/ToUnicode`. Every interesting code is claimed by a `/Differences`
+    /// entry, which closes the declared-encoding route, so the CMap is the
+    /// only thing left in the file that says what those codes produce.
+    ///
+    /// Shaped after the real documents this was measured against: 9 of the
+    /// justified lines in the sampled library are set in a font carrying
+    /// exactly this combination, `/WinAnsiEncoding` plus `/Differences` plus a
+    /// `/ToUnicode`. The subtype is not what the rewrite looks at, and is
+    /// TrueType here to match the other fixtures.
+    ///
+    /// The CMap deliberately holds every form the reader has to survive:
+    ///   * `beginbfchar`, one code standing for one character;
+    ///   * TWO codes claiming the SAME character, which nothing in the file
+    ///     chooses between and which must therefore be refused;
+    ///   * one code standing for TWO characters, which no single character can
+    ///     ask for and which must be skipped whole rather than half-read;
+    ///   * `beginbfrange` in its array form;
+    ///   * `beginbfrange` in its incremental form, where the destination
+    ///     advances with the code.
+    ///
+    /// `LastChar` stops short of the last mapped code, so the width check can
+    /// be shown to still apply on this route: a mapping is not a glyph.
+    ///
+    /// The second line is set in those remapped codes, which is what the read
+    /// side still cannot anchor.
+    fn justified_tounicode_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+        let path = "tests/fixtures/sample_justified_tounicode.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+
+        // Stops at 210, two codes short of the last one the CMap names.
+        let mut widths: Vec<Object> = Vec::new();
+        for code in 32u16..=210 {
+            widths.push(Object::Integer(if code == 32 { 278 } else { 500 }));
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let cmap = "\
+            /CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CMapType 2 def\n\
+            1 begincodespacerange\n\
+            <00> <FF>\n\
+            endcodespacerange\n\
+            5 beginbfchar\n\
+            <C8> <03B1>\n\
+            <C9> <03B2>\n\
+            <CA> <03B3>\n\
+            <CB> <03B3>\n\
+            <CC> <03B703B8>\n\
+            endbfchar\n\
+            2 beginbfrange\n\
+            <CD> <CF> [ <03B4> <03B5> <03B6> ]\n\
+            <D0> <D2> <03BB>\n\
+            endbfrange\n\
+            1 beginbfchar\n\
+            <D5> <03BE>\n\
+            endbfchar\n\
+            endcmap\n\
+            end\n\
+            end\n";
+        let tounicode = doc.add_object(Stream::new(dictionary! {}, cmap.as_bytes().to_vec()));
+
+        // 200 onwards, then a gap, then the code with no width.
+        let mut differences: Vec<Object> = vec![200.into()];
+        for name in [
+            "alpha", "beta", "gamma", "gamma.alt", "eta_theta",
+            "delta", "epsilon", "zeta", "lambda", "mu", "nu",
+        ] {
+            differences.push(Object::Name(name.as_bytes().to_vec()));
+        }
+        differences.push(213.into());
+        differences.push(Object::Name(b"xi".to_vec()));
+
+        let encoding = doc.add_object(dictionary! {
+            "Type" => "Encoding",
+            "BaseEncoding" => "WinAnsiEncoding",
+            "Differences" => differences,
+        });
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "AAAAAA+TestSans",
+            "FirstChar" => 32,
+            "LastChar" => 210,
+            "Widths" => widths,
+            "Encoding" => encoding,
+            "ToUnicode" => tounicode,
+        });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+
+        let lit = |b: &[u8]| Object::String(b.to_vec(), StringFormat::Literal);
+
+        let ascii_line = vec![
+            lit(b"Th"), Object::Integer(-8),
+            lit(b"e "), Object::Integer(-180),
+            lit(b"qui"), Object::Integer(5),
+            lit(b"ck "), Object::Integer(-180),
+            lit(b"brown "), Object::Integer(-180),
+            lit(b"fox "), Object::Integer(-180),
+            lit(b"jum"), Object::Integer(-3),
+            lit(b"ps "), Object::Integer(-180),
+            lit(b"over "), Object::Integer(-180),
+            lit(b"the "), Object::Integer(-180),
+            lit(b"lazy "), Object::Integer(-180),
+            lit(b"dog"),
+        ];
+        // Nothing here has a WinAnsi code, which is the point of it.
+        let remapped_line = vec![
+            lit(b"\xC8\xC9 "), Object::Integer(-180),
+            lit(b"\xCD\xCE "), Object::Integer(-180),
+            lit(b"\xD0\xD1 "), Object::Integer(-180),
+            lit(b"\xD2\xC8 "), Object::Integer(-180),
+            lit(b"\xC9\xCD"),
+        ];
+
+        let operations = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 700.into()]),
+            Operation::new("TJ", vec![Object::Array(ascii_line)]),
+            Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 660.into()]),
+            Operation::new("TJ", vec![Object::Array(remapped_line)]),
+            Operation::new("ET", vec![]),
+        ];
+
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let staging = format!("tests/fixtures/.justified_tounicode_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the ToUnicode fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the ToUnicode fixture into place");
+        path
+    }
+
+    const TOU_BASELINE: f32 = 700.0;
+    const TOU_GREEK_BASELINE: f32 = 660.0;
+    const TOU_TEXT: &str = "The quick brown fox jumps over the lazy dog";
+    /// What the remapped line says, which only the CMap can tell anyone.
+    const TOU_GREEK_TEXT: &str =
+        "\u{3b1}\u{3b2} \u{3b4}\u{3b5} \u{3bb}\u{3bc} \u{3bd}\u{3b1} \u{3b2}\u{3b4}";
+
+    fn tou_bytes() -> Vec<u8> {
+        std::fs::read(justified_tounicode_fixture()).unwrap()
+    }
+
+    /// Replaces the first occurrence of `old` on the ASCII line.
+    fn tou_edit(bytes: &[u8], old: &str, new: &str) -> Result<Vec<u8>, i32> {
+        let at = TOU_TEXT.find(old).expect("that text is not on the line");
+        justified::rewrite_bytes(
+            bytes, 0, TOU_BASELINE, TOU_TEXT.as_bytes(), at, old.len(), new.as_bytes())
+    }
+
+    /// One of the fixture's lines as PDFium reads it now. FOUND BY BASELINE,
+    /// looked up on the untouched fixture, because the text is what the edits
+    /// change.
+    fn tou_line(bytes: &[u8], starts_with: &str) -> DecodedLine {
+        let want = {
+            let base = tou_bytes();
+            let handle = open_document_from_bytes(base.as_ptr(), base.len());
+            assert_ne!(handle, 0);
+            let b = decode_lines(handle, 0)
+                .iter()
+                .find(|l| l.text.starts_with(starts_with))
+                .expect("the fixture has no such line")
+                .baseline;
+            close_document(handle);
+            b
+        };
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the rewritten document");
+        let lines = decode_lines(handle, 0);
+        let line = lines.iter().find(|l| (l.baseline - want).abs() < 1e-4).cloned();
+        close_document(handle);
+        line.expect("the edited line is gone")
+    }
+
+    #[test]
+    fn a_character_only_the_fonts_own_tounicode_can_place_is_written() {
+        // ⚠️ THE PHASE 2 CASE. WinAnsi has no code for alpha at all, and every
+        // code this font uses is claimed by /Differences, so the declared
+        // encoding cannot place it either. The font's own /ToUnicode can, and
+        // PDFium reads back exactly the character that was asked for.
+        let before = tou_bytes();
+        let base = tou_line(&before, "The quick");
+
+        let after = tou_edit(&before, "brown", "gr\u{3b1}y").expect("the edit was refused");
+        let edited = tou_line(&after, "The quick");
+
+        assert_eq!(edited.text.trim(), "The quick gr\u{3b1}y fox jumps over the lazy dog");
+        let drift = (edited.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 0.001, "the right edge moved {drift} pt");
+        assert_eq!(edited.first_object, edited.last_object, "the line was split into objects");
+    }
+
+    #[test]
+    fn a_character_two_codes_both_claim_is_refused_rather_than_guessed() {
+        // The CMap says 0xCA produces gamma and so does 0xCB. Nothing in the
+        // file chooses between them. Beta is the control: one code, accepted.
+        let bytes = tou_bytes();
+        assert!(tou_edit(&bytes, "brown", "\u{3b2}").is_ok(), "the control was refused");
+        assert_eq!(tou_edit(&bytes, "brown", "\u{3b3}"), Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn a_code_standing_for_two_characters_places_neither_of_them() {
+        // 0xCC produces eta THEN theta. A single character cannot ask for it,
+        // and half of it is not it.
+        let bytes = tou_bytes();
+        assert_eq!(tou_edit(&bytes, "brown", "\u{3b7}"), Err(STATUS_UNSUPPORTED));
+        assert_eq!(tou_edit(&bytes, "brown", "\u{3b8}"), Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn a_bfrange_written_as_an_array_places_each_of_its_characters() {
+        let before = tou_bytes();
+        let after = tou_edit(&before, "brown", "\u{3b4}\u{3b5}\u{3b6}").expect("refused");
+        assert_eq!(tou_line(&after, "The quick").text.trim(),
+            "The quick \u{3b4}\u{3b5}\u{3b6} fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn a_bfrange_destination_advances_with_the_code() {
+        // <D0> <D2> <03BB> names lambda at 0xD0 and nu two codes further on,
+        // which a reader that ignored the offset would get wrong.
+        let before = tou_bytes();
+        let after = tou_edit(&before, "brown", "\u{3bb}\u{3bc}\u{3bd}").expect("refused");
+        assert_eq!(tou_line(&after, "The quick").text.trim(),
+            "The quick \u{3bb}\u{3bc}\u{3bd} fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn a_code_the_font_remapped_is_still_not_written_as_winansi_says() {
+        // ⚠️ THE GUARD DID NOT MOVE. 0xC8 is E-grave in WinAnsi and alpha in
+        // this font. /Differences closes the declared route, and the CMap
+        // never names E-grave, so there is nothing left to write it with.
+        assert_eq!(tou_edit(&tou_bytes(), "brown", "\u{c8}"), Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn the_width_check_still_applies_to_a_character_the_cmap_names() {
+        // 0xD5 is xi in the CMap, but LastChar stops at 210 and the font has
+        // no width for it. A mapping is not a glyph.
+        assert_eq!(tou_edit(&tou_bytes(), "brown", "\u{3be}"), Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn an_ascii_edit_on_a_remapped_font_still_takes_the_declared_route() {
+        // Every /Differences entry here is above 127, so ASCII is untouched
+        // and this is exactly the edit it always was.
+        let before = tou_bytes();
+        let base = tou_line(&before, "The quick");
+        let after = tou_edit(&before, "brown", "green").expect("refused");
+        let edited = tou_line(&after, "The quick");
+        assert_eq!(edited.text.trim(), "The quick green fox jumps over the lazy dog");
+        let drift = (edited.right - base.right).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 0.001, "the right edge moved {drift} pt");
+    }
+
+    #[test]
+    fn a_line_whose_own_text_has_no_winansi_codes_cannot_be_anchored_yet() {
+        // ⚠️ THE READ SIDE IS STILL WinAnsi. Writing now asks the font, but
+        // FINDING the line still encodes the caller's text as WinAnsi, so a
+        // line made of remapped codes cannot be matched at all. Widening that
+        // means knowing the font before the line is known, which is a
+        // different problem from this one.
+        let bytes = tou_bytes();
+
+        // The fixture really does say that, as PDFium reads it.
+        let line = tou_line(&bytes, "\u{3b1}\u{3b2}");
+        assert_eq!(line.text.trim(), TOU_GREEK_TEXT);
+
+        let len = TOU_GREEK_TEXT.chars().next().unwrap().len_utf8();
+        assert_eq!(
+            justified::rewrite_bytes(
+                &bytes, 0, TOU_GREEK_BASELINE, TOU_GREEK_TEXT.as_bytes(), 0, len, b"x"),
+            Err(STATUS_UNSUPPORTED));
+    }
+
+    #[test]
+    fn the_ffi_returns_bytes_that_open_and_read_correctly() {
+        // The whole round trip the app will make, through the real entry point.
+        let handle = open_fixture_named(&justified_fixture());
+        let expected = JUSTIFIED_TEXT.as_bytes();
+        let at = JUSTIFIED_TEXT.find("brown").unwrap();
+        let new = b"grey";
+
+        let buf = rewrite_justified_line(
+            handle, 0, JUSTIFIED_BASELINE,
+            expected.as_ptr(), expected.len(), at as u32, 5,
+            new.as_ptr(), new.len());
+        assert_eq!(buf.status, STATUS_OK_PDFIUM);
+        assert!(!buf.data.is_null());
+
+        let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec();
+        free_byte_buffer(buf);
+
+        let edited = line_from(&bytes);
+        assert!(edited.text.contains("grey"), "{:?}", edited.text);
+
+        // ⚠️ AND THE LIVE DOCUMENT IS UNTOUCHED. The core hands back candidate
+        // bytes; nothing is swapped until the caller decides to.
+        let still = decode_lines(handle, 0);
+        assert!(still.iter().any(|l| l.text.contains("brown")),
+            "the live document was modified by a call that only produces bytes");
+        close_document(handle);
+    }
+
+    // ---------------- provisioning a font for Path B ----------------
+
+    const PROVISION_LATIN: &str = r"C:\Windows\Fonts\arial.ttf";
+    const PROVISION_MYANMAR: &str = r"C:\Windows\Fonts\mmrtext.ttf";
+    /// Burmese, which reorders and stacks, so the glyphs are not the characters.
+    const PROVISION_BURMESE: &str = "\u{1000}\u{1031}\u{102c}\u{1004}\u{103a}\u{1038}";
+    const PROVISION_DEVANAGARI: &str = "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}";
+
+    /// The same font, with its `OS/2` table's `fsType` set to `value`.
+    ///
+    /// No font shipped with Windows declares itself non-embeddable, so the only
+    /// honest way to test the permission gate is to make one that does.
+    /// `fsType` is a single big-endian `u16` at offset 8 of the `OS/2` table,
+    /// and nothing that reads it verifies the table checksums, so two bytes is
+    /// the whole edit.
+    fn with_fstype(bytes: &[u8], value: u16) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let table_count = u16::from_be_bytes([out[4], out[5]]) as usize;
+        for i in 0..table_count {
+            let record = 12 + i * 16;
+            if &out[record..record + 4] != b"OS/2" {
+                continue;
+            }
+            let at = u32::from_be_bytes(out[record + 8..record + 12].try_into().unwrap()) as usize;
+            out[at + 8..at + 10].copy_from_slice(&value.to_be_bytes());
+            return out;
+        }
+        panic!("that font has no OS/2 table to patch");
+    }
+
+    /// Puts bytes somewhere `provision` can read them, OUTSIDE the repository.
+    ///
+    /// The name carries what is being tested because `font_file_bytes` caches
+    /// by path, so two different fonts must never share one.
+    fn a_font_file(name: &str, bytes: &[u8]) -> String {
+        let path = std::env::temp_dir().join(format!("ayaan_provision_{name}.ttf"));
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// Every byte of the replacement is accounted for by exactly one glyph.
+    ///
+    /// The cluster extents partition the source, so their lengths must add back
+    /// up to it. This is the property `/ToUnicode` is built on: a glyph that
+    /// carries no text, or text some other glyph also claims, is a character
+    /// that cannot be searched for or copied back out.
+    fn every_byte_is_accounted_for(p: &provision::Provisioned, text: &str) {
+        let total: usize = p.to_unicode.iter().map(|(_, s)| s.len()).sum();
+        assert_eq!(total, text.len(),
+            "the glyphs account for {total} of {} bytes", text.len());
+    }
+
+    #[test]
+    fn a_font_that_can_spell_the_text_is_provisioned() {
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let p = provision::provision(Some(PROVISION_LATIN), "Replacement text", 12.0)
+            .expect("a Latin font refused Latin");
+        assert!(!p.glyphs.is_empty(), "no glyphs");
+        assert!(p.glyphs.iter().all(|g| g.id != 0), "a .notdef slipped through");
+        every_byte_is_accounted_for(&p, "Replacement text");
+    }
+
+    #[test]
+    fn a_font_that_cannot_spell_the_text_is_refused() {
+        // ⚠️ THE FAILURE THIS PHASE EXISTS TO PREVENT. A face with no glyph for
+        // a character shapes it to .notdef rather than saying so, and .notdef
+        // draws as an empty box or as nothing at all. Nothing downstream would
+        // notice.
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        for text in [PROVISION_DEVANAGARI, PROVISION_BURMESE] {
+            assert_eq!(
+                provision::provision(Some(PROVISION_LATIN), text, 12.0).err(),
+                Some(provision::Refusal::CannotSpell),
+                "a Latin font claimed it could set {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_complex_script_is_provisioned_by_a_font_that_has_it() {
+        if !std::path::Path::new(PROVISION_MYANMAR).exists() {
+            return;
+        }
+        let p = provision::provision(Some(PROVISION_MYANMAR), PROVISION_BURMESE, 12.0)
+            .expect("a Myanmar font refused Burmese");
+        assert!(p.glyphs.iter().all(|g| g.id != 0), "a .notdef slipped through");
+        every_byte_is_accounted_for(&p, PROVISION_BURMESE);
+    }
+
+    #[test]
+    fn no_font_named_is_a_refusal_rather_than_a_fallback() {
+        // ⚠️ EXACTLY WHERE THE TEXT-BOX ENGINE SAYS HELVETICA. resolve_text_font
+        // answers this same question with a font, which is right for a text box
+        // and wrong for type standing in for a document's own.
+        assert_eq!(provision::provision(None, "text", 12.0).err(),
+            Some(provision::Refusal::NoFontNamed));
+        assert_eq!(provision::provision(Some(""), "text", 12.0).err(),
+            Some(provision::Refusal::NoFontNamed));
+    }
+
+    #[test]
+    fn a_font_file_that_is_not_there_is_a_refusal_rather_than_a_fallback() {
+        assert_eq!(
+            provision::provision(Some(r"C:\Windows\Fonts\no_such_font_at_all.ttf"), "text", 12.0)
+                .err(),
+            Some(provision::Refusal::FileUnreadable));
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_face_are_refused() {
+        // A PDF, which reads perfectly well and is not a font.
+        let not_a_font = justified_fixture();
+        assert_eq!(provision::provision(Some(&not_a_font), "text", 12.0).err(),
+            Some(provision::Refusal::NotAFace));
+    }
+
+    #[test]
+    fn a_font_whose_own_fstype_prohibits_embedding_is_refused() {
+        // ⚠️ THE FONT'S RULE, READ RATHER THAN ASSUMED. The controls matter as
+        // much as the refusal: the SAME bytes with a permissive fsType go
+        // through, so this is reading the field rather than refusing on
+        // principle. 0x0002 is the one value that means "must not be embedded".
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let font = std::fs::read(PROVISION_LATIN).unwrap();
+
+        let restricted = a_font_file("restricted", &with_fstype(&font, 0x0002));
+        assert_eq!(provision::provision(Some(&restricted), "text", 12.0).err(),
+            Some(provision::Refusal::EmbeddingProhibited));
+
+        for (name, bits) in [("installable", 0x0000u16), ("editable", 0x0008),
+                             ("preview_and_print", 0x0004)] {
+            let path = a_font_file(name, &with_fstype(&font, bits));
+            assert!(provision::provision(Some(&path), "text", 12.0).is_ok(),
+                "fsType {bits:#06x} was refused, and it permits embedding");
+        }
+    }
+
+    #[test]
+    fn a_provisioned_font_is_one_pdfium_will_actually_take() {
+        // The only thing here that touches a document: a font object added to
+        // an in-memory copy that is closed without ever being saved. It is the
+        // one question rustybuzz cannot answer, because agreeing that bytes are
+        // a face is not the same as agreeing to embed them.
+        use pdfium_render::prelude::*;
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let p = provision::provision(Some(PROVISION_LATIN), "Replacement text", 12.0)
+            .expect("refused");
+
+        let handle = open_fixture_named(&justified_fixture());
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let mut doc_guard = lock(&doc);
+            assert!(provision::embed(&mut doc_guard, &p).is_ok(),
+                "PDFium would not embed a font rustybuzz accepted");
+        }
+        close_document(handle);
+    }
+
+    /// PHASE 4 PRIORITY 1. Does a font PDFium embedded survive a save and a
+    /// reopen when NOTHING on the page uses it yet?
+    ///
+    /// The scratch proof forced the question by adding a throwaway text-box
+    /// annotation in the font and deleting it afterwards. If the font persists
+    /// on its own, that trick is not needed and Path B gets simpler. If it does
+    /// not, the trick comes back and this says so.
+    ///
+    /// Also measures the thing the emitter has to do next: FIND that font
+    /// again in the saved bytes. Object ids are only usable for that if PDFium
+    /// keeps them stable across a save, which is exactly what this prints.
+    ///
+    ///   cargo test provisioned_font_survival_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn provisioned_font_survival_spike() {
+        use lopdf::{Document, Object};
+
+        let font_file = std::fs::read(PROVISION_LATIN).unwrap();
+        let p = provision::provision(Some(PROVISION_LATIN), "Replacement text", 12.0)
+            .expect("provisioning refused");
+
+        let handle = open_fixture_named(&justified_fixture());
+
+        let snapshot = |h: u64| -> Vec<u8> {
+            let buf = snapshot_document(h);
+            assert_eq!(buf.status, STATUS_OK_PDFIUM);
+            let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec();
+            free_byte_buffer(buf);
+            bytes
+        };
+
+        /// Every object id in the file, and the Type0 fonts among them.
+        fn survey(bytes: &[u8]) -> (Vec<(u32, u16)>, Vec<(u32, u16)>) {
+            let doc = Document::load_mem(bytes).expect("lopdf refused the snapshot");
+            let mut all: Vec<(u32, u16)> = doc.objects.keys().copied().collect();
+            all.sort();
+            let mut type0: Vec<(u32, u16)> = doc
+                .objects
+                .iter()
+                .filter(|(_, o)| {
+                    let Object::Dictionary(d) = o else { return false };
+                    d.get(b"Subtype").ok().and_then(|x| x.as_name().ok()) == Some(b"Type0")
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            type0.sort();
+            (all, type0)
+        }
+
+        let before = snapshot(handle);
+        let (ids_before, type0_before) = survey(&before);
+        println!("BEFORE: {} objects, {} Type0 fonts", ids_before.len(), type0_before.len());
+
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let mut doc_guard = lock(&doc);
+            provision::embed(&mut doc_guard, &p).expect("PDFium refused the font");
+        }
+
+        let after = snapshot(handle);
+        let (ids_after, type0_after) = survey(&after);
+        println!("AFTER : {} objects, {} Type0 fonts", ids_after.len(), type0_after.len());
+
+        // Q1: did the font survive a save with nothing referencing it?
+        println!("Q1 font survived unreferenced : {}", type0_after.len() > type0_before.len());
+
+        // Q2: are pre-existing object ids stable, so a diff can name the new one?
+        let kept = ids_before.iter().filter(|id| ids_after.contains(id)).count();
+        println!("Q2 ids stable                 : {kept} of {} kept, {} new",
+            ids_before.len(), ids_after.len() as i64 - kept as i64);
+
+        // Q3: what does the new font look like, and are its bytes ours?
+        let doc = Document::load_mem(&after).unwrap();
+        for id in &type0_after {
+            let d = doc.get_dictionary(*id).unwrap();
+            let base = d.get(b"BaseFont").ok().and_then(|x| x.as_name().ok())
+                .map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
+            let enc = d.get(b"Encoding").ok().and_then(|x| x.as_name().ok())
+                .map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
+            let mut file_len = 0usize;
+            let mut cid_to_gid = String::new();
+            let mut has_w = false;
+            let mut dw = String::new();
+            if let Some(desc) = d.get(b"DescendantFonts").ok().and_then(|o| match o {
+                Object::Array(a) => a.first().cloned(),
+                Object::Reference(r) => doc.get_object(*r).ok()
+                    .and_then(|x| x.as_array().ok()).and_then(|a| a.first().cloned()),
+                _ => None,
+            }) {
+                let dd = match &desc {
+                    Object::Reference(i) => doc.get_dictionary(*i).ok().cloned(),
+                    Object::Dictionary(x) => Some(x.clone()),
+                    _ => None,
+                };
+                if let Some(dd) = dd {
+                    has_w = dd.get(b"W").is_ok();
+                    dw = format!("{:?}", dd.get(b"DW").ok());
+                    cid_to_gid = dd.get(b"CIDToGIDMap").ok()
+                        .and_then(|x| x.as_name().ok())
+                        .map(|n| String::from_utf8_lossy(n).to_string()).unwrap_or_default();
+                    if let Some(fd) = dd.get(b"FontDescriptor").ok().and_then(|o| match o {
+                        Object::Reference(i) => doc.get_dictionary(*i).ok().cloned(),
+                        Object::Dictionary(x) => Some(x.clone()),
+                        _ => None,
+                    }) {
+                        if let Ok(Object::Reference(fid)) = fd.get(b"FontFile2") {
+                            if let Ok(st) = doc.get_object(*fid).and_then(|o| o.as_stream()) {
+                                file_len = st.decompressed_content()
+                                    .unwrap_or_else(|_| st.content.clone()).len();
+                            }
+                        }
+                    }
+                }
+            }
+            println!("  font {id:?} BaseFont {base:?} Encoding {enc:?}");
+            println!("    CIDToGIDMap {cid_to_gid:?} /W present {has_w} /DW {dw}");
+            println!("    FontFile2 {file_len} bytes, we handed over {} bytes, same: {}",
+                font_file.len(), file_len == font_file.len());
+        }
+
+        // Q4: did the page's own Resources gain anything?
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let page = doc.get_dictionary(pid).unwrap();
+        let res = match page.get(b"Resources") {
+            Ok(Object::Reference(i)) => doc.get_dictionary(*i).ok().cloned(),
+            Ok(Object::Dictionary(d)) => Some(d.clone()),
+            _ => None,
+        };
+        let names: Vec<String> = res
+            .and_then(|r| match r.get(b"Font") {
+                Ok(Object::Reference(i)) => doc.get_dictionary(*i).ok().cloned(),
+                Ok(Object::Dictionary(d)) => Some(d.clone()),
+                _ => None,
+            })
+            .map(|f| f.iter().map(|(k, _)| String::from_utf8_lossy(k).to_string()).collect())
+            .unwrap_or_default();
+        println!("Q4 page /Resources /Font names: {names:?}");
+
+        close_document(handle);
+    }
+
+    // ---------------- Path B: a shaped replacement in a second font ----------------
+
+    /// A justified fixture whose font is REALLY EMBEDDED, so what PDFium draws
+    /// is the file's own type rather than a substitute.
+    ///
+    /// The other justified fixtures name a font that is not there, which is
+    /// fine for arithmetic and useless for a render diff: a substituted face
+    /// has its own metrics and its own outlines. This one carries the actual
+    /// `FontFile2` and takes its `/Widths` from that same face, so the page on
+    /// screen is the page the numbers describe.
+    ///
+    /// Same shape as `justified_fixture` otherwise: one justified line whose
+    /// words are split by kerning, one large negative adjustment after each
+    /// space doing the justification, a second line below it that must not
+    /// move, and the whole thing inside a marked-content sequence.
+    fn justified_embedded_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+        let path = "tests/fixtures/sample_justified_embedded.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+        let font_bytes = std::fs::read(PROVISION_LATIN).expect("no font to embed");
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).expect("unparseable");
+        let upem = face.units_per_em() as f64;
+
+        // The face's own advances, in the thousandths of an em a PDF wants.
+        let mut widths: Vec<Object> = Vec::new();
+        for code in 32u8..=126 {
+            let advance = face
+                .glyph_index(code as char)
+                .and_then(|g| face.glyph_hor_advance(g))
+                .unwrap_or(0) as f64;
+            widths.push(Object::Integer((advance / upem * 1000.0).round() as i64));
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+
+        let mut file = Stream::new(dictionary! { "Length1" => font_bytes.len() as i64 },
+            font_bytes.clone());
+        // Left uncompressed so the bytes in the file are the bytes handed over.
+        file.set_plain_content(font_bytes.clone());
+        let file_id = doc.add_object(file);
+        let descriptor = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "ArialMT",
+            "Flags" => 32,                       // nonsymbolic
+            "FontBBox" => vec![(-665).into(), (-325).into(), 2000.into(), 1006.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 905,
+            "Descent" => -212,
+            "CapHeight" => 716,
+            "StemV" => 80,
+            "FontFile2" => file_id,
+        });
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => "ArialMT",
+            "FirstChar" => 32,
+            "LastChar" => 126,
+            "Widths" => widths,
+            "Encoding" => "WinAnsiEncoding",
+            "FontDescriptor" => descriptor,
+        });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+
+        let lit = |b: &[u8]| Object::String(b.to_vec(), StringFormat::Literal);
+        let line = vec![
+            lit(b"Th"), Object::Integer(-8),
+            lit(b"e "), Object::Integer(-180),
+            lit(b"qui"), Object::Integer(5),
+            lit(b"ck "), Object::Integer(-180),
+            lit(b"brown "), Object::Integer(-180),
+            lit(b"fox "), Object::Integer(-180),
+            lit(b"jum"), Object::Integer(-3),
+            lit(b"ps "), Object::Integer(-180),
+            lit(b"over "), Object::Integer(-180),
+            lit(b"the "), Object::Integer(-180),
+            lit(b"lazy "), Object::Integer(-180),
+            lit(b"dog"),
+        ];
+
+        let operations = vec![
+            Operation::new("BDC", vec!["P".into(), Object::Dictionary(dictionary! { "MCID" => 0 })]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 700.into()]),
+            Operation::new("TJ", vec![Object::Array(line)]),
+            Operation::new("ET", vec![]),
+            // ⚠️ THE LINE THAT PROVES THE Tf RESTORE. It names no font of its
+            // own, so it draws in whatever Tf is still in force.
+            Operation::new("BT", vec![]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 680.into()]),
+            Operation::new("TJ", vec![Object::Array(vec![lit(b"and rests here quietly.")])]),
+            Operation::new("ET", vec![]),
+            Operation::new("EMC", vec![]),
+        ];
+
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+
+        let staging = format!("tests/fixtures/.justified_embedded_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the embedded fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the embedded fixture into place");
+        path
+    }
+
+    const EMBEDDED_BASELINE: f32 = 700.0;
+    const EMBEDDED_TEXT: &str = "The quick brown fox jumps over the lazy dog";
+    const DEVANAGARI_FONT: &str = r"C:\Windows\Fonts\Nirmala.ttf";
+
+    /// Everything Path B needs that PDFium has to do: the font embedded in a
+    /// COPY, and the id of the font object in those bytes.
+    ///
+    /// ⚠️ THE LIVE DOCUMENT IS NEVER TOUCHED. The snapshot is opened as a
+    /// second document and the font goes in there, so what comes back is
+    /// candidate bytes exactly as Path A's contract promises.
+    ///
+    /// The font is found by DIFFING THE OBJECT IDS either side of the embed.
+    /// Measured: PDFium keeps every pre-existing id across a save, so the one
+    /// that appears is the one that was added. Naming it by its `/BaseFont`
+    /// instead was tried and is a heuristic that happens to work on one file.
+    fn embed_into_a_copy(bytes: &[u8], font_path: &str) -> (Vec<u8>, lopdf::ObjectId) {
+        use lopdf::Document;
+
+        let snapshot = |h: u64| -> Vec<u8> {
+            let buf = snapshot_document(h);
+            assert_eq!(buf.status, STATUS_OK_PDFIUM, "snapshot failed");
+            let out = unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec();
+            free_byte_buffer(buf);
+            out
+        };
+        let type0_ids = |b: &[u8]| -> Vec<lopdf::ObjectId> {
+            let doc = Document::load_mem(b).expect("lopdf refused the snapshot");
+            let mut ids: Vec<lopdf::ObjectId> = doc
+                .objects
+                .iter()
+                .filter(|(_, o)| matches!(o, lopdf::Object::Dictionary(d)
+                    if d.get(b"Subtype").ok().and_then(|x| x.as_name().ok()) == Some(b"Type0")))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let copy = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(copy, 0, "PDFium refused the snapshot");
+        let before = type0_ids(&snapshot(copy));
+
+        let p = provision::provision(Some(font_path), "x", 12.0).expect("provisioning refused");
+        {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&copy).cloned().unwrap();
+            let mut doc_guard = lock(&doc);
+            provision::embed(&mut doc_guard, &p).expect("PDFium refused the font");
+        }
+        let after_bytes = snapshot(copy);
+        close_document(copy);
+
+        let added: Vec<lopdf::ObjectId> = type0_ids(&after_bytes)
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(added.len(), 1, "expected exactly one new Type0 font, got {added:?}");
+        (after_bytes, added[0])
+    }
+
+    /// A page rendered at a fixed width, and where it differs from another.
+    fn shot(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the document");
+        let r = render_uncached(handle, 0, 900);
+        assert_eq!(r.status, STATUS_OK_PDFIUM, "the page did not render");
+        let (w, h) = (r.width as usize, r.height as usize);
+        let px = unsafe { std::slice::from_raw_parts(r.buffer, r.len) }.to_vec();
+        free_render_result(r);
+        close_document(handle);
+        (w, h, px)
+    }
+
+    /// Changed pixels, and the box they fall in: (count, x0, y0, x1, y1).
+    fn diff_box(a: &(usize, usize, Vec<u8>), b: &(usize, usize, Vec<u8>))
+        -> (usize, usize, usize, usize, usize)
+    {
+        assert_eq!((a.0, a.1), (b.0, b.1), "the two renders are different sizes");
+        let (w, h) = (a.0, a.1);
+        let (mut n, mut x0, mut y0, mut x1, mut y1) = (0usize, usize::MAX, usize::MAX, 0usize, 0usize);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if (0..3).any(|k| (a.2[i + k] as i32 - b.2[i + k] as i32).abs() > 24) {
+                    n += 1;
+                    x0 = x0.min(x); y0 = y0.min(y);
+                    x1 = x1.max(x); y1 = y1.max(y);
+                }
+            }
+        }
+        (n, x0, y0, x1, y1)
+    }
+
+    /// PHASE 4 PRIORITY 2. The smallest possible mixed-font replacement: ONE
+    /// character, in the middle of a word, in a font the document does not
+    /// have. Everything either side of it must stay in the document's own type.
+    ///
+    ///   cargo test smallest_mixed_font_splice_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn smallest_mixed_font_splice_spike() {
+        use lopdf::content::Content;
+        use lopdf::{Document, Object};
+
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            println!("no Devanagari font on this machine");
+            return;
+        }
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let (base, font_id) = embed_into_a_copy(&original, DEVANAGARI_FONT);
+        println!("font object in the copy: {font_id:?}");
+
+        // ⚠️ THE CONTROL IS THE POST-SAVE COPY, not the fixture. Rendering the
+        // fixture instead would put PDFium's own whole-page re-render into the
+        // diff, which is how an earlier measurement of this came out wrong.
+        let before = shot(&base);
+
+        let replacement = "\u{915}";  // ka
+        let at = EMBEDDED_TEXT.find("brown").unwrap() + 2;   // the "o" of brown
+        let p = provision::provision(Some(DEVANAGARI_FONT), replacement, shaped::SHAPING_SIZE)
+            .expect("provisioning refused");
+        println!("shaped into {} glyph(s)", p.glyphs.len());
+
+        let edited = justified::rewrite_bytes_shaped(
+            &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(), at, 1, &p, replacement, font_id);
+        let edited = match edited {
+            Ok(b) => b,
+            Err(e) => { println!("REFUSED with status {e}"); return; }
+        };
+
+        let after = shot(&edited);
+        let (n, x0, y0, x1, y1) = diff_box(&before, &after);
+        println!("changed pixels {n}, box x {x0}..{x1}  y {y0}..{y1}  (page {}x{})",
+            after.0, after.1);
+
+        // where the two lines actually are, in render pixels
+        let handle = open_document_from_bytes(base.as_ptr(), base.len());
+        let mut edges = (0.0f32, 0.0f32);
+        for l in decode_lines(handle, 0) {
+            println!("  line {:?} top {:.1}px bottom {:.1}px left {:.5} right {:.5}",
+                l.text.chars().take(28).collect::<String>(),
+                l.top * after.0 as f32, l.bottom * after.0 as f32, l.left, l.right);
+            if l.text.starts_with("The quick") { edges = (l.left, l.right); }
+        }
+        close_document(handle);
+
+        // what the line reader makes of the result
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        for l in decode_lines(handle, 0) {
+            println!("  AFTER line objs {}..{} font {:?} left {:.5} right {:.5} {:?}",
+                l.first_object, l.last_object, l.font,
+                l.left, l.right, l.text.chars().take(40).collect::<String>());
+            if l.first_object == 0 {
+                println!("     LEFT drift {:.6} pt   RIGHT drift {:.6} pt",
+                    (l.left - edges.0).abs() * 612.0, (l.right - edges.1).abs() * 612.0);
+            }
+        }
+        close_document(handle);
+
+        // ⚠️ THE CONTROL. Path A editing the SAME line of the SAME fixture. If
+        // it drifts the same amount, the drift is the real font's metrics and
+        // the measurement, not anything Path B does.
+        let control = justified::rewrite_bytes(
+            &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(),
+            EMBEDDED_TEXT.find("brown").unwrap(), 5, b"green").expect("Path A refused");
+        let handle = open_document_from_bytes(control.as_ptr(), control.len());
+        for l in decode_lines(handle, 0) {
+            if l.first_object == 0 {
+                println!("  PATH A control: RIGHT drift {:.6} pt  {:?}",
+                    (l.right - edges.1).abs() * 612.0,
+                    l.text.chars().take(40).collect::<String>());
+            }
+        }
+        close_document(handle);
+
+        // the marked-content structure
+        let doc = Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let content = Content::decode(&doc.get_page_content(pid)).unwrap();
+        let count = |op: &str| content.operations.iter().filter(|o| o.operator == op).count();
+        let mcids = content.operations.iter().filter(|o| o.operator == "BDC")
+            .filter(|o| matches!(o.operands.get(1), Some(Object::Dictionary(d))
+                if d.get(b"MCID").is_ok())).count();
+        println!("BDC {} EMC {} MCID {} BT {} ET {} Tf {} TJ {}",
+            count("BDC"), count("EMC"), mcids, count("BT"), count("ET"),
+            count("Tf"), count("TJ"));
+        for op in &content.operations {
+            if op.operator == "Tf" {
+                println!("   Tf {:?}", op.operands);
+            }
+        }
+    }
+
+    /// PHASE 4 PRIORITY 5. Replacements whose glyphs the font's own `/W` does
+    /// not describe, which is what the reconciliation exists for.
+    ///
+    /// PDFium builds `/W` by walking the font's cmap, so every glyph GSUB
+    /// produced is missing from it and the renderer falls back to `/DW`. A
+    /// conjunct is exactly that case.
+    ///
+    ///   cargo test width_reconciliation_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn width_reconciliation_spike() {
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+
+        let cases: [(&str, &str, &str); 6] = [
+            ("latin",     PROVISION_LATIN,  "green"),
+            // Accented Latin and typographic marks: Unicode the shaper has to
+            // carry through even though nothing about it reorders.
+            ("unicode",   PROVISION_LATIN,  "caf\u{e9}\u{2019}s"),
+            // ⚠️ RIGHT TO LEFT, AND JOINED. The shaper returns these in VISUAL
+            // order with the contextual forms already chosen, which is what a
+            // content stream wants. It is the case most likely to expose an
+            // emitter that quietly assumed logical order.
+            ("arabic",    PROVISION_LATIN,  "\u{645}\u{631}\u{62d}\u{628}\u{627}"),
+            ("ka",        DEVANAGARI_FONT,  "\u{915}"),
+            ("conjunct",  DEVANAGARI_FONT,  "\u{915}\u{94d}\u{937}\u{93e}"),
+            ("burmese",   PROVISION_MYANMAR, "\u{1019}\u{103c}\u{1014}\u{103a}"),
+        ];
+
+        for (label, font, replacement) in cases {
+            if !std::path::Path::new(font).exists() {
+                println!("{label}: no font, skipped");
+                continue;
+            }
+            let (base, font_id) = embed_into_a_copy(&original, font);
+
+            let want = {
+                let h = open_document_from_bytes(base.as_ptr(), base.len());
+                let r = decode_lines(h, 0).into_iter()
+                    .find(|l| l.text.starts_with("The quick")).unwrap().right;
+                close_document(h);
+                r
+            };
+
+            let Ok(p) = provision::provision(Some(font), replacement, shaped::SHAPING_SIZE) else {
+                println!("{label}: provisioning refused");
+                continue;
+            };
+            let edited = match justified::rewrite_bytes_shaped(
+                &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(), at, 5, &p, replacement, font_id)
+            {
+                Ok(b) => b,
+                Err(e) => { println!("{label}: REFUSED status {e}"); continue; }
+            };
+
+            // How many corrections the emitter had to write.
+            let corrections = {
+                let doc = lopdf::Document::load_mem(&base).unwrap();
+                let widths = shaped::cid_widths(&doc, font_id).unwrap();
+                let array = shaped::run(&p, replacement, &widths).array;
+                array.iter().filter(|o| matches!(o, lopdf::Object::Real(_))).count()
+            };
+
+            let h = open_document_from_bytes(edited.as_ptr(), edited.len());
+            let lines = decode_lines(h, 0);
+            let line = lines.iter().find(|l| l.first_object == 0).unwrap();
+            println!("{label:9} glyphs {:2}  corrections {corrections:2}  \
+                      right drift {:.6} pt  lines {}  objs {}..{}",
+                p.glyphs.len(), (line.right - want).abs() * 612.0,
+                lines.len(), line.first_object, line.last_object);
+            println!("            reads back {:?}",
+                line.text.chars().take(46).collect::<String>());
+            close_document(h);
+
+            // Written out so the rendering can be LOOKED AT. A correct advance
+            // and a correct object count say nothing about whether a conjunct
+            // actually formed.
+            let dir = concat!(env!("TEMP"), "/ayaan_phase4");
+            let _ = std::fs::create_dir_all(dir);
+            std::fs::write(format!("{dir}/{label}.pdf"), &edited).unwrap();
+        }
+        println!("PDFs written for visual inspection");
+    }
+
+    /// One Path B edit on the embedded fixture: the bytes, and the font object.
+    fn shaped_edit(font: &str, at: usize, len: usize, replacement: &str)
+        -> Result<(Vec<u8>, Vec<u8>), i32>
+    {
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let (base, font_id) = embed_into_a_copy(&original, font);
+        let p = provision::provision(Some(font), replacement, shaped::SHAPING_SIZE).expect("provisioning refused");
+        let edited = justified::rewrite_bytes_shaped(
+            &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(), at, len, &p, replacement, font_id)?;
+        Ok((base, edited))
+    }
+
+    /// The edited line and the untouched one below it, as PDFium reads them.
+    fn two_lines(bytes: &[u8]) -> (DecodedLine, DecodedLine) {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the document");
+        let lines = decode_lines(handle, 0);
+        close_document(handle);
+        assert_eq!(lines.len(), 2, "expected two lines, got {}: {lines:?}", lines.len());
+        let edited = lines.iter().find(|l| l.first_object == 0)
+            .expect("the edited line is gone").clone();
+        let below = lines.iter().find(|l| l.first_object != 0)
+            .expect("the line below is gone").clone();
+        (edited, below)
+    }
+
+    /// How many of each operator the page draws with, and how many marks carry
+    /// an MCID.
+    fn structure(bytes: &[u8]) -> std::collections::BTreeMap<String, usize> {
+        use lopdf::content::Content;
+        use lopdf::{Document, Object};
+        let doc = Document::load_mem(bytes).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let content = Content::decode(&doc.get_page_content(pid)).unwrap();
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for op in &content.operations {
+            *counts.entry(op.operator.clone()).or_insert(0) += 1;
+        }
+        let mcids = content.operations.iter()
+            .filter(|o| o.operator == "BDC")
+            .filter(|o| matches!(o.operands.get(1), Some(Object::Dictionary(d))
+                if d.get(b"MCID").is_ok()))
+            .count();
+        counts.insert("MCID".into(), mcids);
+        counts
+    }
+
+    /// The `Tf` operands the page sets, in order.
+    fn font_switches(bytes: &[u8]) -> Vec<(String, f64)> {
+        use lopdf::content::Content;
+        use lopdf::{Document, Object};
+        let doc = Document::load_mem(bytes).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        Content::decode(&doc.get_page_content(pid))
+            .unwrap()
+            .operations
+            .iter()
+            .filter(|o| o.operator == "Tf")
+            .map(|o| {
+                let name = match o.operands.first() {
+                    Some(Object::Name(n)) => String::from_utf8_lossy(n).to_string(),
+                    _ => String::new(),
+                };
+                let size = match o.operands.get(1) {
+                    Some(Object::Integer(i)) => *i as f64,
+                    Some(Object::Real(r)) => *r as f64,
+                    _ => 0.0,
+                };
+                (name, size)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_smallest_mixed_font_replacement_keeps_the_line() {
+        // ⚠️ PHASE 4 PRIORITY 2, AND THE SMALLEST CASE THERE IS. One character,
+        // in the middle of a word, in a font the document does not have. The
+        // words either side keep the document's own type.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap() + 2;      // the "o"
+        let (base, edited) = shaped_edit(DEVANAGARI_FONT, at, 1, "\u{915}").expect("refused");
+
+        let (was, _) = two_lines(&base);
+        let (now, _) = two_lines(&edited);
+
+        assert!(now.text.contains('\u{915}'), "the replacement is not there: {:?}", now.text);
+        assert!(now.text.starts_with("The quick br"), "{:?}", now.text);
+        assert!(now.text.contains("wn fox jumps over the lazy dog"), "{:?}", now.text);
+        // Still ONE line, though it is now three text objects.
+        assert_eq!(now.first_object, 0);
+        assert_eq!(now.last_object, 2, "the replacement did not stay on the line");
+        assert!((now.left - was.left).abs() * JUSTIFIED_PAGE_W < 0.001, "the left edge moved");
+    }
+
+    #[test]
+    fn a_mixed_font_replacement_holds_the_right_margin() {
+        // ⚠️ PHASE 4 PRIORITY 6, AND THE BUG THE CONTROL CAUGHT. The emitter
+        // first reported the advance the SHAPER wanted rather than the one the
+        // page will perform, which left the line 0.0034pt short: every /W
+        // correction too small to be worth writing is a difference the renderer
+        // keeps. Path A editing the same line drifts 0.000036pt, and that gap
+        // is what gave it away.
+        for (font, replacement) in [
+            (DEVANAGARI_FONT, "\u{915}"),
+            (DEVANAGARI_FONT, "\u{915}\u{94d}\u{937}\u{93e}"),   // a conjunct: /W has no entry
+            (PROVISION_MYANMAR, "\u{1019}\u{103c}\u{1014}\u{103a}"),
+            (PROVISION_LATIN, "green"),
+        ] {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let at = EMBEDDED_TEXT.find("brown").unwrap();
+            let (base, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            let (was, _) = two_lines(&base);
+            let (now, _) = two_lines(&edited);
+            let drift = (now.right - was.right).abs() * JUSTIFIED_PAGE_W;
+            assert!(drift < 0.001, "{replacement:?} moved the right edge {drift} pt");
+        }
+    }
+
+    #[test]
+    fn the_original_font_is_in_force_again_immediately_after_the_replacement() {
+        // ⚠️ PHASE 4 PRIORITIES 3 AND 7. Tf persists across BT/ET, so without
+        // the restore the new font re-set every later line on the page:
+        // measured at 90,000 changed pixels over a 500-point band.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (base, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, "\u{915}").expect("refused");
+
+        // The document's own font is set again, right after the new one, and
+        // again after the invisible searchable run, which switches the same
+        // font in and out for its own stand-in glyphs.
+        let switches = font_switches(&edited);
+        assert_eq!(switches, vec![
+            ("F1".to_string(), 12.0),
+            ("AyaanPathB".to_string(), 12.0),
+            ("F1".to_string(), 12.0),
+            ("AyaanPathB".to_string(), 12.0),
+            ("F1".to_string(), 12.0),
+        ], "the font switching is wrong");
+
+        // ⚠️ THE INVARIANT, NOT THE LIST. Whatever else is added later, the
+        // page must never be left in the new font: every switch to it is
+        // followed immediately by a switch back, and the last word is the
+        // document's own.
+        for pair in switches.windows(2) {
+            if pair[0].0 == "AyaanPathB" {
+                assert_eq!(pair[1].0, "F1", "the new font was left in force");
+            }
+        }
+        assert_eq!(switches.last().unwrap().0, "F1");
+
+        // And the line below, which names no font of its own, did not change.
+        let (_, before_below) = two_lines(&base);
+        let (_, after_below) = two_lines(&edited);
+        assert_eq!(after_below.text, before_below.text);
+        assert_eq!(after_below.font, before_below.font, "the line below changed typeface");
+        for (a, b) in [(after_below.left, before_below.left), (after_below.right, before_below.right)] {
+            assert!((a - b).abs() * JUSTIFIED_PAGE_W < 0.001, "the line below moved");
+        }
+    }
+
+    #[test]
+    fn the_marked_content_structure_is_untouched() {
+        // ⚠️ PHASE 4 PRIORITY 4. The replacement changes ONE entry of the
+        // operation vector; everything else is re-emitted in place. Only the
+        // counts that must change do: two more Tf and two more TJ, for the
+        // font switched in and out and the array split in three.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (base, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, "\u{915}").expect("refused");
+
+        let (was, now) = (structure(&base), structure(&edited));
+        // The ORIGINAL sequence is what must not move, and its MCID is what
+        // says so. The opener COUNT can no longer stand in for that: the
+        // invisible run now opens with a `BDC` of its own, because it RECORDS
+        // its logical text in a property dictionary instead of leaving it to be
+        // decoded back out of the glyphs.
+        assert_eq!(now.get("MCID"), was.get("MCID"), "MCID count changed");
+        // What Phase 5 adds, and nothing beyond it: one marked span of its own,
+        // with its own text block and matrix, for the invisible searchable run.
+        assert_eq!(now["BDC"], was["BDC"] + 1, "expected exactly one more marked span");
+        assert_eq!(now.get("BMC").copied().unwrap_or(0), was.get("BMC").copied().unwrap_or(0),
+            "a bare BMC appeared; the run has to carry its property dictionary");
+        assert_eq!(now["EMC"], was["EMC"] + 1, "expected one more closer, for that span");
+        assert_eq!(now["BT"], was["BT"] + 1);
+        assert_eq!(now["ET"], was["ET"] + 1);
+        assert_eq!(now["Tm"], was["Tm"] + 1);
+        assert_eq!(now["Tf"], was["Tf"] + 4, "two fonts switched in, two switched back");
+        assert_eq!(now["TJ"], was["TJ"] + 3, "the array split in three, plus the run");
+
+        // ⚠️ OUTSIDE THE ORIGINAL SPAN, PROVEN BY THE MARKS RATHER THAN BY
+        // COUNTING. Inserting after the line's ET instead of after the EMC put
+        // the run INSIDE the tagged content, and the operator counts looked
+        // exactly the same either way. What gave it away was the object: it
+        // carried the enclosing tag as well as ours.
+        {
+            use pdfium_render::prelude::*;
+            let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let bindings = doc_guard.bindings();
+            let mut checked = 0;
+            for i in 0..page.objects().len() {
+                let Ok(o) = page.objects().get(i) else { continue };
+                let PdfPageObject::Text(t) = &o else { continue };
+                if path_b_mark_id(bindings, t.object_handle()).is_none() { continue; }
+                checked += 1;
+                let marks = bindings.FPDFPageObj_CountMarks(t.object_handle());
+                assert_eq!(marks, 1,
+                    "the invisible run carries {marks} marks, so it is inside a tagged span");
+            }
+            assert_eq!(checked, 1, "the invisible run was not found");
+            drop(doc_guard);
+            drop(_guard);
+            close_document(handle);
+        }
+    }
+
+    #[test]
+    fn a_replacement_at_the_end_of_the_line_still_restores_the_font() {
+        // Nothing follows it inside the line, so the restore has no text of its
+        // own to set. It is still required: Tf outlives the ET.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("dog").unwrap();
+        let (base, edited) = shaped_edit(DEVANAGARI_FONT, at, 3, "\u{915}").expect("refused");
+        assert_eq!(font_switches(&edited).last(), Some(&("F1".to_string(), 12.0)));
+
+        let (_, before_below) = two_lines(&base);
+        let (_, after_below) = two_lines(&edited);
+        assert_eq!(after_below.font, before_below.font, "the line below changed typeface");
+    }
+
+    #[test]
+    fn the_page_declares_the_font_it_draws_with() {
+        // ⚠️ A CONTENT STREAM NAMING A RESOURCE THE PAGE DOES NOT DECLARE DRAWS
+        // NOTHING. PDFium writes the font object out even when nothing uses it
+        // (measured), but it does not put the name in the page's own
+        // /Resources, so the emitter has to.
+        use lopdf::{Document, Object};
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, "\u{915}").expect("refused");
+
+        let doc = Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let page = doc.get_dictionary(pid).unwrap();
+        let resources = match page.get(b"Resources") {
+            Ok(Object::Reference(id)) => doc.get_dictionary(*id).unwrap().clone(),
+            Ok(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("the page has no /Resources"),
+        };
+        let fonts = match resources.get(b"Font") {
+            Ok(Object::Reference(id)) => doc.get_dictionary(*id).unwrap().clone(),
+            Ok(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("the page declares no fonts"),
+        };
+        let named = fonts.get(b"AyaanPathB").expect("the page does not declare the new font");
+        let Object::Reference(font_id) = named else { panic!("not a reference") };
+
+        // And it is a Type0 font carrying the outlines, not an empty stand-in.
+        let font = doc.get_dictionary(*font_id).unwrap();
+        assert_eq!(font.get(b"Subtype").unwrap().as_name().unwrap(), b"Type0");
+        assert_eq!(font.get(b"Encoding").unwrap().as_name().unwrap(), b"Identity-H");
+        // The original font is still declared too.
+        assert!(fonts.get(b"F1").is_ok(), "the document's own font was dropped");
+    }
+
+    #[test]
+    fn a_width_the_font_does_not_describe_is_corrected() {
+        // ⚠️ PHASE 4 PRIORITY 5. PDFium builds /W by walking the font's cmap,
+        // so a glyph GSUB produced is missing from it and the renderer falls
+        // back to /DW. Measured on a real conjunct: one correction written,
+        // where the same word's unshaped letters need none.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let (base, font_id) = embed_into_a_copy(&original, DEVANAGARI_FONT);
+        let doc = lopdf::Document::load_mem(&base).unwrap();
+        let widths = shaped::cid_widths(&doc, font_id).expect("no /W on the embedded font");
+
+        let corrections = |text: &str| -> usize {
+            let p = provision::provision(Some(DEVANAGARI_FONT), text, shaped::SHAPING_SIZE).expect("refused");
+            let array = shaped::run(&p, text, &widths).array;
+            array.iter().filter(|o| matches!(o, lopdf::Object::Real(_))).count()
+        };
+        assert_eq!(corrections("\u{915}"), 0, "a plain letter needed correcting");
+        assert!(corrections("\u{915}\u{94d}\u{937}\u{93e}") > 0,
+            "the conjunct needed no correction, so /W described a glyph GSUB invented");
+    }
+
+    /// One call through the real shaped entry point.
+    fn shaped_ffi(handle: u64, at: usize, len: usize, replacement: &str, font: &str)
+        -> Result<Vec<u8>, i32>
+    {
+        let expected = EMBEDDED_TEXT.as_bytes();
+        let new = replacement.as_bytes();
+        let path = font.as_bytes();
+        let buf = rewrite_justified_line_shaped(
+            handle, 0, EMBEDDED_BASELINE,
+            expected.as_ptr(), expected.len(), at as u32, len as u32,
+            new.as_ptr(), new.len(), path.as_ptr(), path.len());
+        let out = if buf.status == STATUS_OK_PDFIUM && !buf.data.is_null() {
+            Ok(unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec())
+        } else {
+            Err(buf.status)
+        };
+        free_byte_buffer(buf);
+        out
+    }
+
+    #[test]
+    fn the_shaped_ffi_returns_bytes_that_open_and_read_correctly() {
+        // ⚠️ PHASE 4 PRIORITY 8. The whole trip the app will make: embed on a
+        // COPY, rewrite, hand back candidate bytes. The live document must be
+        // exactly as it was, which is the same contract Path A already keeps.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+
+        let edited = shaped_ffi(handle, at, 5, "\u{915}", DEVANAGARI_FONT)
+            .expect("the shaped edit was refused");
+
+        let (line, below) = two_lines(&edited);
+        assert!(line.text.contains('\u{915}'), "{:?}", line.text);
+        assert!(!line.text.contains("brown"), "the old word is still there: {:?}", line.text);
+        assert_eq!(below.text.trim(), "and rests here quietly.");
+
+        // ⚠️ AND THE LIVE DOCUMENT IS UNTOUCHED. The core hands back candidate
+        // bytes; nothing is swapped until the caller decides to.
+        let still = decode_lines(handle, 0);
+        assert!(still.iter().any(|l| l.text.contains("brown")),
+            "the live document was modified by a call that only produces bytes");
+        assert_eq!(still.len(), 2, "the live document gained or lost a line");
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_shaped_ffi_refuses_a_font_it_must_not_or_cannot_use() {
+        // Each refusal reaches the caller as its own reason, because each one
+        // needs a different message. Licence, broken file, and a font that
+        // simply has no glyph for the text are three different problems.
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+
+        let restricted = a_font_file(
+            "ffi_restricted",
+            &with_fstype(&std::fs::read(PROVISION_LATIN).unwrap(), 0x0002));
+        assert_eq!(shaped_ffi(handle, at, 5, "green", &restricted),
+            Err(STATUS_FONT_NOT_EMBEDDABLE));
+
+        assert_eq!(shaped_ffi(handle, at, 5, "green", r"C:\Windows\Fonts\nope.ttf"),
+            Err(STATUS_FONT_UNUSABLE));
+
+        // A PDF handed in as a font.
+        assert_eq!(shaped_ffi(handle, at, 5, "green", &justified_fixture()),
+            Err(STATUS_FONT_UNUSABLE));
+
+        // A Latin font asked for Devanagari.
+        assert_eq!(shaped_ffi(handle, at, 5, "\u{915}", PROVISION_LATIN),
+            Err(STATUS_UNSUPPORTED));
+
+        // No font at all, which is the caller's mistake rather than the font's.
+        let expected = EMBEDDED_TEXT.as_bytes();
+        let buf = rewrite_justified_line_shaped(
+            handle, 0, EMBEDDED_BASELINE, expected.as_ptr(), expected.len(),
+            at as u32, 5, b"x".as_ptr(), 1, std::ptr::null(), 0);
+        assert_eq!(buf.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(buf);
+
+        // None of that touched the document.
+        assert!(decode_lines(handle, 0).iter().any(|l| l.text.contains("brown")));
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_path_b_has_already_edited_is_refused_rather_than_corrupted() {
+        // ⚠️ PATH B IS ONE EDIT PER LINE, FOR NOW. Two separate things block a
+        // second one, and both were measured rather than reasoned about:
+        //
+        //   1. STRUCTURE. A Path B line is THREE text runs, because a TJ array
+        //      speaks one font and the replacement needs another. `locate`
+        //      accepts a line that is one run, so it refuses with
+        //      LINE_NOT_REWRITABLE. This is the one that bites even when the
+        //      replacement was pure ASCII.
+        //   2. ENCODING. Once the line holds a character WinAnsi has no code
+        //      for, the anchor cannot be spelled at all and it refuses with
+        //      UNSUPPORTED before structure is ever considered.
+        //
+        // Neither is a defect here: both refuse cleanly and write nothing. They
+        // are the two things a repeated-edit phase has to answer.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+
+        for (replacement, expected_status) in [
+            ("green", STATUS_LINE_NOT_REWRITABLE),
+            ("\u{915}", STATUS_UNSUPPORTED),
+        ] {
+            let handle = open_fixture_named(&justified_embedded_fixture());
+            let once = shaped_ffi(handle, at, 5, replacement, DEVANAGARI_FONT)
+                .expect("the first edit was refused");
+            close_document(handle);
+
+            let handle = open_document_from_bytes(once.as_ptr(), once.len());
+            let text = decode_lines(handle, 0)
+                .into_iter()
+                .find(|l| l.first_object == 0)
+                .expect("the edited line is gone")
+                .text
+                .trim_end()
+                .to_string();
+            let at2 = text.find("lazy").expect("the second word is gone");
+
+            let bytes = text.as_bytes();
+            let new = "\u{916}".as_bytes();
+            let path = DEVANAGARI_FONT.as_bytes();
+            let buf = rewrite_justified_line_shaped(
+                handle, 0, EMBEDDED_BASELINE, bytes.as_ptr(), bytes.len(),
+                at2 as u32, 4, new.as_ptr(), new.len(), path.as_ptr(), path.len());
+            assert_eq!(buf.status, expected_status,
+                "a second edit after {replacement:?} refused for the wrong reason");
+            assert!(buf.data.is_null(), "a refusal handed back bytes");
+            free_byte_buffer(buf);
+
+            // And the once-edited document is exactly as it was.
+            let after = decode_lines(handle, 0);
+            assert_eq!(after.len(), 2);
+            assert_eq!(after.iter().find(|l| l.first_object == 0).unwrap().text.trim_end(), text,
+                "the refused call changed the document");
+            close_document(handle);
+        }
+    }
+
+    /// PHASE 5 PRE-CODING MEASUREMENT A. Does the EXISTING text-box searchable
+    /// layer already surface as a line in `get_page_lines`?
+    ///
+    /// It is filtered out of the text-OBJECT reader by its mark, but the line
+    /// reader is a different path and nothing there looks at marks. If the
+    /// answer is yes, that is a pre-existing condition rather than anything
+    /// Path B introduces, and filtering ONLY the Path B marker changes no
+    /// existing behaviour at all.
+    ///
+    ///   cargo test existing_search_layer_in_line_reader_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn existing_search_layer_in_line_reader_spike() {
+        let words = "Findable Invisible Words";
+        let h = page_with_text_box(words, None);
+
+        let before: Vec<String> = decode_lines(h, 0).iter().map(|l| l.text.clone()).collect();
+        println!("lines BEFORE the sync : {before:?}");
+
+        let pages = [0i32];
+        let status = unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) };
+        println!("sync status           : {status}");
+
+        let after: Vec<String> = decode_lines(h, 0).iter().map(|l| l.text.clone()).collect();
+        println!("lines AFTER the sync  : {after:?}");
+        println!("the box's words appear as a LINE: {}",
+            after.iter().any(|t| t.contains("Findable")));
+
+        // And the object reader, which does filter, for contrast.
+        let objects: Vec<String> =
+            decode_text_objects(h, 0).into_iter().map(|t| t.text).collect();
+        println!("the box's words appear as an OBJECT: {}",
+            objects.iter().any(|t| t.contains("Findable")));
+
+        close_document(h);
+    }
+
+    /// PHASE 5 PRE-CODING MEASUREMENT B, and the gate that could kill the
+    /// design: does an invisible marked run written into a Path B page by
+    /// lopdf SURVIVE a PDFium open and save, and does it leave the shaped run
+    /// alone?
+    ///
+    /// PDFium's `CPDF_PageContentGenerator::ProcessText` emits a single hex
+    /// `Tj` and throws per-glyph positions away. If opening the page were
+    /// enough to trigger regeneration, both the shaped run and the invisible
+    /// one would be destroyed and Path B would have no searchable story at all.
+    ///
+    /// Measures, in one pass: mark survival, extractable logical text, whether
+    /// the visible pixels move, whether the shaped `TJ` is flattened, whether a
+    /// phantom line appears, and where the logical characters' boxes fall
+    /// against the visible replacement's box.
+    ///
+    ///   cargo test path_b_invisible_run_round_trip_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn path_b_invisible_run_round_trip_spike() {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object, StringFormat};
+        use pdfium_render::prelude::*;
+
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            println!("no Devanagari font");
+            return;
+        }
+        let replacement = "\u{915}\u{94d}\u{937}\u{93e}";     // a conjunct
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (base, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, replacement).expect("refused");
+
+        // ---- where the VISIBLE replacement actually landed, in PDF points ----
+        // The middle of the three text objects the splice produced.
+        let (vis_left, vis_right, vis_bottom) = {
+            let h = open_document_from_bytes(edited.as_ptr(), edited.len());
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&h).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let o = page.objects().get(1).unwrap();
+            let b = o.bounds().unwrap();
+            let out = (b.left().value, b.right().value, b.bottom().value);
+            drop(doc_guard);
+            drop(_guard);
+            close_document(h);
+            out
+        };
+        println!("visible replacement: left {vis_left:.3} right {vis_right:.3} pt");
+
+        // ---- the logical, UNSHAPED glyphs: one per character ----
+        let font_bytes = std::fs::read(DEVANAGARI_FONT).unwrap();
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+        let upem = face.units_per_em() as f64;
+        let logical: Vec<(u16, f64)> = replacement
+            .chars()
+            .filter_map(|c| face.glyph_index(c).map(|g| {
+                let adv = face.glyph_hor_advance(g).unwrap_or(0) as f64 / upem * 1000.0;
+                (g.0, adv)
+            }))
+            .collect();
+        println!("logical glyphs: {} for {} characters",
+            logical.len(), replacement.chars().count());
+
+        // ---- write the invisible run, AFTER the sequence's ET ----
+        const SIZE: f64 = 12.0;
+        let id = "b7f3a1c95e2d40188a6c3f0e9d4b7a21";
+        let mut doc = Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let mut ops = Content::decode(&doc.get_page_content(pid)).unwrap().operations;
+
+        // The run is stretched so it OCCUPIES THE VISIBLE REPLACEMENT'S WIDTH:
+        // a highlight has to land on the glyphs the reader can see, not on the
+        // unshaped stand-ins, which are a different width entirely.
+        let natural: f64 = logical.iter().map(|(_, a)| a).sum();
+        let target = (vis_right - vis_left) as f64 / SIZE * 1000.0;
+        let spread = if logical.len() > 1 {
+            (target - natural) / (logical.len() - 1) as f64
+        } else {
+            0.0
+        };
+        let mut array: Vec<Object> = Vec::new();
+        for (i, (gid, _)) in logical.iter().enumerate() {
+            array.push(Object::String(gid.to_be_bytes().to_vec(), StringFormat::Hexadecimal));
+            if i + 1 < logical.len() {
+                array.push(Object::Real((-spread) as f32));
+            }
+        }
+
+        // ⚠️ AFTER THE SEQUENCE'S EMC, NOT AFTER THE FIRST ET. Measured: going
+        // in after the ET put the run INSIDE the original marked-content span
+        // and left the nesting broken, BMC 1 against EMC 2. The tagged content
+        // must not gain a second copy of the text.
+        let mut close = ops.iter().position(|o| o.operator == "TJ").unwrap();
+        while close < ops.len() && ops[close].operator != "EMC" { close += 1; }
+        let insert_at = (close + 1).min(ops.len());
+
+        let run = vec![
+            Operation::new("BMC", vec![Object::Name(format!("AyaanPathB:{id}").into_bytes())]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"AyaanPathB".to_vec()), (SIZE as f32).into()]),
+            Operation::new("Tr", vec![3.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(),
+                Object::Real(vis_left), Object::Real(vis_bottom)]),
+            Operation::new("TJ", vec![Object::Array(array)]),
+            Operation::new("Tr", vec![0.into()]),
+            Operation::new("ET", vec![]),
+            Operation::new("EMC", vec![]),
+            // ⚠️ AND THE FONT GOES BACK, for exactly the reason it does after
+            // the visible run. Measured without it: the NEXT line was drawn in
+            // the Identity-H font and came out as CJK, its own single bytes
+            // read as two-byte codes.
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), (SIZE as f32).into()]),
+        ];
+        for (k, op) in run.into_iter().enumerate() { ops.insert(insert_at + k, op); }
+
+        let encoded = Content { operations: ops }.encode().unwrap();
+        doc.change_page_content(pid, encoded).unwrap();
+        let mut with_run = Vec::new();
+        doc.save_to(&mut with_run).unwrap();
+
+        // ---- THE GATE: through PDFium, open then save, then look again ----
+        let h = open_document_from_bytes(with_run.as_ptr(), with_run.len());
+        assert_ne!(h, 0, "PDFium refused the page");
+        let snap = snapshot_document(h);
+        let round_tripped = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+        close_document(h);
+
+        for (label, bytes) in [("before PDFium", &with_run), ("after PDFium", &round_tripped)] {
+            let h = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+            println!("--- {label} ---");
+
+            // 1. the mark
+            {
+                let _guard = lock(&CALL_LOCK);
+                let doc = lock(&core().documents).get(&h).cloned().unwrap();
+                let doc_guard = lock(&doc);
+                let page = doc_guard.pages().get(0).unwrap();
+                let bindings = doc_guard.bindings();
+                let mut names = Vec::new();
+                for i in 0..page.objects().len() {
+                    let Ok(o) = page.objects().get(i) else { continue };
+                    let PdfPageObject::Text(t) = &o else { continue };
+                    for m in 0..bindings.FPDFPageObj_CountMarks(t.object_handle()).max(0) {
+                        let mark = bindings.FPDFPageObj_GetMark(t.object_handle(), m as _);
+                        if mark.is_null() { continue; }
+                        let mut out: std::os::raw::c_ulong = 0;
+                        bindings.FPDFPageObjMark_GetName(mark, std::ptr::null_mut(), 0, &mut out);
+                        if out <= 2 { continue; }
+                        let mut buf = vec![0u16; out as usize / 2];
+                        bindings.FPDFPageObjMark_GetName(mark, buf.as_mut_ptr(), out, &mut out);
+                        while buf.last() == Some(&0) { buf.pop(); }
+                        names.push((i, String::from_utf16_lossy(&buf)));
+                    }
+                }
+                println!("  marks           : {names:?}");
+            }
+
+            // 2. the shaped TJ, still per-glyph or flattened?
+            let d = Document::load_mem(bytes).unwrap();
+            let (_, &p) = d.get_pages().iter().next().unwrap();
+            let c = Content::decode(&d.get_page_content(p)).unwrap();
+            let tj = c.operations.iter().filter(|o| o.operator == "TJ").count();
+            let plain = c.operations.iter().filter(|o| o.operator == "Tj").count();
+            let tr = c.operations.iter().filter(|o| o.operator == "Tr").count();
+            println!("  TJ {tj}  Tj {plain}  Tr {tr}  BMC {}  EMC {}",
+                c.operations.iter().filter(|o| o.operator == "BMC").count(),
+                c.operations.iter().filter(|o| o.operator == "EMC").count());
+
+            // 3. extraction, and 5. the line reader
+            let chars = get_page_chars(h, 0, 900);
+            let text: String = if chars.status == 0 && !chars.chars.is_null() {
+                unsafe { std::slice::from_raw_parts(chars.chars, chars.len) }
+                    .iter().filter_map(|c| char::from_u32(c.codepoint)).collect()
+            } else { String::new() };
+            free_char_info_array(chars);
+            println!("  finds the logical text: {}", text.contains(replacement));
+            let lines: Vec<String> = decode_lines(h, 0).iter().map(|l| l.text.clone()).collect();
+            println!("  lines           : {lines:?}");
+            close_document(h);
+        }
+
+        // ⚠️ CONSTRAINT 7: WHERE WOULD A HIGHLIGHT LAND? The boxes come from the
+        // INVISIBLE run's characters, and a highlight drawn on them has to sit
+        // over the glyphs the reader can actually see. The stand-ins are a
+        // different width entirely, so the run is stretched to the visible
+        // replacement's width and this is what checks that it worked.
+        {
+            let h = open_document_from_bytes(round_tripped.as_ptr(), round_tripped.len());
+            let chars = get_page_chars(h, 0, 900);
+            if chars.status == 0 && !chars.chars.is_null() {
+                let all = unsafe { std::slice::from_raw_parts(chars.chars, chars.len) };
+                let wanted: Vec<char> = replacement.chars().collect();
+                let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                let mut found = 0;
+                for c in all {
+                    let Some(ch) = char::from_u32(c.codepoint) else { continue };
+                    if !wanted.contains(&ch) { continue; }
+                    found += 1;
+                    lo = lo.min(c.left);
+                    hi = hi.max(c.right);
+                }
+                // get_page_chars reports in the capture space it was given.
+                let scale = 612.0 / 900.0;
+                println!("highlight box over {found} char(s): {:.3}..{:.3} pt",
+                    lo * scale, hi * scale);
+                println!("visible replacement             : {vis_left:.3}..{vis_right:.3} pt");
+                println!("  left off by {:.3} pt, right off by {:.3} pt",
+                    (lo * scale - vis_left).abs(), (hi * scale - vis_right).abs());
+            }
+            free_char_info_array(chars);
+            close_document(h);
+        }
+
+        // 4. do the visible pixels move?
+        let a = shot(&edited);
+        let b = shot(&round_tripped);
+        let (n, x0, y0, x1, y1) = diff_box(&a, &b);
+        println!("visible pixels changed by the invisible run: {n}  box x {x0}..{x1} y {y0}..{y1}");
+    }
+
+    // ---------------- Path B: the invisible searchable run ----------------
+
+    /// Every script the acceptance matrix covers, with the font that can set it.
+    const PATH_B_SCRIPTS: [(&str, &str, &str); 5] = [
+        ("latin",   PROVISION_LATIN,   "green"),
+        ("unicode", PROVISION_LATIN,   "caf\u{e9}\u{2019}s"),
+        ("hindi",   DEVANAGARI_FONT,   "\u{915}\u{94d}\u{937}\u{93e}"),
+        ("burmese", PROVISION_MYANMAR, "\u{1019}\u{103c}\u{1014}\u{103a}"),
+        ("arabic",  PROVISION_LATIN,   "\u{645}\u{631}\u{62d}\u{628}\u{627}"),
+    ];
+
+    /// The page's text exactly as a reader's Find would see it.
+    ///
+    /// ⚠️ THE CHARACTER API, NOT `PdfPageText::all()`, which TRUNCATES: a page
+    /// holding "Countable Words" came back as "Countable Wor" and silently
+    /// broke a guard that depended on it.
+    fn found_text(bytes: &[u8]) -> String {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the document");
+        let chars = get_page_chars(handle, 0, 900);
+        let out = if chars.status == STATUS_OK_PDFIUM && !chars.chars.is_null() {
+            unsafe { std::slice::from_raw_parts(chars.chars, chars.len) }
+                .iter()
+                .filter_map(|c| char::from_u32(c.codepoint))
+                .collect()
+        } else {
+            String::new()
+        };
+        free_char_info_array(chars);
+        close_document(handle);
+        out
+    }
+
+    /// Which object indices the Path B invisible runs sit at.
+    fn path_b_indices(bytes: &[u8]) -> Vec<usize> {
+        use pdfium_render::prelude::*;
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let out = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let bindings = doc_guard.bindings();
+            let mut out = Vec::new();
+            for i in 0..page.objects().len() {
+                let Ok(o) = page.objects().get(i) else { continue };
+                let PdfPageObject::Text(t) = &o else { continue };
+                if path_b_mark_id(bindings, t.object_handle()).is_some() {
+                    out.push(i as usize);
+                }
+            }
+            out
+        };
+        close_document(handle);
+        out
+    }
+
+    /// How many Path B invisible runs the page carries, and their ids.
+    ///
+    /// ⚠️ COUNTS PAGE OBJECTS, NOT TEXT MATCHES. PDFium collapses identical
+    /// runs drawn on top of each other, so a match count reads 1 however many
+    /// copies exist and a duplicate test would pass whatever the code did.
+    fn path_b_runs(bytes: &[u8]) -> Vec<String> {
+        use pdfium_render::prelude::*;
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let ids = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let bindings = doc_guard.bindings();
+            let mut ids = Vec::new();
+            for i in 0..page.objects().len() {
+                let Ok(o) = page.objects().get(i) else { continue };
+                let PdfPageObject::Text(t) = &o else { continue };
+                if let Some(id) = path_b_mark_id(bindings, t.object_handle()) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+        close_document(handle);
+        ids
+    }
+
+    #[test]
+    fn find_returns_the_logical_unicode_for_every_script() {
+        // ⚠️ THE WHOLE POINT OF THE RUN. The VISIBLE glyphs extract wrongly and
+        // always will: PDFium builds /ToUnicode by walking the font's cmap, so
+        // a conjunct GSUB invented has no entry and Burmese comes back in
+        // visual order. The invisible run carries the characters themselves.
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let (_, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            assert!(found_text(&edited).contains(replacement),
+                "{label}: Find cannot see {replacement:?} in {:?}", found_text(&edited));
+        }
+    }
+
+    #[test]
+    fn the_highlight_lands_on_the_glyphs_a_reader_can_see() {
+        // The boxes come from the INVISIBLE run, and a highlight drawn on them
+        // has to sit over the visible replacement. The stand-ins are a
+        // different width entirely, so the run is stretched to match.
+        use pdfium_render::prelude::*;
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let (_, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+
+            // Where the visible replacement is: the middle of the three objects.
+            let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+            let (vis_left, vis_right) = {
+                let _guard = lock(&CALL_LOCK);
+                let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+                let doc_guard = lock(&doc);
+                let page = doc_guard.pages().get(0).unwrap();
+                let b = page.objects().get(1).unwrap().bounds().unwrap();
+                (b.left().value, b.right().value)
+            };
+
+            // Where a highlight would be drawn.
+            let chars = get_page_chars(handle, 0, 900);
+            assert_eq!(chars.status, STATUS_OK_PDFIUM);
+            let all = unsafe { std::slice::from_raw_parts(chars.chars, chars.len) };
+            // ⚠️ THE CONTIGUOUS RUN, NOT LOOSE CHARACTERS. "green" shares every
+            // one of its letters with the rest of the line, and collecting them
+            // all measured a box 78..326pt wide across the whole page.
+            let wanted: Vec<char> = replacement.chars().collect();
+            let page: Vec<char> = all.iter()
+                .map(|c| char::from_u32(c.codepoint).unwrap_or('\u{fffd}'))
+                .collect();
+            let start = page.windows(wanted.len())
+                .position(|w| w == wanted.as_slice())
+                .unwrap_or_else(|| panic!("{label}: the replacement is not on the page"));
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for c in &all[start..start + wanted.len()] {
+                lo = lo.min(c.left);
+                hi = hi.max(c.right);
+            }
+            free_char_info_array(chars);
+            close_document(handle);
+
+            let scale = JUSTIFIED_PAGE_W / 900.0;
+            let (lo, hi) = (lo * scale, hi * scale);
+            // A quarter point of overhang: character boxes carry side bearings
+            // where object bounds are ink.
+            assert!((lo - vis_left).abs() < 1.0 && (hi - vis_right).abs() < 1.0,
+                "{label}: highlight {lo:.3}..{hi:.3} against glyphs {vis_left:.3}..{vis_right:.3}");
+        }
+    }
+
+    #[test]
+    fn the_invisible_run_is_not_offered_as_a_line() {
+        // Offering it would offer an edit on nothing, sitting exactly on top of
+        // a line that is already editable.
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let (base, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            let before = two_lines(&base);
+            // ⚠️ `two_lines` INSISTS ON EXACTLY TWO. Before the filter existed
+            // the run added a third, so this assertion is the phantom-line
+            // check and not merely a convenience.
+            let (line, below) = two_lines(&edited);
+            assert_eq!(below.text, before.1.text, "{label}: the line below changed");
+
+            // ⚠️ CHECKED BY OBJECT, NOT BY TEXT. For Latin the replacement is
+            // legitimately IN the visible line, so a text check would fail on a
+            // correct page; and for a shaped script the visible run extracts
+            // wrongly, so a text check would pass on a broken one.
+            let hidden = path_b_indices(&edited);
+            assert_eq!(hidden.len(), 1, "{label}: wrong number of runs");
+            assert!(!(line.first_object..=line.last_object).contains(&hidden[0]),
+                "{label}: the line claims the invisible run, objects {}..{} against {}",
+                line.first_object, line.last_object, hidden[0]);
+        }
+    }
+
+    #[test]
+    fn exactly_one_invisible_run_is_written() {
+        // ⚠️ COUNTED AS PAGE OBJECTS. PDFium collapses identical runs drawn on
+        // top of each other, so counting text matches would read 1 whatever the
+        // code did.
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let (base, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            assert!(path_b_runs(&base).is_empty(), "{label}: a run existed before the edit");
+            assert_eq!(path_b_runs(&edited).len(), 1, "{label}: wrong number of runs");
+        }
+    }
+
+    #[test]
+    fn a_stale_invisible_run_is_dropped_only_on_the_line_being_rewritten() {
+        // Removal is a lopdf operation, which is why Path B can have one at
+        // all: FPDFPage_RemoveObject followed by a drop destroys the process.
+        //
+        // ⚠️ AND IT TAKES ONLY THIS LINE'S. It used to take every run on the
+        // page, so a second shaped edit anywhere left the first line's glyphs
+        // drawn with nothing to say what they spell.
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object};
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, "\u{915}").expect("refused");
+
+        // Two more runs, planted the way stale ones would survive: one on
+        // ANOTHER line, and one with no `Tm` at all.
+        let mut doc = Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let mut ops = Content::decode(&doc.get_page_content(pid)).unwrap().operations;
+        let planted = |suffix: &str, tm: Option<f32>| {
+            let mut out = vec![
+                Operation::new("BDC", vec![
+                    Object::Name(format!("{}{suffix}", shaped::PATH_B_MARK_PREFIX).into_bytes()),
+                    Object::Dictionary(lopdf::Dictionary::new()),
+                ]),
+                Operation::new("BT", vec![]),
+            ];
+            if let Some(y) = tm {
+                out.push(Operation::new("Tm", vec![1.into(), 0.into(), 0.into(),
+                    1.into(), 72.into(), Object::Real(y)]));
+            }
+            out.push(Operation::new("ET", vec![]));
+            out.push(Operation::new("EMC", vec![]));
+            out
+        };
+        let mut prefix = planted("deadbeef", Some(EMBEDDED_BASELINE - 20.0));
+        prefix.extend(planted("cafef00d", None));
+        for (k, op) in prefix.into_iter().enumerate() {
+            ops.insert(k, op);
+        }
+        let encoded = Content { operations: ops }.encode().unwrap();
+        doc.change_page_content(pid, encoded).unwrap();
+        let mut with_stale = Vec::new();
+        doc.save_to(&mut with_stale).unwrap();
+
+        let is_mark = |o: &Operation| {
+            (o.operator == "BDC" || o.operator == "BMC")
+                && matches!(o.operands.first(), Some(Object::Name(n))
+                    if n.starts_with(shaped::PATH_B_MARK_PREFIX.as_bytes()))
+        };
+        let mut ops = Content::decode(
+            &Document::load_mem(&with_stale).unwrap().get_page_content(pid)).unwrap().operations;
+        assert_eq!(ops.iter().filter(|o| is_mark(o)).count(), 3, "the planted runs are not there");
+
+        // Only the one on the rewritten line goes.
+        assert_eq!(justified::remove_path_b_runs(&mut ops, EMBEDDED_BASELINE), 1,
+            "removal was not line-local");
+        let left: Vec<String> = ops.iter().filter(|o| is_mark(o))
+            .filter_map(|o| match o.operands.first() {
+                Some(Object::Name(n)) => Some(String::from_utf8_lossy(n).to_string()),
+                _ => None,
+            }).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left.iter().any(|n| n.ends_with("deadbeef")), "another line's run was taken: {left:?}");
+        assert!(left.iter().any(|n| n.ends_with("cafef00d")), "a run with no Tm was taken: {left:?}");
+    }
+
+    #[test]
+    fn the_text_box_searchable_layer_is_untouched_by_a_path_b_edit() {
+        // The two layers share a technique and nothing else. A Path B run must
+        // not be swept up by the text-box sync, and must not sweep it up.
+        let words = "Findable Invisible Words";
+        let h = page_with_text_box(words, None);
+        let pages = [0i32];
+        assert_eq!(unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) }, STATUS_OK_PDFIUM);
+
+        let snap = snapshot_document(h);
+        let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+        close_document(h);
+
+        // The text box's own run is there, and none of it is ours.
+        assert!(found_text(&bytes).contains(words), "the text box's layer is gone");
+        assert!(path_b_runs(&bytes).is_empty(), "a text-box run was read as a Path B run");
+    }
+
+    #[test]
+    fn the_mark_survives_a_real_file_save_and_reopen() {
+        // ⚠️ A FILE, NOT A SNAPSHOT. Everything else here round-trips through
+        // `snapshot_document`, which is PDFium writing to memory. The app
+        // writes to disk and the user opens that file again later, and a mark
+        // that only survived the in-memory path would take the searchability
+        // with it the first time someone actually saved.
+        use std::ffi::CString;
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let replacement = "\u{915}\u{94d}\u{937}\u{93e}";
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, replacement).expect("refused");
+        let before = path_b_runs(&edited);
+        assert_eq!(before.len(), 1);
+
+        // Out to disk, through the same call the app saves with, then closed.
+        let path = std::env::temp_dir().join("ayaan_path_b_file_round_trip.pdf");
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        assert_ne!(handle, 0);
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { save_document(handle, c_path.as_ptr()) }, STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        // And back in from the file, as a new document.
+        let reopened = std::fs::read(&path).unwrap();
+        let after = path_b_runs(&reopened);
+        assert_eq!(after, before, "the mark did not survive the file round trip");
+        assert!(found_text(&reopened).contains(replacement),
+            "the logical text did not survive the file round trip");
+
+        // The visible replacement is still there, and still one line.
+        let (line, _) = two_lines(&reopened);
+        let hidden = path_b_indices(&reopened);
+        assert_eq!(hidden.len(), 1);
+        assert!(!(line.first_object..=line.last_object).contains(&hidden[0]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn arabic_reads_back_in_logical_order_and_highlights_where_it_is_drawn() {
+        // ⚠️ THE CASE MOST LIKELY TO BE WRONG. The shaper returns Arabic in
+        // VISUAL order with contextual forms already chosen, which is what the
+        // content stream wants; the invisible run is written in LOGICAL order,
+        // which is what a reader searching for the word will type. The two
+        // orders disagree, and the highlight still has to land on the glyphs.
+        use pdfium_render::prelude::*;
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let word = "\u{645}\u{631}\u{62d}\u{628}\u{627}";      // marhaba
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (_, edited) = shaped_edit(PROVISION_LATIN, at, 5, word).expect("refused");
+
+        // Find returns the characters in the order they were typed.
+        let text = found_text(&edited);
+        assert!(text.contains(word), "Find cannot see the Arabic: {text:?}");
+
+        // The visible glyphs, and where a highlight would go.
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        let (vis_left, vis_right) = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let b = page.objects().get(1).unwrap().bounds().unwrap();
+            (b.left().value, b.right().value)
+        };
+        let chars = get_page_chars(handle, 0, 900);
+        assert_eq!(chars.status, STATUS_OK_PDFIUM);
+        let all = unsafe { std::slice::from_raw_parts(chars.chars, chars.len) };
+        let wanted: Vec<char> = word.chars().collect();
+        let page: Vec<char> = all.iter()
+            .map(|c| char::from_u32(c.codepoint).unwrap_or('\u{fffd}'))
+            .collect();
+        let start = page.windows(wanted.len()).position(|w| w == wanted.as_slice())
+            .expect("the Arabic is not on the page in logical order");
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for c in &all[start..start + wanted.len()] {
+            lo = lo.min(c.left);
+            hi = hi.max(c.right);
+        }
+        free_char_info_array(chars);
+        close_document(handle);
+
+        let scale = JUSTIFIED_PAGE_W / 900.0;
+        let (lo, hi) = (lo * scale, hi * scale);
+        assert!((lo - vis_left).abs() < 1.0 && (hi - vis_right).abs() < 1.0,
+            "highlight {lo:.3}..{hi:.3} against the drawn glyphs {vis_left:.3}..{vis_right:.3}");
+
+        // And the line still reads as one line with the run kept out of it.
+        let (line, _) = two_lines(&edited);
+        let hidden = path_b_indices(&edited);
+        assert_eq!(hidden.len(), 1);
+        assert!(!(line.first_object..=line.last_object).contains(&hidden[0]));
+    }
+
+    /// PHASE 6 PRE-CODING MEASUREMENT. Phase 5 filtered the LINE reader. What
+    /// does the OBJECT reader still show, and what happens when one page
+    /// carries more than one Path B edit?
+    ///
+    ///   cargo test phase6_survey_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn phase6_survey_spike() {
+        use lopdf::content::Content;
+        use lopdf::{Document, Object};
+
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            println!("no Devanagari font");
+            return;
+        }
+        let replacement = "\u{915}\u{94d}\u{937}\u{93e}";
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, replacement).expect("refused");
+
+        // --- 1. the LINE reader, filtered in Phase 5 ---
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        let lines: Vec<String> = decode_lines(handle, 0).iter().map(|l| l.text.clone()).collect();
+        println!("lines            : {lines:?}");
+
+        // --- 2. the OBJECT reader, which Phase 5 did not touch ---
+        let objects: Vec<(String, f32, f32)> = decode_text_objects(handle, 0)
+            .into_iter().map(|t| (t.text, t.left, t.right)).collect();
+        println!("text objects     : {objects:?}");
+        println!("the run is offered as an object: {}",
+            objects.iter().any(|(t, ..)| t.contains(replacement)));
+        close_document(handle);
+
+        // --- 3. what a SECOND Path B edit would do to the first one's run ---
+        // The remover drops EVERY Path B span before writing, so a second edit
+        // anywhere on the page would take the first one's searchability with
+        // it. Simulated here by running the remover over the page as it stands.
+        let doc = Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let mut ops = Content::decode(&doc.get_page_content(pid)).unwrap().operations;
+        let spans = ops.iter().filter(|o| o.operator == "BMC"
+            && matches!(o.operands.first(), Some(Object::Name(n))
+                if n.starts_with(shaped::PATH_B_MARK_PREFIX.as_bytes()))).count();
+        let removed = justified::remove_path_b_runs(&mut ops, EMBEDDED_BASELINE);
+        println!("spans on the page: {spans}, and a second edit would remove {removed} of them");
+
+        // --- 4. the resource name, which is a single fixed slot ---
+        let page = doc.get_dictionary(pid).unwrap();
+        let res = match page.get(b"Resources") {
+            Ok(Object::Reference(i)) => doc.get_dictionary(*i).unwrap().clone(),
+            Ok(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("no resources"),
+        };
+        let fonts = match res.get(b"Font") {
+            Ok(Object::Reference(i)) => doc.get_dictionary(*i).unwrap().clone(),
+            Ok(Object::Dictionary(d)) => d.clone(),
+            _ => panic!("no fonts"),
+        };
+        let names: Vec<String> =
+            fonts.iter().map(|(k, _)| String::from_utf8_lossy(k).to_string()).collect();
+        println!("font resources   : {names:?}");
+    }
+
+    // ---------------- Path B: what the readers may offer ----------------
+
+    /// A page carrying an invisible run that is NOT ours: render mode 3, no
+    /// mark, exactly like a scanned page's OCR layer.
+    ///
+    /// ⚠️ THE FIXTURE THAT KEEPS THE FILTER HONEST. Hiding every invisible run
+    /// would be a one-line change and would silently swallow other people's
+    /// text. This page must keep offering its hidden words.
+    fn ocr_style_fixture() -> String {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+        let path = "tests/fixtures/sample_invisible_unmarked.pdf".to_string();
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+        let mut widths: Vec<Object> = Vec::new();
+        for code in 32u8..=126 {
+            widths.push(Object::Integer(if code == b' ' { 278 } else { 500 }));
+        }
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "TrueType", "BaseFont" => "AAAAAA+TestSans",
+            "FirstChar" => 32, "LastChar" => 126, "Widths" => widths,
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font } });
+        let lit = |b: &[u8]| Object::String(b.to_vec(), StringFormat::Literal);
+
+        let operations = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 700.into()]),
+            Operation::new("TJ", vec![Object::Array(vec![lit(b"A scan of a page")])]),
+            Operation::new("ET", vec![]),
+            // The OCR layer: invisible, unmarked, and someone else's.
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Tr", vec![3.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 72.into(), 660.into()]),
+            Operation::new("TJ", vec![Object::Array(vec![lit(b"Recognised hidden words")])]),
+            Operation::new("Tr", vec![0.into()]),
+            Operation::new("ET", vec![]),
+        ];
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, Content { operations }.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+            "Resources" => resources,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+        }));
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let staging = format!("tests/fixtures/.invisible_unmarked_{}.pdf", std::process::id());
+        doc.save(&staging).expect("failed to write the OCR fixture");
+        std::fs::rename(&staging, &path).expect("failed to move the OCR fixture into place");
+        path
+    }
+
+    fn number_of(o: &lopdf::Object) -> f64 {
+        match o {
+            lopdf::Object::Integer(i) => *i as f64,
+            lopdf::Object::Real(r) => *r as f64,
+            _ => 0.0,
+        }
+    }
+
+    /// The page content with every `AyaanPathB:<32 hex>` id blanked, so two
+    /// runs of the same code hash the same.
+    fn mask_mark_ids(content: &[u8]) -> Vec<u8> {
+        let needle = shaped::PATH_B_MARK_PREFIX.as_bytes();
+        let mut out = content.to_vec();
+        let mut i = 0;
+        while i + needle.len() + 32 <= out.len() {
+            if &out[i..i + needle.len()] == needle {
+                for b in &mut out[i + needle.len()..i + needle.len() + 32] {
+                    *b = b'0';
+                }
+                i += needle.len() + 32;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The text of every object the object reader offers.
+    fn offered_objects(bytes: &[u8]) -> Vec<String> {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let out = decode_text_objects(handle, 0).into_iter().map(|t| t.text).collect();
+        close_document(handle);
+        out
+    }
+
+    #[test]
+    fn an_invisible_run_that_is_not_ours_is_still_offered() {
+        // ⚠️ BOUNDARY 7, AND THE REASON THE FILTER READS A MARK. An OCR layer
+        // is render mode 3 and belongs to whoever made the scan. Filtering on
+        // the mode would take it away from them.
+        let bytes = std::fs::read(ocr_style_fixture()).unwrap();
+        let offered = offered_objects(&bytes);
+        assert!(offered.iter().any(|t| t.contains("Recognised hidden words")),
+            "an unmarked invisible run was filtered: {offered:?}");
+        assert!(offered.iter().any(|t| t.contains("A scan of a page")));
+    }
+
+    #[test]
+    fn a_path_b_run_is_not_offered_as_an_editable_object() {
+        // It sits almost exactly on top of the glyphs it stands for, so
+        // offering it would put a second transparent target over one the user
+        // can already select.
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let (base, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            let offered = offered_objects(&edited);
+
+            // The run is gone from BOTH readers.
+            assert_eq!(offered.len(), 4,
+                "{label}: expected the line split in three plus the line below: {offered:?}");
+            let hidden = path_b_indices(&edited);
+            assert_eq!(hidden.len(), 1);
+
+            // ⚠️ AND THE VISIBLE REPLACEMENT IS STILL THERE. A filter that took
+            // the wrong object would leave the page looking edited and the word
+            // unselectable.
+            assert!(offered[0].starts_with("The quick"), "{label}: {offered:?}");
+            assert!(offered[2].contains("fox jumps over the lazy dog"), "{label}: {offered:?}");
+
+            // Ordinary text either side is untouched, to the object.
+            let was = offered_objects(&base);
+            assert_eq!(offered.last(), was.last(), "{label}: the line below changed");
+        }
+    }
+
+    #[test]
+    fn several_path_b_runs_on_one_page_are_all_filtered() {
+        // The filter is per object and assumes nothing about order or count.
+        // Planted rather than emitted: a second Path B EDIT is a different
+        // question and is not this phase's.
+        use lopdf::content::Content;
+        use lopdf::{Document, Object};
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, "\u{915}").expect("refused");
+
+        let mut doc = Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let ops = Content::decode(&doc.get_page_content(pid)).unwrap().operations;
+        let start = ops.iter().position(|o| (o.operator == "BDC" || o.operator == "BMC")
+            && matches!(o.operands.first(), Some(Object::Name(n))
+                if n.starts_with(shaped::PATH_B_MARK_PREFIX.as_bytes()))).unwrap();
+        let end = ops[start..].iter().position(|o| o.operator == "EMC").unwrap() + start;
+        let span: Vec<_> = ops[start..=end].to_vec();
+
+        let mut ops = ops;
+        // ⚠️ PLACED APART, AND THAT IS NOT COSMETIC. Three copies stacked at
+        // one position are collapsed by PDFium into a single reported object,
+        // so the first version of this test could not tell the filter working
+        // from the filter missing: removing the filter changed nothing it
+        // asserted. Each planted run gets its own baseline.
+        for (n, extra) in ["aaaaaaaa", "bbbbbbbb"].iter().enumerate() {
+            let mut copy = span.clone();
+            copy[0] = lopdf::content::Operation::new("BMC", vec![Object::Name(
+                format!("{}{extra}", shaped::PATH_B_MARK_PREFIX).into_bytes())]);
+            for op in copy.iter_mut() {
+                if op.operator == "Tm" {
+                    let y = number_of(&op.operands[5]) - 40.0 * (n as f64 + 1.0);
+                    op.operands[5] = Object::Real(y as f32);
+                }
+            }
+            ops.extend(copy);
+        }
+        let encoded = Content { operations: ops }.encode().unwrap();
+        doc.change_page_content(pid, encoded).unwrap();
+        let mut many = Vec::new();
+        doc.save_to(&mut many).unwrap();
+
+        assert_eq!(path_b_runs(&many).len(), 3, "the planted runs are not there");
+        assert_eq!(offered_objects(&many).len(), 4, "a planted run was offered as an object");
+        let handle = open_document_from_bytes(many.as_ptr(), many.len());
+        assert_eq!(decode_lines(handle, 0).len(), 2, "a planted run was offered as a line");
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_text_box_layer_reads_exactly_as_it_did_before() {
+        // ⚠️ PINNED, INCLUDING THE PART THAT IS WRONG. Its run is filtered from
+        // the OBJECT reader and merges into the LINE reader, which is a
+        // pre-existing wart this phase deliberately does not fix. Asserting
+        // both means a later change cannot alter either by accident.
+        let words = "Findable Invisible Words";
+        let h = page_with_text_box(words, None);
+        let pages = [0i32];
+        assert_eq!(unsafe { sync_text_layer(h, pages.as_ptr(), pages.len()) }, STATUS_OK_PDFIUM);
+
+        let objects: Vec<String> = decode_text_objects(h, 0).into_iter().map(|t| t.text).collect();
+        assert!(!objects.iter().any(|t| t.contains("Findable")),
+            "the text box's run became selectable: {objects:?}");
+
+        let lines: Vec<String> = decode_lines(h, 0).iter().map(|l| l.text.clone()).collect();
+        assert!(lines.iter().any(|t| t.contains("Findable")),
+            "the pre-existing line behaviour changed, which this phase must not do: {lines:?}");
+        close_document(h);
+    }
+
+    #[test]
+    fn the_filter_still_holds_after_a_real_file_round_trip() {
+        use std::ffi::CString;
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let replacement = "\u{915}\u{94d}\u{937}\u{93e}";
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 5, replacement).expect("refused");
+
+        let path = std::env::temp_dir().join("ayaan_path_b_filter_round_trip.pdf");
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { save_document(handle, c_path.as_ptr()) }, STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let reopened = std::fs::read(&path).unwrap();
+        assert_eq!(offered_objects(&reopened).len(), 4, "the run came back as an object");
+        let handle = open_document_from_bytes(reopened.as_ptr(), reopened.len());
+        assert_eq!(decode_lines(handle, 0).len(), 2, "the run came back as a line");
+        close_document(handle);
+        // And it is still findable, which is the point of it being there.
+        assert!(found_text(&reopened).contains(replacement));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PHASE 7 PRE-CODING MEASUREMENT. What does a Path B replacement that
+    /// CONTAINS SPACES do to the line's justification?
+    ///
+    /// Phase 4 emitted the replacement as a rigid block on purpose and deferred
+    /// this. Path A does not: `splice` cuts an inserted space into its own
+    /// array element so it can stretch like every other slot, and the measured
+    /// cost of not doing that was gaps of 4.24 and 4.48 points against 6.8
+    /// elsewhere on the same line.
+    ///
+    ///   cargo test phase7_gap_survey_spike -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn phase7_gap_survey_spike() {
+        /// Every inter-word gap on the line holding `needle`, in points.
+        fn gaps(bytes: &[u8]) -> Vec<f32> {
+            let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+            assert_ne!(handle, 0);
+            let chars = get_page_chars(handle, 0, 900);
+            assert_eq!(chars.status, STATUS_OK_PDFIUM);
+            // Measured while the slice is alive: CharInfo is not Clone, and
+            // deriving it on a production type for a spike would be the tail
+            // wagging the dog.
+            let out = {
+                let all = unsafe { std::slice::from_raw_parts(chars.chars, chars.len) };
+                let scale = JUSTIFIED_PAGE_W / 900.0;
+                let top = all.iter().map(|c| c.top).fold(f32::MAX, f32::min);
+                let line: Vec<&CharInfo> =
+                    all.iter().filter(|c| (c.top - top).abs() < 6.0).collect();
+                let mut out = Vec::new();
+                for pair in line.windows(3) {
+                    if char::from_u32(pair[1].codepoint) == Some(' ') {
+                        out.push((pair[2].left - pair[0].right) * scale);
+                    }
+                }
+                out
+            };
+            free_char_info_array(chars);
+            close_document(handle);
+            out
+        }
+
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        // Narrow enough that the line still fits: Path A refuses "two words"
+        // with TOO_WIDE, which is a correct refusal and not what is under test.
+        let replacement = "a b";
+
+        // --- the control: Path A doing the same edit, in the document's font ---
+        let (base, _) = embed_into_a_copy(&original, PROVISION_LATIN);
+        let path_a = justified::rewrite_bytes(
+            &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(),
+            at, 5, replacement.as_bytes()).expect("Path A refused");
+        println!("PATH A gaps : {:?}", gaps(&path_a).iter()
+            .map(|g| (g * 100.0).round() / 100.0).collect::<Vec<_>>());
+
+        // --- Path B, whose replacement is currently rigid ---
+        let (_, path_b) = shaped_edit(PROVISION_LATIN, at, 5, replacement).expect("Path B refused");
+        println!("PATH B gaps : {:?}", gaps(&path_b).iter()
+            .map(|g| (g * 100.0).round() / 100.0).collect::<Vec<_>>());
+
+        // --- and the right edge, which must hold either way ---
+        for (label, bytes) in [("path A", &path_a), ("path B", &path_b)] {
+            let (line, _) = two_lines(bytes);
+            let want = two_lines(&base).0.right;
+            println!("{label}: right drift {:.6} pt  text {:?}",
+                (line.right - want).abs() * JUSTIFIED_PAGE_W,
+                line.text.chars().take(48).collect::<String>());
+        }
+
+        // --- and what happens when the line's own slots are all inside the
+        // --- replacement, so nothing outside it can stretch
+        let whole = justified::rewrite_bytes_shaped(
+            &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(), 0, EMBEDDED_TEXT.len(),
+            &provision::provision(Some(PROVISION_LATIN), "one two", shaped::SHAPING_SIZE).unwrap(),
+            "one two",
+            {
+                let d = lopdf::Document::load_mem(&base).unwrap();
+                d.objects.iter().find(|(_, o)| matches!(o, lopdf::Object::Dictionary(dd)
+                    if dd.get(b"Subtype").ok().and_then(|x| x.as_name().ok()) == Some(b"Type0")))
+                    .map(|(id, _)| *id).unwrap()
+            });
+        println!("replacing the WHOLE line: {:?}", whole.map(|b| b.len()));
+
+        // ⚠️ THE BEFORE PICTURE for "a space-free replacement is unchanged".
+        // Hashed as the decoded PAGE CONTENT, never the whole file: PDFium
+        // writes a fresh document /ID on every save, so file hashes differ
+        // between two runs of the same binary.
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() { continue; }
+            let (_, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            let d = lopdf::Document::load_mem(&edited).unwrap();
+            let (_, &pid) = d.get_pages().iter().next().unwrap();
+            // ⚠️ THE MARK ID IS MASKED OUT. It embeds a nanosecond timestamp,
+            // so the same binary hashes differently on two consecutive runs:
+            // measured, b655cbc0 then 93901c3b for identical output. The same
+            // trap as PDFium's regenerated /ID, and it makes an unmasked hash
+            // useless as a stability check.
+            let c = mask_mark_ids(&d.get_page_content(pid));
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in &c { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+            println!("NOSPACE {label:8} content {:5} bytes hash {h:016x}", c.len());
+        }
+    }
+
+    // ---------------- Path B: justification inside the replacement ----------------
+
+    /// Every inter-word gap on the page's first line, in points.
+    ///
+    /// Measured between the ink either side of a space rather than from the
+    /// space's own box, because that is the gap a reader sees.
+    fn line_gaps(bytes: &[u8]) -> Vec<f32> {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        let chars = get_page_chars(handle, 0, 900);
+        assert_eq!(chars.status, STATUS_OK_PDFIUM);
+        let out = {
+            let all = unsafe { std::slice::from_raw_parts(chars.chars, chars.len) };
+            let scale = JUSTIFIED_PAGE_W / 900.0;
+            let top = all.iter().map(|c| c.top).fold(f32::MAX, f32::min);
+            let line: Vec<&CharInfo> = all.iter().filter(|c| (c.top - top).abs() < 6.0).collect();
+            let mut out = Vec::new();
+            for w in line.windows(3) {
+                if char::from_u32(w[1].codepoint) == Some(' ') {
+                    out.push((w[2].left - w[0].right) * scale);
+                }
+            }
+            out
+        };
+        free_char_info_array(chars);
+        close_document(handle);
+        out
+    }
+
+    /// The slots a replacement would emit, without writing anything.
+    fn replacement_slots(font: &str, text: &str) -> usize {
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let (base, font_id) = embed_into_a_copy(&original, font);
+        let doc = lopdf::Document::load_mem(&base).unwrap();
+        let widths = shaped::cid_widths(&doc, font_id).unwrap();
+        let p = provision::provision(Some(font), text, shaped::SHAPING_SIZE).unwrap();
+        shaped::run(&p, text, &widths).slots.len()
+    }
+
+    #[test]
+    fn a_space_inside_a_replacement_stretches_like_the_rest_of_the_line() {
+        // ⚠️ THE PHASE 7 CASE. Emitted rigidly, that gap measured 3.32pt
+        // against 7.50pt everywhere else on the same line: less than half, and
+        // plainly visible. Path A has always cut an inserted space into its own
+        // element so it can stretch; this gives Path B the same.
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let (_, edited) = shaped_edit(PROVISION_LATIN, at, 5, "a b").expect("refused");
+
+        let gaps = line_gaps(&edited);
+        assert!(gaps.len() >= 8, "expected the line's gaps, got {gaps:?}");
+        // Kerned pairs sit slightly under; the slots must agree with each other.
+        let widest = gaps.iter().cloned().fold(f32::MIN, f32::max);
+        let narrowest = gaps.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(widest - narrowest < 0.7,
+            "the line is not evenly spaced: {gaps:?}");
+    }
+
+    #[test]
+    fn several_spaces_in_a_replacement_all_stretch_the_same() {
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        // Three words where one stood, so two interior slots.
+        let at = EMBEDDED_TEXT.find("jumps").unwrap();
+        let (_, edited) = shaped_edit(PROVISION_LATIN, at, 5, "a b c").expect("refused");
+        assert_eq!(replacement_slots(PROVISION_LATIN, "a b c"), 2);
+
+        let gaps = line_gaps(&edited);
+        let widest = gaps.iter().cloned().fold(f32::MIN, f32::max);
+        let narrowest = gaps.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(widest - narrowest < 0.7, "the line is not evenly spaced: {gaps:?}");
+    }
+
+    #[test]
+    fn a_trailing_space_in_a_replacement_is_not_a_slot() {
+        // ⚠️ THE SAME RULE PATH A KEEPS. A justification slot is the gap
+        // BETWEEN two things, and there is nothing after the last glyph to hold
+        // apart. Counting one there would steal width from the real gaps.
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        assert_eq!(replacement_slots(PROVISION_LATIN, "ab"), 0);
+        assert_eq!(replacement_slots(PROVISION_LATIN, "a b"), 1);
+        assert_eq!(replacement_slots(PROVISION_LATIN, "a "), 0, "a trailing space became a slot");
+        assert_eq!(replacement_slots(PROVISION_LATIN, "a b "), 1, "the trailing space was counted");
+    }
+
+    #[test]
+    fn a_replacement_with_no_spaces_emits_no_slots_at_all() {
+        // The Phase 4 output has to be reachable unchanged, and the way to be
+        // sure is that the slot path never runs for it. Measured alongside
+        // this: with slot emission disabled, all five of these produce
+        // byte-identical page content, so the space-free path is untouched.
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            assert_eq!(replacement_slots(font, replacement), 0,
+                "{label}: a space-free replacement emitted a slot");
+        }
+    }
+
+    #[test]
+    fn the_whole_line_can_be_replaced() {
+        // ⚠️ THIS USED TO BE REFUSED, and for no good reason: every slot fell
+        // inside the replacement, so the solver found none outside it and gave
+        // up. Selecting a whole line and replacing it is a legitimate edit, and
+        // now that the replacement's own spaces are slots there is something to
+        // stretch.
+        //
+        // ⚠️ AND THE TWO ENDINGS ARE BOTH ASSERTED, because they measure
+        // different things. The line's right edge is the INK edge of its last
+        // glyph. Replace the line and that glyph changes, so the edge moves by
+        // the difference in side bearing however exact the arithmetic is:
+        // measured at 0.36pt for a line ending "o" where it had ended "g". End
+        // the replacement with the SAME glyph and the drift collapses to
+        // nothing, which is what shows the advance itself is exact.
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let (base, font_id) = embed_into_a_copy(&original, PROVISION_LATIN);
+        let want = two_lines(&base).0.right;
+
+        let replace_all = |text: &str| -> Vec<u8> {
+            let p = provision::provision(Some(PROVISION_LATIN), text, shaped::SHAPING_SIZE)
+                .expect("provisioning refused");
+            justified::rewrite_bytes_shaped(
+                &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(),
+                0, EMBEDDED_TEXT.len(), &p, text, font_id)
+                .expect("replacing the whole line was refused")
+        };
+
+        // Same final glyph as the line it replaces: the advance is exact.
+        let edited = replace_all("one dog");
+        let (line, below) = two_lines(&edited);
+        assert!(line.text.contains("one dog"), "{:?}", line.text);
+        assert!(!line.text.contains("quick"), "the old text survived: {:?}", line.text);
+        assert_eq!(below.text.trim(), "and rests here quietly.",
+            "replacing the line disturbed the one below it");
+        let drift = (line.right - want).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 0.001, "the right edge moved {drift} pt");
+
+        // A different final glyph: still within one side bearing.
+        let edited = replace_all("one two");
+        let (line, _) = two_lines(&edited);
+        assert!(line.text.contains("one two"), "{:?}", line.text);
+        let drift = (line.right - want).abs() * JUSTIFIED_PAGE_W;
+        assert!(drift < 1.0, "the right edge moved {drift} pt, more than a side bearing");
+    }
+
+    #[test]
+    fn a_replacement_too_wide_for_the_line_is_still_refused() {
+        // Slots add width; they cannot take any away. A replacement wider than
+        // the line has to refuse exactly as it always did.
+        if !std::path::Path::new(PROVISION_LATIN).exists() {
+            return;
+        }
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let original = std::fs::read(justified_embedded_fixture()).unwrap();
+        let (base, font_id) = embed_into_a_copy(&original, PROVISION_LATIN);
+        let wide = "two words that are far too wide for this line to hold";
+        let p = provision::provision(Some(PROVISION_LATIN), wide, shaped::SHAPING_SIZE).unwrap();
+        assert_eq!(
+            justified::rewrite_bytes_shaped(
+                &base, 0, EMBEDDED_BASELINE, EMBEDDED_TEXT.as_bytes(), at, 5, &p, wide, font_id),
+            Err(STATUS_TOO_WIDE));
+    }
+
+    #[test]
+    fn the_searchable_run_still_covers_a_stretched_replacement() {
+        // ⚠️ THE THING MOST LIKELY TO BREAK HERE. The invisible run is sized
+        // against the replacement's advance, and this phase CHANGED that
+        // advance: every interior space now adds a slot's worth of stretch. A
+        // run still sized against the unstretched figure comes up short by one
+        // gap per space.
+        //
+        // ⚠️ AND IT HAS TO BE A SHAPED SCRIPT. Written first with Latin, this
+        // test could not fail: the VISIBLE run extracts as "a b" too, so the
+        // search found the visible box and compared it against itself, and
+        // mis-sizing the invisible run changed nothing it asserted. Devanagari
+        // extracts wrongly on purpose, so the logical characters can only have
+        // come from the invisible run.
+        use pdfium_render::prelude::*;
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let replacement = "\u{915}\u{94d}\u{937} \u{915}\u{94d}\u{937}";   // two conjuncts, one space
+        let at = EMBEDDED_TEXT.find("brown fox jumps").unwrap();
+        let (_, edited) = shaped_edit(DEVANAGARI_FONT, at, 15, replacement).expect("refused");
+
+        // The visible replacement is the middle of the three text objects.
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        let (vis_left, vis_right) = {
+            let _guard = lock(&CALL_LOCK);
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            let doc_guard = lock(&doc);
+            let page = doc_guard.pages().get(0).unwrap();
+            let b = page.objects().get(1).unwrap().bounds().unwrap();
+            (b.left().value, b.right().value)
+        };
+        let chars = get_page_chars(handle, 0, 900);
+        assert_eq!(chars.status, STATUS_OK_PDFIUM);
+        let (lo, hi) = {
+            let all = unsafe { std::slice::from_raw_parts(chars.chars, chars.len) };
+            let page: Vec<char> = all.iter()
+                .map(|c| char::from_u32(c.codepoint).unwrap_or('\u{fffd}')).collect();
+            let wanted: Vec<char> = replacement.chars().collect();
+            let start = page.windows(wanted.len()).position(|w| w == wanted.as_slice())
+                .expect("the logical text is not on the page, so the run is missing");
+            let s = &all[start..start + wanted.len()];
+            (s.iter().map(|c| c.left).fold(f32::MAX, f32::min),
+             s.iter().map(|c| c.right).fold(f32::MIN, f32::max))
+        };
+        free_char_info_array(chars);
+        close_document(handle);
+
+        let scale = JUSTIFIED_PAGE_W / 900.0;
+        let (lo, hi) = (lo * scale, hi * scale);
+        assert!((lo - vis_left).abs() < 1.0 && (hi - vis_right).abs() < 1.0,
+            "highlight {lo:.3}..{hi:.3} against the drawn glyphs {vis_left:.3}..{vis_right:.3}");
+    }
+
+    // ---------------- the transaction seam ----------------
+
+    /// Swaps `bytes` in behind `handle`, returning the previous contents.
+    fn swap_in(handle: u64, bytes: &[u8]) -> Result<Vec<u8>, i32> {
+        let buf = replace_document_contents(handle, bytes.as_ptr(), bytes.len());
+        let out = if buf.status == STATUS_OK_PDFIUM && !buf.data.is_null() {
+            Ok(unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec())
+        } else {
+            Err(buf.status)
+        };
+        free_byte_buffer(buf);
+        out
+    }
+
+    /// A live document's first page content stream.
+    ///
+    /// ⚠️ THE CONTENT, NOT THE FILE. PDFium writes a fresh document /ID on
+    /// every save, so two snapshots of an UNCHANGED document differ. The page
+    /// content is what actually says whether anything moved.
+    fn live_page_content(handle: u64) -> Vec<u8> {
+        let snap = snapshot_document(handle);
+        assert_eq!(snap.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        doc.get_page_content(pid)
+    }
+
+    #[test]
+    fn a_swap_replaces_the_document_behind_the_same_handle() {
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let replacement = "\u{915}\u{94d}\u{937}\u{93e}";
+        let edited = shaped_ffi(handle, at, 5, replacement, DEVANAGARI_FONT).expect("refused");
+
+        // Before the swap the live document still says the old word.
+        assert!(decode_lines(handle, 0).iter().any(|l| l.text.contains("brown")));
+
+        let previous = swap_in(handle, &edited).expect("the swap was refused");
+
+        // ⚠️ THE SAME HANDLE, now reading as edited.
+        let lines = decode_lines(handle, 0);
+        assert!(!lines.iter().any(|l| l.text.contains("brown")), "{lines:?}");
+        assert_eq!(lines.len(), 2, "the invisible run leaked into the line reader");
+
+        // Find still sees the logical text through the live handle.
+        let snap = snapshot_document(handle);
+        let now = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+        free_byte_buffer(snap);
+        assert!(found_text(&now).contains(replacement));
+        assert_eq!(offered_objects(&now).len(), 4, "the invisible run became selectable");
+
+        // And what came back is a document that still says the old word, which
+        // is what makes undo this same call again.
+        assert!(decode_lines(open_document_from_bytes(previous.as_ptr(), previous.len()), 0)
+            .iter().any(|l| l.text.contains("brown")),
+            "the returned previous contents are not the pre-swap document");
+        close_document(handle);
+    }
+
+    #[test]
+    fn bytes_pdfium_will_not_open_leave_the_document_alone() {
+        // ⚠️ A FAILURE IS NEVER A STATE. Validation happens before anything is
+        // committed, so there is nothing to roll back.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let before = live_page_content(handle);
+
+        assert_eq!(swap_in(handle, b"%PDF-1.7 and then nonsense"),
+            Err(STATUS_REPLACEMENT_REJECTED));
+
+        assert_eq!(live_page_content(handle), before, "a refused swap changed the document");
+        assert_eq!(decode_lines(handle, 0).len(), 2);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_replacement_with_a_different_page_count_is_refused() {
+        // Not a replacement for THIS document, whatever else it is.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let before = live_page_content(handle);
+        let other = std::fs::read(justified_fixture()).unwrap();
+        let pages = {
+            let h = open_document_from_bytes(other.as_ptr(), other.len());
+            let n = get_page_count(h);
+            close_document(h);
+            n
+        };
+        assert_eq!(pages, 1, "the fixtures no longer differ in page count");
+
+        // Two pages against one.
+        let two = std::fs::read("tests/fixtures/sample_20pages.pdf").unwrap();
+        assert_eq!(swap_in(handle, &two), Err(STATUS_INVALID_INPUT));
+        assert_eq!(live_page_content(handle), before, "a refused swap changed the document");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_swap_invalidates_the_tiles_and_the_render_generations() {
+        // ⚠️ BOTH. A render already in flight was started against the old
+        // document; leaving its generation in place would let the result be
+        // recognised as current and delivered over the new page.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        // Put something in both.
+        let r = render_uncached(handle, 0, 400);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        free_render_result(r);
+        lock(&core().generations).insert((handle, 0), 12345);
+        lock(&core().cache).put(
+            TileKey::page_key(handle, 0, Tier::Low, 400),
+            CachedTile { width: 1, height: 1, bytes: Arc::from(vec![0u8; 4]) });
+        assert!(lock(&core().cache).iter().any(|(k, _)| k.doc == handle));
+
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let edited = shaped_ffi(handle, at, 5, "\u{915}", DEVANAGARI_FONT).expect("refused");
+        swap_in(handle, &edited).expect("the swap was refused");
+
+        assert!(!lock(&core().cache).iter().any(|(k, _)| k.doc == handle),
+            "a tile from the old document survived the swap");
+        assert!(!lock(&core().generations).keys().any(|(d, _)| *d == handle),
+            "a render generation from the old document survived the swap");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_swap_refuses_nonsense_arguments_without_panicking() {
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let bytes = std::fs::read(justified_embedded_fixture()).unwrap();
+
+        assert_eq!(swap_in(0, &bytes), Err(STATUS_INVALID_INPUT));
+        assert_eq!(swap_in(handle, &[]), Err(STATUS_INVALID_INPUT));
+        let buf = replace_document_contents(handle, std::ptr::null(), 10);
+        assert_eq!(buf.status, STATUS_INVALID_INPUT);
+        free_byte_buffer(buf);
+        // An unknown handle.
+        assert_eq!(swap_in(handle + 9999, &bytes), Err(STATUS_INVALID_INPUT));
+
+        assert_eq!(decode_lines(handle, 0).len(), 2, "a refused call disturbed the document");
+        close_document(handle);
+    }
+
+    #[test]
+    fn repeated_swaps_do_not_accumulate_documents() {
+        // The registry must hold exactly one document for the handle however
+        // many times it is swapped. The BYTES go with it: PDFium takes
+        // ownership of the Vec it was loaded from, so the old document frees
+        // them when it drops.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let a = std::fs::read(justified_embedded_fixture()).unwrap();
+        let registered = || lock(&core().documents).keys().filter(|k| **k == handle).count();
+
+        assert_eq!(registered(), 1);
+        let mut carried = a.clone();
+        for round in 0..20 {
+            carried = swap_in(handle, &carried)
+                .unwrap_or_else(|e| panic!("swap {round} refused with {e}"));
+            assert_eq!(registered(), 1, "the registry grew on swap {round}");
+        }
+        assert_eq!(decode_lines(handle, 0).len(), 2);
+        close_document(handle);
+    }
+
+    // ---------------- blocks, end to end ----------------
+
+    const CONJUNCT: &str = "\u{915}\u{94d}\u{937}\u{93e}";
+
+    fn only_block(handle: u64) -> block::Block {
+        let (mut blocks, _) = page_blocks(handle, 0).expect("no blocks");
+        assert_eq!(blocks.len(), 1, "the fixture stopped being one block");
+        blocks.remove(0)
+    }
+
+    /// The block's logical text, which is what a reader would be selecting in.
+    fn block_text(handle: u64) -> String {
+        only_block(handle).text
+    }
+
+    #[test]
+    fn a_page_reads_as_one_block_of_two_lines() {
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let b = only_block(handle);
+        assert_eq!(b.text, format!("{EMBEDDED_TEXT}\nand rests here quietly."));
+        assert_eq!(b.lines.len(), 2);
+        assert!(b.editable(), "{:?}", b.refusals);
+        // The break belongs to no object, so it can never be spliced.
+        assert!(matches!(b.map[EMBEDDED_TEXT.len()], block::Source::Break));
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_block_edit_replaces_a_word_and_commits() {
+        // ⚠️ THE WHOLE TRIP. Logical characters of a paragraph in, a committed
+        // document out, through the emitter and the transaction that already
+        // existed.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = block_text(handle).find("brown").expect("the fixture changed");
+
+        assert_eq!(edit_block_line(handle, 0, 0, at, 5, "green", None), STATUS_OK_PDFIUM);
+
+        // ⚠️ THE SAME HANDLE, now reading as edited.
+        let lines = decode_lines(handle, 0);
+        assert!(lines.iter().any(|l| l.text.contains("green")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.text.contains("brown")), "{lines:?}");
+        assert_eq!(block_text(handle), "The quick green fox jumps over the lazy dog\nand rests here quietly.");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_block_offset_past_the_break_addresses_the_second_line() {
+        // ⚠️ THE TEST THAT SAYS THIS IS BLOCK ADDRESSING AT ALL. The offset is
+        // counted from the start of the PARAGRAPH, past a line break, and what
+        // comes out has to be the SECOND line's anchor with a span inside the
+        // second line's own text.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let b = only_block(handle);
+        let at = b.text.find("quietly").expect("the fixture changed");
+        assert!(at > EMBEDDED_TEXT.len(), "the target is not past the break");
+
+        let plan = block::plan(
+            &b, at, 7,
+            STATUS_SELECTION_SPANS_LINES, STATUS_SELECTION_NOT_ADDRESSABLE,
+            STATUS_BLOCK_NOT_EDITABLE, STATUS_INVALID_INPUT,
+        ).expect("refused");
+        assert_eq!(plan.line, 1);
+        assert_eq!(plan.baseline, 680.0);
+        assert_eq!(plan.expected, "and rests here quietly.");
+        assert_eq!(&plan.expected[plan.at..plan.at + plan.len], "quietly");
+
+        // ⚠️ AND THE EMITTER STILL DECIDES. This fixture's second line names no
+        // font of its own, deliberately, to prove the Path B `Tf` restore; a
+        // line with no font is one Path A cannot resolve and refuses. The
+        // addressing layer passes that refusal through unchanged instead of
+        // turning it into a reason of its own.
+        let expected = plan.expected.as_bytes();
+        let new = b"loudly";
+        let direct = rewrite_justified_line(
+            handle, 0, plan.baseline,
+            expected.as_ptr(), expected.len(), plan.at as u32, plan.len as u32,
+            new.as_ptr(), new.len());
+        let direct_status = direct.status;
+        free_byte_buffer(direct);
+        assert_eq!(direct_status, STATUS_UNSUPPORTED);
+        assert_eq!(edit_block_line(handle, 0, 0, at, 7, "loudly", None), direct_status);
+        close_document(handle);
+    }
+
+    /// The embedded fixture with a second line Path A will actually accept.
+    ///
+    /// ⚠️ TWO THINGS THE FIXTURE LEAVES OUT, BOTH ON PURPOSE. Its second line
+    /// names no font, which is what proves the Path B `Tf` restore, and it is a
+    /// single string with no justification slots. Path A needs both: a font to
+    /// take metrics from, and at least one slot, because it re-solves the
+    /// line's justification to hold its width. `solve` refusing a slotless line
+    /// is why this helper exists at all, and it is worth saying plainly: the
+    /// emitter is called `rewrite_justified_line` and it means it.
+    fn two_editable_lines() -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Object, StringFormat};
+        let bytes = std::fs::read(justified_embedded_fixture()).unwrap();
+        let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let mut content = Content::decode(&doc.get_page_content(pid)).unwrap();
+        let second = content.operations.iter().enumerate()
+            .filter(|(_, o)| o.operator == "BT")
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("the fixture stopped having two text objects");
+        content.operations.insert(
+            second + 1,
+            Operation::new("Tf", vec!["F1".into(), 12.into()]));
+        let tj = content.operations.iter().enumerate().skip(second)
+            .find(|(_, o)| o.operator == "TJ")
+            .map(|(i, _)| i)
+            .expect("the second line stopped being a TJ");
+        // The same words, set with the gaps a justified line carries.
+        let lit = |b: &[u8]| Object::String(b.to_vec(), StringFormat::Literal);
+        content.operations[tj] = Operation::new("TJ", vec![Object::Array(vec![
+            lit(b"and "), Object::Integer(-180),
+            lit(b"rests "), Object::Integer(-180),
+            lit(b"here "), Object::Integer(-180),
+            lit(b"quietly."),
+        ])]);
+        doc.change_page_content(pid, content.encode().unwrap()).unwrap();
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_block_edit_past_the_break_commits_on_the_second_line() {
+        // ⚠️ THE WHOLE TRIP, ON A LINE THAT IS NOT THE FIRST. An offset counted
+        // through the paragraph, a line break in between, and the edit has to
+        // land on the second line and nowhere else.
+        let bytes = two_editable_lines();
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        let at = block_text(handle).find("quietly").expect("the fixture changed");
+        assert!(at > EMBEDDED_TEXT.len(), "the target is not past the break");
+
+        assert_eq!(edit_block_line(handle, 0, 0, at, 7, "loudly", None), STATUS_OK_PDFIUM);
+
+        let lines = decode_lines(handle, 0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, EMBEDDED_TEXT, "the first line was touched");
+        assert!(lines[1].text.contains("loudly"), "{lines:?}");
+        assert!(!lines[1].text.contains("quietly"), "{lines:?}");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_block_edit_is_the_same_document_as_the_line_edit_it_stands_for() {
+        // ⚠️ A CONTROL, AND THE POINT OF ONE. The addressing layer must add
+        // nothing and lose nothing: driving the emitter through the block model
+        // and driving it directly have to produce the same page, byte for byte.
+        let by_block = {
+            let handle = open_fixture_named(&justified_embedded_fixture());
+            let at = block_text(handle).find("brown").unwrap();
+            assert_eq!(edit_block_line(handle, 0, 0, at, 5, "green", None), STATUS_OK_PDFIUM);
+            let content = live_page_content(handle);
+            close_document(handle);
+            content
+        };
+        let by_line = {
+            let handle = open_fixture_named(&justified_embedded_fixture());
+            let at = EMBEDDED_TEXT.find("brown").unwrap();
+            let expected = EMBEDDED_TEXT.as_bytes();
+            let new = b"green";
+            let buf = rewrite_justified_line(
+                handle, 0, EMBEDDED_BASELINE,
+                expected.as_ptr(), expected.len(), at as u32, 5,
+                new.as_ptr(), new.len());
+            assert_eq!(buf.status, STATUS_OK_PDFIUM);
+            let bytes = unsafe { std::slice::from_raw_parts(buf.data, buf.len) }.to_vec();
+            free_byte_buffer(buf);
+            swap_in(handle, &bytes).expect("the swap was refused");
+            let content = live_page_content(handle);
+            close_document(handle);
+            content
+        };
+        assert_eq!(by_block, by_line, "the block model changed what gets written");
+    }
+
+    #[test]
+    fn a_block_edit_can_set_a_replacement_in_a_font_the_document_lacks() {
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = block_text(handle).find("brown").unwrap();
+
+        assert_eq!(
+            edit_block_line(handle, 0, 0, at, 5, CONJUNCT, Some(DEVANAGARI_FONT)),
+            STATUS_OK_PDFIUM);
+
+        // The page now says what was typed, not what was drawn.
+        let text = block_text(handle);
+        assert!(text.contains(CONJUNCT), "{text:?}");
+        assert!(!text.contains("brown"), "{text:?}");
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_model_reads_a_shaped_run_logically_and_will_not_re_edit_it() {
+        // ⚠️ THE PATH B CEILING, ARRIVING FROM THE READ SIDE. The visible
+        // glyphs decode to something nobody typed; the logical characters live
+        // in the invisible partner, and pairing them is what makes the
+        // paragraph readable. Re-editing that run is still refused, which is
+        // the retired Phase 11 saying so honestly instead of corrupting it.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = block_text(handle).find("brown").unwrap();
+        assert_eq!(
+            edit_block_line(handle, 0, 0, at, 5, CONJUNCT, Some(DEVANAGARI_FONT)),
+            STATUS_OK_PDFIUM);
+
+        let b = only_block(handle);
+        // ⚠️ THE MUTATION GUARD. If the pairing had not worked, the logical
+        // text would BE the drawn text and the assertion above would pass for
+        // the wrong reason. The two must differ.
+        assert!(!b.lines[0].drawn.contains(CONJUNCT),
+            "the glyphs decode to the logical text, so this proves nothing: {:?}",
+            b.lines[0].drawn);
+        assert!(b.text.contains(CONJUNCT), "{:?}", b.text);
+
+        let at = b.text.find(CONJUNCT).unwrap();
+        assert!(matches!(b.map[at], block::Source::Atomic { .. }));
+        assert_eq!(
+            edit_block_line(handle, 0, 0, at, 4, "x", None),
+            STATUS_SELECTION_NOT_ADDRESSABLE);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_selection_crossing_a_line_break_is_refused_and_changes_nothing() {
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let before = live_page_content(handle);
+        // A window straddling the break: the tail of line one and the head of
+        // line two.
+        let at = EMBEDDED_TEXT.len() - 3;
+        assert_eq!(edit_block_line(handle, 0, 0, at, 8, "x", None),
+            STATUS_SELECTION_SPANS_LINES);
+        assert_eq!(live_page_content(handle), before, "a refused edit changed the page");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_block_edit_the_emitter_refuses_leaves_the_document_alone() {
+        // ⚠️ A FAILURE IS NEVER A STATE. The emitter hands back a reason and no
+        // bytes, so there is nothing committed and nothing to roll back.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let before = live_page_content(handle);
+        let at = block_text(handle).find("brown").unwrap();
+
+        // No wrapping, ever: a line break in the replacement is a paragraph
+        // edit, which this is not.
+        assert_eq!(edit_block_line(handle, 0, 0, at, 5, "one\ntwo", None),
+            STATUS_INVALID_INPUT);
+        assert_eq!(live_page_content(handle), before);
+
+        // And nonsense addresses are refused before anything is planned.
+        assert_eq!(edit_block_line(handle, 0, 99, at, 5, "x", None), STATUS_INVALID_INPUT);
+        assert_eq!(edit_block_line(handle, 0, 0, at, 0, "x", None), STATUS_INVALID_INPUT);
+        assert_eq!(edit_block_line(handle, 0, 0, 9999, 5, "x", None), STATUS_INVALID_INPUT);
+        assert_eq!(edit_block_line(0, 0, 0, at, 5, "x", None), STATUS_INVALID_INPUT);
+        assert_eq!(live_page_content(handle), before);
+        close_document(handle);
+    }
+
+    #[test]
+    fn two_block_edits_in_a_row_each_see_the_document_the_last_one_left() {
+        // The commit is the transaction, so the model is re-read from the live
+        // handle every time and offsets are never stale.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = block_text(handle).find("brown").unwrap();
+        assert_eq!(edit_block_line(handle, 0, 0, at, 5, "green", None), STATUS_OK_PDFIUM);
+
+        let at = block_text(handle).find("lazy").expect("the first edit lost the line");
+        assert_eq!(edit_block_line(handle, 0, 0, at, 4, "eager", None), STATUS_OK_PDFIUM);
+
+        assert_eq!(block_text(handle),
+            "The quick green fox jumps over the eager dog\nand rests here quietly.");
+        close_document(handle);
+    }
+
+    /// THE STEP A/B CORPUS, against the model as it actually shipped.
+    ///
+    /// Not a regression test in CI: it reads the machine's own PDF folders and
+    /// says nothing on another machine. `#[ignore]`d, run with
+    /// `cargo test --release block_corpus -- --ignored --nocapture`, and the
+    /// numbers are meant to be compared against the Step B record: 154
+    /// documents, 3971 lines, 2854 blocks. A different block count means the
+    /// grouping drifted and every figure in that record stopped being about
+    /// this rule.
+    #[test]
+    #[ignore]
+    fn block_corpus() {
+        use std::collections::BTreeMap;
+        let roots = [
+            r"D:\Ayaan PDF Test file",
+            r"%USERPROFILE%\Downloads",
+            r"%USERPROFILE%\Downloads\Telegram Desktop",
+        ];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("pdf") {
+                    continue;
+                }
+                if e.metadata().map(|m| m.len() > 20_000_000).unwrap_or(true) {
+                    continue;
+                }
+                files.push(path);
+            }
+        }
+        files.sort();
+
+        let (mut docs, mut lines, mut blocks, mut editable) = (0usize, 0usize, 0usize, 0usize);
+        let mut sizes: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut refusals: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut mapped = 0usize;
+        let mut atomic_runs = 0usize;
+
+        for path in &files {
+            let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+            let handle = open_document(c.as_ptr());
+            if handle == 0 {
+                continue;
+            }
+            docs += 1;
+            for page in 0..3.min(get_page_count(handle)) {
+                let Ok((found, _)) = page_blocks(handle, page) else { continue };
+                for b in &found {
+                    blocks += 1;
+                    lines += b.lines.len();
+                    mapped += b.map.len();
+                    atomic_runs += b.lines.iter().flat_map(|l| &l.runs).filter(|r| r.atomic).count();
+                    if b.editable() {
+                        editable += 1;
+                    }
+                    for r in &b.refusals {
+                        *refusals.entry(*r).or_insert(0) += 1;
+                    }
+                    let bucket = match b.lines.len() {
+                        1 => "1 line",
+                        2..=3 => "2-3",
+                        4..=10 => "4-10",
+                        _ => "11+",
+                    };
+                    *sizes.entry(bucket).or_insert(0) += 1;
+                }
+            }
+            close_document(handle);
+        }
+
+        println!("documents {docs}, lines {lines}, blocks {blocks}");
+        println!("logical characters mapped {mapped}, atomic runs {atomic_runs}");
+        for (k, v) in &sizes {
+            println!("  {k:<8} {v:6}");
+        }
+        println!("editable {editable} of {blocks}  ({:.1}%)",
+            editable as f64 / blocks.max(1) as f64 * 100.0);
+        for (k, v) in &refusals {
+            let why = match *k {
+                block::BLOCK_INTERLEAVED => "another line sits inside this block's objects",
+                block::BLOCK_FOREIGN => "a member line is drawn by foreign objects",
+                block::BLOCK_SHARED_OBJECTS => "member lines share objects",
+                block::BLOCK_UNDECODABLE => "undecodable characters",
+                block::BLOCK_NO_RUNS => "a member line has no runs",
+                block::BLOCK_PATH_B_UNPAIRED => "an unpaired logical run on the page",
+                block::BLOCK_LOGICAL_RUN_INSIDE_LINE => "a logical run inside a line",
+                _ => "?",
+            };
+            println!("  {v:6}  {why}");
+        }
+    }
+
+    // ---------------- the block emitter ----------------
+
+    const BOTH_LINES: &str =
+        "The quick brown fox jumps over the lazy dog\nand rests here quietly.";
+
+    fn editable_block_document() -> u64 {
+        let bytes = two_editable_lines();
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert!(handle != 0);
+        assert_eq!(block_text(handle), BOTH_LINES, "the fixture changed");
+        handle
+    }
+
+    #[test]
+    fn emitting_a_block_writes_back_exactly_what_was_typed() {
+        // ⚠️ THE WHOLE POINT OF A BLOCK EMITTER. The caller hands back the
+        // paragraph's text, not a span and a replacement, and reading the
+        // document afterwards gives that text back.
+        let handle = editable_block_document();
+        let edited = "The quick green fox jumps over the lazy dog\nand rests here quietly.";
+        assert_eq!(emit_block(handle, 0, 0, edited, None), STATUS_OK_PDFIUM);
+        assert_eq!(block_text(handle), edited);
+        close_document(handle);
+    }
+
+    #[test]
+    fn emitting_a_block_commits_two_changed_lines_together() {
+        // ⚠️ THE CAPABILITY THE LINE PATH DID NOT HAVE. Two lines change, both
+        // are emitted onto the same accumulating bytes, and ONE swap commits
+        // them. A reader never sees the paragraph half edited.
+        let handle = editable_block_document();
+        let edited = "The quick green fox jumps over the lazy dog\nand rests here loudly.";
+        assert_eq!(emit_block(handle, 0, 0, edited, None), STATUS_OK_PDFIUM);
+        assert_eq!(block_text(handle), edited);
+
+        let lines = decode_lines(handle, 0);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].text.contains("green"), "{lines:?}");
+        assert!(lines[1].text.contains("loudly"), "{lines:?}");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_written_leaves_the_whole_block_alone() {
+        // ⚠️ ALL OR NOTHING, AND THE FIRST LINE IS THE PROOF. Its edit is
+        // perfectly writable and is emitted first; the second line asks for
+        // letters the document's font has no glyph for and no font was offered.
+        // If the emitter committed as it went, "green" would be on the page.
+        let handle = editable_block_document();
+        let before = live_page_content(handle);
+        let edited = format!(
+            "The quick green fox jumps over the lazy dog\nand rests here {CONJUNCT}.");
+
+        assert_eq!(emit_block(handle, 0, 0, &edited, None), STATUS_UNSUPPORTED);
+
+        assert_eq!(live_page_content(handle), before, "a failed block was half written");
+        assert_eq!(block_text(handle), BOTH_LINES);
+        close_document(handle);
+    }
+
+    #[test]
+    fn an_unedited_block_does_not_go_through_the_transaction() {
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let r = render_uncached(handle, 0, 400);
+        assert_eq!(r.status, STATUS_OK_PDFIUM);
+        free_render_result(r);
+        lock(&core().cache).put(
+            TileKey { doc: handle, page: 0, tier: Tier::Low, width: 400,
+                level: -1, col: -1, row: -1 },
+            CachedTile { width: 1, height: 1, bytes: Arc::from(vec![0u8; 4]) });
+        assert!(lock(&core().cache).iter().any(|(k, _)| k.doc == handle));
+
+        let same = block_text(handle);
+        assert_eq!(emit_block(handle, 0, 0, &same, None), STATUS_OK_PDFIUM);
+
+        // ⚠️ THE TILES ARE THE EVIDENCE, not the content. Path A is
+        // deterministic, so a document that was rewritten with the text it
+        // already had would compare equal and prove nothing. A commit evicts
+        // every tile; these are still here, so there was no commit.
+        assert!(lock(&core().cache).iter().any(|(k, _)| k.doc == handle),
+            "an unedited block still went through the transaction");
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_block_with_a_different_number_of_lines_needs_reflow() {
+        let handle = editable_block_document();
+        let before = live_page_content(handle);
+
+        // The break deleted: the same words, one line.
+        assert_eq!(emit_block(handle, 0, 0, &BOTH_LINES.replace('\n', " "), None),
+            STATUS_BLOCK_NEEDS_REFLOW);
+        // A break added.
+        assert_eq!(emit_block(handle, 0, 0, "The quick\nbrown fox\nand rests here quietly.", None),
+            STATUS_BLOCK_NEEDS_REFLOW);
+
+        assert_eq!(live_page_content(handle), before);
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_block_emitter_and_the_selection_edit_write_the_same_document() {
+        // ⚠️ A CONTROL. Handing back an edited paragraph and asking for one
+        // span to be replaced are two ways of saying the same thing, and they
+        // have to reach the same page.
+        let by_emit = {
+            let handle = editable_block_document();
+            let edited = BOTH_LINES.replace("brown", "green");
+            assert_eq!(emit_block(handle, 0, 0, &edited, None), STATUS_OK_PDFIUM);
+            let content = live_page_content(handle);
+            close_document(handle);
+            content
+        };
+        let by_selection = {
+            let handle = editable_block_document();
+            let at = block_text(handle).find("brown").unwrap();
+            assert_eq!(edit_block_line(handle, 0, 0, at, 5, "green", None), STATUS_OK_PDFIUM);
+            let content = live_page_content(handle);
+            close_document(handle);
+            content
+        };
+        assert_eq!(by_emit, by_selection);
+    }
+
+    #[test]
+    fn the_block_emitter_reaches_for_path_b_only_when_path_a_cannot_spell_it() {
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = editable_block_document();
+        // One line the document's own font can set, one it cannot.
+        let edited = format!(
+            "The quick green fox jumps over the lazy dog\nand rests here {CONJUNCT}.");
+        assert_eq!(emit_block(handle, 0, 0, &edited, Some(DEVANAGARI_FONT)), STATUS_OK_PDFIUM);
+
+        let b = only_block(handle);
+        assert!(b.text.contains("green"), "{:?}", b.text);
+        // ⚠️ AND ONLY THE SECOND LINE TOOK THE NEW FONT. Path A is tried first
+        // precisely so an ordinary edit keeps the document's own type; if the
+        // emitter reached for Path B whenever a font was offered, line one
+        // would carry a shaped run it never needed.
+        assert!(!b.lines[0].runs.iter().any(|r| r.atomic), "line one was set in the new font");
+        assert!(b.lines[1].runs.iter().any(|r| r.atomic), "line two was not");
+        // The glyphs are there and they are not the letters anyone typed.
+        assert!(!b.lines[1].drawn.contains(CONJUNCT), "{:?}", b.lines[1].drawn);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_block_line_that_path_b_cannot_help_with_never_reaches_for_the_font() {
+        // ⚠️ THE FONT IS DELIBERATELY NOT A FONT. This line cannot hold the
+        // text at its own width, and setting it in a different face does not
+        // change that. Path A's answer is the true one and must be the one
+        // reported; if the emitter fell through to Path B on any failure it
+        // would try to load this path, fail on the FONT instead, and describe
+        // the wrong problem entirely.
+        let handle = editable_block_document();
+        let before = live_page_content(handle);
+        let far_too_much = "green ".repeat(40);
+        let edited = BOTH_LINES.replace("brown", &far_too_much);
+
+        assert_eq!(
+            emit_block(handle, 0, 0, &edited, Some(r"C:\not\a\font\at\all.ttf")),
+            STATUS_TOO_WIDE);
+        assert_eq!(live_page_content(handle), before);
+        close_document(handle);
+    }
+
+    /// A second Devanagari word, different from `CONJUNCT`, so a test cannot
+    /// pass by finding the same string twice.
+    const NASAL: &str = "\u{92e}\u{947}\u{902}";
+
+    /// Every shaped run in the block, as the model says it reads.
+    fn shaped_runs_of(handle: u64) -> Vec<String> {
+        let b = only_block(handle);
+        let mut out = Vec::new();
+        for line in &b.lines {
+            let mut at = line.start;
+            for run in &line.runs {
+                if run.atomic {
+                    out.push(b.text.chars().skip(at).take(run.logical_len)
+                        .collect::<String>().trim().to_string());
+                }
+                at += run.logical_len;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn two_shaped_edits_in_one_block_both_keep_their_logical_text() {
+        // ⚠️ THE DEFECT THIS REPLACED. Path B's cleanup took every invisible
+        // run on the page rather than the edited line's, so writing the second
+        // of these left the first line's glyphs drawn with nothing to say what
+        // they spell. The emitter had to refuse the second one outright.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = editable_block_document();
+        let edited = format!(
+            "The quick {CONJUNCT} fox jumps over the lazy dog\nand rests here {NASAL}.");
+        assert_eq!(emit_block(handle, 0, 0, &edited, Some(DEVANAGARI_FONT)), STATUS_OK_PDFIUM);
+
+        let b = only_block(handle);
+        assert!(b.lines[0].runs.iter().any(|r| r.atomic), "the first line lost its shaped run");
+        assert!(b.lines[1].runs.iter().any(|r| r.atomic), "the second line has no shaped run");
+        // ⚠️ THE MUTATION GUARD. If the logical text were coming from the
+        // glyphs, it would BE the glyphs, and the assertions below would be
+        // comparing the drawn text with itself.
+        assert!(!b.lines[0].drawn.contains(CONJUNCT), "{:?}", b.lines[0].drawn);
+        assert!(!b.lines[1].drawn.contains(NASAL), "{:?}", b.lines[1].drawn);
+        assert_eq!(shaped_runs_of(handle), vec![CONJUNCT.to_string(), NASAL.to_string()]);
+        assert_eq!(block_text(handle), edited);
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_second_shaped_edit_leaves_the_first_line_s_logical_run_alone() {
+        // The same thing reached the way a user would: two separate edits, each
+        // its own transaction, the second made against the document the first
+        // one left.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = editable_block_document();
+        let first = BOTH_LINES.replace("brown", CONJUNCT);
+        assert_eq!(emit_block(handle, 0, 0, &first, Some(DEVANAGARI_FONT)), STATUS_OK_PDFIUM);
+        assert_eq!(shaped_runs_of(handle), vec![CONJUNCT.to_string()]);
+
+        let second = block_text(handle).replace("quietly", NASAL);
+        assert_eq!(emit_block(handle, 0, 0, &second, Some(DEVANAGARI_FONT)), STATUS_OK_PDFIUM);
+
+        assert_eq!(shaped_runs_of(handle), vec![CONJUNCT.to_string(), NASAL.to_string()],
+            "the earlier line's logical run did not survive the second edit");
+        close_document(handle);
+    }
+
+    #[test]
+    fn the_recorded_logical_text_survives_a_save_and_a_reopen() {
+        // ⚠️ THROUGH A FILE, not an in-memory snapshot. The question is whether
+        // the property survives being WRITTEN and read like a real document,
+        // which is the only version of it that matters to someone who closes
+        // the app.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = editable_block_document();
+        let edited = format!(
+            "The quick {CONJUNCT} fox jumps over the lazy dog\nand rests here {NASAL}.");
+        assert_eq!(emit_block(handle, 0, 0, &edited, Some(DEVANAGARI_FONT)), STATUS_OK_PDFIUM);
+        let before = shaped_runs_of(handle);
+        assert_eq!(before, vec![CONJUNCT.to_string(), NASAL.to_string()]);
+
+        let path = format!("{}/ayaan_path_b_roundtrip.pdf", std::env::temp_dir().display());
+        let c_path = std::ffi::CString::new(path.as_str()).unwrap();
+        assert_eq!(save_document(handle, c_path.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let reopened = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert!(reopened != 0);
+        assert_eq!(shaped_runs_of(reopened), before, "the recorded text did not survive the file");
+        assert_eq!(block_text(reopened), edited);
+        close_document(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same Path B edit, made on the first line and on the second, and what
+    /// each one reads back as.
+    ///
+    /// ⚠️ A DEFECT, RECORDED RATHER THAN PATCHED AROUND, AND IT IS NOT IN THE
+    /// EMITTER. Both edits write the SAME four glyph codes with the SAME gaps;
+    /// the two invisible runs differ only in their `Tm`. PDFium then reports
+    /// four codepoints for one and three for the other, because recovering the
+    /// logical text means decoding glyphs through a text page whose answers
+    /// depend on what else is near them.
+    ///
+    /// ⚠️ SO THE LOGICAL TEXT SHOULD BE RECORDED, NOT RE-DERIVED. It is known
+    /// exactly at write time: it is what the user typed. The same lesson as
+    /// every invented identity in this app, arriving at the text layer.
+    ///
+    /// If this test starts failing, that has been fixed. Delete the recorded
+    /// numbers and assert both sides read back whole.
+    #[test]
+    fn the_same_shaped_edit_reads_back_whole_wherever_it_sits() {
+        use lopdf::content::Content;
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let recovered = |word: &str| -> (String, Vec<lopdf::Object>) {
+            let handle = editable_block_document();
+            let edited = BOTH_LINES.replace(word, CONJUNCT);
+            assert_eq!(emit_block(handle, 0, 0, &edited, Some(DEVANAGARI_FONT)),
+                STATUS_OK_PDFIUM);
+            let logical = only_block(handle)
+                .lines
+                .iter()
+                .flat_map(|l| &l.runs)
+                .find(|r| r.atomic)
+                .map(|r| {
+                    // The run's own logical characters, as the model recovered
+                    // them: its stretch of the block's text.
+                    let b = only_block(handle);
+                    let line = b.lines.iter().position(|l| l.runs.iter().any(|x| x.atomic)).unwrap();
+                    let l = &b.lines[line];
+                    let before: usize = l.runs.iter().take_while(|x| !x.atomic)
+                        .map(|x| x.logical_len).sum();
+                    b.text.chars().skip(l.start + before).take(r.logical_len).collect::<String>()
+                })
+                .expect("no shaped run");
+            let snap = snapshot_document(handle);
+            let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+            free_byte_buffer(snap);
+            let doc = lopdf::Document::load_mem(&bytes).unwrap();
+            let (_, &pid) = doc.get_pages().iter().next().unwrap();
+            let content = Content::decode(&doc.get_page_content(pid)).unwrap();
+            let codes = content.operations.iter().rev()
+                .find(|o| o.operator == "TJ")
+                .and_then(|o| match o.operands.first() {
+                    Some(lopdf::Object::Array(a)) => Some(a.clone()),
+                    _ => None,
+                })
+                .expect("no invisible run");
+            close_document(handle);
+            (logical, codes)
+        };
+
+        let (first_line, first_codes) = recovered("brown");
+        let (second_line, second_codes) = recovered("quietly");
+
+        // ⚠️ THE CONTROL. Identical codes means the emitter did the same thing
+        // both times, so any difference below is the reading and not the
+        // writing.
+        assert_eq!(first_codes, second_codes,
+            "the emitter wrote different runs, so this measures nothing");
+
+        // ⚠️ BOTH, WHOLE, WHEREVER THEY SIT. Decoding gave four codepoints
+        // on one line and three on the other for byte-identical runs.
+        // Recording makes position irrelevant by construction.
+        assert!(first_line.starts_with(CONJUNCT), "first line: {first_line:?}");
+        assert!(second_line.starts_with(CONJUNCT), "second line: {second_line:?}");
     }
 
     /// SPIKE for hardening the searchable layer. Three things have to work

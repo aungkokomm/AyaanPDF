@@ -29,3 +29,10 @@ PdfEditorApp/Assets/Cursors/cursors.res
 # Built by the ignored scan_cost measurement, not a fixture any test asserts
 # on. 380KB of filler text, regenerated on demand by the test that wants it.
 render_core/tests/fixtures/.dense_timing.pdf
+
+# Regenerated on demand by justified_embedded_fixture(). Excluded for two
+# reasons: it is 1MB, an order of magnitude larger than every other fixture,
+# and it is large because it EMBEDS A COMPLETE COPY OF C:\Windows\Fonts\arial.ttf.
+# Checking that in would redistribute a licensed Microsoft font. The four small
+# sibling fixtures embed no font program and are checked in normally.
+render_core/tests/fixtures/sample_justified_embedded.pdf
