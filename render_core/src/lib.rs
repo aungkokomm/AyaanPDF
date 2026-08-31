@@ -28123,6 +28123,16 @@ p={spread_px:.4},c={rgba:08X})"
         tc: f64,
         tw: f64,
         th: f64,
+        /// The text LINE matrix as this operator begins, and as it leaves it.
+        ///
+        /// ⚠️ THEY DIFFER FOR `'` AND `"`, which move down a line before they
+        /// draw. Re-anchoring measures from the first and restores to the
+        /// second, so those two operators need no special case.
+        tlm_in: M,
+        tlm_out: M,
+        /// Whether the producer set a position for this run, rather than
+        /// letting it follow on from the run before.
+        repositioned: bool,
     }
 
     /// Every text-showing operator of a page, located through the full CTM.
@@ -28137,8 +28147,12 @@ p={spread_px:.4},c={rgba:08X})"
         let mut size = 0.0f64;
         let (mut tc, mut tw, mut th) = (0.0f64, 0.0f64, 1.0f64);
         let mut font_stack: Vec<(Vec<u8>, f64)> = Vec::new();
+        let mut placed = true;
 
         for (i, op) in content.operations.iter().enumerate() {
+            // Taken before the operator runs, because `'` and `"` move the line
+            // matrix themselves.
+            let tlm_in = tlm;
             let num = |k: usize| op.operands.get(k).and_then(|o| match o {
                 Object::Integer(n) => Some(*n as f64),
                 Object::Real(r) => Some(*r as f64),
@@ -28179,6 +28193,11 @@ p={spread_px:.4},c={rgba:08X})"
                 tlm = tlm.translated(0.0, -leading);
                 tm = tlm;
             }
+            if matches!(op.operator.as_str(),
+                "BT" | "Tm" | "Td" | "TD" | "T*" | "'" | "\"")
+            {
+                placed = true;
+            }
             if !matches!(op.operator.as_str(), "TJ" | "Tj" | "'" | "\"") { continue; }
 
             // ⚠️ THE CODES ONLY, POSITIONING DROPPED. That is the whole point:
@@ -28203,11 +28222,13 @@ p={spread_px:.4},c={rgba:08X})"
             }
             out.push(ShownRun {
                 at: i, y: tm.then(ctm).origin_y(), tm, font: font.clone(), size, codes,
-                tc, tw, th,
+                tc, tw, th, tlm_in, tlm_out: tlm, repositioned: placed,
             });
+            placed = false;
         }
         out
     }
+
 
     /// Why a block will not be regenerated.
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -28215,9 +28236,6 @@ p={spread_px:.4},c={rgba:08X})"
         LineNotFound,
         MixedStyleWithinLine,
         NoCodes,
-        /// The font has no width table, so where one piece of the line ends
-        /// cannot be known.
-        NoMetrics,
         /// Two pieces of one line are set at different scales or angles.
         MixedMatrixWithinLine,
     }
@@ -28289,8 +28307,17 @@ p={spread_px:.4},c={rgba:08X})"
             Some(Object::String(b, f)) => vec![Object::String(b.clone(), *f)],
             _ => Vec::new(),
         };
-        let glyphs = run.codes.len() as f64;
-        let spaces = run.codes.iter().filter(|b| **b == b' ').count() as f64;
+        // ⚠️ GLYPHS, NOT BYTES. A Type0 code is TWO bytes, so counting bytes
+        // applies character spacing twice for every glyph. And word spacing
+        // applies to the single-byte code 32, which an Identity-H font does not
+        // have at all, so counting byte 0x20 inside a CID invents spacing the
+        // renderer never applies.
+        let (glyphs, spaces) = if m.is_cid() {
+            ((run.codes.len() / 2) as f64, 0.0)
+        } else {
+            (run.codes.len() as f64,
+             run.codes.iter().filter(|b| **b == b' ').count() as f64)
+        };
         // Per the spec: ((w0 - Tj/1000) * Tfs + Tc + Tw) * Th, summed.
         Some((m.advance(&array)? + glyphs * run.tc + spaces * run.tw) * run.th)
     }
@@ -28298,7 +28325,6 @@ p={spread_px:.4},c={rgba:08X})"
     fn regenerate_block(
         content: &lopdf::content::Content,
         runs: &[ShownRun],
-        advances: &[Option<f64>],
         block: &block::Block,
         how: Fidelity,
     ) -> Result<lopdf::content::Content, NoRegen> {
@@ -28307,7 +28333,6 @@ p={spread_px:.4},c={rgba:08X})"
 
         let mut replace: std::collections::BTreeMap<usize, Vec<Operation>> =
             std::collections::BTreeMap::new();
-        let mut drop: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
         for line in &block.lines {
             let mine: Vec<&ShownRun> = runs.iter()
@@ -28319,14 +28344,6 @@ p={spread_px:.4},c={rgba:08X})"
             }
             if mine.iter().all(|r| r.codes.is_empty()) { return Err(NoRegen::NoCodes); }
 
-            let place = |m: &M| Operation::new(
-                "Tm", m.0.iter().map(|v| Object::Real(*v as f32)).collect());
-
-            // ⚠️ ONE RUN FOR THE WHOLE LINE, in every mode. That is what a
-            // re-broken line is, so the control has to survive it too or it is
-            // not controlling for anything reflow will actually do. Where the
-            // producer left a gap between pieces, the gap is put back as a `TJ`
-            // adjustment computed from the MEASURED advance.
             if mine.iter().any(|r| {
                 let (a, b) = (r.tm.0, first.tm.0);
                 (a[0] - b[0]).abs() > 1e-9 || (a[1] - b[1]).abs() > 1e-9
@@ -28334,34 +28351,69 @@ p={spread_px:.4},c={rgba:08X})"
             }) {
                 return Err(NoRegen::MixedMatrixWithinLine);
             }
-            let scale = first.tm.0[0];
-            let step = first.size * first.th * scale;
-            let mut merged: Vec<Object> = Vec::new();
-            for (k, r) in mine.iter().enumerate() {
-                if k > 0 {
-                    let prev = mine[k - 1];
-                    let Some(adv) = advances[prev.at] else { return Err(NoRegen::NoMetrics) };
-                    let landed = prev.tm.0[4] + adv * scale;
-                    let gap = r.tm.0[4] - landed;
-                    if gap.abs() > 1e-6 {
-                        if step.abs() < 1e-9 { return Err(NoRegen::NoMetrics); }
-                        merged.push(Object::Real((-gap / step * 1000.0) as f32));
-                    }
+
+            // ⚠️ ONE SHOW PER PIECE, NEVER MERGED. The producer's piece
+            // boundaries are exactly where its state changes, so folding a line
+            // into one array draws every later piece in the FIRST one's colour,
+            // character spacing and render mode. Measured: merging cost 115 of
+            // the 129 blocks that would not come back.
+            //
+            // A piece is moved RELATIVELY and the line matrix is then put back
+            // where the operator left it, so the producer's own `Td` chain
+            // still lands where it always did. An absolute `Tm` cannot: it
+            // destroys the line matrix the rest of the chain is measured from.
+            let delta = |from: &M, to: &M| -> Option<(f64, f64)> {
+                let m = from.0;
+                let det = m[0] * m[3] - m[1] * m[2];
+                if det.abs() < 1e-12 { return None; }
+                let (de, df) = (to.0[4] - m[4], to.0[5] - m[5]);
+                Some(((de * m[3] - df * m[2]) / det, (df * m[0] - de * m[1]) / det))
+            };
+            let moves = |(tx, ty): (f64, f64)| tx.abs() > 1e-9 || ty.abs() > 1e-9;
+            let td = |(tx, ty): (f64, f64)| Operation::new(
+                "Td", vec![Object::Real(tx as f32), Object::Real(ty as f32)]);
+
+            for r in &mine {
+                let show = Operation::new(
+                    "TJ", vec![Object::Array(array_of(r, content, how))]);
+                // ⚠️ ONLY WHERE THE PRODUCER PLACED THE PIECE, and only when
+                // the move is real.
+                //
+                // A piece the producer left to FOLLOW ON has no position of its
+                // own: it begins exactly where the renderer's accumulated
+                // advance leaves it, which is more exact than any width table
+                // we can read. Anchoring it substitutes our measurement for
+                // that, and the error compounds down a line, which these
+                // producers write 20 to 36 pieces long.
+                //
+                // And a zero move is not free: `Td` sets the text matrix FROM
+                // the line matrix, so emitting `Td 0 0` to mean "stays put"
+                // throws away the accumulated advance the next piece needs.
+                //
+                // `'` and `"` fall out of this: they move the line matrix down
+                // before drawing, so their delta is real and gets emitted.
+                if !r.repositioned {
+                    replace.insert(r.at, vec![show]);
+                    continue;
                 }
-                merged.extend(array_of(r, content, how));
+                let (Some(there), Some(back)) =
+                    (delta(&r.tlm_in, &r.tm), delta(&r.tm, &r.tlm_out))
+                else {
+                    return Err(NoRegen::MixedMatrixWithinLine);
+                };
+                let mut seq = Vec::with_capacity(3);
+                if moves(there) { seq.push(td(there)); }
+                seq.push(show);
+                if moves(back) { seq.push(td(back)); }
+                replace.insert(r.at, seq);
             }
-            let seq: Vec<Operation> =
-                vec![place(&first.tm), Operation::new("TJ", vec![Object::Array(merged)])];
-            replace.insert(first.at, seq);
-            for r in &mine[1..] { drop.insert(r.at); }
         }
 
-        let mut ops = Vec::with_capacity(content.operations.len() + block.lines.len());
+        let mut ops = Vec::with_capacity(content.operations.len() + block.lines.len() * 4);
         for (i, op) in content.operations.iter().enumerate() {
-            if let Some(sub) = replace.get(&i) {
-                ops.extend(sub.iter().cloned());
-            } else if !drop.contains(&i) {
-                ops.push(op.clone());
+            match replace.get(&i) {
+                Some(sub) => ops.extend(sub.iter().cloned()),
+                None => ops.push(op.clone()),
             }
         }
         Ok(Content { operations: ops })
@@ -28419,6 +28471,9 @@ p={spread_px:.4},c={rgba:08X})"
         let mut multi_seen = 0usize;
         let mut multi_ok = 0usize;
         let mut no_widths: BTreeMap<String, usize> = BTreeMap::new();
+        // Not used to rebuild anything any more: a piece is either placed by
+        // the producer or follows on. Reported because reflow WILL need it.
+        let (mut adv_known, mut adv_total) = (0usize, 0usize);
         let mut type0_seen = 0usize;
         let mut type0_ok = 0usize;
         let mut simple_seen = 0usize;
@@ -28504,6 +28559,9 @@ p={spread_px:.4},c={rgba:08X})"
                     }
                 }
 
+                adv_total += runs.len();
+                adv_known += runs.iter().filter(|r| advances[r.at].is_some()).count();
+
                 // The page box, for turning user-space y into a pixel row.
                 let media = doc.get_dictionary(pid).ok()
                     .and_then(|d| d.get(b"MediaBox").ok().cloned())
@@ -28541,7 +28599,7 @@ p={spread_px:.4},c={rgba:08X})"
                         .filter(|r| (r.y - l.baseline as f64).abs() < 0.05)
                         .any(|r| is_cid[r.at]));
                     for (mi, (_, how)) in modes.iter().enumerate() {
-                        let rebuilt = match regenerate_block(&content, &runs, &advances, b, *how) {
+                        let rebuilt = match regenerate_block(&content, &runs, b, *how) {
                             Ok(c) => c,
                             Err(e) => {
                                 if mi == 0 { *refused.entry(format!("{e:?}")).or_insert(0) += 1; }
@@ -28663,6 +28721,9 @@ p={spread_px:.4},c={rgba:08X})"
             pct(single_ok, single_seen));
         println!("  some line in pieces     : {multi_ok}/{multi_seen} identical ({:.1}%)",
             pct(multi_ok, multi_seen));
+
+        println!("\nRUNS WHOSE ADVANCE WE CAN MEASURE: {adv_known} of {adv_total} ({:.1}%)",
+            pct(adv_known, adv_total));
 
         println!("\nRUNS WHOSE FONT HAS NO WIDTH TABLE, BY SUBTYPE");
         if no_widths.is_empty() { println!("  none"); }
