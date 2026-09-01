@@ -153,6 +153,7 @@ pub(crate) enum Source {
 /// a reader sees, the second counts what an emitter must cover: whitespace the
 /// normalisation dropped is in the second and not the first, and a shaped run's
 /// two counts have nothing to do with each other at all.
+#[derive(Clone)]
 pub(crate) struct Run {
     pub object: usize,
     pub obj_at: usize,
@@ -167,6 +168,7 @@ pub(crate) struct Run {
     pub color: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct BlockLine {
     pub runs: Vec<Run>,
     pub first_object: usize,
@@ -187,6 +189,7 @@ pub(crate) struct BlockLine {
     pub end: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct Block {
     pub text: String,
     pub map: Vec<Source>,

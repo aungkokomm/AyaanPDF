@@ -260,6 +260,57 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Which generation of the documents the block model was built from.
+///
+/// ⚠️ SAFE BY DEFAULT, AND THAT IS THE ENTIRE DESIGN. This is bumped by the
+/// guard EVERY core call takes, and the handful of calls that are pure reads
+/// opt out of the bump one by one. A mutation added to this file next year
+/// therefore invalidates the model without its author having to know the model
+/// exists. The other way round, a whitelist of mutations, is one forgotten
+/// entry away from handing an editor a stale paragraph and having it write to
+/// the wrong bytes.
+static MODEL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The guard for a call that may change a document. See [`MODEL_EPOCH`].
+fn call_guard() -> std::sync::MutexGuard<'static, ()> {
+    MODEL_EPOCH.fetch_add(1, Ordering::SeqCst);
+    lock(&CALL_LOCK)
+}
+
+/// The guard for a call that only READS, and so may leave the model standing.
+///
+/// ⚠️ EVERY USE OF THIS IS A CLAIM ABOUT A FUNCTION, and the claim is that
+/// it cannot change what a page draws. Three functions make it today, and each
+/// was read end to end before it did: they assemble bytes to hand back and
+/// touch nothing. When in doubt, use [`call_guard`]: the cost of being wrong
+/// here is silent corruption, and the cost of being cautious is a rebuild.
+fn read_guard() -> std::sync::MutexGuard<'static, ()> {
+    lock(&CALL_LOCK)
+}
+
+/// The block model as last built, and what it was built from.
+struct CachedModel {
+    epoch: u64,
+    /// ⚠️ A SECOND LOCK ON THE DOOR, not the only one. The epoch is what
+    /// makes the memo correct; this catches a page whose object count changed
+    /// under a call that wrongly claimed to be a read, which is the one mistake
+    /// the design above can still make.
+    objects: usize,
+    model: (Vec<block::Block>, usize),
+}
+
+/// Assembling a page's blocks costs about 1.8 seconds on a 296-page book, and
+/// editing one line asks for it TWICE: once to find the line, once to write it.
+static MODEL_CACHE: Mutex<Option<((u64, i32), CachedModel)>> = Mutex::new(None);
+
+/// How many times the memo has answered instead of the page.
+///
+/// ⚠️ SO THE TESTS CAN ASSERT ON BEHAVIOUR RATHER THAN ON A CLOCK. "The
+/// second call was faster" passes on an idle machine and fails under load, and
+/// says nothing about whether the answer came from the right place.
+static MODEL_HITS: AtomicU64 = AtomicU64::new(0);
+
+
 /// Binds PDFium once (relative to the host executable's directory — see
 /// module docs on why cwd can't be trusted) and reuses that single instance
 /// for the process's lifetime. `None` means PDFium isn't available; callers
@@ -468,7 +519,7 @@ fn open_protected_inner(path: *const c_char, password: *const c_char) -> OpenRes
     };
 
     let document = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let Some(pdfium) = pdfium() else {
             return failed(STATUS_INVALID_INPUT);
         };
@@ -502,7 +553,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
     // the last reference) — hold CALL_LOCK across that, same as any other
     // native-touching call.
     {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let removed = lock(&core.documents).remove(&doc_handle);
         drop(removed);
     }
@@ -522,7 +573,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
 /// Returns the page count for a handle, or -1 if the handle is unknown.
 #[unsafe(no_mangle)]
 pub extern "C" fn get_page_count(doc_handle: u64) -> i32 {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     match lock(&core().documents).get(&doc_handle) {
         Some(doc) => lock(&doc).pages().len() as i32,
         None => -1,
@@ -552,7 +603,7 @@ pub extern "C" fn rotate_page(doc_handle: u64, page_index: i32, degrees: i32) ->
 fn rotate_page_inner(doc_handle: u64, page_index: i32, degrees: i32) -> i32 {
     use pdfium_render::prelude::PdfPageRenderRotation;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -595,7 +646,7 @@ pub extern "C" fn delete_page(doc_handle: u64, page_index: i32) -> i32 {
 }
 
 fn delete_page_inner(doc_handle: u64, page_index: i32) -> i32 {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -644,7 +695,7 @@ pub extern "C" fn rebuild_page_order(doc_handle: u64, indices: *const i32, count
 fn rebuild_page_order_inner(doc_handle: u64, indices: *const i32, count: usize) -> i32 {
     let order: &[i32] = unsafe { std::slice::from_raw_parts(indices, count) };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -711,7 +762,7 @@ pub extern "C" fn insert_pages_from_bytes(
 fn insert_pages_from_bytes_inner(doc_handle: u64, data: *const u8, len: usize, at_index: i32) -> i32 {
     let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return -1;
@@ -760,7 +811,7 @@ pub extern "C" fn insert_blank_page(
     panic::catch_unwind(|| {
         use pdfium_render::prelude::*;
 
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
             return STATUS_INVALID_INPUT;
@@ -805,7 +856,7 @@ fn extract_pages_to_file_inner(doc_handle: u64, indices: *const i32, count: usiz
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -1048,7 +1099,7 @@ struct SearchRun {
 fn sync_text_layer_inner(doc_handle: u64, pages: &[i32]) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -1244,7 +1295,7 @@ fn save_document_inner(doc_handle: u64, path: *const c_char) -> i32 {
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -1303,7 +1354,7 @@ fn render_region_inner(
 ) -> RenderResult {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return RenderResult::failure(STATUS_INVALID_INPUT);
@@ -1420,7 +1471,7 @@ fn render_tile_inner(doc_handle: u64, page_index: i32, level: i32, col: i32, row
     // Page aspect decides how many tile ROWS exist, since tiles are square in
     // pixel space but the page is not.
     let aspect = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
             return RenderResult::failure(STATUS_INVALID_INPUT);
@@ -1524,7 +1575,7 @@ pub extern "C" fn get_page_sizes(doc_handle: u64) -> PageSizeArray {
 }
 
 fn get_page_sizes_inner(doc_handle: u64) -> PageSizeArray {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return PageSizeArray::failure(STATUS_INVALID_INPUT);
@@ -1603,7 +1654,7 @@ pub extern "C" fn snapshot_document(doc_handle: u64) -> ByteBuffer {
 }
 
 fn snapshot_document_inner(doc_handle: u64) -> ByteBuffer {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
@@ -1918,7 +1969,7 @@ fn embed_for_shaping(
         return None;
     };
     {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&copy).cloned();
         let Some(doc) = doc else {
             close_document(copy);
@@ -1995,7 +2046,7 @@ fn replace_document_contents_inner(doc_handle: u64, data: *const u8, len: usize)
     // `open_document_from_bytes` each take `CALL_LOCK` themselves, so building
     // this out of them would either deadlock or leave a window between reading
     // the old document and replacing it.
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let core = core();
 
     let existing = lock(&core.documents).get(&doc_handle).cloned();
@@ -2082,7 +2133,7 @@ fn open_document_from_bytes_inner(data: *const u8, len: usize) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
 
     let document = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let Some(pdfium) = pdfium() else {
             return 0;
         };
@@ -2245,7 +2296,7 @@ pub extern "C" fn delete_annotation(doc_handle: u64, page_index: i32, index: i32
 }
 
 fn delete_annotation_inner(doc_handle: u64, page_index: i32, index: i32) -> i32 {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -2328,7 +2379,7 @@ fn set_annotation_bounds_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -2606,7 +2657,7 @@ fn resize_annotation_inner(
     // Rebuild. Pull the pixels out of the existing annotation before removing
     // it, since removing it takes the image with it.
     let extracted = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
             return STATUS_INVALID_INPUT;
@@ -2732,7 +2783,7 @@ fn resize_annotation_inner(
 fn extract_stamp_pixels(doc_handle: u64, page_index: i32, index: i32) -> Option<(i32, i32, Vec<u8>)> {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned()?;
     let doc_guard = lock(&doc);
     let mut page = doc_guard.pages().get(page_index as u16).ok()?;
@@ -2823,7 +2874,7 @@ fn rotate_stamp_annotation_inner(
     // pdfium-render's own accessor hands back a detached copy, which is the
     // "does nothing" noted on set_annotation_bounds.
     let upright = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let Some(doc) = lock(&core().documents).get(&doc_handle).cloned() else {
             return STATUS_INVALID_INPUT;
         };
@@ -3011,7 +3062,7 @@ fn add_stamp_annotation_inner(
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -3971,7 +4022,7 @@ pub unsafe extern "C" fn set_annotation_group_id(
     };
 
     panic::catch_unwind(|| {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
         let doc_guard = lock(&doc);
@@ -3998,7 +4049,7 @@ pub extern "C" fn get_annotation_group_id(doc_handle: u64, page_index: i32, inde
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     }
     panic::catch_unwind(|| {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else { return ByteBuffer::err(STATUS_INVALID_INPUT); };
         let doc_guard = lock(&doc);
@@ -4142,7 +4193,7 @@ pub extern "C" fn get_annotation_contents(doc_handle: u64, page_index: i32, inde
 fn get_annotation_contents_inner(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
@@ -4177,7 +4228,7 @@ pub extern "C" fn get_annotation_id(doc_handle: u64, page_index: i32, index: i32
 fn get_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
@@ -4234,7 +4285,7 @@ pub unsafe extern "C" fn set_annotation_id(
 fn set_annotation_id_inner(doc_handle: u64, page_index: i32, index: i32, id_hex: &str) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -4290,7 +4341,7 @@ pub unsafe extern "C" fn set_annotation_body(
 fn set_annotation_body_inner(doc_handle: u64, page_index: i32, index: i32, body: &str) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -4498,7 +4549,7 @@ fn add_text_box_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -5504,7 +5555,7 @@ fn add_shape_annotations_inner_with_image(
 
     let specs: &[ShapeSpec] = unsafe { std::slice::from_raw_parts(specs, spec_count) };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -6212,7 +6263,7 @@ pub extern "C" fn shape_has_shadow_image(doc_handle: u64, page_index: i32, index
     }
 
     panic::catch_unwind(|| {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let Some(doc) = lock(&core().documents).get(&doc_handle).cloned() else {
             return -STATUS_INVALID_INPUT;
         };
@@ -6347,7 +6398,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     let (kind, cur_r, cur_g, cur_b, cur_a, cur_width_pts, fx, fy, cur_rot, cur_fill, cur_radius_pts,
          cur_box_w_pts, cur_box_h_pts, cur_effects,
          page_left, page_top, page_w, bounds) = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
         let doc_guard = lock(&doc);
@@ -6470,7 +6521,7 @@ fn restyle_shape_annotation_inner_with_rotation(
     if status != STATUS_OK_PDFIUM { return status; }
 
     if !out_new_index.is_null() {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         if let Some(doc) = doc {
             let doc_guard = lock(&doc);
@@ -6632,7 +6683,7 @@ fn resize_shape_annotation_inner(
     use pdfium_render::prelude::*;
 
     let tag = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
             return STATUS_INVALID_INPUT;
@@ -6666,7 +6717,7 @@ fn resize_shape_annotation_inner(
     // is being undone and why a turned shape needs its recorded size.
     let (left, top, right, bottom) = if bounds_are_padded {
         let page_w = {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&doc_handle).cloned();
             let Some(doc) = doc else { return STATUS_INVALID_INPUT; };
             let doc_guard = lock(&doc);
@@ -6698,7 +6749,7 @@ fn resize_shape_annotation_inner(
     // Width was stored in PDF points and the spec wants capture-space pixels,
     // so it goes back through the same scale the writer applied.
     let (width_px, radius_px, effects_px) = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
             return STATUS_INVALID_INPUT;
@@ -6754,7 +6805,7 @@ fn resize_shape_annotation_inner(
 
     // The rebuild is appended, so it is the last annotation on the page.
     if !out_new_index.is_null() {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         if let Some(doc) = doc {
             let doc_guard = lock(&doc);
@@ -6939,7 +6990,7 @@ fn relayout_text_box_inner_v2(
     // width in points here, since we may need it to convert the tag's own
     // normalized rect into capture space for the caller-omitted bounds case.
     let (mut parsed, page_w_pts) = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let Some(doc) = doc else {
             return STATUS_INVALID_INPUT;
@@ -7013,7 +7064,7 @@ fn relayout_text_box_inner_v2(
     }
 
     if !out_new_index.is_null() {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         if let Some(doc) = doc {
             let doc_guard = lock(&doc);
@@ -7033,7 +7084,7 @@ fn relayout_text_box_inner_v2(
 /// boxes return None and the caller falls back to whatever else it has.
 fn tag_box_rect(index: usize, doc_handle: u64, page_index: i32) -> Option<(f32, f32, f32, f32)> {
     use pdfium_render::prelude::*;
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned()?;
     let doc_guard = lock(&doc);
     let page = doc_guard.pages().get(page_index as u16).ok()?;
@@ -7100,7 +7151,7 @@ fn add_ink_annotations_inner(
         unsafe { std::slice::from_raw_parts(points, point_count) }
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -7258,7 +7309,7 @@ fn add_highlight_annotations_inner(
         unsafe { std::slice::from_raw_parts(quads, quad_count) }
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -7429,7 +7480,7 @@ fn add_note_annotations_inner(
 
     let notes: &[BurnNote] = unsafe { std::slice::from_raw_parts(notes, note_count) };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -7559,7 +7610,7 @@ fn burn_annotations_inner(
         return STATUS_OK_PDFIUM;
     }
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -7697,7 +7748,7 @@ pub extern "C" fn get_form_field_count(doc_handle: u64) -> i32 {
 }
 
 fn get_form_field_count_inner(doc_handle: u64) -> i32 {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return -1;
@@ -7738,7 +7789,7 @@ fn fill_text_field_inner(doc_handle: u64, field_name: *const c_char, value: *con
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -7902,7 +7953,7 @@ fn choice_options(
 fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
@@ -8100,7 +8151,7 @@ pub extern "C" fn get_bookmarks(doc_handle: u64) -> ByteBuffer {
 fn get_bookmarks_inner(doc_handle: u64) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
@@ -8234,7 +8285,7 @@ fn set_form_field_state_inner(
     index: i32,
     on: bool,
 ) -> i32 {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -8322,7 +8373,7 @@ fn delete_form_field_widget_inner(doc_handle: u64, field_name: *const c_char) ->
         return STATUS_INVALID_INPUT;
     };
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -8465,7 +8516,7 @@ pub extern "C" fn get_annotations(doc_handle: u64, page_index: i32) -> Annotatio
 fn get_annotations_inner(doc_handle: u64, page_index: i32) -> AnnotationArray {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return AnnotationArray::failure(STATUS_INVALID_INPUT);
@@ -8690,7 +8741,7 @@ pub extern "C" fn get_page_links(doc_handle: u64, page_index: i32) -> ByteBuffer
 }
 
 fn get_page_links_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -8804,7 +8855,7 @@ fn add_uri_link_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -8902,7 +8953,7 @@ pub extern "C" fn set_uri_link(
 fn set_uri_link_inner(doc_handle: u64, page_index: i32, index: i32, uri: &str) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
         return STATUS_INVALID_INPUT;
@@ -9023,7 +9074,7 @@ pub extern "C" fn get_page_text_objects(doc_handle: u64, page_index: i32) -> Byt
 fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = read_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -9492,7 +9543,7 @@ pub extern "C" fn get_page_word_clusters(doc_handle: u64, page_index: i32) -> By
 }
 
 fn get_page_word_clusters_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -9655,7 +9706,7 @@ fn set_word_cluster_text_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -10550,7 +10601,7 @@ pub extern "C" fn get_page_lines(doc_handle: u64, page_index: i32) -> ByteBuffer
 }
 
 fn get_page_lines_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = read_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -10690,7 +10741,7 @@ fn set_line_text_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -11186,7 +11237,7 @@ fn set_object_range_text_inner(
 ) -> i32 {
     use pdfium_render::prelude::*;
 
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -11294,7 +11345,7 @@ pub extern "C" fn get_page_chars(doc_handle: u64, page_index: i32, target_width:
 }
 
 fn get_page_chars_inner(doc_handle: u64, page_index: i32, target_width: i32) -> CharInfoArray {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -11385,7 +11436,7 @@ pub extern "C" fn get_page_text_runs(doc_handle: u64, page_index: i32) -> ByteBu
 }
 
 fn get_page_text_runs_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = call_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -11567,7 +11618,7 @@ fn render_low_res_inner(doc_handle: u64, page_index: i32, target_width: i32) -> 
         // Arc clone below — dropping the last reference to a PdfDocument
         // runs PDFium's native close, which needs the same serialization as
         // any other native call.
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let result = doc.as_ref().and_then(|d| {
             let guard = lock(&d);
@@ -11611,7 +11662,7 @@ pub extern "C" fn render_uncached(doc_handle: u64, page_index: i32, target_width
 
 fn render_uncached_inner(doc_handle: u64, page_index: i32, target_width: i32) -> RenderResult {
     let rendered = {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&doc_handle).cloned();
         let result = doc.as_ref().and_then(|d| {
             let guard = lock(&d);
@@ -11667,7 +11718,7 @@ pub extern "C" fn request_high_res(doc_handle: u64, page_index: i32, target_widt
             // both the render call and the drop of doc_arc at the end of
             // this scope, since dropping the last Arc<PdfDocument> reference
             // runs PDFium's native close.
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let result = doc_arc.as_ref().and_then(|doc| {
                 let guard = lock(&doc);
                 render_page_via_pdfium(&guard, page_index, target_width)
@@ -12051,7 +12102,7 @@ fn page_block_inputs(
 /// replacement drops every one of them.
 fn page_blocks(doc_handle: u64, page_index: i32)
     -> Result<(Vec<block::Block>, usize), i32> {
-    let _guard = lock(&CALL_LOCK);
+    let _guard = read_guard();
 
     let doc = lock(&core().documents).get(&doc_handle).cloned();
     let Some(doc) = doc else {
@@ -12066,9 +12117,35 @@ fn page_blocks(doc_handle: u64, page_index: i32)
         return Err(STATUS_INVALID_INPUT);
     }
 
-    let (lines, objects, unpaired, logical_runs) =
+    // ⚠️ THE SAME PAGE, ASKED FOR TWICE, IS THE CASE THIS EXISTS FOR:
+    // editing one line asks once to find the line and once to write it, and on
+    // a real book that was 1.8 seconds each. The memo holds ONE page, because
+    // that is the shape of the question; a second page displaces it rather than
+    // growing without bound.
+    let epoch = MODEL_EPOCH.load(Ordering::SeqCst);
+    let objects = {
+        use pdfium_render::prelude::PdfPageObjectsCommon;
+        page.objects().len() as usize
+    };
+    if let Some((key, held)) = lock(&MODEL_CACHE).as_ref() {
+        if *key == (doc_handle, page_index)
+            && held.epoch == epoch
+            && held.objects == objects
+        {
+            MODEL_HITS.fetch_add(1, Ordering::SeqCst);
+            return Ok(held.model.clone());
+        }
+    }
+
+    let (lines, obs, unpaired, logical_runs) =
         page_block_inputs(&doc_guard, &page, page_w);
-    Ok((block::assemble(lines, &objects, unpaired), logical_runs))
+    let model = (block::assemble(lines, &obs, unpaired), logical_runs);
+
+    *lock(&MODEL_CACHE) = Some((
+        (doc_handle, page_index),
+        CachedModel { epoch, objects, model: model.clone() },
+    ));
+    Ok(model)
 }
 
 /// Replaces `len` LOGICAL characters from `at` in one block, and commits.
@@ -12470,7 +12547,7 @@ mod tests {
 
         for name in ["sample.pdf", "sample_styled.pdf", "sample_20pages.pdf"] {
             let handle = open_fixture_named(&format!("tests/fixtures/{name}"));
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -12526,7 +12603,7 @@ mod tests {
         // ASCII the original almost certainly has, then a character it almost
         // certainly does not: the question a subset font decides.
         for replacement in ["EDITED", "Edited \u{e9}\u{2014}", "\u{1000}\u{1031}"] {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let mut page = doc_guard.pages().get(0).unwrap();
@@ -12576,7 +12653,7 @@ mod tests {
 
         for replacement in ["Hi", "EDITED", "a much longer replacement than the original", "caf\u{e9}"] {
             let handle = open_fixture_named("tests/fixtures/sample.pdf");
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let mut page = doc_guard.pages().get(0).unwrap();
@@ -12635,7 +12712,7 @@ mod tests {
 
         let handle = open_fixture_named("tests/fixtures/blank.pdf");
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let mut doc_guard = lock(&doc);
 
@@ -12684,7 +12761,7 @@ mod tests {
         // And the question that decides Stage 2's guard: what can an embedded
         // font's object be changed to?
         for replacement in ["EDITED", "caf\u{e9}", "\u{1000}\u{1031}"] {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let mut page = doc_guard.pages().get(0).unwrap();
@@ -14542,7 +14619,7 @@ mod tests {
     /// How many objects a page holds, for the never-removed rule.
     fn count_page_objects(handle: u64, page_index: i32) -> usize {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(page_index as u16).unwrap();
@@ -15107,7 +15184,7 @@ mod tests {
     /// How many objects the page holds, for the index-stability check.
     fn object_count(handle: u64) -> usize {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let page = g.pages().get(0).unwrap();
@@ -15670,7 +15747,7 @@ mod tests {
         // which is not re-entrant, and the test harness runs these in parallel
         // with the writes: without this the process dies with a stack overrun
         // rather than failing an assertion.
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
 
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
@@ -16527,7 +16604,7 @@ mod tests {
         use pdfium_render::prelude::*;
 
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(0).unwrap();
@@ -16612,7 +16689,7 @@ mod tests {
     /// rather than by the call merely returning OK.
     fn page_object_count(handle: u64, page_index: i32) -> usize {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let page = g.pages().get(page_index as u16).unwrap();
@@ -16714,7 +16791,7 @@ mod tests {
             STATUS_OK_PDFIUM
         );
 
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let page = g.pages().get(0).unwrap();
@@ -17422,7 +17499,7 @@ p={spread_px:.4},c={rgba:08X})"
         let before = marked_pixels(handle, 0);
 
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let mut page = doc_guard.pages().get(0).unwrap();
@@ -17444,7 +17521,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         // Also prove the kind survives in a field we can read back.
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -18381,7 +18458,7 @@ p={spread_px:.4},c={rgba:08X})"
     /// the app can still recognise its own marks. For the reader's view (which
     /// must be empty) use raw_contents.
     fn contents_of(handle: u64, page_index: i32, index: usize) -> Option<String> {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned()?;
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(page_index as u16).ok()?;
@@ -18878,7 +18955,7 @@ p={spread_px:.4},c={rgba:08X})"
     /// Every hidden run on a page, as (owning object id, its words).
     fn hidden_runs(handle: u64, page_index: i32) -> Vec<(String, String)> {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(page_index as u16).unwrap();
@@ -18898,7 +18975,7 @@ p={spread_px:.4},c={rgba:08X})"
 
     /// The ids of the Ayaan text boxes on a page, from their own tags.
     fn box_ids(handle: u64, page_index: i32) -> Vec<String> {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(page_index as u16).unwrap();
@@ -19138,7 +19215,7 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     fn page_size(handle: u64) -> (f32, f32) {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(0).unwrap();
@@ -19260,7 +19337,7 @@ p={spread_px:.4},c={rgba:08X})"
         index: usize,
     ) -> Option<(usize, pdfium_render::prelude::PdfRect)> {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned()?;
         let doc_guard = lock(&doc);
         let page = doc_guard.pages().get(0).ok()?;
@@ -19817,7 +19894,7 @@ p={spread_px:.4},c={rgba:08X})"
     /// What KIND of marks an annotation is made of.
     fn object_kinds(handle: u64, index: usize) -> Vec<&'static str> {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let Some(doc) = lock(&core().documents).get(&handle).cloned() else { return vec![] };
         let doc_guard = lock(&doc);
         let Ok(page) = doc_guard.pages().get(0) else { return vec![] };
@@ -20076,7 +20153,7 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     fn page_count_of_annotations(handle: u64) -> usize {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let Some(doc) = lock(&core().documents).get(&handle).cloned() else { return 0 };
         let doc_guard = lock(&doc);
         let Ok(page) = doc_guard.pages().get(0) else { return 0 };
@@ -21825,7 +21902,7 @@ p={spread_px:.4},c={rgba:08X})"
             STATUS_OK_PDFIUM
         );
 
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let mut page = g.pages().get(0).unwrap();
@@ -22508,7 +22585,7 @@ p={spread_px:.4},c={rgba:08X})"
 
     /// Number of annotations on a page.
     fn page_annotation_count(handle: u64, page_index: i32) -> usize {
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let page = g.pages().get(page_index as u16).unwrap();
@@ -22544,7 +22621,7 @@ p={spread_px:.4},c={rgba:08X})"
         assert_eq!(page_annotation_count(reopened, 0), before + 1, "note did not survive the save");
 
         let found = {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&reopened).cloned().unwrap();
             let g = lock(&doc);
             let page = g.pages().get(0).unwrap();
@@ -22578,7 +22655,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         // Placed at the TOP of the capture, so it must sit near the top of the
         // page in PDF coords, i.e. a HIGH y.
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let page = g.pages().get(1).unwrap();
@@ -22932,7 +23009,7 @@ p={spread_px:.4},c={rgba:08X})"
         // every status code stayed OK.
         use pdfium_render::prelude::*;
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned().unwrap();
         let g = lock(&doc);
         let mut page = g.pages().get(0).unwrap();
@@ -23484,7 +23561,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         // Now add the SAME words as an invisible run straight into the page.
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&h).cloned().unwrap();
             let mut doc_guard = lock(&doc);
             let token = doc_guard
@@ -24890,7 +24967,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         let handle = open_fixture_named(&justified_fixture());
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let mut doc_guard = lock(&doc);
             assert!(provision::embed(&mut doc_guard, &p).is_ok(),
@@ -24954,7 +25031,7 @@ p={spread_px:.4},c={rgba:08X})"
         println!("BEFORE: {} objects, {} Type0 fonts", ids_before.len(), type0_before.len());
 
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let mut doc_guard = lock(&doc);
             provision::embed(&mut doc_guard, &p).expect("PDFium refused the font");
@@ -25208,7 +25285,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         let p = provision::provision(Some(font_path), "x", 12.0).expect("provisioning refused");
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&copy).cloned().unwrap();
             let mut doc_guard = lock(&doc);
             provision::embed(&mut doc_guard, &p).expect("PDFium refused the font");
@@ -25646,7 +25723,7 @@ p={spread_px:.4},c={rgba:08X})"
         {
             use pdfium_render::prelude::*;
             let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -25966,7 +26043,7 @@ p={spread_px:.4},c={rgba:08X})"
         // The middle of the three text objects the splice produced.
         let (vis_left, vis_right, vis_bottom) = {
             let h = open_document_from_bytes(edited.as_ptr(), edited.len());
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&h).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -26065,7 +26142,7 @@ p={spread_px:.4},c={rgba:08X})"
 
             // 1. the mark
             {
-                let _guard = lock(&CALL_LOCK);
+                let _guard = call_guard();
                 let doc = lock(&core().documents).get(&h).cloned().unwrap();
                 let doc_guard = lock(&doc);
                 let page = doc_guard.pages().get(0).unwrap();
@@ -26191,7 +26268,7 @@ p={spread_px:.4},c={rgba:08X})"
         let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
         assert_ne!(handle, 0);
         let out = {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -26220,7 +26297,7 @@ p={spread_px:.4},c={rgba:08X})"
         let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
         assert_ne!(handle, 0);
         let ids = {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -26272,7 +26349,7 @@ p={spread_px:.4},c={rgba:08X})"
             // Where the visible replacement is: the middle of the three objects.
             let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
             let (vis_left, vis_right) = {
-                let _guard = lock(&CALL_LOCK);
+                let _guard = call_guard();
                 let doc = lock(&core().documents).get(&handle).cloned().unwrap();
                 let doc_guard = lock(&doc);
                 let page = doc_guard.pages().get(0).unwrap();
@@ -26507,7 +26584,7 @@ p={spread_px:.4},c={rgba:08X})"
         // The visible glyphs, and where a highlight would go.
         let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
         let (vis_left, vis_right) = {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -27148,7 +27225,7 @@ p={spread_px:.4},c={rgba:08X})"
         // The visible replacement is the middle of the three text objects.
         let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
         let (vis_left, vis_right) = {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let doc_guard = lock(&doc);
             let page = doc_guard.pages().get(0).unwrap();
@@ -28571,6 +28648,119 @@ p={spread_px:.4},c={rgba:08X})"
     // The line the app hands over is named by the object range
     // `get_page_lines` publishes, so these read it the same way the app does
     // and then ask the same question the app asks.
+
+    // ========== THE BLOCK MODEL MEMO ==========
+    //
+    // Measured on a 296-page book: assembling one page's blocks is about 1.8
+    // seconds, and editing one line asked for it twice. The memo removes the
+    // second. What these tests are really about is the first: that it can
+    // never answer for a page that has since changed.
+
+    fn hits() -> u64 { MODEL_HITS.load(Ordering::SeqCst) }
+
+    /// The same page, asked for twice with nothing in between.
+    #[test]
+    fn the_model_is_remembered_between_two_asks() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+
+        let before = hits();
+        let (first, _) = page_blocks(handle, 0).expect("blocks");
+        assert_eq!(hits(), before, "the first ask should have built the model");
+
+        let (again, _) = page_blocks(handle, 0).expect("blocks");
+        assert_eq!(hits(), before + 1, "the second ask should have used the memo");
+
+        // And the memo answers the same thing the page would have.
+        assert_eq!(first.len(), again.len());
+        for (a, b) in first.iter().zip(again.iter()) {
+            assert_eq!(a.text, b.text);
+        }
+        close_document(handle);
+    }
+
+    /// ⚠️ THE ONE THAT MATTERS. A memo that outlives the page it describes
+    /// hands an editor a paragraph that is no longer there, and the edit lands
+    /// on the wrong bytes. Every kind of write is checked, not just the one
+    /// this memo was added for.
+    #[test]
+    fn a_write_of_any_kind_throws_the_model_away() {
+        // 1. The block route, which commits by swapping the document's bytes.
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let says = block_line_text(handle, 0, 0, 21);
+        assert_eq!(says.trim(), "Kerning arial ordinary");
+
+        // Asked for BEFORE the write, so there is a model to go stale.
+        let _ = page_blocks(handle, 0).expect("blocks");
+        assert_eq!(retype_via_block(handle, 0, 0, 21, &says, "Kerning arial ordinar"),
+            STATUS_OK_PDFIUM);
+
+        // The object range is deliberately not used to find it again: retyping
+        // a line can drop the object that drew the letter removed, so the range
+        // the caller held is not a handle on anything afterwards.
+        let (now, _) = page_blocks(handle, 0).expect("blocks");
+        assert!(now.iter().any(|b| b.text.contains("Kerning arial ordinar")),
+            "the page does not say what was written");
+        assert!(!now.iter().any(|b| b.text.contains("Kerning arial ordinary")),
+            "the model answered for a page that had already changed");
+        close_document(handle);
+
+        // 2. The object writer, which mutates page objects and regenerates.
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        let (blocks, _) = page_blocks(handle, 0).expect("blocks");
+        let Some(line) = blocks.iter().flat_map(|b| b.lines.iter())
+            .find(|l| l.refusal == 0 && l.drawn.trim().len() > 6) else {
+            close_document(handle);
+            return;
+        };
+        let (first, last) = (line.first_object, line.last_object);
+        let drawn = line.drawn.trim().to_string();
+        let shorter = drawn[..drawn.len() - 1].to_string();
+        let t = shorter.as_bytes();
+        let status = set_line_text(handle, 0, first as u32, last as u32, 0,
+            t.as_ptr(), t.len(), std::ptr::null(), 0);
+
+        if status == STATUS_OK_PDFIUM {
+            let (now, _) = page_blocks(handle, 0).expect("blocks");
+            let reads = now.iter().any(|b| b.text.contains(&shorter));
+            assert!(reads, "the model still says {drawn:?} after it was retyped");
+        }
+        close_document(handle);
+    }
+
+    /// One page at a time, deliberately: the memo holds the page being edited
+    /// rather than growing with every page a reader scrolls past.
+    #[test]
+    fn a_second_page_displaces_the_first() {
+        let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let _ = page_blocks(handle, 0);
+        let before = hits();
+        let _ = page_blocks(handle, 0);
+        assert_eq!(hits(), before + 1, "page 0 should have been remembered");
+
+        let _ = page_blocks(handle, 1);
+        let between = hits();
+        let _ = page_blocks(handle, 0);
+        assert_eq!(hits(), between, "page 0 should have been displaced by page 1");
+        close_document(handle);
+    }
+
+    /// Closing a document must not leave its model behind for the next one:
+    /// a handle can be reused, and the memo is keyed by handle.
+    #[test]
+    fn a_closed_document_leaves_no_model_behind() {
+        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let _ = page_blocks(handle, 0);
+        let _ = page_blocks(handle, 0);
+        let before = hits();
+        close_document(handle);
+
+        let again = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let _ = page_blocks(again, 0);
+        assert_eq!(hits(), before,
+            "a reopened document was answered from the closed one's model");
+        close_document(again);
+    }
 
     /// What the block model says the line drawn by `first..=last` says.
     fn block_line_text(handle: u64, page: i32, first: usize, last: usize) -> String {
@@ -30156,7 +30346,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         // --- 1. add two marked invisible runs -------------------------------
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&h).cloned().unwrap();
             let mut doc_guard = lock(&doc);
             let token = doc_guard.fonts_mut().helvetica();
@@ -30194,7 +30384,7 @@ p={spread_px:.4},c={rgba:08X})"
 
         // --- 3. read the marks back, and REMOVE only object A ---------------
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&reopened).cloned().unwrap();
             let doc_guard = lock(&doc);
             let mut page = doc_guard.pages().get(0).unwrap();
@@ -30871,7 +31061,7 @@ p={spread_px:.4},c={rgba:08X})"
     /// private-key view.
     fn raw_contents(handle: u64, page_index: i32, index: usize) -> Option<String> {
         use pdfium_render::prelude::*;
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let doc = lock(&core().documents).get(&handle).cloned()?;
         let g = lock(&doc);
         let page = g.pages().get(page_index as u16).ok()?;
@@ -30982,7 +31172,7 @@ p={spread_px:.4},c={rgba:08X})"
         // the comment field, exactly as an old build would have left it.
         let legacy = format!("{SHAPE_TAG}0:FF0000FF:2.0000:1:1");
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let g = lock(&doc);
             let mut page = g.pages().get(0).unwrap();
@@ -31700,7 +31890,7 @@ p={spread_px:.4},c={rgba:08X})"
         // Inset the crop box well inside the media box, asymmetrically so a
         // sign error cannot cancel out.
         {
-            let _guard = lock(&CALL_LOCK);
+            let _guard = call_guard();
             let doc = lock(&core().documents).get(&handle).cloned().unwrap();
             let g = lock(&doc);
             let mut page = g.pages().get(0).unwrap();
@@ -33064,7 +33254,7 @@ p={spread_px:.4},c={rgba:08X})"
     fn render_file(path: &std::path::Path, width: i32) -> (i32, Vec<u8>) {
         use pdfium_render::prelude::*;
 
-        let _guard = lock(&CALL_LOCK);
+        let _guard = call_guard();
         let pdfium = pdfium().expect("pdfium is not available");
         let doc = pdfium
             .load_pdf_from_file(path.to_str().unwrap(), None)
