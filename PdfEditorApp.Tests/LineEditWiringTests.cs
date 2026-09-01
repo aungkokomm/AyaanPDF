@@ -32,6 +32,26 @@ public class LineEditWiringTests
 
     private static string Page() => Source("PdfEditorApp", "MainPage.xaml.cs");
 
+    /// <summary>
+    /// The whole edit path: the command, the background write, and what follows
+    /// it back on the UI thread.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// ⚠️ THE INVARIANTS BELOW ARE ABOUT THE PATH, NOT ABOUT ONE METHOD. The
+    /// native write moved onto a background task and its aftermath moved with
+    /// it, so a test reading only the command would now be reading the half
+    /// that does the least, and would keep passing while the half that matters
+    /// rotted.
+    /// </remarks>
+    private static string EditPath()
+    {
+        string vm = ViewModel();
+        return Body(vm, "public bool EditSelectedLine(")
+            + Body(vm, "private async void WriteLineAsync(")
+            + Body(vm, "private void FinishLineWrite(");
+    }
+
     /// <summary>One method's body, comment lines dropped so that commenting a
     /// call out counts as removing it.</summary>
     private static string Body(string code, string signature)
@@ -65,7 +85,7 @@ public class LineEditWiringTests
         // A line edit empties every text object in its range and shifts what
         // follows. The reader pressed one key, so Ctrl+Z has to put it all back
         // in one step.
-        string body = Body(ViewModel(), "public bool EditSelectedLine(");
+        string body = EditPath();
 
         Assert.Contains("BeginEdit(", body, StringComparison.Ordinal);
         Assert.Contains("RecordEdit(new LineTextRecord(", body, StringComparison.Ordinal);
@@ -78,7 +98,7 @@ public class LineEditWiringTests
         // The core puts the page back as it found it when it refuses, so there
         // is nothing to undo. Committing anyway would leave a Ctrl+Z that does
         // nothing, which reads as the app having lost the edit.
-        string body = Body(ViewModel(), "public bool EditSelectedLine(");
+        string body = EditPath();
 
         int refused = body.IndexOf("status != RenderStatus.OkPdfium", StringComparison.Ordinal);
         int abandon = body.IndexOf("AbandonEdit()", StringComparison.Ordinal);
@@ -95,7 +115,7 @@ public class LineEditWiringTests
         // Being told before typing is the difference between a limitation and a
         // bug, and both ends check: the editor will not open on a refused line,
         // and the edit will not send one even if it somehow did.
-        string body = Body(ViewModel(), "public bool EditSelectedLine(");
+        string body = EditPath();
         Assert.Contains("!line.CanEdit", body, StringComparison.Ordinal);
 
         string open = Body(Page(), "private bool OpenUnitEditor(int caretAt)");
@@ -109,7 +129,7 @@ public class LineEditWiringTests
         // ⚠️ It is the one refusal with a remedy: the same edit with fewer words
         // goes through. Reporting it as "unsupported" would be telling the user
         // the feature is broken.
-        string body = Body(ViewModel(), "public bool EditSelectedLine(");
+        string body = EditPath();
 
         Assert.Contains("RenderStatus.TooWide", body, StringComparison.Ordinal);
         Assert.Contains("too long to fit", body, StringComparison.Ordinal);
@@ -152,8 +172,10 @@ public class LineEditWiringTests
         // says, because that is the anchor the core checks before splicing. A
         // call site that drops the argument silently loses every multi-piece
         // line again, and nothing else would notice.
-        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
-        Assert.Contains("line.FontName, newText, line.Text);", edit, StringComparison.Ordinal);
+        string edit = EditPath();
+        // The trailing paren differs between the two: the edit call sits inside a
+        // Task.Run lambda now. What matters is the argument, not the wrapping.
+        Assert.Contains("line.FontName, newText, line.Text)", edit, StringComparison.Ordinal);
 
         string undo = Body(ViewModel(), "private void ApplyLineText(LineTextRecord record, bool backwards)");
         Assert.Contains("line.FontName, wanted, line.Text);", undo, StringComparison.Ordinal);
@@ -165,7 +187,7 @@ public class LineEditWiringTests
         // ⚠️ THE SAME DISPATCH, WRITTEN THE SAME WAY, in both places. Undo
         // reaching a writer the edit did not is how a line comes back subtly
         // different from the one that was there.
-        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
+        string edit = EditPath();
         string undo = Body(ViewModel(), "private void ApplyLineText(LineTextRecord record, bool backwards)");
 
         foreach (string body in new[] { edit, undo })
@@ -182,7 +204,7 @@ public class LineEditWiringTests
         // Its own rule set is what refused the line, so offering it one anyway
         // asks it to do the thing it declined. The ternary is the guarantee:
         // the block branch is the one that runs, and it does not fall through.
-        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
+        string edit = EditPath();
 
         int test = edit.IndexOf("line.Route == LineWriter.BlockWriter", StringComparison.Ordinal);
         int block = edit.IndexOf("Interop.LineGateway.WriteAsBlock(", StringComparison.Ordinal);
@@ -239,6 +261,132 @@ public class LineEditWiringTests
 
         Assert.DoesNotContain("SystemFontMatch", body, StringComparison.Ordinal);
         Assert.DoesNotContain("fontName", body, StringComparison.Ordinal);
+    }
+
+    // ---------------- the write runs off the UI thread ----------------
+    //
+    // ⚠️ STRUCTURAL, NOT TIMED. "Finishes within N ms" would pass on a small
+    // document and fail on a loaded machine, and would say nothing about which
+    // thread ran what. What matters is the shape: the native call is inside a
+    // Task.Run, the command that starts it does not call the gateway at all,
+    // and the guard is set before and cleared after whatever happens.
+
+    [Fact]
+    public void the_native_write_happens_inside_a_background_task()
+    {
+        // Measured at 931 ms on a 296-page book. On the UI thread that is a
+        // frozen window, and the app looked hung on exactly the documents where
+        // editing matters most.
+        string body = Body(ViewModel(), "private async void WriteLineAsync(");
+
+        int run = body.IndexOf("await Task.Run(", StringComparison.Ordinal);
+        int block = body.IndexOf("Interop.LineGateway.WriteAsBlock(", StringComparison.Ordinal);
+        int obj = body.IndexOf("Interop.LineGateway.Write(", StringComparison.Ordinal);
+
+        Assert.True(run > 0, "the write is not handed to a background task");
+        Assert.True(block > run, "the block writer is called outside the task");
+        Assert.True(obj > run, "the object writer is called outside the task");
+    }
+
+    [Fact]
+    public void the_command_itself_no_longer_touches_the_gateway()
+    {
+        // Everything synchronous that remains is the undo batch and the guard.
+        string edit = Body(ViewModel(), "public bool EditSelectedLine(string newText)");
+
+        Assert.DoesNotContain("Interop.LineGateway.", edit, StringComparison.Ordinal);
+        Assert.Contains("BeginEdit(\"Edit line\");", edit, StringComparison.Ordinal);
+        Assert.Contains("RecordEdit(new LineTextRecord(", edit, StringComparison.Ordinal);
+        Assert.Contains("_lineWriteInFlight = true;", edit, StringComparison.Ordinal);
+        Assert.Contains("WriteLineAsync(line, page, newText);", edit, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_guard_is_cleared_whatever_the_write_does()
+    {
+        // ⚠️ IN THE FINALLY, NOT AFTER THE AWAIT. A throw that escaped would
+        // leave the guard set for the rest of the session and every later edit
+        // would refuse in silence.
+        string body = Body(ViewModel(), "private async void WriteLineAsync(");
+
+        int fin = body.IndexOf("finally", StringComparison.Ordinal);
+        int clear = body.IndexOf("_lineWriteInFlight = false;", StringComparison.Ordinal);
+
+        Assert.True(fin > 0, "there is no finally around the write");
+        Assert.True(clear > fin, "the guard is cleared outside the finally");
+        Assert.Contains("catch (Exception ex)", body, StringComparison.Ordinal);
+        Assert.Equal(1, Count(ViewModel(), "_lineWriteInFlight = false;"));
+    }
+
+    /// <summary>
+    /// The guard comes before the first thing each command would otherwise do.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// ⚠️ ANCHORED, NOT WINDOWED. "Within the first N characters" would pass
+    /// or fail on how many comments sit above the check. What has to be true is
+    /// an ordering: the guard is read before the batch is opened, and before
+    /// the history is asked for anything.
+    ///
+    /// Undo finds its line BY TEXT, because retyping renumbers the objects and
+    /// the recorded range goes stale. Asking a half-written document what it
+    /// says would find the wrong line, or none at all.
+    /// </remarks>
+    [Theory]
+    [InlineData("public bool EditSelectedLine(string newText)", "BeginEdit(")]
+    [InlineData("public void Undo()", "_history.Undo(")]
+    [InlineData("public void Redo()", "_history.Redo(")]
+    public void nothing_may_start_while_a_write_is_in_flight(string signature, string firstWork)
+    {
+        string code = ViewModel();
+        int at = code.IndexOf(signature, StringComparison.Ordinal);
+        Assert.True(at > 0, $"there is no {signature}");
+
+        int guard = code.IndexOf("if (_lineWriteInFlight)", at, StringComparison.Ordinal);
+        int work = code.IndexOf(firstWork, at, StringComparison.Ordinal);
+
+        Assert.True(guard > 0, $"{signature} never checks the guard");
+        Assert.True(work > 0, $"{signature} no longer contains {firstWork}");
+        Assert.True(guard < work, $"{signature} starts work before checking the guard");
+    }
+
+    [Fact]
+    public void what_followed_the_write_still_follows_it_in_the_same_order()
+    {
+        string body = Body(ViewModel(), "private void FinishLineWrite(");
+
+        // The refusal path is unchanged: nothing to undo, and the same words.
+        Assert.Contains("AbandonEdit();", body, StringComparison.Ordinal);
+        Assert.Contains("RenderStatus.TooWide =>", body, StringComparison.Ordinal);
+        Assert.Contains("RenderStatus.Unsupported when line.Route == LineWriter.BlockWriter =>",
+            body, StringComparison.Ordinal);
+
+        int commit = body.IndexOf("CommitEdit();", StringComparison.Ordinal);
+        int invalidate = body.IndexOf("InvalidateLoadedPage(page);", StringComparison.Ordinal);
+        int clear = body.IndexOf("ClearLineSelection();", StringComparison.Ordinal);
+        int outline = body.IndexOf("RefreshSelectionOutline();", StringComparison.Ordinal);
+        int render = body.IndexOf("RenderCurrentPage();", StringComparison.Ordinal);
+
+        Assert.True(commit > 0, "the batch is never committed");
+        Assert.True(invalidate > commit, "the cache is dropped before the batch commits");
+        Assert.True(clear > invalidate, "the selection is cleared before the cache is dropped");
+        Assert.True(outline > clear, "the outline is refreshed before the selection is cleared");
+        Assert.True(render > outline, "the page is rendered before the outline is refreshed");
+    }
+
+    [Fact]
+    public void the_editor_is_gone_before_the_write_ever_starts()
+    {
+        // ⚠️ THE REASON THE BOX CANNOT STAY STUCK. It is removed by the page
+        // BEFORE the commit is asked for, so no outcome of the write, success,
+        // refusal or throw, can leave it on screen.
+        string page = Page();
+
+        int teardown = page.IndexOf("TearDownUnitEditor();", StringComparison.Ordinal);
+        int commit = page.IndexOf("ViewModel.CommitTextUnit(typed);", StringComparison.Ordinal);
+
+        Assert.True(teardown > 0, "the editor is never torn down");
+        Assert.True(commit > teardown, "the commit runs before the editor is removed");
     }
 
     [Fact]

@@ -5228,6 +5228,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // ⚠️ ONE WRITE AT A TIME, AND THE GUARD IS WHY. A second commit
+        // arriving while one is still writing would open an undo batch over the
+        // top of the open one, and hand the core a line whose object range the
+        // running write is about to renumber.
+        if (_lineWriteInFlight)
+        {
+            Status = "Still saving the last change.";
+            return false;
+        }
+
         int page = _selectedLinePage;
 
         // ONE ENTRY, opened before the write and closed after it, so undo puts
@@ -5236,18 +5246,87 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RecordEdit(new LineTextRecord(
             page, line.FirstObject, line.LastObject, line.PrefixChars, line.Text, newText));
 
-        // ⚠️ THE OBJECT WRITER IS NEVER HANDED A LINE ROUTED PAST IT. Its own
-        // rule set is what refused this line in the first place, so offering it
-        // one anyway would be asking it to do the thing it declined. A block
-        // line goes straight to the writer that takes it.
-        int status = line.Route == LineWriter.BlockWriter
-            ? Interop.LineGateway.WriteAsBlock(
-                _documentHandle, page, line.FirstObject, line.LastObject,
-                line.Text, newText)
-            : Interop.LineGateway.Write(
-                _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
-                line.FontName, newText, line.Text);
+        _lineWriteInFlight = true;
+        WriteLineAsync(line, page, newText);
 
+        // ⚠️ "ACCEPTED", NOT "WRITTEN". The result is not known yet; it
+        // reaches the reader through FinishLineWrite, which runs everything that
+        // used to follow the write here, in the order it used to run.
+        return true;
+    }
+
+    /// <summary>
+    /// Whether a line write is running on a background thread.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// ⚠️ A FLAG, NOT A LOCK, DELIBERATELY. Everything that reads it is a user
+    /// command and runs on the UI thread and nowhere else. A lock would say two
+    /// threads contend for this, which would invite someone to take it from the
+    /// background continuation as well, and that is the very bug it would look
+    /// like it was preventing. The native side is serialised by its own
+    /// CALL_LOCK and needs no help from here.
+    /// </remarks>
+    private bool _lineWriteInFlight;
+
+    /// <summary>Whether a line write is in flight, so nothing else may start.</summary>
+    public bool IsLineWriteInFlight => _lineWriteInFlight;
+
+    /// <summary>
+    /// The write itself, off the UI thread, and everything that follows it back
+    /// on the UI thread.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// ⚠️ ONLY THE NATIVE CALL MOVED. Measured on a 296-page 2MB book: the
+    /// write is 931ms of whole-file parse and re-serialise, and it was running
+    /// on the UI thread, so the window froze and the app looked hung on exactly
+    /// the documents where editing matters most. Everything around it, the undo
+    /// batch, the invalidation, the repaint and the selection cleanup, stays
+    /// where it was and in the order it was.
+    ///
+    /// ⚠️ THE CONTINUATION RESUMES ON THE UI THREAD, the same way every other
+    /// awaited core call in this file does: WinUI installs a synchronisation
+    /// context on it, so what follows the await touches observable state safely.
+    /// </remarks>
+    private async void WriteLineAsync(LineSnapshot line, int page, string newText)
+    {
+        int status;
+        try
+        {
+            status = await Task.Run(() => line.Route == LineWriter.BlockWriter
+                // ⚠️ THE OBJECT WRITER IS NEVER HANDED A LINE ROUTED PAST IT.
+                // Its own rule set is what refused this line in the first place,
+                // so offering it one anyway would be asking it to do the thing
+                // it declined. A block line goes straight to the writer that
+                // takes it.
+                ? Interop.LineGateway.WriteAsBlock(
+                    _documentHandle, page, line.FirstObject, line.LastObject,
+                    line.Text, newText)
+                : Interop.LineGateway.Write(
+                    _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
+                    line.FontName, newText, line.Text));
+        }
+        catch (Exception ex)
+        {
+            // A throw that escaped here would leave the guard set for the rest
+            // of the session and every later edit would silently refuse.
+            Diag.Log($"EditSelectedLine write threw: {ex}");
+            status = RenderStatus.Panic;
+        }
+        finally
+        {
+            _lineWriteInFlight = false;
+        }
+
+        FinishLineWrite(line, page, status);
+    }
+
+    /// <summary>
+    /// What used to follow the write, unchanged and in the same order.
+    /// </summary>
+    private void FinishLineWrite(LineSnapshot line, int page, int status)
+    {
         if (status != RenderStatus.OkPdfium)
         {
             // The core leaves the page as it found it when it refuses, so the
@@ -5270,7 +5349,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             };
 
             Diag.Log($"EditSelectedLine refused status={status} font={line.FontName}");
-            return false;
+            return;
         }
 
         CommitEdit();
@@ -5283,7 +5362,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         IsDirty = true;
 
         Status = "Line changed.";
-        return true;
     }
 
     // ---------------- deleting a unit of the document's own text ----------------
@@ -12499,6 +12577,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // the outside, and both read to the user as "undo is laggy".
     public void Undo()
     {
+        // ⚠️ NOT WHILE A LINE IS BEING WRITTEN. Undo finds its line BY TEXT,
+        // because retyping renumbers the objects and the recorded range goes
+        // stale; asking a half-written document what it says would find the
+        // wrong line or none.
+        if (_lineWriteInFlight)
+        {
+            Status = "Still saving the last change.";
+            return;
+        }
+
         var target = _history.Undo(Capture);
         Diag.Log($"undo: {(target is null ? "NOTHING to undo" : "applying")} canUndo={_history.CanUndo} canRedo={_history.CanRedo}");
         if (target is not null)
@@ -12509,6 +12597,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void Redo()
     {
+        if (_lineWriteInFlight)
+        {
+            Status = "Still saving the last change.";
+            return;
+        }
+
         var target = _history.Redo(Capture);
         Diag.Log($"redo: {(target is null ? "NOTHING to redo" : "applying")} canUndo={_history.CanUndo} canRedo={_history.CanRedo}");
         if (target is not null)
