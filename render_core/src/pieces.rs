@@ -606,7 +606,7 @@ fn locate_by_coding(
         }
         spans.push((start, chunks));
     }
-    if drawn != expected {
+    if !same_line(&drawn, expected) {
         return Err(crate::STATUS_STALE_ANCHOR);
     }
 
@@ -643,6 +643,45 @@ fn locate_by_coding(
         return Err(crate::STATUS_UNSUPPORTED);
     };
     Ok((k, code_at, code_len, new_codes))
+}
+
+/// Whether the line decoded out of the stream says the same as the line the
+/// caller is looking at, allowing one whitespace character to stand for
+/// another.
+///
+/// ⚠️ THE READER AND THE STREAM DISAGREE ABOUT ONE CHARACTER, AND ONLY ONE.
+/// Measured on a real book: the producer draws the word gaps with a glyph whose
+/// `/ToUnicode` says `U+0009`, while PDFium hands the app `U+0020`. So the
+/// decode of `About the Book` is `About\tthe\tBook`, and an exact comparison
+/// refused every line on the page that had a space in it, whatever the edit
+/// was and wherever on the line it fell.
+///
+/// ⚠️ WHY THIS IS NOT TEXT NORMALISATION. Everything downstream indexes the
+/// decode by BYTE OFFSET into `expected`, so the two strings have to stay
+/// aligned byte for byte. A substitution is therefore allowed only where both
+/// characters are whitespace AND occupy the same number of bytes, which is what
+/// makes tab-for-space safe and, say, `U+00A0`-for-space not. Nothing else is
+/// folded: a letter that differs is still a stale anchor.
+fn same_line(drawn: &str, expected: &str) -> bool {
+    if drawn.len() != expected.len() {
+        return false;
+    }
+    let mut d = drawn.chars();
+    let mut e = expected.chars();
+    loop {
+        match (d.next(), e.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) => {
+                if a == b {
+                    continue;
+                }
+                if !(a.is_whitespace() && b.is_whitespace() && a.len_utf8() == b.len_utf8()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// The span, found without asking the font what its codes mean.
@@ -870,12 +909,46 @@ pub(crate) fn replace_in_line(
     };
     let grew = now - was;
 
-    // ⚠️ ONLY THE LAST PIECE OF A LINE MAY CHANGE WIDTH. Anything after it that
-    // the producer positioned would stay put and be written over, and anything
-    // that follows on would move by the RENDERER's advance while a piece after
-    // that moved by ours. Sliding them is reflow's job, with reflow's gates.
+    // ⚠️ A PIECE THAT CHANGED WIDTH TAKES THE REST OF ITS LINE WITH IT.
+    //
+    // The rule this replaces was "only the LAST piece of a line may change
+    // width", and on a page whose producer draws one glyph per text object that
+    // refused nearly every real edit: swapping `a` for `o` makes the line
+    // 56/1000 of an em wider, and every letter after it is nailed to its own
+    // coordinate, so the replacement grew into its neighbour. Measured on a
+    // 296-page book: 638 of 638 pieces on the page are positioned individually.
+    //
+    // ⚠️ WHICH IS EXACTLY WHY SLIDING THEM IS SAFE HERE, AND WHY THE OLD RULE
+    // WAS RIGHT TO REFUSE OTHERWISE. A piece the producer positioned does not
+    // move when the piece before it changes length, so moving it ourselves puts
+    // it precisely where it belongs. A piece that FOLLOWS ON has already been
+    // moved by the renderer's own advance, and moving it again would count the
+    // difference twice. So the whole tail is checked, and one piece that
+    // follows on refuses the edit the way the whole line used to.
+    //
+    // ⚠️ HORIZONTAL, WITHIN ONE LINE, AND NOTHING ELSE. No line is broken, no
+    // line moves vertically, no other line is touched and no paragraph is
+    // re-laid-out. That is reflow and it is a separate problem; this is
+    // arithmetic on one baseline.
+    let mut slide: Vec<(usize, f64)> = Vec::new();
     if grew.abs() > 1e-9 && k + 1 < mine.len() {
-        return Err(crate::STATUS_BLOCK_NEEDS_REFLOW);
+        if mine[k + 1..].iter().any(|r| !r.repositioned) {
+            return Err(crate::STATUS_BLOCK_NEEDS_REFLOW);
+        }
+        // ⚠️ THE DISTANCE IS AGREED IN USER SPACE, NOT IN TEXT SPACE. `Td`
+        // takes text-space units, which each piece's own matrix scales
+        // differently, so a line that mixes sizes would move its larger pieces
+        // further than its smaller ones if the same number were handed to all
+        // of them. The physical distance is computed once from the piece that
+        // changed, and every follower is asked for the number that produces it.
+        let moved = grew * piece.tm.then(piece.ctm).0[0];
+        for r in &mine[k + 1..] {
+            let scale = r.tm.then(r.ctm).0[0];
+            if scale.abs() < 1e-12 {
+                return Err(crate::STATUS_BLOCK_NEEDS_REFLOW);
+            }
+            slide.push((r.at, moved / scale));
+        }
     }
 
     // Only a line that GREW can run out of room. Checking a line that did not
@@ -901,6 +974,12 @@ pub(crate) fn replace_in_line(
             shift: 0.0,
         },
     );
+    // Each follower keeps its own array verbatim and is simply moved. `write`
+    // brackets it with a `Td` and its inverse, so the text line matrix leaves
+    // the piece exactly as it entered and nothing downstream is disturbed.
+    for (at, shift) in slide {
+        plan.insert(at, Emission { array: None, shift });
+    }
     Ok(write(content, &plan))
 }
 
@@ -945,4 +1024,176 @@ fn adjusted_at(array: &[Object], offset: usize) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_line;
+
+    /// The pattern this exists for, taken from the document that exposed it:
+    /// the word gaps decode as \t and the reader was shown SPACE.
+    #[test]
+    fn a_gap_the_reader_calls_a_space_still_anchors() {
+        assert!(same_line("About\tthe\tBook", "About the Book"));
+        assert!(same_line("About\tthe\tAuthor", "About the Author"));
+        assert!(same_line("Title\tPage", "Title Page"));
+        assert!(same_line("Also\tby\tYuval\tNoah\tHarari", "Also by Yuval Noah Harari"));
+
+        // A line with no whitespace at all is unaffected either way.
+        assert!(same_line("Cover", "Cover"));
+        assert!(same_line("Introduction", "Introduction"));
+    }
+
+    /// ⚠️ THE HALF THAT MATTERS MORE. Loosening the anchor must not loosen
+    /// what it is FOR: a line that genuinely says something else is still
+    /// stale, and writing to it would put the edit on the wrong text.
+    #[test]
+    fn a_letter_that_differs_is_still_a_stale_anchor() {
+        assert!(!same_line("About\tthe\tBook", "About the Cook"));
+        assert!(!same_line("Title\tPage", "Title Rage"));
+        assert!(!same_line("Cover", "Cever"));
+        // Whitespace standing against a letter is not a whitespace substitution.
+        assert!(!same_line("About\tthe\tBook", "Aboutxthe Book"));
+    }
+
+    /// ⚠️ WHY THE SUBSTITUTION IS RESTRICTED TO EQUAL BYTE LENGTHS.
+    /// Everything downstream indexes by byte offset into the caller's string,
+    /// so a two-byte space standing for a one-byte one would shift every offset
+    /// after it and the edit would land on the wrong characters.
+    #[test]
+    fn whitespace_of_a_different_byte_length_is_not_interchangeable() {
+        // Four bytes each, but the substitution itself is two bytes for one.
+        assert_eq!("a\u{00A0}b".len(), "a  b".len());
+        assert!(!same_line("a\u{00A0}b", "a  b"));
+    }
+
+    #[test]
+    fn a_line_of_a_different_length_is_not_the_same_line() {
+        assert!(!same_line("About\tthe\tBook", "Aboutthe Book"));
+        assert!(!same_line("About the Book", "About the Books"));
+        assert!(!same_line("", "x"));
+    }
+
+    use super::{read, replace_in_line, Piece};
+    use lopdf::content::Content;
+    use lopdf::Document;
+
+    /// The fixture, its first line's baseline, and the pieces drawing it.
+    fn font_cases() -> (Document, lopdf::ObjectId, Content, f64) {
+        let doc = Document::load("tests/fixtures/sample_font_cases.pdf").expect("fixture");
+        let page_id = doc.get_pages().into_iter().next().expect("a page").1;
+        let content = Content::decode(&doc.get_page_content(page_id)).expect("content");
+        let baseline = read(&content).first().expect("a piece").y;
+        (doc, page_id, content, baseline)
+    }
+
+    fn on_baseline(content: &Content, baseline: f64) -> Vec<Piece> {
+        read(content).into_iter().filter(|p| (p.y - baseline).abs() < 0.05).collect()
+    }
+
+    const LINE: &str = "Kerning arial ordinary";
+
+    /// ⚠️ THE WHOLE POINT OF THE CHANGE, AND IT IS ABOUT DISTANCE RATHER THAN
+    /// TEXT. Getting the letters right while leaving them in the wrong places
+    /// is not an edit anyone would accept, so this asserts on where every glyph
+    /// of the line SITS, before and after.
+    ///
+    /// `a` is 1139/2048 of an em here and `m` is 1706, so the line grows. Every
+    /// glyph before the edit must not move at all, and every glyph after it
+    /// must move by exactly that difference: not approximately, and not merely
+    /// in the right direction.
+    #[test]
+    fn the_glyphs_after_the_edit_move_by_exactly_the_width_difference() {
+        let (doc, page_id, content, baseline) = font_cases();
+        let before = on_baseline(&content, baseline);
+        let at = LINE.find('a').expect("an 'a' to widen");
+
+        let out = replace_in_line(
+            &doc, page_id, &content, baseline as f32, LINE, at, 1, "m", None)
+            .expect("the writer refused a line it should now take");
+        let after = on_baseline(&out, baseline);
+
+        assert_eq!(before.len(), after.len(), "the edit added or dropped a piece");
+
+        // Where each piece puts its origin, in user space.
+        let x = |p: &Piece| p.tm.then(p.ctm).0[4];
+        let k = before.iter().position(|p| p.at == before[at].at).unwrap_or(at);
+
+        // Nothing before the edit moves.
+        for i in 0..k {
+            assert!((x(&before[i]) - x(&after[i])).abs() < 1e-9,
+                "piece {i}, before the edit, moved from {} to {}", x(&before[i]), x(&after[i]));
+        }
+
+        // Everything after it moves by ONE distance, the same for all of them.
+        let moves: Vec<f64> = (k + 1..before.len())
+            .map(|i| x(&after[i]) - x(&before[i]))
+            .collect();
+        assert!(!moves.is_empty(), "this line has no glyphs after the edit to check");
+        let first = moves[0];
+        assert!(first > 0.0, "the line grew, so the tail must move right, not {first}");
+        for (n, m) in moves.iter().enumerate() {
+            assert!((m - first).abs() < 1e-6,
+                "glyph {n} after the edit moved {m}, not {first} like the rest");
+        }
+
+        // And that distance is the width difference, not a number that merely
+        // looks plausible: the tail moved by exactly what the glyph gained.
+        let grew = x(&after[before.len() - 1]) - x(&before[before.len() - 1]);
+        assert!((grew - first).abs() < 1e-6);
+    }
+
+    /// ⚠️ THE GUARD THE OLD RULE WAS ACTUALLY WRITTEN FOR, AND IT STAYS.
+    ///
+    /// A piece the producer positioned does not move when the piece before it
+    /// changes length, which is why moving it ourselves is correct. A piece
+    /// that FOLLOWS ON has already been moved by the renderer's own advance,
+    /// and moving it again would count the difference twice and pull the line
+    /// apart. This fixture positions every glyph, so one `Td` is removed to
+    /// produce exactly that shape.
+    #[test]
+    fn a_line_whose_glyphs_flow_on_is_still_refused() {
+        let (doc, page_id, content, baseline) = font_cases();
+        let line = on_baseline(&content, baseline);
+        let last = line.last().expect("a piece").at;
+
+        let mut ops = content.operations.clone();
+        let td = (0..last).rev()
+            .find(|&i| ops[i].operator == "Td")
+            .expect("a Td to remove");
+        ops.remove(td);
+        let flowed = Content { operations: ops };
+
+        // The fixture edit has to have produced the shape, or the test proves
+        // nothing about the guard.
+        assert!(on_baseline(&flowed, baseline).iter().skip(1).any(|p| !p.repositioned),
+            "removing that Td did not make any piece follow on");
+
+        let at = LINE.find('a').expect("an 'a' to widen");
+        let out = replace_in_line(
+            &doc, page_id, &flowed, baseline as f32, LINE, at, 1, "m", None);
+
+        assert_eq!(out.err(), Some(crate::STATUS_BLOCK_NEEDS_REFLOW),
+            "a line with a follow-on piece must still refuse a width change");
+    }
+
+    /// The same line, edited at its LAST glyph, where there is no tail to move.
+    /// This path predates the change and must be untouched by it.
+    #[test]
+    fn an_edit_at_the_end_of_a_line_still_moves_nothing() {
+        let (doc, page_id, content, baseline) = font_cases();
+        let before = on_baseline(&content, baseline);
+        let at = LINE.len() - 1;
+
+        let out = replace_in_line(
+            &doc, page_id, &content, baseline as f32, LINE, at, 1, "m", None)
+            .expect("the last glyph of a line may always change width");
+        let after = on_baseline(&out, baseline);
+
+        let x = |p: &Piece| p.tm.then(p.ctm).0[4];
+        for i in 0..before.len() {
+            assert!((x(&before[i]) - x(&after[i])).abs() < 1e-9,
+                "piece {i} moved for an edit at the end of the line");
+        }
+    }
 }

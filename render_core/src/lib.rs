@@ -12390,20 +12390,32 @@ fn emit_block(
         // is here for the lines Path A will not take: one drawn in several
         // pieces, or one with no slots to solve. It changes a single piece's
         // array and leaves every other operator alone.
-        if let Ok(next) = pieces::rewrite_bytes(
+        let refused = match pieces::rewrite_bytes(
             &bytes, page_index, plan.baseline, &plan.expected,
             plan.at, plan.len, &change.text, Some(right_limit),
         ) {
-            bytes = next;
-            continue;
-        }
+            Ok(next) => {
+                bytes = next;
+                continue;
+            }
+            Err(refused) => refused,
+        };
         // ⚠️ ONLY THIS ONE REASON FALLS THROUGH. `STATUS_UNSUPPORTED` from Path
         // A means the document's own font cannot spell what was typed, which is
         // exactly and only what Path B is for. Every other refusal is about the
         // line rather than the letters, and a second attempt would fail the
         // same way.
+        //
+        // ⚠️ BUT THE REASON REPORTED IS THE SECOND WRITER'S, NOT THE FIRST'S.
+        // Path A refuses EVERY line on a page whose producer draws one glyph
+        // per text object, so returning its `STATUS_LINE_NOT_REWRITABLE` told
+        // the caller "this line cannot be rewritten" no matter what the writer
+        // that actually took the line had found. Measured on a real book: the
+        // piece writer was reporting a stale anchor and a reflow refusal, and
+        // both arrived as the same constant. Two investigations were spent
+        // reading that constant before the mask was noticed.
         if status != STATUS_UNSUPPORTED {
-            return status;
+            return refused;
         }
         let Some(path) = font_path else {
             return STATUS_UNSUPPORTED;
@@ -28406,8 +28418,24 @@ p={spread_px:.4},c={rgba:08X})"
                         }
                         if !clean { outside.push(format!("{name} [{label}]")); continue; }
 
-                        // Every OTHER piece of the page must still be where the
-                        // producer put it.
+                        // Every other piece of the page must still be where the
+                        // producer put it, and the ones that DO move must move
+                        // together.
+                        //
+                        // ⚠️ THIS USED TO READ "NOTHING ON THE PAGE MOVED", and
+                        // that stopped being the invariant when a width change
+                        // began taking the rest of its line with it. The rule it
+                        // is replaced by is not weaker, it is more specific:
+                        // nothing moves vertically, nothing off the edited
+                        // baseline moves at all, and everything that moves on
+                        // the edited baseline moves by ONE distance. A writer
+                        // that slid two glyphs by different amounts, or slid a
+                        // neighbouring line, would have passed the old check by
+                        // failing it in the same way and is caught by this one.
+                        //
+                        // That the single distance is the WIDTH DIFFERENCE, and
+                        // not merely consistent, is asserted in pieces.rs where
+                        // the metrics are in reach.
                         let Ok(after_doc) = lopdf::Document::load_mem(&edited) else { continue };
                         let Some(&apid) = after_doc.get_pages().get(&(page as u32 + 1))
                             else { continue };
@@ -28416,12 +28444,29 @@ p={spread_px:.4},c={rgba:08X})"
                         let was = pieces::read(&content);
                         let now = pieces::read(&after_content);
                         let mut fixed = was.len() == now.len();
+                        let mut slid: Option<f64> = None;
                         if fixed {
                             for (x, y) in was.iter().zip(now.iter()) {
                                 let (p, q) = (x.tm.then(x.ctm).0, y.tm.then(y.ctm).0);
-                                if (p[4] - q[4]).abs() > 1e-6 || (p[5] - q[5]).abs() > 1e-6 {
+                                if (p[5] - q[5]).abs() > 1e-6 {
                                     fixed = false;
                                     break;
+                                }
+                                let dx = q[4] - p[4];
+                                if dx.abs() <= 1e-6 {
+                                    continue;
+                                }
+                                if (x.y - baseline as f64).abs() >= 0.05 {
+                                    fixed = false;
+                                    break;
+                                }
+                                match slid {
+                                    None => slid = Some(dx),
+                                    Some(d) if (d - dx).abs() < 1e-6 => {}
+                                    _ => {
+                                        fixed = false;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -28498,15 +28543,20 @@ p={spread_px:.4},c={rgba:08X})"
             };
             println!("    {v:5}  status {k:3}  {why}");
         }
-        assert_eq!(short_seen + long_seen,
-            short_ok + long_ok + refused_wider.values().sum::<usize>(),
-            "a width change neither succeeded nor was refused");
         println!("\n  changed pixels outside the block : {}", outside.len());
         for n in outside.iter().take(5) { println!("      {n}"); }
         println!("  an untouched piece moved         : {}", moved.len());
         for n in moved.iter().take(5) { println!("      {n}"); }
         println!("  text did not read back           : {}", lost.len());
         for n in lost.iter().take(5) { println!("      {n}"); }
+
+        // AFTER the three lists above, deliberately: this is the assertion that
+        // catches a case which neither wrote cleanly nor refused, and the lists
+        // are the only evidence of WHICH case. Asserting first printed the
+        // count and hid the names.
+        assert_eq!(short_seen + long_seen,
+            short_ok + long_ok + refused_wider.values().sum::<usize>(),
+            "a width change neither succeeded nor was refused");
 
         assert!(not_identical.is_empty(),
             "writing a block's own text back changed {} of {accepted} blocks",
@@ -28703,6 +28753,55 @@ p={spread_px:.4},c={rgba:08X})"
         assert_eq!(retype_via_block(handle, 0, 0, 21, &says, "one\ntwo"), STATUS_INVALID_INPUT);
         assert_eq!(was, page_drawing(handle, 0), "a rejected argument changed the page");
         close_document(handle);
+    }
+
+    /// ⚠️ THE REFUSAL REPORTED IS THE ONE FROM THE WRITER THAT TOOK THE LINE.
+    ///
+    /// Path A is tried first and refuses every line drawn in several pieces,
+    /// with `LINE_NOT_REWRITABLE`. The route used to return THAT, so whatever
+    /// the piece writer found was replaced by a constant before the caller ever
+    /// saw it. Measured on a real book: a reflow refusal and a stale anchor
+    /// both arrived as `LINE_NOT_REWRITABLE`, and two investigations were spent
+    /// reading that constant.
+    ///
+    /// The pair is the proof. Both edits change one letter in the middle of the
+    /// same line; only the WIDTH of the replacement differs, which is the piece
+    /// writer's own rule and nothing Path A has an opinion about.
+    #[test]
+    fn the_block_route_reports_the_writer_that_took_the_line() {
+        let says = {
+            let h = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+            let t = block_line_text(h, 0, 0, 21);
+            close_document(h);
+            t
+        };
+        assert_eq!(says.trim(), "Kerning arial ordinary");
+
+        // Same width: the piece writer takes it, so there is nothing to report.
+        let equal = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        assert_eq!(retype_via_block(equal, 0, 0, 21, &says, "Kerning orial ordinary"),
+            STATUS_OK_PDFIUM, "an equal-width interior edit should have been written");
+        close_document(equal);
+
+        // Wider in the middle: this is the edit the writer used to refuse and
+        // now takes, by moving the rest of the line along.
+        let wider = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        assert_eq!(retype_via_block(wider, 0, 0, 21, &says, "Kerning mrial ordinary"),
+            STATUS_OK_PDFIUM, "a wider interior glyph should now move the tail");
+        close_document(wider);
+
+        // Too long to fit: the piece writer refuses with a reason of its own,
+        // and THAT is what the caller has to be given. Path A never says
+        // TOO_WIDE about this line; it says LINE_NOT_REWRITABLE, which is the
+        // constant the route used to return instead.
+        let long = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        let was = page_drawing(long, 0);
+        let status = retype_via_block(long, 0, 0, 21, &says, "Kerning arial ordinarymmmmm");
+        assert_ne!(status, STATUS_LINE_NOT_REWRITABLE,
+            "the route is reporting Path A's refusal again instead of the writer's");
+        assert_eq!(status, STATUS_TOO_WIDE);
+        assert_eq!(was, page_drawing(long, 0), "a refusal changed the page");
+        close_document(long);
     }
 
     /// Saving and opening the saved bytes again finds the edit still there.

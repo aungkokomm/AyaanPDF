@@ -34,6 +34,13 @@ public sealed partial class MainWindow : Window
         // looking like buttons and behaving like a title bar.
         SetTitleBar(TitleDragArea);
 
+        // ⚠️ THE RUNNING BUILD SAYS WHICH BUILD IT IS, IN THE TITLE BAR.
+        // A whole test cycle was spent on an installed app two days behind the
+        // repository, and the About dialog could have said so all along: nobody
+        // opens a dialog to check something they have no reason to doubt. The
+        // version is read from the assembly, so it cannot drift from the csproj.
+        TitleText.Text = $"{AppInfo.Name} {AppInfo.Version}";
+
         AppWindow.SetIcon("Assets/AppIcon.ico");
         AppWindow.Closing += OnClosing;
 
