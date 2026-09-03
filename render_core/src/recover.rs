@@ -600,11 +600,74 @@ pub(crate) fn clusters_of(
     out
 }
 
+/// How far above and below the baseline a face reaches at this size. The
+/// second number is negative, the way a font declares its descender.
+fn reach_of(face: &rustybuzz::Face, size: f64) -> (f64, f64) {
+    let upem = face.units_per_em() as f64;
+    if upem <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let scale = size / upem;
+    (face.ascender() as f64 * scale, face.descender() as f64 * scale)
+}
+
+/// The page's crop box, as (left, top, width) in PDF user space.
+///
+/// ⚠️ INHERITED, AND THE CROP BOX BEFORE THE MEDIA BOX, because that is what
+/// the rest of the app normalizes against: `page_origin` asks PDFium the same
+/// two questions in the same order. A page that answered differently here would
+/// put every recovered line at an offset from every other line on the page.
+pub(crate) fn page_box(doc: &Document, page: ObjectId) -> Option<(f64, f64, f64)> {
+    let mut at = page;
+    for _ in 0..32 {
+        let Ok(dict) = doc.get_dictionary(at) else { break };
+        for key in [b"CropBox".as_slice(), b"MediaBox".as_slice()] {
+            if let Some(found) = dict.get(key).ok().and_then(|o| rect_of(doc, o)) {
+                return Some(found);
+            }
+        }
+        match dict.get(b"Parent").ok().and_then(|o| o.as_reference().ok()) {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    None
+}
+
+/// A PDF rectangle as (left, top, width), whichever corners it names.
+fn rect_of(doc: &Document, object: &Object) -> Option<(f64, f64, f64)> {
+    let Ok((_, Object::Array(a))) = doc.dereference(object) else { return None };
+    if a.len() != 4 {
+        return None;
+    }
+    let mut v = [0.0f64; 4];
+    for (slot, o) in v.iter_mut().zip(a) {
+        *slot = doc.dereference(o).ok().and_then(|(_, r)| number(r))?;
+    }
+    // A rectangle may be written from any corner to any corner.
+    let (x0, x1) = (v[0].min(v[2]), v[0].max(v[2]));
+    let (_, y1) = (v[1].min(v[3]), v[1].max(v[3]));
+    let width = x1 - x0;
+    (width > 0.0).then_some((x0, y1, width))
+}
+
 /// One line of a page, and what it says.
 pub(crate) struct Reading {
     /// Where the line sits, in PDF user space.
     pub(crate) y: f64,
     pub(crate) x: f64,
+    /// How tall the type is, and how far it reaches above and below the
+    /// baseline, all in PDF user space.
+    ///
+    /// ⚠️ FROM THE FACE, NOT FROM THE GLYPHS THAT HAPPEN TO BE ON THE LINE.
+    /// The app draws a frame round a line and covers it while it is retyped, and
+    /// a box that tracked the tallest letter present would jump as soon as the
+    /// reader typed a taller one.
+    pub(crate) size: f64,
+    pub(crate) top: f64,
+    pub(crate) bottom: f64,
+    /// The line's font, subset tag and all, for the app to match on screen.
+    pub(crate) font: String,
     /// What it says, or nothing when it could not be proven.
     pub(crate) text: Option<String>,
     /// Where each cluster of that reading is drawn. Empty when nothing was
@@ -710,7 +773,20 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
                 Some((text, clusters)) => (Some(text), clusters),
                 None => (None, Vec::new()),
             };
-            Reading { y: line.y, x: line.x, text, clusters }
+            let (top, bottom) = faces
+                .get(line.base_font.as_str())
+                .map(|(face, _)| reach_of(face, line.size))
+                .unwrap_or((0.0, 0.0));
+            Reading {
+                y: line.y,
+                x: line.x,
+                size: line.size,
+                top: line.y + top,
+                bottom: line.y + bottom,
+                font: line.base_font.clone(),
+                text,
+                clusters,
+            }
         })
         .collect()
 }

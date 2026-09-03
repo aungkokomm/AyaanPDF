@@ -413,10 +413,14 @@ public class TextRegionWiringTests
         Assert.Contains("_linesByPage.TryGetValue(page, out var have)", build, StringComparison.Ordinal);
         // Read on the pool, not through LinesFor.
         Assert.Contains("Task.Run(", build, StringComparison.Ordinal);
-        Assert.Contains("Interop.LineGateway.Load(handle, at)", build, StringComparison.Ordinal);
+        // ⚠️ AND TOLD WHETHER THE ANSWER IS FINAL. A page of shaped text is
+        // read on another thread again, and until that finishes the gateway can
+        // only report what PDFium made of it; caching that would mean the
+        // reading finished and this page never noticed.
+        Assert.Contains("Interop.LineGateway.Load(handle, at, out ready)", build, StringComparison.Ordinal);
         Assert.DoesNotContain("LinesFor(", build);
         // And given back afterwards.
-        Assert.Contains("_linesByPage[page] = result.Lines;", build, StringComparison.Ordinal);
+        Assert.Contains("result.Settled) { _linesByPage[page] = result.Lines; }", build, StringComparison.Ordinal);
     }
 
     /// <summary>

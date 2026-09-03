@@ -1735,6 +1735,33 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
 /// ⚠️ NEITHER ANSWER BLOCKS. A slot that is locked means another thread is
 /// inside the 17 seconds, and the right thing to do about that is nothing at
 /// all, not queue up behind it.
+/// Whether a page's shaped text has been read and is waiting to be asked for.
+///
+/// ⚠️ ASKING TOO EARLY MUST NOT WAIT, WHICH IS THE WHOLE POINT OF THIS. Reading
+/// a page for the first time is about seventeen seconds of reshaping, and
+/// `recover_page_text` will happily block for all of it. The app draws its
+/// lines on the UI thread, so it asks this first and simply carries on with
+/// what PDFium gave it until the answer is yes.
+///
+/// ⚠️ AND "BEING BUILT" IS NOT READY, unlike [`already_prepared`], which is
+/// asked a different question: whether to START one. A caller here wants to
+/// know whether it can have the answer now without waiting.
+#[unsafe(no_mangle)]
+pub extern "C" fn recovery_is_ready(doc_handle: u64, page_index: i32) -> i32 {
+    if doc_handle == 0 || page_index < 0 {
+        return 0;
+    }
+    let slot = {
+        let all = lock(&core().recoveries);
+        all.get(&(doc_handle, page_index)).cloned()
+    };
+    let Some(slot) = slot else { return 0 };
+    match slot.try_lock() {
+        Ok(held) => i32::from(held.is_some()),
+        Err(_) => 0,
+    }
+}
+
 fn already_prepared(doc_handle: u64, page_index: i32) -> bool {
     let slot = {
         let all = lock(&core().recoveries);
@@ -1867,11 +1894,19 @@ pub extern "C" fn retype_recovered_line(
 /// starts that on a background thread as soon as a document is opened. A call
 /// arriving before it has finished waits for it rather than starting a second.
 ///
-/// Encoding: `u32` line count, then per line `f32` y, `f32` x, `u32` byte
-/// length and that many UTF-8 bytes, then `u32` cluster count and, for each,
-/// `u32` first byte, `u32` last byte, `f32` left, `f32` right. A line nothing
-/// could prove has no bytes and no clusters, and is still reported so a caller
-/// can match it by baseline.
+/// Encoding, little-endian: a `u32` line count, then per line the baseline in
+/// PDF USER SPACE, the bounds and baseline NORMALIZED, the font size in points,
+/// two length-prefixed UTF-8 strings (the text and the font name), and a `u32`
+/// cluster count followed by `u32` first byte, `u32` last byte, `f32` left and
+/// `f32` right for each. A line nothing could prove has no text and no
+/// clusters, and is still reported so a caller can match it by baseline.
+///
+/// ⚠️ TWO COORDINATE SYSTEMS ON PURPOSE, because two callers need two
+/// different things and converting between them in the app would round. The
+/// first number is the line's IDENTITY, and it is exactly what
+/// [`retype_recovered_line`] must be handed back. Everything after it is for
+/// DRAWING, normalized the way `get_page_lines` normalizes: top-left origin,
+/// both axes divided by the page WIDTH.
 ///
 /// ⚠️ THE BOXES ARE PER CLUSTER, NOT PER CHARACTER, and the script forces
 /// it: `မြ` is drawn as one unit with the medial before the consonant it
@@ -1898,22 +1933,46 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     };
 
+    // ⚠️ ASKED OF LOPDF, NOT OF PDFIUM. This runs on the preparing thread as
+    // well as on the reader's, and reaching for a PDFium page there would parse
+    // it on a thread that has no business parsing anything.
+    let Some((page_left, page_top, page_w)) = recover::page_box(&doc, page) else {
+        return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+    };
+    let across = |v: f64| ((v - page_left) / page_w) as f32;
+    let down = |v: f64| ((page_top - v) / page_w) as f32;
+
     let indexes = indexes_for_page(doc_handle, page_index, &doc, page);
     let read = recover::read_page_with(&doc, page, &indexes);
     let mut out: Vec<u8> = Vec::new();
     out.extend((read.len() as u32).to_le_bytes());
     for line in &read {
         out.extend((line.y as f32).to_le_bytes());
-        out.extend((line.x as f32).to_le_bytes());
+
+        // The line's own extent is where its clusters start and stop, not where
+        // its pen was placed: a line can be placed before the first thing it
+        // draws, and the frame is drawn round the letters.
+        let left = line.clusters.first().map(|c| c.left).unwrap_or(line.x);
+        let right = line.clusters.last().map(|c| c.right).unwrap_or(line.x);
+        out.extend(across(left).to_le_bytes());
+        out.extend(down(line.top).to_le_bytes());
+        out.extend(across(right).to_le_bytes());
+        out.extend(down(line.bottom).to_le_bytes());
+        out.extend(down(line.y).to_le_bytes());
+        out.extend((line.size as f32).to_le_bytes());
+
         let said = line.text.as_deref().unwrap_or("");
         out.extend((said.len() as u32).to_le_bytes());
         out.extend(said.as_bytes());
+        out.extend((line.font.len() as u32).to_le_bytes());
+        out.extend(line.font.as_bytes());
+
         out.extend((line.clusters.len() as u32).to_le_bytes());
         for cluster in &line.clusters {
             out.extend((cluster.from as u32).to_le_bytes());
             out.extend((cluster.to as u32).to_le_bytes());
-            out.extend((cluster.left as f32).to_le_bytes());
-            out.extend((cluster.right as f32).to_le_bytes());
+            out.extend(across(cluster.left).to_le_bytes());
+            out.extend(across(cluster.right).to_le_bytes());
         }
     }
 
@@ -26262,6 +26321,85 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     /// Phase 1 on the real thing: read a line of a Word-produced Myanmar page,
+    /// What the APP is shown for a real Myanmar page, as opposed to what
+    /// recovery can read. Diagnostic: it prints and asserts nothing about the
+    /// numbers, because the numbers are what the phase is here to change.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn what_the_app_sees_on_a_real_myanmar_page() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let lines = decode_lines(handle, 0);
+        let read = read_recovered(handle);
+        close_document(handle);
+
+        let refused = lines.iter().filter(|l| l.refusal == LINE_COMPLEX_SCRIPT).count();
+        println!("{} lines from PDFium, {} of them refused as complex script",
+            lines.len(), refused);
+        println!("{} lines from recovery, {} of them read",
+            read.len(), read.iter().filter(|(_, t)| !t.is_empty()).count());
+        for l in lines.iter().take(3) {
+            let shown: String = l.text.chars().take(24).collect();
+            println!("  PDFium says {shown:?}");
+        }
+        for (_, text) in read.iter().filter(|(_, t)| !t.is_empty()).take(3) {
+            let shown: String = text.chars().take(24).collect();
+            println!("  recovery says {shown:?}");
+        }
+    }
+
+    /// ⚠️ THE NORMALIZATION, AND NOTHING ELSE. Recovery works in PDF user
+    /// space and the app draws in fractions of the page WIDTH from the TOP
+    /// LEFT. Getting the flip or the crop box wrong would put every recovered
+    /// line somewhere plausible but not where the text is, and a caret that
+    /// lands on the wrong letter edits the wrong text.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn the_recovered_geometry_lands_on_the_page() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let mine = recovered_lines(handle, 0);
+        let theirs = decode_lines(handle, 0);
+        close_document(handle);
+
+        let read: Vec<_> = mine.iter().filter(|l| !l.text.is_empty()).collect();
+        assert!(!read.is_empty(), "nothing was read");
+
+        for l in &read {
+            // On the page, and the right way up.
+            assert!(l.left >= 0.0 && l.right <= 1.0,
+                "{:?} runs from {} to {} across the page", l.text, l.left, l.right);
+            assert!(l.top > 0.0 && l.bottom > l.top && l.bottom < 1.5,
+                "{:?} runs from {} to {} down the page", l.text, l.top, l.bottom);
+            assert!(l.baseline > l.top && l.baseline <= l.bottom,
+                "the baseline of {:?} is not between its top and its bottom", l.text);
+
+            // And the clusters are inside the line they belong to.
+            for c in &l.clusters {
+                assert!(c.left >= l.left - 1e-4 && c.right <= l.right + 1e-4,
+                    "a cluster of {:?} at {}..{} is outside the line's {}..{}",
+                    l.text, c.left, c.right, l.left, l.right);
+            }
+        }
+
+        // ⚠️ AGAINST PDFIUM, WHICH IS THE INDEPENDENT WITNESS. It cannot read
+        // this page's text, but it knows exactly where the ink is, and it
+        // normalizes through its own crop box in its own code. A recovered line
+        // must sit on a baseline PDFium also reports.
+        for l in &read {
+            let near = theirs.iter().any(|t| (t.baseline - l.baseline).abs() < 0.002);
+            assert!(near, "no PDFium line shares the baseline {} of {:?}",
+                l.baseline, l.text);
+        }
+        println!("{} recovered lines, all on a baseline PDFium agrees with", read.len());
+    }
+
     /// change a word, and write it back.
     ///
     /// ⚠️ THIS CHECKS THE TEXT, NOT THE PICTURE. That the page reads back as the
@@ -26343,7 +26481,32 @@ p={spread_px:.4},c={rgba:08X})"
         read_recovered_page(handle, 0)
     }
 
-    fn read_recovered_page(handle: u64, page: i32) -> Vec<(f32, String)> {
+    #[derive(Debug, Clone, Copy)]
+    struct RecoveredCluster {
+        from: usize,
+        to: usize,
+        left: f32,
+        right: f32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecoveredLine {
+        /// The line's identity, in PDF user space.
+        pdf_baseline: f32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        baseline: f32,
+        size: f32,
+        text: String,
+        font: String,
+        clusters: Vec<RecoveredCluster>,
+    }
+
+    /// Everything `recover_page_text` reported, decoded, with the invariants
+    /// the format promises checked on the way past.
+    fn recovered_lines(handle: u64, page: i32) -> Vec<RecoveredLine> {
         let buffer = recover_page_text(handle, page);
         assert_eq!(buffer.status, STATUS_OK_PDFIUM, "recovery refused the page");
         let raw = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
@@ -26358,25 +26521,55 @@ p={spread_px:.4},c={rgba:08X})"
         let count = u32::from_le_bytes(take4(&raw, &mut at));
         let mut out = Vec::new();
         for _ in 0..count {
-            let y = f32::from_le_bytes(take4(&raw, &mut at));
-            let _x = f32::from_le_bytes(take4(&raw, &mut at));
+            let pdf_baseline = f32::from_le_bytes(take4(&raw, &mut at));
+            let left = f32::from_le_bytes(take4(&raw, &mut at));
+            let top = f32::from_le_bytes(take4(&raw, &mut at));
+            let right = f32::from_le_bytes(take4(&raw, &mut at));
+            let bottom = f32::from_le_bytes(take4(&raw, &mut at));
+            let baseline = f32::from_le_bytes(take4(&raw, &mut at));
+            let size = f32::from_le_bytes(take4(&raw, &mut at));
+
             let len = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
             let text = String::from_utf8(raw[at..at + len].to_vec()).unwrap();
             at += len;
-            let clusters = u32::from_le_bytes(take4(&raw, &mut at));
-            for _ in 0..clusters {
+            let font_len = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
+            let font = String::from_utf8(raw[at..at + font_len].to_vec()).unwrap();
+            at += font_len;
+
+            if !text.is_empty() {
+                assert!(!font.is_empty(), "a line was read but names no font");
+                assert!(size > 0.0, "a line was read at no size");
+                assert!(top < bottom && left <= right,
+                    "line {text:?} has bounds l{left} t{top} r{right} b{bottom}");
+            }
+
+            let n = u32::from_le_bytes(take4(&raw, &mut at));
+            let mut clusters = Vec::with_capacity(n as usize);
+            for _ in 0..n {
                 let from = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
                 let to = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
-                let _left = f32::from_le_bytes(take4(&raw, &mut at));
-                let _right = f32::from_le_bytes(take4(&raw, &mut at));
+                let cl = f32::from_le_bytes(take4(&raw, &mut at));
+                let cr = f32::from_le_bytes(take4(&raw, &mut at));
                 assert!(to <= text.len() && text.is_char_boundary(from)
                     && text.is_char_boundary(to),
                     "a cluster names bytes {from}..{to} of {text:?}");
+                clusters.push(RecoveredCluster { from, to, left: cl, right: cr });
             }
-            out.push((y, text));
+
+            out.push(RecoveredLine {
+                pdf_baseline, left, top, right, bottom, baseline, size,
+                text, font, clusters,
+            });
         }
         assert_eq!(at, raw.len(), "the buffer did not decode exactly");
         out
+    }
+
+    fn read_recovered_page(handle: u64, page: i32) -> Vec<(f32, String)> {
+        recovered_lines(handle, page)
+            .into_iter()
+            .map(|l| (l.pdf_baseline, l.text))
+            .collect()
     }
 
     /// \u{26a0}\u{fe0f} THE WHOLE CHAIN, ON A PAGE THIS TEST WROTE. Path B draws

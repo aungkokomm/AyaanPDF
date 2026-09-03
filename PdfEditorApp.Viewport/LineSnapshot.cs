@@ -70,6 +70,20 @@ public enum LineWriter
     /// producer's own pieces alone.
     /// </summary>
     BlockWriter = 2,
+
+    /// <summary>
+    /// The writer for a line the file's own tables cannot spell out, which was
+    /// read from the FONT instead and is put back the same way.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ADDRESSED BY BASELINE AND TEXT, NOT BY OBJECTS. The producer drew
+    /// these lines as dozens of separate placements, so there is no object
+    /// range to hand a writer; the recovery writer empties every placement the
+    /// line is drawn by and writes one run in their place. That is why a line
+    /// routed here carries <see cref="LineSnapshot.Recovered"/> and the other
+    /// two do not.
+    /// </remarks>
+    RecoveryWriter = 3,
 }
 
 /// <summary>
@@ -116,7 +130,8 @@ public sealed record LineSnapshot(
     uint ColorRgb,
     LineRefusal Refusal,
     string Text,
-    string FontName)
+    string FontName,
+    RecoveredLine? Recovered = null)
 {
     /// <summary>Which writer will be asked to retype this line.</summary>
     ///
@@ -136,8 +151,15 @@ public sealed record LineSnapshot(
     /// and it is why complex script is refused here rather than attempted.
     /// Rotated, gapped, out-of-order and foreign-object lines are refused
     /// because neither writer handles them.
+    ///
+    /// ⚠️ EXCEPT WHEN THE LINE WAS RECOVERED, which overrules everything
+    /// above. A recovered line did not come from PDFium at all: it was proven
+    /// against the FONT, character by character, by reshaping the candidate
+    /// text and demanding the page's own glyph ids back. The refusal PDFium's
+    /// reading earned is a fact about PDFium's reading and says nothing about
+    /// this one.
     /// </remarks>
-    public LineWriter Route => Refusal switch
+    public LineWriter Route => Recovered is not null ? LineWriter.RecoveryWriter : Refusal switch
     {
         LineRefusal.None => LineWriter.ObjectWriter,
 

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 
 namespace PdfEditorApp.Interop;
@@ -712,6 +712,64 @@ internal static partial class RenderCoreNative
     /// </summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern void prepare_recovery(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// What a page's shaped text says, read from the FONT, with a box for every
+    /// cluster of every line.
+    /// </summary>
+    /// <remarks>
+    /// Waits if <see cref="prepare_recovery"/> is still working, and is a few
+    /// milliseconds once it has finished. Every line the core found is
+    /// reported, including the ones it could not prove, so a caller can see
+    /// that a line is there and was declined rather than seeing nothing.
+    ///
+    /// ⚠️ TWO COORDINATE SYSTEMS IN ONE BUFFER, and they are not
+    /// interchangeable. The first number of each line is its baseline in PDF
+    /// USER SPACE, which is the identity <see cref="retype_recovered_line"/>
+    /// must be handed back. Everything after it is normalized for DRAWING, the
+    /// same way <see cref="get_page_lines"/> normalizes.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern ByteBuffer recover_page_text(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// Whether <see cref="recover_page_text"/> can answer at once, or would
+    /// wait for <see cref="prepare_recovery"/> to finish. 1 or 0.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ASK THIS BEFORE ASKING FOR THE TEXT, ON THE UI THREAD ALWAYS.
+    /// Reading a page for the first time is about seventeen seconds, and the
+    /// call to read it will block for every one of them. Until this says yes,
+    /// carry on with the lines PDFium gave and ask again next time.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int recovery_is_ready(ulong docHandle, int pageIndex);
+
+    /// <summary>
+    /// Retypes one recovered line, returning the whole new document.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NOT AN EDIT IN PLACE. The producer draws one of these lines as
+    /// dozens of separate placements; this empties every one of them and writes
+    /// a single shaped run where they were, which is a change to the file's own
+    /// structure and comes back as bytes rather than as a mutated handle.
+    ///
+    /// <paramref name="baseline"/> and <paramref name="expectedUtf8"/> together
+    /// identify the line and must be exactly what was read. The core re-derives
+    /// the page and refuses if no line still says this, so a stale selection
+    /// cannot overwrite whatever now sits at that baseline.
+    ///
+    /// <paramref name="fontPathUtf8"/> is an INSTALLED font file, never the
+    /// subset the document embeds: a subset has its layout tables pruned, and
+    /// shaping through one was measured producing two .notdef and seven wrong
+    /// glyphs out of twenty-four.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern ByteBuffer retype_recovered_line(
+        ulong docHandle, int pageIndex, float baseline,
+        [In] byte[] expectedUtf8, nuint expectedLen,
+        [In] byte[] newTextUtf8, nuint newTextLen,
+        [In] byte[] fontPathUtf8, nuint fontPathLen);
 
     /// <summary>
     /// Replaces one visual line with one string, or changes nothing at all.

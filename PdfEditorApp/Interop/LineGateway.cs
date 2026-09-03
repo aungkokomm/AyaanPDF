@@ -15,8 +15,31 @@ namespace PdfEditorApp.Interop;
 /// </summary>
 internal static class LineGateway
 {
-    /// <summary>Every visual line on the page, or nothing when it has none.</summary>
-    public static IReadOnlyList<LineSnapshot> Load(ulong docHandle, int pageIndex)
+    /// <summary>
+    /// Every visual line on the page, or nothing when it has none.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE ANSWER IS NOT ALWAYS FINAL, AND THE CALLER MUST NOT CACHE ONE
+    /// THAT IS NOT. A page of shaped text is read on a background thread, and
+    /// until that finishes this reports what PDFium made of it, which on a
+    /// Word-produced Burmese page is a hundred and fifty fragments of scrambled
+    /// text. Caching that would mean the reading finished and nobody ever
+    /// looked at it.
+    /// </remarks>
+    public static IReadOnlyList<LineSnapshot> Load(
+        ulong docHandle, int pageIndex, out bool settled)
+    {
+        settled = true;
+        var found = Read(docHandle, pageIndex, ref settled);
+        return found;
+    }
+
+    /// <summary>The same, for callers that do not keep the result.</summary>
+    public static IReadOnlyList<LineSnapshot> Load(ulong docHandle, int pageIndex) =>
+        Load(docHandle, pageIndex, out _);
+
+    private static IReadOnlyList<LineSnapshot> Read(
+        ulong docHandle, int pageIndex, ref bool settled)
     {
         var buffer = RenderCoreNative.get_page_lines(docHandle, pageIndex);
         try
@@ -38,11 +61,25 @@ internal static class LineGateway
             // work of reading it from the FONT instead takes about seventeen
             // seconds. Started now, it is finished long before a reader has
             // clicked on anything. Started when they click, they wait for it.
-            if (LineReader.NeedsReshaping(lines))
+            if (!LineReader.NeedsReshaping(lines))
             {
-                RenderCoreNative.prepare_recovery(docHandle, pageIndex);
+                return lines;
             }
-            return lines;
+
+            RenderCoreNative.prepare_recovery(docHandle, pageIndex);
+
+            // ⚠️ AND NEVER WAITED FOR. This runs on the UI thread every time a
+            // page is looked at, and asking for the text before it is ready
+            // blocks for the whole seventeen seconds, which is precisely the
+            // freeze prepare_recovery exists to prevent. Until it is ready the
+            // page keeps the lines PDFium gave it, refusals and all, and the
+            // caller asks again: see the settled flag.
+            if (RenderCoreNative.recovery_is_ready(docHandle, pageIndex) == 0)
+            {
+                settled = false;
+                return lines;
+            }
+            return RecoveredLines.Merge(lines, RecoveryGateway.Load(docHandle, pageIndex));
         }
         finally
         {

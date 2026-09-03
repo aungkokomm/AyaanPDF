@@ -112,6 +112,23 @@ public static class SystemFontMatch
             return "impact.ttf";
         }
 
+        // ⚠️ THE SAME TWO FAMILIES THE CORE WILL READ, AND NO MORE. Recovery
+        // proves a page's Burmese by reshaping candidate text through the
+        // INSTALLED font and demanding the page's own glyph ids back, so only a
+        // font it can do that with is any use here. Its list is
+        // recover::installed, and these two must not drift from it: offering a
+        // font the core will not accept turns a clean refusal into a failed
+        // write after the reader has finished typing.
+        if (name.Contains("myanmartext"))
+        {
+            return Pick("mmrtext.ttf", "mmrtextb.ttf", "mmrtext.ttf", "mmrtextb.ttf", bold, italic);
+        }
+        if (name.Contains("pyidaungsu"))
+        {
+            return Pick("Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf",
+                "Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf", bold, italic);
+        }
+
         // A symbolic font is deliberately absent. Wingdings was measured to read
         // back empty through a rewrite: its glyphs are pictures, and the letters
         // of a replacement do not map onto them at all.

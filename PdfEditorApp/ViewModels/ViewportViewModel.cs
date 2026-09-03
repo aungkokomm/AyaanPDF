@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -5096,13 +5097,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_documentHandle == 0) { return Array.Empty<LineSnapshot>(); }
 
-        if (!_linesByPage.TryGetValue(pageIndex, out var found))
+        if (_linesByPage.TryGetValue(pageIndex, out var found))
         {
-            found = Interop.LineGateway.Load(_documentHandle, pageIndex);
-            _linesByPage[pageIndex] = found;
+            return found;
         }
 
-        return found;
+        // ⚠️ CACHED ONLY WHEN THE ANSWER IS FINAL. A page of shaped text is
+        // read on a background thread, and until that finishes the gateway can
+        // only report what PDFium made of it. Remembering that would mean the
+        // reading finished and the page never noticed: the reader would be
+        // clicking fragments of scrambled text for as long as the document
+        // stayed open.
+        var lines = Interop.LineGateway.Load(_documentHandle, pageIndex, out bool settled);
+        if (settled)
+        {
+            _linesByPage[pageIndex] = lines;
+        }
+        return lines;
     }
 
     /// <summary>The line of the document's own text that is selected, or null.</summary>
@@ -5237,6 +5248,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // A line the core read from the FONT is put back by the writer that
+        // reads it, and by no other: it has no object range for the other two
+        // to address.
+        if (line.Route == LineWriter.RecoveryWriter)
+        {
+            return EditRecoveredLine(line, _selectedLinePage, newText);
+        }
+
         // ⚠️ ONE WRITE AT A TIME, AND THE GUARD IS WHY. A second commit
         // arriving while one is still writing would open an undo batch over the
         // top of the open one, and hand the core a line whose object range the
@@ -5261,6 +5280,72 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // ⚠️ "ACCEPTED", NOT "WRITTEN". The result is not known yet; it
         // reaches the reader through FinishLineWrite, which runs everything that
         // used to follow the write here, in the order it used to run.
+        return true;
+    }
+
+    /// <summary>
+    /// Retypes a line the core read from the font.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A WHOLE-DOCUMENT REWRITE, LIKE A FORM EDIT AND FOR THE SAME REASON.
+    /// The producer draws one of these lines as dozens of separate placements,
+    /// and putting it back means emptying all of them and writing one shaped run
+    /// where they were. That is a change to the file's own structure rather than
+    /// to a PDFium page, so it comes back as bytes and the document behind the
+    /// handle is replaced by them. Every index the app is holding is stale the
+    /// moment it returns.
+    ///
+    /// ⚠️ AND THE HISTORY ENTRY IS CAPTURED BEFORE AND PUSHED AFTER, exactly as
+    /// <see cref="SetFormFieldState"/> does it. The core changes nothing when it
+    /// refuses, and an entry pushed anyway would be a Ctrl+Z that appears to do
+    /// nothing.
+    /// </remarks>
+    private bool EditRecoveredLine(LineSnapshot line, int page, string newText)
+    {
+        if (line.Recovered is not { } recovered) { return false; }
+
+        // ⚠️ AN INSTALLED FONT, NEVER THE SUBSET THE FILE EMBEDS. A subset has
+        // its layout tables pruned, and shaping Burmese through one was
+        // measured giving two .notdef and seven wrong glyphs out of twenty-four.
+        string? fontPath = SystemFontMatch.PathFor(line.FontName);
+        if (fontPath is null)
+        {
+            Status = $"{line.FontName} is not installed on this machine, so this line cannot be retyped.";
+            return false;
+        }
+
+        var before = Capture(HistoryScope.Document, "Edit line", null);
+
+        byte[]? bytes = Interop.RecoveryGateway.Retype(
+            _documentHandle, page, recovered.PdfBaseline, recovered.Text, newText, fontPath);
+        if (bytes is null)
+        {
+            Diag.Log($"EditRecoveredLine p{page} refused at baseline {recovered.PdfBaseline}");
+            Status = "This line could not be retyped.";
+            return false;
+        }
+
+        RestoreDocumentBytes(bytes);
+
+        // ⚠️ THE DOCUMENT IS A DIFFERENT ONE NOW, and so is its handle, so the
+        // reading the core had cached for the old one is gone with it. Started
+        // again here rather than at the reader's next click, which is the whole
+        // reason prepare_recovery exists.
+        // ⚠️ THE WORDS GO WITH THE LINES, ALWAYS. They are read from the same
+        // content and describe the same document, and this rewrote all of it.
+        _linesByPage.Clear();
+        _clustersByPage.Clear();
+        _textRegions.Clear();
+        RenderCoreNative.prepare_recovery(_documentHandle, page);
+
+        _history.Push(before);
+        NotifyHistoryChanged();
+
+        InvalidateAllPageRasters();
+        RenderCurrentPage();
+        IsDirty = true;
+
+        Status = "Line retyped.";
         return true;
     }
 
@@ -10108,11 +10193,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 var result = await Task.Run(() =>
                 {
                     byte[]? b = bytes ?? SnapshotDocumentBytes(handle);
-                    var lines = cached ?? Interop.LineGateway.Load(handle, at);
+                    bool ready = true;
+                    var lines = cached ?? Interop.LineGateway.Load(handle, at, out ready);
                     var regions = b is null
                         ? (IReadOnlyList<TextRegion>)Array.Empty<TextRegion>()
                         : TextRegionReader.Build(b, at, lines);
-                    return (Bytes: b, Lines: lines, Regions: regions);
+                    return (Bytes: b, Lines: lines, Regions: regions, Settled: ready);
                 });
 
                 if (handle != _documentHandle || epoch != _textRegionEpoch || !IsEditMode)
@@ -10121,7 +10207,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 }
 
                 _textRegionBytes ??= result.Bytes;
-                if (cached is null) { _linesByPage[page] = result.Lines; }
+
+                // ⚠️ AND NOT REMEMBERED WHILE A PAGE IS STILL BEING READ, for
+                // the reason LinesFor gives: what is on offer until then is
+                // PDFium's reading, which for a shaped script is fragments of
+                // visual-order text.
+                if (cached is null && result.Settled) { _linesByPage[page] = result.Lines; }
 
                 // Always recorded, even when empty, or a page the reader cannot
                 // be offered anything on would be rebuilt on every single paint.
@@ -10192,12 +10283,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private int _lineEditPage = -1;
     private List<EditGlyph> _lineEditGlyphs = new();
 
-    /// <summary>One glyph of the text being edited: where it sits, and where it
-    /// is in the text the writer will be handed.</summary>
-    private sealed record EditGlyph(
-        double Left, double Right, double Bottom, int Offset,
-        double PointSize, string FontName, string ColorHex);
-
     /// <summary>
     /// Where the type sits on this line, in normalized page units.
     /// </summary>
@@ -10264,6 +10349,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // very next thing the reader does is click the line they just changed.
         // Reading the cache alone found it empty and refused to edit text that
         // had been editable a second earlier.
+        // ⚠️ A RECOVERED LINE BRINGS ITS OWN POSITIONS AND MUST NOT BE LOOKED
+        // UP HERE. The region model is built from what PDFium reads, and on a
+        // page like this one PDFium reads a hundred and fifty fragments of
+        // visual-order text where the page has eighteen lines. Nothing in it
+        // spells the recovered line, so the equality check below would refuse
+        // text the core has proven character by character. See
+        // `LineSnapshot.Recovered`.
+        if (unit.Line?.Recovered is { } recovered)
+        {
+            return BeginRecoveredEdit(pageIndex, unit, recovered, normX);
+        }
+
         var line = TextRegionHitTest.LineAt(EnsureTextRegions(pageIndex), normX, normY);
         var glyphs = line is null ? null : GlyphsOf(line, unit);
         if (line is null || glyphs is null || glyphs.Count == 0)
@@ -10285,6 +10382,58 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
 
         Diag.Log($"BeginInPlaceEdit p{pageIndex} caret={_lineEdit.Caret} text={unit.Text}");
+        InPlaceEditChanged?.Invoke();
+        return true;
+    }
+
+    /// <summary>A packed 0x00RRGGBB fill colour as the hex the drawing takes.</summary>
+    private static string InkHexOf(uint rgb) =>
+        "#" + (rgb & 0x00FFFFFFu).ToString("X6", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Puts a caret in a line the core read from the font.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CLUSTERS ARE THE POSITIONS, AND THERE ARE NO OTHERS. They were
+    /// laid out with the widths the FILE declares and the numbers written
+    /// between the glyphs, so they say where the page actually draws each mark
+    /// rather than where this font would put it. A line that arrived without
+    /// them is refused, because the alternative is a caret somewhere plausible
+    /// and wrong.
+    /// </remarks>
+    private bool BeginRecoveredEdit(
+        int pageIndex, TextUnitSelection unit, RecoveredLine recovered, double normX)
+    {
+        var glyphs = EditGlyphs.Of(recovered, InkHexOf(unit.Line!.ColorRgb));
+        if (glyphs.Count == 0)
+        {
+            Diag.Log($"BeginInPlaceEdit p{pageIndex} refused: no clusters for “{unit.Text}”");
+            Status = "This text cannot be edited in place yet.";
+            ShowUnitNotice("This text cannot be edited in place yet.");
+            return false;
+        }
+
+        // ⚠️ THE LINE'S OWN BOX, NOT A REGION LOOKED UP BY POSITION. Everything
+        // the tail needs is on the recovered line already, and asking the region
+        // model would be asking the reader that could not read this text.
+        _lineEditLine = new TextLine(
+            Text: unit.Text,
+            FirstObject: unit.Line.FirstObject,
+            LastObject: unit.Line.LastObject,
+            Left: unit.Line.Left,
+            Top: unit.Line.Top,
+            Right: unit.Line.Right,
+            Bottom: unit.Line.Bottom,
+            Baseline: unit.Line.Baseline,
+            Status: TextRegionStatus.Ok,
+            Runs: Array.Empty<TextRun>());
+        _lineEditUnit = unit;
+        _lineEditPage = pageIndex;
+        _lineEditGlyphs = glyphs;
+        _lineEditCoverHex = SamplePageBackground(pageIndex, _lineEditLine);
+        _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
+
+        Diag.Log($"BeginInPlaceEdit p{pageIndex} recovered caret={_lineEdit.Caret} text={unit.Text}");
         InPlaceEditChanged?.Invoke();
         return true;
     }
@@ -10343,38 +10492,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return sb.ToString();
     }
 
-    /// <summary>Which offset a click at <paramref name="x"/> means, by each
-    /// glyph's own midpoint.</summary>
-    private static int CaretOffsetIn(List<EditGlyph> glyphs, string text, double x)
-    {
-        foreach (var g in glyphs)
-        {
-            if (x < (g.Left + g.Right) / 2) { return Math.Clamp(g.Offset, 0, text.Length); }
-        }
-        return text.Length;
-    }
+    // ⚠️ THE RULES THEMSELVES LIVE IN THE VIEWPORT PROJECT, where a test can
+    // reach them. They used to be here, which meant the arithmetic that decides
+    // which letter a click lands on was only ever checked by running the app.
+
+    private static int CaretOffsetIn(List<EditGlyph> glyphs, string text, double x) =>
+        EditGlyphs.OffsetAt(glyphs, text, x);
 
     /// <summary>Where on the page an offset in the UNCHANGED text sits.</summary>
-    private double CaretXOf(int offset)
-    {
-        if (_lineEditGlyphs.Count == 0) { return 0; }
-        if (offset <= 0) { return _lineEditGlyphs[0].Left; }
+    private double CaretXOf(int offset) => EditGlyphs.XOf(_lineEditGlyphs, offset);
 
-        foreach (var g in _lineEditGlyphs)
-        {
-            if (g.Offset >= offset) { return g.Left; }
-        }
-        return _lineEditGlyphs[^1].Right;
-    }
-
-    private EditGlyph GlyphAtOrAfter(int offset)
-    {
-        foreach (var g in _lineEditGlyphs)
-        {
-            if (g.Offset >= offset) { return g; }
-        }
-        return _lineEditGlyphs[^1];
-    }
+    private EditGlyph GlyphAtOrAfter(int offset) =>
+        EditGlyphs.AtOrAfter(_lineEditGlyphs, offset);
 
     // ---------------- what a keystroke does ----------------
 

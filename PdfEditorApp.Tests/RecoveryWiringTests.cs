@@ -110,6 +110,129 @@ public class RecoveryWiringTests
         Assert.True(asked < called, "the page is prepared before anyone asks whether it needs it");
     }
 
+    /// <summary>
+    /// ⚠️ AND NEVER WAITS FOR IT. The gateway runs on the UI thread every time
+    /// a page is looked at, and asking for the reading before it is ready blocks
+    /// for the whole seventeen seconds. That freeze is precisely what
+    /// prepare_recovery exists to prevent, so the readiness question comes
+    /// first and an unready page simply keeps PDFium's lines for now.
+    /// </summary>
+    [Fact]
+    public void the_gateway_never_waits_for_the_reading()
+    {
+        string source = Source("PdfEditorApp", "Interop", "LineGateway.cs");
+
+        int asked = source.IndexOf("recovery_is_ready(docHandle, pageIndex)", StringComparison.Ordinal);
+        int loaded = source.IndexOf("RecoveryGateway.Load(docHandle, pageIndex)", StringComparison.Ordinal);
+
+        Assert.True(asked > 0, "nothing asks whether the reading is ready");
+        Assert.True(loaded > 0, "nothing reads it");
+        Assert.True(asked < loaded, "the reading is asked for before anyone checks it is ready");
+
+        // And an unready page says so, or the caller would cache PDFium's
+        // fragments and never look again.
+        Assert.Contains("settled = false;", source, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ THE FRAGMENTS ARE REPLACED IN ONE PLACE. If any other path built the
+    /// page's lines the reader would meet 150 scrambled fragments on one route
+    /// and 18 real lines on another, depending on how they got there.
+    /// </summary>
+    [Fact]
+    public void the_gateway_is_where_the_two_readings_are_merged()
+    {
+        string source = Source("PdfEditorApp", "Interop", "LineGateway.cs");
+        Assert.Contains("RecoveredLines.Merge(lines,", source, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The second gate: a recovered line brings its own positions, and the
+    /// region model must not be consulted for it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THIS IS WHERE THE READER WAS STOPPED. The region model is built from
+    /// what PDFium reads, so nothing in it spells the recovered text, and the
+    /// equality check that guards a caret refused every Burmese line with "This
+    /// text cannot be edited in place yet" even after the core could read it
+    /// perfectly. The branch has to come BEFORE the lookup, not after it.
+    /// </remarks>
+    [Fact]
+    public void a_recovered_line_never_asks_the_reader_that_could_not_read_it()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int begin = vm.IndexOf("public bool BeginInPlaceEdit(", StringComparison.Ordinal);
+        Assert.True(begin > 0);
+
+        string body = vm[begin..(begin + 2500)];
+        int branch = body.IndexOf("unit.Line?.Recovered is { } recovered", StringComparison.Ordinal);
+        int lookup = body.IndexOf("TextRegionHitTest.LineAt(", StringComparison.Ordinal);
+
+        Assert.True(branch > 0, "nothing notices a recovered line");
+        Assert.True(lookup > 0);
+        Assert.True(branch < lookup, "the region model is consulted before the recovered branch");
+    }
+
+    /// <summary>
+    /// ⚠️ ROUTED, NOT GUESSED. A recovered line has no object range, so the two
+    /// writers addressed by objects must never see one. The route says which
+    /// writer takes it and everything derives from that.
+    /// </summary>
+    [Fact]
+    public void a_recovered_line_commits_through_its_own_writer()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        Assert.Contains("line.Route == LineWriter.RecoveryWriter", vm, StringComparison.Ordinal);
+        Assert.Contains("EditRecoveredLine(line, _selectedLinePage, newText)", vm, StringComparison.Ordinal);
+        Assert.Contains("Interop.RecoveryGateway.Retype(", vm, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ CAPTURED BEFORE, PUSHED AFTER, exactly as a form edit does it. The
+    /// core changes nothing when it refuses, and an entry pushed anyway would be
+    /// a Ctrl+Z that appears to do nothing.
+    /// </summary>
+    [Fact]
+    public void a_refused_retype_leaves_no_undo_step_behind()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int at = vm.IndexOf("private bool EditRecoveredLine(", StringComparison.Ordinal);
+        Assert.True(at > 0);
+        string body = vm[at..(at + 2600)];
+
+        int captured = body.IndexOf("Capture(HistoryScope.Document", StringComparison.Ordinal);
+        int wrote = body.IndexOf("RecoveryGateway.Retype(", StringComparison.Ordinal);
+        int pushed = body.IndexOf("_history.Push(before)", StringComparison.Ordinal);
+
+        Assert.True(captured > 0 && wrote > captured && pushed > wrote,
+            "the undo step is not captured before the write and pushed after it");
+
+        // The refusal returns before the push.
+        int refused = body.IndexOf("Status = \"This line could not be retyped.\";", StringComparison.Ordinal);
+        Assert.True(refused > 0 && refused < pushed);
+    }
+
+    /// <summary>
+    /// ⚠️ EVERY PER-PAGE CACHE, AND THE READING TOO. This replaces the whole
+    /// document behind a NEW handle, so the lines, the words and the reading the
+    /// core had for the old one all describe a document that no longer exists.
+    /// The reading is started again here rather than at the reader's next click,
+    /// which is the entire reason prepare_recovery exists.
+    /// </summary>
+    [Fact]
+    public void a_retype_throws_away_everything_it_invalidated()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int at = vm.IndexOf("private bool EditRecoveredLine(", StringComparison.Ordinal);
+        string body = vm[at..(at + 2600)];
+
+        Assert.Contains("RestoreDocumentBytes(bytes);", body, StringComparison.Ordinal);
+        Assert.Contains("_linesByPage.Clear();", body, StringComparison.Ordinal);
+        Assert.Contains("_clustersByPage.Clear();", body, StringComparison.Ordinal);
+        Assert.Contains("prepare_recovery(_documentHandle, page)", body, StringComparison.Ordinal);
+    }
+
     private static string Source(params string[] parts)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
