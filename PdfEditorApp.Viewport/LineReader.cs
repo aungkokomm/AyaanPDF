@@ -38,6 +38,26 @@ public static class LineReader
     /// the lines decoded so far are still correct and the page simply offers
     /// fewer of them.
     /// </summary>
+    /// <summary>
+    /// Whether this page holds text the core can only read by reshaping it.
+    ///
+    /// ⚠️ THIS REFUSAL IS THE SIGNAL, AND IT IS FREE. The core cannot decide
+    /// for itself whether a document is worth the seventeen seconds that
+    /// reading it costs: finding out means either serialising the whole file or
+    /// asking PDFium for a page, and asking for a page parses it. The lines are
+    /// already read by the time anyone looks at this, and they already say so.
+    /// </summary>
+    public static bool NeedsReshaping(IReadOnlyList<LineSnapshot>? lines)
+    {
+        if (lines is null) { return false; }
+
+        foreach (var line in lines)
+        {
+            if (line.Refusal == LineRefusal.ComplexScript) { return true; }
+        }
+        return false;
+    }
+
     public static IReadOnlyList<LineSnapshot> Parse(byte[]? bytes)
     {
         if (bytes is null || bytes.Length < 4)

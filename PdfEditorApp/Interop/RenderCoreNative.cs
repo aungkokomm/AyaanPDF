@@ -698,6 +698,22 @@ internal static partial class RenderCoreNative
     public static extern ByteBuffer get_page_lines(ulong docHandle, int pageIndex);
 
     /// <summary>
+    /// Starts working out what a page's shaped text says, and returns at once.
+    ///
+    /// A page whose script the core cannot read through the file's own tables
+    /// comes back from <see cref="get_page_lines"/> as
+    /// <see cref="Viewport.LineRefusal.ComplexScript"/>. Reading it instead
+    /// from the FONT costs about 17 seconds of work the first time, so this
+    /// starts that on a background thread as soon as such a page is seen, and
+    /// the reading is waiting by the time anyone asks for it.
+    ///
+    /// ⚠️ SAFE TO CALL ON EVERY REPAINT. Once a page is done, or while it is
+    /// being done, this costs a lock and returns.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern void prepare_recovery(ulong docHandle, int pageIndex);
+
+    /// <summary>
     /// Replaces one visual line with one string, or changes nothing at all.
     ///
     /// The three identifying arguments must be exactly what the line was read

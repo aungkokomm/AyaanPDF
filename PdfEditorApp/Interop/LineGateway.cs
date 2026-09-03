@@ -31,7 +31,18 @@ internal static class LineGateway
             byte[] bytes = new byte[(int)buffer.Len];
             Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
 
-            return LineReader.Parse(bytes);
+            var lines = LineReader.Parse(bytes);
+
+            // ⚠️ THE ONE PLACE THAT KNOWS IN TIME. A page whose script cannot be
+            // read through the file's own tables says so right here, and the
+            // work of reading it from the FONT instead takes about seventeen
+            // seconds. Started now, it is finished long before a reader has
+            // clicked on anything. Started when they click, they wait for it.
+            if (LineReader.NeedsReshaping(lines))
+            {
+                RenderCoreNative.prepare_recovery(docHandle, pageIndex);
+            }
+            return lines;
         }
         finally
         {

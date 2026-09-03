@@ -1709,6 +1709,14 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
     }
     std::thread::spawn(move || {
         let _ = panic::catch_unwind(|| {
+            // ⚠️ ASKED AGAIN AND AGAIN, SO ASKING AGAIN MUST BE FREE. A caller
+            // reaches this from wherever it reads a page's lines, which is
+            // every repaint, and serialising the document each time to find
+            // out there was nothing to do would be worse than the wait it
+            // exists to remove.
+            if already_prepared(doc_handle, page_index) {
+                return;
+            }
             let Some(bytes) = document_bytes(doc_handle) else { return };
             let Ok(doc) = lopdf::Document::load_mem(&bytes) else { return };
             let pages = doc.get_pages();
@@ -1719,6 +1727,25 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
             let _ = indexes_for_page(doc_handle, page_index, &doc, page);
         });
     });
+}
+
+/// Whether this page is already read for, or is being read for right now.
+///
+/// ⚠️ NEITHER ANSWER BLOCKS. A slot that is locked means another thread is
+/// inside the 17 seconds, and the right thing to do about that is nothing at
+/// all, not queue up behind it.
+fn already_prepared(doc_handle: u64, page_index: i32) -> bool {
+    let slot = {
+        let all = lock(&core().recoveries);
+        all.get(&(doc_handle, page_index)).cloned()
+    };
+    let Some(slot) = slot else { return false };
+    match slot.try_lock() {
+        Ok(held) => held.is_some(),
+        // Held by whoever is building it, or poisoned by one that died trying.
+        // Either way there is nothing useful to add.
+        Err(_) => true,
+    }
 }
 
 /// The document as bytes, for the readers that work on PDF structure rather
