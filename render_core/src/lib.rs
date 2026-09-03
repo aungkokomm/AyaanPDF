@@ -1675,6 +1675,67 @@ fn snapshot_document_inner(doc_handle: u64) -> ByteBuffer {
     buffer
 }
 
+/// What a page's Burmese says, recovered by reshaping it.
+///
+/// ⚠️ THIS IS THE ONLY WAY TO READ A PAGE WHOSE OWN TABLES ARE WRONG, and
+/// a Word-produced Myanmar file is one: 6 of 59 entries in one of its fonts
+/// mapped a real Burmese letter to a bare space. `get_page_lines` reads through
+/// those tables and refuses the result as `LINE_COMPLEX_SCRIPT`, correctly.
+/// This answers the same page from the FONT instead. See [`crate::reshape`].
+///
+/// ⚠️ AND IT IS SLOW: about 17 seconds for a page, nearly all of it
+/// building the index of what the font draws. It is a deliberate, separate call
+/// for exactly that reason, so nothing pays for it that has not asked.
+///
+/// Encoding: `u32` line count, then per line `f32` y, `f32` x, `u32` byte
+/// length and that many UTF-8 bytes. A line nothing could prove has length 0,
+/// and is still reported so a caller can match it by baseline.
+#[unsafe(no_mangle)]
+pub extern "C" fn recover_page_text(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(move || recover_page_text_inner(doc_handle, page_index))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
+    let snap = snapshot_document(doc_handle);
+    if snap.status != STATUS_OK_PDFIUM {
+        return ByteBuffer::err(snap.status);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+    free_byte_buffer(snap);
+
+    let Ok(doc) = lopdf::Document::load_mem(&bytes) else {
+        return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+    };
+    let pages = doc.get_pages();
+    let Some((_, &page)) = pages.iter().nth(page_index as usize) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let read = recover::read_page(&doc, page);
+    let mut out: Vec<u8> = Vec::new();
+    out.extend((read.len() as u32).to_le_bytes());
+    for line in &read {
+        out.extend((line.y as f32).to_le_bytes());
+        out.extend((line.x as f32).to_le_bytes());
+        let said = line.text.as_deref().unwrap_or("");
+        out.extend((said.len() as u32).to_le_bytes());
+        out.extend(said.as_bytes());
+    }
+
+    let mut boxed = out.into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
 /// Rewrites ONE justified line's content-stream operators, returning the whole
 /// document's new bytes.
 ///
@@ -25873,6 +25934,69 @@ p={spread_px:.4},c={rgba:08X})"
             "the live document was modified by a call that only produces bytes");
         assert_eq!(still.len(), 2, "the live document gained or lost a line");
         close_document(handle);
+    }
+
+    /// What `recover_page_text` reported, decoded.
+    fn recovered(bytes: &[u8], page: i32) -> Vec<(f32, String)> {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the document");
+        let buffer = recover_page_text(handle, page);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "recovery refused the page");
+        let raw = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+        close_document(handle);
+
+        let mut at = 0usize;
+        let take4 = |b: &[u8], at: &mut usize| {
+            let v: [u8; 4] = b[*at..*at + 4].try_into().unwrap();
+            *at += 4;
+            v
+        };
+        let count = u32::from_le_bytes(take4(&raw, &mut at));
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let y = f32::from_le_bytes(take4(&raw, &mut at));
+            let _x = f32::from_le_bytes(take4(&raw, &mut at));
+            let len = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
+            let text = String::from_utf8(raw[at..at + len].to_vec()).unwrap();
+            at += len;
+            out.push((y, text));
+        }
+        assert_eq!(at, raw.len(), "the buffer did not decode exactly");
+        out
+    }
+
+    /// \u{26a0}\u{fe0f} THE WHOLE CHAIN, ON A PAGE THIS TEST WROTE. Path B draws
+    /// Burmese into a fixture, and the recovery reads it back out of the glyphs
+    /// alone. Neither half is told anything by the other.
+    #[test]
+    fn a_page_s_burmese_is_read_back_out_of_its_glyphs() {
+        if !std::path::Path::new(MYANMAR_FONT).exists() {
+            return;
+        }
+        // "မြန်မာ", whose medial is drawn before the consonant it follows.
+        const MYANMAR: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let edited = shaped_ffi(handle, at, 5, MYANMAR, MYANMAR_FONT)
+            .expect("the shaped edit was refused");
+        close_document(handle);
+
+        let read = recovered(&edited, 0);
+        assert!(read.iter().any(|(_, text)| text.contains(MYANMAR)),
+            "the Burmese this test drew was not read back: {read:?}");
+    }
+
+    /// \u{26a0}\u{fe0f} AND A PAGE WITH NO BURMESE ON IT IS NOT GUESSED AT. Every
+    /// line comes back empty rather than wrong, because no font on it is one
+    /// this can read.
+    #[test]
+    fn a_page_in_a_font_this_cannot_read_reports_nothing() {
+        let bytes = std::fs::read(justified_embedded_fixture()).unwrap();
+        let read = recovered(&bytes, 0);
+        assert!(read.iter().all(|(_, text)| text.is_empty()),
+            "a Latin page was read as something: {read:?}");
     }
 
     /// KNOWN-GOOD MYANMAR -> SHAPED PAGE CONTENT -> SAVE/REOPEN -> CORRECT TEXT.

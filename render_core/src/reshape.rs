@@ -34,42 +34,89 @@ pub(crate) struct Index {
     longest: usize,
 }
 
+/// Whether a page drawing only `allowed` can be using this piece of a syllable.
+///
+/// ⚠️ IT MUST BE ASKED IN CONTEXT. A mark on its own is not Burmese,
+/// and a shaper says so by drawing a dotted circle in front of it. No page
+/// contains that glyph, so testing the bare form rejects every mark there is:
+/// measured, it took every conjunct in the language out of the index.
+///
+/// So each piece is shaped ONTO a consonant, and what it adds to that
+/// consonant's own glyphs is what a page using it would have to be drawing.
+fn usable(face: &rustybuzz::Face, allowed: &BTreeSet<u16>, piece: &str) -> bool {
+    const ON: &str = "\u{1000}";
+    if piece.is_empty() {
+        return true;
+    }
+    let alone = draws(face, ON);
+    let with = draws(face, &format!("{ON}{piece}"));
+    let mut added = with.iter().filter(|g| !alone.contains(g)).peekable();
+    added.peek().is_none() || added.any(|g| allowed.contains(g))
+}
+
+/// The parts of a syllable a page can actually be drawing.
+///
+/// ⚠️ THIS IS WHAT MAKES RECOVERY AFFORDABLE, and it is allowed to be
+/// wrong. The enumeration is a product: every base against every stack, medial,
+/// vowel and tail, which is millions of syllables and about eighteen seconds of
+/// shaping. Dropping the parts a page cannot contain cuts each term of that
+/// product. If it ever drops one the page DOES contain, the line fails to prove
+/// and is refused, because nothing is believed without being shaped again.
+/// Narrowing can cost a reading; it cannot corrupt one.
+struct Scope {
+    stacks: Vec<char>,
+    medials: Vec<&'static str>,
+    vowels: Vec<&'static str>,
+    tails: Vec<&'static str>,
+}
+
+/// ⚠️ ONLY THE STACKS ARE NARROWED, AND THAT IS A MEASURED CHOICE. Narrowing
+/// the medials, vowels and tails the same way was tried on a real page and is a
+/// bad trade: it read 12 lines instead of 16 and saved 4.6 seconds of 17.7. A
+/// page of ordinary prose uses most of the marks in the language, so there is
+/// little to cut, and cutting the few it happens not to use costs whole lines.
+/// Stacking is different: it is the term that multiplies, every base against
+/// every stack, and a page uses a handful of conjuncts at most.
+fn scope_of(face: &rustybuzz::Face, glyphs: Option<&BTreeSet<u16>>) -> Option<Scope> {
+    let allowed = glyphs?;
+    Some(Scope {
+        stacks: (0x1000u32..=0x1021)
+            .filter_map(char::from_u32)
+            .filter(|c| usable(face, allowed, &format!("\u{1039}{c}")))
+            .collect(),
+        medials: MEDIALS.to_vec(),
+        vowels: VOWELS.to_vec(),
+        tails: TAILS.to_vec(),
+    })
+}
+
+const MEDIALS: [&str; 12] = [
+    "", "\u{103B}", "\u{103C}", "\u{103D}", "\u{103E}",
+    "\u{103B}\u{103D}", "\u{103B}\u{103E}", "\u{103C}\u{103D}",
+    "\u{103C}\u{103E}", "\u{103D}\u{103E}",
+    "\u{103B}\u{103D}\u{103E}", "\u{103C}\u{103D}\u{103E}",
+];
+/// ⚠️ A STACKED CONSONANT DOES NOT TAKE THE FULL MEDIAL SET. Allowing it to
+/// multiplied the enumeration by 12 instead of 5.
+const MEDIALS_ON_A_STACK: [&str; 5] = ["", "\u{103B}", "\u{103C}", "\u{103D}", "\u{103E}"];
+const ES: [&str; 2] = ["", "\u{1031}"];
+const VOWELS: [&str; 10] = [
+    "", "\u{102B}", "\u{102C}", "\u{102D}", "\u{102E}", "\u{102F}",
+    "\u{1030}", "\u{1032}", "\u{102D}\u{102F}", "\u{102E}\u{102F}",
+];
+const TAILS: [&str; 10] = [
+    "", "\u{1036}", "\u{1037}", "\u{103A}", "\u{1038}",
+    "\u{1036}\u{1038}", "\u{1037}\u{103A}", "\u{102C}\u{103A}",
+    "\u{1036}\u{1037}", "\u{103A}\u{1038}",
+];
+
 /// Burmese syllables, as text.
 ///
 /// The shape of a syllable is fixed by the script, so this is an ENUMERATION
 /// and not a search: an optional kinzi, a base, an optional stacked consonant,
 /// the medials in their fixed order, then the vowels and the tone marks in
 /// theirs. Anything the font cannot draw is dropped when it is shaped.
-/// Which consonants can appear STACKED under another on a page drawing only
-/// `glyphs`, found by asking the font what each stacked form draws.
-///
-/// ⚠️ THIS IS AN OPTIMISATION AND IT IS ALLOWED TO BE WRONG. Stacking is what
-/// makes the enumeration expensive: every base pairs with every stack. Cutting
-/// the stacks a page cannot contain removes most of that. If it ever cuts one a
-/// page DOES contain, the line simply fails to prove and is refused, because
-/// nothing is believed without being shaped again. Narrowing can cost a reading;
-/// it cannot corrupt one.
-/// ⚠️ AND IT MUST BE ASKED IN CONTEXT. A stacked consonant on its own is not
-/// Burmese, and a shaper says so by drawing a dotted circle in front of it. No
-/// page contains that glyph, so testing the bare form rejected every stack
-/// there is and took the conjuncts down with it.
-fn stackable(face: &rustybuzz::Face, glyphs: Option<&BTreeSet<u16>>) -> Option<Vec<char>> {
-    let allowed = glyphs?;
-    let alone = draws(face, "\u{1000}");
-    let mut out = Vec::new();
-    for c in (0x1000u32..=0x1021).filter_map(char::from_u32) {
-        let stacked = draws(face, &format!("\u{1000}\u{1039}{c}"));
-        // What the stack ADDED to the base, which is the part a page carrying
-        // this conjunct has to be drawing.
-        let mut added = stacked.iter().filter(|g| !alone.contains(g)).peekable();
-        if added.peek().is_none() || added.any(|g| allowed.contains(g)) {
-            out.push(c);
-        }
-    }
-    Some(out)
-}
-
-fn syllables(only: Option<&BTreeSet<char>>, stacks_of: Option<&[char]>) -> Vec<String> {
+fn syllables(only: Option<&BTreeSet<char>>, scope: Option<&Scope>) -> Vec<String> {
     let wanted = |s: &str| -> bool {
         match only {
             None => true,
@@ -99,39 +146,33 @@ fn syllables(only: Option<&BTreeSet<char>>, stacks_of: Option<&[char]>) -> Vec<S
     let kinzi = "\u{1004}\u{103A}\u{1039}";
     let with_kinzi: Vec<String> = consonants.iter().map(|c| format!("{kinzi}{c}")).collect();
 
-    let stacks: Vec<String> = match stacks_of {
-        Some(only) => only.iter().map(|c| format!("\u{1039}{c}")).collect(),
+    let stacks: Vec<String> = match scope {
+        Some(s) => s.stacks.iter().map(|c| format!("\u{1039}{c}")).collect(),
         None => consonants.iter().map(|c| format!("\u{1039}{c}")).collect(),
     };
-
-    const MEDIALS: [&str; 12] = [
-        "", "\u{103B}", "\u{103C}", "\u{103D}", "\u{103E}",
-        "\u{103B}\u{103D}", "\u{103B}\u{103E}", "\u{103C}\u{103D}",
-        "\u{103C}\u{103E}", "\u{103D}\u{103E}",
-        "\u{103B}\u{103D}\u{103E}", "\u{103C}\u{103D}\u{103E}",
-    ];
-    // ⚠️ A STACKED CONSONANT DOES NOT TAKE THE FULL MEDIAL SET. Allowing it to
-    // multiplied the enumeration by 12 instead of 5 and cost most of a
-    // 7.6-million-entry index that a real page used about 300 of.
-    const MEDIALS_ON_A_STACK: [&str; 5] =
-        ["", "\u{103B}", "\u{103C}", "\u{103D}", "\u{103E}"];
-    const ES: [&str; 2] = ["", "\u{1031}"];
-    const VOWELS: [&str; 10] = [
-        "", "\u{102B}", "\u{102C}", "\u{102D}", "\u{102E}", "\u{102F}",
-        "\u{1030}", "\u{1032}", "\u{102D}\u{102F}", "\u{102E}\u{102F}",
-    ];
-    const TAILS: [&str; 10] = [
-        "", "\u{1036}", "\u{1037}", "\u{103A}", "\u{1038}",
-        "\u{1036}\u{1038}", "\u{1037}\u{103A}", "\u{102C}\u{103A}",
-        "\u{1036}\u{1037}", "\u{103A}\u{1038}",
-    ];
+    let medials: &[&str] = match scope {
+        Some(s) => &s.medials,
+        None => &MEDIALS,
+    };
+    let stacked_medials: Vec<&str> = match scope {
+        Some(s) => s.medials.iter().copied().filter(|m| MEDIALS_ON_A_STACK.contains(m)).collect(),
+        None => MEDIALS_ON_A_STACK.to_vec(),
+    };
+    let vowels: &[&str] = match scope {
+        Some(s) => &s.vowels,
+        None => &VOWELS,
+    };
+    let tails: &[&str] = match scope {
+        Some(s) => &s.tails,
+        None => &TAILS,
+    };
 
     let mut out: Vec<String> = Vec::new();
     let mut emit = |base: &str, stack: &str, medials: &[&str]| {
         for medial in medials {
             for e in ES {
-                for vowel in VOWELS {
-                    for tail in TAILS {
+                for vowel in vowels {
+                    for tail in tails {
                         let s = format!("{base}{stack}{medial}{e}{vowel}{tail}");
                         if wanted(&s) {
                             out.push(s);
@@ -143,15 +184,15 @@ fn syllables(only: Option<&BTreeSet<char>>, stacks_of: Option<&[char]>) -> Vec<S
     };
 
     for base in &plain {
-        emit(base, "", &MEDIALS);
+        emit(base, "", medials);
         for stack in &stacks {
-            emit(base, stack, &MEDIALS_ON_A_STACK);
+            emit(base, stack, &stacked_medials);
         }
     }
     // ⚠️ NO STACK ON TOP OF A KINZI. A kinzi already IS a stacked form, and
     // pairing the two is not Burmese.
     for base in &with_kinzi {
-        emit(base, "", &MEDIALS);
+        emit(base, "", medials);
     }
 
     // Whatever else a line of this text can hold.
@@ -198,7 +239,7 @@ impl Index {
         // `UnicodeBuffer` per syllable allocates, and this shapes hundreds of
         // thousands of them; `GlyphBuffer::clear` hands the same one back.
         let mut buffer = rustybuzz::UnicodeBuffer::new();
-        for text in syllables(chars, stackable(&face, glyphs).as_deref()) {
+        for text in syllables(chars, scope_of(&face, glyphs).as_ref()) {
             buffer.push_str(&text);
             let shaped = rustybuzz::shape(&face, &[], buffer);
             let drawn: Vec<u16> =

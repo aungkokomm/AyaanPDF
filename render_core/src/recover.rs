@@ -11,10 +11,16 @@
 //! answer that cannot drift: `Td` and `T*` are RELATIVE, and a reader that
 //! watches only `Tm` misses every line a producer moves to by leading.
 //!
-//! ⚠️ NOTHING CALLS THIS YET. What is missing is not here: the core refuses
-//! every shaped line before it gets this far, and a caret needs a position for
-//! each CHARACTER, which a line's reading does not carry. Both are the next
-//! step, and neither changes what this module answers.
+//! ⚠️ REACHED ONLY THROUGH `recover_page_text`, AND ON PURPOSE. Building the
+//! index of what a font draws takes about 17 seconds for a page, so this is a
+//! call a caller makes deliberately, for a page it already knows is refused.
+//! `get_page_lines` still reads through the file's own tables and still refuses
+//! the result, correctly: those tables really are wrong.
+//!
+//! ⚠️ WHAT IS STILL MISSING IS NOT HERE. An editor needs a position for each
+//! CHARACTER, and a line's reading does not carry one: the glyphs a page draws
+//! and the characters they spell are not in the same order and are not the same
+//! count. That is the next problem, and it does not change what this answers.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -388,12 +394,21 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
     (!out.is_empty()).then_some(out)
 }
 
+/// One line of a page, and what it says.
+pub(crate) struct Reading {
+    /// Where the line sits, in PDF user space.
+    pub(crate) y: f64,
+    pub(crate) x: f64,
+    /// What it says, or nothing when it could not be proven.
+    pub(crate) text: Option<String>,
+}
+
 /// Everything a page says that can be PROVEN, line by line.
 ///
 /// A line reads as `None` when nothing reproduced its glyphs: an unknown font,
 /// a character outside the enumeration, or a producer doing something the
 /// index does not model. A refusal is the correct answer there.
-pub(crate) fn read_page(doc: &Document, page: ObjectId) -> Vec<(f64, Option<String>)> {
+pub(crate) fn read_page(doc: &Document, page: ObjectId) -> Vec<Reading> {
     let lines = lines_of(doc, page);
 
     // One index per font, built over only the characters and glyphs that font
@@ -415,12 +430,13 @@ pub(crate) fn read_page(doc: &Document, page: ObjectId) -> Vec<(f64, Option<Stri
 
     lines
         .iter()
-        .map(|line| {
-            let said = faces.get(&line.base_font).and_then(|(bytes, index)| {
+        .map(|line| Reading {
+            y: line.y,
+            x: line.x,
+            text: faces.get(&line.base_font).and_then(|(bytes, index)| {
                 let face = rustybuzz::Face::from_slice(bytes, 0)?;
                 read_line(index, &face, line)
-            });
-            (line.y, said)
+            }),
         })
         .collect()
 }
@@ -702,12 +718,12 @@ mod tests {
         let (_, &page) = doc.get_pages().iter().next().unwrap();
 
         let read = read_page(&doc, page);
-        let proven = read.iter().filter(|(_, said)| said.is_some()).count();
+        let proven = read.iter().filter(|r| r.text.is_some()).count();
         println!("{proven} of {} lines, in {:?}", read.len(), started.elapsed());
-        for (n, (y, said)) in read.iter().enumerate() {
-            match said {
-                Some(text) => println!("  {n:>2} y={y:7.1}  {text}"),
-                None => println!("  {n:>2} y={y:7.1}  REFUSED"),
+        for (n, r) in read.iter().enumerate() {
+            match &r.text {
+                Some(text) => println!("  {n:>2} y={:7.1}  {text}", r.y),
+                None => println!("  {n:>2} y={:7.1}  REFUSED", r.y),
             }
         }
         assert!(proven * 2 > read.len(), "read {proven} of {} lines", read.len());
