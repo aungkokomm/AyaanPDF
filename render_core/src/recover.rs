@@ -100,14 +100,32 @@ pub(crate) struct Line {
     /// space. A negative number opens space and a positive one closes it, and
     /// both count: the total is how far the pen really travelled.
     pub(crate) adjust: f64,
-    /// Glyph indices with a word space in front of them.
+    /// Where the line's word spaces are, and how wide.
     ///
     /// ⚠️ FOUND BY GEOMETRY, NOT BY GLYPH. A space between two separately
     /// placed runs is drawn by placing the second one further along, so there
     /// is no space glyph to read. The gaps INSIDE a run are a different thing
     /// and are not breaks: a justified line stretches the spaces it already
     /// has, so reading those as spaces splits words the author typed as one.
-    pub(crate) breaks: Vec<usize>,
+    ///
+    /// ⚠️ AND THE WIDTH IS KEPT BECAUSE A REWRITER NEEDS IT. Collapsing a
+    /// line's placements into one run loses every space that was drawn as a
+    /// placement, unless the run puts them back as `TJ` numbers.
+    pub(crate) breaks: Vec<Break>,
+    /// Which operations of the page's content stream drew this line, in order.
+    ///
+    /// ⚠️ WHAT A REWRITER NEEDS AND A READER DOES NOT. A line is drawn by
+    /// several separately placed runs, so replacing its text means knowing
+    /// every operation that contributed a glyph, not just where the line sits.
+    pub(crate) drawn_by: Vec<usize>,
+}
+
+/// A word space inside a line: which glyph it comes before, and how wide it is
+/// in points.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Break {
+    pub(crate) at: usize,
+    pub(crate) points: f64,
 }
 
 fn number(o: &Object) -> Option<f64> {
@@ -132,7 +150,7 @@ fn dictionary(doc: &Document, o: &Object) -> Option<lopdf::Dictionary> {
 /// ⚠️ THE WIDTHS COME FROM THE FILE, NOT FROM THE INSTALLED FONT. They are what
 /// the producer actually advanced by, which is what decides where one placed
 /// run ends and whether a space stands between it and the next.
-fn fonts_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)> {
+pub(crate) fn fonts_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)> {
     let mut out = BTreeMap::new();
     let Some(page) = doc.get_dictionary(page).ok() else { return out };
     let Some(resources) = page.get(b"Resources").ok().and_then(|o| dictionary(doc, o)) else {
@@ -173,6 +191,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     let mut leading = 0.0f64;
     let mut glyphs: Vec<u16> = Vec::new();
     let mut adjust = 0.0f64;
+    let mut drawn_by: Vec<usize> = Vec::new();
 
     macro_rules! finish {
         () => {
@@ -189,14 +208,16 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     glyphs: std::mem::take(&mut glyphs),
                     adjust: std::mem::replace(&mut adjust, 0.0),
                     breaks: Vec::new(),
+                    drawn_by: std::mem::take(&mut drawn_by),
                 });
             } else {
                 adjust = 0.0;
+                drawn_by.clear();
             }
         };
     }
 
-    for op in &content.operations {
+    for (index, op) in content.operations.iter().enumerate() {
         match op.operator.as_str() {
             "BT" => {
                 finish!();
@@ -255,6 +276,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     Some(o @ Object::String(..)) => vec![o.clone()],
                     _ => continue,
                 };
+                drawn_by.push(index);
                 for item in items {
                     match item {
                         Object::String(bytes, _) => {
@@ -322,12 +344,13 @@ fn merge_placements(
         let gap = ends_at(out.last().unwrap()).map(|end| line.x - end);
         let prev = out.last_mut().unwrap();
         let at = prev.glyphs.len();
-        if gap.is_some_and(|g| g >= A_SPACE * line.size) {
-            prev.breaks.push(at);
+        if let Some(points) = gap.filter(|g| *g >= A_SPACE * line.size) {
+            prev.breaks.push(Break { at, points });
         }
         prev.glyphs.extend(&line.glyphs);
-        prev.breaks.extend(line.breaks.iter().map(|i| i + at));
+        prev.breaks.extend(line.breaks.iter().map(|b| Break { at: b.at + at, ..*b }));
         prev.adjust += line.adjust;
+        prev.drawn_by.extend(&line.drawn_by);
     }
     out
 }
@@ -364,7 +387,7 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
     let cuts: Vec<usize> = line
         .breaks
         .iter()
-        .copied()
+        .map(|b| b.at)
         .chain(std::iter::once(line.glyphs.len()))
         .collect();
 
@@ -417,6 +440,11 @@ impl Indexes {
     /// Whether anything on the page can be read at all.
     pub(crate) fn is_empty(&self) -> bool {
         self.by_font.is_empty()
+    }
+
+    /// What this font draws, if it is one that can be read.
+    pub(crate) fn index_for(&self, base_font: &str) -> Option<&crate::reshape::Index> {
+        self.by_font.get(base_font).map(|(_, index)| index)
     }
 }
 
@@ -481,6 +509,18 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
             }),
         })
         .collect()
+}
+
+/// Every line sitting on this baseline.
+///
+/// ⚠️ A BASELINE DOES NOT IDENTIFY A LINE, and this does not pretend it
+/// does. Two columns share one, and so do a shaped run and the invisible
+/// searchable run Ayaan writes beside it: measured, taking the first match on a
+/// Path B page picked the invisible one. It is the caller's expected TEXT that
+/// settles which was meant, and this only narrows the field.
+pub(crate) fn lines_at(lines: &[Line], baseline: f64) -> impl Iterator<Item = &Line> {
+    const NEAR: f64 = 0.5;
+    lines.iter().filter(move |l| (l.y - baseline).abs() < NEAR)
 }
 
 /// The same, building the indexes first. For a caller with nothing prepared.
@@ -608,7 +648,11 @@ mod tests {
 
         let lines = lines_of(&doc, page);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].breaks, vec![3], "the gap was not read as a space");
+        let found: Vec<usize> = lines[0].breaks.iter().map(|b| b.at).collect();
+        assert_eq!(found, vec![3], "the gap was not read as a space");
+        assert!((lines[0].breaks[0].points - 6.0).abs() < 0.01,
+            "the space came back {:?} wide, not the 6 points that were left",
+            lines[0].breaks[0].points);
     }
 
     /// A different baseline is a different line, however close it is drawn.
@@ -701,7 +745,8 @@ mod tests {
             size: 12.0,
             glyphs: left.iter().copied().chain(right.iter().copied()).collect(),
             adjust: 0.0,
-            breaks: vec![left.len()],
+            breaks: vec![Break { at: left.len(), points: 3.0 }],
+            drawn_by: Vec::new(),
         };
         assert_eq!(read_line(&index, &face, &line).as_deref(),
             Some(format!("{LEFT} {RIGHT}").as_str()));
@@ -731,7 +776,8 @@ mod tests {
             glyphs: drawn,
             adjust: 0.0,
             // Straight through the middle of the first cluster.
-            breaks: vec![1],
+            breaks: vec![Break { at: 1, points: 3.0 }],
+            drawn_by: Vec::new(),
         };
         assert_eq!(read_line(&index, &face, &line).as_deref(), Some(WORD),
             "an impossible break took the line down with it");

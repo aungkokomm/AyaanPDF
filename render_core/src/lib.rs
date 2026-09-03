@@ -41,6 +41,7 @@ mod pieces;
 mod provision;
 mod recover;
 mod reshape;
+mod retype;
 mod shaped;
 pub mod outline;
 
@@ -1782,6 +1783,75 @@ fn indexes_for_page(
     let built = Arc::new(recover::indexes_for(doc, page));
     *held = Some(Arc::clone(&built));
     built
+}
+
+/// Replaces the text of one line whose old text was RECOVERED, returning the
+/// whole document's new bytes.
+///
+/// ⚠️ FOR THE LINES `rewrite_justified_line_shaped` CANNOT EVEN FIND. That
+/// writer locates a line by encoding the expected text through WinAnsi, which
+/// has no code for U+1019, so a line of Burmese refuses before it starts. This
+/// one finds the line by its GLYPHS instead, through [`crate::recover`].
+///
+/// ⚠️ AND IT DOES NOT TOUCH THE LIVE DOCUMENT. It takes a snapshot,
+/// rewrites the bytes and hands them back. The caller opens them, checks the
+/// result, and only then swaps. A failure has nothing to roll back.
+///
+/// The line is named by its page and baseline, and by `expected_utf8`, what the
+/// caller believes it says. The line is recovered again here and must still say
+/// exactly that, so a stale selection cannot overwrite what has replaced it.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn retype_recovered_line(
+    doc_handle: u64,
+    page_index: i32,
+    baseline: f32,
+    expected_utf8: *const u8,
+    expected_len: usize,
+    new_text_utf8: *const u8,
+    new_text_len: usize,
+    font_path_utf8: *const u8,
+    font_path_len: usize,
+) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let (Some(expected), Some(new_text), Some(font_path)) = (
+        bytes_arg(expected_utf8, expected_len),
+        bytes_arg(new_text_utf8, new_text_len),
+        bytes_arg(font_path_utf8, font_path_len),
+    ) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let (Ok(expected), Ok(new_text), Ok(font_path)) = (
+        String::from_utf8(expected),
+        String::from_utf8(new_text),
+        String::from_utf8(font_path),
+    ) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    panic::catch_unwind(move || {
+        let Some(bytes) = document_bytes(doc_handle) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        match retype::retype(
+            &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
+        ) {
+            Ok(out) => {
+                let mut boxed = out.into_boxed_slice();
+                let buffer = ByteBuffer {
+                    data: boxed.as_mut_ptr(),
+                    len: boxed.len(),
+                    status: STATUS_OK_PDFIUM,
+                };
+                std::mem::forget(boxed);
+                buffer
+            }
+            Err(status) => ByteBuffer::err(status),
+        }
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
 }
 
 /// What a page's Burmese says, recovered by reshaping it.
@@ -26106,6 +26176,134 @@ p={spread_px:.4},c={rgba:08X})"
         println!("{said} of {} lines", read.len());
         close_document(handle);
         assert!(said > 0);
+    }
+
+    /// \u{26a0}\u{fe0f} PHASE 1, END TO END. A line is READ out of the glyphs, its
+    /// text is changed, and the page is made to say the new thing. Neither half
+    /// is told anything by the other: the reading comes from shaping the font,
+    /// and the writing is checked by reading it again.
+    #[test]
+    fn a_recovered_line_can_be_retyped() {
+        if !std::path::Path::new(MYANMAR_FONT).exists() {
+            return;
+        }
+        const WAS: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+        const NOW: &str = "\u{1019}\u{102C}\u{1014}";
+
+        // A page with Burmese on it, written by the other half of this feature.
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let edited = shaped_ffi(handle, at, 5, WAS, MYANMAR_FONT).expect("refused");
+        close_document(handle);
+
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        let read = read_recovered(handle);
+        let (y, text) = read.iter().find(|(_, t)| t.contains(WAS))
+            .cloned()
+            .expect("the Burmese was not read back");
+
+        let retyped = retype_ffi(handle, y, &text, &text.replace(WAS, NOW), MYANMAR_FONT)
+            .expect("the retype was refused");
+        close_document(handle);
+
+        // And the page says the new thing, read the same way as the old.
+        let after = recovered(&retyped, 0);
+        assert!(after.iter().any(|(_, t)| t.contains(NOW)),
+            "the page does not say what was written: {after:?}");
+        assert!(!after.iter().any(|(_, t)| t.contains(WAS)),
+            "the old text is still there: {after:?}");
+    }
+
+    /// \u{26a0}\u{fe0f} AND A CALLER WHOSE IDEA OF THE LINE IS STALE IS REFUSED. The
+    /// line is recovered again and must still say what the caller thinks, or
+    /// someone else's text would be overwritten.
+    #[test]
+    fn a_recovered_line_whose_text_has_moved_on_is_refused() {
+        if !std::path::Path::new(MYANMAR_FONT).exists() {
+            return;
+        }
+        const WAS: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let edited = shaped_ffi(handle, at, 5, WAS, MYANMAR_FONT).expect("refused");
+        close_document(handle);
+
+        let handle = open_document_from_bytes(edited.as_ptr(), edited.len());
+        let read = read_recovered(handle);
+        let (y, _) = read.iter().find(|(_, t)| t.contains(WAS)).cloned().unwrap();
+
+        let refused = retype_ffi(handle, y, "something else entirely", WAS, MYANMAR_FONT);
+        close_document(handle);
+        assert_eq!(refused, Err(STATUS_LINE_NOT_REWRITABLE));
+    }
+
+    /// Phase 1 on the real thing: read a line of a Word-produced Myanmar page,
+    /// change a word, and write it back.
+    ///
+    /// ⚠️ THIS CHECKS THE TEXT, NOT THE PICTURE. That the page reads back as the
+    /// new words says nothing about whether it still LOOKS right, and only a
+    /// person looking at it can say that. The file it leaves behind is for
+    /// exactly that.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn retyping_a_line_of_a_real_myanmar_page() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        const FONT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let read = read_recovered(handle);
+
+        // The first line the page will let us read.
+        let (y, text) = read.iter().find(|(_, t)| !t.is_empty()).cloned().expect("nothing read");
+        println!("was: {text}");
+
+        // Change the first word to another word already on the page.
+        let cut = text.find(' ').unwrap_or(text.len());
+        let edited = format!("မြန်မာ{}", &text[cut..]);
+        println!("now: {edited}");
+
+        let out = retype_ffi(handle, y, &text, &edited, FONT).expect("the retype was refused");
+        close_document(handle);
+
+        let path = std::env::temp_dir().join("ayaan_phase1_real.pdf");
+        std::fs::write(&path, &out).unwrap();
+        println!("wrote {}", path.display());
+
+        let after = recovered(&out, 0);
+        let said = after.iter().find(|(ry, _)| (ry - y).abs() < 0.5).map(|(_, t)| t.clone());
+        println!("page now says: {said:?}");
+        assert_eq!(said.as_deref(), Some(edited.as_str()));
+
+        // And every other line is exactly as it was.
+        let before: Vec<String> = read.iter().filter(|(ry, _)| (ry - y).abs() >= 0.5)
+            .map(|(_, t)| t.clone()).collect();
+        let now: Vec<String> = after.iter().filter(|(ry, _)| (ry - y).abs() >= 0.5)
+            .map(|(_, t)| t.clone()).collect();
+        assert_eq!(before, now, "another line changed");
+    }
+
+    fn retype_ffi(handle: u64, baseline: f32, expected: &str, new_text: &str, font: &str)
+        -> Result<Vec<u8>, i32>
+    {
+        let want = expected.as_bytes();
+        let text = new_text.as_bytes();
+        let path = font.as_bytes();
+        let buffer = retype_recovered_line(
+            handle, 0, baseline,
+            want.as_ptr(), want.len(),
+            text.as_ptr(), text.len(),
+            path.as_ptr(), path.len());
+        if buffer.status != STATUS_OK_PDFIUM {
+            let status = buffer.status;
+            free_byte_buffer(buffer);
+            return Err(status);
+        }
+        let out = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+        Ok(out)
     }
 
     /// What `recover_page_text` reported, decoded.

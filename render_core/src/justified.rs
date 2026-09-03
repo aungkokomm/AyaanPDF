@@ -1302,7 +1302,7 @@ pub(crate) fn rewrite_bytes_shaped(
 /// nothing uses it (measured), but a content stream naming a resource the page
 /// does not declare draws nothing at all. Both `/Resources` and `/Font` come in
 /// two forms, inline or by reference, and a real producer uses either.
-fn name_the_font(
+pub(crate) fn name_the_font(
     doc: &mut Document,
     page_id: lopdf::ObjectId,
     name: &[u8],
@@ -1379,7 +1379,7 @@ fn closing_emc(ops: &[Operation], from: usize) -> usize {
 /// ⚠️ UTF-16BE WITH A BOM. A PDF text string is PDFDoc-encoded unless the BOM
 /// says otherwise, and PDFDocEncoding cannot spell any of this. Hex, so no byte
 /// needs an escaping rule to survive.
-fn actual_text(text: &str) -> Operation {
+pub(crate) fn actual_text(text: &str) -> Operation {
     let mut utf16 = vec![0xFEu8, 0xFF];
     for unit in text.encode_utf16() {
         utf16.push((unit >> 8) as u8);
