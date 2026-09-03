@@ -10,6 +10,7 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Shapes;
 using PdfEditorApp.Controls;
 using PdfEditorApp.ViewModels;
@@ -37,6 +38,12 @@ public sealed partial class MainPage : Page
     private object? _appliedCursorKey;
     private bool _isCtrlDown;
     private bool _isSelectingText;
+
+    /// <summary>
+    /// True while the pointer is dragging a selection through the page's OWN
+    /// text, which is a different thing from the reader's copy selection above.
+    /// </summary>
+    private bool _inPlaceDragging;
 
     /// <summary>Where a text-selection press started, so the release can tell a
     /// click from a drag.</summary>
@@ -91,6 +98,11 @@ public sealed partial class MainPage : Page
             handledEventsToo: true);
         ViewModel.InkStrokeChanged += OnInkStrokeChanged;
         ViewModel.SelectionVisualsChanged += UpdateObjectToolbar;
+
+        // The caret and the redrawn tail follow the page: SelectionVisualsChanged
+        // covers scrolling and zooming, InPlaceEditChanged covers typing.
+        ViewModel.InPlaceEditChanged += RenderInPlaceEdit;
+        ViewModel.SelectionVisualsChanged += RenderInPlaceEdit;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
         // Shapes are a SEPARATE collection but share the ink canvas, so without
         // this a finished shape was added to the model and nothing ever redrew
@@ -2468,7 +2480,7 @@ public sealed partial class MainPage : Page
         if (ViewModel.Mode == mode) { return; }
 
         CommitTextEdit();
-        CommitUnitEdit();
+        ViewModel.CommitInPlaceEdit();
         ResetPointerInteraction();
 
         ViewModel.Mode = mode;
@@ -3400,10 +3412,10 @@ public sealed partial class MainPage : Page
     /// <summary>Clicking the dimmed area outside the box finishes the edit, keeping what was typed.</summary>
     private void EditScrim_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
-        // Either kind of editor may be open on this layer, and clicking away
-        // means the same thing for both: commit and close.
+        // ⚠️ THE ADD TEXT EDITOR ONLY. Editing the page's own text no longer
+        // uses this layer at all: it happens on the page, with nothing over it
+        // and nothing dimmed, so there is no scrim to click away from.
         CommitTextEdit();
-        CommitUnitEdit();
         e.Handled = true;
     }
 
@@ -6918,6 +6930,270 @@ public sealed partial class MainPage : Page
         PageJumpBox.SelectAll();
     }
 
+    // ---------------- drawing an in-place edit ----------------
+    //
+    // ⚠️⚠️ TWO THINGS ONLY, AND NEITHER IS A BOX. The caret, at the character
+    // the reader clicked; and the part of the line the page can no longer draw,
+    // redrawn in the page's own font, size, colour and baseline. Until they
+    // change something there is no second thing, so nothing at all is painted
+    // over the document and what they see is their own page with a caret in it.
+    //
+    // No border, no background of its own, no delete button, no scrim. Every
+    // one of those was on the TextBox this replaced, and every one of them said
+    // "you are editing a different object".
+
+    /// <summary>
+    /// The selection wash: the accent blue, translucent, so the page's own type
+    /// reads through it.
+    /// </summary>
+    private const string SelectionWashHex = "#552D6FC4";
+
+    private void RenderInPlaceEdit()
+    {
+        InPlaceLayer.Children.Clear();
+
+        if (!ViewModel.IsEditingInPlace) { return; }
+
+        int page = ViewModel.InPlacePage;
+        if (page < 0) { return; }
+
+        // ⚠️ TWO DIFFERENT SCALES, the same trap the old editor documented. The
+        // geometry is normalized across the page and converts with OverlayScale;
+        // the font size is an absolute point size and converts with
+        // DIPs-per-point. Mixing them once filled the window with two enormous
+        // letters.
+        double scale = ViewModel.OverlayScale;
+        double dipsPerPoint = ViewModel.DipsPerPointOn(page);
+        if (scale <= 0 || dipsPerPoint <= 0) { return; }
+
+        double pageTop = ViewModel.SlotTopOf(page);
+        var tail = ViewModel.InPlaceTail();
+
+        // ⚠️ THE SELECTION OVER THE PAGE'S OWN GLYPHS GOES DOWN FIRST, so it
+        // sits under everything and the real type shows through it. It is a
+        // wash of colour over the document's letterforms, which is what a
+        // selection over a page should look like; painting it opaque would hide
+        // the very text it is saying is selected.
+        if (ViewModel.InPlaceSelectionOnPage() is { } selected)
+        {
+            double sl = selected.Left * scale;
+            double st = (selected.Top * scale) + pageTop;
+            var wash = new Rectangle
+            {
+                Width = Math.Max(0, (selected.Right - selected.Left) * scale),
+                Height = (selected.Bottom - selected.Top) * scale,
+                Fill = HexBrush(SelectionWashHex),
+            };
+            Canvas.SetLeft(wash, sl);
+            Canvas.SetTop(wash, st);
+            InPlaceLayer.Children.Add(wash);
+        }
+
+        if (tail is not null)
+        {
+            DrawInPlaceTail(tail, scale, pageTop, dipsPerPoint);
+        }
+
+        // The caret, when it is still among text the page itself is drawing.
+        // When it has moved out into the tail, the tail drew it.
+        if (ViewModel.InPlaceCaretOnPage() is { } caret)
+        {
+            DrawCaret(
+                caret.X * scale,
+                (caret.Top * scale) + pageTop,
+                (caret.Bottom - caret.Top) * scale,
+                HexBrush(tail?.ColorHex ?? "#000000"),
+                dipsPerPoint * 12);
+        }
+    }
+
+    private void DrawInPlaceTail(
+        LiveTextTail tail, double scale, double pageTop, double dipsPerPoint)
+    {
+        double left = tail.Left * scale;
+        double top = (tail.Top * scale) + pageTop;
+        double height = (tail.Bottom - tail.Top) * scale;
+        double fontDip = Math.Max(1, tail.FontSizePts * dipsPerPoint);
+        var ink = HexBrush(tail.ColorHex);
+
+        // 1. Paint out the glyphs this replaces, and ONLY those. The cover stops
+        //    at the old text's own right edge, because that is as far as the
+        //    page drew, and it is the page's own colour rather than an assumed
+        //    white.
+        var cover = new Rectangle
+        {
+            Width = Math.Max(0, (tail.CoverRight - tail.Left) * scale),
+            Height = height,
+            Fill = HexBrush(tail.CoverColorHex),
+        };
+        Canvas.SetLeft(cover, left);
+        Canvas.SetTop(cover, top);
+        InPlaceLayer.Children.Add(cover);
+
+        // 2. The selection inside the tail, measured in the font the tail is
+        //    drawn in. Under the text for the same reason as above.
+        if (tail.SelectFrom >= 0 && tail.SelectTo > tail.SelectFrom)
+        {
+            double from = RunWidth(tail.Text[..tail.SelectFrom], tail, fontDip, ink);
+            double to = RunWidth(tail.Text[..tail.SelectTo], tail, fontDip, ink);
+
+            var wash = new Rectangle
+            {
+                Width = Math.Max(0, to - from),
+                Height = height,
+                Fill = HexBrush(SelectionWashHex),
+            };
+            Canvas.SetLeft(wash, left + from);
+            Canvas.SetTop(wash, top);
+            InPlaceLayer.Children.Add(wash);
+        }
+
+        // 3. The tail itself, sitting on the page's own baseline. Where that
+        //    falls below the top of the text depends on the font's ascent, so
+        //    it is asked for rather than guessed at.
+        var text = NewTailRun(tail.Text, tail, fontDip, ink);
+        text.Measure(new Windows.Foundation.Size(
+            double.PositiveInfinity, double.PositiveInfinity));
+
+        double ascent = text.BaselineOffset > 0 ? text.BaselineOffset : fontDip * 0.8;
+        double baselineY = (tail.Baseline * scale) + pageTop;
+
+        Canvas.SetLeft(text, left);
+        Canvas.SetTop(text, baselineY - ascent);
+        InPlaceLayer.Children.Add(text);
+
+        // 4. The caret, when it is inside the tail. Its position is the width of
+        //    the text before it, measured in the very font that text is drawn
+        //    in, so it lands exactly where the next character will appear.
+        if (tail.CaretInTail)
+        {
+            DrawCaret(left + RunWidth(tail.Before, tail, fontDip, ink), top, height, ink, fontDip);
+        }
+    }
+
+    /// <summary>
+    /// How wide a piece of the tail is, measured in the font it is drawn in.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ MEASURED, NOT ESTIMATED. The caret and the selection edges both have
+    /// to land between the same two letters the reader is looking at, and a
+    /// proportional font gives no shortcut. Measuring the very run that is
+    /// drawn is the only thing that cannot drift from it.
+    /// </remarks>
+    private static double RunWidth(string text, LiveTextTail tail, double fontDip, Brush ink)
+    {
+        if (string.IsNullOrEmpty(text)) { return 0; }
+
+        var run = NewTailRun(text, tail, fontDip, ink);
+        run.Measure(new Windows.Foundation.Size(
+            double.PositiveInfinity, double.PositiveInfinity));
+        return run.DesiredSize.Width;
+    }
+
+    private static TextBlock NewTailRun(
+        string text, LiveTextTail tail, double fontDip, Brush ink) =>
+        new()
+        {
+            Text = text,
+            FontFamily = new Microsoft.UI.Xaml.Media.FontFamily(tail.FontFamily),
+            FontSize = fontDip,
+            Foreground = ink,
+            FontWeight = tail.Bold
+                ? Microsoft.UI.Text.FontWeights.Bold
+                : Microsoft.UI.Text.FontWeights.Normal,
+            FontStyle = tail.Italic
+                ? Windows.UI.Text.FontStyle.Italic
+                : Windows.UI.Text.FontStyle.Normal,
+
+            // ⚠️ NO WRAPPING AND NO TRIMMING. A tail that ran onto a second
+            // line, or ended in an ellipsis, would be showing the reader
+            // something other than what they typed.
+            TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.None,
+            IsHitTestVisible = false,
+        };
+
+    /// <summary>A text caret: a thin upright rule, in the colour of the type it
+    /// sits among.</summary>
+    private void DrawCaret(double x, double top, double height, Brush ink, double fontDip)
+    {
+        double width = Math.Max(1, fontDip * 0.06);
+
+        var caret = new Rectangle
+        {
+            Width = width,
+            Height = height,
+            Fill = ink,
+        };
+
+        // Centred on the position rather than starting at it, so it sits
+        // between two letters instead of on top of the one to its right.
+        Canvas.SetLeft(caret, x - (width / 2));
+        Canvas.SetTop(caret, top);
+        InPlaceLayer.Children.Add(caret);
+
+        Blink(caret);
+    }
+
+    /// <summary>
+    /// Makes the caret blink, at the rate Windows carets blink.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NOT DECORATION. A thin upright rule that never moves is a mark on the
+    /// page, and this one is drawn among the page's own letterforms where a
+    /// stray rule is exactly what it would look like. Blinking is the whole of
+    /// what tells the reader it is a caret and that the keyboard is theirs.
+    ///
+    /// Discrete frames rather than a fade, because a caret is on or off.
+    /// </remarks>
+    private static void Blink(UIElement caret)
+    {
+        var frames = new DoubleAnimationUsingKeyFrames
+        {
+            RepeatBehavior = RepeatBehavior.Forever,
+            Duration = new Duration(TimeSpan.FromMilliseconds(1060)),
+        };
+        frames.KeyFrames.Add(new DiscreteDoubleKeyFrame
+        {
+            KeyTime = KeyTime.FromTimeSpan(TimeSpan.Zero),
+            Value = 1,
+        });
+        frames.KeyFrames.Add(new DiscreteDoubleKeyFrame
+        {
+            KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(530)),
+            Value = 0,
+        });
+
+        Storyboard.SetTarget(frames, caret);
+        Storyboard.SetTargetProperty(frames, "Opacity");
+
+        var blink = new Storyboard();
+        blink.Children.Add(frames);
+        blink.Begin();
+    }
+
+    /// <summary>
+    /// Typed text, while the reader is editing the page's own text.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ CharacterReceived, NOT KeyDown MAPPED TO LETTERS. This is the event
+    /// that has already been through the keyboard layout, the dead keys and the
+    /// IME, so it delivers what the reader actually meant to type. This user
+    /// writes Devanagari and Burmese, where mapping virtual keys to characters
+    /// by hand would produce nothing usable at all.
+    /// </remarks>
+    private void RootGrid_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
+    {
+        if (!ViewModel.IsEditingInPlace || _isCtrlDown || IsAltDown()) { return; }
+
+        // Enter, Escape, Backspace and Tab arrive here too. They are keys, not
+        // text, and RootGrid_KeyDown has already dealt with them.
+        if (char.IsControl(args.Character)) { return; }
+
+        ViewModel.InPlaceInsert(args.Character.ToString());
+        args.Handled = true;
+    }
+
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
         // DIAGNOSTIC (temporary): does the REAL handler get this key at all?
@@ -6961,6 +7237,79 @@ public sealed partial class MainPage : Page
                 e.Handled = true;
             }
 
+            return;
+        }
+
+        // ⚠️ IN-PLACE EDITING TAKES ITS KEYS BEFORE THE CANVAS DOES. There is no
+        // TextBox holding focus any more, so nothing else will claim them: the
+        // reader is typing into the page itself. It has to come before what
+        // follows, because Escape would leave full screen, Delete would remove
+        // an annotation, and the arrows would nudge a selection or scroll.
+        //
+        // ⚠️ AND AFTER THE TEXT-FIELD GUARD ABOVE, never before it. The find
+        // box and the page-jump box are real text fields, and a caret sitting
+        // in the page does not entitle this to take the keys out of one.
+        //
+        // Only the keys it actually means. Ctrl and Alt chords fall straight
+        // through, so Ctrl+S still saves while a line is open.
+        if (ViewModel.IsEditingInPlace && !IsTextInputFocused && !IsAltDown())
+        {
+            // ⚠️ SELECT ALL IS THE ONE CHORD THIS CLAIMS. Every other Ctrl
+            // combination falls through, so Ctrl+S still saves while a line is
+            // open. Ctrl+A while typing into text has to mean that text, not
+            // every annotation on the page.
+            if (_isCtrlDown)
+            {
+                if (e.Key == VirtualKey.A)
+                {
+                    ViewModel.InPlaceSelectAll();
+                    e.Handled = true;
+                }
+
+                return;
+            }
+
+            // Held shift extends the selection instead of moving the caret,
+            // which is the whole of the keyboard's selection model.
+            bool extend = IsShiftDown();
+
+            // ⚠️ AN IF-CHAIN, NOT A SWITCH, and deliberately so. The canvas
+            // below owns the switch case for the Delete key, and a second one
+            // written the same way up here would be the first thing anyone
+            // searching this file for that chord would land on, including the
+            // tests that pin what it runs.
+            Action? act =
+                  e.Key == VirtualKey.Back ? ViewModel.InPlaceBackspace
+                : e.Key == VirtualKey.Delete ? ViewModel.InPlaceDelete
+                : e.Key == VirtualKey.Left ? () => ViewModel.InPlaceMoveLeft(extend)
+                : e.Key == VirtualKey.Right ? () => ViewModel.InPlaceMoveRight(extend)
+                : e.Key == VirtualKey.Home ? () => ViewModel.InPlaceMoveHome(extend)
+                : e.Key == VirtualKey.End ? () => ViewModel.InPlaceMoveEnd(extend)
+                : e.Key == VirtualKey.Enter ? () => ViewModel.CommitInPlaceEdit()
+                : e.Key == VirtualKey.Escape ? ViewModel.CancelInPlaceEdit
+                : null;
+
+            if (act is not null)
+            {
+                act();
+                e.Handled = true;
+                return;
+            }
+
+            // ⚠️ AND EVERY OTHER KEY BELONGS TO THE TEXT TOO. Nothing below may
+            // act on a keystroke while the reader is typing into the page's own
+            // text. The reader found this by typing a "u" and watching the
+            // highlighter switch on: single-key tool switching sits at the
+            // bottom of this method and claims any key nothing else took. It is
+            // not only U. Every tool letter does it, and so do the canvas cases
+            // above for space, the digits and the letters they use unmodified.
+            //
+            // ⚠️ RETURNED, NOT MARKED HANDLED, and the difference matters. The
+            // keystroke still has to be translated into a character and
+            // delivered to RootGrid_CharacterReceived, which is what actually
+            // types it. Claiming the routed event here would risk that
+            // translation for no benefit: simply leaving is enough to stop
+            // everything below, because everything below is in this method.
             return;
         }
 
@@ -7383,195 +7732,43 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // ⚠️ AND NOTHING ELSE. A double click on the DOCUMENT'S own text used to
-        // open a word editor here, and no longer does: the page's own text is
-        // reached by clicking once to select a unit and again to say where in it
-        // to type. Only our own text boxes still answer a double click, because
-        // re-opening one of those is a different operation on a different thing.
+        // ⚠️ AND A DOUBLE CLICK IN TEXT BEING EDITED TAKES THE WORD, which
+        // is what a double click means everywhere else and the quickest way to
+        // replace one. It used to open a word EDITOR here; there is no editor
+        // any more, so it selects instead, in place.
+        if (ViewModel.IsEditingInPlace && ViewModel.InPlacePage == content.Page)
+        {
+            ViewModel.InPlaceSelectWordAt(nx);
+            e.Handled = true;
+        }
+
+        // Nothing else. The page's own text is reached by clicking once to
+        // select a unit and again to say where in it to type. Only our own text
+        // boxes answer a double click by opening, because re-opening one of
+        // those is a different operation on a different thing.
     }
 
     // -------- Editing the selected unit of the document's own text --------
     //
-    // ⚠️ ONE EDITOR FOR BOTH UNITS, and one gesture that reaches it. The first
-    // click on page text selects a line, or the word under it when the line
-    // refuses, and boxes what it chose. The second click, inside that box, opens
-    // this and puts the caret where it landed.
+    // ⚠️⚠️ THERE IS NO EDITOR FOR PAGE TEXT ANY MORE. A TextBox used to be
+    // floated over the line here. It is gone, and it must not come back: the
+    // page itself is what the reader edits, and the caret, the keystrokes and
+    // the redrawn tail all live in the view model (see BeginInPlaceEdit). The
+    // gesture is unchanged, so what follows still applies to reaching it: the
+    // first click selects a line, or the word under it when the line refuses,
+    // and boxes what it chose; the second click, inside that box, puts the
+    // caret where it landed.
     //
-    // WHAT THIS REPLACED, and why it is worth remembering: double-click meant
-    // the word and triple-click meant the line. Two problems, both structural.
-    // A click count is invisible, so nothing on screen ever said which unit an
-    // edit was about to change. And the second click of the triple opened an
-    // editor directly over the word, so the third click landed on that TextBox
-    // and never reached the page at all, which needed a second interception
-    // path just to get the gesture back. The box here is NOT hit-testable, so
-    // the second click reaches the viewport like any other.
-
-    private TextBox? _unitEditor;
-    private TextUnitSelection? _unitBeingEdited;
-
-    /// <summary>
-    /// Opens the editor over the selected unit with the caret at
-    /// <paramref name="caretAt"/> characters in.
-    ///
-    /// Refuses up front for a unit the core will not rewrite, because being told
-    /// before typing is the difference between a limitation and a bug.
-    /// </summary>
-    private bool OpenUnitEditor(int caretAt)
-    {
-        if (ViewModel.SelectedTextUnit is not TextUnitSelection unit) { return false; }
-
-        if (!unit.CanEdit)
-        {
-            ViewModel.Status = unit.RefusalReason;
-
-            // SAID AGAIN, because by now the label from the selecting click may
-            // have taken itself away, and a click that appears to do nothing is
-            // the complaint this whole thing answers.
-            ViewModel.ShowUnitNotice(unit.RefusalReason);
-            return false;
-        }
-
-        CommitTextEdit();
-        CancelUnitEdit();
-        ResetPointerInteraction();
-
-        // Reaching a unit takes clicks on page text, and those start a reader
-        // selection, so without this the blue highlight sits under the editor
-        // and the same words look selected two different ways.
-        ViewModel.ClearReaderTextSelection();
-
-        double scale = ViewModel.OverlayScale;
-        double pageTop = ViewModel.SlotTopOf(unit.Page);
-        double widthDip = (unit.Right - unit.Left) * scale;
-
-        // ⚠️ TWO DIFFERENT SCALES. The unit's BOUNDS are normalized (0..1 across
-        // the page) and convert with OverlayScale; its FONT SIZE is an absolute
-        // point size and converts with DIPs-per-point. Mixing them once filled
-        // the window with two enormous letters.
-        double dipsPerPoint = ViewModel.DipsPerPointOn(unit.Page);
-        if (dipsPerPoint <= 0) { return false; }
-
-        double fontDip = unit.FontSizePts * dipsPerPoint;
-
-        _unitBeingEdited = unit;
-
-        _unitEditor = new TextBox
-        {
-            // ONE LINE. Enter means "done" rather than "new paragraph", and a
-            // unit that could grow into two lines would be a paragraph edit,
-            // which the core refuses anyway.
-            AcceptsReturn = false,
-            TextWrapping = TextWrapping.NoWrap,
-            // Room to type past the end without the box scrolling away under
-            // the cursor, but never wider than the page.
-            Width = Math.Min(scale, Math.Max(48, widthDip + (fontDip * 4))),
-            MinHeight = Math.Max(20, fontDip * 1.6),
-            Padding = new Thickness(2, 0, 2, 0),
-            BorderThickness = new Thickness(1.5),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2D, 0x6F, 0xC4)),
-            CornerRadius = new CornerRadius(2),
-            Background = new SolidColorBrush(Colors.White),
-            FontSize = Math.Max(8, fontDip),
-            Text = unit.Text,
-        };
-
-        // Sat a little above and left of the text so the frame does not hide the
-        // baseline the reader is matching against.
-        Canvas.SetLeft(_unitEditor, (unit.Left * scale) - 2);
-        Canvas.SetTop(_unitEditor, (unit.Top * scale) + pageTop - 2);
-        EditCanvas.Children.Add(_unitEditor);
-
-        // THE LAYER HAS TO BE SHOWN. EditOverlay is Collapsed until an edit
-        // begins, so an editor added to it without this is built, focused and
-        // typed into entirely invisibly.
-        EditOverlay.Visibility = Visibility.Visible;
-
-        _unitEditor.KeyDown += UnitEditor_KeyDown;
-        _unitEditor.LostFocus += UnitEditor_LostFocus;
-
-        _unitEditor.Focus(FocusState.Programmatic);
-
-        // ⚠️ A CARET, NOT A SELECT-ALL. The click that opened this said where in
-        // the text the reader wants to be, and selecting everything would throw
-        // that away and make the next keystroke delete the line.
-        int at = Math.Clamp(caretAt, 0, unit.Text.Length);
-        _unitEditor.SelectionStart = at;
-        _unitEditor.SelectionLength = 0;
-        return true;
-    }
-
-    /// <summary>Enter commits, Escape abandons. Nothing else is special.</summary>
-    private void UnitEditor_KeyDown(object sender, KeyRoutedEventArgs e)
-    {
-        if (e.Key == Windows.System.VirtualKey.Enter)
-        {
-            e.Handled = true;
-            CommitUnitEdit();
-        }
-        else if (e.Key == Windows.System.VirtualKey.Escape)
-        {
-            e.Handled = true;
-            CancelUnitEdit();
-            ViewModel.ClearTextUnitSelection();
-        }
-    }
-
-    /// <summary>Clicking away commits, the way every in-place rename does.</summary>
-    private void UnitEditor_LostFocus(object sender, RoutedEventArgs e) => CommitUnitEdit();
-
-    /// <summary>
-    /// Sends the typed text to the core, then closes the editor either way.
-    ///
-    /// The editor closes even when the core refuses, because it has already put
-    /// the page back as it found it and said why: leaving a box open over
-    /// unchanged text would suggest the edit was still pending.
-    /// </summary>
-    private void CommitUnitEdit()
-    {
-        if (_unitEditor is not TextBox editor) { return; }
-
-        string typed = editor.Text;
-        var unit = _unitBeingEdited;
-
-        TearDownUnitEditor();
-
-        if (unit is null || typed.Trim() == unit.Text.Trim())
-        {
-            ViewModel.ClearTextUnitSelection();
-            return;
-        }
-
-        ViewModel.CommitTextUnit(typed);
-    }
-
-    /// <summary>Closes the editor and changes nothing.</summary>
-    private void CancelUnitEdit()
-    {
-        if (_unitEditor is null) { return; }
-        TearDownUnitEditor();
-    }
-
-    private void TearDownUnitEditor()
-    {
-        if (_unitEditor is not TextBox editor) { return; }
-
-        // Unhooked BEFORE removal: removing a focused TextBox raises LostFocus,
-        // which would re-enter the commit that is already running.
-        editor.KeyDown -= UnitEditor_KeyDown;
-        editor.LostFocus -= UnitEditor_LostFocus;
-
-        _unitEditor = null;
-        _unitBeingEdited = null;
-
-        EditCanvas.Children.Remove(editor);
-
-        // Only if nothing else is being edited: the Add Text editor shares this
-        // layer, and hiding it from under one would take the other with it.
-        if (_textEditor is null)
-        {
-            EditOverlay.Visibility = Visibility.Collapsed;
-        }
-    }
+    // WHAT THE TEXTBOX GOT WRONG, so nobody rebuilds it: it was opaque white in
+    // the app's UI font rather than the page's, wider and taller than the type
+    // so it covered the lines above and below, carried a delete button, and sat
+    // over a scrim that dimmed the whole page. Every one of those said "you are
+    // editing a different object", and it was.
+    //
+    // WHAT THE TEXTBOX GOT RIGHT, and the replacement keeps: it was NOT
+    // hit-testable, so the click that opened it still reached the viewport. An
+    // earlier design put an editor under the reader's third click and had to
+    // add a second interception path just to get the gesture back.
 
     /// <summary>
     /// Opens the editor on a text box that has already been hit-tested.
@@ -7909,7 +8106,32 @@ public sealed partial class MainPage : Page
                 {
                     if (ViewModel.TextUnitBoxContains(content.Page, nx, ny))
                     {
-                        OpenUnitEditor(ViewModel.CaretOffsetFor(content.Page, content.X));
+                        // ⚠️ THE PAGE BECOMES EDITABLE, NOTHING OPENS OVER IT.
+                        // A caret goes at the character that was clicked and
+                        // the keyboard starts reaching the text. Clicking again
+                        // while already editing just moves the caret, the way
+                        // clicking in any text does.
+                        if (ViewModel.IsEditingInPlace)
+                        {
+                            // ⚠️ AND THE PRESS ARMS A DRAG. Holding and
+                            // moving selects through the text, which is how
+                            // anyone selects anything. A double click on top of
+                            // this is handled by ViewportHost_DoubleTapped,
+                            // which takes the whole word.
+                            ViewModel.InPlaceClickCaret(nx, extend: IsShiftDown());
+
+                            _inPlaceDragging = true;
+                            _dragPointerId = e.Pointer.PointerId;
+                            ViewportHost.CapturePointer(e.Pointer);
+                        }
+                        else if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny))
+                        {
+                            // Nothing else holds focus now that there is no
+                            // TextBox, so the keys have to be sent somewhere
+                            // that will hand them to RootGrid_KeyDown.
+                            RootGrid.Focus(FocusState.Programmatic);
+                        }
+
                         e.Handled = true;
                         break;
                     }
@@ -7918,6 +8140,16 @@ public sealed partial class MainPage : Page
                     // the reader has moved on, and a box left behind over text
                     // they are no longer working on is just clutter that still
                     // swallows clicks the next time they aim near it.
+                    //
+                    // ⚠️ COMMITTING FIRST, because clicking away from text you
+                    // have typed into means "done", the way it does in every
+                    // in-place rename. Clearing without committing would throw
+                    // the reader's typing away silently.
+                    if (ViewModel.IsEditingInPlace)
+                    {
+                        ViewModel.CommitInPlaceEdit();
+                    }
+
                     ViewModel.ClearTextUnitSelection();
                 }
 
@@ -8130,6 +8362,16 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
+        // ⚠️ DRAGGING THROUGH TEXT SELECTS IT, and comes before every other
+        // drag below: while a caret is in the page's own text, moving the
+        // pointer means "select to here", not pan, marquee or move an object.
+        if (_inPlaceDragging && ViewModel.IsEditingInPlace)
+        {
+            ViewModel.InPlaceClickCaret(content.X / ViewModel.OverlayScale, extend: true);
+            e.Handled = true;
+            return;
+        }
+
         // Guide drag: whatever tool is armed, if a guide is being moved,
         // update its position from the pointer's page-local coords. The
         // capture keeps events flowing here even after the pointer leaves
@@ -8233,6 +8475,14 @@ public sealed partial class MainPage : Page
             double slotY = pInHost.Y - ViewportHost.Padding.Top;
             bool offPage = slotX < 0 || slotY < 0 || ViewModel.PageAt(slotY) < 0;
             ViewModel.EndGuideDrag(offPage);
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+            return;
+        }
+
+        if (_inPlaceDragging)
+        {
+            _inPlaceDragging = false;
             ViewportHost.ReleasePointerCapture(e.Pointer);
             e.Handled = true;
             return;

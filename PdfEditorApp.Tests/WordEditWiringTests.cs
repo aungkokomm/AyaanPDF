@@ -32,6 +32,8 @@ public class WordEditWiringTests
 
     private static string Page() => Source("PdfEditorApp", "MainPage.xaml.cs");
 
+    private static string Xaml() => Source("PdfEditorApp", "MainPage.xaml");
+
     [Fact]
     public void an_edit_is_one_history_entry_and_not_several()
     {
@@ -140,37 +142,42 @@ public class WordEditWiringTests
         // Being told before typing is the difference between a limitation and a
         // bug. Rotated text, mixed styling and out-of-order scripts are all real
         // cases measured on real documents.
-        string code = Page();
+        string code = ViewModel();
 
-        int open = code.IndexOf("private bool OpenUnitEditor(", StringComparison.Ordinal);
+        int open = code.IndexOf("public bool BeginInPlaceEdit(", StringComparison.Ordinal);
         Assert.True(open > 0);
 
         int next = code.IndexOf("\n    /// <summary>", open, StringComparison.Ordinal);
         string body = code[open..next];
 
         int guard = body.IndexOf("!unit.CanEdit", StringComparison.Ordinal);
-        int build = body.IndexOf("new TextBox", StringComparison.Ordinal);
+        int build = body.IndexOf("new LineEditBuffer(", StringComparison.Ordinal);
 
-        Assert.True(guard > 0 && guard < build, "the editor is built before the unit is checked");
+        Assert.True(guard > 0 && build > 0 && guard < build,
+            "the caret is placed before the unit is checked");
     }
 
     [Fact]
-    public void closing_the_editor_cannot_re_enter_the_commit()
+    public void committing_cannot_re_enter_itself()
     {
-        // Removing a focused TextBox raises LostFocus, and LostFocus commits.
-        // Unhooking after removal would run the commit a second time, on an
-        // editor that is already being torn down.
-        string code = Page();
+        // Removing a focused TextBox raised LostFocus, and LostFocus committed,
+        // so the old editor had to unhook before it removed. There is no focus
+        // to lose any more, and the same protection comes from the state
+        // instead: the edit is ended first, and a commit with nothing open
+        // returns immediately.
+        string code = ViewModel();
 
-        int tear = code.IndexOf("private void TearDownUnitEditor()", StringComparison.Ordinal);
-        Assert.True(tear > 0);
+        int at = code.IndexOf("public bool CommitInPlaceEdit()", StringComparison.Ordinal);
+        Assert.True(at > 0);
 
-        string body = code[tear..(tear + 900)];
-        int unhook = body.IndexOf("LostFocus -= UnitEditor_LostFocus", StringComparison.Ordinal);
-        int remove = body.IndexOf("EditCanvas.Children.Remove", StringComparison.Ordinal);
+        string body = code[at..Math.Min(code.Length, at + 900)];
+        int guard = body.IndexOf("if (_lineEdit is null) { return false; }", StringComparison.Ordinal);
+        int end = body.IndexOf("EndInPlaceEdit();", StringComparison.Ordinal);
+        int commit = body.IndexOf("CommitTextUnit(typed)", StringComparison.Ordinal);
 
-        Assert.True(unhook > 0 && remove > unhook,
-            "the editor is removed before its handlers are unhooked");
+        Assert.True(guard >= 0, "a commit with nothing open does not return early");
+        Assert.True(end > guard && commit > end,
+            "the edit is still open while the write runs");
     }
 
     [Fact]
@@ -203,56 +210,74 @@ public class WordEditWiringTests
     }
 
     [Fact]
-    public void opening_the_editor_shows_the_layer_it_is_built_on()
+    public void the_in_place_layer_is_never_hidden_from_what_it_draws()
     {
-        // ⚠️ THE DEFECT THIS EXISTS FOR. EditOverlay is Collapsed in the XAML
-        // until an edit begins. An editor added to it without showing it is
-        // built, focused and typed into entirely invisibly: every unit test
-        // passes, the core does the right thing, and the reader sees nothing
-        // happen when they click.
-        string code = Page();
+        // ⚠️ THE DEFECT THIS EXISTS FOR, KEPT. EditOverlay is Collapsed in
+        // the XAML until an edit begins, and an editor added to it without
+        // showing it was built, focused and typed into entirely invisibly:
+        // every unit test passed, the core did the right thing, and the reader
+        // saw nothing happen when they clicked.
+        //
+        // The in-place layer answers that by never being collapsed at all. It
+        // holds nothing until there is something to draw, so there is no
+        // visibility to forget to set.
+        string xaml = Xaml();
 
-        int open = code.IndexOf("private bool OpenUnitEditor(", StringComparison.Ordinal);
-        int next = code.IndexOf("/// <summary>", open, StringComparison.Ordinal);
-        string body = code[open..next];
+        int at = xaml.IndexOf("InPlaceLayer", StringComparison.Ordinal);
+        Assert.True(at > 0, "there is no in-place layer");
 
-        Assert.Contains("EditOverlay.Visibility = Visibility.Visible",
-            body, StringComparison.Ordinal);
+        string element = xaml[at..Math.Min(xaml.Length, at + 200)];
+        Assert.DoesNotContain("Visibility=", element);
 
-        int add = body.IndexOf("EditCanvas.Children.Add", StringComparison.Ordinal);
-        int show = body.IndexOf("EditOverlay.Visibility", StringComparison.Ordinal);
-        Assert.True(add > 0 && show > add, "the layer is shown before the editor exists");
+        // And what it draws is added to it, not to the dimmed layer.
+        string draw = Page();
+        int render = draw.IndexOf("private void RenderInPlaceEdit()", StringComparison.Ordinal);
+        Assert.True(render > 0);
+        string body = draw[render..Math.Min(draw.Length, render + 2000)];
+        Assert.Contains("InPlaceLayer.Children.Clear();", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("EditCanvas", body);
+        Assert.DoesNotContain("EditOverlay", body);
     }
 
     [Fact]
-    public void closing_the_editor_hides_the_layer_but_not_from_under_the_other_one()
+    public void editing_page_text_never_touches_the_dimmed_layer()
     {
-        // The scrim dims the whole page, so leaving the layer up would grey the
-        // document for the rest of the session. The text-box editor shares this
-        // layer, though, so hiding it unconditionally would close that one too.
+        // ⚠️ THE SCRIM DIMS THE WHOLE PAGE, which is exactly why editing the
+        // document's own text no longer goes anywhere near it. The page has to
+        // stay visually stable while the reader works in it. Add Text still
+        // uses that layer to place a NEW box, which is a different thing and
+        // keeps the behaviour it had.
         string code = Page();
 
-        int tear = code.IndexOf("private void TearDownUnitEditor()", StringComparison.Ordinal);
-        string body = code[tear..(tear + 1200)];
+        int at = code.IndexOf("private void EditScrim_PointerPressed(", StringComparison.Ordinal);
+        Assert.True(at > 0);
+        string scrim = code[at..(at + 700)];
 
-        Assert.Contains("_textEditor is null", body, StringComparison.Ordinal);
-        Assert.Contains("EditOverlay.Visibility = Visibility.Collapsed",
-            body, StringComparison.Ordinal);
+        Assert.Contains("CommitTextEdit();", scrim, StringComparison.Ordinal);
+        Assert.DoesNotContain("InPlace", scrim);
+
+        // Nothing anywhere reopens a TextBox over the document's own text.
+        Assert.DoesNotContain("_unitEditor", code);
+        Assert.DoesNotContain("OpenUnitEditor", code);
     }
 
     [Fact]
-    public void clicking_away_commits_either_kind_of_editor()
+    public void clicking_away_commits_whichever_edit_is_open()
     {
-        // Both live on the same dimmed layer, and clicking off the box means
-        // the same thing for both.
+        // Clicking off means "done" for both kinds, but they are reached in
+        // different places now: Add Text through its scrim, the document's own
+        // text through the ordinary press on the page, because there is no
+        // scrim over it to click.
         string code = Page();
 
         int scrim = code.IndexOf(
             "private void EditScrim_PointerPressed(", StringComparison.Ordinal);
-        string body = code[scrim..(scrim + 600)];
+        Assert.Contains("CommitTextEdit();", code[scrim..(scrim + 700)], StringComparison.Ordinal);
 
-        Assert.Contains("CommitTextEdit();", body, StringComparison.Ordinal);
-        Assert.Contains("CommitUnitEdit();", body, StringComparison.Ordinal);
+        int away = code.IndexOf("Any other press drops the box", StringComparison.Ordinal);
+        Assert.True(away > 0);
+        Assert.Contains("CommitInPlaceEdit();",
+            code[away..Math.Min(code.Length, away + 900)], StringComparison.Ordinal);
     }
 
     [Fact]
@@ -266,17 +291,17 @@ public class WordEditWiringTests
         // two letters, which is exactly what happened.
         string code = Page();
 
-        int open = code.IndexOf("private bool OpenUnitEditor(", StringComparison.Ordinal);
-        int next = code.IndexOf("/// <summary>", open, StringComparison.Ordinal);
-        string body = code[open..next];
+        int open = code.IndexOf("private void RenderInPlaceEdit()", StringComparison.Ordinal);
+        Assert.True(open > 0);
+        string body = code[open..Math.Min(code.Length, open + 3600)];
 
-        Assert.Contains("DipsPerPointOn(unit.Page)", body, StringComparison.Ordinal);
+        Assert.Contains("DipsPerPointOn(page)", body, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.OverlayScale", body, StringComparison.Ordinal);
 
         // The font size must come from the point converter, never from the
         // normalized one. Asserted as an exact string so the two cannot be
         // swapped back without this failing.
-        Assert.Contains("FontSize = Math.Max(8, fontDip)",
-            body, StringComparison.Ordinal);
+        Assert.Contains("tail.FontSizePts * dipsPerPoint", body, StringComparison.Ordinal);
 
         // And an unreadable page size means "cannot size this", not "scale by
         // nothing", which would collapse the editor to a sliver.

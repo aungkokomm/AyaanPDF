@@ -121,6 +121,7 @@
     </Page.Resources>
 
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
+          CharacterReceived="RootGrid_CharacterReceived"
           KeyboardAcceleratorPlacementMode="Hidden">
         <!-- Ctrl chords are NOT declared as accelerators on this Grid, and the
              accelerators on the MenuFlyoutItems below are not what makes them
@@ -668,6 +669,54 @@
                                             page content is not one of our marks
                                             and never carries our rotation.
                                         -->
+                                        <!--
+                                            WHERE THE DOCUMENT'S OWN TEXT IS,
+                                            while the reader is still deciding
+                                            where to click. Drawn only in Edit
+                                            mode, and only around regions that
+                                            can actually be offered.
+
+                                            Deliberately fainter and dashed:
+                                            this is not a selection, and a page
+                                            wearing solid rules everywhere reads
+                                            as a form rather than as a page. The
+                                            selection frame below is solid and
+                                            draws on top of these.
+
+                                            NOT HIT-TESTABLE, like every other
+                                            overlay here: the reader's click has
+                                            to reach the page.
+
+                                            THIS IS THE LOCATION OF THE PAGE'S
+                                            OWN TEXT. IT IS NOT AN EDITOR, and
+                                            it must never grow into one. Editing
+                                            has to feel like editing the PDF's
+                                            own text where it already sits, not
+                                            like typing into a separate box that
+                                            appeared on top of it. When the
+                                            caret arrives it goes at the real
+                                            character position underneath, and
+                                            the page stays visually stable. The
+                                            box may say what is selected; it may
+                                            not become the surface being typed
+                                            into. See TextRegionModel.cs.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind TextRegionOutlines}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Stroke="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                               StrokeThickness="1"
+                                                               StrokeDashArray="3,3"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
                                         <ItemsControl ItemsSource="{x:Bind PageTextOutline}" IsHitTestVisible="False">
                                             <ItemsControl.ItemsPanel>
                                                 <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
@@ -881,11 +930,47 @@
                     to the scrim; only the editor child is interactive.
                     Collapsed until an edit begins.
                 -->
+                <!--
+                    ⚠️ THIS IS THE INTERACTION THAT IS BEING REPLACED, NOT
+                    EXTENDED. A settled product requirement: editing must feel
+                    like editing the PDF's own text where it already sits, not
+                    like typing into a separate box that appeared on top of the
+                    page. This overlay is the opposite of that on both counts.
+                    It floats a TextBox over the text, and the scrim DIMS THE
+                    WHOLE PAGE while it is up, so the page does not stay
+                    visually stable either.
+
+                    It stays for now because nothing has replaced it yet. Do not
+                    build on it, and do not keep it merely because it is already
+                    written. The replacement puts a caret at the real character
+                    position, from the geometry in TextRegionModel.cs.
+                -->
                 <Grid x:Name="EditOverlay" Visibility="Collapsed">
                     <Rectangle x:Name="EditScrim" Fill="#30000000"
                                PointerPressed="EditScrim_PointerPressed" />
                     <Canvas x:Name="EditCanvas" />
                 </Grid>
+
+                <!--
+                    EDITING THE PAGE'S OWN TEXT, IN PLACE.
+
+                    Deliberately NOT inside EditOverlay: no scrim, nothing
+                    dimmed, no box. The page stays exactly as it is and this
+                    carries only two things, both of which belong to the text
+                    rather than to a dialog:
+
+                      - the caret, at the character the reader clicked;
+                      - the part of the line the page can no longer draw,
+                        redrawn in the page's own font, size, colour and
+                        baseline, covering only the old glyphs it replaces.
+
+                    Until the reader changes something there is no second item
+                    at all, so nothing whatever is painted over the document.
+
+                    NOT HIT-TESTABLE: a click has to reach the page so it can
+                    move the caret, exactly as clicking in text does anywhere.
+                -->
+                <Canvas x:Name="InPlaceLayer" IsHitTestVisible="False" />
 
             </controls:CursorGrid>
         </ScrollView>

@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -392,6 +393,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // ink stroke nobody asked for.
                 ActiveTool = ToolMode.Select;
             }
+
+            // Entering Edit is when the reader wants to see what they can
+            // touch; leaving it is when those boxes have to stop being drawn.
+            RefreshTextRegions();
 
             Status = _mode == AppMode.Edit
                 ? "Edit mode. Click text to select it, then click again to type."
@@ -3706,6 +3711,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             s.Stop();
             SharpenVisiblePages();
+
+            // The pages on screen decide which regions are worth building, so
+            // this rides the same debounce rather than paying on every frame.
+            RefreshTextRegions();
         };
         return timer;
     }
@@ -5542,6 +5551,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         SelectedTextUnit = picked;
 
+        // ⚠️ WHERE THE CLICK ACTUALLY LANDED, to the glyph. The unit above
+        // is what the core can address; this is the same click resolved
+        // against the drawn characters.
+        //
+        // ⚠️ RECORDED, NOT DRAWN. It was drawn once, as a box on the glyph,
+        // to show that clicks resolved to the right letter. The caret does
+        // that now and does it better, and the box outlived the click that
+        // made it: it was still sitting on the original letter while the
+        // reader typed, in the middle of a word they were changing. Two marks
+        // in the same text, one of them stale, is exactly the kind of thing
+        // that stops the page feeling like the page.
+        _textHit = TextRegionHitTest.Resolve(TextRegionsFor(pageIndex), normX, normY);
+        _textHitPage = _textHit is null ? -1 : pageIndex;
+        if (_textHit is not null)
+        {
+            Diag.Log(
+                $"TextHit p{pageIndex} char={(_textHit.Character?.Text ?? "(gap)")} "
+                + $"caret={_textHit.CaretOffset} of {_textHit.Line.Text.Length} "
+                + $"line={_textHit.Line.Text}");
+        }
+
         // The two older fields stay in step, because the commit paths still read
         // them: EditSelectedLine and EditSelectedWord are unchanged and this is
         // deliberately not a third way to write text.
@@ -5570,6 +5600,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public void ClearTextUnitSelection()
     {
         if (_selectedTextUnit is null) { return; }
+
+        // The resolved glyph goes with the selection: it describes the click
+        // that made it, and outliving it would leave a mark on the page with
+        // nothing selected to explain it.
+        _textHit = null;
+        _textHitPage = -1;
 
         SelectedTextUnit = null;
         ClearLineSelection();
@@ -9865,8 +9901,786 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// would address the wrong annotation next time, and the marks are part of
     /// the page bitmap, so without a re-render the change stays invisible.
     /// </summary>
+    // ---------------- the document's own text, as regions ----------------
+    //
+    // ⚠️ READ BY PDFPIG, WRITTEN BY NOBODY. This is the geometry layer only:
+    // PDFium still renders and the Rust writer still writes. PDFium's own
+    // per-object answer to "what text is here" costs 1756 ms on a 296-page
+    // book against about 20 ms here, which is why the read side moved.
+
+    /// <summary>Regions per page, for the pages currently on screen.</summary>
+    private readonly Dictionary<int, IReadOnlyList<TextRegion>> _textRegions = new();
+
+    /// <summary>
+    /// The document bytes the regions were built from.
+    ///
+    /// ⚠️ THE DOCUMENT AS IT IS NOW, NOT THE FILE ON DISK. The open
+    /// document carries edits nobody has saved, and a model built from the file
+    /// would describe a page the reader is not looking at.
+    /// </summary>
+    private byte[]? _textRegionBytes;
+
+    /// <summary>How the "there is text here" boxes are drawn: the editable
+    /// blue at low alpha, so the page reads as a page and not as a form.</summary>
+    private const string TextRegionColor = "#442D6FC4";
+
+    /// <summary>Throws the region model away. Anything that changes the page
+    /// changes it, so this is called from the same place the rasters go.</summary>
+    private void InvalidateTextRegions()
+    {
+        _textRegions.Clear();
+        _textRegionBytes = null;
+
+        // ⚠️ THE EPOCH GOES UP HERE, NOT ANYWHERE ELSE. A build reading the
+        // page this call just invalidated may already be in flight, and
+        // clearing the dictionary does not stop it from writing its answer
+        // back afterwards. Bumping this is what makes that answer be dropped.
+        _textRegionEpoch++;
+
+        // ⚠️ AND THE MODEL IS ASKED FOR AGAIN. Clearing on its own left it
+        // empty until the reader next scrolled, because that is what drives the
+        // rebuild. So the click straight after an edit found no regions on the
+        // page and the app refused to edit the line it had just edited.
+        //
+        // Queued rather than run here: this is called from inside command
+        // batches, several times over for a single edit, and the queued pass
+        // collapses those into one.
+        if (_textRegionRefreshQueued) { return; }
+
+        _textRegionRefreshQueued = true;
+        if (!_dispatcherQueue.TryEnqueue(() =>
+            {
+                _textRegionRefreshQueued = false;
+                RefreshTextRegions();
+            }))
+        {
+            _textRegionRefreshQueued = false;
+        }
+    }
+
+    private bool _textRegionRefreshQueued;
+
+    /// <summary>
+    /// The regions for one page, built now if they are not already there.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ SYNCHRONOUS, AND BOUNDED BECAUSE OF WHAT RUNS BEFORE IT. The click
+    /// that selected this text has already called LinesFor for the page, so the
+    /// expensive half, reading the lines out of the core, is cached by the time
+    /// anyone gets here. What is left is the snapshot and the model itself,
+    /// measured at about 60 ms and 20 ms.
+    ///
+    /// It exists for one case: the reader clicking to place a caret before the
+    /// queued rebuild above has landed. Refusing there told them their own text
+    /// could not be edited, seconds after they had edited it.
+    /// </remarks>
+    private IReadOnlyList<TextRegion> EnsureTextRegions(int page)
+    {
+        if (_textRegions.TryGetValue(page, out var have)) { return have; }
+        if (_documentHandle == 0) { return Array.Empty<TextRegion>(); }
+
+        _textRegionBytes ??= SnapshotDocumentBytes();
+        if (_textRegionBytes is null) { return Array.Empty<TextRegion>(); }
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var built = TextRegionReader.Build(_textRegionBytes, page, LinesFor(page));
+        _textRegions[page] = built;
+
+        Diag.Log($"EnsureTextRegions p{page} built {built.Count} regions "
+                 + $"in {clock.Elapsed.TotalMilliseconds:F1} ms");
+        return built;
+    }
+
+    /// <summary>
+    /// Rebuilds the region boxes for the pages on screen.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// Called from the same debounce that sharpens visible pages, so scrolling
+    /// does not pay for it on every frame, and from the mode switch, because
+    /// entering Edit is the moment the reader expects to see what they can
+    /// touch.
+    /// </remarks>
+    public void RefreshTextRegions()
+    {
+        foreach (var slot in PageSlots) { slot.TextRegionOutlines.Clear(); }
+
+        if (!IsEditMode || _documentHandle == 0 || PageSlots.Count == 0)
+        {
+            SelectionVisualsChanged?.Invoke();
+            return;
+        }
+
+        var (first, last) = _layout.VisibleRange(_lastViewTop, _lastViewBottom);
+        if (first < 0)
+        {
+            SelectionVisualsChanged?.Invoke();
+            return;
+        }
+
+        bool missing = false;
+        int drawn = 0;
+
+        for (int page = first; page <= last && page < PageSlots.Count; page++)
+        {
+            if (!_textRegions.TryGetValue(page, out var regions))
+            {
+                missing = true;
+                continue;
+            }
+
+            // Through SlotFor, never by position: in single-page view the list
+            // holds one card and its index is not the page number.
+            var slot = SlotFor(page);
+            if (slot is null) { continue; }
+
+            foreach (var region in regions)
+            {
+                if (!region.CanOffer) { continue; }
+                double l = region.Left * SlotLayoutWidth;
+                double t = region.Top * SlotLayoutWidth;
+                slot.TextRegionOutlines.Add(new ScaledRect(
+                    l, t,
+                    (region.Right * SlotLayoutWidth) - l,
+                    (region.Bottom * SlotLayoutWidth) - t,
+                    TextRegionColor));
+                drawn++;
+            }
+        }
+
+        SelectionVisualsChanged?.Invoke();
+
+        if (missing) { _ = BuildTextRegionsAsync(first, last); }
+    }
+
+    /// <summary>Bumped whenever the model is thrown away, so a build already in
+    /// flight cannot put a page back that describes the document as it was.</summary>
+    private int _textRegionEpoch;
+
+    /// <summary>One build at a time. Every caller wants the same pages, the
+    /// ones on screen, so a second pass would only repeat the expensive read.</summary>
+    private bool _textRegionBuildRunning;
+
+    /// <summary>
+    /// Builds the model for pages on screen that do not have one yet, off the
+    /// UI thread, and paints when it lands.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE LINE READ IS THE EXPENSIVE HALF, AND IT HAPPENS HERE. Measured
+    /// warm: reading one page's lines out of the core is 1311 ms on the Harari
+    /// book and 4630 ms on the Myanmar file, against about 20 ms to build the
+    /// whole region model from them. On the UI thread that is a frozen window
+    /// every time the reader scrolls into a page in Edit mode.
+    ///
+    /// ⚠️ NOT THROUGH LinesFor. That writes into a dictionary the UI thread
+    /// owns. The read runs on the pool and the lines are handed BACK to that
+    /// cache on the UI thread, which keeps the cache single-threaded and still
+    /// makes the next visit to the page free.
+    ///
+    /// Calling the core from the pool is what the app already does for every
+    /// page render, with the same document handle, so this adds no new
+    /// assumption. What it does add is the staleness check after the await:
+    /// the document can be closed, replaced or written to, and Edit mode can be
+    /// left, while a build is in flight.
+    /// </remarks>
+    private async Task BuildTextRegionsAsync(int first, int last)
+    {
+        if (_textRegionBuildRunning) { return; }
+        _textRegionBuildRunning = true;
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        int built = 0;
+
+        try
+        {
+            ulong handle = _documentHandle;
+            int epoch = _textRegionEpoch;
+
+            for (int page = first; page <= last && page < PageSlots.Count; page++)
+            {
+                if (_textRegions.ContainsKey(page)) { continue; }
+
+                byte[]? bytes = _textRegionBytes;
+                IReadOnlyList<LineSnapshot>? cached =
+                    _linesByPage.TryGetValue(page, out var have) ? have : null;
+                int at = page;
+
+                var result = await Task.Run(() =>
+                {
+                    byte[]? b = bytes ?? SnapshotDocumentBytes(handle);
+                    var lines = cached ?? Interop.LineGateway.Load(handle, at);
+                    var regions = b is null
+                        ? (IReadOnlyList<TextRegion>)Array.Empty<TextRegion>()
+                        : TextRegionReader.Build(b, at, lines);
+                    return (Bytes: b, Lines: lines, Regions: regions);
+                });
+
+                if (handle != _documentHandle || epoch != _textRegionEpoch || !IsEditMode)
+                {
+                    return;
+                }
+
+                _textRegionBytes ??= result.Bytes;
+                if (cached is null) { _linesByPage[page] = result.Lines; }
+
+                // Always recorded, even when empty, or a page the reader cannot
+                // be offered anything on would be rebuilt on every single paint.
+                _textRegions[page] = result.Regions;
+                built++;
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"BuildTextRegionsAsync {first}..{last} failed: {ex}");
+        }
+        finally
+        {
+            _textRegionBuildRunning = false;
+        }
+
+        // Traced because the claim that moved the read side was a MEASUREMENT,
+        // and a measurement taken in a probe is not the same as one taken in
+        // the app the reader is using.
+        Diag.Log($"BuildTextRegionsAsync pages {first}..{last} built {built} " +
+                 $"off the UI thread in {clock.Elapsed.TotalMilliseconds:F1} ms");
+
+        if (built > 0) { RefreshTextRegions(); }
+    }
+
+    /// <summary>The regions on a page, for tests and for the phase that adds a
+    /// caret. Empty until <see cref="RefreshTextRegions"/> has run.</summary>
+    public IReadOnlyList<TextRegion> TextRegionsFor(int page) =>
+        _textRegions.TryGetValue(page, out var r) ? r : Array.Empty<TextRegion>();
+
+    /// <summary>The glyph and caret offset the last click resolved to.</summary>
+    private TextHit? _textHit;
+    private int _textHitPage = -1;
+
+    /// <summary>The resolved glyph, for tests and for the phase that puts a
+    /// caret at it.</summary>
+    public TextHit? ResolvedTextHit => _textHit;
+
+
+    // ---------------- editing the page's own text, IN PLACE ----------------
+    //
+    // ⚠️⚠️ THE PAGE IS THE EDITOR. A settled product requirement: clicking text
+    // makes THAT text editable where it already sits, and nothing appears on
+    // top of the page to type into. What that costs is all here.
+    //
+    // What it replaced was a TextBox floated over the line: opaque white, in
+    // the app's UI font rather than the page's, wider and taller than the type
+    // so it covered the lines above and below, with a delete button on it, over
+    // a scrim that dimmed the whole page. Everything about that said "you are
+    // editing a different object", which is exactly what it was.
+    //
+    // Three rules make the difference:
+    //
+    //   1. The caret is placed from the PAGE'S OWN GLYPH POSITIONS, never by
+    //      measuring a string. The page was set by another engine in a font
+    //      this app may not have, so a measured caret drifts along the line.
+    //
+    //   2. Only the CHANGED TAIL is ever drawn over. Everything before the
+    //      first changed character is still the page's own pixels, so an edit
+    //      that has changed nothing covers nothing at all.
+    //
+    //   3. The tail is drawn in the page's own font, size, colour and baseline,
+    //      with no border, no background of its own and no chrome.
+
+    private LineEditBuffer? _lineEdit;
+    private TextLine? _lineEditLine;
+    private TextUnitSelection? _lineEditUnit;
+    private int _lineEditPage = -1;
+    private List<EditGlyph> _lineEditGlyphs = new();
+
+    /// <summary>One glyph of the text being edited: where it sits, and where it
+    /// is in the text the writer will be handed.</summary>
+    private sealed record EditGlyph(
+        double Left, double Right, double Bottom, int Offset,
+        double PointSize, string FontName, string ColorHex);
+
+    /// <summary>
+    /// Where the type sits on this line, in normalized page units.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NOT LineSnapshot.Baseline, WHICH IS MEASURED FROM THE BOTTOM OF THE
+    /// PAGE. Everything drawn here is top-left, and mixing the two conventions
+    /// would put the redrawn tail as far from the line as the line is from the
+    /// foot of the page.
+    ///
+    /// ⚠️ AND NOT THE LINE'S BOTTOM EITHER, which is wherever the deepest
+    /// descender reaches. The baseline is where letters WITHOUT descenders sit,
+    /// so it is the bottom edge that most of the glyphs share.
+    /// </remarks>
+    private double BaselineOfEdit()
+    {
+        if (_lineEditGlyphs.Count == 0) { return 0; }
+
+        return _lineEditGlyphs
+            .GroupBy(g => Math.Round(g.Bottom, 4))
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key)
+            .First().Key;
+    }
+
+    /// <summary>Whether the reader is typing into the page's own text.</summary>
+    public bool IsEditingInPlace => _lineEdit is not null;
+
+    /// <summary>The text as it now stands, for tests.</summary>
+    public string? InPlaceText => _lineEdit?.Text;
+
+    /// <summary>Where the caret is in that text, or -1.</summary>
+    public int InPlaceCaret => _lineEdit?.Caret ?? -1;
+
+    /// <summary>The page being edited, or -1.</summary>
+    public int InPlacePage => _lineEditPage;
+
+    /// <summary>Raised whenever what is drawn for the in-place edit changes.</summary>
+    public event Action? InPlaceEditChanged;
+
+    /// <summary>
+    /// Starts editing the selected unit, with the caret where the click landed.
+    /// </summary>
+    /// <remarks>
+    /// Refuses up front for a unit the core will not rewrite, because being
+    /// told before typing is the difference between a limitation and a bug.
+    /// </remarks>
+    public bool BeginInPlaceEdit(int pageIndex, double normX, double normY)
+    {
+        if (!IsEditMode) { return false; }
+        if (_selectedTextUnit is not { } unit || unit.Page != pageIndex) { return false; }
+
+        if (!unit.CanEdit)
+        {
+            Status = unit.RefusalReason;
+
+            // SAID AGAIN, because by now the label from the selecting click may
+            // have taken itself away, and a click that appears to do nothing is
+            // the complaint this whole interaction answers.
+            ShowUnitNotice(unit.RefusalReason);
+            return false;
+        }
+
+        // ⚠️ Ensure, NOT TextRegionsFor. An edit throws the model away, and the
+        // very next thing the reader does is click the line they just changed.
+        // Reading the cache alone found it empty and refused to edit text that
+        // had been editable a second earlier.
+        var line = TextRegionHitTest.LineAt(EnsureTextRegions(pageIndex), normX, normY);
+        var glyphs = line is null ? null : GlyphsOf(line, unit);
+        if (line is null || glyphs is null || glyphs.Count == 0)
+        {
+            // ⚠️ REFUSED, NOT APPROXIMATED. Without the page's own glyph
+            // positions there is nowhere honest to put a caret, and guessing
+            // would put it on the wrong letter and edit the wrong text.
+            Diag.Log($"BeginInPlaceEdit p{pageIndex} refused: no glyphs for “{unit.Text}”");
+            Status = "This text cannot be edited in place yet.";
+            ShowUnitNotice("This text cannot be edited in place yet.");
+            return false;
+        }
+
+        _lineEditLine = line;
+        _lineEditUnit = unit;
+        _lineEditPage = pageIndex;
+        _lineEditGlyphs = glyphs;
+        _lineEditCoverHex = SamplePageBackground(pageIndex, line);
+        _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
+
+        Diag.Log($"BeginInPlaceEdit p{pageIndex} caret={_lineEdit.Caret} text={unit.Text}");
+        InPlaceEditChanged?.Invoke();
+        return true;
+    }
+
+    /// <summary>
+    /// The glyphs of the selected unit, or null when the region model cannot
+    /// account for it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE EQUALITY CHECK IS THE SAFETY. A unit whose text the glyphs do not
+    /// spell is a unit this cannot put a caret in: the two readers are talking
+    /// about different text, and an edit addressed by one would land in the
+    /// other. Whitespace is allowed to differ, and nothing else, for the same
+    /// measured reason the aligner allows it.
+    /// </remarks>
+    private static List<EditGlyph>? GlyphsOf(TextLine line, TextUnitSelection unit)
+    {
+        var chars = line.Characters.ToList();
+
+        if (unit.Kind == TextUnitKind.Line)
+        {
+            return SameIgnoringWhitespace(string.Concat(chars.Select(c => c.Text)), unit.Text)
+                ? chars.Select(c => new EditGlyph(
+                    c.Left, c.Right, c.Bottom, c.Offset,
+                    c.PointSize, c.FontName, c.ColorHex)).ToList()
+                : null;
+        }
+
+        // A word: the glyphs inside its box, with offsets rebased to count from
+        // the start of the word, because the word is what the writer is handed.
+        var mine = chars.Where(c =>
+        {
+            double middle = (c.Left + c.Right) / 2;
+            return middle >= unit.Left - 1e-6 && middle <= unit.Right + 1e-6;
+        }).ToList();
+
+        if (mine.Count == 0) { return null; }
+        if (!SameIgnoringWhitespace(string.Concat(mine.Select(c => c.Text)), unit.Text)) { return null; }
+
+        int start = mine[0].Offset;
+        return mine.Select(c => new EditGlyph(
+            c.Left, c.Right, c.Bottom, c.Offset - start,
+            c.PointSize, c.FontName, c.ColorHex)).ToList();
+    }
+
+    private static bool SameIgnoringWhitespace(string a, string b) =>
+        string.Equals(Squash(a), Squash(b), StringComparison.Ordinal);
+
+    private static string Squash(string s)
+    {
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (char c in s)
+        {
+            if (!char.IsWhiteSpace(c)) { sb.Append(c); }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Which offset a click at <paramref name="x"/> means, by each
+    /// glyph's own midpoint.</summary>
+    private static int CaretOffsetIn(List<EditGlyph> glyphs, string text, double x)
+    {
+        foreach (var g in glyphs)
+        {
+            if (x < (g.Left + g.Right) / 2) { return Math.Clamp(g.Offset, 0, text.Length); }
+        }
+        return text.Length;
+    }
+
+    /// <summary>Where on the page an offset in the UNCHANGED text sits.</summary>
+    private double CaretXOf(int offset)
+    {
+        if (_lineEditGlyphs.Count == 0) { return 0; }
+        if (offset <= 0) { return _lineEditGlyphs[0].Left; }
+
+        foreach (var g in _lineEditGlyphs)
+        {
+            if (g.Offset >= offset) { return g.Left; }
+        }
+        return _lineEditGlyphs[^1].Right;
+    }
+
+    private EditGlyph GlyphAtOrAfter(int offset)
+    {
+        foreach (var g in _lineEditGlyphs)
+        {
+            if (g.Offset >= offset) { return g; }
+        }
+        return _lineEditGlyphs[^1];
+    }
+
+    // ---------------- what a keystroke does ----------------
+
+    public void InPlaceInsert(string text) => Changed(() => _lineEdit!.Insert(text));
+
+    public void InPlaceBackspace() => Changed(() => _lineEdit!.Backspace());
+
+    public void InPlaceDelete() => Changed(() => _lineEdit!.Delete());
+
+    // ⚠️ EVERY MOVE TAKES extend, AND THAT IS THE KEYBOARD'S WHOLE
+    // SELECTION MODEL. Held shift keeps the anchor and drags the caret. Without
+    // it the only way to change a word was to delete it letter by letter and
+    // retype it, which is not editing.
+
+    public void InPlaceMoveLeft(bool extend = false) =>
+        Changed(() => _lineEdit!.MoveLeft(extend));
+
+    public void InPlaceMoveRight(bool extend = false) =>
+        Changed(() => _lineEdit!.MoveRight(extend));
+
+    public void InPlaceMoveHome(bool extend = false) =>
+        Changed(() => _lineEdit!.MoveHome(extend));
+
+    public void InPlaceMoveEnd(bool extend = false) =>
+        Changed(() => _lineEdit!.MoveEnd(extend));
+
+    public void InPlaceSelectAll() => Changed(() => _lineEdit!.SelectAll());
+
+    /// <summary>Selects the word a double-click landed in.</summary>
+    public void InPlaceSelectWordAt(double normX)
+    {
+        if (_lineEdit is null) { return; }
+
+        int at = CaretOffsetIn(_lineEditGlyphs, _lineEdit.Text, normX);
+        Changed(() => _lineEdit!.SelectWordAt(Math.Max(0, at)));
+    }
+
+    /// <summary>What is selected, or null when nothing is.</summary>
+    public (int Start, int End)? InPlaceSelection =>
+        _lineEdit is { HasSelection: true } b ? (b.SelectionStart, b.SelectionEnd) : null;
+
+    /// <summary>
+    /// Moves the caret to a click, while an edit is already open.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONLY MEANINGFUL IN TEXT THE PAGE STILL DRAWS. Once the reader has
+    /// typed, the tail is no longer where the page put it, so a click out there
+    /// cannot be resolved against the page's glyphs and the caret is left where
+    /// it is rather than sent somewhere invented.
+    /// </remarks>
+    public void InPlaceClickCaret(double normX, bool extend = false)
+    {
+        if (_lineEdit is null) { return; }
+
+        int prefix = _lineEdit.UnchangedPrefix;
+        int at = CaretOffsetIn(_lineEditGlyphs, _lineEdit.Text, normX);
+        if (at > prefix) { return; }
+
+        Changed(() => _lineEdit!.PlaceCaret(at, extend));
+    }
+
+    private void Changed(Action act)
+    {
+        if (_lineEdit is null) { return; }
+        act();
+        InPlaceEditChanged?.Invoke();
+    }
+
+    // ---------------- finishing ----------------
+
+    /// <summary>
+    /// Sends the typed text to the core, then closes the edit either way.
+    /// </summary>
+    /// <remarks>
+    /// The edit closes even when the core refuses, because by then the page has
+    /// been put back as it was found and the reason said. Leaving a caret in
+    /// unchanged text would suggest the edit was still pending.
+    /// </remarks>
+    public bool CommitInPlaceEdit()
+    {
+        if (_lineEdit is null) { return false; }
+
+        string typed = _lineEdit.Text;
+        bool changed = _lineEdit.IsChanged;
+
+        EndInPlaceEdit();
+
+        if (!changed)
+        {
+            ClearTextUnitSelection();
+            return false;
+        }
+
+        // ⚠️ THE SAME COMMIT AS BEFORE, UNTOUCHED. A third way to write a
+        // document's text is the one thing this interaction change must not
+        // become: only how the reader reaches it has changed.
+        return CommitTextUnit(typed);
+    }
+
+    /// <summary>Abandons the edit and changes nothing.</summary>
+    public void CancelInPlaceEdit()
+    {
+        if (_lineEdit is null) { return; }
+        EndInPlaceEdit();
+        ClearTextUnitSelection();
+    }
+
+    private void EndInPlaceEdit()
+    {
+        _lineEdit = null;
+        _lineEditLine = null;
+        _lineEditUnit = null;
+        _lineEditPage = -1;
+        _lineEditGlyphs = new List<EditGlyph>();
+        InPlaceEditChanged?.Invoke();
+    }
+
+    // ---------------- what gets drawn ----------------
+
+    /// <summary>
+    /// The tail of the line that the page can no longer draw, or null when the
+    /// page can still draw all of it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NULL IS THE COMMON CASE AND THE IMPORTANT ONE. Until the reader
+    /// changes something there is no tail, so nothing whatever is drawn over
+    /// the page and what they are looking at is their own document.
+    /// </remarks>
+    public LiveTextTail? InPlaceTail()
+    {
+        if (_lineEdit is null || _lineEditLine is null || _lineEditGlyphs.Count == 0)
+        {
+            return null;
+        }
+        if (!_lineEdit.IsChanged) { return null; }
+
+        var line = _lineEditLine;
+        int prefix = _lineEdit.UnchangedPrefix;
+        var first = GlyphAtOrAfter(prefix);
+
+        string tail = _lineEdit.Text[Math.Min(prefix, _lineEdit.Text.Length)..];
+        int caretInTail = _lineEdit.Caret - prefix;
+        bool caretHere = caretInTail >= 0 && caretInTail <= tail.Length;
+
+        // The part of the selection that falls inside the tail, as offsets into
+        // it. Only the drawing knows how wide the tail's text is, so it is
+        // handed the range rather than a rectangle.
+        int selectFrom = -1, selectTo = -1;
+        if (_lineEdit.HasSelection)
+        {
+            int from = Math.Max(_lineEdit.SelectionStart, prefix) - prefix;
+            int to = _lineEdit.SelectionEnd - prefix;
+            if (to > from && from >= 0 && to <= tail.Length)
+            {
+                selectFrom = from;
+                selectTo = to;
+            }
+        }
+
+        return new LiveTextTail(
+            Before: caretHere ? tail[..caretInTail] : tail,
+            After: caretHere ? tail[caretInTail..] : string.Empty,
+            CaretInTail: caretHere,
+            SelectFrom: selectFrom,
+            SelectTo: selectTo,
+            Left: CaretXOf(prefix),
+            Top: line.Top,
+            Bottom: line.Bottom,
+            Baseline: BaselineOfEdit(),
+
+            // ⚠️ COVER THE OLD TAIL'S OWN EXTENT, not the new one's. What has
+            // to be painted out is what the page drew, and the page drew as far
+            // as its last glyph.
+            CoverRight: _lineEditGlyphs[^1].Right,
+            FontFamily: DisplayFontMatch.FamilyFor(first.FontName),
+            FontSizePts: first.PointSize,
+            Bold: DisplayFontMatch.IsBold(first.FontName),
+            Italic: DisplayFontMatch.IsItalic(first.FontName),
+            ColorHex: first.ColorHex,
+            CoverColorHex: _lineEditCoverHex);
+    }
+
+    /// <summary>The page's own colour behind the line being edited.</summary>
+    private string _lineEditCoverHex = "#FFFFFF";
+
+    /// <summary>
+    /// Samples what the page is actually painted with just above and just below
+    /// a line, so the changed tail can be covered with the page's own colour.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ SAMPLED, NOT ASSUMED. Paper is usually white and often is not, and a
+    /// white patch on a coloured page would be more obtrusive than the text it
+    /// was hiding.
+    ///
+    /// ⚠️ AND ONCE PER EDIT, NEVER PER KEYSTROKE. A sharpened page is around
+    /// fifteen megabytes; reading it on every letter typed would make the
+    /// editor stutter. Only the two rows bracketing the line are read, and only
+    /// when the edit begins.
+    /// </remarks>
+    private string SamplePageBackground(int pageIndex, TextLine line)
+    {
+        const string Paper = "#FFFFFF";
+
+        var bitmap = SlotFor(pageIndex)?.Bitmap;
+        if (bitmap is null) { return Paper; }
+
+        try
+        {
+            int w = bitmap.PixelWidth, h = bitmap.PixelHeight;
+            if (w <= 0 || h <= 0) { return Paper; }
+
+            // The model divides BOTH axes by the page width, and the bitmap has
+            // the page's aspect, so both convert with the pixel width.
+            int x0 = Math.Clamp((int)(line.Left * w), 0, w - 1);
+            int x1 = Math.Clamp((int)(line.Right * w), x0 + 1, w);
+            double height = line.Bottom - line.Top;
+
+            int above = Math.Clamp((int)((line.Top - (height * 0.35)) * w), 0, h - 1);
+            int below = Math.Clamp((int)((line.Bottom + (height * 0.35)) * w), 0, h - 1);
+
+            var counts = new Dictionary<int, int>();
+            using var stream = bitmap.PixelBuffer.AsStream();
+
+            foreach (int row in new[] { above, below })
+            {
+                int span = x1 - x0;
+                byte[] line8 = new byte[span * 4];
+                stream.Seek(((long)row * w + x0) * 4, SeekOrigin.Begin);
+                if (stream.Read(line8, 0, line8.Length) < line8.Length) { continue; }
+
+                // Every eighth pixel is plenty to find the paper, and keeps
+                // this to a few hundred reads on a wide line.
+                for (int i = 0; i + 3 < line8.Length; i += 32)
+                {
+                    int key = (line8[i + 2] << 16) | (line8[i + 1] << 8) | line8[i];
+                    counts[key] = counts.TryGetValue(key, out int n) ? n + 1 : 1;
+                }
+            }
+
+            if (counts.Count == 0) { return Paper; }
+
+            int best = counts.OrderByDescending(kv => kv.Value).First().Key;
+            return $"#{best:X6}";
+        }
+        catch (Exception ex)
+        {
+            // A page whose colour cannot be read is still a page that can be
+            // edited; paper is the right guess for almost every document.
+            Diag.Log($"SamplePageBackground p{pageIndex} failed: {ex.Message}");
+            return Paper;
+        }
+    }
+
+    /// <summary>
+    /// The selected range that lies over text the page itself is still drawing,
+    /// in normalized page units, or null when none of it does.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE SELECTION CAN STRADDLE THE CHANGE. Everything before the first
+    /// changed character is real page pixels and is measured from the drawn
+    /// glyphs; everything after it is text this app drew, and only the drawing
+    /// knows how wide that is. So the range is cut at the prefix and each half
+    /// is highlighted by whoever can place it.
+    /// </remarks>
+    public (double Left, double Right, double Top, double Bottom)? InPlaceSelectionOnPage()
+    {
+        if (_lineEdit is null || _lineEditLine is null || _lineEditGlyphs.Count == 0)
+        {
+            return null;
+        }
+        if (!_lineEdit.HasSelection) { return null; }
+
+        int prefix = _lineEdit.IsChanged ? _lineEdit.UnchangedPrefix : _lineEdit.Text.Length;
+        int start = _lineEdit.SelectionStart;
+        int end = Math.Min(_lineEdit.SelectionEnd, prefix);
+        if (end <= start) { return null; }
+
+        return (CaretXOf(start), CaretXOf(end), _lineEditLine.Top, _lineEditLine.Bottom);
+    }
+
+    /// <summary>
+    /// Where the caret sits when it is in text the page still draws, in
+    /// normalized page units, or null when it is inside the tail and the tail
+    /// is drawing it.
+    /// </summary>
+    public (double X, double Top, double Bottom)? InPlaceCaretOnPage()
+    {
+        if (_lineEdit is null || _lineEditLine is null || _lineEditGlyphs.Count == 0)
+        {
+            return null;
+        }
+
+        if (_lineEdit.IsChanged && _lineEdit.Caret > _lineEdit.UnchangedPrefix)
+        {
+            return null;   // the tail carries it, positioned by the text itself
+        }
+
+        return (CaretXOf(_lineEdit.Caret), _lineEditLine.Top, _lineEditLine.Bottom);
+    }
+
     private void InvalidateLoadedPage(int pageIndex)
     {
+        // The region model describes the page as it was; it goes with the
+        // raster for exactly the same reason.
+        InvalidateTextRegions();
+
         // The cache always goes NOW: the very next line of the caller may look
         // an annotation up by Id and must not see pre-write indices. Only the
         // repaint is deferrable, and only inside a command.
@@ -12076,10 +12890,19 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Abandons the open action, for a gesture that changed nothing.</summary>
     private void AbandonEdit() => _openBatch = null;
 
-    private byte[]? SnapshotDocumentBytes()
+    private byte[]? SnapshotDocumentBytes() => SnapshotDocumentBytes(_documentHandle);
+
+    /// <summary>
+    /// The same snapshot, against a handle the caller captured earlier.
+    ///
+    /// ⚠️ FOR BACKGROUND CALLERS. Reading _documentHandle from the pool would
+    /// read whatever it has become since, so a build in flight would snapshot a
+    /// document the reader has already closed or replaced.
+    /// </summary>
+    private static byte[]? SnapshotDocumentBytes(ulong handle)
     {
-        if (_documentHandle == 0) { return null; }
-        var buffer = RenderCoreNative.snapshot_document(_documentHandle);
+        if (handle == 0) { return null; }
+        var buffer = RenderCoreNative.snapshot_document(handle);
         byte[]? bytes = null;
         if (buffer.Status == RenderStatus.OkPdfium && buffer.Data != IntPtr.Zero && buffer.Len > 0)
         {

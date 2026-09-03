@@ -118,7 +118,10 @@ public class LineEditWiringTests
         string body = EditPath();
         Assert.Contains("!line.CanEdit", body, StringComparison.Ordinal);
 
-        string open = Body(Page(), "private bool OpenUnitEditor(int caretAt)");
+        // The near end used to be a TextBox that refused to open. There is no
+        // editor to open any more, so the same refusal now guards the caret:
+        // a line the core will not rewrite never gets one.
+        string open = Body(ViewModel(), "public bool BeginInPlaceEdit(");
         Assert.Contains("!unit.CanEdit", open, StringComparison.Ordinal);
         Assert.Contains("unit.RefusalReason", open, StringComparison.Ordinal);
     }
@@ -375,18 +378,19 @@ public class LineEditWiringTests
     }
 
     [Fact]
-    public void the_editor_is_gone_before_the_write_ever_starts()
+    public void the_caret_is_gone_before_the_write_ever_starts()
     {
-        // ⚠️ THE REASON THE BOX CANNOT STAY STUCK. It is removed by the page
-        // BEFORE the commit is asked for, so no outcome of the write, success,
-        // refusal or throw, can leave it on screen.
-        string page = Page();
+        // ⚠️ THE REASON NOTHING CAN STAY STUCK ON THE PAGE. The edit is
+        // ended BEFORE the commit is asked for, so no outcome of the write,
+        // success, refusal or throw, can leave a caret or a redrawn tail
+        // sitting over text that has moved on.
+        string body = Body(ViewModel(), "public bool CommitInPlaceEdit()");
 
-        int teardown = page.IndexOf("TearDownUnitEditor();", StringComparison.Ordinal);
-        int commit = page.IndexOf("ViewModel.CommitTextUnit(typed);", StringComparison.Ordinal);
+        int end = body.IndexOf("EndInPlaceEdit();", StringComparison.Ordinal);
+        int commit = body.IndexOf("CommitTextUnit(typed)", StringComparison.Ordinal);
 
-        Assert.True(teardown > 0, "the editor is never torn down");
-        Assert.True(commit > teardown, "the commit runs before the editor is removed");
+        Assert.True(end > 0, "the edit is never ended");
+        Assert.True(commit > end, "the commit runs before the edit is ended");
     }
 
     [Fact]
@@ -429,26 +433,47 @@ public class LineEditWiringTests
     [Fact]
     public void the_line_editor_commits_the_way_every_in_place_rename_does()
     {
+        // Enter commits and Escape abandons, exactly as before. They are read
+        // by the page's own key handler now rather than by a TextBox, because
+        // there is no longer a TextBox to hold focus.
         string page = Page();
+        int at = page.IndexOf("ViewModel.IsEditingInPlace && !IsTextInputFocused",
+                              StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing routes keys to an in-place edit");
 
-        Assert.Contains("private void UnitEditor_LostFocus(object sender, RoutedEventArgs e) => CommitUnitEdit();",
-                        page, StringComparison.Ordinal);
-
-        string keys = Body(page, "private void UnitEditor_KeyDown(");
+        string keys = page[at..Math.Min(page.Length, at + 2400)];
         Assert.Contains("VirtualKey.Enter", keys, StringComparison.Ordinal);
-        Assert.Contains("CommitUnitEdit()", keys, StringComparison.Ordinal);
+        Assert.Contains("CommitInPlaceEdit()", keys, StringComparison.Ordinal);
         Assert.Contains("VirtualKey.Escape", keys, StringComparison.Ordinal);
-        Assert.Contains("CancelUnitEdit()", keys, StringComparison.Ordinal);
+        Assert.Contains("CancelInPlaceEdit", keys, StringComparison.Ordinal);
+
+        // ⚠️ AND CLICKING AWAY COMMITS, which is the half a keyboard test
+        // would miss. Clearing the selection without committing would throw
+        // away what the reader typed, silently.
+        int away = page.IndexOf("Any other press drops the box", StringComparison.Ordinal);
+        Assert.True(away > 0, "the click-away path is no longer where this test looks");
+        string drop = page[away..Math.Min(page.Length, away + 900)];
+        Assert.Contains("CommitInPlaceEdit();", drop, StringComparison.Ordinal);
+
+        // And it commits BEFORE it clears, or the typing goes with the box.
+        int commits = drop.IndexOf("CommitInPlaceEdit();", StringComparison.Ordinal);
+        int clears = drop.IndexOf("ClearTextUnitSelection();", StringComparison.Ordinal);
+        Assert.True(clears > commits, "the selection is dropped before the typing is kept");
     }
 
     [Fact]
-    public void the_editor_never_grows_wider_than_the_page()
+    public void nothing_is_painted_over_the_page_beyond_the_text_it_replaces()
     {
-        // It is sized to the line plus room to type past its end, and a long
-        // line near the right margin would otherwise put the box off screen.
-        string body = Body(Page(), "private bool OpenUnitEditor(int caretAt)");
+        // ⚠️ THE BOX THIS REPLACED WAS SIZED TO THE LINE PLUS ROOM TO TYPE,
+        // so it covered the lines above and below. Nothing is sized that way
+        // any more: the only thing painted over the page is the old tail's own
+        // extent, and it stops exactly where the page stopped drawing.
+        string body = Body(ViewModel(), "public LiveTextTail? InPlaceTail()");
 
-        Assert.Contains("Math.Min(scale,", body, StringComparison.Ordinal);
-        Assert.Contains("scale = ViewModel.OverlayScale", body, StringComparison.Ordinal);
+        Assert.Contains("CoverRight: _lineEditGlyphs[^1].Right", body, StringComparison.Ordinal);
+
+        // And when nothing has changed there is no tail at all, so the page is
+        // untouched while the reader is only looking at it.
+        Assert.Contains("if (!_lineEdit.IsChanged) { return null; }", body, StringComparison.Ordinal);
     }
 }

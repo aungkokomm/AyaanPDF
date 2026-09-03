@@ -211,7 +211,7 @@ public class AppModeTests
         // Leaving Edit is not the same as pressing Escape: the reader typed it.
         string body = Body(Page(), "private void SetMode(AppMode mode)");
 
-        int commit = body.IndexOf("CommitUnitEdit()", StringComparison.Ordinal);
+        int commit = body.IndexOf("ViewModel.CommitInPlaceEdit()", StringComparison.Ordinal);
         int set = body.IndexOf("ViewModel.Mode = mode;", StringComparison.Ordinal);
 
         Assert.True(commit > 0 && commit < set, "the mode changes before the editor is committed");

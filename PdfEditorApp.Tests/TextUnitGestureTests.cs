@@ -212,22 +212,28 @@ public class TextUnitGestureTests
         string select = SelectCase();
 
         int inBox = select.IndexOf("TextUnitBoxContains(", StringComparison.Ordinal);
-        int open = select.IndexOf("OpenUnitEditor(", inBox, StringComparison.Ordinal);
+        int open = select.IndexOf("BeginInPlaceEdit(", inBox, StringComparison.Ordinal);
 
         Assert.True(open > inBox);
-        Assert.Contains("OpenUnitEditor(ViewModel.CaretOffsetFor(content.Page, content.X))",
+
+        // ⚠️ THE POINT ITSELF, NOT AN OFFSET COMPUTED FROM IT. The caret is
+        // resolved against the page's own glyphs inside the view model, so the
+        // click has to arrive there as a place on the page.
+        Assert.Contains("BeginInPlaceEdit(content.Page, nx, ny)",
                         select, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void the_editor_places_a_caret_and_does_not_select_everything()
+    public void the_click_places_a_caret_and_does_not_select_everything()
     {
         // ⚠️ Select-all would throw away what the click just said and make the
-        // next keystroke delete the line.
-        string body = Body(Page(), "private bool OpenUnitEditor(int caretAt)");
+        // next keystroke delete the line. There is nothing to select any more:
+        // the click produces one caret offset, taken from the glyph it landed
+        // on, and that is the whole of what starting an edit does.
+        string body = Body(ViewModel(), "public bool BeginInPlaceEdit(");
 
-        Assert.Contains("SelectionStart = at;", body, StringComparison.Ordinal);
-        Assert.Contains("SelectionLength = 0;", body, StringComparison.Ordinal);
+        Assert.Contains("new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX))",
+                        body, StringComparison.Ordinal);
         Assert.DoesNotContain("SelectAll()", body, StringComparison.Ordinal);
     }
 
@@ -290,15 +296,21 @@ public class TextUnitGestureTests
     }
 
     [Fact]
-    public void there_is_one_editor_for_the_documents_text_and_not_two()
+    public void there_is_no_editor_over_the_documents_text_at_all()
     {
-        // The word editor and the line editor were duplicates of each other and
-        // drifted. One gesture reaches one editor now.
+        // ⚠️ A SETTLED PRODUCT REQUIREMENT. The word editor and the line
+        // editor were duplicates that drifted, and were merged into one; that
+        // one has now been removed outright. Editing the document's own text
+        // happens ON the page, so no TextBox may be floated over it again.
         string page = Page();
 
         Assert.DoesNotContain("_wordEditor", page, StringComparison.Ordinal);
         Assert.DoesNotContain("_lineEditor", page, StringComparison.Ordinal);
-        Assert.Contains("private TextBox? _unitEditor;", page, StringComparison.Ordinal);
+        Assert.DoesNotContain("_unitEditor", page, StringComparison.Ordinal);
+
+        // The caret and the redrawn tail are what replaced it.
+        Assert.Contains("BeginInPlaceEdit(", page, StringComparison.Ordinal);
+        Assert.Contains("RenderInPlaceEdit()", page, StringComparison.Ordinal);
     }
 
     // ---------------- the unit rule ----------------

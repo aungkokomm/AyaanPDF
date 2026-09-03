@@ -118,6 +118,22 @@ public partial class PageSlot : ObservableObject
     public ObservableCollection<ScaledRect> PageTextOutline { get; } = new();
 
     /// <summary>
+    /// The document's own text that Edit mode can offer, one box per region.
+    ///
+    /// ⚠️ SUBTLE ON PURPOSE, AND NOT A SELECTION. This says "there is
+    /// editable text here" about the whole page at once, and it is drawn while
+    /// the reader is still deciding where to click. <see cref="PageTextOutline"/>
+    /// says "this one", after they have. Drawing them alike would make the page
+    /// look selected everywhere.
+    ///
+    /// Empty in View mode, and empty for any region with nothing offerable in
+    /// it: a box around text that cannot be clicked is a promise the app does
+    /// not keep.
+    /// </summary>
+    public ObservableCollection<ScaledRect> TextRegionOutlines { get; } = new();
+
+
+    /// <summary>
     /// Why the framed piece of the document's own text cannot be edited. At
     /// most one entry, and empty whenever it can be.
     ///
