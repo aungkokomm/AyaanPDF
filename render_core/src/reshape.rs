@@ -19,12 +19,9 @@
 //! the installed font matched all 24. A document whose font is not installed
 //! is refused rather than guessed at.
 //!
-//! ⚠️ NOTHING CALLS THIS YET, ON PURPOSE. Reading a page is settled and tested;
-//! putting a caret in one is not. Wiring it into the editor needs two things
-//! this module deliberately does not decide: where a line ends, which has to
-//! come from the page's own text positioning rather than a guess, and where the
-//! words are, which on a justified line is drawn as `TJ` gaps and not as space
-//! glyphs. Both belong to the caller.
+//! ⚠️ THIS MODULE KNOWS NOTHING ABOUT PDFs, ON PURPOSE. Where a line ends, and
+//! where the words are on a justified line, are questions about page structure
+//! rather than about a font. [`crate::recover`] answers those and calls this.
 #![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashMap};
@@ -43,7 +40,36 @@ pub(crate) struct Index {
 /// and not a search: an optional kinzi, a base, an optional stacked consonant,
 /// the medials in their fixed order, then the vowels and the tone marks in
 /// theirs. Anything the font cannot draw is dropped when it is shaped.
-fn syllables(only: Option<&BTreeSet<char>>) -> Vec<String> {
+/// Which consonants can appear STACKED under another on a page drawing only
+/// `glyphs`, found by asking the font what each stacked form draws.
+///
+/// ⚠️ THIS IS AN OPTIMISATION AND IT IS ALLOWED TO BE WRONG. Stacking is what
+/// makes the enumeration expensive: every base pairs with every stack. Cutting
+/// the stacks a page cannot contain removes most of that. If it ever cuts one a
+/// page DOES contain, the line simply fails to prove and is refused, because
+/// nothing is believed without being shaped again. Narrowing can cost a reading;
+/// it cannot corrupt one.
+/// ⚠️ AND IT MUST BE ASKED IN CONTEXT. A stacked consonant on its own is not
+/// Burmese, and a shaper says so by drawing a dotted circle in front of it. No
+/// page contains that glyph, so testing the bare form rejected every stack
+/// there is and took the conjuncts down with it.
+fn stackable(face: &rustybuzz::Face, glyphs: Option<&BTreeSet<u16>>) -> Option<Vec<char>> {
+    let allowed = glyphs?;
+    let alone = draws(face, "\u{1000}");
+    let mut out = Vec::new();
+    for c in (0x1000u32..=0x1021).filter_map(char::from_u32) {
+        let stacked = draws(face, &format!("\u{1000}\u{1039}{c}"));
+        // What the stack ADDED to the base, which is the part a page carrying
+        // this conjunct has to be drawing.
+        let mut added = stacked.iter().filter(|g| !alone.contains(g)).peekable();
+        if added.peek().is_none() || added.any(|g| allowed.contains(g)) {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn syllables(only: Option<&BTreeSet<char>>, stacks_of: Option<&[char]>) -> Vec<String> {
     let wanted = |s: &str| -> bool {
         match only {
             None => true,
@@ -73,7 +99,10 @@ fn syllables(only: Option<&BTreeSet<char>>) -> Vec<String> {
     let kinzi = "\u{1004}\u{103A}\u{1039}";
     let with_kinzi: Vec<String> = consonants.iter().map(|c| format!("{kinzi}{c}")).collect();
 
-    let stacks: Vec<String> = consonants.iter().map(|c| format!("\u{1039}{c}")).collect();
+    let stacks: Vec<String> = match stacks_of {
+        Some(only) => only.iter().map(|c| format!("\u{1039}{c}")).collect(),
+        None => consonants.iter().map(|c| format!("\u{1039}{c}")).collect(),
+    };
 
     const MEDIALS: [&str; 12] = [
         "", "\u{103B}", "\u{103C}", "\u{103D}", "\u{103E}",
@@ -165,8 +194,16 @@ impl Index {
         let mut says: HashMap<Vec<u16>, String> = HashMap::new();
         let mut longest = 1usize;
 
-        for text in syllables(chars) {
-            let drawn = draws(&face, &text);
+        // ⚠️ THE BUFFER IS REUSED, WHICH IS MOST OF THE COST. A fresh
+        // `UnicodeBuffer` per syllable allocates, and this shapes hundreds of
+        // thousands of them; `GlyphBuffer::clear` hands the same one back.
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        for text in syllables(chars, stackable(&face, glyphs).as_deref()) {
+            buffer.push_str(&text);
+            let shaped = rustybuzz::shape(&face, &[], buffer);
+            let drawn: Vec<u16> =
+                shaped.glyph_infos().iter().map(|i| i.glyph_id as u16).collect();
+            buffer = shaped.clear();
             // A syllable the font cannot spell draws `.notdef`, and no page
             // contains one, so it can only add noise.
             if drawn.is_empty() || drawn.contains(&0) {

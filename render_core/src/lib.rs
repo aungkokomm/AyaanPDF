@@ -39,6 +39,7 @@ mod block;
 mod justified;
 mod pieces;
 mod provision;
+mod recover;
 mod reshape;
 mod shaped;
 pub mod outline;
