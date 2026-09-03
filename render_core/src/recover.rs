@@ -148,6 +148,9 @@ fn fonts_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, (String, Option
 }
 
 /// Every line the page draws, in the order it draws them.
+// The accumulator reset inside `finish!` is read by every expansion except the
+// last one, which is the only place the compiler can see.
+#[allow(unused_assignments)]
 pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     let names = fonts_of(doc, page);
     let Ok(content) = lopdf::content::Content::decode(&doc.get_page_content(page)) else {
