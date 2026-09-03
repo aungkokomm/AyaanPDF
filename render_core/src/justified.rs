@@ -1221,7 +1221,7 @@ pub(crate) fn rewrite_bytes_shaped(
     // measured at 90,000 changed pixels over a 500-point band, against about
     // 10,000 confined to the edited line once it was restored.
     let size = Object::Real(plan.font_size as f32);
-    let mut replacing: Vec<Operation> = Vec::with_capacity(5);
+    let mut replacing: Vec<Operation> = Vec::with_capacity(7);
     if !before.is_empty() {
         replacing.push(Operation::new("TJ", vec![Object::Array(before)]));
     }
@@ -1229,7 +1229,24 @@ pub(crate) fn rewrite_bytes_shaped(
         "Tf",
         vec![Object::Name(RESOURCE.to_vec()), size.clone()],
     ));
+    // ⚠️ THE SPAN WRAPS THE VISIBLE RUN AND NOTHING ELSE, both `Tf` operators
+    // outside it, so the run's meaning travels with the run and neither font
+    // switch sits inside a span a reader may treat as one unit.
+    //
+    // ⚠️ AND ONLY WHERE THE PER-GLYPH ORDER IS ACTUALLY WRONG. Text no shaper
+    // reorders already extracts correctly one glyph at a time, and a span is
+    // not free: PDFium re-derives the character positions inside one, which was
+    // measured on a Latin replacement as a line whose word gaps went from
+    // agreeing within 0.7pt to spreading over 1.05pt. A mechanism that buys
+    // nothing here is not applied here.
+    let span = crate::needs_shaping(new_text) && !reads_right_to_left(new_text);
+    if span {
+        replacing.push(actual_text(new_text));
+    }
     replacing.push(Operation::new("TJ", vec![Object::Array(replacement)]));
+    if span {
+        replacing.push(Operation::new("EMC", vec![]));
+    }
     replacing.push(Operation::new(
         "Tf",
         vec![Object::Name(plan.font_name.clone()), size],
@@ -1343,6 +1360,62 @@ fn closing_emc(ops: &[Operation], from: usize) -> usize {
         Some(at) => (from + at + 1).min(ops.len()),
         None => ops.len(),
     }
+}
+
+/// What the visible shaped run SAYS, as opposed to what it draws.
+///
+/// ⚠️ THIS IS THE ONLY THING THAT SURVIVES REORDERING. A shaper draws U+103C
+/// before the consonant it was typed after, so the glyphs enter the content
+/// stream in an order the characters are not in, and every per-glyph mechanism
+/// reproduces the drawing order because that is the only order the stream has.
+/// Measured: U+1019 U+103C written, drawn correctly, extracted as U+103C
+/// U+1019. An explicit `/ToUnicode` built from the shaper's own clusters was
+/// tried and is WORSE, because a CMap is keyed by glyph and one glyph serves
+/// two clusters: the same file came back with a duplicated syllable, and with
+/// junk characters where a glyph had no entry and fell through to the font
+/// cmap. `/ActualText` is per-OCCURRENCE, which is the one thing a per-glyph
+/// map can never be.
+///
+/// ⚠️ UTF-16BE WITH A BOM. A PDF text string is PDFDoc-encoded unless the BOM
+/// says otherwise, and PDFDocEncoding cannot spell any of this. Hex, so no byte
+/// needs an escaping rule to survive.
+fn actual_text(text: &str) -> Operation {
+    let mut utf16 = vec![0xFEu8, 0xFF];
+    for unit in text.encode_utf16() {
+        utf16.push((unit >> 8) as u8);
+        utf16.push((unit & 0xFF) as u8);
+    }
+    let mut props = lopdf::Dictionary::new();
+    props.set("ActualText", Object::String(utf16, lopdf::StringFormat::Hexadecimal));
+    Operation::new("BDC", vec![Object::Name(b"Span".to_vec()), Object::Dictionary(props)])
+}
+
+/// Whether the run reads right to left, in which case NO span is written.
+///
+/// ⚠️ MEASURED: PDFIUM BIDI-REORDERS THE TEXT IT SUBSTITUTES. Arabic supplied
+/// as `/ActualText` in correct logical order came back exactly reversed, while
+/// the same edit WITHOUT a span already extracted in logical order: PDFium maps
+/// the visual glyph stream back through the font's cmap and its own bidi pass
+/// puts it right. So the span is for the scripts whose per-glyph order is
+/// actually wrong, and RTL is left to the path that already works.
+///
+/// Any strong RTL character disqualifies the run, rather than the bidi
+/// algorithm's first-strong rule. A replacement is one word in one script, and
+/// the conservative answer costs nothing: not writing the span is exactly the
+/// behaviour that was already correct.
+fn reads_right_to_left(text: &str) -> bool {
+    text.chars().any(|c| {
+        let u = c as u32;
+        (0x0590..=0x05FF).contains(&u)        // Hebrew
+            || (0x0600..=0x06FF).contains(&u) // Arabic
+            || (0x0700..=0x074F).contains(&u) // Syriac
+            || (0x0750..=0x077F).contains(&u) // Arabic Supplement
+            || (0x0780..=0x07BF).contains(&u) // Thaana
+            || (0x07C0..=0x07FF).contains(&u) // NKo
+            || (0x08A0..=0x08FF).contains(&u) // Arabic Extended-A
+            || (0xFB1D..=0xFDFF).contains(&u) // Hebrew and Arabic presentation forms
+            || (0xFE70..=0xFEFF).contains(&u)
+    })
 }
 
 /// The invisible run that makes a shaped replacement searchable.

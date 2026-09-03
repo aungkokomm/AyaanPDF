@@ -25244,6 +25244,7 @@ p={spread_px:.4},c={rgba:08X})"
     const EMBEDDED_BASELINE: f32 = 700.0;
     const EMBEDDED_TEXT: &str = "The quick brown fox jumps over the lazy dog";
     const DEVANAGARI_FONT: &str = r"C:\Windows\Fonts\Nirmala.ttf";
+    const MYANMAR_FONT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
 
     /// Everything Path B needs that PDFium has to do: the font embedded in a
     /// COPY, and the id of the font object in those bytes.
@@ -25703,12 +25704,14 @@ p={spread_px:.4},c={rgba:08X})"
         // its logical text in a property dictionary instead of leaving it to be
         // decoded back out of the glyphs.
         assert_eq!(now.get("MCID"), was.get("MCID"), "MCID count changed");
-        // What Phase 5 adds, and nothing beyond it: one marked span of its own,
-        // with its own text block and matrix, for the invisible searchable run.
-        assert_eq!(now["BDC"], was["BDC"] + 1, "expected exactly one more marked span");
+        // TWO marked spans of its own: one around the VISIBLE run, carrying
+        // `/ActualText` so the run says what it means, and one for the
+        // invisible searchable run with its own text block and matrix. The
+        // first adds no BT/ET/Tm, which is why only those two counts move.
+        assert_eq!(now["BDC"], was["BDC"] + 2, "expected exactly two more marked spans");
         assert_eq!(now.get("BMC").copied().unwrap_or(0), was.get("BMC").copied().unwrap_or(0),
             "a bare BMC appeared; the run has to carry its property dictionary");
-        assert_eq!(now["EMC"], was["EMC"] + 1, "expected one more closer, for that span");
+        assert_eq!(now["EMC"], was["EMC"] + 2, "expected one more closer for each span");
         assert_eq!(now["BT"], was["BT"] + 1);
         assert_eq!(now["ET"], was["ET"] + 1);
         assert_eq!(now["Tm"], was["Tm"] + 1);
@@ -25867,6 +25870,132 @@ p={spread_px:.4},c={rgba:08X})"
         assert!(still.iter().any(|l| l.text.contains("brown")),
             "the live document was modified by a call that only produces bytes");
         assert_eq!(still.len(), 2, "the live document gained or lost a line");
+        close_document(handle);
+    }
+
+    /// KNOWN-GOOD MYANMAR -> SHAPED PAGE CONTENT -> SAVE/REOPEN -> CORRECT TEXT.
+    ///
+    /// ⚠️ THE WRITE PATH ON ITS OWN, WITH NOTHING EXTRACTED. The string here
+    /// is supplied by this test, not read out of a PDF, because reading complex
+    /// script back out of an arbitrary document is a different and much harder
+    /// problem: measured on a real Myanmar file, 68.2% of lines came back
+    /// structurally invalid. Whether Ayaan can WRITE complex text correctly has
+    /// to be settled before any of that is touched.
+    ///
+    /// ⚠️ AND IT REORDERS, which is the whole point of the choice. U+103C
+    /// (medial ra) is typed after its consonant and DRAWN BEFORE it, so the
+    /// glyphs go into the content stream in an order the characters are not in.
+    /// A round trip that only proved one standalone letter would prove nothing
+    /// about that. This asserts the text comes back in LOGICAL order.
+    ///
+    /// ⚠️ WHAT MAKES IT PASS IS `/ActualText`, and nothing else can. This test
+    /// failed for as long as the run's meaning was carried per GLYPH, because
+    /// the stream's only order is the drawing order. See `justified::actual_text`
+    /// for the two mechanisms that were measured and refuted first.
+    #[test]
+    fn known_good_myanmar_survives_the_write_and_reads_back_exactly() {
+        if !std::path::Path::new(MYANMAR_FONT).exists() {
+            return;
+        }
+
+        // "မြန်မာ": ma, medial ra (reorders), na, asat, ma, aa.
+        const MYANMAR: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+
+        let edited = shaped_ffi(handle, at, 5, MYANMAR, MYANMAR_FONT)
+            .expect("the shaped edit was refused");
+
+        // 2 and 4: PDFium opens the saved bytes and reads them.
+        let (line, below) = two_lines(&edited);
+
+        // 3: the characters come back exactly, and in the order they were
+        // written rather than the order they were drawn.
+        assert!(
+            line.text.contains(MYANMAR),
+            "Myanmar did not survive the round trip.\n  wrote: {:?}\n  read : {:?}",
+            MYANMAR.chars().map(|c| format!("{:04X}", c as u32)).collect::<Vec<_>>(),
+            line.text.chars().map(|c| format!("{:04X}", c as u32)).collect::<Vec<_>>(),
+        );
+
+        // 5: it is selectable and searchable, which for a PDF means the text
+        // page can find it. Nothing else makes a glyph mean anything.
+        assert!(line.text.find(MYANMAR).is_some(), "the run is not findable in the page text");
+
+        // 7: the Latin around it is untouched, on this line and the next.
+        assert!(!line.text.contains("brown"), "the old word is still there: {:?}", line.text);
+        assert!(line.text.contains("The quick"), "the words before it changed: {:?}", line.text);
+        assert!(line.text.contains("fox jumps"), "the words after it changed: {:?}", line.text);
+        assert_eq!(below.text.trim(), "and rests here quietly.");
+
+        // 6: page content, not an annotation. The bytes must carry no
+        // annotation at all, or this would be a text box floating over the page
+        // wearing the same clothes.
+        let doc = lopdf::Document::load_mem(&edited).unwrap();
+        let (_, &pid) = doc.get_pages().iter().next().unwrap();
+        let page = doc.get_dictionary(pid).unwrap();
+        match page.get(b"Annots") {
+            Err(_) => {}
+            Ok(annots) => {
+                let empty = match annots {
+                    lopdf::Object::Array(a) => a.is_empty(),
+                    lopdf::Object::Reference(id) => doc
+                        .get_object(*id)
+                        .and_then(|o| o.as_array().map(|a| a.is_empty()))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                assert!(empty, "the replacement was written as an annotation");
+            }
+        }
+
+        // 1, as far as a test can take it: every character got a real glyph.
+        // `provision` refuses .notdef, so reaching here means the font could
+        // spell all of it. Whether it LOOKS right is for a human to say.
+        let p = provision::provision(Some(MYANMAR_FONT), MYANMAR, shaped::SHAPING_SIZE)
+            .expect("the font cannot spell the string this test just wrote");
+        assert!(p.glyphs.iter().all(|g| g.id != 0), "a .notdef reached the page");
+        assert!(
+            p.glyphs.len() >= MYANMAR.chars().count() - 2,
+            "the shaper produced suspiciously few glyphs: {}",
+            p.glyphs.len()
+        );
+
+        // And the live document is untouched, the same contract Path A keeps.
+        let still = decode_lines(handle, 0);
+        assert!(still.iter().any(|l| l.text.contains("brown")),
+            "the live document was modified by a call that only produces bytes");
+        close_document(handle);
+    }
+
+    /// The control for the test above: Myanmar that does NOT reorder.
+    ///
+    /// If this passes while the reordering one fails, the write path itself is
+    /// sound and the defect is specifically that a cluster the shaper MOVED is
+    /// read back in the order it was drawn rather than the order it was
+    /// written.
+    #[test]
+    fn myanmar_without_reordering_reads_back_exactly() {
+        if !std::path::Path::new(MYANMAR_FONT).exists() {
+            return;
+        }
+
+        // ma, aa, na. Every glyph stays where its character is, so nothing here
+        // depends on the written order surviving the drawing order.
+        const PLAIN: &str = "\u{1019}\u{102C}\u{1014}";
+
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let edited = shaped_ffi(handle, at, 5, PLAIN, MYANMAR_FONT).expect("refused");
+
+        let (line, _) = two_lines(&edited);
+        assert!(
+            line.text.contains(PLAIN),
+            "even non-reordering Myanmar did not survive.\n  wrote: {:?}\n  read : {:?}",
+            PLAIN.chars().map(|c| format!("{:04X}", c as u32)).collect::<Vec<_>>(),
+            line.text.chars().map(|c| format!("{:04X}", c as u32)).collect::<Vec<_>>(),
+        );
         close_document(handle);
     }
 
@@ -26314,6 +26443,40 @@ p={spread_px:.4},c={rgba:08X})"
         };
         close_document(handle);
         ids
+    }
+
+    /// WHICH RUNS GET THE SPAN, and which deliberately do not.
+    ///
+    /// ⚠️ BOTH EXCLUSIONS ARE MEASURED, NOT CAUTIOUS. Arabic supplied as
+    /// `/ActualText` in logical order came back exactly REVERSED, because
+    /// PDFium bidi-reorders the text it substitutes, while the same edit
+    /// without a span already extracted logically. And a Latin replacement's
+    /// word gaps went from agreeing within 0.7pt to spreading over 1.05pt,
+    /// because PDFium re-derives the character positions inside a span. The
+    /// span goes only where the per-glyph order is genuinely wrong.
+    #[test]
+    fn the_span_is_written_only_where_the_glyph_order_is_wrong() {
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        for (label, font, replacement) in PATH_B_SCRIPTS {
+            if !std::path::Path::new(font).exists() {
+                continue;
+            }
+            let (_, edited) = shaped_edit(font, at, 5, replacement).expect("refused");
+            let doc = lopdf::Document::load_mem(&edited).unwrap();
+            let (_, &pid) = doc.get_pages().iter().next().unwrap();
+            let stream = doc.get_page_content(pid);
+            let has = stream.windows(10).any(|w| w == b"ActualText");
+
+            // Shaped and left to right: the two that need it.
+            let wanted = matches!(label, "hindi" | "burmese");
+            assert_eq!(has, wanted,
+                "{label}: /ActualText present is {has}, expected {wanted}");
+
+            // ⚠️ AND EITHER ANSWER MUST STILL READ. The gate is only ever
+            // allowed to choose the mechanism, never to lose the characters.
+            assert!(found_text(&edited).contains(replacement),
+                "{label}: Find cannot see {replacement:?}");
+        }
     }
 
     #[test]
@@ -27637,12 +27800,16 @@ p={spread_px:.4},c={rgba:08X})"
             STATUS_OK_PDFIUM);
 
         let b = only_block(handle);
-        // ⚠️ THE MUTATION GUARD. If the pairing had not worked, the logical
-        // text would BE the drawn text and the assertion above would pass for
-        // the wrong reason. The two must differ.
-        assert!(!b.lines[0].drawn.contains(CONJUNCT),
-            "the glyphs decode to the logical text, so this proves nothing: {:?}",
-            b.lines[0].drawn);
+        // ⚠️ THE MUTATION GUARD, TURNED AROUND ON PURPOSE. It used to assert
+        // that the drawn text DIFFERS from the logical text, so the assertion
+        // below could not pass by comparing the drawn text with itself.
+        // `/ActualText` made that premise false deliberately: the visible run
+        // now states what it means, so the glyphs decode logically too. What
+        // still proves the pairing is real is the mapping further down, which
+        // reports this stretch as a Path B atomic unit rather than as ordinary
+        // decoded glyphs.
+        assert!(b.lines[0].drawn.contains(CONJUNCT),
+            "the visible run no longer reads logically: {:?}", b.lines[0].drawn);
         assert!(b.text.contains(CONJUNCT), "{:?}", b.text);
 
         let at = b.text.find(CONJUNCT).unwrap();
@@ -30120,8 +30287,10 @@ p={spread_px:.4},c={rgba:08X})"
         // would carry a shaped run it never needed.
         assert!(!b.lines[0].runs.iter().any(|r| r.atomic), "line one was set in the new font");
         assert!(b.lines[1].runs.iter().any(|r| r.atomic), "line two was not");
-        // The glyphs are there and they are not the letters anyone typed.
-        assert!(!b.lines[1].drawn.contains(CONJUNCT), "{:?}", b.lines[1].drawn);
+        // The glyphs are there, and since `/ActualText` they also say what they
+        // spell. What this test is about is which LINE took the new font, which
+        // the two assertions above settle.
+        assert!(b.lines[1].drawn.contains(CONJUNCT), "{:?}", b.lines[1].drawn);
         close_document(handle);
     }
 
@@ -30183,13 +30352,46 @@ p={spread_px:.4},c={rgba:08X})"
         let b = only_block(handle);
         assert!(b.lines[0].runs.iter().any(|r| r.atomic), "the first line lost its shaped run");
         assert!(b.lines[1].runs.iter().any(|r| r.atomic), "the second line has no shaped run");
-        // ⚠️ THE MUTATION GUARD. If the logical text were coming from the
-        // glyphs, it would BE the glyphs, and the assertions below would be
-        // comparing the drawn text with itself.
-        assert!(!b.lines[0].drawn.contains(CONJUNCT), "{:?}", b.lines[0].drawn);
-        assert!(!b.lines[1].drawn.contains(NASAL), "{:?}", b.lines[1].drawn);
+        // ⚠️ THE MUTATION GUARD, TURNED AROUND. Since `/ActualText` the drawn
+        // text and the logical text agree by design, so this can no longer be
+        // the thing that separates them. `shaped_runs_of` below is: it reads
+        // the RECORDED runs, and it is what would have caught the defect in the
+        // comment at the top of this test.
+        assert!(b.lines[0].drawn.contains(CONJUNCT), "{:?}", b.lines[0].drawn);
+        assert!(b.lines[1].drawn.contains(NASAL), "{:?}", b.lines[1].drawn);
         assert_eq!(shaped_runs_of(handle), vec![CONJUNCT.to_string(), NASAL.to_string()]);
         assert_eq!(block_text(handle), edited);
+        close_document(handle);
+    }
+
+    /// ⚠️ WHY A STALE `/ActualText` SPAN CANNOT HAPPEN. The span states what ONE
+    /// run means, so a run rewritten inside a span written for different text
+    /// would extract as the OLD word: right on the page, wrong to every reader.
+    /// It cannot arise, because a line already carrying a Path B run refuses any
+    /// further edit. That is the same atomic refusal
+    /// `the_model_reads_a_shaped_run_logically_and_will_not_re_edit_it` asserts
+    /// from the other side, and it was measured against the code from before the
+    /// span existed as well: the span relies on this contract, it did not
+    /// introduce it.
+    #[test]
+    fn a_line_that_already_carries_a_shaped_run_takes_no_second_edit() {
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            return;
+        }
+        let handle = editable_block_document();
+        let first = BOTH_LINES.replace("brown", CONJUNCT);
+        assert_eq!(emit_block(handle, 0, 0, &first, Some(DEVANAGARI_FONT)), STATUS_OK_PDFIUM);
+
+        // A different word on the SAME line, nowhere near the shaped run.
+        let second = block_text(handle).replace("lazy", NASAL);
+        assert_eq!(emit_block(handle, 0, 0, &second, Some(DEVANAGARI_FONT)),
+            STATUS_SELECTION_NOT_ADDRESSABLE);
+
+        // And the refusal left the page exactly as it was: one run, one span.
+        assert_eq!(shaped_runs_of(handle), vec![CONJUNCT.to_string()]);
+        let content = live_page_content(handle);
+        assert_eq!(String::from_utf8_lossy(&content).matches("ActualText").count(), 1,
+            "the page carries a span its shaped runs do not account for");
         close_document(handle);
     }
 
