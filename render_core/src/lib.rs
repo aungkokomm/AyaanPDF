@@ -1868,8 +1868,15 @@ pub extern "C" fn retype_recovered_line(
 /// arriving before it has finished waits for it rather than starting a second.
 ///
 /// Encoding: `u32` line count, then per line `f32` y, `f32` x, `u32` byte
-/// length and that many UTF-8 bytes. A line nothing could prove has length 0,
-/// and is still reported so a caller can match it by baseline.
+/// length and that many UTF-8 bytes, then `u32` cluster count and, for each,
+/// `u32` first byte, `u32` last byte, `f32` left, `f32` right. A line nothing
+/// could prove has no bytes and no clusters, and is still reported so a caller
+/// can match it by baseline.
+///
+/// ⚠️ THE BOXES ARE PER CLUSTER, NOT PER CHARACTER, and the script forces
+/// it: `မြ` is drawn as one unit with the medial before the consonant it
+/// follows, so the page has no position between the two of them. See
+/// [`crate::recover::Cluster`].
 #[unsafe(no_mangle)]
 pub extern "C" fn recover_page_text(doc_handle: u64, page_index: i32) -> ByteBuffer {
     if doc_handle == 0 || page_index < 0 {
@@ -1901,6 +1908,13 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
         let said = line.text.as_deref().unwrap_or("");
         out.extend((said.len() as u32).to_le_bytes());
         out.extend(said.as_bytes());
+        out.extend((line.clusters.len() as u32).to_le_bytes());
+        for cluster in &line.clusters {
+            out.extend((cluster.from as u32).to_le_bytes());
+            out.extend((cluster.to as u32).to_le_bytes());
+            out.extend((cluster.left as f32).to_le_bytes());
+            out.extend((cluster.right as f32).to_le_bytes());
+        }
     }
 
     let mut boxed = out.into_boxed_slice();
@@ -26135,21 +26149,30 @@ p={spread_px:.4},c={rgba:08X})"
         let handle = open_fixture_named(file.to_str().unwrap());
         prepare_recovery(handle, 0);
 
-        let first = std::time::Instant::now();
-        let one = read_recovered(handle);
-        let first = first.elapsed();
+        let readings = read_recovered(handle);
+        let again = read_recovered(handle);
+        assert!(readings.iter().any(|(_, text)| text.contains(MYANMAR)),
+            "the first reading lost the Burmese: {readings:?}");
+        assert_eq!(readings, again, "the two readings disagree");
 
-        let second = std::time::Instant::now();
-        let two = read_recovered(handle);
-        let second = second.elapsed();
+        // ⚠️ ASKED OF THE CACHE, NOT OF A CLOCK. Building the index is seconds
+        // of reshaping and reading a page that already has one is three
+        // milliseconds, so timing the two reads says everything on an idle
+        // machine and nothing while the rest of the suite is saturating the
+        // cores. Measured under load: the second read still did its 3ms of
+        // work, and waited 1.9 seconds to be given a core, which a wall-clock
+        // ceiling reported as a rebuilt index. What "prepared once" means is
+        // that the second reading got the SAME INDEX back, and that can simply
+        // be asked.
+        let doc = lopdf::Document::load_mem(&edited).unwrap();
+        let (_, &first_page) = doc.get_pages().iter().next().unwrap();
+        let one = indexes_for_page(handle, 0, &doc, first_page);
+        let two = indexes_for_page(handle, 0, &doc, first_page);
+        assert!(Arc::ptr_eq(&one, &two), "the second reading rebuilt the index");
+        assert!(!one.is_empty(), "there was no index to keep");
+
         close_document(handle);
         let _ = std::fs::remove_file(&file);
-
-        assert!(one.iter().any(|(_, text)| text.contains(MYANMAR)),
-            "the first reading lost the Burmese: {one:?}");
-        assert_eq!(one, two, "the two readings disagree");
-        assert!(second < std::time::Duration::from_secs(1),
-            "the second reading rebuilt the index: {second:?} after {first:?}");
     }
 
     /// The real thing, on a file that is not in this repository: what a reader
@@ -26340,6 +26363,16 @@ p={spread_px:.4},c={rgba:08X})"
             let len = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
             let text = String::from_utf8(raw[at..at + len].to_vec()).unwrap();
             at += len;
+            let clusters = u32::from_le_bytes(take4(&raw, &mut at));
+            for _ in 0..clusters {
+                let from = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
+                let to = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
+                let _left = f32::from_le_bytes(take4(&raw, &mut at));
+                let _right = f32::from_le_bytes(take4(&raw, &mut at));
+                assert!(to <= text.len() && text.is_char_boundary(from)
+                    && text.is_char_boundary(to),
+                    "a cluster names bytes {from}..{to} of {text:?}");
+            }
             out.push((y, text));
         }
         assert_eq!(at, raw.len(), "the buffer did not decode exactly");

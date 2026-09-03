@@ -100,6 +100,14 @@ pub(crate) struct Line {
     /// space. A negative number opens space and a positive one closes it, and
     /// both count: the total is how far the pen really travelled.
     pub(crate) adjust: f64,
+    /// Every `TJ` number the line carries, and which glyph it comes before.
+    ///
+    /// ⚠️ THE TOTAL IS NOT ENOUGH TO PLACE A CARET. A justified line's
+    /// stretch is spread along it, so knowing only that it adds 2 points
+    /// somewhere puts everything after the first space up to 2 points wrong,
+    /// and a caret that lands between the wrong letters is the whole failure
+    /// this way of editing exists to avoid.
+    pub(crate) nudges: Vec<(usize, f64)>,
     /// Where the line's word spaces are, and how wide.
     ///
     /// ⚠️ FOUND BY GEOMETRY, NOT BY GLYPH. A space between two separately
@@ -191,6 +199,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     let mut leading = 0.0f64;
     let mut glyphs: Vec<u16> = Vec::new();
     let mut adjust = 0.0f64;
+    let mut nudges: Vec<(usize, f64)> = Vec::new();
     let mut drawn_by: Vec<usize> = Vec::new();
 
     macro_rules! finish {
@@ -207,11 +216,13 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     size,
                     glyphs: std::mem::take(&mut glyphs),
                     adjust: std::mem::replace(&mut adjust, 0.0),
+                    nudges: std::mem::take(&mut nudges),
                     breaks: Vec::new(),
                     drawn_by: std::mem::take(&mut drawn_by),
                 });
             } else {
                 adjust = 0.0;
+                nudges.clear();
                 drawn_by.clear();
             }
         };
@@ -239,12 +250,16 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                 if op.operator == "TD" {
                     leading = -ty;
                 }
-                // ⚠️ A HORIZONTAL Td IS THE SAME LINE. A producer uses one to
-                // step along a line it is drawing in pieces, and treating each
-                // piece as its own line cuts words, and syllables, in half.
-                if ty.abs() > 0.01 {
-                    finish!();
-                }
+                // ⚠️ A HORIZONTAL Td IS THE SAME LINE, BUT IT IS A NEW
+                // PLACEMENT. A producer uses one to step along a line it is
+                // drawing in pieces, and treating each piece as its own line
+                // cuts words, and syllables, in half; `merge_placements` is
+                // what puts them back, and it also records how far the pen
+                // skipped. Swallowing the step here instead kept the glyphs
+                // together but stamped the run with the x of its LAST
+                // placement, so a real line's clusters began 175 points right
+                // of where the page draws them.
+                finish!();
                 line_matrix = Matrix::translation(tx, ty).then(line_matrix);
             }
             "T*" => {
@@ -291,6 +306,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                             // contributes to the advance is its negation.
                             if let Some(v) = number(&other) {
                                 adjust -= v;
+                                nudges.push((glyphs.len(), v));
                             }
                         }
                     }
@@ -324,10 +340,17 @@ fn merge_placements(
     const A_SPACE: f64 = 0.18;
 
     // Where a run ENDS: where it was placed, plus everything it advanced by.
+    //
+    // ⚠️ INCLUDING THE GAPS IT HAS ALREADY BEEN GIVEN. This is asked about a
+    // line that may already be several placements joined, and a gap moves the
+    // pen just as surely as a glyph does. Leaving them out made every gap after
+    // the first come out inflated by the sum of the ones before it: one real
+    // line reported three gaps worth 405 points across 496 points of text.
     let ends_at = |line: &Line| -> Option<f64> {
         let widths = fonts.get(&line.resource).and_then(|(_, w)| w.as_ref())?;
         let drawn: f64 = line.glyphs.iter().map(|g| widths.of(*g)).sum();
-        Some(line.x + (drawn + line.adjust) / 1000.0 * line.size)
+        let gaps: f64 = line.breaks.iter().map(|b| b.points).sum();
+        Some(line.x + (drawn + line.adjust) / 1000.0 * line.size + gaps)
     };
 
     let mut out: Vec<Line> = Vec::new();
@@ -350,6 +373,7 @@ fn merge_placements(
         prev.glyphs.extend(&line.glyphs);
         prev.breaks.extend(line.breaks.iter().map(|b| Break { at: b.at + at, ..*b }));
         prev.adjust += line.adjust;
+        prev.nudges.extend(line.nudges.iter().map(|(i, v)| (i + at, *v)));
         prev.drawn_by.extend(&line.drawn_by);
     }
     out
@@ -366,15 +390,60 @@ fn merge_placements(
 pub(crate) fn read_line(index: &crate::reshape::Index, face: &rustybuzz::Face, line: &Line)
     -> Option<String>
 {
-    // ⚠️ AND IF NO SPLIT WORKS, THE LINE IS READ WHOLE. Losing a space is worth
-    // far less than losing the line, and a reading with a word space missing is
-    // still the author's text.
-    split_at_the_spaces(index, face, line)
-        .or_else(|| crate::reshape::prove(face, index, &line.glyphs))
+    Some(said_by(&pieces_of(index, face, line)?))
+}
+
+/// One stretch of a line that was proven on its own.
+pub(crate) struct Piece {
+    /// Which of the line's glyphs say it.
+    pub(crate) glyphs: std::ops::Range<usize>,
+    /// What they say.
+    pub(crate) text: String,
+    /// Whether the reading puts a space character here.
+    ///
+    /// ⚠️ A GAP AND A SPACE ARE NOT THE SAME THING. A producer can draw a
+    /// space GLYPH and then also skip; the reading needs one space character
+    /// for the two of them, while the geometry has to cross both widths. So
+    /// this says only what the TEXT does, and [`clusters_of`] reads the skips
+    /// off the line itself.
+    pub(crate) space_before: bool,
+}
+
+/// What a line's pieces say together.
+pub(crate) fn said_by(pieces: &[Piece]) -> String {
+    let mut out = String::new();
+    for piece in pieces {
+        if piece.space_before {
+            out.push(' ');
+        }
+        out.push_str(&piece.text);
+    }
+    out
+}
+
+/// The line, cut into the stretches that could each be proven.
+///
+/// ⚠️ THE READING AND THE GEOMETRY MUST COME FROM THE SAME CUTS, which is
+/// why this is one function and not two. A caret placed from a different split
+/// than the text it is being placed in would drift by a whole space wherever
+/// the two disagreed.
+pub(crate) fn pieces_of(index: &crate::reshape::Index, face: &rustybuzz::Face, line: &Line)
+    -> Option<Vec<Piece>>
+{
+    // ⚠️ AND IF NO SPLIT WORKS, THE LINE IS READ WHOLE. Losing a space is
+    // worth far less than losing the line, and a reading with a word space
+    // missing is still the author's text.
+    split_at_the_spaces(index, face, line).or_else(|| {
+        Some(vec![Piece {
+            glyphs: 0..line.glyphs.len(),
+            text: crate::reshape::prove(face, index, &line.glyphs)?,
+            space_before: false,
+        }])
+    })
 }
 
 fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, line: &Line)
-    -> Option<String>
+    -> Option<Vec<Piece>>
 {
     if line.breaks.is_empty() {
         return None;
@@ -391,7 +460,7 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
         .chain(std::iter::once(line.glyphs.len()))
         .collect();
 
-    let mut out = String::new();
+    let mut out: Vec<Piece> = Vec::new();
     let mut from = 0usize;
     let mut next = 0usize;
     while from < line.glyphs.len() {
@@ -402,19 +471,133 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
             if cut <= from || cut > line.glyphs.len() {
                 continue;
             }
-            if let Some(piece) = crate::reshape::prove(face, index, &line.glyphs[from..cut]) {
-                taken = Some((cut, piece));
+            if let Some(text) = crate::reshape::prove(face, index, &line.glyphs[from..cut]) {
+                taken = Some((cut, text));
                 break;
             }
         }
-        let (cut, piece) = taken?;
-        if !out.is_empty() && !out.ends_with(' ') && !piece.starts_with(' ') {
-            out.push(' ');
-        }
-        out.push_str(&piece);
+        let (cut, text) = taken?;
+
+        // The page's own skip before this piece, whatever it means.
+        let gap_before = line
+            .breaks
+            .iter()
+            .find(|b| b.at == from)
+            .map(|b| b.points)
+            .unwrap_or(0.0);
+
+        // ⚠️ BUT NOT A SPACE IF THE PAGE ALREADY DREW ONE. A break only says
+        // the pieces were placed apart, and a placement can begin right after a
+        // space glyph, in which case adding another would put two where the
+        // author typed one.
+        let ends_open = out.last().is_some_and(|p: &Piece| p.text.ends_with(' '));
+        let space_before = !out.is_empty()
+            && !ends_open
+            && !text.starts_with(' ')
+            && gap_before > 0.0;
+
+        out.push(Piece { glyphs: from..cut, text, space_before });
         from = cut;
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Where one cluster of a line's reading is drawn.
+///
+/// ⚠️ A CLUSTER, NOT A CHARACTER, AND THE SCRIPT FORCES IT. `မြ` is drawn
+/// as one unit with the medial BEFORE the consonant it follows, so there is no
+/// position on the page between the two of them for a caret to stand at. A
+/// reader moves through Burmese a cluster at a time and so does this. Asking
+/// for a per-character box would mean inventing positions the page does not
+/// have, and putting a caret at an invented position is exactly the failure
+/// editing in place exists to avoid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Cluster {
+    /// The bytes of the line's reading this covers.
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    /// Where it is drawn, in PDF user space.
+    pub(crate) left: f64,
+    pub(crate) right: f64,
+}
+
+/// Where each cluster of a line's reading sits on the page.
+///
+/// ⚠️ MEASURED WITH THE PAGE'S OWN WIDTHS AND THE PAGE'S OWN NUDGES. The
+/// advance a glyph really made is what the file declares for it plus whatever
+/// `TJ` number was written in front of it, and on a justified line those
+/// numbers are where the stretch lives. Laying the text out from the font's
+/// natural advances instead would drift further along the line, which is the
+/// end a reader is most likely to click.
+pub(crate) fn clusters_of(
+    line: &Line,
+    pieces: &[Piece],
+    face: &rustybuzz::Face,
+    widths: &crate::shaped::CidWidths,
+) -> Vec<Cluster> {
+    let scale = line.size / 1000.0;
+    // How far the page skips before drawing the glyph at this index.
+    let skip_at = |g: usize| -> f64 {
+        line.breaks.iter().filter(|b| b.at == g).map(|b| b.points).sum()
+    };
+    let mut out: Vec<Cluster> = Vec::new();
+    let mut x = line.x;
+    let mut at = 0usize;
+
+    for piece in pieces {
+        // ⚠️ THE SKIP IS ALWAYS CROSSED, whether or not a character stands
+        // in it. A space the reading invented gets a box of its own, because a
+        // caret has to be able to stand in it. A skip the page left AFTER a
+        // space it had already drawn belongs to that space, so it widens the
+        // cluster before it. Either way the pen moves, and forgetting that put
+        // one line 14 points left of where it is drawn.
+        let gap = skip_at(piece.glyphs.start);
+        if gap > 0.0 {
+            if piece.space_before {
+                out.push(Cluster { from: at, to: at + 1, left: x, right: x + gap });
+                at += 1;
+            } else if let Some(last) = out.last_mut() {
+                last.right += gap;
+            }
+            x += gap;
+        }
+
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(&piece.text);
+        let shaped = rustybuzz::shape(face, &[], buffer);
+        let infos = shaped.glyph_infos();
+
+        let mut i = 0usize;
+        while i < infos.len() {
+            let cluster = infos[i].cluster as usize;
+            let left = x;
+            while i < infos.len() && infos[i].cluster as usize == cluster {
+                let g = piece.glyphs.start + i;
+                // ⚠️ AND A SKIP INSIDE A PIECE IS CROSSED TOO. A piece is as
+                // long as the reading could be proven, which has nothing to do
+                // with where the page chose to re-place its pen: measured, one
+                // real line skipped 37 points at seven places that all fell
+                // inside a piece, and every cluster after them sat short.
+                if i > 0 {
+                    x += skip_at(g);
+                }
+                // The number written in front of this glyph, if any. Positive
+                // moves the pen LEFT, so its contribution is its negation.
+                for (_, v) in line.nudges.iter().filter(|(at, _)| *at == g) {
+                    x -= v * scale;
+                }
+                x += widths.of(infos[i].glyph_id as u16) * scale;
+                i += 1;
+            }
+            let ends = infos
+                .get(i)
+                .map(|g| g.cluster as usize)
+                .unwrap_or(piece.text.len());
+            out.push(Cluster { from: at + cluster, to: at + ends, left, right: x });
+        }
+        at += piece.text.len();
+    }
+    out
 }
 
 /// One line of a page, and what it says.
@@ -424,6 +607,9 @@ pub(crate) struct Reading {
     pub(crate) x: f64,
     /// What it says, or nothing when it could not be proven.
     pub(crate) text: Option<String>,
+    /// Where each cluster of that reading is drawn. Empty when nothing was
+    /// proven, because there is nothing to place.
+    pub(crate) clusters: Vec<Cluster>,
 }
 
 /// What each of a page's fonts draws, ready to read that page with.
@@ -498,15 +684,33 @@ pub(crate) fn worth_reading(doc: &Document, page: ObjectId) -> bool {
 pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
     -> Vec<Reading>
 {
+    // ⚠️ ONE FACE PER FONT, NOT ONE PER LINE. Parsing Myanmar Text is a few
+    // megabytes of work, and building it inside the loop charged that to every
+    // line on the page. Measured on one fixture: three seconds a click.
+    let faces: BTreeMap<&str, (rustybuzz::Face, &crate::reshape::Index)> = indexes
+        .by_font
+        .iter()
+        .filter_map(|(name, (bytes, index))| {
+            Some((name.as_str(), (rustybuzz::Face::from_slice(bytes, 0)?, index)))
+        })
+        .collect();
+    let widths = fonts_of(doc, page);
     lines_of(doc, page)
         .iter()
-        .map(|line| Reading {
-            y: line.y,
-            x: line.x,
-            text: indexes.by_font.get(&line.base_font).and_then(|(bytes, index)| {
-                let face = rustybuzz::Face::from_slice(bytes, 0)?;
-                read_line(index, &face, line)
-            }),
+        .map(|line| {
+            let read = faces.get(line.base_font.as_str()).and_then(|(face, index)| {
+                let pieces = pieces_of(index, face, line)?;
+                let clusters = match widths.get(&line.resource).and_then(|(_, w)| w.as_ref()) {
+                    Some(w) => clusters_of(line, &pieces, face, w),
+                    None => Vec::new(),
+                };
+                Some((said_by(&pieces), clusters))
+            });
+            let (text, clusters) = match read {
+                Some((text, clusters)) => (Some(text), clusters),
+                None => (None, Vec::new()),
+            };
+            Reading { y: line.y, x: line.x, text, clusters }
         })
         .collect()
 }
@@ -743,6 +947,7 @@ mod tests {
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
+            nudges: Vec::new(),
             glyphs: left.iter().copied().chain(right.iter().copied()).collect(),
             adjust: 0.0,
             breaks: vec![Break { at: left.len(), points: 3.0 }],
@@ -773,6 +978,7 @@ mod tests {
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
+            nudges: Vec::new(),
             glyphs: drawn,
             adjust: 0.0,
             // Straight through the middle of the first cluster.
@@ -783,6 +989,65 @@ mod tests {
             "an impossible break took the line down with it");
     }
 
+
+    /// Phase 2 on the real thing: does the geometry land where the page draws?
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn the_clusters_of_a_real_word_page_land_where_the_text_is() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = indexes_for(&doc, page);
+        let lines = lines_of(&doc, page);
+        let read = read_page_with(&doc, page, &indexes);
+        let fonts = fonts_of(&doc, page);
+
+        let mut placed = 0usize;
+        for (line, reading) in lines.iter().zip(read.iter()) {
+            let Some(text) = reading.text.as_deref() else { continue };
+            placed += 1;
+
+            // Contiguous, in order, on character boundaries, covering it all.
+            assert_eq!(reading.clusters.first().map(|c| c.from), Some(0));
+            assert_eq!(reading.clusters.last().map(|c| c.to), Some(text.len()));
+            for pair in reading.clusters.windows(2) {
+                assert_eq!(pair[0].to, pair[1].from, "a gap in {text:?}");
+            }
+            for c in &reading.clusters {
+                assert!(text.is_char_boundary(c.from) && text.is_char_boundary(c.to),
+                    "cluster {c:?} cuts a character of {text:?}");
+            }
+
+            // And the line ends where the page says it ends.
+            let Some((_, Some(w))) = fonts.get(&line.resource) else { continue };
+            // ⚠️ AND NONE OF IT IS OFF THE PAGE. Independent of the
+            // arithmetic below, which shares its inputs with the code it is
+            // checking: a bug that stamped a line with the x of its LAST
+            // placement put clusters at 752 points on a 595 point page.
+            for c in &reading.clusters {
+                assert!(c.left >= 0.0 && c.right <= 595.5,
+                    "cluster {c:?} is off the page");
+            }
+
+            // Where the pen finishes: every glyph it drew, every number
+            // written between them, and every skip the page asked for.
+            let drawn: f64 = line.glyphs.iter().map(|g| w.of(*g)).sum();
+            let gaps: f64 = line.breaks.iter().map(|b| b.points).sum();
+            let ends = line.x + (drawn + line.adjust) / 1000.0 * line.size + gaps;
+            let ours = reading.clusters.last().unwrap().right;
+            println!("line at y={:7.1}: {:2} clusters, {} skips worth {:6.2}, ends at {:8.2} against {:8.2}, out by {:5.2}",
+                line.y, reading.clusters.len(), line.breaks.len(), gaps,
+                ours, ends, (ours - ends).abs());
+            assert!((ours - ends).abs() < 0.5,
+                "the clusters end {:.2}pt from where the line does", (ours - ends).abs());
+        }
+        println!("{placed} lines placed");
+        assert!(placed > 0);
+    }
 
     /// The measurement, against a real Word-produced page that is not in this
     /// repository. Ignored because it needs that file; kept because it is the
@@ -828,6 +1093,150 @@ mod tests {
         assert!(installed("BCDEEE+MyanmarText").is_some());
         assert!(installed("MyanmarText-Bold").is_some());
         assert_ne!(installed("MyanmarText-Bold"), installed("MyanmarText"));
+    }
+
+    /// A page drawing exactly `text`, and what recovery makes of it.
+    ///
+    /// Every glyph is declared half an em wide, so at 12 point each advances
+    /// exactly 6 points and the arithmetic in these tests is checkable by hand.
+    fn a_page_saying(text: &str) -> (String, Vec<Cluster>) {
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let glyphs = crate::reshape::draws(&face, text);
+
+        let (doc, page) = a_page(vec![
+            Operation::new("BT", vec![]),
+            pick(12.0),
+            place(72.0, 700.0),
+            show(&glyphs),
+            Operation::new("ET", vec![]),
+        ], 500.0);
+
+        let chars: BTreeSet<char> = text.chars().collect();
+        let index = crate::reshape::Index::build(&bytes, Some(&chars), None).unwrap();
+        let indexes = Indexes {
+            by_font: [("BCDEEE+MyanmarText".to_string(), (bytes, index))]
+                .into_iter()
+                .collect(),
+        };
+        let read = read_page_with(&doc, page, &indexes);
+        let one = read.into_iter().next().expect("no line");
+        (one.text.expect("nothing read"), one.clusters)
+    }
+
+    /// ⚠️ THE DECISION THIS WHOLE PHASE RESTS ON. `မြ` is ONE cluster covering
+    /// BOTH characters, because the medial is drawn before the consonant it
+    /// follows and there is no position on the page between them. A caret that
+    /// could stand there would be standing somewhere the page does not have.
+    #[test]
+    fn a_reordered_pair_is_one_cluster_and_not_two() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        // "မြန်မာ": ma + medial ra, na + asat, ma + aa. Three characters pairs,
+        // three clusters, six glyphs, and every character is three bytes.
+        const WORD: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+        let (text, clusters) = a_page_saying(WORD);
+
+        assert_eq!(text, WORD);
+        assert_eq!(clusters.len(), 3, "{clusters:?}");
+
+        assert_eq!(clusters[0].from, 0);
+        assert_eq!(clusters[0].to, 6, "the medial was split off its consonant");
+        assert_eq!(clusters[1].from, 6);
+        assert_eq!(clusters[1].to, 12);
+        assert_eq!(clusters[2].from, 12);
+        assert_eq!(clusters[2].to, 18);
+    }
+
+    /// Two glyphs at half an em each, at 12 point, from x=72.
+    #[test]
+    fn a_cluster_is_as_wide_as_the_glyphs_that_draw_it() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const WORD: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+        let (_, clusters) = a_page_saying(WORD);
+
+        for (n, want) in [(0usize, (72.0, 84.0)), (1, (84.0, 96.0)), (2, (96.0, 108.0))] {
+            assert!((clusters[n].left - want.0).abs() < 0.01
+                && (clusters[n].right - want.1).abs() < 0.01,
+                "cluster {n} is {:?}, expected {want:?}", clusters[n]);
+        }
+    }
+
+    /// ⚠️ NO GAPS AND NO OVERLAPS, or a caret offset would fall into a crack
+    /// between two clusters and there would be no answer for where it goes.
+    #[test]
+    fn the_clusters_cover_the_whole_reading_in_order() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const LINE: &str = "အရုဏ်ဦး ရောင်နီသည်";
+        let (text, clusters) = a_page_saying(LINE);
+
+        assert!(!clusters.is_empty());
+        assert_eq!(clusters[0].from, 0, "the reading does not start at the first cluster");
+        assert_eq!(clusters.last().unwrap().to, text.len(),
+            "the reading is longer than the clusters that place it");
+
+        for pair in clusters.windows(2) {
+            assert_eq!(pair[0].to, pair[1].from, "a gap or an overlap: {pair:?}");
+            assert!(pair[1].left >= pair[0].left - 0.01,
+                "the clusters are not laid left to right: {pair:?}");
+        }
+        // And every cluster names bytes that really are a character boundary.
+        for c in &clusters {
+            assert!(text.is_char_boundary(c.from) && text.is_char_boundary(c.to),
+                "cluster {c:?} cuts a character in half of {text:?}");
+        }
+    }
+
+    /// A space that no glyph draws still has to be somewhere, or the caret
+    /// cannot be put between the two words it separates.
+    #[test]
+    fn a_space_between_placements_gets_a_box_of_its_own() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        const LEFT: &str = "မြန်မာ";
+        const RIGHT: &str = "မြန်မာ";
+        let left = crate::reshape::draws(&face, LEFT);
+        let right = crate::reshape::draws(&face, RIGHT);
+
+        // The first piece ends at 72 + 6 glyphs * 6pt = 108; the second starts
+        // six points further on.
+        let (doc, page) = a_page(vec![
+            Operation::new("BT", vec![]),
+            pick(12.0),
+            place(72.0, 700.0),
+            show(&left),
+            Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]),
+            pick(12.0),
+            place(114.0, 700.0),
+            show(&right),
+            Operation::new("ET", vec![]),
+        ], 500.0);
+
+        let chars: BTreeSet<char> = LEFT.chars().collect();
+        let index = crate::reshape::Index::build(&bytes, Some(&chars), None).unwrap();
+        let indexes = Indexes {
+            by_font: [("BCDEEE+MyanmarText".to_string(), (bytes, index))]
+                .into_iter()
+                .collect(),
+        };
+        let one = read_page_with(&doc, page, &indexes).into_iter().next().unwrap();
+        let text = one.text.expect("nothing read");
+        assert_eq!(text, format!("{LEFT} {RIGHT}"));
+
+        let space = one.clusters.iter()
+            .find(|c| &text[c.from..c.to] == " ")
+            .expect("the space has no box");
+        assert!((space.left - 108.0).abs() < 0.01 && (space.right - 114.0).abs() < 0.01,
+            "the space is at {space:?}, not the six points that were left for it");
     }
 
     /// ⚠️ AN UNKNOWN FONT IS REFUSED, NOT SUBSTITUTED. Reading a page with the
