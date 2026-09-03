@@ -429,6 +429,14 @@ struct Core {
     next_generation: AtomicU64,
     requests: Mutex<HashMap<u64, RequestSlot>>,
     next_request_id: AtomicU64,
+    /// What each opened page's Burmese needs to be read: see
+    /// [`crate::recover`]. Keyed by document and page, and built at most once.
+    ///
+    /// ⚠️ THE INNER MUTEX IS THE POINT. Building takes about 17 seconds, so
+    /// a reader arriving while a background build is running must WAIT for it
+    /// rather than start a second one. Whoever takes the lock first builds;
+    /// everyone else blocks and then finds the answer already there.
+    recoveries: Mutex<HashMap<(u64, i32), Arc<Mutex<Option<Arc<recover::Indexes>>>>>>,
 }
 
 static CORE: OnceLock<Core> = OnceLock::new();
@@ -445,6 +453,7 @@ fn core() -> &'static Core {
         next_generation: AtomicU64::new(1),
         requests: Mutex::new(HashMap::new()),
         next_request_id: AtomicU64::new(1),
+            recoveries: Mutex::new(HashMap::new()),
     })
 }
 
@@ -570,6 +579,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
     }
 
     lock(&core.generations).retain(|(doc, _), _| *doc != doc_handle);
+    lock(&core.recoveries).retain(|(doc, _), _| *doc != doc_handle);
 }
 
 /// Returns the page count for a handle, or -1 if the handle is unknown.
@@ -1675,6 +1685,78 @@ fn snapshot_document_inner(doc_handle: u64) -> ByteBuffer {
     buffer
 }
 
+/// Starts building what a page's Burmese needs to be read, and returns at once.
+///
+/// ⚠️ THE CALLER DECIDES WHEN, AND THAT IS NOT AN OVERSIGHT. Two ways of
+/// deciding here were tried and both cost more than they saved. Serialising
+/// every opened document to look at its font names put 26 seconds on the test
+/// suite, for documents with no Burmese in them. Asking PDFium instead, which
+/// already knows, means GETTING A PAGE, and getting a page parses it: that
+/// broke `preparing_a_page_of_gradients_costs_one_page_load_and_no_more`, a
+/// test that exists because page loads have caused three separate hangs.
+///
+/// The caller has the answer for free. `get_page_lines` already reports
+/// `LINE_COMPLEX_SCRIPT` for exactly the lines this can read, so an app knows
+/// a page needs preparing without anyone opening anything twice.
+///
+/// Building takes about 17 seconds; a page read with one already built takes
+/// milliseconds. Safe to call more than once for the same page: the second call
+/// finds the work already done or already running, and does nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
+    if doc_handle == 0 || page_index < 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = panic::catch_unwind(|| {
+            let Some(bytes) = document_bytes(doc_handle) else { return };
+            let Ok(doc) = lopdf::Document::load_mem(&bytes) else { return };
+            let pages = doc.get_pages();
+            let Some((_, &page)) = pages.iter().nth(page_index as usize) else { return };
+            if !recover::worth_reading(&doc, page) {
+                return;
+            }
+            let _ = indexes_for_page(doc_handle, page_index, &doc, page);
+        });
+    });
+}
+
+/// The document as bytes, for the readers that work on PDF structure rather
+/// than through PDFium.
+fn document_bytes(doc_handle: u64) -> Option<Vec<u8>> {
+    let snap = snapshot_document(doc_handle);
+    if snap.status != STATUS_OK_PDFIUM {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+    free_byte_buffer(snap);
+    Some(bytes)
+}
+
+/// What this page needs to be read, building it if nobody has yet.
+///
+/// ⚠️ AND WAITING IF SOMEBODY IS BUILDING IT NOW. Two threads asking at
+/// once must not both spend the 17 seconds, so the second one blocks on the
+/// first and takes its answer.
+fn indexes_for_page(
+    doc_handle: u64,
+    page_index: i32,
+    doc: &lopdf::Document,
+    page: lopdf::ObjectId,
+) -> Arc<recover::Indexes> {
+    let slot = {
+        let mut all = lock(&core().recoveries);
+        Arc::clone(all.entry((doc_handle, page_index)).or_default())
+    };
+    let mut held = lock(&slot);
+    if let Some(ready) = held.as_ref() {
+        return Arc::clone(ready);
+    }
+    let built = Arc::new(recover::indexes_for(doc, page));
+    *held = Some(Arc::clone(&built));
+    built
+}
+
 /// What a page's Burmese says, recovered by reshaping it.
 ///
 /// ⚠️ THIS IS THE ONLY WAY TO READ A PAGE WHOSE OWN TABLES ARE WRONG, and
@@ -1683,9 +1765,10 @@ fn snapshot_document_inner(doc_handle: u64) -> ByteBuffer {
 /// those tables and refuses the result as `LINE_COMPLEX_SCRIPT`, correctly.
 /// This answers the same page from the FONT instead. See [`crate::reshape`].
 ///
-/// ⚠️ AND IT IS SLOW: about 17 seconds for a page, nearly all of it
-/// building the index of what the font draws. It is a deliberate, separate call
-/// for exactly that reason, so nothing pays for it that has not asked.
+/// ⚠️ THE COST IS PAID WHEN THE DOCUMENT OPENS, not here. Building the
+/// index of what the font draws takes about 17 seconds, and `prepare_recovery`
+/// starts that on a background thread as soon as a document is opened. A call
+/// arriving before it has finished waits for it rather than starting a second.
 ///
 /// Encoding: `u32` line count, then per line `f32` y, `f32` x, `u32` byte
 /// length and that many UTF-8 bytes. A line nothing could prove has length 0,
@@ -1700,13 +1783,9 @@ pub extern "C" fn recover_page_text(doc_handle: u64, page_index: i32) -> ByteBuf
 }
 
 fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
-    let snap = snapshot_document(doc_handle);
-    if snap.status != STATUS_OK_PDFIUM {
-        return ByteBuffer::err(snap.status);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
-    free_byte_buffer(snap);
-
+    let Some(bytes) = document_bytes(doc_handle) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
     let Ok(doc) = lopdf::Document::load_mem(&bytes) else {
         return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
     };
@@ -1715,7 +1794,8 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     };
 
-    let read = recover::read_page(&doc, page);
+    let indexes = indexes_for_page(doc_handle, page_index, &doc, page);
+    let read = recover::read_page_with(&doc, page, &indexes);
     let mut out: Vec<u8> = Vec::new();
     out.extend((read.len() as u32).to_le_bytes());
     for line in &read {
@@ -25936,15 +26016,90 @@ p={spread_px:.4},c={rgba:08X})"
         close_document(handle);
     }
 
+    /// \u{26a0}\u{fe0f} THE SECOND READING MUST BE FREE. Building what a page needs
+    /// costs about 17 seconds, so it is built ONCE, when the document opens,
+    /// and every reading after that uses it. A reader that rebuilt each time
+    /// would be unusable however correct it was.
+    #[test]
+    fn a_page_is_only_ever_prepared_once() {
+        if !std::path::Path::new(MYANMAR_FONT).exists() {
+            return;
+        }
+        const MYANMAR: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+
+        let handle = open_fixture_named(&justified_embedded_fixture());
+        let at = EMBEDDED_TEXT.find("brown").unwrap();
+        let edited = shaped_ffi(handle, at, 5, MYANMAR, MYANMAR_FONT).expect("refused");
+        close_document(handle);
+
+        // Opened FROM A PATH, which is what starts the preparing.
+        let file = std::env::temp_dir().join("ayaan_recovery_once.pdf");
+        std::fs::write(&file, &edited).unwrap();
+        let handle = open_fixture_named(file.to_str().unwrap());
+        prepare_recovery(handle, 0);
+
+        let first = std::time::Instant::now();
+        let one = read_recovered(handle);
+        let first = first.elapsed();
+
+        let second = std::time::Instant::now();
+        let two = read_recovered(handle);
+        let second = second.elapsed();
+        close_document(handle);
+        let _ = std::fs::remove_file(&file);
+
+        assert!(one.iter().any(|(_, text)| text.contains(MYANMAR)),
+            "the first reading lost the Burmese: {one:?}");
+        assert_eq!(one, two, "the two readings disagree");
+        assert!(second < std::time::Duration::from_secs(1),
+            "the second reading rebuilt the index: {second:?} after {first:?}");
+    }
+
+    /// The real thing, on a file that is not in this repository: what a reader
+    /// actually waits for once the document has been open for a moment.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn what_a_click_on_a_real_myanmar_page_costs() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let opened = std::time::Instant::now();
+        let handle = open_fixture_named(FILE);
+        prepare_recovery(handle, 0);
+        println!("opening and asking returned in {:?}", opened.elapsed());
+
+        // What the reader is doing while the preparing runs.
+        std::thread::sleep(std::time::Duration::from_secs(20));
+
+        let click = std::time::Instant::now();
+        let read = read_recovered(handle);
+        println!("the click cost {:?}", click.elapsed());
+        let said = read.iter().filter(|(_, t)| !t.is_empty()).count();
+        println!("{said} of {} lines", read.len());
+        close_document(handle);
+        assert!(said > 0);
+    }
+
     /// What `recover_page_text` reported, decoded.
     fn recovered(bytes: &[u8], page: i32) -> Vec<(f32, String)> {
         let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
         assert_ne!(handle, 0, "PDFium refused the document");
+        let out = read_recovered_page(handle, page);
+        close_document(handle);
+        out
+    }
+
+    /// The same, for a document the caller is holding open.
+    fn read_recovered(handle: u64) -> Vec<(f32, String)> {
+        read_recovered_page(handle, 0)
+    }
+
+    fn read_recovered_page(handle: u64, page: i32) -> Vec<(f32, String)> {
         let buffer = recover_page_text(handle, page);
         assert_eq!(buffer.status, STATUS_OK_PDFIUM, "recovery refused the page");
         let raw = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
         free_byte_buffer(buffer);
-        close_document(handle);
 
         let mut at = 0usize;
         let take4 = |b: &[u8], at: &mut usize| {

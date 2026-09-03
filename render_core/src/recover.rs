@@ -403,42 +403,89 @@ pub(crate) struct Reading {
     pub(crate) text: Option<String>,
 }
 
-/// Everything a page says that can be PROVEN, line by line.
+/// What each of a page's fonts draws, ready to read that page with.
 ///
-/// A line reads as `None` when nothing reproduced its glyphs: an unknown font,
-/// a character outside the enumeration, or a producer doing something the
-/// index does not model. A refusal is the correct answer there.
-pub(crate) fn read_page(doc: &Document, page: ObjectId) -> Vec<Reading> {
-    let lines = lines_of(doc, page);
+/// ⚠️ THIS IS THE EXPENSIVE PART, AND THE ONLY EXPENSIVE PART. Building it
+/// takes about 17 seconds; reading a page with one already built takes
+/// milliseconds. It is separate from the reading so a caller can pay for it
+/// once, in advance, and off the thread the reader is waiting on.
+pub(crate) struct Indexes {
+    by_font: BTreeMap<String, (Vec<u8>, crate::reshape::Index)>,
+}
 
-    // One index per font, built over only the characters and glyphs that font
-    // actually draws on this page.
+impl Indexes {
+    /// Whether anything on the page can be read at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_font.is_empty()
+    }
+}
+
+/// Builds what is needed to read this page: one index per font, over the
+/// glyphs that font actually draws here.
+///
+/// ⚠️ AN INDEX BUILT FOR AN OLDER VERSION OF A PAGE STAYS SAFE TO USE, so
+/// nothing here needs invalidating when the page changes. The narrowing decides
+/// which syllables are in the index, never what one means, and every reading is
+/// shaped again against the glyphs actually on the page. A stale index can only
+/// fail to read something; it cannot read it wrongly.
+pub(crate) fn indexes_for(doc: &Document, page: ObjectId) -> Indexes {
     let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
-    for line in &lines {
-        wanted.entry(line.base_font.clone()).or_default().extend(&line.glyphs);
+    for line in lines_of(doc, page) {
+        wanted.entry(line.base_font).or_default().extend(line.glyphs);
     }
 
-    let mut faces: BTreeMap<String, (Vec<u8>, crate::reshape::Index)> = BTreeMap::new();
+    let mut by_font = BTreeMap::new();
     for (base_font, glyphs) in &wanted {
         let Some(path) = installed(base_font) else { continue };
         let Ok(bytes) = std::fs::read(path) else { continue };
         let Some(index) = crate::reshape::Index::build(&bytes, None, Some(glyphs)) else {
             continue;
         };
-        faces.insert(base_font.clone(), (bytes, index));
+        by_font.insert(base_font.clone(), (bytes, index));
     }
+    Indexes { by_font }
+}
 
-    lines
+/// Whether a font by this name is one that can be read.
+///
+/// ⚠️ ASKED OF A NAME AND NOTHING ELSE, so a caller can decide whether a
+/// document is worth reading before it has gone to the trouble of serialising
+/// it. Measured: serialising every opened document just to find out cost 26
+/// seconds across the test suite, for an answer PDFium already has.
+pub(crate) fn can_read(base_font: &str) -> bool {
+    installed(base_font).is_some()
+}
+
+/// Whether this page draws anything in a font that can be read, which is what
+/// says whether building an index for it is worth 17 seconds.
+pub(crate) fn worth_reading(doc: &Document, page: ObjectId) -> bool {
+    lines_of(doc, page).iter().any(|l| can_read(&l.base_font))
+}
+
+/// Everything a page says that can be PROVEN, line by line.
+///
+/// A line reads as `None` when nothing reproduced its glyphs: an unknown font,
+/// a character outside the enumeration, or a producer doing something the
+/// index does not model. A refusal is the correct answer there.
+pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
+    -> Vec<Reading>
+{
+    lines_of(doc, page)
         .iter()
         .map(|line| Reading {
             y: line.y,
             x: line.x,
-            text: faces.get(&line.base_font).and_then(|(bytes, index)| {
+            text: indexes.by_font.get(&line.base_font).and_then(|(bytes, index)| {
                 let face = rustybuzz::Face::from_slice(bytes, 0)?;
                 read_line(index, &face, line)
             }),
         })
         .collect()
+}
+
+/// The same, building the indexes first. For a caller with nothing prepared.
+pub(crate) fn read_page(doc: &Document, page: ObjectId) -> Vec<Reading> {
+    read_page_with(doc, page, &indexes_for(doc, page))
 }
 
 #[cfg(test)]
