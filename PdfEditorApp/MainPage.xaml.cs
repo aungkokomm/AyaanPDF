@@ -7072,6 +7072,69 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
+    /// Moves the caret to a point, wherever in the line that point falls.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A LINE BEING EDITED HAS TWO HALVES AND THEY ANSWER DIFFERENTLY.
+    /// Up to the first changed character the page is still drawing its own
+    /// type, and the view model reads the position off the page's glyphs. After
+    /// it, the text on screen was drawn by this app, and only this can say how
+    /// wide it came out. Asking the wrong half was why clicking into text you
+    /// had just typed did nothing.
+    /// </remarks>
+    private void PlaceInPlaceCaret(double normX, bool extend)
+    {
+        if (CaretOffsetInTail(normX) is int inTail)
+        {
+            ViewModel.InPlacePlaceCaret(inTail, extend);
+            return;
+        }
+
+        ViewModel.InPlaceClickCaret(normX, extend);
+    }
+
+    /// <summary>
+    /// Where a click at <paramref name="normX"/> falls in the redrawn tail, or
+    /// null when it does not fall in one.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE HALF OF THE CARET QUESTION ONLY THE VIEW CAN ANSWER. Text the
+    /// page still draws is resolved against the page's own glyphs in the view
+    /// model. Text the reader has typed was drawn by this app, in a font it
+    /// chose, and only the thing that drew it knows how wide it came out. So
+    /// this measures the very runs it laid down, by the same midpoint rule the
+    /// glyph path uses: the left half of a character means before it.
+    ///
+    /// Without this, clicking into what you had just typed did nothing at all.
+    /// </remarks>
+    private int? CaretOffsetInTail(double normX)
+    {
+        if (ViewModel.InPlaceTail() is not { } tail) { return null; }
+
+        double scale = ViewModel.OverlayScale;
+        double dipsPerPoint = ViewModel.DipsPerPointOn(ViewModel.InPlacePage);
+        if (scale <= 0 || dipsPerPoint <= 0) { return null; }
+
+        double left = tail.Left * scale;
+        double x = (normX * scale) - left;
+        if (x < 0) { return null; }        // before the tail: the glyphs answer it
+
+        double fontDip = Math.Max(1, tail.FontSizePts * dipsPerPoint);
+        var ink = HexBrush(tail.ColorHex);
+        int prefix = ViewModel.InPlaceUnchangedPrefix;
+
+        double previous = 0;
+        for (int i = 1; i <= tail.Text.Length; i++)
+        {
+            double edge = RunWidth(tail.Text[..i], tail, fontDip, ink);
+            if (x < (previous + edge) / 2) { return prefix + i - 1; }
+            previous = edge;
+        }
+
+        return prefix + tail.Text.Length;
+    }
+
+    /// <summary>
     /// How wide a piece of the tail is, measured in the font it is drawn in.
     /// </summary>
     /// <remarks>
@@ -7738,7 +7801,18 @@ public sealed partial class MainPage : Page
         // any more, so it selects instead, in place.
         if (ViewModel.IsEditingInPlace && ViewModel.InPlacePage == content.Page)
         {
-            ViewModel.InPlaceSelectWordAt(nx);
+            // Through the same two-halves rule, so double-clicking a word the
+            // reader has just typed takes that word and not the one the page
+            // used to draw there.
+            if (CaretOffsetInTail(nx) is int inTail)
+            {
+                ViewModel.InPlaceSelectWordAtOffset(inTail);
+            }
+            else
+            {
+                ViewModel.InPlaceSelectWordAt(nx);
+            }
+
             e.Handled = true;
         }
 
@@ -8118,7 +8192,7 @@ public sealed partial class MainPage : Page
                             // anyone selects anything. A double click on top of
                             // this is handled by ViewportHost_DoubleTapped,
                             // which takes the whole word.
-                            ViewModel.InPlaceClickCaret(nx, extend: IsShiftDown());
+                            PlaceInPlaceCaret(nx, IsShiftDown());
 
                             _inPlaceDragging = true;
                             _dragPointerId = e.Pointer.PointerId;
@@ -8367,7 +8441,7 @@ public sealed partial class MainPage : Page
         // pointer means "select to here", not pan, marquee or move an object.
         if (_inPlaceDragging && ViewModel.IsEditingInPlace)
         {
-            ViewModel.InPlaceClickCaret(content.X / ViewModel.OverlayScale, extend: true);
+            PlaceInPlaceCaret(content.X / ViewModel.OverlayScale, extend: true);
             e.Handled = true;
             return;
         }

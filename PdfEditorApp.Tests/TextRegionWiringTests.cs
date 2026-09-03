@@ -262,6 +262,48 @@ public class TextRegionWiringTests
             "single-key tool switching now runs before the in-place gate");
     }
 
+    /// <summary>
+    /// ⚠️ A LINE BEING EDITED HAS TWO HALVES AND THEY ANSWER DIFFERENTLY. Up to
+    /// the first changed character the page is still drawing its own type, so
+    /// the position is read off the page's glyphs. After it, what is on screen
+    /// was drawn by this app in a font it chose, and only the view can say how
+    /// wide it came out. Asking the glyphs about that half was why clicking
+    /// into text you had just typed did nothing at all.
+    /// </summary>
+    [Fact]
+    public void a_click_reaches_text_the_reader_has_already_typed()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+
+        // One place decides which half answers, and both the press and the drag
+        // go through it.
+        Assert.Contains("private void PlaceInPlaceCaret(double normX, bool extend)",
+            page, StringComparison.Ordinal);
+        Assert.Contains("PlaceInPlaceCaret(nx, IsShiftDown());", page, StringComparison.Ordinal);
+        Assert.Contains("PlaceInPlaceCaret(content.X / ViewModel.OverlayScale, extend: true);",
+            page, StringComparison.Ordinal);
+
+        int at = page.IndexOf("private void PlaceInPlaceCaret(", StringComparison.Ordinal);
+        string body = page[at..Math.Min(page.Length, at + 700)];
+        Assert.Contains("CaretOffsetInTail(normX)", body, StringComparison.Ordinal);
+        Assert.Contains("InPlacePlaceCaret(inTail, extend)", body, StringComparison.Ordinal);
+        Assert.Contains("InPlaceClickCaret(normX, extend)", body, StringComparison.Ordinal);
+
+        // ⚠️ AND THE TAIL IS MEASURED, NOT ESTIMATED, in the very font it was
+        // drawn in, by the same midpoint rule the glyph path uses.
+        int tail = page.IndexOf("private int? CaretOffsetInTail(", StringComparison.Ordinal);
+        Assert.True(tail > 0);
+        string measure = page[tail..Math.Min(page.Length, tail + 1600)];
+        Assert.Contains("RunWidth(tail.Text[..i], tail, fontDip, ink)", measure, StringComparison.Ordinal);
+        Assert.Contains("(previous + edge) / 2", measure, StringComparison.Ordinal);
+
+        // The view model still refuses to answer for the half it cannot see.
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int click = vm.IndexOf("public void InPlaceClickCaret(", StringComparison.Ordinal);
+        Assert.Contains("if (at > prefix) { return; }",
+            vm[click..Math.Min(vm.Length, click + 1200)], StringComparison.Ordinal);
+    }
+
     [Fact]
     public void dragging_through_text_selects_it()
     {

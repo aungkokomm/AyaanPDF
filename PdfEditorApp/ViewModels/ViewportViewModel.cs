@@ -10409,7 +10409,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_lineEdit is null) { return; }
 
         int at = CaretOffsetIn(_lineEditGlyphs, _lineEdit.Text, normX);
-        Changed(() => _lineEdit!.SelectWordAt(Math.Max(0, at)));
+        InPlaceSelectWordAtOffset(at);
+    }
+
+    /// <summary>Selects the word around an offset the view already resolved,
+    /// for a double-click that landed in text the reader has typed.</summary>
+    public void InPlaceSelectWordAtOffset(int offset)
+    {
+        if (_lineEdit is null) { return; }
+        Changed(() => _lineEdit!.SelectWordAt(Math.Max(0, offset)));
     }
 
     /// <summary>What is selected, or null when nothing is.</summary>
@@ -10431,10 +10439,36 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         int prefix = _lineEdit.UnchangedPrefix;
         int at = CaretOffsetIn(_lineEditGlyphs, _lineEdit.Text, normX);
+
+        // ⚠️ PAST THE UNCHANGED TEXT, THE GLYPHS ARE THE WRONG ANSWER. Beyond
+        // here the page is no longer drawing what the line says, so a position
+        // read off its glyphs would be a position in text that has moved. The
+        // view resolves those by measuring what it actually drew, and calls
+        // InPlacePlaceCaret with the answer.
         if (at > prefix) { return; }
 
         Changed(() => _lineEdit!.PlaceCaret(at, extend));
     }
+
+    /// <summary>
+    /// Puts the caret at an offset the VIEW resolved, by measuring the text it
+    /// drew.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE ONE THING ONLY THE VIEW CAN ANSWER. Everything before the first
+    /// changed character is the page's own type and is measured from the page's
+    /// own glyphs, here. Everything after it was drawn by this app in a font it
+    /// chose, and only the thing that drew it knows how wide it came out. So
+    /// the tail's half of the question is asked there and answered here.
+    /// </remarks>
+    public void InPlacePlaceCaret(int offset, bool extend = false)
+    {
+        if (_lineEdit is null) { return; }
+        Changed(() => _lineEdit!.PlaceCaret(offset, extend));
+    }
+
+    /// <summary>How much of the line is still exactly what the page draws.</summary>
+    public int InPlaceUnchangedPrefix => _lineEdit?.UnchangedPrefix ?? 0;
 
     private void Changed(Action act)
     {
