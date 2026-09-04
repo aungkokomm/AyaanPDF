@@ -770,21 +770,8 @@ internal static partial class RenderCoreNative
     /// </remarks>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern ByteBuffer shift_page_text(
-        ulong docHandle, int pageIndex, float baseline, int wholeBlock, float dx, float dy);
-
-    /// <summary>
-    /// The baselines of every line in the same paragraph as the one given,
-    /// normalized the same way. A <c>u32</c> count then that many <c>f32</c>.
-    /// </summary>
-    /// <remarks>
-    /// ⚠️ ASKED RATHER THAN WORKED OUT HERE. Where a paragraph ends is decided
-    /// by a rule tuned against real pages, and it lives in the core beside the
-    /// block model that shares it. The app holds every line's box already; all
-    /// it is missing is which of them move together.
-    /// </remarks>
-    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-    public static extern ByteBuffer text_block_baselines(
-        ulong docHandle, int pageIndex, float baseline);
+        ulong docHandle, int pageIndex, float[] baselines, int baselineCount,
+        float dx, float dy);
 
     /// <summary>
     /// Retypes one recovered line, returning the whole new document.

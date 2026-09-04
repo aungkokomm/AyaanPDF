@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -4498,37 +4498,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         RefreshLinkOutlines();
 
         // The document's own text, which is not one of ours and gets its own
-        // frame. No grips: nothing here is draggable, and a handle that does
-        // nothing is worse than no handle.
+        // frame.
         //
-        // ⚠️ THE UNIT, whichever it turned out to be. This used to draw only a
-        // word, because a word was the only thing a click could select. It is a
-        // whole line now unless the line refused, and the frame has to say which
-        // it is: the reader is about to click inside it to type, and the box is
-        // the only thing on screen that tells them what they are about to
-        // change.
-        if (_selectedTextUnit is { } word && word.Page >= 0)
+        // ⚠️ ONE BOX PER BLOCK, AND THE BOX IS WHAT MOVES. It used to be one
+        // box round one line while a drag carried the whole paragraph, so the
+        // frame and the gesture disagreed and the drag had to paint extra
+        // frames to make up the difference. The block is the object now: what
+        // is drawn is exactly the set of lines that will be sent.
+        if (_selectedBlocks.Count > 0)
         {
-            var textSlot = SlotFor(word.Page);
-
-            // PADDED, and the frame is the ONLY thing padded. The word's bounds
-            // are the tight box around its glyphs, which is what the hit test
-            // and the reflow measurement need and must keep. Drawn at that size
-            // the rule lands ON the letterforms: an all-caps word has no
-            // descenders, so its box stops at the baseline and the stroke cuts
-            // straight through the feet of the type.
-            //
-            // Scaled from the word's own height so it holds at any size and any
-            // zoom, and slightly deeper than it is wide because the crowding is
-            // worst above and below. This is what makes the frame sit off the
-            // text the way the reader's own selection does.
-            // ⚠️ THE SAME NUMBERS THE HIT TEST USES, taken from it rather than
-            // repeated, because a frame the reader can see and a box the pointer
-            // can enter that disagree by a few points is a click that lands
-            // inside the rule and dismisses the selection.
-            double h = (word.Bottom - word.Top) * SlotLayoutWidth;
-            double padX = h * TextUnitSelection.FramePadXFactor;
-            double padY = h * TextUnitSelection.FramePadYFactor;
+            var textSlot = SlotFor(_selectedBlocks[0].Page);
 
             // ⚠️ WHILE IT IS BEING DRAGGED THE FRAME GOES WHERE THE POINTER IS,
             // AND ONLY THE FRAME. The page's own glyphs stay where the file
@@ -4539,91 +4518,72 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 ? (_textMove.Dx, _textMove.Dy)
                 : (0.0, 0.0);
 
-            // ⚠️ AND WHERE IT CAME FROM, FAINTLY, WHILE IT IS BEING CARRIED.
-            // A frame under the pointer says where the text is going; on its
-            // own it says nothing about how far that is from where the text
-            // still IS. Leaving a ghost behind is what turns a floating outline
-            // into a visible displacement, and it disappears the moment the
-            // reader lets go, because by then the two are the same place.
-            if (_textMove.IsDragging)
+            // The colour says whether TYPING is on offer, which is the anchor's
+            // business and not the block's: a block is always movable.
+            string frameColor =
+                _selectedTextUnit is { CanEdit: false } ? RefusedUnitColor : EditableUnitColor;
+
+            double firstTop = double.MaxValue, firstLeft = 0;
+            foreach (var block in _selectedBlocks)
             {
-                double gl = (word.Left * SlotLayoutWidth) - padX;
-                double gt = (word.Top * SlotLayoutWidth) - padY;
-                textSlot?.PageTextOutline.Add(new ScaledRect(
-                    gl, gt,
-                    (word.Right * SlotLayoutWidth) - gl + padX,
-                    (word.Bottom * SlotLayoutWidth) + padY - gt,
-                    GhostUnitColor));
-            }
+                // ⚠️ PADDED BY THE SAME RULE THE HIT TEST USES, taken from the
+                // block rather than repeated here. A frame the reader can see
+                // and a box the pointer can enter that disagree by a few points
+                // is a click that lands inside the rule and dismisses the
+                // selection.
+                var (bl, bt, br, bb) = block.Frame;
 
-            double tl = ((word.Left + mx) * SlotLayoutWidth) - padX;
-            double tt = ((word.Top + my) * SlotLayoutWidth) - padY;
-            double frameBottom = ((word.Bottom + my) * SlotLayoutWidth) + padY;
-            double frameRight = ((word.Right + mx) * SlotLayoutWidth) + padX;
-            string frameColor = word.CanEdit ? EditableUnitColor : RefusedUnitColor;
-            textSlot?.PageTextOutline.Add(new ScaledRect(
-                tl, tt, frameRight - tl, frameBottom - tt, frameColor));
-
-            // ⚠️ CORNER MARKS ONLY WHILE THE BOX IS AN OBJECT, which is exactly
-            // while a drag would move it: not once there is a caret in the
-            // line, because then a drag selects through the text and a mark
-            // saying "pick me up" would be advertising the wrong gesture.
-            //
-            // Small filled squares, deliberately NOT the white circles the
-            // annotation grips use. Those mean "drag me to resize", and this
-            // text cannot be resized: there is no reflow to give it a new
-            // width with. These say only "this is one object, with edges", the
-            // way a bounding box does in a drawing program, and dragging one
-            // does what dragging anywhere else in the frame does.
-            if (textSlot is not null && (IsEditMode && !IsEditingInPlace))
-            {
-                foreach ((double hx, double hy) in new[]
+                // ⚠️ AND WHERE IT CAME FROM, FAINTLY, WHILE IT IS BEING
+                // CARRIED. A frame under the pointer says where the text is
+                // going; on its own it says nothing about how far that is from
+                // where the text still IS. The ghost is what turns a floating
+                // outline into a visible displacement, and it goes the moment
+                // the reader lets go, because by then the two are one place.
+                if (_textMove.IsDragging)
                 {
-                    (tl, tt), (frameRight, tt), (tl, frameBottom), (frameRight, frameBottom),
-                })
-                {
-                    textSlot.PageTextHandles.Add(new ScaledRect(
-                        hx - TextHandleHalf, hy - TextHandleHalf,
-                        TextHandleHalf * 2, TextHandleHalf * 2, frameColor));
-                }
-            }
-
-            // ⚠️ AND EVERY OTHER LINE THAT IS COMING WITH IT. The default is to
-            // move the whole paragraph, so a reader shown only the line they
-            // grabbed would be told the wrong thing about what they are about
-            // to do. Which lines those are is the core's answer, not one worked
-            // out here: see ShiftGateway.BlockBaselines.
-            if (_textMove.IsDragging && _movingBaselines.Count > 1)
-            {
-                foreach (var other in LinesFor(word.Page))
-                {
-                    if (Math.Abs(other.Baseline - word.Baseline) < BlockBaselineTolerance)
-                    {
-                        continue;
-                    }
-                    bool coming = false;
-                    foreach (double at in _movingBaselines)
-                    {
-                        if (Math.Abs(at - other.Baseline) < BlockBaselineTolerance)
-                        {
-                            coming = true;
-                            break;
-                        }
-                    }
-                    if (!coming) { continue; }
-
-                    double oh = (other.Bottom - other.Top) * SlotLayoutWidth;
-                    double ox = oh * TextUnitSelection.FramePadXFactor;
-                    double oy = oh * TextUnitSelection.FramePadYFactor;
-                    double ol = ((other.Left + mx) * SlotLayoutWidth) - ox;
-                    double ot = ((other.Top + my) * SlotLayoutWidth) - oy;
                     textSlot?.PageTextOutline.Add(new ScaledRect(
-                        ol, ot,
-                        ((other.Right + mx) * SlotLayoutWidth) - ol + ox,
-                        ((other.Bottom + my) * SlotLayoutWidth) + oy - ot,
-                        EditableUnitColor));
+                        bl * SlotLayoutWidth, bt * SlotLayoutWidth,
+                        (br - bl) * SlotLayoutWidth, (bb - bt) * SlotLayoutWidth,
+                        GhostUnitColor));
                 }
+
+                double tl = (bl + mx) * SlotLayoutWidth;
+                double tt = (bt + my) * SlotLayoutWidth;
+                double frameRight = (br + mx) * SlotLayoutWidth;
+                double frameBottom = (bb + my) * SlotLayoutWidth;
+
+                textSlot?.PageTextOutline.Add(new ScaledRect(
+                    tl, tt, frameRight - tl, frameBottom - tt, frameColor));
+
+                // ⚠️ CORNER MARKS ONLY WHILE THE BOX IS AN OBJECT, which is
+                // exactly while a drag would move it: not once there is a caret
+                // in the line, because then a drag selects through the text and
+                // a mark saying "pick me up" advertises the wrong gesture.
+                //
+                // Small filled squares, deliberately NOT the white circles the
+                // annotation grips use. Those mean "drag me to resize", and
+                // this text cannot be resized: there is no reflow to give it a
+                // new width with. These say only "this is one object, with
+                // edges", the way a bounding box does in a drawing program, and
+                // dragging one does what dragging anywhere else in it does.
+                if (textSlot is not null && IsEditMode && !IsEditingInPlace)
+                {
+                    foreach ((double hx, double hy) in new[]
+                    {
+                        (tl, tt), (frameRight, tt),
+                        (tl, frameBottom), (frameRight, frameBottom),
+                    })
+                    {
+                        textSlot.PageTextHandles.Add(new ScaledRect(
+                            hx - TextHandleHalf, hy - TextHandleHalf,
+                            TextHandleHalf * 2, TextHandleHalf * 2, frameColor));
+                    }
+                }
+
+                if (tt < firstTop) { firstTop = tt; firstLeft = tl; }
             }
+
+            double noticeTop = firstTop, noticeLeft = firstLeft;
 
             // AND WHY, when it cannot be edited. Beside the box rather than in
             // the status bar, because the status bar does not exist: `Status`
@@ -4636,12 +4596,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
                 // Above unless the frame is too near the top of the page to
                 // leave room, which happens on the first line of every page.
-                bool above = tt > UnitNoticeRoom;
+                bool above = noticeTop > UnitNoticeRoom;
 
                 textSlot.PageTextNotice.Add(new PageNotice(
-                    Left: Math.Clamp(tl, 0, Math.Max(0, SlotLayoutWidth - maxWidth)),
-                    TopMargin: above ? 0 : frameBottom + UnitNoticeGap,
-                    BottomMargin: above ? textSlot.SlotHeight - tt + UnitNoticeGap : 0,
+                    Left: Math.Clamp(noticeLeft, 0, Math.Max(0, SlotLayoutWidth - maxWidth)),
+                    TopMargin: above ? 0 : noticeTop + UnitNoticeGap,
+                    BottomMargin: above ? textSlot.SlotHeight - noticeTop + UnitNoticeGap : 0,
                     MaxWidth: maxWidth,
                     Above: above,
                     Text: why,
@@ -5713,7 +5673,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// changed is the difference between a limitation and a click that did
     /// nothing.
     /// </summary>
-    public bool SelectTextUnitAt(int pageIndex, double normX, double normY)
+    /// <summary>
+    /// The same, saying which block the click means and whether it joins what
+    /// is already selected.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE BLOCK IS WHAT A CLICK GETS, and the line is what Alt gets. Every
+    /// editor that lets you move a PDF's own text treats a paragraph as the
+    /// object, because that is the thing a reader means when they point at
+    /// text. The segmenter that decides where a paragraph ends is a guess and
+    /// is sometimes wrong, which is why <paramref name="oneLineOnly"/> exists:
+    /// a way out that Acrobat does not give you.
+    ///
+    /// ⚠️ AND THE ANCHOR IS STILL A LINE OR A WORD. The block is what MOVES;
+    /// the anchor is what a caret goes into and what gets retyped. Adding a
+    /// second block does not change what typing would edit.
+    /// </remarks>
+    public bool SelectTextUnitAt(
+        int pageIndex, double normX, double normY, bool oneLineOnly, bool add)
     {
         if (_documentHandle == 0) { return false; }
 
@@ -5726,6 +5703,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             : line is not null ? TextUnitSelection.From(pageIndex, line)
             : word is not null ? TextUnitSelection.From(pageIndex, word)
             : null;
+
+        var block = BlockAt(pageIndex, normX, normY, oneLineOnly);
+
+        // ⚠️ THE BLOCKS ARE SET BEFORE THE ANCHOR, because assigning the anchor
+        // refreshes the overlay and the overlay draws the blocks. The other
+        // order paints one frame behind.
+        if (!add || block is null || _selectedBlocks.Count == 0
+            || _selectedBlocks[0].Page != pageIndex)
+        {
+            // A plain click starts again, and so does a shift-click onto
+            // another page: the core rewrites one page's content at a time, so
+            // a selection spanning two of them could not be moved anyway.
+            _selectedBlocks.Clear();
+        }
+        if (block is not null && !_selectedBlocks.Any(b => b.IsSameAs(block)))
+        {
+            _selectedBlocks.Add(block);
+        }
 
         SelectedTextUnit = picked;
 
@@ -5774,6 +5769,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return picked is not null;
     }
 
+    /// <summary>
+    /// A plain click: the whole block, replacing whatever was selected.
+    /// </summary>
+    /// <remarks>
+    /// AFTER the method it calls, deliberately. Several tests read this file as
+    /// text and slice from the first "public bool SelectTextUnitAt(" they find,
+    /// and an expression-bodied overload sitting above the real one hands them
+    /// a body with nothing in it.
+    /// </remarks>
+    public bool SelectTextUnitAt(int pageIndex, double normX, double normY) =>
+        SelectTextUnitAt(pageIndex, normX, normY, oneLineOnly: false, add: false);
+
     /// <summary>Drops the selected unit and its box.</summary>
     public void ClearTextUnitSelection()
     {
@@ -5785,35 +5792,97 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _textHit = null;
         _textHitPage = -1;
 
+        _selectedBlocks.Clear();
         SelectedTextUnit = null;
         ClearLineSelection();
         ClearPageTextSelection();
     }
 
-    /// <summary>Whether a point falls inside the selected unit's box.</summary>
-    public bool TextUnitBoxContains(int pageIndex, double normX, double normY) =>
-        _selectedTextUnit?.Contains(pageIndex, normX, normY) ?? false;
+    /// <summary>
+    /// The blocks of the document's own text that are selected: one after a
+    /// click, more after a shift-click, and always on one page.
+    /// </summary>
+    private readonly List<TextBlockSelection> _selectedBlocks = new();
+
+    /// <summary>How many blocks are selected, for the toolbar to gate on.</summary>
+    public int SelectedTextBlockCount => _selectedBlocks.Count;
+
+    /// <summary>Whether a point falls inside any selected block's box.</summary>
+    public bool TextUnitBoxContains(int pageIndex, double normX, double normY)
+    {
+        foreach (var block in _selectedBlocks)
+        {
+            if (block.Contains(pageIndex, normX, normY)) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// The block under a point, or the one line under it when that is what was
+    /// asked for.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE REGION THE PAGE IS ALREADY DIVIDED INTO, not a fresh grouping.
+    /// <see cref="TextRegionsFor"/> is what draws the faint outlines the reader
+    /// can already see in Edit mode, so a click selects the box they were
+    /// looking at.
+    /// </remarks>
+    private TextBlockSelection? BlockAt(
+        int pageIndex, double normX, double normY, bool oneLineOnly)
+    {
+        var line = TextRegionHitTest.LineAt(
+            TextRegionsFor(pageIndex), normX, normY, offerableOnly: false);
+        if (oneLineOnly)
+        {
+            return line is null ? null : TextBlockSelection.Of(pageIndex, line);
+        }
+
+        foreach (var region in TextRegionsFor(pageIndex))
+        {
+            if (line is not null)
+            {
+                // By the LINE the pointer is on rather than by the box it is
+                // in. The boxes can overlap where a segmenter has drawn one
+                // round a heading that leans over the paragraph under it, and
+                // the line is never ambiguous.
+                if (region.Lines.Contains(line))
+                {
+                    return TextBlockSelection.Of(pageIndex, region);
+                }
+                continue;
+            }
+            if (normX >= region.Left && normX <= region.Right
+                && normY >= region.Top && normY <= region.Bottom)
+            {
+                return TextBlockSelection.Of(pageIndex, region);
+            }
+        }
+
+        return line is null ? null : TextBlockSelection.Of(pageIndex, line);
+    }
+
+    /// <summary>
+    /// Every line that is selected, which is exactly what a move sends.
+    /// </summary>
+    private List<double> SelectedBaselines()
+    {
+        var all = new List<double>();
+        foreach (var block in _selectedBlocks)
+        {
+            foreach (double at in block.Baselines)
+            {
+                if (!all.Any(had => Math.Abs(had - at) < TextBlockSelection.SameBaseline))
+                {
+                    all.Add(at);
+                }
+            }
+        }
+        return all;
+    }
 
     // ---------------- moving the document's own text ----------------
 
     private readonly DragGesture _textMove = new();
-
-    /// <summary>
-    /// How close two baselines must be to be the same line of type, as a
-    /// fraction of the page width. About a point on A4.
-    /// </summary>
-    /// <remarks>
-    /// The core answers in a 32-bit float and the app holds another, so they
-    /// will not be equal; what matters is that no two lines of a paragraph are
-    /// ever this close together.
-    /// </remarks>
-    private const double BlockBaselineTolerance = 0.002;
-
-    /// <summary>
-    /// The baselines of every line that will move, fetched once when the drag
-    /// starts. Normalized the way the whole overlay is.
-    /// </summary>
-    private IReadOnlyList<double> _movingBaselines = Array.Empty<double>();
 
     /// <summary>Whether the reader is dragging the document's own text.</summary>
     public bool IsMovingTextUnit => _textMove.IsDragging;
@@ -5867,16 +5936,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public bool UpdateTextUnitMove(double normX, double normY)
     {
+        // ⚠️ NOTHING IS ASKED WHEN THE DRAG BEGINS ANY MORE. This used to
+        // call the core to find out which lines were coming along, because the
+        // core decided what a paragraph was and the app did not know. The
+        // selection carries its own lines now, so what will move is already in
+        // hand and a drag costs no document parse at all.
         bool started = _textMove.Move(normX, normY);
-        if (started)
-        {
-            // ⚠️ ASKED ONCE, WHEN THE DRAG BEGINS. The answer cannot change
-            // while the reader holds the pointer down, and asking on every
-            // pointer move would put a whole-document parse inside the drag.
-            _movingBaselines = _selectedTextUnit is { } unit && _documentHandle != 0
-                ? Interop.ShiftGateway.BlockBaselines(_documentHandle, unit.Page, unit.Baseline)
-                : Array.Empty<double>();
-        }
         if (started || _textMove.IsDragging)
         {
             RefreshSelectionOutline();
@@ -5895,11 +5960,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// PDFium page, so it comes back as bytes and everything the app is holding
     /// is stale when it returns.
     ///
-    /// <paramref name="oneLineOnly"/> is the held modifier: without it the
-    /// whole paragraph moves, which is what a reader dragging a block of text
-    /// expects.
+    /// ⚠️ WHAT MOVES IS WHAT IS IN THE BOX, and there is no modifier
+    /// here any more. Which lines those are was decided by the click that made
+    /// the selection: a plain one takes the block, Alt takes the single line.
+    /// A drag can then only carry what the reader can see it is holding.
     /// </remarks>
-    public bool CommitTextUnitMove(bool oneLineOnly)
+    public bool CommitTextUnitMove()
     {
         if (!_textMove.IsDragging)
         {
@@ -5909,9 +5975,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         (double dx, double dy) = (_textMove.Dx, _textMove.Dy);
         _textMove.Release();
-        _movingBaselines = Array.Empty<double>();
 
-        bool moved = MoveTextUnitBy(dx, dy, oneLineOnly, "Move text", takeAStep: true);
+        bool moved = MoveTextUnitBy(dx, dy, "Move text", takeAStep: true);
         if (!moved) { RefreshSelectionOutline(); }
         TextUnitMoveChanged?.Invoke();
         return moved;
@@ -5938,14 +6003,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// second and later keystrokes of a held arrow, which belong to the step
     /// the first one pushed.
     /// </param>
-    private bool MoveTextUnitBy(
-        double dx, double dy, bool oneLineOnly, string label, bool takeAStep)
+    private bool MoveTextUnitBy(double dx, double dy, string label, bool takeAStep)
     {
-        if (_selectedTextUnit is not { } unit || _documentHandle == 0 || unit.Page < 0)
-        {
-            return false;
-        }
-        int page = unit.Page;
+        if (_selectedBlocks.Count == 0 || _documentHandle == 0) { return false; }
+
+        int page = _selectedBlocks[0].Page;
+        if (page < 0) { return false; }
+
+        var baselines = SelectedBaselines();
+        if (baselines.Count == 0) { return false; }
 
         // Captured BEFORE the write, because that is the state undo restores,
         // but only PUSHED after it succeeds: the core leaves the document
@@ -5958,19 +6024,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var before = takeAStep ? Capture(HistoryScope.Document, label, null) : null;
 
         byte[]? bytes = Interop.ShiftGateway.Move(
-            _documentHandle, page, unit.Baseline, !oneLineOnly, dx, dy);
+            _documentHandle, page, baselines, dx, dy);
         if (bytes is null)
         {
-            Diag.Log($"MoveTextUnitBy p{page} refused at baseline {unit.Baseline}");
+            Diag.Log($"MoveTextUnitBy p{page} refused, {baselines.Count} line(s)");
             Status = "This text could not be moved.";
             ShowUnitNotice("This text could not be moved.");
             return false;
         }
 
-        // Where to look for the text afterwards: the middle of the box it was
-        // in, carried by the same displacement the text was.
-        double atX = ((unit.Left + unit.Right) / 2) + dx;
-        double atY = ((unit.Top + unit.Bottom) / 2) + dy;
+        // Where to look for each block afterwards: the middle of the box it was
+        // in, carried by the same displacement the text was. Taken BEFORE the
+        // write, because everything describing the old document is about to go.
+        var lookFor = _selectedBlocks
+            .Select(b => (((b.Left + b.Right) / 2) + dx, ((b.Top + b.Bottom) / 2) + dy))
+            .ToList();
+
+        // Where the caret was aiming, so the anchor comes back as the same line
+        // or word rather than as whatever the block's middle happens to sit on.
+        var anchor = _selectedTextUnit is { } was
+            ? (((was.Left + was.Right) / 2) + dx, ((was.Top + was.Bottom) / 2) + dy)
+            : lookFor[0];
 
         RestoreDocumentBytes(bytes);
 
@@ -5995,15 +6069,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         IsDirty = true;
 
         // ⚠️ FOUND AGAIN BY THE SAME HIT TEST A CLICK USES, rather than by a
-        // lookup of its own. That is what keeps the unit the reader gets back
-        // the one they would have got by clicking there: the same rule decides
-        // between a line and a word, and it decides it against the document as
-        // it is NOW. A move that carried the text off the page or under
-        // something else simply finds nothing, and the frame goes, which is
-        // honest about what happened.
-        SelectTextUnitAt(page, atX, atY);
+        // lookup of its own. That is what keeps what the reader gets back the
+        // same as what a click there would have given them, decided against the
+        // document as it is NOW. A move that carried the text off the page or
+        // under something else simply finds nothing, and the frame goes, which
+        // is honest about what happened.
+        //
+        // ⚠️ THE ANCHOR LAST, because every one of these sets it and the last
+        // one wins. Put first, it would be overwritten by whichever line
+        // happened to sit at the next block's middle, and the caret would come
+        // back somewhere the reader never clicked.
+        _selectedBlocks.Clear();
+        foreach (var (x, y) in lookFor)
+        {
+            SelectTextUnitAt(page, x, y, oneLineOnly: false, add: true);
+        }
+        SelectTextUnitAt(page, anchor.Item1, anchor.Item2, oneLineOnly: false, add: true);
 
-        Status = oneLineOnly ? "Line moved." : "Text moved.";
+        Status = baselines.Count == 1 ? "Line moved." : "Text moved.";
         return true;
     }
 
@@ -6021,7 +6104,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// selection has changed: nudge, click elsewhere, nudge is TWO runs, and
     /// the label alone cannot tell those apart.
     /// </remarks>
-    public bool NudgeTextUnit(double dx, double dy, bool oneLineOnly)
+    public bool NudgeTextUnit(double dx, double dy)
     {
         if (_selectedTextUnit is null) { return false; }
 
@@ -6033,7 +6116,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (IsEditingInPlace) { return false; }
 
         bool fresh = !_nudgeRunOpen || _history.NextUndoLabel != NudgeStepLabel;
-        bool moved = MoveTextUnitBy(dx, dy, oneLineOnly, NudgeStepLabel, takeAStep: fresh);
+        bool moved = MoveTextUnitBy(dx, dy, NudgeStepLabel, takeAStep: fresh);
 
         // ⚠️ SET AFTER THE MOVE, NOT BEFORE. The move reselects the text it
         // carried, and going through the selection is exactly what closes a
@@ -6076,13 +6159,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         if (_textMove.IsDragging)
         {
-            CommitTextUnitMove(oneLineOnly);
+            CommitTextUnitMove();
             return false;
         }
 
         int page = _textMove.Page;
         (double x, double y) = (_textMove.FromX, _textMove.FromY);
         _textMove.Clear();
+
+        // ⚠️ ALT NARROWS EVEN INSIDE THE BOX, and it has to. A block is often
+        // most of a page, so the reader who wants one line of it is standing
+        // inside the selection already, where a press means "type here". Alt
+        // has to mean the same thing wherever it is held, or it means nothing.
+        if (oneLineOnly)
+        {
+            SelectTextUnitAt(page, x, y, oneLineOnly: true, add: false);
+            return false;   // narrowed, not typing: no caret to give the keys to
+        }
+
         return BeginInPlaceEdit(page, x, y);
     }
 
@@ -6092,7 +6186,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_textMove.Page < 0 && !_textMove.IsDragging) { return; }
 
         _textMove.Clear();
-        _movingBaselines = Array.Empty<double>();
         RefreshSelectionOutline();
         TextUnitMoveChanged?.Invoke();
     }

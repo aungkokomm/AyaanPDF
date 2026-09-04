@@ -77,10 +77,10 @@ public class TextMoveWiringTests
     [Fact]
     public void a_press_that_never_travelled_still_puts_a_caret_in_the_line()
     {
-        string body = Method(Vm(), "public bool ReleaseTextUnitPress(", 900);
+        string body = Method(Vm(), "public bool ReleaseTextUnitPress(", 1600);
 
         Assert.Contains("_textMove.IsDragging", body, StringComparison.Ordinal);
-        Assert.Contains("CommitTextUnitMove(oneLineOnly)", body, StringComparison.Ordinal);
+        Assert.Contains("CommitTextUnitMove();", body, StringComparison.Ordinal);
 
         // ⚠️ FROM THE PRESS, NOT FROM THE RELEASE. A pointer that has drifted
         // a couple of points would otherwise put the caret at a different
@@ -93,12 +93,26 @@ public class TextMoveWiringTests
             StringComparison.Ordinal);
     }
 
-    /// <summary>The held modifier is what asks for one line instead of the block.</summary>
+    /// <summary>
+    /// ⚠️ ALT NARROWS TO THE ONE LINE WHEREVER IT IS HELD, inside the box as
+    /// well as outside it. A block is often most of a page, so the reader who
+    /// wants one line of it is standing inside the selection already, where a
+    /// press otherwise means "type here". A modifier that works in one place
+    /// and not the other may as well not exist.
+    /// </summary>
     [Fact]
-    public void releasing_commits_the_move_and_alt_asks_for_one_line()
+    public void alt_narrows_the_selection_to_a_single_line()
     {
-        string page = Page();
-        Assert.Contains("ViewModel.ReleaseTextUnitPress(IsAltDown())", page, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.ReleaseTextUnitPress(IsAltDown())", Page(),
+            StringComparison.Ordinal);
+
+        string body = Method(Vm(), "public bool ReleaseTextUnitPress(", 1600);
+        Assert.Contains("SelectTextUnitAt(page, x, y, oneLineOnly: true, add: false)",
+            body, StringComparison.Ordinal);
+
+        // And a plain click outside takes the block, with Shift growing it.
+        Assert.Contains("oneLineOnly: IsAltDown(), add: IsShiftDown()", Page(),
+            StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -125,18 +139,28 @@ public class TextMoveWiringTests
     [Fact]
     public void a_move_leaves_the_same_text_selected_where_it_landed()
     {
-        string body = Method(Vm(), "private bool MoveTextUnitBy(", 3400);
+        string body = Method(Vm(), "private bool MoveTextUnitBy(", 4200);
 
         int cleared = body.IndexOf("ClearTextUnitSelection();", StringComparison.Ordinal);
-        int found = body.IndexOf("SelectTextUnitAt(page, atX, atY);", StringComparison.Ordinal);
+        int found = body.IndexOf("SelectTextUnitAt(page, x, y, oneLineOnly: false, add: true);",
+            StringComparison.Ordinal);
 
         Assert.True(cleared > 0, "the stale selection is not dropped");
-        Assert.True(found > cleared, "nothing puts the frame back on the moved text");
+        Assert.True(found > cleared, "nothing puts the frames back on the moved text");
 
-        // ⚠️ FOUND BY THE SAME HIT TEST A CLICK USES, so the reader gets the
-        // unit they would have got by clicking there, decided against the
-        // document as it is NOW rather than by a lookup of its own.
-        Assert.Contains("double atX = ((unit.Left + unit.Right) / 2) + dx;", body, StringComparison.Ordinal);
+        // ⚠️ FOUND BY THE SAME HIT TEST A CLICK USES, so the reader gets what a
+        // click there would have given them, decided against the document as it
+        // is NOW rather than by a lookup of its own. EVERY block comes back,
+        // not just the one holding the caret.
+        Assert.Contains("var lookFor = _selectedBlocks", body, StringComparison.Ordinal);
+
+        // ⚠️ AND THE ANCHOR LAST, because every one of these sets it and the
+        // last one wins. Put first it would be overwritten by whichever line
+        // sits at the next block's middle, and the caret would come back
+        // somewhere the reader never clicked.
+        int anchor = body.IndexOf("SelectTextUnitAt(page, anchor.Item1, anchor.Item2",
+            StringComparison.Ordinal);
+        Assert.True(anchor > found, "the anchor is reselected before the other blocks");
     }
 
     /// <summary>
@@ -195,7 +219,10 @@ public class TextMoveWiringTests
         Assert.True(annotation > 0 && text > annotation, "text answers before annotations do");
         Assert.True(scroll > text, "the page still scrolls before the text is offered the keys");
         Assert.Contains("IsShiftDown() ? BigNudgeStep : SmallNudgeStep", body, StringComparison.Ordinal);
-        Assert.Contains("IsAltDown())", body, StringComparison.Ordinal);
+        // ⚠️ NO MODIFIER ON THE KEYBOARD. What moves was settled by the click
+        // that made the selection, so the arrows carry whatever the box on
+        // screen says they will.
+        Assert.DoesNotContain("IsAltDown()", body, StringComparison.Ordinal);
     }
 
     // ---------------- what the reader can see ----------------
@@ -272,7 +299,7 @@ public class TextMoveWiringTests
     [Fact]
     public void a_refused_move_leaves_no_undo_step_behind()
     {
-        string body = Method(Vm(), "private bool MoveTextUnitBy(", 3400);
+        string body = Method(Vm(), "private bool MoveTextUnitBy(", 4200);
 
         int captured = body.IndexOf("Capture(HistoryScope.Document", StringComparison.Ordinal);
         int wrote = body.IndexOf("ShiftGateway.Move(", StringComparison.Ordinal);
@@ -292,7 +319,7 @@ public class TextMoveWiringTests
     [Fact]
     public void a_move_throws_away_everything_it_invalidated()
     {
-        string body = Method(Vm(), "private bool MoveTextUnitBy(", 3400);
+        string body = Method(Vm(), "private bool MoveTextUnitBy(", 4200);
 
         Assert.Contains("RestoreDocumentBytes(bytes);", body, StringComparison.Ordinal);
         Assert.Contains("_linesByPage.Clear();", body, StringComparison.Ordinal);
@@ -302,20 +329,25 @@ public class TextMoveWiringTests
     }
 
     /// <summary>
-    /// ⚠️ ASKED ONCE, WHEN THE DRAG BEGINS. Which lines come along cannot change
-    /// while the pointer is held down, and asking on every pointer move would put
-    /// a whole-document parse inside the drag.
+    /// ⚠️ NOTHING IS ASKED WHEN A DRAG BEGINS ANY MORE, and that is the whole
+    /// point of the block model. This used to call the core to find out which
+    /// lines were coming along, because the CORE decided what a paragraph was
+    /// and the app did not know: two answers to one question, agreeing often
+    /// enough to look right. The selection carries its own lines now, so what
+    /// will move is already in hand and a drag costs no document parse at all.
     /// </summary>
     [Fact]
-    public void the_lines_that_will_move_are_asked_for_once()
+    public void beginning_a_drag_asks_the_core_nothing()
     {
         string body = Method(Vm(), "public bool UpdateTextUnitMove(", 1400);
 
-        int started = body.IndexOf("if (started)", StringComparison.Ordinal);
-        int asked = body.IndexOf("ShiftGateway.BlockBaselines(", StringComparison.Ordinal);
+        Assert.DoesNotContain("Gateway.", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("_movingBaselines", Vm(), StringComparison.Ordinal);
 
-        Assert.True(started > 0 && asked > started,
-            "the block is asked for outside the branch that runs once");
+        // And the call it used to make is gone from the app entirely, so there
+        // is no second answer left to drift back to.
+        Assert.DoesNotContain("text_block_baselines",
+            Source("PdfEditorApp", "Interop", "RenderCoreNative.cs"), StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -348,7 +380,12 @@ public class TextMoveWiringTests
 
         Assert.Contains("_textMove.IsDragging\n                ? (_textMove.Dx, _textMove.Dy)",
             vm.Replace("\r\n", "\n"), StringComparison.Ordinal);
-        Assert.Contains("_movingBaselines.Count > 1", vm, StringComparison.Ordinal);
+
+        // ⚠️ ONE BOX PER BLOCK, AND THE BOX IS WHAT MOVES. The drag used to
+        // paint extra frames on the lines the CORE said were coming, because
+        // the frame was round one line while the drag carried a paragraph.
+        // There is nothing to make up for now: what is drawn is what is sent.
+        Assert.Contains("foreach (var block in _selectedBlocks)", vm, StringComparison.Ordinal);
     }
 
     // ---------------- helpers ----------------

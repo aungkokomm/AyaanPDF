@@ -1882,74 +1882,6 @@ pub extern "C" fn retype_recovered_line(
     .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
 }
 
-/// Which lines belong to the same paragraph as the one at `baseline`.
-///
-/// Encoding: a `u32` count, then that many `f32` baselines, NORMALIZED the way
-/// the app draws: measured DOWN from the top of the page and divided by its
-/// WIDTH. The one asked about is among them.
-///
-/// ⚠️ SO THE APP NEVER HAS TO KNOW WHERE A PARAGRAPH ENDS. It already holds
-/// every line's box; what it cannot work out is which of them move together,
-/// because that rule lives here and was tuned against real pages. Answering
-/// with baselines rather than with a rectangle keeps it that way, and lets the
-/// app frame each line it is about to move rather than one box round the lot.
-#[unsafe(no_mangle)]
-pub extern "C" fn text_block_baselines(
-    doc_handle: u64,
-    page_index: i32,
-    baseline: f32,
-) -> ByteBuffer {
-    if doc_handle == 0 || page_index < 0 || !baseline.is_finite() {
-        return ByteBuffer::err(STATUS_INVALID_INPUT);
-    }
-
-    panic::catch_unwind(move || {
-        let Some(bytes) = document_bytes(doc_handle) else {
-            return ByteBuffer::err(STATUS_INVALID_INPUT);
-        };
-        let Ok(doc) = lopdf::Document::load_mem(&bytes) else {
-            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
-        };
-        let pages = doc.get_pages();
-        let Some((_, &page)) = pages.iter().nth(page_index as usize) else {
-            return ByteBuffer::err(STATUS_INVALID_INPUT);
-        };
-        let Some((_, page_top, page_w)) = recover::page_box(&doc, page) else {
-            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
-        };
-
-        let at = page_top - (baseline as f64 * page_w);
-        let lines = recover::lines_of(&doc, page);
-
-        // ⚠️ `page_y` BOTH WAYS, IN AND OUT. What arrives was read off the page
-        // and what goes back is compared against the app's own line list, which
-        // was too. `y` is the placement as the stream writes it, and on a page
-        // drawn under a transform it is a different frame entirely.
-        let Some(mine) = lines.iter().position(|l| (l.page_y - at).abs() < 0.5) else {
-            return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
-        };
-        let Some(group) = shift::blocks_of(&lines).into_iter().find(|g| g.contains(&mine))
-        else {
-            return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
-        };
-
-        let mut out: Vec<u8> = Vec::new();
-        out.extend((group.len() as u32).to_le_bytes());
-        for i in &group {
-            out.extend((((page_top - lines[*i].page_y) / page_w) as f32).to_le_bytes());
-        }
-
-        let mut boxed = out.into_boxed_slice();
-        let buffer = ByteBuffer {
-            data: boxed.as_mut_ptr(),
-            len: boxed.len(),
-            status: STATUS_OK_PDFIUM,
-        };
-        std::mem::forget(boxed);
-        buffer
-    })
-    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
-}
 
 /// Moves a line, or the whole paragraph it belongs to, across the page.
 ///
@@ -1962,9 +1894,10 @@ pub extern "C" fn text_block_baselines(
 /// The conversion into PDF user space happens on this side, where the page's
 /// crop box is, so the app never has to know about it.
 ///
-/// `whole_block` non-zero moves every line of the paragraph the baseline falls
-/// in, decided by the same rule the block model uses; zero moves only that one
-/// line.
+/// `baselines` names EVERY LINE TO MOVE and they all move by the same
+/// displacement: one line, one paragraph, or several paragraphs at once. The
+/// caller decides what a block is; this only finds the operations that draw the
+/// lines it was given. See the note in the body for why it stopped deciding.
 ///
 /// ⚠️ AND IT REFUSES RATHER THAN CARRYING A NEIGHBOUR ALONG. One `Tm` can place
 /// several pieces of text, so if the ones being moved also draw something that
@@ -1973,15 +1906,21 @@ pub extern "C" fn text_block_baselines(
 pub extern "C" fn shift_page_text(
     doc_handle: u64,
     page_index: i32,
-    baseline: f32,
-    whole_block: i32,
+    baselines: *const f32,
+    baseline_count: i32,
     dx: f32,
     dy: f32,
 ) -> ByteBuffer {
-    if doc_handle == 0 || page_index < 0 {
+    if doc_handle == 0 || page_index < 0 || baselines.is_null() || baseline_count <= 0 {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     }
-    if !baseline.is_finite() || !dx.is_finite() || !dy.is_finite() {
+    if !dx.is_finite() || !dy.is_finite() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+
+    let asked: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(baselines, baseline_count as usize) }.to_vec();
+    if asked.iter().any(|b| !b.is_finite()) {
         return ByteBuffer::err(STATUS_INVALID_INPUT);
     }
 
@@ -2001,14 +1940,31 @@ pub extern "C" fn shift_page_text(
         };
 
         // Out of the app's units and into the page's own.
-        let at = page_top - (baseline as f64 * page_w);
         let across = dx as f64 * page_w;
         let down = -(dy as f64) * page_w;
 
+        // ⚠️ EVERY LINE THE CALLER NAMED, AND NO OTHERS. This used to take
+        // one baseline and a flag and work out the rest of the paragraph
+        // itself. That made TWO answers to "what is a block": the app drew one
+        // box, from its own page segmentation, and this moved a different set
+        // of lines, from the leading and the left edge. The two agree often
+        // enough to look right and not often enough to be right, and a box
+        // that does not say what a drag will do is worse than no box at all.
+        //
+        // So the caller says exactly which lines to move and this only finds
+        // the operations that draw them. One line, one paragraph and several
+        // paragraphs are all the same call.
         let lines = recover::lines_of(&doc, page);
-        let Some(ops) = shift::drawn_by(&lines, at, whole_block != 0) else {
-            return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
-        };
+        let mut ops: Vec<usize> = Vec::new();
+        for b in &asked {
+            let at = page_top - (*b as f64 * page_w);
+            let Some(found) = shift::drawn_by(&lines, at, false) else {
+                return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
+            };
+            ops.extend(found);
+        }
+        ops.sort_unstable();
+        ops.dedup();
 
         match shift::shift(&doc, page, &ops, across, down) {
             Ok(out) => {
@@ -26388,11 +26344,11 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     /// `shift_page_text`, decoded, or the status it refused with.
-    fn shifted(handle: u64, page: i32, baseline: f32, whole_block: bool, dx: f32, dy: f32)
+    fn shifted(handle: u64, page: i32, baselines: &[f32], dx: f32, dy: f32)
         -> Result<Vec<u8>, i32>
     {
         let buffer = shift_page_text(
-            handle, page, baseline, i32::from(whole_block), dx, dy);
+            handle, page, baselines.as_ptr(), baselines.len() as i32, dx, dy);
         if buffer.status != STATUS_OK_PDFIUM {
             let status = buffer.status;
             free_byte_buffer(buffer);
@@ -26498,8 +26454,33 @@ p={spread_px:.4},c={rgba:08X})"
             .expect("the page has changed under this test");
         let at = target.baseline;
 
+        // ⚠️ THE CALLER WORKS OUT THE PARAGRAPH, exactly as the app now
+        // does. shift_page_text no longer decides what a block is; it is given
+        // the lines and finds the operations that draw them. Which is also what
+        // makes this the multi-selection test: several named lines move
+        // together and nothing else moves at all.
+        let doc_bytes = document_bytes(handle);
+        let doc = lopdf::Document::load_mem(&doc_bytes).unwrap();
+        let pages = doc.get_pages();
+        let (_, &page_id) = pages.iter().next().unwrap();
+        let (_, page_top, page_w) = recover::page_box(&doc, page_id).unwrap();
+        let page_lines = recover::lines_of(&doc, page_id);
+        let mine = page_lines
+            .iter()
+            .position(|l| (l.page_y - (page_top - at as f64 * page_w)).abs() < 0.5)
+            .expect("the line the app is holding is not one the mover has");
+        let group = shift::blocks_of(&page_lines)
+            .into_iter()
+            .find(|g| g.contains(&mine))
+            .expect("no paragraph holds it");
+        assert!(group.len() > 1, "a paragraph of one line proves nothing here");
+        let asked: Vec<f32> = group
+            .iter()
+            .map(|i| ((page_top - page_lines[*i].page_y) / page_w) as f32)
+            .collect();
+
         // A twentieth of the page width right, and a fortieth down.
-        let out = shifted(handle, 0, at, true, 0.05, 0.025).expect("refused");
+        let out = shifted(handle, 0, &asked, 0.05, 0.025).expect("refused");
         close_document(handle);
 
         let after = recovered_lines(open_fixture_named_from(&out), 0);
@@ -26546,7 +26527,7 @@ p={spread_px:.4},c={rgba:08X})"
             .find(|l| !l.text.is_empty() && (l.pdf_baseline - 455.0).abs() < 1.0)
             .expect("the page has changed under this test");
 
-        let out = shifted(handle, 0, target.baseline, false, 0.05, 0.0).expect("refused");
+        let out = shifted(handle, 0, &[target.baseline], 0.05, 0.0).expect("refused");
         close_document(handle);
 
         let after = recovered_lines(open_fixture_named_from(&out), 0);

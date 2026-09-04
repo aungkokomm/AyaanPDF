@@ -191,20 +191,25 @@ public class WordEditWiringTests
         string code = ViewModel();
 
         int outline = code.IndexOf("PageTextOutline.Add(", StringComparison.Ordinal);
-        Assert.True(outline > 0, "the word frame is no longer drawn");
+        Assert.True(outline > 0, "the text frame is no longer drawn");
 
-        // Look back over the block that builds the rect. Generous, because the
-        // first Add is now the ghost left behind by a move and the padding is
-        // worked out once, above both of them.
-        string block = code[Math.Max(0, outline - 2400)..outline];
-        Assert.Contains("padX", block, StringComparison.Ordinal);
-        Assert.Contains("padY", block, StringComparison.Ordinal);
+        // ⚠️ THE PADDING LIVES IN THE SELECTION NOW, NOT IN THE DRAWING CODE.
+        // The overlay used to work it out itself and could have worked it out
+        // wrong; TextBlockSelection.Frame is the one padded box and Contains is
+        // defined in terms of it, so what is drawn and what the pointer can
+        // enter cannot differ.
+        Assert.Contains("var (bl, bt, br, bb) = block.Frame;", code, StringComparison.Ordinal);
 
-        // And the padding must be derived from the word, not a fixed number of
-        // pixels, or it would swamp small type and vanish on large.
-        Assert.Contains("word.Bottom - word.Top", block, StringComparison.Ordinal);
+        string frame = Source("PdfEditorApp.Viewport", "TextBlockSelection.cs");
 
-        // And the geometry handed to the core stays the tight box: the write
+        // Derived from the type's own height, not a fixed number of pixels, or
+        // it would swamp small type and vanish on large.
+        Assert.Contains("LineHeight * TextUnitSelection.FramePadXFactor", frame,
+            StringComparison.Ordinal);
+        Assert.Contains("LineHeight * TextUnitSelection.FramePadYFactor", frame,
+            StringComparison.Ordinal);
+
+        // And the geometry handed to the core stays the TIGHT box: the write
         // takes the cluster straight from the model, so a padded rect could
         // only get there by someone padding the model itself.
         Assert.Contains("WordClusterGateway.Write(_documentHandle, page, word, newText)",

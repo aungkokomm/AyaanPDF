@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -7529,7 +7529,7 @@ public sealed partial class MainPage : Page
                 {
                     double stepD = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
                     ViewModel.NudgeTextUnit(
-                        0, e.Key == VirtualKey.Down ? stepD : -stepD, IsAltDown());
+                        0, e.Key == VirtualKey.Down ? stepD : -stepD);
                 }
                 else
                 {
@@ -7546,18 +7546,18 @@ public sealed partial class MainPage : Page
                 }
                 else if (ViewModel.HasSelectedTextUnit)
                 {
-                    // ⚠️ THE CARET GUARD IS IN NudgeTextUnit, NOT HERE, and it
-                    // has to be: the block that claims the arrows for a caret
-                    // lets them through when Alt is held, and Alt is exactly
-                    // the modifier passed below.
+                    // ⚠️ THE CARET GUARD IS IN NudgeTextUnit, NOT HERE. The
+                    // block that claims the arrows for a caret lets them
+                    // through when Alt is held, so this switch is reachable
+                    // with a caret in the line and the view model is the only
+                    // place that can say no to both callers at once.
                     //
-                    // ⚠️ AND ALT MEANS THE SAME THING IT MEANS TO A DRAG, one
-                    // line rather than the paragraph. A modifier that meant two
-                    // different things in the two gestures that move the same
-                    // text would be worse than not having one.
+                    // WHAT moves was settled by the click that made the
+                    // selection, so there is no modifier here: the keyboard
+                    // carries whatever the box on screen says it will.
                     double stepR = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
                     ViewModel.NudgeTextUnit(
-                        e.Key == VirtualKey.Right ? stepR : -stepR, 0, IsAltDown());
+                        e.Key == VirtualKey.Right ? stepR : -stepR, 0);
                 }
                 else
                 {
@@ -8741,7 +8741,17 @@ public sealed partial class MainPage : Page
                 && !MovedSincePress(e))
             {
                 ViewModel.ClearReaderTextSelection();
-                ViewModel.SelectTextUnitAt(_textPressPage, _textPressNormX, _textPressNormY);
+
+                // ⚠️ ALT NARROWS, SHIFT ADDS. A click takes the whole block,
+                // which is what a reader pointing at text means and what every
+                // editor that moves a PDF's own text does. The block comes from
+                // a segmenter and is sometimes wrong, so Alt is the way down to
+                // the single line; Acrobat gives you no such way out. Shift
+                // grows the selection, matching what it already does to
+                // annotations.
+                ViewModel.SelectTextUnitAt(
+                    _textPressPage, _textPressNormX, _textPressNormY,
+                    oneLineOnly: IsAltDown(), add: IsShiftDown());
             }
 
             e.Handled = true;

@@ -143,11 +143,21 @@ public class TextUnitSelectionTests
         // Both sides multiply by these, and the constants live beside the hit
         // test so the drawing code has to reach for them rather than repeat
         // them. Two copies of a number that must agree do not stay agreed.
+        // ⚠️ STRONGER NOW THAN WHEN THIS WAS WRITTEN. The drawing code used to
+        // reach for the constants itself and could have reached wrong. The
+        // block's own Frame is the single padded box and Contains is defined in
+        // terms of it, so the frame and the hit test cannot differ at all.
+        string block = System.IO.File.ReadAllText(FindUp(
+            "PdfEditorApp.Viewport", "TextBlockSelection.cs"));
+
+        Assert.Contains("TextUnitSelection.FramePadXFactor", block, StringComparison.Ordinal);
+        Assert.Contains("TextUnitSelection.FramePadYFactor", block, StringComparison.Ordinal);
+        Assert.Contains("var (l, t, r, b) = Frame;", block, StringComparison.Ordinal);
+
+        // And the overlay draws THAT box rather than padding one of its own.
         string vm = System.IO.File.ReadAllText(FindUp(
             "PdfEditorApp", "ViewModels", "ViewportViewModel.cs"));
-
-        Assert.Contains("TextUnitSelection.FramePadXFactor", vm, StringComparison.Ordinal);
-        Assert.Contains("TextUnitSelection.FramePadYFactor", vm, StringComparison.Ordinal);
+        Assert.Contains("var (bl, bt, br, bb) = block.Frame;", vm, StringComparison.Ordinal);
     }
 
     // ---------------- saying why it cannot be edited ----------------

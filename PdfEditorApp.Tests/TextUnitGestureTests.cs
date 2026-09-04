@@ -376,10 +376,15 @@ public class TextUnitGestureTests
         // the unit would have been unpadded and would have done exactly that.
         string body = Body(ViewModel(), "private void RefreshSelectionOutlineCore()");
 
-        Assert.Contains("_selectedTextUnit is { } word", body, StringComparison.Ordinal);
+        Assert.Contains("_selectedBlocks.Count > 0", body, StringComparison.Ordinal);
         Assert.Contains("PageTextOutline.Add(", body, StringComparison.Ordinal);
-        Assert.Contains("word.CanEdit ? EditableUnitColor : RefusedUnitColor",
-                        body, StringComparison.Ordinal);
+
+        // ⚠️ THE COLOUR IS THE ANCHOR'S BUSINESS, NOT THE BLOCK'S. It says
+        // whether TYPING is on offer, and a block is always movable, so one
+        // refused line inside it must not paint the whole box as refused.
+        Assert.Contains(
+            "_selectedTextUnit is { CanEdit: false } ? RefusedUnitColor : EditableUnitColor",
+            body, StringComparison.Ordinal);
     }
 
     [Fact]
