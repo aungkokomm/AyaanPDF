@@ -1638,9 +1638,15 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
+                // ⚠️ BY FONT NAME AS WELL AS BY SCRIPT NAME. This matched only
+                // "myanmar" and so never once looked at the Pyidaungsu file the
+                // user supplied for exactly this measurement: the corpus table
+                // reported no Pyidaungsu because it had not read the file that
+                // had it, not because the file was missing.
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.to_lowercase().contains("myanmar"))
+                    .map(|n| n.to_lowercase())
+                    .is_some_and(|n| n.contains("myanmar") || n.contains("pyidaungsu"))
             })
             .collect();
         files.sort();
@@ -1678,9 +1684,94 @@ mod tests {
                 println!("  page {n}: {} runs, {} lines, {proven} read, \
                           index {built:.1?}, whole page {:.1?}",
                     lines.len(), read.len(), started.elapsed());
-                for f in &known {
-                    println!("      {f}");
+
+                // ⚠️ PER FONT, because "16 of 30" on a page set in two weights
+                // does not say whether the half that failed is a font that
+                // resolved to nothing or a font that resolved to the wrong
+                // build. Those are different bugs with different fixes.
+                let mut said: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+                for r in &read {
+                    let e = said.entry(r.font.clone()).or_default();
+                    e.1 += 1;
+                    if r.text.is_some() { e.0 += 1; }
                 }
+                for f in &known {
+                    let family = f.split(" ->").next().unwrap_or_default();
+                    let (ok, all) = said.get(family).copied().unwrap_or((0, 0));
+                    println!("      {f}   read {ok} of {all}");
+                }
+            }
+        }
+    }
+
+    /// MEASUREMENT: which Pyidaungsu on this machine actually reads the page.
+    ///
+    /// ⚠️ THERE ARE THREE OF THEM AND THEY ARE DIFFERENT FILES. `installed`
+    /// hardcodes `C:\Windows\Fonts\Pyidaungsu.ttf`, which is an older build
+    /// than the 2.5.3 the user installed PER-USER, and a third is registered by
+    /// an unrelated application. Proving a line means shaping candidate text
+    /// and demanding the page's own glyph ids back, so the build matters: a
+    /// font that renames or renumbers a glyph proves nothing.
+    ///
+    /// The question this answers is whether resolving fonts through the
+    /// registry is worth building, or whether the file already on the system
+    /// path reads the page just as well.
+    #[test]
+    #[ignore = "diagnostic, and needs fonts and a PDF that are not in this repository"]
+    fn which_pyidaungsu_reads_the_users_page() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text test pdf.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("no Pyidaungsu file here");
+            return;
+        }
+        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let candidates: Vec<(&str, String)> = vec![
+            ("system Pyidaungsu.ttf", r"C:\Windows\Fonts\Pyidaungsu.ttf".to_string()),
+            ("per-user 2.5.3 Regular",
+             format!(r"{local}\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf")),
+            ("per-user 2.5.3 Bold",
+             format!(r"{local}\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Bold.ttf")),
+            ("BMSTU pyidaungsu-1.2",
+             r"C:\Program Files (x86)\BMSTU\MMUDictionary\pyidaungsu-1.2.ttf".to_string()),
+        ];
+
+        let doc = Document::load(FILE).unwrap();
+        let pages = doc.get_pages();
+        let (_, &page) = pages.iter().next().unwrap();
+        let lines = lines_of(&doc, page);
+
+        // Every font the page names, and the glyphs each draws.
+        let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+        for line in &lines {
+            wanted.entry(line.base_font.clone()).or_default().extend(line.glyphs.iter().copied());
+        }
+        for (font, glyphs) in &wanted {
+            println!("{font}: {} lines, {} distinct glyphs",
+                lines.iter().filter(|l| &l.base_font == font).count(), glyphs.len());
+        }
+
+        for (label, path) in &candidates {
+            if !std::path::Path::new(path).exists() {
+                println!("\n{label}: not on this machine");
+                continue;
+            }
+            let bytes = std::fs::read(path).unwrap();
+            println!("\n{label} ({} bytes)", bytes.len());
+
+            for (font, glyphs) in &wanted {
+                let started = std::time::Instant::now();
+                let Some(index) = crate::reshape::Index::build(&bytes, None, Some(glyphs)) else {
+                    println!("   {font}: no index (the font draws none of these glyphs)");
+                    continue;
+                };
+                let mut indexes = Indexes { by_font: BTreeMap::new() };
+                indexes.by_font.insert(font.clone(), (bytes.clone(), index));
+
+                let read = read_page_with(&doc, page, &indexes);
+                let mine: Vec<&Reading> = read.iter().filter(|r| &r.font == font).collect();
+                let proven = mine.iter().filter(|r| r.text.is_some()).count();
+                println!("   {font}: read {proven} of {} in {:.1?}",
+                    mine.len(), started.elapsed());
             }
         }
     }
