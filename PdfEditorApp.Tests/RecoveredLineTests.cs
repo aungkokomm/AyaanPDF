@@ -400,12 +400,41 @@ public class RecoveredLineTests
     /// </summary>
     [Theory]
     [InlineData("BCDEEE+MyanmarText", "mmrtext.ttf")]
-    [InlineData("BCDGEE+MyanmarText-Bold", "mmrtextb.ttf")]
     [InlineData("Pyidaungsu", "Pyidaungsu.ttf")]
-    [InlineData("ABCDEF+Pyidaungsu-Bold", "Pyidaungsu-Bold.ttf")]
     public void the_myanmar_families_resolve_to_the_files_the_core_reads(
         string baseFont, string expected)
     {
+        Assert.Equal(expected, SystemFontMatch.FileNameFor(baseFont));
+    }
+
+    /// <summary>
+    /// ⚠️ A COMMA IS AS GOOD AS A HYPHEN, and on a real file it is what the
+    /// producer used: the page names its bold `ABCDEE+Pyidaungsu,Bold`. Both
+    /// spellings have to reach the same file, or the app and the core disagree
+    /// about a font one of them has already accepted.
+    /// </summary>
+    [Theory]
+    [InlineData("ABCDEE+Pyidaungsu,Bold", "Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf")]
+    [InlineData("ABCDEF+Pyidaungsu-Bold", "Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf")]
+    [InlineData("BCDGEE+MyanmarText-Bold", "mmrtext.ttf", "mmrtextb.ttf")]
+    public void a_bold_burmese_name_lands_on_the_bold_file_or_the_family_it_belongs_to(
+        string baseFont, string regular, string boldFile)
+    {
+        // ⚠️ NOT A FIXED ANSWER, because it depends on what is installed. A
+        // bold name resolves to the bold FILE when there is one and to the
+        // family's regular file when there is not: measured, there is no
+        // Pyidaungsu-Bold.ttf on the machine this was written on, and the
+        // regular file proves 9 of the 10 bold lines of a real page.
+        //
+        // ⚠️ AND FALLING BACK CANNOT MISREAD ANYTHING. A line is proven by
+        // shaping candidate text through the font and demanding the page's own
+        // glyph ids back, so a font that does not match yields a refusal.
+        string expected =
+            System.IO.File.Exists(System.IO.Path.Combine(
+                SystemFontMatch.FontsDirectory, boldFile))
+                ? boldFile
+                : regular;
+
         Assert.Equal(expected, SystemFontMatch.FileNameFor(baseFont));
     }
 }

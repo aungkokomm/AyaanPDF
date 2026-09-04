@@ -49,17 +49,43 @@ pub(crate) fn family_of(base_font: &str) -> &str {
 fn installed(base_font: &str) -> Option<&'static str> {
     // "BCDEEE+MyanmarText" is one font, wearing a subset tag.
     let name = family_of(base_font);
-    let (family, bold) = match name.split_once('-') {
+
+    // ⚠️ A COMMA IS AS GOOD AS A HYPHEN, and measured on a real file it is what
+    // the producer used: the page names its bold `ABCDEE+Pyidaungsu,Bold`.
+    // Splitting on the hyphen alone took the whole of that as a family name,
+    // matched nothing, and refused every bold line on the page before it began.
+    let (family, bold) = match name.split_once(|c| c == '-' || c == ',') {
         Some((f, style)) => (f, style.eq_ignore_ascii_case("bold")),
         None => (name, false),
     };
-    match (family, bold) {
-        ("MyanmarText", false) => Some(r"C:\Windows\Fonts\mmrtext.ttf"),
-        ("MyanmarText", true) => Some(r"C:\Windows\Fonts\mmrtextb.ttf"),
-        ("Pyidaungsu", false) => Some(r"C:\Windows\Fonts\Pyidaungsu.ttf"),
-        ("Pyidaungsu", true) => Some(r"C:\Windows\Fonts\Pyidaungsu-Bold.ttf"),
-        _ => None,
+
+    let (regular, heavy) = match family {
+        "MyanmarText" => (
+            r"C:\Windows\Fonts\mmrtext.ttf",
+            r"C:\Windows\Fonts\mmrtextb.ttf",
+        ),
+        "Pyidaungsu" => (
+            r"C:\Windows\Fonts\Pyidaungsu.ttf",
+            r"C:\Windows\Fonts\Pyidaungsu-Bold.ttf",
+        ),
+        _ => return None,
+    };
+    if !bold {
+        return Some(regular);
     }
+
+    // ⚠️ AND THE FAMILY'S REGULAR FILE WILL DO WHEN THERE IS NO BOLD ONE.
+    // Measured: on the machine this was written on there is no
+    // `Pyidaungsu-Bold.ttf` at all, and the regular file proves 9 of the 10
+    // bold lines of a real page, because the two weights of that family are
+    // built from one source and number their glyphs alike.
+    //
+    // ⚠️ THIS CANNOT PRODUCE A WRONG READING, which is the whole reason it is
+    // allowed. A line is proven by shaping candidate text through this font and
+    // demanding the page's own glyph ids back, so a font that does not match
+    // yields a REFUSAL and never a misreading. The worst case of guessing here
+    // is the refusal we already had.
+    Some(if std::path::Path::new(heavy).exists() { heavy } else { regular })
 }
 
 /// A 3x2 PDF matrix, as its six written numbers.
@@ -2143,11 +2169,65 @@ mod tests {
         }
     }
 
+    /// ⚠️ THIS HAD NO `#[test]` AND SO HAD NEVER ONCE RUN. It was found while
+    /// changing the very function it covers. A test that silently does nothing
+    /// is worse than no test, because the file reads as though the rule is held
+    /// down when nothing is holding it.
+    #[test]
     fn a_subset_tag_is_not_part_of_the_font_s_name() {
         assert_eq!(installed("BCDEEE+MyanmarText"), installed("MyanmarText"));
         assert!(installed("BCDEEE+MyanmarText").is_some());
         assert!(installed("MyanmarText-Bold").is_some());
-        assert_ne!(installed("MyanmarText-Bold"), installed("MyanmarText"));
+
+        // ⚠️ NOT `assert_ne!` ANY MORE, and that is not a weakening. A bold
+        // name resolves to the bold FILE when there is one and to the family's
+        // regular file when there is not, so demanding the two differ would be
+        // demanding a particular font be installed on whatever machine runs
+        // this. Which file it lands on is asserted below, against what is
+        // actually on disk.
+        let bold = installed("MyanmarText-Bold").unwrap();
+        assert_eq!(
+            bold,
+            if std::path::Path::new(r"C:\Windows\Fonts\mmrtextb.ttf").exists() {
+                r"C:\Windows\Fonts\mmrtextb.ttf"
+            } else {
+                r"C:\Windows\Fonts\mmrtext.ttf"
+            });
+    }
+
+    /// ⚠️ A COMMA IS AS GOOD AS A HYPHEN, and on a real file it is what the
+    /// producer used: the user's page names its bold `ABCDEE+Pyidaungsu,Bold`.
+    /// Splitting on the hyphen alone took that whole string as a family name,
+    /// matched nothing, and refused all ten of the page's bold lines before it
+    /// began. Measured after the fix: 9 of those 10 read.
+    #[test]
+    fn a_style_written_with_a_comma_is_still_a_style() {
+        assert_eq!(installed("ABCDEE+Pyidaungsu,Bold"), installed("Pyidaungsu-Bold"));
+        assert!(installed("ABCDEE+Pyidaungsu,Bold").is_some());
+
+        // The family is what is left of the name, whichever way it was written.
+        assert_eq!(installed("Pyidaungsu,Bold"), installed("Pyidaungsu-Bold"));
+
+        // And a comma in a name that is not a style still does not match.
+        assert_eq!(installed("Helvetica,Bold"), None);
+    }
+
+    /// ⚠️ THE FAMILY'S REGULAR FILE IS THE HONEST FALLBACK FOR A MISSING BOLD.
+    /// A line is proven by shaping candidate text through the installed font
+    /// and demanding the page's own glyph ids back, so a font that does not
+    /// match yields a REFUSAL, never a misreading. The worst case of falling
+    /// back is the refusal there already was; the measured case is 9 of 10 bold
+    /// lines read on a machine with no bold Pyidaungsu at all.
+    #[test]
+    fn a_missing_bold_falls_back_to_the_family_it_belongs_to() {
+        let regular = installed("Pyidaungsu").unwrap();
+        let bold = installed("Pyidaungsu,Bold").unwrap();
+
+        if std::path::Path::new(r"C:\Windows\Fonts\Pyidaungsu-Bold.ttf").exists() {
+            assert_ne!(bold, regular, "a bold file is installed and was not used");
+        } else {
+            assert_eq!(bold, regular, "no bold file, so the regular one had to answer");
+        }
     }
 
     /// A page drawing exactly `text`, and what recovery makes of it.

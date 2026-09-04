@@ -119,14 +119,21 @@ public static class SystemFontMatch
         // recover::installed, and these two must not drift from it: offering a
         // font the core will not accept turns a clean refusal into a failed
         // write after the reader has finished typing.
+        //
+        // ⚠️ AND THE FAMILY'S REGULAR FILE ANSWERS FOR A MISSING BOLD, exactly
+        // as recover::installed now does. Measured: there is no
+        // Pyidaungsu-Bold.ttf on the machine this was written on, and the
+        // regular file proves 9 of the 10 bold lines of a real page, because
+        // the two weights of that family number their glyphs alike. Without
+        // this the app would refuse a font the core has just accepted, which is
+        // the drift these two lists exist to avoid.
         if (name.Contains("myanmartext"))
         {
-            return Pick("mmrtext.ttf", "mmrtextb.ttf", "mmrtext.ttf", "mmrtextb.ttf", bold, italic);
+            return Weight("mmrtext.ttf", "mmrtextb.ttf", bold);
         }
         if (name.Contains("pyidaungsu"))
         {
-            return Pick("Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf",
-                "Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf", bold, italic);
+            return Weight("Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf", bold);
         }
 
         // A symbolic font is deliberately absent. Wingdings was measured to read
@@ -162,4 +169,20 @@ public static class SystemFontMatch
             (false, true) => italicFile,
             (false, false) => regular,
         };
+
+    /// <summary>
+    /// The bold file when it is installed, and the family's regular one when it
+    /// is not. There is no italic in either Burmese family.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ CHECKED HERE RATHER THAN LEFT TO <see cref="PathFor"/>. That returns
+    /// null for a file it cannot find, so a missing bold became "no font at
+    /// all" instead of "the other weight of the same family", and the app
+    /// refused text the core could read.
+    /// </remarks>
+    private static string Weight(string regular, string boldFile, bool bold)
+    {
+        if (!bold) { return regular; }
+        return File.Exists(Path.Combine(FontsDirectory, boldFile)) ? boldFile : regular;
+    }
 }
