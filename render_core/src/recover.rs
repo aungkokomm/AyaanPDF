@@ -1704,6 +1704,107 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT: can one index serve a whole document, or must every page
+    /// pay for its own?
+    ///
+    /// ⚠️ THE NUMBER PHASE 5 TURNS ON. An index is built per page today, keyed
+    /// by (document, page) and scoped to the glyph ids THAT page draws, and it
+    /// costs about 17 seconds. A document of N Burmese pages therefore costs
+    /// N x 17s, and every index is thrown away when an edit rewrites the
+    /// document behind a new handle, so the wait comes back after each edit.
+    ///
+    /// Two ways out, both measured here against the per-page baseline:
+    ///
+    ///   UNION      one index scoped to every glyph every page draws. Needs all
+    ///              the pages parsed first, which is cheap, but enumerates a
+    ///              larger set.
+    ///   DECLARED   one index scoped to the CIDs the embedded SUBSET declares a
+    ///              width for, which is the whole document's glyph set and is
+    ///              available from the font dictionary WITHOUT parsing a single
+    ///              page.
+    ///
+    /// ⚠️ AND COVERAGE IS MEASURED WITH THE COST, because an index that is
+    /// faster and reads fewer lines is not a saving. Spellings grow
+    /// COMBINATORIALLY with the character mix, so a wider scope can cost more
+    /// than the pages it replaces; that is exactly what this is for.
+    #[test]
+    #[ignore = "diagnostic, and needs a multi-page Burmese PDF that is not in this repository"]
+    fn whether_one_index_can_serve_a_whole_document() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("no multi-page Burmese file here");
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        println!("{} pages", pages.len());
+
+        // ---- the baseline: one index per page, as it works today ----
+        let started = std::time::Instant::now();
+        let mut per_page_read = 0usize;
+        let mut per_page_lines = 0usize;
+        for (n, &page) in pages.iter().enumerate() {
+            let at = std::time::Instant::now();
+            let indexes = indexes_for(&doc, page);
+            let read = read_page_with(&doc, page, &indexes);
+            let proven = read.iter().filter(|r| r.text.is_some()).count();
+            per_page_read += proven;
+            per_page_lines += read.len();
+            println!("  page {n}: {proven} of {} in {:.1?}", read.len(), at.elapsed());
+        }
+        let per_page = started.elapsed();
+        println!("PER PAGE: {per_page_read} of {per_page_lines} lines, {per_page:.1?}");
+
+        // ---- what each scope would cover ----
+        let mut union: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+        let mut declared: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+        for &page in &pages {
+            for line in lines_of(&doc, page) {
+                union.entry(line.base_font.clone()).or_default().extend(line.glyphs);
+            }
+            for (_, (base_font, widths)) in fonts_of(&doc, page) {
+                if let Some(w) = widths {
+                    declared.entry(base_font).or_default().extend(w.declared());
+                }
+            }
+        }
+        for (font, glyphs) in &union {
+            let d = declared.get(font).map(|s| s.len()).unwrap_or(0);
+            println!("  {font}: pages draw {} glyphs, the subset declares {d}",
+                glyphs.len());
+        }
+
+        // ---- one index for the document, by each scope ----
+        for (label, scope) in [("UNION", &union), ("DECLARED", &declared)] {
+            let started = std::time::Instant::now();
+            let mut by_font = BTreeMap::new();
+            for (base_font, glyphs) in scope {
+                let Some(path) = installed(base_font) else { continue };
+                let Ok(bytes) = std::fs::read(path) else { continue };
+                let Some(index) = crate::reshape::Index::build(&bytes, None, Some(glyphs))
+                else { continue };
+                by_font.insert(base_font.clone(), (bytes, index));
+            }
+            let built = started.elapsed();
+            let shared = Indexes { by_font };
+
+            let mut read_total = 0usize;
+            let mut lines_total = 0usize;
+            let mut each: Vec<String> = Vec::new();
+            for &page in &pages {
+                let read = read_page_with(&doc, page, &shared);
+                let proven = read.iter().filter(|r| r.text.is_some()).count();
+                each.push(format!("{proven}/{}", read.len()));
+                read_total += proven;
+                lines_total += read.len();
+            }
+            println!("  {label} per page: {}", each.join("  "));
+            println!("{label}: {read_total} of {lines_total} lines, \
+                      built in {built:.1?}, all pages in {:.1?}",
+                started.elapsed());
+        }
+    }
+
     /// MEASUREMENT: which Pyidaungsu on this machine actually reads the page.
     ///
     /// ⚠️ THERE ARE THREE OF THEM AND THEY ARE DIFFERENT FILES. `installed`
