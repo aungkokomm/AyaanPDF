@@ -4566,6 +4566,16 @@ public sealed partial class MainPage : Page
             _textBoxPreview = null;
         }
 
+        // Text being carried is put back where the file still draws it. A move
+        // is only real once the button comes up, so a capture lost on the way
+        // there has to abandon it, or the frame is left floating at an offset
+        // over text that never went anywhere.
+        if (_textMoveArmed)
+        {
+            _textMoveArmed = false;
+            ViewModel.CancelTextUnitMove();
+        }
+
         _isPanning = false;
         _isDrawingShape = false;
         _isSizingText = false;
@@ -7646,6 +7656,15 @@ public sealed partial class MainPage : Page
         // guide-move cursor would advertise a gesture that cannot happen.
         if (!ToolWantsPointer) { return null; }
 
+        // ⚠️ A GESTURE IN PROGRESS KEEPS ITS CURSOR. Carrying text takes the
+        // pointer out of the box it was picked up in almost immediately, and
+        // asking where the pointer is NOW would put the I-beam back in the
+        // reader's hand halfway through a move they are still making.
+        if (ViewModel.IsMovingTextUnit)
+        {
+            return InputSystemCursorShape.SizeAll;
+        }
+
         var content = ContentPoint(e);
         double nx = content.X / ViewModel.OverlayScale;
         double ny = content.Y / ViewModel.OverlayScale;
@@ -7662,6 +7681,22 @@ public sealed partial class MainPage : Page
         if (ViewModel.ActiveTool != ToolMode.Select)
         {
             return null;
+        }
+
+        // ⚠️ THE DOCUMENT'S OWN TEXT, BEFORE THE ANNOTATIONS, because that is
+        // the order the press is routed in: a press inside the framed text box
+        // is taken before any annotation under it gets a look. A cursor in the
+        // other order would offer a resize the press would never perform.
+        //
+        // SizeAll is the whole affordance. The frame says WHICH text; only the
+        // pointer changing as it crosses the rule says the text can be picked
+        // up at all, and it says it before the reader has committed to
+        // anything. It is deliberately not offered once there is a caret in
+        // the line: there a drag selects through the text, and the Select
+        // tool's own I-beam is the truth.
+        if (ViewModel.CanMoveTextUnitAt(content.Page, nx, ny))
+        {
+            return InputSystemCursorShape.SizeAll;
         }
 
         var grip = ViewModel.GripUnder(content.Page, nx, ny);
@@ -8211,14 +8246,20 @@ public sealed partial class MainPage : Page
                         }
                         else
                         {
-                            // ⚠️ ARMED BEFORE THE EDIT IS BEGUN, AND THE EDIT
-                            // STILL BEGINS. A press inside the box means "type
-                            // here" and it still does; this only remembers
-                            // where the press landed, so that if the pointer
-                            // travels instead of lifting, the reader turns out
-                            // to have been picking the text up rather than
-                            // aiming a caret at it. A press that never travels
-                            // does exactly what it did before.
+                            // ⚠️ THE PRESS ONLY ARMS, AND DECIDES NOTHING. Both
+                            // gestures the frame offers start with a press
+                            // inside it: travel and the text is picked up, lift
+                            // and a caret goes in. Which one it was is not
+                            // known until the button comes up, so it is
+                            // ViewportHost_PointerReleased that acts, on the
+                            // point the press LANDED on.
+                            //
+                            // ⚠️ AND BEGINNING THE EDIT HERE IS WHAT BROKE THE
+                            // MOVE. Taking the caret back once a drag started
+                            // meant CancelInPlaceEdit, which clears the text
+                            // selection, and the selection is the very thing
+                            // the move is committed against. It moved nothing,
+                            // silently, every time.
                             _textMoveArmed =
                                 ViewModel.BeginTextUnitMove(content.Page, nx, ny);
                             if (_textMoveArmed)
@@ -8226,8 +8267,7 @@ public sealed partial class MainPage : Page
                                 _dragPointerId = e.Pointer.PointerId;
                                 ViewportHost.CapturePointer(e.Pointer);
                             }
-
-                            if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny))
+                            else if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny))
                             {
                                 // Nothing else holds focus now that there is no
                                 // TextBox, so the keys have to be sent somewhere
@@ -8466,20 +8506,15 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
-        // ⚠️ CARRYING THE TEXT COMES FIRST, because the press that armed it
-        // also put a caret in the line, and without this the very same pointer
-        // movement would be read as selecting through the text it is moving.
+        // ⚠️ CARRYING THE TEXT COMES FIRST, ahead of every other drag below.
+        // The press only armed the gesture; this is where it turns into a move,
+        // and once it has, the pointer belongs to the text being carried.
         if (_textMoveArmed)
         {
             double mx = content.X / ViewModel.OverlayScale;
             double my = content.Y / ViewModel.OverlayScale;
 
-            if (ViewModel.UpdateTextUnitMove(mx, my))
-            {
-                // It is a move after all, so the caret the press put in the
-                // line has no business being there.
-                ViewModel.CancelInPlaceEdit();
-            }
+            ViewModel.UpdateTextUnitMove(mx, my);
             if (ViewModel.IsMovingTextUnit)
             {
                 e.Handled = true;
@@ -8613,14 +8648,19 @@ public sealed partial class MainPage : Page
             // goes, which is what a reader dragging a block of text means; Alt
             // is the one modifier not already spoken for here, since Shift
             // extends a selection and Ctrl is the zoom.
-            bool moved = ViewModel.CommitTextUnitMove(IsAltDown());
-            ViewportHost.ReleasePointerCapture(e.Pointer);
-            if (moved)
+            //
+            // A press that never travelled is still the click it was, and the
+            // caret goes in here rather than on the way down. See
+            // ViewportViewModel.ReleaseTextUnitPress for why it has to.
+            if (ViewModel.ReleaseTextUnitPress(IsAltDown()))
             {
-                _inPlaceDragging = false;
-                e.Handled = true;
-                return;
+                RootGrid.Focus(FocusState.Programmatic);
             }
+
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            _inPlaceDragging = false;
+            e.Handled = true;
+            return;
         }
 
         if (_inPlaceDragging)

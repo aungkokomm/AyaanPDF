@@ -4487,6 +4487,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.SelectionGrips.Clear();
             slot.ExtraSelectionOutlines.Clear();
             slot.PageTextOutline.Clear();
+            slot.PageTextHandles.Clear();
             slot.PageTextNotice.Clear();
             slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
         }
@@ -4538,14 +4539,54 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 ? (_textMove.Dx, _textMove.Dy)
                 : (0.0, 0.0);
 
+            // ⚠️ AND WHERE IT CAME FROM, FAINTLY, WHILE IT IS BEING CARRIED.
+            // A frame under the pointer says where the text is going; on its
+            // own it says nothing about how far that is from where the text
+            // still IS. Leaving a ghost behind is what turns a floating outline
+            // into a visible displacement, and it disappears the moment the
+            // reader lets go, because by then the two are the same place.
+            if (_textMove.IsDragging)
+            {
+                double gl = (word.Left * SlotLayoutWidth) - padX;
+                double gt = (word.Top * SlotLayoutWidth) - padY;
+                textSlot?.PageTextOutline.Add(new ScaledRect(
+                    gl, gt,
+                    (word.Right * SlotLayoutWidth) - gl + padX,
+                    (word.Bottom * SlotLayoutWidth) + padY - gt,
+                    GhostUnitColor));
+            }
+
             double tl = ((word.Left + mx) * SlotLayoutWidth) - padX;
             double tt = ((word.Top + my) * SlotLayoutWidth) - padY;
             double frameBottom = ((word.Bottom + my) * SlotLayoutWidth) + padY;
+            double frameRight = ((word.Right + mx) * SlotLayoutWidth) + padX;
+            string frameColor = word.CanEdit ? EditableUnitColor : RefusedUnitColor;
             textSlot?.PageTextOutline.Add(new ScaledRect(
-                tl, tt,
-                ((word.Right + mx) * SlotLayoutWidth) - tl + padX,
-                frameBottom - tt,
-                word.CanEdit ? EditableUnitColor : RefusedUnitColor));
+                tl, tt, frameRight - tl, frameBottom - tt, frameColor));
+
+            // ⚠️ CORNER MARKS ONLY WHILE THE BOX IS AN OBJECT, which is exactly
+            // while a drag would move it: not once there is a caret in the
+            // line, because then a drag selects through the text and a mark
+            // saying "pick me up" would be advertising the wrong gesture.
+            //
+            // Small filled squares, deliberately NOT the white circles the
+            // annotation grips use. Those mean "drag me to resize", and this
+            // text cannot be resized: there is no reflow to give it a new
+            // width with. These say only "this is one object, with edges", the
+            // way a bounding box does in a drawing program, and dragging one
+            // does what dragging anywhere else in the frame does.
+            if (textSlot is not null && (IsEditMode && !IsEditingInPlace))
+            {
+                foreach ((double hx, double hy) in new[]
+                {
+                    (tl, tt), (frameRight, tt), (tl, frameBottom), (frameRight, frameBottom),
+                })
+                {
+                    textSlot.PageTextHandles.Add(new ScaledRect(
+                        hx - TextHandleHalf, hy - TextHandleHalf,
+                        TextHandleHalf * 2, TextHandleHalf * 2, frameColor));
+                }
+            }
 
             // ⚠️ AND EVERY OTHER LINE THAT IS COMING WITH IT. The default is to
             // move the whole paragraph, so a reader shown only the line they
@@ -5792,12 +5833,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </remarks>
     public bool BeginTextUnitMove(int pageIndex, double normX, double normY)
     {
-        if (!IsEditMode || IsEditingInPlace) { return false; }
-        if (!TextUnitBoxContains(pageIndex, normX, normY)) { return false; }
+        if (!CanMoveTextUnitAt(pageIndex, normX, normY)) { return false; }
 
         _textMove.Press(pageIndex, normX, normY);
         return true;
     }
+
+    /// <summary>
+    /// Whether a press at this point would pick the framed text up.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CURSOR ASKS THE SAME QUESTION THE PRESS DOES, and that is why
+    /// this exists as one method rather than two agreeing conditions. A pointer
+    /// that shows the move cursor where a press would not move anything is a
+    /// promise the app then breaks, and the reader has no way to tell which of
+    /// the two was lying.
+    /// </remarks>
+    public bool CanMoveTextUnitAt(int pageIndex, double normX, double normY) =>
+        IsEditMode
+        && !IsEditingInPlace
+        && TextUnitBoxContains(pageIndex, normX, normY);
 
     /// <summary>
     /// Takes the pointer's new position. True on the move that turns the press
@@ -5899,6 +5954,42 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Lets an armed press go, and does whichever of the two things it turned
+    /// out to be.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CLICK HAPPENS HERE, ON THE WAY UP, AND IT HAS TO. The press could
+    /// not begin an edit on the way down, because putting a caret in the line
+    /// is <see cref="CancelInPlaceEdit"/>'s business to take back and taking it
+    /// back CLEARS THE SELECTION the move is about to be committed against. The
+    /// move then had nothing to move, which is exactly what it did: nothing.
+    ///
+    /// So the press only arms, and one of two things happens when the button
+    /// comes up: the pointer travelled and the text is put down where it was
+    /// carried to, or it did not and a caret goes in at the point the button
+    /// went DOWN, which is where the reader was aiming.
+    /// </remarks>
+    /// <returns>
+    /// True when a caret went into the line, so the caller can hand it the
+    /// keyboard. False for a move, a refusal, and for nothing armed.
+    /// </returns>
+    public bool ReleaseTextUnitPress(bool oneLineOnly)
+    {
+        if (_textMove.Page < 0) { return false; }
+
+        if (_textMove.IsDragging)
+        {
+            CommitTextUnitMove(oneLineOnly);
+            return false;
+        }
+
+        int page = _textMove.Page;
+        (double x, double y) = (_textMove.FromX, _textMove.FromY);
+        _textMove.Clear();
+        return BeginInPlaceEdit(page, x, y);
+    }
+
     /// <summary>Abandons a move in progress and puts the frame back.</summary>
     public void CancelTextUnitMove()
     {
@@ -5972,6 +6063,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private const string EditableUnitColor = "#FF2D6FC4";
     private const string RefusedUnitColor = "#FFB0700F";
+
+    /// <summary>
+    /// The same blue at a third of its opacity, for the outline left behind at
+    /// the place text is being carried away from.
+    /// </summary>
+    /// <remarks>
+    /// It has to be the SAME hue: a different colour would read as a second
+    /// thing on the page rather than as the same thing, somewhere else.
+    /// </remarks>
+    private const string GhostUnitColor = "#552D6FC4";
+
+    /// <summary>
+    /// Half the side of a corner mark on the text frame, in DIPs. Smaller than
+    /// <see cref="GripHalf"/> on purpose: these are edges of a bounding box,
+    /// not handles that resize anything.
+    /// </summary>
+    private const double TextHandleHalf = 3.0;
 
     /// <summary>How wide the refusal label may run before it wraps.</summary>
     private const double UnitNoticeMaxWidth = 360.0;

@@ -193,8 +193,10 @@ public class WordEditWiringTests
         int outline = code.IndexOf("PageTextOutline.Add(", StringComparison.Ordinal);
         Assert.True(outline > 0, "the word frame is no longer drawn");
 
-        // Look back over the block that builds the rect.
-        string block = code[Math.Max(0, outline - 1200)..outline];
+        // Look back over the block that builds the rect. Generous, because the
+        // first Add is now the ghost left behind by a move and the padding is
+        // worked out once, above both of them.
+        string block = code[Math.Max(0, outline - 2400)..outline];
         Assert.Contains("padX", block, StringComparison.Ordinal);
         Assert.Contains("padY", block, StringComparison.Ordinal);
 

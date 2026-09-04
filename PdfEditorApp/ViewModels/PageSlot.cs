@@ -118,6 +118,20 @@ public partial class PageSlot : ObservableObject
     public ObservableCollection<ScaledRect> PageTextOutline { get; } = new();
 
     /// <summary>
+    /// The four corner marks of that frame, and empty whenever the frame is
+    /// not an object the reader can pick up.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ SEPARATE FROM <see cref="SelectionGrips"/> BECAUSE THEY MEAN
+    /// DIFFERENT THINGS. Those are white circles and they resize an annotation.
+    /// These are small filled squares and they resize nothing: the document's
+    /// own text has no reflow to give it a new width with, so the frame moves
+    /// as a whole, from anywhere inside it. Drawing them alike would offer a
+    /// gesture that does not exist.
+    /// </remarks>
+    public ObservableCollection<ScaledRect> PageTextHandles { get; } = new();
+
+    /// <summary>
     /// The document's own text that Edit mode can offer, one box per region.
     ///
     /// ⚠️ SUBTLE ON PURPOSE, AND NOT A SELECTION. This says "there is

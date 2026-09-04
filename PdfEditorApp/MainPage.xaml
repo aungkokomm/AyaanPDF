@@ -742,6 +742,36 @@
                                         </ItemsControl>
 
                                         <!--
+                                            The corner marks of that frame, which
+                                            say it is one OBJECT and can be picked
+                                            up. FILLED squares, not the white
+                                            circles of SelectionGrips: those
+                                            resize an annotation and these resize
+                                            nothing, because the document's own
+                                            text has no reflow to give it a new
+                                            width with. Dragging one moves the
+                                            text, exactly as dragging anywhere
+                                            else inside the frame does.
+
+                                            Not hit-testable, like the frame: the
+                                            press that matters is the one that
+                                            reaches the page underneath.
+                                        -->
+                                        <ItemsControl ItemsSource="{x:Bind PageTextHandles}" IsHitTestVisible="False">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><Grid /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="viewport:ScaledRect">
+                                                    <Rectangle Fill="{x:Bind local:MainPage.HexBrush(ColorHex)}"
+                                                               Width="{x:Bind Width}" Height="{x:Bind Height}"
+                                                               Margin="{x:Bind local:MainPage.Offset(Left, Top)}"
+                                                               HorizontalAlignment="Left" VerticalAlignment="Top" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <!--
                                             WHY that text cannot be edited, said
                                             beside the frame that says which text.
 

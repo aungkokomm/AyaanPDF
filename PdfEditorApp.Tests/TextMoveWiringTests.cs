@@ -21,28 +21,39 @@ public class TextMoveWiringTests
     // ---------------- the gesture ----------------
 
     /// <summary>
-    /// ⚠️ THE CLICK IS THE ONE THAT MUST NOT BREAK. A press inside the box is
-    /// how a caret gets into a line, and that is how the reader edits anything
-    /// at all. Arming a move must not take it away, so the edit still begins on
-    /// the very same press and only a pointer that travels changes its mind.
+    /// ⚠️ THE PRESS DECIDES NOTHING, AND THAT IS THE WHOLE FIX. It used to arm
+    /// the move AND begin the edit, so a drag had to take the caret back with
+    /// CancelInPlaceEdit, which CLEARS THE TEXT SELECTION. The selection is
+    /// what the move is committed against, so the commit found nothing to move
+    /// and moved nothing, every single time, without a word.
     /// </summary>
     [Fact]
-    public void the_press_arms_a_move_and_still_begins_the_edit()
+    public void the_press_only_arms_and_does_not_begin_an_edit_of_its_own()
     {
         string page = Page();
 
         int armed = page.IndexOf("ViewModel.BeginTextUnitMove(content.Page, nx, ny)", StringComparison.Ordinal);
-        int edited = page.IndexOf("ViewModel.BeginInPlaceEdit(content.Page, nx, ny)", StringComparison.Ordinal);
-
         Assert.True(armed > 0, "nothing arms a move");
-        Assert.True(edited > 0, "the press no longer begins an edit");
-        Assert.True(armed < edited, "the move is armed after the edit has already begun");
+
+        // ⚠️ ELSE. A press that armed a move must NOT also begin an edit; the
+        // bare `if` here is the whole defect, because the caret it puts in has
+        // to be taken back the moment the pointer travels.
+        Assert.Contains("else if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny))",
+            page, StringComparison.Ordinal);
+
+        // And so nothing needs taking back: the pointer movement that carries
+        // the text must not cancel an edit, because that call clears the text
+        // selection the move is committed against.
+        int carrying = page.IndexOf("ViewModel.UpdateTextUnitMove(mx, my)", StringComparison.Ordinal);
+        Assert.True(carrying > 0);
+        string moving = page[carrying..Math.Min(page.Length, carrying + 400)];
+        Assert.DoesNotContain("CancelInPlaceEdit", moving, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// ⚠️ AND CARRYING COMES BEFORE SELECTING. The same press put a caret in
-    /// the line, so without this the pointer movement that carries the text
-    /// would be read as selecting through it.
+    /// ⚠️ AND CARRYING COMES BEFORE SELECTING. A second press, once there is a
+    /// caret in the line, drags to select; without this ordering the pointer
+    /// movement that carries the text would be read the same way.
     /// </summary>
     [Fact]
     public void moving_the_text_is_tested_before_selecting_through_it()
@@ -59,18 +70,27 @@ public class TextMoveWiringTests
     }
 
     /// <summary>
-    /// Once it turns out to be a move, the caret the press put in the line has
-    /// no business being there.
+    /// ⚠️ THE CLICK STILL HAS TO HAPPEN, on the way up, at the point the button
+    /// went DOWN. It is how a caret gets into a line and therefore how the
+    /// reader edits anything at all, and the keyboard has to follow it.
     /// </summary>
     [Fact]
-    public void a_press_that_becomes_a_move_takes_its_caret_back()
+    public void a_press_that_never_travelled_still_puts_a_caret_in_the_line()
     {
-        string page = Page();
-        int at = page.IndexOf("ViewModel.UpdateTextUnitMove(mx, my)", StringComparison.Ordinal);
-        Assert.True(at > 0);
+        string body = Method(Vm(), "public bool ReleaseTextUnitPress(", 900);
 
-        string body = page[at..Math.Min(page.Length, at + 400)];
-        Assert.Contains("ViewModel.CancelInPlaceEdit();", body, StringComparison.Ordinal);
+        Assert.Contains("_textMove.IsDragging", body, StringComparison.Ordinal);
+        Assert.Contains("CommitTextUnitMove(oneLineOnly)", body, StringComparison.Ordinal);
+
+        // ⚠️ FROM THE PRESS, NOT FROM THE RELEASE. A pointer that has drifted
+        // a couple of points would otherwise put the caret at a different
+        // character than the one the reader aimed at.
+        Assert.Contains("_textMove.FromX, _textMove.FromY", body, StringComparison.Ordinal);
+        Assert.Contains("BeginInPlaceEdit(page, x, y)", body, StringComparison.Ordinal);
+
+        Assert.Contains("RootGrid.Focus(FocusState.Programmatic)",
+            Method(Page(), "ViewModel.ReleaseTextUnitPress(IsAltDown())", 200),
+            StringComparison.Ordinal);
     }
 
     /// <summary>The held modifier is what asks for one line instead of the block.</summary>
@@ -78,7 +98,83 @@ public class TextMoveWiringTests
     public void releasing_commits_the_move_and_alt_asks_for_one_line()
     {
         string page = Page();
-        Assert.Contains("ViewModel.CommitTextUnitMove(IsAltDown())", page, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.ReleaseTextUnitPress(IsAltDown())", page, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ CAPTURE CAN BE LOST WITHOUT A RELEASE, and a move is only real once
+    /// the button comes up. Without this the frame is left floating at an
+    /// offset over text that never went anywhere.
+    /// </summary>
+    [Fact]
+    public void losing_the_pointer_puts_the_text_back()
+    {
+        string body = Method(Page(), "private void ResetPointerInteraction()", 3200);
+        Assert.Contains("ViewModel.CancelTextUnitMove();", body, StringComparison.Ordinal);
+    }
+
+    // ---------------- what the reader can see ----------------
+
+    /// <summary>
+    /// ⚠️ THE POINTER IS THE AFFORDANCE. The frame says WHICH text; only the
+    /// cursor changing as it crosses the rule says the text can be picked up at
+    /// all, and it says so before the reader has committed to anything.
+    ///
+    /// Asked of the same predicate the press uses, so a pointer promising a
+    /// move where a press would not make one is impossible by construction.
+    /// </summary>
+    [Fact]
+    public void the_pointer_offers_the_move_before_the_reader_tries_it()
+    {
+        string body = Method(Page(), "InputSystemCursorShape? HoverCursor(", 3000);
+
+        int text = body.IndexOf("ViewModel.CanMoveTextUnitAt(content.Page, nx, ny)", StringComparison.Ordinal);
+        int grips = body.IndexOf("ViewModel.GripUnder(content.Page, nx, ny)", StringComparison.Ordinal);
+
+        Assert.True(text > 0, "the framed text offers no cursor of its own");
+        Assert.True(grips > 0);
+        Assert.True(text < grips,
+            "an annotation grip would answer for text the press takes first");
+
+        // ⚠️ AND IT KEEPS IT. Carrying text takes the pointer out of the box it
+        // was picked up in almost at once, and asking where the pointer is NOW
+        // would put the I-beam back halfway through the move.
+        Assert.Contains("ViewModel.IsMovingTextUnit", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ AND WHERE IT CAME FROM, while it is being carried. A frame under the
+    /// pointer says where the text is going and nothing about how far that is
+    /// from where the text still is.
+    /// </summary>
+    [Fact]
+    public void a_ghost_stays_behind_at_the_place_the_text_is_leaving()
+    {
+        string vm = Vm();
+        Assert.Contains("GhostUnitColor", vm, StringComparison.Ordinal);
+
+        // Added BEFORE the frame that is being carried, because the overlay is
+        // a Grid and what goes in first goes underneath.
+        int ghost = vm.IndexOf("GhostUnitColor));", StringComparison.Ordinal);
+        int carried = vm.IndexOf("tl, tt, frameRight - tl, frameBottom - tt, frameColor));", StringComparison.Ordinal);
+        Assert.True(ghost > 0 && carried > ghost, "the ghost is drawn over the frame it belongs behind");
+    }
+
+    /// <summary>
+    /// ⚠️ CORNER MARKS ONLY WHILE THE BOX IS AN OBJECT, which is exactly while
+    /// a drag would move it. Once there is a caret in the line a drag selects
+    /// through the text, and a mark saying "pick me up" would be advertising a
+    /// gesture that is no longer on offer.
+    /// </summary>
+    [Fact]
+    public void the_frame_wears_corner_marks_only_when_it_can_be_picked_up()
+    {
+        string vm = Vm();
+        int at = vm.IndexOf("textSlot.PageTextHandles.Add(", StringComparison.Ordinal);
+        Assert.True(at > 0, "the frame has no corner marks");
+
+        string guard = vm[Math.Max(0, at - 700)..at];
+        Assert.Contains("IsEditMode && !IsEditingInPlace", guard, StringComparison.Ordinal);
     }
 
     // ---------------- the commit ----------------
@@ -144,10 +240,14 @@ public class TextMoveWiringTests
     [Fact]
     public void a_move_does_not_begin_while_the_reader_is_typing()
     {
-        string body = Method(Vm(), "public bool BeginTextUnitMove(", 700);
+        string body = Method(Vm(), "public bool CanMoveTextUnitAt(", 300);
 
         Assert.Contains("IsEditingInPlace", body, StringComparison.Ordinal);
         Assert.Contains("TextUnitBoxContains(pageIndex, normX, normY)", body, StringComparison.Ordinal);
+
+        // And the press asks that, rather than repeating it.
+        Assert.Contains("if (!CanMoveTextUnitAt(pageIndex, normX, normY)) { return false; }",
+            Method(Vm(), "public bool BeginTextUnitMove(", 300), StringComparison.Ordinal);
     }
 
     /// <summary>

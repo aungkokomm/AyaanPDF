@@ -126,4 +126,27 @@ public class DragGestureTests
         Assert.False(g.IsDragging);
         Assert.False(g.Release());
     }
+
+    /// <summary>
+    /// ⚠️ THE PRESS POSITION OUTLIVES THE PRESS. What this decides is whether a
+    /// click or a drag was meant, and it cannot know until the pointer either
+    /// travels or lifts. By then the click still has to happen somewhere, and
+    /// the only right answer is where the button went down: a pointer that
+    /// drifted a couple of points on the way up would otherwise put the caret
+    /// at a different character than the reader aimed at.
+    /// </summary>
+    [Fact]
+    public void a_press_that_wobbles_is_still_acted_on_where_it_landed()
+    {
+        var g = new DragGesture();
+        g.Press(2, 0.4, 0.6);
+
+        // Under the threshold, so still a click.
+        Assert.False(g.Move(0.4015, 0.6015));
+        Assert.False(g.IsDragging);
+
+        Assert.Equal(0.4, g.FromX, 6);
+        Assert.Equal(0.6, g.FromY, 6);
+        Assert.Equal(2, g.Page);
+    }
 }

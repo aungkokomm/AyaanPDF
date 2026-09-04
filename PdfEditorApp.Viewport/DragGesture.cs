@@ -42,6 +42,21 @@ public sealed class DragGesture
 
     public double Dy { get; private set; }
 
+    /// <summary>
+    /// Where the press landed, which is where a press that never travelled has
+    /// to be acted on.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE PRESS POSITION OUTLIVES THE PRESS, and that is the point. What
+    /// this gesture decides is whether a click or a drag was meant, and it
+    /// cannot know until the pointer either travels or lifts. By then the
+    /// click still has to happen somewhere, and the only right answer is where
+    /// the button went down, not where it came up.
+    /// </remarks>
+    public double FromX => _fromX;
+
+    public double FromY => _fromY;
+
     /// <summary>Arms a press that MIGHT become a drag.</summary>
     public void Press(int page, double x, double y)
     {
