@@ -92,6 +92,22 @@ public class PrepareNoticeWiringTests
         Assert.Contains("ViewModel.PrepareMessage", block, StringComparison.Ordinal);
         Assert.Contains("ViewModel.PreparePercent", block, StringComparison.Ordinal);
 
+        // ⚠️ IN THE CANVAS COLUMN, AND WITHOUT THIS IT IS NOT A FLOATING NOTICE
+        // AT ALL. The chrome here occupies real COLUMNS and the canvas is the
+        // third, so an element that does not say which column it is in lands in
+        // the FIRST: this shipped that way once and appeared squashed into the
+        // bottom of the tool rail, on top of the buttons there, nowhere near
+        // the document it was talking about.
+        //
+        // ⚠️ READ OFF THE TAG, NOT OFF THE TEXT AROUND IT. The comment above
+        // this element explains the rule and so contains the very string being
+        // looked for, and a window wide enough to catch a careless edit is wide
+        // enough to catch that comment and pass on it.
+        int tag = xaml.LastIndexOf("<Border", at, StringComparison.Ordinal);
+        Assert.True(tag > 0, "the notice is not an element");
+        string opening = xaml[tag..xaml.IndexOf('>', tag)];
+        Assert.Contains("Grid.Column=\"2\"", opening, StringComparison.Ordinal);
+
         // ⚠️ LAST IN THE GRID, so it floats over the page rather than moving
         // it. Anywhere earlier and the document would jump the moment a wait
         // began and jump back when it ended.
@@ -100,6 +116,15 @@ public class PrepareNoticeWiringTests
         Assert.True(
             xaml.IndexOf("ViewportHost", StringComparison.Ordinal) < at,
             "the notice is declared before the page it floats over");
+
+        // ⚠️ AND NOT AT THE EDGE THE STATUS PILL ALREADY OWNS. That is centred
+        // at the BOTTOM of the same column, and two centred things at one edge
+        // sit on top of each other.
+        int pill = xaml.IndexOf("x:Name=\"StatusBar\"", StringComparison.Ordinal);
+        Assert.True(pill > 0);
+        string pillBlock = xaml[pill..Math.Min(xaml.Length, pill + 300)];
+        Assert.Contains("VerticalAlignment=\"Bottom\"", pillBlock, StringComparison.Ordinal);
+        Assert.Contains("VerticalAlignment=\"Top\"", block, StringComparison.Ordinal);
     }
 
     /// <summary>
