@@ -1882,6 +1882,82 @@ pub extern "C" fn retype_recovered_line(
     .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
 }
 
+/// Moves a line, or the whole paragraph it belongs to, across the page.
+///
+/// Returns the WHOLE NEW DOCUMENT, like [`retype_recovered_line`] and for the
+/// same reason: this changes the file's own structure rather than a PDFium
+/// page, so every index the caller is holding is stale when it returns.
+///
+/// ⚠️ EVERYTHING HERE IS NORMALIZED THE WAY THE APP DRAWS: top-left origin,
+/// both axes divided by the page WIDTH, and `dy` therefore POSITIVE DOWNWARDS.
+/// The conversion into PDF user space happens on this side, where the page's
+/// crop box is, so the app never has to know about it.
+///
+/// `whole_block` non-zero moves every line of the paragraph the baseline falls
+/// in, decided by the same rule the block model uses; zero moves only that one
+/// line.
+///
+/// ⚠️ AND IT REFUSES RATHER THAN CARRYING A NEIGHBOUR ALONG. One `Tm` can place
+/// several pieces of text, so if the ones being moved also draw something that
+/// was not asked for, nothing is written at all. See [`crate::shift::shift`].
+#[unsafe(no_mangle)]
+pub extern "C" fn shift_page_text(
+    doc_handle: u64,
+    page_index: i32,
+    baseline: f32,
+    whole_block: i32,
+    dx: f32,
+    dy: f32,
+) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    if !baseline.is_finite() || !dx.is_finite() || !dy.is_finite() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+
+    panic::catch_unwind(move || {
+        let Some(bytes) = document_bytes(doc_handle) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        let Ok(doc) = lopdf::Document::load_mem(&bytes) else {
+            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+        };
+        let pages = doc.get_pages();
+        let Some((_, &page)) = pages.iter().nth(page_index as usize) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        let Some((_, page_top, page_w)) = recover::page_box(&doc, page) else {
+            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+        };
+
+        // Out of the app's units and into the page's own.
+        let at = page_top - (baseline as f64 * page_w);
+        let across = dx as f64 * page_w;
+        let down = -(dy as f64) * page_w;
+
+        let lines = recover::lines_of(&doc, page);
+        let Some(ops) = shift::drawn_by(&lines, at, whole_block != 0) else {
+            return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
+        };
+
+        match shift::shift(&doc, page, &ops, across, down) {
+            Ok(out) => {
+                let mut boxed = out.into_boxed_slice();
+                let buffer = ByteBuffer {
+                    data: boxed.as_mut_ptr(),
+                    len: boxed.len(),
+                    status: STATUS_OK_PDFIUM,
+                };
+                std::mem::forget(boxed);
+                buffer
+            }
+            Err(status) => ByteBuffer::err(status),
+        }
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
 /// What a page's Burmese says, recovered by reshaping it.
 ///
 /// ⚠️ THIS IS THE ONLY WAY TO READ A PAGE WHOSE OWN TABLES ARE WRONG, and
@@ -26233,6 +26309,119 @@ p={spread_px:.4},c={rgba:08X})"
 
         close_document(handle);
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// A document opened from bytes, for reading back what a write produced.
+    fn open_fixture_named_from(bytes: &[u8]) -> u64 {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0, "PDFium refused the document");
+        handle
+    }
+
+    /// `shift_page_text`, decoded, or the status it refused with.
+    fn shifted(handle: u64, page: i32, baseline: f32, whole_block: bool, dx: f32, dy: f32)
+        -> Result<Vec<u8>, i32>
+    {
+        let buffer = shift_page_text(
+            handle, page, baseline, i32::from(whole_block), dx, dy);
+        if buffer.status != STATUS_OK_PDFIUM {
+            let status = buffer.status;
+            free_byte_buffer(buffer);
+            return Err(status);
+        }
+        let out = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+        Ok(out)
+    }
+
+    /// Moving a paragraph of a real page, through the FFI the app will call.
+    ///
+    /// ⚠️ THE READINGS ARE THE MEASUREMENT. Where the text is afterwards is
+    /// asked of recovery, which finds the lines again from scratch in the new
+    /// document, so nothing here is checking its own arithmetic against itself.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn a_paragraph_of_a_real_page_moves_together() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let before = recovered_lines(handle, 0);
+        let readable: Vec<_> = before.iter().filter(|l| !l.text.is_empty()).collect();
+        assert!(readable.len() > 4, "not enough read to tell a paragraph from a page");
+
+        // The third paragraph's first line, which the measurement puts at the
+        // indented y=455.0, is far enough down that a whole paragraph moves
+        // without running off the page.
+        let target = readable
+            .iter()
+            .find(|l| (l.pdf_baseline - 455.0).abs() < 1.0)
+            .expect("the page has changed under this test");
+        let at = target.baseline;
+
+        // A twentieth of the page width right, and a fortieth down.
+        let out = shifted(handle, 0, at, true, 0.05, 0.025).expect("refused");
+        close_document(handle);
+
+        let after = recovered_lines(open_fixture_named_from(&out), 0);
+
+        // Every line that moved went the same way, and the ones that did not
+        // move did not move at all.
+        let mut moved = 0usize;
+        let mut still = 0usize;
+        for was in &before {
+            if was.text.is_empty() {
+                continue;
+            }
+            let same = after.iter().find(|n| n.text == was.text);
+            let Some(now) = same else { continue };
+            let d = (now.left - was.left, now.top - was.top);
+            if d.0.abs() < 1e-4 && d.1.abs() < 1e-4 {
+                still += 1;
+            } else {
+                moved += 1;
+                assert!((d.0 - 0.05).abs() < 0.002,
+                    "{:?} moved {} across, not 0.05", was.text, d.0);
+                assert!((d.1 - 0.025).abs() < 0.002,
+                    "{:?} moved {} down, not 0.025", was.text, d.1);
+            }
+        }
+        println!("{moved} lines moved, {still} stayed");
+        assert_eq!(moved, 4, "the third paragraph is four lines");
+        assert!(still > 8, "only {still} lines stayed put");
+    }
+
+    /// One line on its own, which is what a held modifier will ask for.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn one_line_moves_without_its_paragraph() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let before = recovered_lines(handle, 0);
+        let target = before
+            .iter()
+            .find(|l| !l.text.is_empty() && (l.pdf_baseline - 455.0).abs() < 1.0)
+            .expect("the page has changed under this test");
+
+        let out = shifted(handle, 0, target.baseline, false, 0.05, 0.0).expect("refused");
+        close_document(handle);
+
+        let after = recovered_lines(open_fixture_named_from(&out), 0);
+        let moved = before
+            .iter()
+            .filter(|w| !w.text.is_empty())
+            .filter(|w| {
+                after.iter().any(|n| n.text == w.text && (n.left - w.left).abs() > 1e-4)
+            })
+            .count();
+
+        assert_eq!(moved, 1, "moving one line took {moved} with it");
     }
 
     /// The real thing, on a file that is not in this repository: what a reader

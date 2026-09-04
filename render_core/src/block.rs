@@ -111,6 +111,16 @@ impl RawLine {
     fn height(&self) -> f32 {
         (self.bottom - self.top).abs().max(1e-6)
     }
+
+    fn stacked(&self) -> Stacked<'_> {
+        Stacked {
+            font: &self.font,
+            size: self.size,
+            left: self.left,
+            baseline: self.baseline,
+            height: self.height(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,12 +240,46 @@ const INDENT_MAX: f32 = 4.0;
 /// above". Taking the magnitude instead joined 8 blocks the measured corpus
 /// keeps apart, which is how this was caught.
 fn leading_below(a: &RawLine, b: &RawLine) -> f32 {
-    (a.baseline - b.baseline) / a.height()
+    leading(&a.stacked(), &b.stacked())
 }
 
 fn joins(a: &RawLine, b: &RawLine, established: Option<f32>, a_is_block_start: bool) -> bool {
-    let h = a.height();
-    let leading = leading_below(a, b);
+    stacks(&a.stacked(), &b.stacked(), established, a_is_block_start)
+}
+
+/// The only things that decide whether one line stacks under another.
+///
+/// ⚠️ HERE SO THERE IS EXACTLY ONE COPY OF THE RULE. Two readers find lines on
+/// a page: this one, through PDFium's objects, and `recover::lines_of`, through
+/// the content stream. Both need to know where a paragraph ends, and a second
+/// copy of the rule would drift from this one the first time either was tuned.
+pub(crate) struct Stacked<'a> {
+    pub font: &'a str,
+    pub size: f32,
+    pub left: f32,
+    pub baseline: f32,
+    /// How tall the line's ink is. Never zero: it is what everything else is
+    /// measured in.
+    pub height: f32,
+}
+
+/// How far `b`'s baseline sits BELOW `a`'s, in `a`'s line heights.
+///
+/// ⚠️ SIGNED, AND NEVER `abs()`. The sort is by the ink top, which is not the
+/// same order as the baseline for lines of different sizes.
+pub(crate) fn leading(a: &Stacked, b: &Stacked) -> f32 {
+    (a.baseline - b.baseline) / a.height.abs().max(1e-6)
+}
+
+/// Whether `b` is the next line of the same paragraph as `a`.
+pub(crate) fn stacks(
+    a: &Stacked,
+    b: &Stacked,
+    established: Option<f32>,
+    a_is_block_start: bool,
+) -> bool {
+    let h = a.height.abs().max(1e-6);
+    let leading = leading(a, b);
     if b.font != a.font {
         return false;
     }
@@ -258,17 +302,19 @@ fn joins(a: &RawLine, b: &RawLine, established: Option<f32>, a_is_block_start: b
     a_is_block_start && -dl >= INDENT_MIN && -dl <= INDENT_MAX
 }
 
-fn group(lines: &[RawLine]) -> Vec<Vec<usize>> {
+/// Groups lines already sorted into reading order into paragraphs, as indices.
+pub(crate) fn stack_up(lines: &[Stacked]) -> Vec<Vec<usize>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < lines.len() {
         let mut members = vec![i];
         let mut established: Option<f32> = None;
         let mut j = i;
-        while j + 1 < lines.len() && joins(&lines[j], &lines[j + 1], established, members.len() == 1)
+        while j + 1 < lines.len()
+            && stacks(&lines[j], &lines[j + 1], established, members.len() == 1)
         {
             if established.is_none() {
-                established = Some(leading_below(&lines[j], &lines[j + 1]));
+                established = Some(leading(&lines[j], &lines[j + 1]));
             }
             members.push(j + 1);
             j += 1;
@@ -277,6 +323,11 @@ fn group(lines: &[RawLine]) -> Vec<Vec<usize>> {
         i = j + 1;
     }
     out
+}
+
+fn group(lines: &[RawLine]) -> Vec<Vec<usize>> {
+    let stacked: Vec<Stacked> = lines.iter().map(RawLine::stacked).collect();
+    stack_up(&stacked)
 }
 
 // ---------------------------------------------------------------------------

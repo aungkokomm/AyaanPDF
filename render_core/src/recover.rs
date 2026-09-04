@@ -35,9 +35,20 @@ use lopdf::{Document, Object, ObjectId};
 /// the answer is a short list of fonts whose behaviour has been measured rather
 /// than a search of the system. Anything else is refused, which costs a reader
 /// nothing they had before.
+/// A base font's name without the subset tag a producer puts in front of it.
+///
+/// ⚠️ TWO SUBSETS OF ONE FACE ARE ONE FACE. Measured on a real page:
+/// its body text alternates between `BCDEEE+MyanmarText` and
+/// `BCDGEE+MyanmarText` line by line, so anything comparing the names as
+/// written sees a different font every other line. That split one paragraph of
+/// nine lines into six.
+pub(crate) fn family_of(base_font: &str) -> &str {
+    base_font.rsplit('+').next().unwrap_or(base_font)
+}
+
 fn installed(base_font: &str) -> Option<&'static str> {
     // "BCDEEE+MyanmarText" is one font, wearing a subset tag.
-    let name = base_font.rsplit('+').next().unwrap_or(base_font);
+    let name = family_of(base_font);
     let (family, bold) = match name.split_once('-') {
         Some((f, style)) => (f, style.eq_ignore_ascii_case("bold")),
         None => (name, false),

@@ -108,6 +108,85 @@ fn number(o: &Object) -> Option<f64> {
     }
 }
 
+/// The page's lines gathered into paragraphs, as indices into `lines`.
+///
+/// ⚠️ THE BLOCK MODEL'S OWN RULE, NOT A SECOND ONE. `block::stacks` decides
+/// where a paragraph ends, and it was tuned against real pages: same font, same
+/// size, a leading that is neither nothing nor more than two and a half line
+/// heights and that stays consistent down the paragraph, and a left edge that
+/// either matches or is the first line's indent. A second copy of that here
+/// would drift from it the first time either was touched.
+///
+/// ⚠️ MEASURED IN THE TYPE SIZE, WHERE THAT READER USES THE INK HEIGHT. It
+/// knows each line's ink from PDFium; this one walks the content stream and has
+/// only the size the `Tf` names. The two differ by the ratio of ink to em,
+/// which for body text is close enough that the tolerances swallow it, and the
+/// measurement below says whether it did.
+pub(crate) fn blocks_of(lines: &[crate::recover::Line]) -> Vec<Vec<usize>> {
+    // ⚠️ READING ORDER, AND THESE ARE PDF COORDINATES, so down the page is
+    // DECREASING y. The content stream's own order is close to this but is not
+    // promised to be it.
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by(|a, b| {
+        lines[*b]
+            .y
+            .partial_cmp(&lines[*a].y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(lines[*a].x.partial_cmp(&lines[*b].x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let stacked: Vec<crate::block::Stacked> = order
+        .iter()
+        .map(|i| crate::block::Stacked {
+            font: crate::recover::family_of(&lines[*i].base_font),
+            size: lines[*i].size as f32,
+            left: lines[*i].x as f32,
+            baseline: lines[*i].y as f32,
+            height: lines[*i].size as f32,
+        })
+        .collect();
+
+    crate::block::stack_up(&stacked)
+        .into_iter()
+        .map(|group| group.into_iter().map(|i| order[i]).collect())
+        .collect()
+}
+
+/// Every operation that draws the paragraph the line at `baseline` belongs to,
+/// or just that line's own when `whole_block` is false.
+///
+/// ⚠️ THE LINES OF A BLOCK ARE NOT NECESSARILY NEXT TO EACH OTHER IN THE
+/// STREAM, which is why this gathers operations rather than a range. A producer
+/// is free to draw a paragraph's second line before its first, and one on this
+/// page draws a line in sixty-three separate operations.
+pub(crate) fn drawn_by(
+    lines: &[crate::recover::Line],
+    baseline: f64,
+    whole_block: bool,
+) -> Option<Vec<usize>> {
+    let mine = lines
+        .iter()
+        .position(|l| (l.y - baseline).abs() < BASELINE_TOLERANCE)?;
+
+    let members: Vec<usize> = if whole_block {
+        blocks_of(lines).into_iter().find(|g| g.contains(&mine))?
+    } else {
+        vec![mine]
+    };
+
+    let mut out: Vec<usize> = Vec::new();
+    for i in members {
+        out.extend(&lines[i].drawn_by);
+    }
+    out.sort_unstable();
+    out.dedup();
+    (!out.is_empty()).then_some(out)
+}
+
+/// How close a baseline must be to be the same line, in PDF points. A caller
+/// hands back a number it read from a `f32` buffer, so it will not be exact.
+const BASELINE_TOLERANCE: f64 = 0.5;
+
 /// Moves the text drawn by `showing` across the page by `(dx, dy)` in PDF user
 /// space, returning the document's new bytes.
 ///
@@ -450,6 +529,49 @@ mod tests {
             // And the file is still a file.
             let reopened = Document::load_mem(&out).unwrap();
             assert_eq!(reopened.get_pages().len(), pages.len());
+        }
+    }
+
+    /// What the paragraphs of a real page come out as. Diagnostic: the point is
+    /// to see whether measuring in the type SIZE rather than the ink height
+    /// still puts the breaks where a reader would.
+    #[test]
+    #[ignore = "needs PDFs that are not in this repository"]
+    fn what_the_paragraphs_of_a_real_page_are() {
+        const FILES: [(&str, usize); 3] = [
+            (r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf", 0),
+            (r"D:\Ayaan PDF Test file\Pyidaungsu- text test pdf.pdf", 0),
+            (r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf", 2),
+        ];
+
+        for (file, page_index) in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            let name = std::path::Path::new(file).file_name().unwrap().to_owned();
+            let doc = Document::load(file).unwrap();
+            let pages = doc.get_pages();
+            let (_, &page) = pages.iter().nth(page_index).unwrap();
+            let lines = crate::recover::lines_of(&doc, page);
+
+            let blocks = blocks_of(&lines);
+            println!("\n{name:?}: {} lines in {} paragraphs",
+                lines.len(), blocks.len());
+
+            let mut order: Vec<usize> = (0..lines.len()).collect();
+            order.sort_by(|a, b| lines[*b].y.partial_cmp(&lines[*a].y).unwrap());
+            for w in order.windows(2) {
+                let (a, b) = (&lines[w[0]], &lines[w[1]]);
+                println!("  y {:8.1} -> {:8.1}  lead {:5.2}  x {:7.2} -> {:7.2}  {} | {}",
+                    a.y, b.y, (a.y - b.y) / a.size, a.x, b.x, a.base_font, b.base_font);
+            }
+            for (n, group) in blocks.iter().enumerate() {
+                let tops: Vec<String> =
+                    group.iter().map(|i| format!("{:.1}", lines[*i].y)).collect();
+                let ops: usize = group.iter().map(|i| lines[*i].drawn_by.len()).sum();
+                println!("  {n:>2}: {:>2} line(s), {ops:>3} operations, size {:.2}, at y {}",
+                    group.len(), lines[group[0]].size, tops.join(" "));
+            }
         }
     }
 
