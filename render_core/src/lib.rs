@@ -42,6 +42,7 @@ mod provision;
 mod recover;
 mod reshape;
 mod retype;
+mod shift;
 mod shaped;
 pub mod outline;
 

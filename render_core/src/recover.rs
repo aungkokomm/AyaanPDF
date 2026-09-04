@@ -1702,6 +1702,148 @@ mod tests {
         }
     }
 
+    /// HOW a page positions the text it draws, which is what decides how a
+    /// line could be moved. Diagnostic.
+    ///
+    /// Three things are asked of every text object on the page: whether it
+    /// starts with an absolute `Tm`, whether anything inside it is placed
+    /// relatively afterwards, and whether the page has put a transform under it
+    /// with `cm`. A line whose placement is absolute can be moved by changing
+    /// six numbers; one placed relative to the line before it cannot, because
+    /// moving it would move everything that follows.
+    #[test]
+    #[ignore = "needs PDFs that are not in this repository"]
+    fn how_the_real_files_position_their_text() {
+        const FILES: [(&str, usize); 3] = [
+            (r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf", 0),
+            (r"D:\Ayaan PDF Test file\Pyidaungsu- text test pdf.pdf", 0),
+            (r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf", 2),
+        ];
+
+        for (file, page_index) in FILES {
+            if !std::path::Path::new(file).exists() {
+                println!("{file:?}: not here");
+                continue;
+            }
+            let doc = Document::load(file).unwrap();
+            let pages = doc.get_pages();
+            let Some((_, &page)) = pages.iter().nth(page_index) else { continue };
+            let Ok(content) = lopdf::content::Content::decode(&doc.get_page_content(page))
+            else {
+                println!("{file:?}: content would not decode");
+                continue;
+            };
+
+            let (mut objects, mut absolute, mut relative_only, mut empty) = (0, 0, 0, 0);
+            let mut moved_under = 0usize;
+            let mut depth = 0i32;
+
+            // What the page has put under the text, if anything.
+            let mut transforms = 0usize;
+
+            let mut in_text = false;
+            let mut first_placement: Option<&str> = None;
+            let mut showed = false;
+
+            for op in &content.operations {
+                match op.operator.as_str() {
+                    "q" => depth += 1,
+                    "Q" => depth -= 1,
+                    "cm" => {
+                        transforms += 1;
+                        if depth > 0 { moved_under += 1; }
+                    }
+                    "BT" => {
+                        in_text = true;
+                        first_placement = None;
+                        showed = false;
+                    }
+                    "ET" => {
+                        if in_text {
+                            objects += 1;
+                            match (showed, first_placement) {
+                                (false, _) => empty += 1,
+                                (true, Some("Tm")) => absolute += 1,
+                                (true, _) => relative_only += 1,
+                            }
+                        }
+                        in_text = false;
+                    }
+                    "Tm" | "Td" | "TD" | "T*" if in_text => {
+                        if first_placement.is_none() && !showed {
+                            first_placement = Some(match op.operator.as_str() {
+                                "Tm" => "Tm",
+                                other => Box::leak(other.to_string().into_boxed_str()),
+                            });
+                        }
+                    }
+                    "TJ" | "Tj" if in_text => showed = true,
+                    _ => {}
+                }
+            }
+
+            let name = std::path::Path::new(file).file_name().unwrap();
+            println!(
+                "\n{name:?} page {page_index}: {} operations, {objects} text objects",
+                content.operations.len());
+            println!("   placed absolutely by Tm : {absolute}");
+            println!("   placed relatively only  : {relative_only}");
+            println!("   drew nothing            : {empty}");
+            println!("   cm transforms on the page: {transforms} ({moved_under} inside q/Q)");
+        }
+    }
+
+    /// Whether a transform is in force when the page draws its text, which
+    /// decides whether a move measured on screen is a move in the numbers the
+    /// `Tm` operators carry. Diagnostic.
+    #[test]
+    #[ignore = "needs PDFs that are not in this repository"]
+    fn whether_a_transform_is_in_force_over_the_text() {
+        const FILES: [(&str, usize); 3] = [
+            (r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf", 0),
+            (r"D:\Ayaan PDF Test file\Pyidaungsu- text test pdf.pdf", 0),
+            (r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf", 2),
+        ];
+
+        for (file, page_index) in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            let doc = Document::load(file).unwrap();
+            let pages = doc.get_pages();
+            let Some((_, &page)) = pages.iter().nth(page_index) else { continue };
+            let content = lopdf::content::Content::decode(&doc.get_page_content(page)).unwrap();
+
+            let name = std::path::Path::new(file).file_name().unwrap();
+            let mut said = false;
+            let mut text_after = 0usize;
+            let mut seen_cm = false;
+
+            for op in &content.operations {
+                match op.operator.as_str() {
+                    "cm" => {
+                        let m: Vec<f64> = op.operands.iter().filter_map(number).collect();
+                        let identity = m.len() == 6
+                            && (m[0] - 1.0).abs() < 1e-9 && m[1].abs() < 1e-9
+                            && m[2].abs() < 1e-9 && (m[3] - 1.0).abs() < 1e-9
+                            && m[4].abs() < 1e-9 && m[5].abs() < 1e-9;
+                        println!("{name:?}: cm {m:?} {}",
+                            if identity { "(identity)" } else { "(NOT identity)" });
+                        said = true;
+                        seen_cm = true;
+                    }
+                    "BT" if seen_cm => text_after += 1,
+                    _ => {}
+                }
+            }
+            if !said {
+                println!("{name:?}: no cm at all");
+            } else {
+                println!("{name:?}: {text_after} text objects drawn after it");
+            }
+        }
+    }
+
     fn a_subset_tag_is_not_part_of_the_font_s_name() {
         assert_eq!(installed("BCDEEE+MyanmarText"), installed("MyanmarText"));
         assert!(installed("BCDEEE+MyanmarText").is_some());
