@@ -1920,7 +1920,12 @@ pub extern "C" fn text_block_baselines(
 
         let at = page_top - (baseline as f64 * page_w);
         let lines = recover::lines_of(&doc, page);
-        let Some(mine) = lines.iter().position(|l| (l.y - at).abs() < 0.5) else {
+
+        // ⚠️ `page_y` BOTH WAYS, IN AND OUT. What arrives was read off the page
+        // and what goes back is compared against the app's own line list, which
+        // was too. `y` is the placement as the stream writes it, and on a page
+        // drawn under a transform it is a different frame entirely.
+        let Some(mine) = lines.iter().position(|l| (l.page_y - at).abs() < 0.5) else {
             return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
         };
         let Some(group) = shift::blocks_of(&lines).into_iter().find(|g| g.contains(&mine))
@@ -1931,7 +1936,7 @@ pub extern "C" fn text_block_baselines(
         let mut out: Vec<u8> = Vec::new();
         out.extend((group.len() as u32).to_le_bytes());
         for i in &group {
-            out.extend((((page_top - lines[*i].y) / page_w) as f32).to_le_bytes());
+            out.extend((((page_top - lines[*i].page_y) / page_w) as f32).to_le_bytes());
         }
 
         let mut boxed = out.into_boxed_slice();
@@ -26433,20 +26438,24 @@ p={spread_px:.4},c={rgba:08X})"
             let (_, page_top, page_w) = recover::page_box(&doc, page).unwrap();
             let lines = recover::lines_of(&doc, page);
 
+            // ⚠️ THE REAL LOOKUP DOES THE COUNTING, not a copy of it here. A
+            // diagnostic that repeats the rule it is checking passes the moment
+            // the copy is updated, whether or not the thing it measures moved.
             let mut found = 0usize;
             let mut missed: Vec<(f64, f64, String)> = Vec::new();
             for l in &app {
                 let at = page_top - (l.baseline as f64 * page_w);
-                match lines
-                    .iter()
-                    .map(|c| (c.y, (c.y - at).abs()))
-                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                {
-                    Some((_, gap)) if gap < 0.5 => found += 1,
-                    Some((nearest, _)) if missed.len() < 3 => {
-                        missed.push((at, nearest, l.text.chars().take(28).collect()));
-                    }
-                    _ => {}
+                if shift::drawn_by(&lines, at, false).is_some() {
+                    found += 1;
+                    continue;
+                }
+                if missed.len() < 3 {
+                    let nearest = lines
+                        .iter()
+                        .map(|c| c.page_y)
+                        .min_by(|a, b| (a - at).abs().partial_cmp(&(b - at).abs()).unwrap())
+                        .unwrap_or(f64::NAN);
+                    missed.push((at, nearest, l.text.chars().take(28).collect()));
                 }
             }
 

@@ -164,9 +164,14 @@ pub(crate) fn drawn_by(
     baseline: f64,
     whole_block: bool,
 ) -> Option<Vec<usize>> {
+    // ⚠️ `page_y`, NEVER `y`. The caller read this baseline off the PAGE, and
+    // `y` is where the stream writes the placement, with nothing in force over
+    // it applied. On a book drawn under a `cm` the two are three to ten points
+    // apart and NOT ONE of that page's lines could be found, so every move of
+    // every line of that book was refused.
     let mine = lines
         .iter()
-        .position(|l| (l.y - baseline).abs() < BASELINE_TOLERANCE)?;
+        .position(|l| (l.page_y - baseline).abs() < BASELINE_TOLERANCE)?;
 
     let members: Vec<usize> = if whole_block {
         blocks_of(lines).into_iter().find(|g| g.contains(&mine))?
@@ -573,6 +578,77 @@ mod tests {
                     group.len(), lines[group[0]].size, tops.join(" "));
             }
         }
+    }
+
+    /// The same two lines, wrapped in the transform the book uses: a scale and
+    /// a flip of the Y axis, which is how a producer draws a whole page of text
+    /// in its own coordinates.
+    fn two_lines_under_a_transform() -> (Document, ObjectId) {
+        a_page(vec![
+            Operation::new("q", vec![]),
+            Operation::new("cm", vec![
+                0.72.into(), 0.0.into(), 0.0.into(), (-0.72).into(),
+                72.0.into(), 841.9.into(),
+            ]),
+            Operation::new("BT", vec![]),
+            tm(1.0, 0.0, 0.0, 1.0, 0.0, 100.0),
+            show("one"),
+            Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]),
+            tm(1.0, 0.0, 0.0, 1.0, 0.0, 120.0),
+            show("two"),
+            Operation::new("ET", vec![]),
+            Operation::new("Q", vec![]),
+        ])
+    }
+
+    /// ⚠️ THE REGRESSION THAT COST THE READER EVERY MOVE IN A WHOLE BOOK. A
+    /// line is addressed by the baseline the app read off the PAGE, and until
+    /// `page_y` existed the lookup compared that against the placement as the
+    /// STREAM writes it. Under this transform those are 841.9 - 0.72 * 100 =
+    /// 769.9 and 100, so nothing was ever found and every move was refused.
+    ///
+    /// Both frames are asserted, because a fix that simply swapped one for the
+    /// other would leave the untransformed case broken instead.
+    #[test]
+    fn a_line_under_a_transform_is_addressed_by_where_it_is_on_the_page() {
+        let (doc, page) = two_lines_under_a_transform();
+        let lines = crate::recover::lines_of(&doc, page);
+        assert_eq!(lines.len(), 2, "the fixture stopped drawing two lines");
+
+        // A thousandth of a point, because a `cm` operand is stored as an f32
+        // and 841.9 comes back out of one as 841.90002. Exact equality here
+        // fails on the arithmetic being right.
+        for l in &lines {
+            let on_page = 841.9 - 0.72 * l.y;
+            assert!((l.page_y - on_page).abs() < 1e-3,
+                "y {} should be {on_page} on the page, not {}", l.y, l.page_y);
+        }
+
+        // What the app asks with: the SECOND line, which the flip puts higher
+        // up the page than the first, so a lookup that ignored the transform
+        // could not even land on the right one by accident.
+        let asked = 841.9 - 0.72 * 120.0;
+        let ops = drawn_by(&lines, asked, false).expect("the page baseline found nothing");
+        assert_eq!(ops.len(), 1);
+
+        // And the stream's own number finds nothing, which is the point.
+        assert!(drawn_by(&lines, 120.0, false).is_none(),
+            "the text-space number still addresses a line, so the frames are confused");
+    }
+
+    /// And the untransformed case, where the two frames are the same, still
+    /// answers exactly as it did.
+    #[test]
+    fn a_line_with_nothing_in_force_over_it_is_addressed_the_way_it_always_was() {
+        let (doc, page) = two_lines();
+        let lines = crate::recover::lines_of(&doc, page);
+
+        for l in &lines {
+            assert_eq!(l.y, l.page_y, "an identity transform moved a line");
+        }
+        assert!(drawn_by(&lines, 700.0, false).is_some());
+        assert!(drawn_by(&lines, 680.0, false).is_some());
     }
 
     /// MEASUREMENT, not a feature: how much of a real page can actually be

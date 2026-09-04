@@ -100,8 +100,29 @@ impl Matrix {
 /// One line of a page, as the glyphs it draws.
 pub(crate) struct Line {
     /// Where the line sits, from the text matrix that placed it.
+    ///
+    /// ⚠️ IN THE TEXT OBJECT'S OWN SPACE, WHICH IS NOT THE PAGE'S. This is the
+    /// `Tm` translation as the stream writes it, with nothing in force over it
+    /// applied. Comparing lines of one page against each other is exactly what
+    /// it is for; addressing a line from OUTSIDE the stream is what it is not.
+    /// Use [`Line::page_y`] for that.
     pub(crate) y: f64,
     pub(crate) x: f64,
+
+    /// Where the line sits on the PAGE: the same placement with whatever
+    /// transform is in force where it is drawn applied to it.
+    ///
+    /// ⚠️ THIS IS THE ONLY ADDRESS AN OUTSIDE CALLER MAY USE, and it exists
+    /// because the app addresses a line by its baseline and reads that baseline
+    /// from PDFium, which reports the page. Measured: on a book whose text is
+    /// drawn under `cm [0.72 0 0 -0.72 72 841.9]` the two frames disagree by
+    /// three to ten points against a tolerance of half a point, so ZERO of that
+    /// page's thirty-two lines could be found and every move of every line of
+    /// that book was refused.
+    ///
+    /// Equal to `y` on any page that draws its text without a transform, which
+    /// is why this went unnoticed: the Myanmar test file is one of those.
+    pub(crate) page_y: f64,
     /// The font resource the line is drawn with, and the name behind it.
     pub(crate) resource: Vec<u8>,
     pub(crate) base_font: String,
@@ -207,6 +228,15 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     // and the text matrix is reset to it; only `TJ` moves the text matrix on
     // its own, which is why a line is identified by the line matrix.
     let mut line_matrix = Matrix::IDENTITY;
+    // What is in force over the text, and the stack `q` and `Q` keep it on.
+    //
+    // ⚠️ TRACKED SO A LINE CAN BE FOUND FROM OUTSIDE THE STREAM. Nothing about
+    // reading a line needs this: the glyphs, their order and their widths are
+    // all in the text object's own space. It is here because an outside caller
+    // hands back a baseline it read off the PAGE, and until this existed the
+    // lookup compared that against a number in a different frame.
+    let mut ctm = Matrix::IDENTITY;
+    let mut ctm_stack: Vec<Matrix> = Vec::new();
     let mut leading = 0.0f64;
     let mut glyphs: Vec<u16> = Vec::new();
     let mut adjust = 0.0f64;
@@ -216,9 +246,11 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     macro_rules! finish {
         () => {
             if !glyphs.is_empty() {
+                let on_page = line_matrix.then(ctm);
                 out.push(Line {
                     y: line_matrix.y(),
                     x: line_matrix.x(),
+                    page_y: on_page.y(),
                     resource: resource.clone(),
                     base_font: names
                         .get(&resource)
@@ -241,6 +273,22 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
 
     for (index, op) in content.operations.iter().enumerate() {
         match op.operator.as_str() {
+            // ⚠️ THE TRANSFORM STACK, WHICH IS OUTSIDE THE TEXT OBJECTS. A
+            // producer wraps a whole page of text in one `q`/`cm`/`Q`, so this
+            // has to be tracked across every operation and not only inside a
+            // `BT`. `Q` on an empty stack is a malformed stream, and the
+            // identity is the only answer that keeps the rest readable.
+            "q" => ctm_stack.push(ctm),
+            "Q" => ctm = ctm_stack.pop().unwrap_or(Matrix::IDENTITY),
+            "cm" => {
+                let mut m = [0.0f64; 6];
+                for (i, slot) in m.iter_mut().enumerate() {
+                    *slot = op.operands.get(i).and_then(number).unwrap_or(0.0);
+                }
+                if op.operands.len() >= 6 {
+                    ctm = Matrix(m).then(ctm);
+                }
+            }
             "BT" => {
                 finish!();
                 line_matrix = Matrix::IDENTITY;
@@ -1133,6 +1181,7 @@ mod tests {
         let line = Line {
             y: 700.0,
             x: 72.0,
+            page_y: 700.0,
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -1164,6 +1213,7 @@ mod tests {
         let line = Line {
             y: 700.0,
             x: 72.0,
+            page_y: 700.0,
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
