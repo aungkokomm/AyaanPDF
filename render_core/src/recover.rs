@@ -179,6 +179,20 @@ pub(crate) struct Line {
     /// line's placements into one run loses every space that was drawn as a
     /// placement, unless the run puts them back as `TJ` numbers.
     pub(crate) breaks: Vec<Break>,
+    /// Whether this line's gaps are LETTER SPACING rather than word spaces.
+    ///
+    /// ⚠️ A PRODUCER CAN SET A LINE WITH EXPANDED CHARACTER SPACING, drawing
+    /// every syllable in a placement of its own with the same small gap after
+    /// it. Measured on a real heading: seventeen placements, sixteen gaps, all
+    /// between 0.284 and 0.296 of the type size against a space glyph 0.274
+    /// wide, over text with no space in it anywhere. Read as word spaces, a
+    /// department name came back with a space between every syllable of it,
+    /// and an edit would have written every one of those into the page.
+    ///
+    /// ⚠️ THE GAPS ARE KEPT ALL THE SAME. They are on the page whatever they
+    /// mean, so the geometry still has to cross them or every cluster after the
+    /// first would be placed short. This says only what the TEXT does.
+    pub(crate) tracked: bool,
     /// Which operations of the page's content stream drew this line, in order.
     ///
     /// ⚠️ WHAT A REWRITER NEEDS AND A READER DOES NOT. A line is drawn by
@@ -288,6 +302,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     adjust: std::mem::replace(&mut adjust, 0.0),
                     nudges: std::mem::take(&mut nudges),
                     breaks: Vec::new(),
+                    tracked: false,
                     drawn_by: std::mem::take(&mut drawn_by),
                 });
             } else {
@@ -461,19 +476,26 @@ fn merge_placements(
         !line.glyphs.is_empty() && line.glyphs.iter().all(|g| widths.of(*g) == 0.0)
     };
 
+    // How many times each line in `out` has been joined to another, so a line
+    // gapped at EVERY one of its joins can be told from one gapped only
+    // between its words.
+    let mut joins: Vec<usize> = Vec::new();
+
     let mut out: Vec<Line> = Vec::new();
     for line in lines {
-        let joins = out.last().is_some_and(|prev| {
+        let joined = out.last().is_some_and(|prev| {
             let apart = (prev.y - line.y).abs();
             installed(&prev.base_font) == installed(&line.base_font)
                 && line.x >= prev.x
                 && (apart < SAME_BASELINE
                     || (apart < A_MARK * line.size && draws_only_marks(&line)))
         });
-        if !joins {
+        if !joined {
             out.push(line);
+            joins.push(0);
             continue;
         }
+        *joins.last_mut().unwrap() += 1;
         let gap = ends_at(out.last().unwrap()).map(|end| line.x - end);
         let prev = out.last_mut().unwrap();
         let at = prev.glyphs.len();
@@ -486,7 +508,40 @@ fn merge_placements(
         prev.nudges.extend(line.nudges.iter().map(|(i, v)| (i + at, *v)));
         prev.drawn_by.extend(&line.drawn_by);
     }
+
+    for (line, joins) in out.iter_mut().zip(joins) {
+        line.tracked = is_letter_spaced(line, joins);
+    }
     out
+}
+
+/// Whether a line's gaps are letter spacing rather than word spaces.
+///
+/// ⚠️ THREE THINGS TOGETHER, AND NONE OF THEM ALONE. A justified line's word
+/// spaces are uniform too, so uniformity by itself would take the spaces out of
+/// ordinary text: measured on one real page, a line of seven word gaps sat
+/// between 0.463 and 0.490 of the type size. What letter spacing also does is
+/// gap EVERY join, and stay about as wide as the space it is not. Measured over
+/// two Burmese files, 44 lines: this says yes to the one line that is letter
+/// spaced and no to all the rest, including every uniformly justified one.
+fn is_letter_spaced(line: &Line, joins: usize) -> bool {
+    // As a fraction of the type size. The space glyph in both Burmese faces
+    // this reads is 0.274 of an em, so this admits one about half again as
+    // wide and no more; a word gap on a justified line measured 1.7 times it.
+    const AT_MOST: f64 = 0.40;
+    // How much the gaps may differ from each other before they are not one
+    // setting repeated. The letter-spaced line measured 0.012 across sixteen.
+    const WITHIN: f64 = 0.08;
+    // Two gaps are a coincidence. This is about a line SET that way.
+    const AT_LEAST: usize = 3;
+
+    if joins < AT_LEAST || line.breaks.len() != joins || line.size <= 0.0 {
+        return false;
+    }
+    let ems: Vec<f64> = line.breaks.iter().map(|b| b.points / line.size).collect();
+    let widest = ems.iter().cloned().fold(f64::MIN, f64::max);
+    let narrowest = ems.iter().cloned().fold(f64::MAX, f64::min);
+    widest <= AT_MOST && widest - narrowest <= WITHIN
 }
 
 /// What one line says, or nothing.
@@ -601,7 +656,11 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
         // space glyph, in which case adding another would put two where the
         // author typed one.
         let ends_open = out.last().is_some_and(|p: &Piece| p.text.ends_with(' '));
+        // ⚠️ AND NOT ON A LINE THAT IS MERELY LETTER SPACED. See
+        // `Line::tracked`: every join of such a line carries the same small
+        // gap, and none of them is a space the author typed.
         let space_before = !out.is_empty()
+            && !line.tracked
             && !ends_open
             && !text.starts_with(' ')
             && gap_before > 0.0;
@@ -1257,6 +1316,145 @@ mod tests {
             lines[0].breaks[0].points);
     }
 
+    /// Placements of one glyph each, `gap` points apart, all on one baseline.
+    ///
+    /// Every glyph is 500/1000 of an em and the type is 12 point, so a piece is
+    /// 6 points wide and the next one starts 6 + `gap` further along.
+    fn a_line_placed_a_piece_at_a_time(gaps: &[f64]) -> (Document, ObjectId) {
+        let mut ops = Vec::new();
+        let mut x = 72.0f64;
+        for (i, gap) in std::iter::once(&0.0).chain(gaps).enumerate() {
+            x += if i == 0 { 0.0 } else { 6.0 + gap };
+            ops.push(Operation::new("BT", vec![]));
+            ops.push(pick(12.0));
+            ops.push(place(x, 700.0));
+            ops.push(show(&[10 + i as u16]));
+            ops.push(Operation::new("ET", vec![]));
+        }
+        a_page(ops, 500.0)
+    }
+
+    /// ⚠️ A LINE GAPPED THE SAME SMALL AMOUNT AT EVERY JOIN IS LETTER SPACED.
+    /// Measured on a real heading: seventeen placements, sixteen gaps, all
+    /// between 0.284 and 0.296 of the type size, over text with no space in it
+    /// anywhere. The reader was calling every one of them a word space and
+    /// offering `\u{1006}\u{100A}\u{103A} \u{1019}\u{103C}\u{1031}\u{102C}\u{1004}\u{103A}\u{1038}` for a name that has no space in it.
+    #[test]
+    fn a_line_gapped_the_same_way_at_every_join_is_letter_spaced() {
+        // 0.29 of 12 point type, four times over.
+        let (doc, page) = a_line_placed_a_piece_at_a_time(&[3.48, 3.48, 3.5, 3.46]);
+
+        let lines = lines_of(&doc, page);
+        assert_eq!(lines.len(), 1, "the pieces did not join");
+        assert!(lines[0].tracked, "a letter-spaced line was read as worded");
+
+        // ⚠️ AND THE GAPS ARE STILL THERE. They are on the page whatever they
+        // mean, and the geometry has to cross them or every cluster after the
+        // first is placed short.
+        assert_eq!(lines[0].breaks.len(), 4,
+            "the gaps were thrown away instead of being reinterpreted");
+    }
+
+    /// ⚠️ AND A JUSTIFIED LINE IS NOT, however even its spaces are. Measured
+    /// on a real page, one line's seven word gaps sat between 0.463 and 0.490
+    /// of the type size: uniformity alone would have taken the spaces out of
+    /// ordinary text. What tells them apart is width, and that letter spacing
+    /// gaps EVERY join.
+    #[test]
+    fn a_line_whose_even_gaps_are_word_spaces_keeps_them() {
+        // The same evenness, but half again as wide as a space.
+        let (doc, page) = a_line_placed_a_piece_at_a_time(&[5.7, 5.8, 5.75, 5.72]);
+
+        let lines = lines_of(&doc, page);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].tracked,
+            "a line of word spaces was mistaken for letter spacing");
+    }
+
+    /// ⚠️ AND A LINE GAPPED ONLY BETWEEN ITS WORDS IS NOT, however narrow the
+    /// gaps are. Letter spacing is a setting applied to the whole line, so it
+    /// shows up at every join; a page that draws most of its syllables together
+    /// and breaks only at the spaces is doing the ordinary thing.
+    #[test]
+    fn a_line_gapped_at_only_some_of_its_joins_keeps_its_spaces() {
+        // Five joins, but only three of them gapped: the other two are drawn
+        // hard against each other.
+        let (doc, page) = a_line_placed_a_piece_at_a_time(&[3.48, 0.0, 3.48, 0.0, 3.48]);
+
+        let lines = lines_of(&doc, page);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].tracked,
+            "a line gapped only at its spaces was read as letter spaced");
+    }
+
+    /// ⚠️ TWO GAPS ARE A COINCIDENCE. This is about a line SET that way, and
+    /// a two-piece line has too little of it to tell.
+    #[test]
+    fn a_line_of_two_pieces_is_never_called_letter_spaced() {
+        let (doc, page) = a_line_placed_a_piece_at_a_time(&[3.48]);
+
+        let lines = lines_of(&doc, page);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].tracked);
+    }
+
+    /// ⚠️ AND WHAT IT COMES TO IN THE READING: no space, where before there
+    /// was one at every join.
+    #[test]
+    fn a_letter_spaced_line_reads_as_the_word_it_is() {
+        let Some(bytes) = std::fs::read(MYANMAR_TEXT).ok() else { return };
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+
+        // Three syllables of one word, each drawn in a placement of its own.
+        const A: &str = "\u{1006}\u{100A}\u{103A}";
+        const B: &str = "\u{1019}\u{103C}\u{1031}\u{102C}\u{1004}\u{103A}\u{1038}";
+        // ⚠️ SPELLED THE WAY THE INDEX PROVES IT. Two orderings of the
+        // same two marks draw identically and `Index::build` keeps one of
+        // them, so asking for the other asks about the index rather than
+        // about spaces.
+        const C: &str = "\u{1014}\u{103E}\u{1004}\u{1037}\u{103A}";
+        let pieces = [A, B, C].map(|s| crate::reshape::draws(&face, s));
+
+        let mut chars: BTreeSet<char> = BTreeSet::new();
+        for s in [A, B, C] {
+            chars.extend(s.chars());
+        }
+        let index = crate::reshape::Index::build(&bytes, Some(&chars), None).unwrap();
+
+        let mut glyphs: Vec<u16> = Vec::new();
+        let mut breaks: Vec<Break> = Vec::new();
+        for piece in &pieces {
+            if !glyphs.is_empty() {
+                breaks.push(Break { at: glyphs.len(), points: 3.48 });
+            }
+            glyphs.extend(piece);
+        }
+
+        let mut line = Line {
+            y: 700.0,
+            x: 72.0,
+            page_y: 700.0,
+            resource: b"F1".to_vec(),
+            base_font: "BCDEEE+MyanmarText".into(),
+            size: 12.0,
+            nudges: Vec::new(),
+            glyphs,
+            adjust: 0.0,
+            tracked: false,
+            breaks,
+            drawn_by: Vec::new(),
+        };
+
+        assert_eq!(read_line(&index, &face, &line).as_deref(),
+            Some(format!("{A} {B} {C}").as_str()),
+            "the control is wrong: gaps should read as spaces when they mean spaces");
+
+        line.tracked = true;
+        assert_eq!(read_line(&index, &face, &line).as_deref(),
+            Some(format!("{A}{B}{C}").as_str()),
+            "a letter-spaced line still came back with spaces in it");
+    }
+
     /// A different baseline is a different line, however close it is drawn.
     #[test]
     fn a_new_baseline_is_a_new_line() {
@@ -1349,6 +1547,7 @@ mod tests {
             nudges: Vec::new(),
             glyphs: left.iter().copied().chain(right.iter().copied()).collect(),
             adjust: 0.0,
+            tracked: false,
             breaks: vec![Break { at: left.len(), points: 3.0 }],
             drawn_by: Vec::new(),
         };
@@ -1381,6 +1580,7 @@ mod tests {
             nudges: Vec::new(),
             glyphs: drawn,
             adjust: 0.0,
+            tracked: false,
             // Straight through the middle of the first cluster.
             breaks: vec![Break { at: 1, points: 3.0 }],
             drawn_by: Vec::new(),
@@ -1512,7 +1712,6 @@ mod tests {
         assert_eq!(proven, read.len(), "read {proven} of {} lines", read.len());
     }
 
-    #[test]
     /// What the lines recovery DECLINED are made of, and what the lines around
     /// them are made of, so the two can be compared. Diagnostic: it asserts
     /// nothing, because the numbers are what this phase is here to change.
@@ -1790,6 +1989,81 @@ mod tests {
 
     /// What the Myanmar files in the user's test folder are actually made of,
     /// page by page. Diagnostic: the corpus this work has to cover.
+    /// How wide the gaps a producer leaves between its placements really are,
+    /// against the width of the space glyph the same font draws.
+    ///
+    /// The reader turns a gap into a word space when it is at least
+    /// `A_SPACE` of the type size. On one file that reads every syllable apart
+    /// (`\u{1026}\u{1038} \u{1005}\u{102E}\u{1038}` for text with no spaces in it at all), this says whether those
+    /// gaps are genuinely space-sized or whether the threshold is simply too
+    /// low for the way that producer sets type.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn how_wide_a_producers_gaps_are_against_a_real_space() {
+        const FILES: [&str; 2] = [
+            r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf",
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf",
+        ];
+
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            let doc = Document::load(file).unwrap();
+            let (_, &page) = doc.get_pages().iter().next().unwrap();
+            let indexes = indexes_for_document(&doc);
+            let read = read_page_with(&doc, page, &indexes);
+            let lines = lines_of(&doc, page);
+
+            println!("\n=== {} ===", file.rsplit('\\').next().unwrap());
+            for (i, line) in lines.iter().enumerate() {
+                if line.breaks.is_empty() {
+                    continue;
+                }
+                // How wide the font's own space glyph is at this size, so the
+                // gaps can be compared against the thing they claim to be.
+                let space = installed(&line.base_font)
+                    .and_then(|p| std::fs::read(p).ok())
+                    .and_then(|b| {
+                        let face = rustybuzz::Face::from_slice(&b, 0)?;
+                        let upem = face.units_per_em() as f64;
+                        let id = face.glyph_index(' ')?;
+                        let w = face.glyph_hor_advance(id)? as f64;
+                        Some(w / upem)
+                    })
+                    .unwrap_or(f64::NAN);
+
+                // How many of the line's own glyphs are the font's SPACE, and
+                // how many placements it is made of. A producer that draws its
+                // spaces as glyphs is not making them out of placement gaps.
+                let space_glyphs = installed(&line.base_font)
+                    .and_then(|p| std::fs::read(p).ok())
+                    .and_then(|b| {
+                        let face = rustybuzz::Face::from_slice(&b, 0)?;
+                        let id = face.glyph_index(' ')?.0;
+                        Some(line.glyphs.iter().filter(|g| **g == id).count())
+                    })
+                    .unwrap_or(usize::MAX);
+
+                let widths: Vec<String> = line
+                    .breaks
+                    .iter()
+                    .map(|b| format!("{:.3}", b.points / line.size))
+                    .collect();
+                let says = read
+                    .iter()
+                    .find(|r| (r.y - line.y).abs() < 1e-9)
+                    .and_then(|r| r.text.clone())
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{i:>3} size={:.2} ops={:>3} tracked={} \
+                     gaps(em)=[{}]\n     “{says}”",
+                    line.size, line.drawn_by.len(), line.tracked, widths.join(" ")
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore = "needs Myanmar PDFs that are not in this repository"]
     fn what_the_myanmar_corpus_looks_like() {
