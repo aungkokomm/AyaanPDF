@@ -575,6 +575,73 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT, not a feature: how much of a real page can actually be
+    /// picked up, as blocks and as single lines.
+    ///
+    /// The reader saw "This text could not be moved." on a contents page and it
+    /// is worth knowing whether that is one awkward line or half the book,
+    /// because a multi-selection of things that mostly refuse is not worth
+    /// building.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn how_much_of_a_real_page_can_be_picked_up() {
+        const FILES: [&str; 2] = [
+            r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf",
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf",
+        ];
+
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                println!("{file:?}: not here");
+                continue;
+            }
+            let name = std::path::Path::new(file).file_name().unwrap().to_owned();
+            let doc = Document::load(file).unwrap();
+            let pages = doc.get_pages();
+
+            for (page_index, (_, &page)) in pages.iter().enumerate().take(8) {
+                let lines = crate::recover::lines_of(&doc, page);
+                let with_text: Vec<usize> = (0..lines.len())
+                    .filter(|i| !lines[*i].drawn_by.is_empty() && !lines[*i].glyphs.is_empty())
+                    .collect();
+                if with_text.is_empty() {
+                    continue;
+                }
+
+                let mut alone = 0usize;
+                let mut as_block = 0usize;
+                let mut first_refusal: Option<(f64, usize)> = None;
+                for i in &with_text {
+                    let y = lines[*i].y;
+                    for (whole, tally) in [(false, &mut alone), (true, &mut as_block)] {
+                        match drawn_by(&lines, y, whole) {
+                            Some(ops) => match shift(&doc, page, &ops, 1.0, 0.0) {
+                                Ok(_) => *tally += 1,
+                                Err(_) if !whole && first_refusal.is_none() => {
+                                    first_refusal = Some((y, ops.len()));
+                                }
+                                Err(_) => {}
+                            },
+                            None if !whole && first_refusal.is_none() => {
+                                first_refusal = Some((y, 0));
+                            }
+                            None => {}
+                        }
+                    }
+                }
+
+                println!(
+                    "{name:?} p{page_index}: {} lines, {alone} move alone, {as_block} move as a block{}",
+                    with_text.len(),
+                    match first_refusal {
+                        Some((y, ops)) => format!("; first refusal at y {y:.1} drawn by {ops} ops"),
+                        None => String::new(),
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn undoing_a_displacement_gives_back_what_went_in() {
         let m = Linear { a: 0.72, b: 0.0, c: 0.0, d: -0.72 };

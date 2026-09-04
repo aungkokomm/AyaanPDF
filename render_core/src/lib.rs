@@ -26398,6 +26398,70 @@ p={spread_px:.4},c={rgba:08X})"
         Ok(out)
     }
 
+    /// MEASUREMENT: whether the baseline the APP holds finds the line the core
+    /// is going to move.
+    ///
+    /// The reader was shown "This text could not be moved." on a page whose
+    /// every line the core will move perfectly well when asked by operation
+    /// index. So the suspect is the address: the app reads its lines from
+    /// PDFium and the mover finds them again with `recover::lines_of`, and the
+    /// two only have to disagree by half a point for the lookup to miss.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn the_baseline_the_app_holds_finds_the_line_the_core_moves() {
+        const FILES: [(&str, i32); 2] = [
+            (r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf", 2),
+            (r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf", 0),
+        ];
+
+        for (file, page_index) in FILES {
+            if !std::path::Path::new(file).exists() {
+                println!("{file:?}: not here");
+                continue;
+            }
+            let name = std::path::Path::new(file).file_name().unwrap().to_owned();
+
+            // What the app is holding.
+            let handle = open_fixture_named(file);
+            let app = decode_lines(handle, page_index);
+            close_document(handle);
+
+            // What the mover will find, and the arithmetic shift_page_text does.
+            let doc = lopdf::Document::load(file).unwrap();
+            let pages = doc.get_pages();
+            let (_, &page) = pages.iter().nth(page_index as usize).unwrap();
+            let (_, page_top, page_w) = recover::page_box(&doc, page).unwrap();
+            let lines = recover::lines_of(&doc, page);
+
+            let mut found = 0usize;
+            let mut missed: Vec<(f64, f64, String)> = Vec::new();
+            for l in &app {
+                let at = page_top - (l.baseline as f64 * page_w);
+                match lines
+                    .iter()
+                    .map(|c| (c.y, (c.y - at).abs()))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                {
+                    Some((_, gap)) if gap < 0.5 => found += 1,
+                    Some((nearest, _)) if missed.len() < 3 => {
+                        missed.push((at, nearest, l.text.chars().take(28).collect()));
+                    }
+                    _ => {}
+                }
+            }
+
+            println!(
+                "{name:?} p{page_index}: the app holds {} lines, the mover has {}, {found} address one",
+                app.len(),
+                lines.len()
+            );
+            for (asked, nearest, text) in missed {
+                println!("   asked for y {asked:.2}, nearest is {nearest:.2}, off by {:.2}: {text:?}",
+                    asked - nearest);
+            }
+        }
+    }
+
     /// Moving a paragraph of a real page, through the FFI the app will call.
     ///
     /// ⚠️ THE READINGS ARE THE MEASUREMENT. Where the text is afterwards is
