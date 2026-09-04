@@ -280,6 +280,39 @@ public class RecoveryWiringTests
             body, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// ⚠️ AN EDIT IS A NEW DOCUMENT, AND THE READING HAS TO GO WITH IT.
+    ///
+    /// Editing a recovered line hands back a whole new document, which the app
+    /// opens under a NEW handle. The index is cached against the handle it was
+    /// built for, so without handing it over, prepare_recovery builds the whole
+    /// thing again after every single edit. Measured on a real Burmese file:
+    /// 41 ms of writing, then 12,000 ms of rebuilding the same answer.
+    ///
+    /// ⚠️ AND BEFORE THE CLOSE. Closing a document drops its cached reading, so
+    /// a hand-over after the close has nothing left to hand over.
+    /// </summary>
+    [Fact]
+    public void the_reading_is_handed_to_the_document_that_replaces_it()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        int at = vm.IndexOf("private void RestoreDocumentBytes(", StringComparison.Ordinal);
+        Assert.True(at > 0, "the restoring method is gone");
+
+        string body = vm[at..Math.Min(vm.Length, at + 2000)];
+
+        int opened = body.IndexOf("open_document_from_bytes", StringComparison.Ordinal);
+        int handed = body.IndexOf("adopt_recovery(_documentHandle, restored)", StringComparison.Ordinal);
+        int closed = body.IndexOf("CloseCurrentDocument()", StringComparison.Ordinal);
+
+        Assert.True(opened > 0, "nothing opens the replacement");
+        Assert.True(handed > opened,
+            "the replacement is left to build the whole index over again");
+        Assert.True(closed > handed,
+            "the reading is handed over after the close, which has already dropped it");
+    }
+
     private static string Source(params string[] parts)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

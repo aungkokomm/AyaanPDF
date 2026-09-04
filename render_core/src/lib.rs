@@ -1743,6 +1743,52 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
 /// ⚠️ NEITHER ANSWER BLOCKS. A slot that is locked means another thread is
 /// inside the 17 seconds, and the right thing to do about that is nothing at
 /// all, not queue up behind it.
+/// Hands the index built for one document to the document that replaces it.
+///
+/// ⚠️ A REWRITE IS A NEW HANDLE, AND THE INDEX WAS CACHED AGAINST THE OLD ONE.
+/// Editing a recovered line hands the app a whole new document, which it opens
+/// under a new handle and then asks to have prepared. Nothing had carried the
+/// old handle's index over, so every edit threw away eleven seconds of
+/// reshaping and paid twelve for another. Measured on a real Burmese file, one
+/// edit cost 41 ms of writing and 12,000 ms of building the same thing again.
+///
+/// ⚠️ AND CARRYING IT OVER IS SAFE BY THE INDEX'S OWN CONTRACT. See
+/// `recover::indexes_for`: the scope decides which syllables an index can
+/// prove, never what one means, and every reading is shaped again against the
+/// glyphs actually on the page. An index from before the edit can only fail to
+/// read something; it cannot read it wrongly.
+///
+/// ⚠️ AND IT NEVER WAITS. A slot somebody is inside is not ready to be handed
+/// on, and blocking here would block the edit that is finishing.
+#[unsafe(no_mangle)]
+pub extern "C" fn adopt_recovery(from_handle: u64, to_handle: u64) {
+    if from_handle == 0 || to_handle == 0 || from_handle == to_handle {
+        return;
+    }
+    let ready = {
+        let slot = {
+            let all = lock(&core().recoveries);
+            all.get(&from_handle).cloned()
+        };
+        let Some(slot) = slot else { return };
+        let Ok(held) = slot.try_lock() else { return };
+        let Some(ready) = held.as_ref().map(Arc::clone) else { return };
+        ready
+    };
+
+    let slot = {
+        let mut all = lock(&core().recoveries);
+        Arc::clone(all.entry(to_handle).or_default())
+    };
+    let mut held = lock(&slot);
+    // ⚠️ AND IT DOES NOT DISPLACE ONE ALREADY THERE. The new document may
+    // have been prepared on its own account, and that index was built for the
+    // document as it now is.
+    if held.is_none() {
+        *held = Some(ready);
+    }
+}
+
 /// Whether a page's shaped text has been read and is waiting to be asked for.
 ///
 /// ⚠️ ASKING TOO EARLY MUST NOT WAIT, WHICH IS THE WHOLE POINT OF THIS. Reading
@@ -15341,7 +15387,7 @@ mod tests {
             .clone()
     }
 
-    fn texts_of(handle: u64) -> Vec<String> {
+    pub(crate) fn texts_of(handle: u64) -> Vec<String> {
         decode_lines(handle, 0).into_iter().map(|l| l.text).collect()
     }
 
@@ -16188,6 +16234,86 @@ mod tests {
 
         close_document(reopened);
         let _ = std::fs::remove_file(&file);
+    }
+
+    // ---- handing a document's reading to the document that replaces it ----
+
+    /// A document with one page and no text, opened, so a handle exists to
+    /// cache a reading against.
+    fn a_prepared_handle() -> u64 {
+        let mut doc = crate::recover::tests_only_blank_page();
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let handle = open_document_from_bytes_inner(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        // Prepared with whatever this document needs, which is nothing: an
+        // empty index is still an index, and it is the CACHING that is on test.
+        let _ = indexes_for_doc(handle, &doc);
+        handle
+    }
+
+    /// ⚠️ AN EDIT IS A NEW DOCUMENT, AND THE READING HAS TO GO WITH IT.
+    /// Editing a recovered line hands the app a whole new document under a new
+    /// handle, and the index is cached against the handle it was built for.
+    /// Measured on a real Burmese file: 41 ms of writing, then 12,000 ms of
+    /// building the same index again, after every single edit.
+    #[test]
+    fn the_reading_is_handed_to_the_document_that_replaces_it() {
+        let from = a_prepared_handle();
+        let to = a_prepared_handle_unprepared();
+        assert_eq!(recovery_is_ready(to, 0), 0, "the control is wrong");
+
+        adopt_recovery(from, to);
+
+        assert_eq!(recovery_is_ready(to, 0), 1,
+            "the replacement was left to build the index all over again");
+        close_document(from);
+        close_document(to);
+    }
+
+    /// ⚠️ AND IT DOES NOT DISPLACE ONE ALREADY THERE. The replacement may
+    /// have been prepared on its own account, and that index was built for the
+    /// document as it now is.
+    #[test]
+    fn a_document_that_has_its_own_reading_keeps_it() {
+        let from = a_prepared_handle();
+        let to = a_prepared_handle();
+
+        let before = cached_indexes(to);
+        adopt_recovery(from, to);
+        let after = cached_indexes(to);
+
+        assert!(before.is_some() && after.is_some());
+        assert!(Arc::ptr_eq(&before.unwrap(), &after.unwrap()),
+            "the replacement's own reading was thrown away for an older one");
+        close_document(from);
+        close_document(to);
+    }
+
+    /// ⚠️ AND NOTHING IS HANDED ON FROM A DOCUMENT THAT HAS NOTHING. Asking
+    /// about a handle nobody has prepared must not invent an empty reading for
+    /// the replacement, which would then never be prepared at all.
+    #[test]
+    fn a_document_with_no_reading_hands_on_nothing() {
+        let from = a_prepared_handle_unprepared();
+        let to = a_prepared_handle_unprepared();
+
+        adopt_recovery(from, to);
+
+        assert_eq!(recovery_is_ready(to, 0), 0,
+            "an empty reading was invented for a document that needs a real one");
+        close_document(from);
+        close_document(to);
+    }
+
+    /// The same document, opened and left alone.
+    fn a_prepared_handle_unprepared() -> u64 {
+        let mut doc = crate::recover::tests_only_blank_page();
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let handle = open_document_from_bytes_inner(bytes.as_ptr(), bytes.len());
+        assert_ne!(handle, 0);
+        handle
     }
 
     // ---- the content order a line edit has to leave alone ----

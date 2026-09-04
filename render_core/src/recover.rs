@@ -1009,6 +1009,38 @@ pub(crate) fn indexes_for_document(doc: &Document) -> Indexes {
     build_indexes(&wanted)
 }
 
+/// The smallest document that opens: one blank page.
+///
+/// For tests elsewhere in the crate that need a handle to hang something off
+/// rather than a page to read.
+#[cfg(test)]
+pub(crate) fn tests_only_blank_page() -> Document {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+
+    let mut page_dict = lopdf::Dictionary::new();
+    page_dict.set("Type", Object::Name(b"Page".to_vec()));
+    page_dict.set("Parent", Object::Reference(pages_id));
+    page_dict.set("MediaBox", Object::Array(vec![
+        0.into(), 0.into(), 612.into(), 792.into(),
+    ]));
+    let page = doc.add_object(page_dict);
+
+    let mut pages = lopdf::Dictionary::new();
+    pages.set("Type", Object::Name(b"Pages".to_vec()));
+    pages.set("Kids", Object::Array(vec![Object::Reference(page)]));
+    pages.set("Count", Object::Integer(1));
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+    let mut catalog = lopdf::Dictionary::new();
+    catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+    catalog.set("Pages", Object::Reference(pages_id));
+    let catalog = doc.add_object(catalog);
+
+    doc.trailer.set("Root", catalog);
+    doc
+}
+
 /// How far the current preparation has got, for anything that wants to say so.
 ///
 /// ⚠️ IT USED TO SAY NOTHING FOR TWENTY SECONDS, and a reader can only read

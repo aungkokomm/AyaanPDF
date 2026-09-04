@@ -714,6 +714,24 @@ internal static partial class RenderCoreNative
     public static extern void prepare_recovery(ulong docHandle, int pageIndex);
 
     /// <summary>
+    /// Hands the index built for one document to the document that replaces it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A REWRITE IS A NEW HANDLE. Editing a recovered line hands back a
+    /// whole new document, and the index is cached against the handle it was
+    /// built for. Without this, every edit threw away eleven seconds of
+    /// reshaping and <see cref="prepare_recovery"/> paid twelve for the same
+    /// thing again. Call it after opening the replacement and BEFORE closing
+    /// what it replaces.
+    ///
+    /// ⚠️ NEVER WAITS, AND NEVER DISPLACES. An index still being built is
+    /// left where it is, and a replacement that has already been prepared on
+    /// its own account keeps what it has.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern void adopt_recovery(ulong fromHandle, ulong toHandle);
+
+    /// <summary>
     /// What a page's shaped text says, read from the FONT, with a box for every
     /// cluster of every line.
     /// </summary>

@@ -14026,6 +14026,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         ulong restored = RenderCoreNative.open_document_from_bytes(bytes, (nuint)bytes.Length);
         if (restored == 0) { return; }
+
+        // ⚠️ THE READING GOES WITH IT, OR EVERY EDIT PAYS FOR IT AGAIN.
+        // Reshaping a Burmese document into an index is about eleven seconds
+        // and it is cached against the handle it was built for. This is a NEW
+        // handle, so without handing the index over, prepare_recovery would
+        // build the whole thing again after every single edit: measured, 41 ms
+        // of writing followed by 12,000 ms of rebuilding the same answer.
+        // Before the close, because closing the old handle drops its entry.
+        RenderCoreNative.adopt_recovery(_documentHandle, restored);
         CloseCurrentDocument();
         _documentHandle = restored;
         _textLayers.Clear();

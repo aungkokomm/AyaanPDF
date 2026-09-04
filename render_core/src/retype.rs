@@ -690,6 +690,327 @@ mod tests {
             "the line started at {was_at:.2} and now starts at {now_at:.2}");
     }
 
+    /// What ONE retype costs, stage by stage, and how much of each stage is
+    /// work on the whole document rather than on the paragraph being edited.
+    ///
+    /// Run with
+    ///   cargo test --release --lib what_one_edit_costs -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_one_edit_costs() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let on_disk = std::fs::read(FILE).unwrap();
+
+        // The document as the app holds it: open in PDFium, with one index
+        // already built, which is the state a reader is in when they type.
+        let handle = crate::open_document_from_bytes_inner(on_disk.as_ptr(), on_disk.len());
+        assert_ne!(handle, 0);
+
+        let timed = |what: &str, f: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            f();
+            println!("{what:<44} {:>8.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        };
+
+        // 1. What the FFI does before it calls anything: serialise the whole
+        //    document out of PDFium.
+        let mut bytes = Vec::new();
+        timed("snapshot the whole document out of PDFium",
+            &mut || bytes = crate::document_bytes(handle).unwrap());
+        println!("{:<44} {:>8} KB", "  (the document is)", bytes.len() / 1024);
+
+        // 2. Parsing it with lopdf.
+        let mut doc = None;
+        timed("parse the whole document with lopdf",
+            &mut || doc = Document::load_mem(&bytes).ok());
+        let doc = doc.unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+
+        // 3. The index, which the app has already paid for once.
+        let mut indexes = None;
+        timed("build the whole-document index (once)",
+            &mut || indexes = Some(crate::recover::indexes_for_document(&doc)));
+        let indexes = indexes.unwrap();
+
+        // The line to edit, and a replacement one word different.
+        let read = crate::recover::read_page_with(&doc, page, &indexes);
+        let line = read.iter().find(|r| r.text.is_some()).expect("nothing read");
+        let was = line.text.clone().unwrap();
+        let now = format!("{} X", was.trim());
+
+        // 4. Reading the page to check the line still says what it said.
+        timed("read the page's lines", &mut || {
+            let _ = crate::recover::lines_of(&doc, page);
+        });
+
+        // 5. Shaping the replacement.
+        let mut provisioned = None;
+        timed("shape the replacement", &mut || {
+            provisioned = crate::provision::provision(
+                Some(MYANMAR_TEXT), &now, crate::shaped::SHAPING_SIZE).ok()
+        });
+        let provisioned = provisioned.unwrap();
+
+        // 6. Embedding the font, which opens the document in PDFium a second
+        //    time and serialises it TWICE more.
+        let mut embedded = None;
+        timed("embed the font (opens + saves the doc twice)",
+            &mut || embedded = crate::embed_for_shaping(&bytes, &provisioned));
+        let (after_bytes, _font_id) = embedded.unwrap();
+        println!("{:<44} {:>8} KB", "  (and the document is now)", after_bytes.len() / 1024);
+
+        // 7. Parsing it again.
+        timed("parse the whole document a second time", &mut || {
+            let _ = Document::load_mem(&after_bytes);
+        });
+
+        // 8. The write itself: a deep clone of the object graph and a full save.
+        let after = Document::load_mem(&after_bytes).unwrap();
+        timed("clone the whole object graph", &mut || {
+            let _ = after.clone();
+        });
+        timed("serialise the whole document back out", &mut || {
+            let mut out = Vec::new();
+            let _ = after.clone().save_to(&mut out);
+        });
+
+        // 9. The whole thing, as the app actually calls it.
+        let mut produced = Vec::new();
+        timed("== retype(), end to end ==", &mut || {
+            produced = retype(&bytes, 0, line.y, &was, &now, MYANMAR_TEXT, Some(&indexes))
+                .expect("refused");
+        });
+
+        // 10. And what the app does with the answer: a new document, and a new
+        //     handle, which is a new cache key for the index.
+        let mut fresh = 0u64;
+        timed("open the produced bytes as a new document",
+            &mut || fresh = crate::open_document_from_bytes_inner(
+                produced.as_ptr(), produced.len()));
+        assert_ne!(fresh, 0);
+
+        // 11. ⚠️ THE ONE THAT REPEATS. `prepare_recovery` is called on the
+        //     new handle after every edit, and the index cache is keyed by
+        //     handle, so the index built in step 3 is thrown away and this is
+        //     paid again for every single edit.
+        let produced_doc = Document::load_mem(&produced).unwrap();
+        timed("REBUILD the index for the new handle",
+            &mut || { let _ = crate::recover::indexes_for_document(&produced_doc); });
+
+        // 12. And what that rebuild BUYS. If the line the retype wrote can be
+        //     read with the old index too, the rebuild is paying sixteen
+        //     seconds for nothing and the index can simply be carried over.
+        let rebuilt = crate::recover::indexes_for_document(&produced_doc);
+        let with_old = crate::recover::read_page_with(&produced_doc, page, &indexes);
+        let with_new = crate::recover::read_page_with(&produced_doc, page, &rebuilt);
+        let says = |rs: &[crate::recover::Reading]| -> String {
+            rs.iter()
+                .find(|r| (r.y - line.y).abs() < 0.01)
+                .and_then(|r| r.text.clone())
+                .unwrap_or_else(|| "(unreadable)".into())
+        };
+        println!("\nthe retyped line, with the index carried over: {}", says(&with_old));
+        println!("the retyped line, with the index rebuilt:      {}", says(&with_new));
+
+        let readable = |rs: &[crate::recover::Reading]| rs.iter().filter(|r| r.text.is_some()).count();
+        println!("lines readable, carried over {} / rebuilt {} / of {}",
+            readable(&with_old), readable(&with_new), with_old.len());
+
+        crate::close_document(fresh);
+        crate::close_document(handle);
+    }
+
+    /// What THREE edits in a row do to the file, and whether the line an edit
+    /// wrote can be read back without rebuilding anything.
+    ///
+    /// Run with
+    ///   cargo test --release --lib what_repeated_edits_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_repeated_edits_cost() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let mut bytes = std::fs::read(FILE).unwrap();
+        println!("the file starts at {} KB", bytes.len() / 1024);
+
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+
+        let read = crate::recover::read_page_with(&doc, page, &indexes);
+        let first = read.iter().find(|r| r.text.is_some()).expect("nothing read");
+        let baseline = first.y;
+        let mut says = first.text.clone().unwrap();
+
+        for round in 1..=3 {
+            let now = format!("{} {round}", says.trim());
+            let started = std::time::Instant::now();
+            let Ok(out) = retype(&bytes, 0, baseline, &says, &now, MYANMAR_TEXT, Some(&indexes))
+            else {
+                println!("edit {round}: REFUSED");
+                break;
+            };
+            let took = started.elapsed().as_secs_f64() * 1000.0;
+
+            // How many fonts the file now carries, and how big it is.
+            let after = Document::load_mem(&out).unwrap();
+            let fonts = after
+                .objects
+                .values()
+                .filter(|o| matches!(o, Object::Dictionary(d)
+                    if d.get(b"Subtype").ok().and_then(|x| x.as_name().ok()) == Some(b"Type0")))
+                .count();
+            println!("edit {round}: {took:>6.1} ms, file {} KB, {fonts} Type0 fonts",
+                out.len() / 1024);
+
+            // ⚠️ AND WHAT PDFIUM MAKES OF THE LINE JUST WRITTEN. Ayaan writes
+            // its runs with `/ActualText`, so a line it wrote may be readable
+            // by the ordinary route and need no index at all.
+            let handle = crate::open_document_from_bytes_inner(out.as_ptr(), out.len());
+            if handle != 0 {
+                let seen = crate::tests::texts_of(handle);
+                let mine = seen.iter().find(|s| s.contains('\u{1021}'));
+                println!("   PDFium reads: {:?}", mine.map(|s| s.chars().take(40).collect::<String>()));
+                crate::close_document(handle);
+            }
+
+            // And what recovery makes of it with the index already in hand.
+            let with_old = crate::recover::read_page_with(&after, page, &indexes);
+            let back = with_old
+                .iter()
+                .find(|r| (r.y - baseline).abs() < 0.01)
+                .and_then(|r| r.text.clone());
+            println!("   recovery reads: {:?}",
+                back.as_ref().map(|s| s.chars().take(40).collect::<String>()));
+
+            match back {
+                Some(text) => {
+                    says = text;
+                    bytes = out;
+                }
+                None => {
+                    println!("   the line it just wrote cannot be read again, so a \
+                        second edit of it is refused from here");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// ⚠️ AN EDIT TOUCHES ONE PAGE AND ONE LINE OF IT. The writer hands back
+    /// a whole new document because it changes the file's structure, and the
+    /// question that matters is not whether the BYTES differ but whether
+    /// anything else on the paper does. Every other page's drawing must come
+    /// back operation for operation, and every other line of the edited page
+    /// must still say what it said.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn an_edit_leaves_every_other_page_and_line_alone() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let indexes = crate::recover::indexes_for_document(&doc);
+
+        let edited = pages[0];
+        let read = crate::recover::read_page_with(&doc, edited, &indexes);
+        let line = read.iter().find(|r| r.text.is_some()).expect("nothing read");
+        let was = line.text.clone().unwrap();
+        let now = format!("{} X", was.trim());
+
+        let out = retype(&bytes, 0, line.y, &was, &now, MYANMAR_TEXT, Some(&indexes))
+            .expect("refused");
+        let after = Document::load_mem(&out).unwrap();
+        let after_pages: Vec<ObjectId> = after.get_pages().values().copied().collect();
+        assert_eq!(after_pages.len(), pages.len(), "the edit changed the page count");
+
+        // Every page but the edited one draws exactly what it drew.
+        for (i, (&before, &now_page)) in pages.iter().zip(&after_pages).enumerate().skip(1) {
+            let a = Content::decode(&doc.get_page_content(before)).unwrap();
+            let b = Content::decode(&after.get_page_content(now_page)).unwrap();
+            assert_eq!(a.operations.len(), b.operations.len(),
+                "page {i} is drawn by a different number of operations now");
+            for (n, (x, y)) in a.operations.iter().zip(&b.operations).enumerate() {
+                assert_eq!(x.operator, y.operator,
+                    "page {i} operation {n} changed");
+                assert_eq!(x.operands, y.operands,
+                    "page {i} operation {n} draws something else now");
+            }
+        }
+
+        // And every other line of the edited page still says what it said.
+        let now_read = crate::recover::read_page_with(&after, after_pages[0], &indexes);
+        for r in &read {
+            if (r.y - line.y).abs() < 0.01 {
+                continue;
+            }
+            let then = now_read.iter().find(|n| (n.y - r.y).abs() < 0.01);
+            assert_eq!(then.and_then(|n| n.text.clone()), r.text,
+                "the line at {:.2} changed, and it was not the one being edited", r.y);
+        }
+    }
+
+    /// ⚠️ AND THE EDIT SURVIVES BEING SAVED AND OPENED AGAIN. The writer works
+    /// on lopdf's object graph and the app hands the result to PDFium, so the
+    /// two have to agree about what was written.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn what_an_edit_wrote_is_still_there_after_a_save_and_a_reopen() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+
+        let read = crate::recover::read_page_with(&doc, page, &indexes);
+        let line = read.iter().find(|r| r.text.is_some()).expect("nothing read");
+        let was = line.text.clone().unwrap();
+        let now = format!("{} X", was.trim());
+
+        let out = retype(&bytes, 0, line.y, &was, &now, MYANMAR_TEXT, Some(&indexes))
+            .expect("refused");
+
+        // Through PDFium and back to disk, the way the app saves.
+        let handle = crate::open_document_from_bytes_inner(out.as_ptr(), out.len());
+        assert_ne!(handle, 0, "the produced file would not open");
+        let saved = crate::document_bytes(handle).expect("it would not save");
+        crate::close_document(handle);
+
+        let reopened = crate::open_document_from_bytes_inner(saved.as_ptr(), saved.len());
+        assert_ne!(reopened, 0, "the saved file would not open");
+
+        // ⚠️ READ BACK THROUGH PDFIUM, NOT THROUGH RECOVERY. Ayaan writes its
+        // runs with `/ActualText`, so the line it wrote is ordinary readable
+        // text: that is what makes a SECOND edit of it cheap, and it is the
+        // thing a save has to preserve.
+        let seen = crate::tests::texts_of(reopened);
+        crate::close_document(reopened);
+
+        let wanted: String = now.chars().filter(|c| !c.is_whitespace()).collect();
+        let found = seen.iter().any(|s| {
+            let bare: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            bare.contains(&wanted[..wanted.len().min(30)])
+        });
+        assert!(found, "the edited line is not in the saved file: {seen:?}");
+    }
+
     /// Page one of a file, rendered, so a claim about how it is set can be
     /// checked by looking at it.
     #[test]
