@@ -1788,6 +1788,20 @@ pub extern "C" fn recovery_progress(doc_handle: u64) -> i32 {
     recover::progress::percent().unwrap_or(-1)
 }
 
+/// The index this document has already been prepared with, if it has been.
+///
+/// ⚠️ NEVER WAITS. A slot held by whoever is building it means the twenty
+/// seconds is in progress, and the right thing for a caller here is to carry on
+/// without it rather than queue behind it.
+fn cached_indexes(doc_handle: u64) -> Option<Arc<recover::Indexes>> {
+    let slot = {
+        let all = lock(&core().recoveries);
+        all.get(&doc_handle).cloned()
+    }?;
+    let held = slot.try_lock().ok()?;
+    held.as_ref().map(Arc::clone)
+}
+
 fn already_prepared(doc_handle: u64, _page_index: i32) -> bool {
     let slot = {
         let all = lock(&core().recoveries);
@@ -1883,8 +1897,14 @@ pub extern "C" fn retype_recovered_line(
         let Some(bytes) = document_bytes(doc_handle) else {
             return ByteBuffer::err(STATUS_INVALID_INPUT);
         };
+        // ⚠️ LENT, NOT BUILT. The app has already reshaped this document's
+        // font to READ the line it is now retyping, so handing that index over
+        // turns forty seconds of work into none. Asked without blocking: if
+        // nothing has prepared the document, retype builds its own as before.
+        let ready = cached_indexes(doc_handle);
         match retype::retype(
             &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
+            ready.as_deref(),
         ) {
             Ok(out) => {
                 let mut boxed = out.into_boxed_slice();

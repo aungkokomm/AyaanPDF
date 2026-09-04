@@ -244,6 +244,17 @@ fn says_it(
 /// `expected` is what the caller believes the line says. The line is recovered
 /// again here and must still say it, so a stale selection cannot overwrite
 /// whatever has taken its place.
+/// ⚠️ AND THE INDEX IS LENT, NOT BUILT AGAIN. Reshaping a font into an index
+/// is about twenty seconds, and this used to do it TWICE for one keystroke:
+/// once to check the line still says what the caller thinks, and once more
+/// after embedding the font, on a document that had changed underneath it. The
+/// app has already built one to READ this line with, so a retype that built its
+/// own was paying forty seconds for an answer it was being handed.
+///
+/// ⚠️ ONE INDEX SERVES BOTH READS, before and after embedding. Embedding adds
+/// a font object; it does not renumber the subsets already there, and it is
+/// those the line is drawn with. `lent` is None only when nothing has prepared
+/// the document, and then one is built here as before.
 pub(crate) fn retype(
     bytes: &[u8],
     page_index: i32,
@@ -251,6 +262,7 @@ pub(crate) fn retype(
     expected: &str,
     new_text: &str,
     font_path: &str,
+    lent: Option<&crate::recover::Indexes>,
 ) -> Result<Vec<u8>, i32> {
     if new_text.is_empty() || expected.is_empty() {
         return Err(STATUS_INVALID_INPUT);
@@ -281,9 +293,16 @@ pub(crate) fn retype(
     // line the reader had shown and offered came back here as one that says
     // nothing, and the retype was refused with the text plainly on screen.
     // Two answers to "what does this line say" is one too many.
-    let indexes = crate::recover::indexes_for_document(&doc);
+    let built;
+    let indexes: &crate::recover::Indexes = match lent {
+        Some(ready) => ready,
+        None => {
+            built = crate::recover::indexes_for_document(&doc);
+            &built
+        }
+    };
     let lines = crate::recover::lines_of(&doc, page);
-    if !says_it(&lines, baseline, expected, &indexes, &face) {
+    if !says_it(&lines, baseline, expected, indexes, &face) {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     }
 
@@ -305,9 +324,14 @@ pub(crate) fn retype(
 
     // The line has to be found again: embedding rewrote the document, and the
     // operation indices it carries are indices into that document's stream.
-    let indexes = crate::recover::indexes_for_document(&doc);
+    //
+    // ⚠️ THE SAME INDEX AGAIN, NOT A SECOND ONE. Embedding added a font
+    // object and renumbered nothing: the line is still drawn with the subsets
+    // that were already there, under the same names, so the index built for
+    // them still reads it. Building another here was twenty seconds spent
+    // arriving at the answer already in hand.
     let lines = crate::recover::lines_of(&doc, page);
-    let Some(line) = the_one_that_says(&lines, baseline, expected, &indexes, &face) else {
+    let Some(line) = the_one_that_says(&lines, baseline, expected, indexes, &face) else {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     };
 
@@ -469,7 +493,7 @@ mod tests {
 \u{1000}\u{102F}\u{1015}\u{103A}\u{1005}\u{1000}\u{103A}\u{101D}\u{102D}\u{102F}\u{1004}\u{103A}\u{1038}\u{1019}\u{103E} \
 \u{1021}\u{101B}\u{102F}\u{1023}\u{103A}\u{1026}\u{1038} \
 \u{101B}\u{1031}\u{102C}\u{1004}\u{103A}\u{1014}\u{102E}\u{101E}\u{100A}\u{103A}";
-        let out = retype(&bytes, 0, line.y, &was, NOW, MYANMAR_TEXT)
+        let out = retype(&bytes, 0, line.y, &was, NOW, MYANMAR_TEXT, None)
             .expect("the retype was refused");
 
         // The replacement is the run set in our own font resource.

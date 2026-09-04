@@ -1867,6 +1867,58 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT: what a retype costs once the reading has been paid for.
+    ///
+    /// ⚠️ IT USED TO BUILD ITS OWN INDEX TWICE, once to check the line still
+    /// says what the caller thinks and once more after embedding the font, so
+    /// one keystroke cost about forty seconds on top of the twenty the reader
+    /// had already waited. The app has an index in hand by then, because it
+    /// read the line in order to offer it, so this asks what changes when it is
+    /// lent rather than rebuilt.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_a_retype_costs_with_and_without_the_index_it_could_borrow() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not here");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+
+        let started = std::time::Instant::now();
+        let indexes = indexes_for_document(&doc);
+        println!("preparing the document: {:.1?}", started.elapsed());
+
+        let read = read_page_with(&doc, page, &indexes);
+        let Some(line) = read.iter().find(|r| r.text.is_some()) else {
+            println!("nothing read");
+            return;
+        };
+        let was = line.text.clone().unwrap();
+        let now = format!("{was}\u{1000}");
+
+        let font = installed(&line.font).expect("no font for the line");
+
+        let lent = std::time::Instant::now();
+        let with = crate::retype::retype(&bytes, 0, line.y, &was, &now, font, Some(&indexes));
+        let lent = lent.elapsed();
+
+        let alone = std::time::Instant::now();
+        let without = crate::retype::retype(&bytes, 0, line.y, &was, &now, font, None);
+        let alone = alone.elapsed();
+
+        println!("retype with the index lent:  {:.1?}  ({})",
+            lent, if with.is_ok() { "wrote" } else { "refused" });
+        println!("retype building its own:     {:.1?}  ({})",
+            alone, if without.is_ok() { "wrote" } else { "refused" });
+
+        // ⚠️ AND THE SAME ANSWER EITHER WAY. A borrowed index that changed the
+        // verdict would be a saving bought with correctness.
+        assert_eq!(with.is_ok(), without.is_ok(), "lending the index changed the answer");
+    }
+
     /// MEASUREMENT: is there anywhere inside a paragraph where a click lands on
     /// no line at all?
     ///
