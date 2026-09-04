@@ -161,16 +161,46 @@ fn advance_of(doc: &Document, page: ObjectId, line: &Line) -> Option<f64> {
 /// the most visible thing an editor can do to a page.
 ///
 /// ⚠️ AND A LINE WITH NO SPACES CANNOT BE STRETCHED, so it is left at its
-/// natural width rather than having a gap invented inside a word.
-fn stretched(breaks: &[Break], by: f64) -> Vec<Break> {
-    if breaks.is_empty() || by == 0.0 {
-        return breaks.to_vec();
+/// Where a replacement's word spaces are, as indices into its OWN glyphs.
+///
+/// ⚠️ THE NEW TEXT'S SPACES, NEVER THE OLD LINE'S. This used to reuse the
+/// breaks the old line was read with, which are glyph indices into text that no
+/// longer exists: the replacement has a different number of glyphs in different
+/// places, so every one of those gaps landed somewhere arbitrary in it, and in
+/// Burmese that is usually between a consonant and the vowel sign that belongs
+/// to it. Measured in the running app on a real page: `အရှေ့` came out as
+/// `အရေ့` with its `ှ` sitting alone a space to the right, and gaps opened
+/// inside `မိုးကုပ်စက်ဝိုင်းမှ`. The justification slack was then added to those
+/// same wrong positions, which widened them.
+///
+/// ⚠️ AND THE GAP GOES AFTER THE SPACE, not in place of it. The replacement is
+/// set in a font embedded whole, so its spaces are real space glyphs with real
+/// advances and the words are already correctly apart. What is left to add is
+/// only the stretch the old line had.
+fn spaces_in(glyphs: &[crate::ShapedGlyph], text: &str) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for (i, g) in glyphs.iter().enumerate() {
+        let at = g.cluster as usize;
+        if text[at..].starts_with(' ') && out.last() != Some(&(i + 1)) {
+            out.push(i + 1);
+        }
     }
-    let each = by / breaks.len() as f64;
-    breaks
-        .iter()
-        .map(|b| Break { points: (b.points + each).max(0.0), ..*b })
-        .collect()
+    out
+}
+
+/// The justification the old line had, shared out across those spaces.
+///
+/// ⚠️ NOTHING TO SHARE IT ACROSS MEANS NOTHING IS ADDED. A line of one word has
+/// no spaces to stretch, and a replacement wider than the room it is going into
+/// cannot be squeezed: its own glyphs are as wide as they are. Either way the
+/// line simply ends where its letters end, which is honest, where spreading the
+/// difference between the letters would take a word apart.
+fn share(spaces: &[usize], by: f64) -> Vec<Break> {
+    if spaces.is_empty() || by <= 0.0 {
+        return Vec::new();
+    }
+    let each = by / spaces.len() as f64;
+    spaces.iter().map(|at| Break { at: *at, points: each }).collect()
 }
 
 /// The line on this baseline that reads as `expected`, if exactly one does.
@@ -275,22 +305,252 @@ pub(crate) fn retype(
     };
 
     let glyphs: Vec<u16> = provisioned.glyphs.iter().map(|g| g.id as u16).collect();
-    let kept: Vec<Break> = line
-        .breaks
-        .iter()
-        .copied()
-        .filter(|b| b.at < glyphs.len())
-        .collect();
+    let spaces = spaces_in(&provisioned.glyphs, new_text);
 
-    // Laid out once to find out how wide it comes, then again with the spaces
-    // adjusted so it ends where the old line ended.
-    let natural = lay_out(&glyphs, &kept, line.size, &widths);
+    // Laid out once as the shaper set it, to find out how wide it comes, then
+    // again with its own spaces opened so it ends where the old line ended.
+    let natural = lay_out(&glyphs, &[], line.size, &widths);
     let replacement = match advance_of(&doc, page, line) {
         Some(target) => {
-            let kept = stretched(&kept, target - natural.advance);
-            lay_out(&glyphs, &kept, line.size, &widths)
+            let gaps = share(&spaces, target - natural.advance);
+            lay_out(&glyphs, &gaps, line.size, &widths)
         }
         None => natural,
     };
     write_over(&doc, page, line, replacement, font_id, new_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MYANMAR_TEXT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
+
+    /// Every glyph of `text` as the writer will actually set it: shaped by the
+    /// installed Myanmar Text, which is the font it embeds.
+    fn shaped(text: &str) -> Vec<crate::ShapedGlyph> {
+        crate::provision::provision(Some(MYANMAR_TEXT), text, crate::shaped::SHAPING_SIZE)
+            .unwrap()
+            .glyphs
+    }
+
+    /// The index of every glyph that STARTS a drawn unit, and the end.
+    ///
+    /// A gap anywhere else is a gap inside a mark's own letter.
+    fn cluster_edges(glyphs: &[crate::ShapedGlyph]) -> Vec<usize> {
+        let mut edges = vec![0usize];
+        for (i, g) in glyphs.iter().enumerate().skip(1) {
+            if g.cluster != glyphs[i - 1].cluster {
+                edges.push(i);
+            }
+        }
+        edges.push(glyphs.len());
+        edges
+    }
+
+    /// ⚠️ THE BUG THIS FUNCTION EXISTS FOR. The replacement used to be
+    /// justified on the OLD line's break positions, which are glyph indices
+    /// into text that no longer exists. Seen in the running app on a real page:
+    /// `အရှေ့` came out as `အရေ့` with its `ှ` alone a space to the right, and
+    /// gaps opened inside `မိုးကုပ်စက်ဝိုင်းမှ`.
+    #[test]
+    fn a_replacement_opens_its_gaps_only_at_its_own_spaces() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        // Two words, one space: exactly one gap, and it follows the space.
+        const TEXT: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C} \u{1005}\u{102C}";
+        let glyphs = shaped(TEXT);
+        let spaces = spaces_in(&glyphs, TEXT);
+
+        assert_eq!(spaces.len(), 1, "{spaces:?} for the one space in {TEXT:?}");
+
+        let edges = cluster_edges(&glyphs);
+        assert!(edges.contains(&spaces[0]),
+            "a gap at glyph {} is inside a drawn unit; the edges are {edges:?}",
+            spaces[0]);
+    }
+
+    /// ⚠️ AND NEVER INSIDE A DRAWN UNIT, whichever way the text is written. A
+    /// gap between a consonant and its own vowel sign is the visible damage:
+    /// the mark ends up drawn a space away from the letter it belongs to.
+    #[test]
+    fn no_gap_ever_falls_inside_a_drawn_unit() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        for text in [
+            "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C} \u{1005}\u{102C}",
+            "\u{1021}\u{101B}\u{103E}\u{1031}\u{1037} \u{1019}\u{102D}\u{102F}\u{1038}",
+            "\u{1000} \u{1001} \u{1002} \u{1003}",
+            "one two three",
+        ] {
+            let glyphs = shaped(text);
+            let edges = cluster_edges(&glyphs);
+            for at in spaces_in(&glyphs, text) {
+                assert!(edges.contains(&at),
+                    "in {text:?} a gap at glyph {at} is inside a unit: {edges:?}");
+            }
+        }
+    }
+
+    /// One space means one gap, however many glyphs the words either side of it
+    /// happen to need.
+    #[test]
+    fn a_gap_for_every_space_and_no_others() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const THREE: &str = "\u{1000} \u{1001} \u{1002}";
+        let glyphs = shaped(THREE);
+        assert_eq!(spaces_in(&glyphs, THREE).len(), 2);
+    }
+
+    /// A line of one word has nothing to stretch, and stretching it anyway
+    /// would take the word apart.
+    #[test]
+    fn a_line_with_no_spaces_is_not_stretched_at_all() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const ONE: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+        let spaces = spaces_in(&shaped(ONE), ONE);
+
+        assert!(spaces.is_empty());
+        assert!(share(&spaces, 40.0).is_empty(),
+            "a word was pulled apart to fill the line");
+    }
+
+    /// A replacement wider than the room it is going into cannot be squeezed:
+    /// its own glyphs are as wide as they are.
+    /// What the writer actually PUT IN THE FILE, read back out of it.
+    ///
+    /// ⚠️ THE ONLY TEST HERE THAT WOULD HAVE CAUGHT THE BUG. The two above it
+    /// check functions that did not exist while it was live, so they pin the
+    /// fix but cannot fail on the code that had it. This walks the replacement
+    /// the writer wrote and demands every gap in it fall where the shaper says
+    /// one drawn unit ends. Reverting `spaces_in`/`share` to the old
+    /// `line.breaks` makes it fail.
+    ///
+    /// ⚠️ AND READING THE PAGE BACK IS NOT ENOUGH, which is why this looks at
+    /// the stream. Recovery only turns a gap into a space where it can prove
+    /// both sides, so a gap dropped inside a cluster is passed over and the
+    /// text reads back perfectly while the page is visibly damaged.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn the_gaps_the_writer_leaves_in_the_file_are_all_between_drawn_units() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+
+        // The first line the page will let us read, and a replacement of a
+        // quite different length so the old positions cannot accidentally fit.
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = crate::recover::indexes_for(&doc, page);
+        let read = crate::recover::read_page_with(&doc, page, &indexes);
+        let line = read.iter().find(|r| r.text.is_some()).expect("nothing read");
+        let was = line.text.clone().unwrap();
+
+        // ⚠️ LONG ENOUGH THAT THE OLD LINE'S POSITIONS FALL INSIDE IT. A short
+        // replacement sends every stale index off the end, where it is filtered
+        // away, and that hides the damage instead of showing it.
+        const NOW: &str = "\u{1021}\u{101B}\u{103E}\u{1031}\u{1037}\u{1019}\u{102D}\u{102F}\u{1038}\
+\u{1000}\u{102F}\u{1015}\u{103A}\u{1005}\u{1000}\u{103A}\u{101D}\u{102D}\u{102F}\u{1004}\u{103A}\u{1038}\u{1019}\u{103E} \
+\u{1021}\u{101B}\u{102F}\u{1023}\u{103A}\u{1026}\u{1038} \
+\u{101B}\u{1031}\u{102C}\u{1004}\u{103A}\u{1014}\u{102E}\u{101E}\u{100A}\u{103A}";
+        let out = retype(&bytes, 0, line.y, &was, NOW, MYANMAR_TEXT)
+            .expect("the retype was refused");
+
+        // The replacement is the run set in our own font resource.
+        let after = Document::load_mem(&out).unwrap();
+        let (_, &page) = after.get_pages().iter().next().unwrap();
+        let content = Content::decode(&after.get_page_content(page)).unwrap();
+
+        let mut ours = false;
+        let mut run: Option<Vec<Object>> = None;
+        for op in &content.operations {
+            match op.operator.as_str() {
+                "Tf" => {
+                    ours = matches!(op.operands.first(), Some(Object::Name(n)) if n == RESOURCE);
+                }
+                "TJ" if ours => {
+                    if let Some(Object::Array(a)) = op.operands.first() {
+                        run = Some(a.clone());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let run = run.expect("the replacement is not in the file");
+
+        // Walk it: strings are glyphs, numbers are gaps between them.
+        let mut at = 0usize;
+        let mut gaps: Vec<usize> = Vec::new();
+        for item in &run {
+            match item {
+                Object::String(b, _) => at += b.len() / 2,
+                Object::Real(_) | Object::Integer(_) => gaps.push(at),
+                _ => {}
+            }
+        }
+
+        let glyphs = shaped(NOW);
+        assert_eq!(at, glyphs.len(), "the run does not draw the new text");
+
+        // ⚠️ AT THE SPACES THEMSELVES, NOT MERELY SOMEWHERE HARMLESS. Asking
+        // only that each gap fall on a unit boundary was measured PASSING on
+        // the broken code for one replacement out of two: stale positions can
+        // land on a boundary by luck, and one that does is still a gap in the
+        // wrong place. The positions the writer should have chosen are known
+        // exactly, so demand exactly those.
+        assert_eq!(gaps, spaces_in(&glyphs, NOW),
+            "the writer put its gaps at {gaps:?}, not at the new text's spaces");
+
+        // Said again the way the damage shows on the page, so a failure names
+        // it: a gap inside a unit draws a mark a space away from its letter.
+        let edges = cluster_edges(&glyphs);
+        for gap in &gaps {
+            assert!(edges.contains(gap),
+                "the writer left a gap at glyph {gap}, which is inside a drawn \
+                 unit; the units start at {edges:?}");
+        }
+
+        // ⚠️ AND THE LINE DID NOT MOVE. The replacement is spliced at the first
+        // operation the line was drawn by, so it begins wherever that
+        // operation's pen already was; anything else and the paragraph's left
+        // edge would step in or out by however far the writer was off.
+        let before = crate::recover::lines_of(&doc, page);
+        let after_lines = crate::recover::lines_of(&after, page);
+        let was_at = crate::recover::lines_at(&before, line.y)
+            .map(|l| l.x)
+            .next()
+            .expect("the line was not there to start with");
+        let now_at = crate::recover::lines_at(&after_lines, line.y)
+            .map(|l| l.x)
+            .next()
+            .expect("the line is gone");
+        assert!((now_at - was_at).abs() < 0.01,
+            "the line started at {was_at:.2} and now starts at {now_at:.2}");
+    }
+
+    #[test]
+    fn nothing_is_taken_away_when_the_replacement_is_too_wide() {
+        assert!(share(&[3, 7], -20.0).is_empty());
+        assert!(share(&[3, 7], 0.0).is_empty());
+    }
+
+    #[test]
+    fn the_stretch_is_shared_equally_between_the_spaces() {
+        let gaps = share(&[3, 7, 11], 30.0);
+
+        assert_eq!(gaps.iter().map(|g| g.at).collect::<Vec<_>>(), vec![3, 7, 11]);
+        for g in &gaps {
+            assert!((g.points - 10.0).abs() < 1e-9, "{g:?}");
+        }
+    }
 }
