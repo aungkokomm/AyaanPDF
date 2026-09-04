@@ -47,38 +47,104 @@ fn codes(ids: &[u16]) -> Object {
     )
 }
 
-/// Lays `glyphs` out as one run, putting the line's word spaces back.
+/// Lays `glyphs` out as one run, drawn where the SHAPER put them, and with the
+/// line's word spaces put back.
 ///
 /// ⚠️ A SPACE BETWEEN PLACEMENTS HAS NO GLYPH, so collapsing a line's placements
 /// into one run loses every one of them unless they are re-emitted as `TJ`
 /// numbers. Measured on a real page: one line's three spaces were 169, 36 and
 /// 200 thousandths wide, none of which any glyph would have drawn.
+///
+/// ⚠️ AND A PDF RUN CARRIES NO SHAPING. A viewer advances the pen by the width
+/// the FILE declares for each glyph and draws the next one there; it does not
+/// know that a Burmese mark belongs under the letter before it. The font here
+/// is embedded by PDFium, and measured on the reader's own line PDFium gives
+/// six of its marks the DEFAULT width of a full em where the shaper advances
+/// them by nothing at all. Every one of those opened an em of blank page after
+/// the mark: `\u{1021}\u{101B}\u{103E}\u{1031}\u{1037}` came out as `\u{1021}\u{101B}\u{1031}\u{1037}` with the medial stranded to the right,
+/// and the line was 79 thousandths of an em too wide for every mark in it.
+///
+/// So every glyph the file would advance differently carries a `TJ` number
+/// correcting the pen to the shaper's advance, and a glyph the shaper nudged
+/// sideways is moved there and back around its own placement.
+///
+/// ⚠️ A MARK RAISED OR LOWERED CANNOT BE EXPRESSED HERE. A `TJ` number moves
+/// the pen along the line and nothing else, so a `y_offset` is dropped. Neither
+/// of the two faces this writer is used with asks for one: measured over the
+/// reader's page, none of 43 glyphs was raised or lowered by any amount.
 pub(crate) fn lay_out(
-    glyphs: &[u16],
+    glyphs: &[crate::ShapedGlyph],
     breaks: &[Break],
     size: f64,
     widths: &crate::shaped::CidWidths,
 ) -> Replacement {
+    // The shaper works at `SHAPING_SIZE`, so its advances are already in
+    // thousandths of an em when that size is 1000. Written as the ratio so it
+    // stays right if the size ever changes.
+    let per_mille = 1000.0 / crate::shaped::SHAPING_SIZE as f64;
+
     let mut run: Vec<Object> = Vec::new();
+    let mut pending: Vec<u16> = Vec::new();
+    // Everything the run advances by, in thousandths of the type size.
     let mut advance = 0.0f64;
-    let mut from = 0usize;
+    // A correction too small to be worth a number of its own, kept until it is.
+    let mut owed = 0.0f64;
 
-    for gap in breaks {
-        if gap.at <= from || gap.at > glyphs.len() {
-            continue;
+    // A number can only follow the glyphs drawn so far, so anything held back
+    // is written out first.
+    //
+    // ⚠️ A CORRECTION TOO SMALL TO WRITE IS OWED, NOT DROPPED. Most glyphs
+    // differ from the file's declared width only by the rounding in its own
+    // tables, a thousandth of an em or less, and a number for each would treble
+    // the length of the run. But dropping them lets the error walk: measured on
+    // one real line, fifteen glyphs of rounding had already moved the pen 1.2
+    // thousandths, and a long line drifts further with every one. Carried
+    // forward, the run stays short and the pen stays exact.
+    fn put(run: &mut Vec<Object>, pending: &mut Vec<u16>, owed: &mut f64, by: f64) {
+        *owed += by;
+        if owed.abs() < 0.5 {
+            return;
         }
-        run.push(codes(&glyphs[from..gap.at]));
-        // A positive `TJ` number moves the pen LEFT, so opening a space is a
-        // negative one, in thousandths of the type size.
-        run.push(Object::Real((-(gap.points / size * 1000.0)) as f32));
-        advance += gap.points;
-        from = gap.at;
+        if !pending.is_empty() {
+            run.push(codes(pending));
+            pending.clear();
+        }
+        run.push(Object::Real(*owed as f32));
+        *owed = 0.0;
     }
-    run.push(codes(&glyphs[from..]));
 
-    let drawn: f64 = glyphs.iter().map(|g| widths.of(*g)).sum();
-    advance += drawn / 1000.0 * size;
-    Replacement { run, advance }
+    for (i, g) in glyphs.iter().enumerate() {
+        // The word space asked for before this glyph. A positive `TJ` number
+        // moves the pen LEFT, so opening a space is a negative one.
+        for gap in breaks.iter().filter(|b| b.at == i) {
+            let wide = gap.points / size * 1000.0;
+            put(&mut run, &mut pending, &mut owed, -wide);
+            advance += wide;
+        }
+
+        let asked = g.x_advance as f64 * per_mille;
+        let sideways = g.x_offset as f64 * per_mille;
+
+        put(&mut run, &mut pending, &mut owed, -sideways);
+        pending.push(g.id as u16);
+        // Back to where the pen should be: undo the nudge, and take off
+        // whatever the file's own width added over the shaper's advance.
+        put(&mut run, &mut pending, &mut owed, sideways + widths.of(g.id as u16) - asked);
+        advance += asked;
+    }
+
+    // A space asked for after the last glyph, which is what a line recovered
+    // with a trailing space leaves behind.
+    for gap in breaks.iter().filter(|b| b.at >= glyphs.len()) {
+        let wide = gap.points / size * 1000.0;
+        put(&mut run, &mut pending, &mut owed, -wide);
+        advance += wide;
+    }
+
+    if !pending.is_empty() {
+        run.push(codes(&pending));
+    }
+    Replacement { run, advance: advance / 1000.0 * size }
 }
 
 /// Puts `replacement` where `line` was drawn, in a font of our own.
@@ -149,7 +215,16 @@ fn advance_of(doc: &Document, page: ObjectId, line: &Line) -> Option<f64> {
     let (_, widths) = fonts.get(&line.resource)?;
     let widths = widths.as_ref()?;
     let drawn: f64 = line.glyphs.iter().map(|g| widths.of(*g)).sum();
-    Some((drawn + line.adjust) / 1000.0 * line.size)
+    // ⚠️ AND THE GAPS BETWEEN ITS PLACEMENTS, WHICH ARE NOT IN `adjust`. A
+    // producer draws one line in several placements and the space between two
+    // of them is made by starting the next one further along, not by any
+    // number inside a run. `merge_placements` keeps those as `breaks` for
+    // exactly this reason, and leaving them out measured the reader's own line
+    // 46.7 points shorter than it is: the replacement was told it was already
+    // too wide, no stretch was shared into it at all, and the line came back
+    // with its right edge pulled 46.7 points in from the margin.
+    let gaps: f64 = line.breaks.iter().map(|b| b.points).sum();
+    Some((drawn + line.adjust) / 1000.0 * line.size + gaps)
 }
 
 /// Widens or narrows the line's word spaces so the replacement ends where the
@@ -335,16 +410,16 @@ pub(crate) fn retype(
         return Err(STATUS_LINE_NOT_REWRITABLE);
     };
 
-    let glyphs: Vec<u16> = provisioned.glyphs.iter().map(|g| g.id as u16).collect();
-    let spaces = spaces_in(&provisioned.glyphs, new_text);
+    let glyphs = &provisioned.glyphs;
+    let spaces = spaces_in(glyphs, new_text);
 
     // Laid out once as the shaper set it, to find out how wide it comes, then
     // again with its own spaces opened so it ends where the old line ended.
-    let natural = lay_out(&glyphs, &[], line.size, &widths);
+    let natural = lay_out(glyphs, &[], line.size, &widths);
     let replacement = match advance_of(&doc, page, line) {
         Some(target) => {
             let gaps = share(&spaces, target - natural.advance);
-            lay_out(&glyphs, &gaps, line.size, &widths)
+            lay_out(glyphs, &gaps, line.size, &widths)
         }
         None => natural,
     };
@@ -519,19 +594,62 @@ mod tests {
         }
         let run = run.expect("the replacement is not in the file");
 
-        // Walk it: strings are glyphs, numbers are gaps between them.
+        // Walk the run the way a viewer does: a string draws its glyphs at the
+        // pen, advancing it by the width the FILE declares, and a number moves
+        // the pen along the line. Every glyph should be drawn exactly where the
+        // shaper put it, plus whatever stretch has been opened before it.
+        let glyphs = shaped(NOW);
+        // ⚠️ THE WRITER'S FONT, FOUND BY THE NAME THE WRITER GAVE IT. Asking
+        // for one whose BaseFont ends in "MyanmarText" finds the PAGE's own
+        // subset first, and measuring the replacement with the widths of the
+        // font it is not set in reports every mark 363 thousandths out.
+        let named = crate::recover::fonts_of(&after, page);
+        let embedded = named
+            .get(RESOURCE)
+            .and_then(|(_, w)| w.as_ref())
+            .expect("the replacement's font is not named on the page");
+
+        let mut pen = 0.0f64;
+        let mut shaper = 0.0f64;
+        let mut stretch = 0.0f64;
+        let mut opened: Vec<usize> = Vec::new();
         let mut at = 0usize;
-        let mut gaps: Vec<usize> = Vec::new();
+
         for item in &run {
             match item {
-                Object::String(b, _) => at += b.len() / 2,
-                Object::Real(_) | Object::Integer(_) => gaps.push(at),
+                Object::String(b, _) => {
+                    for pair in b.chunks(2) {
+                        assert!(at < glyphs.len(), "the run draws more than the text has");
+                        let id = u16::from_be_bytes([pair[0], pair[1]]);
+                        assert_eq!(id, glyphs[at].id as u16,
+                            "glyph {at} of the run is not the glyph the shaper made");
+
+                        // Where this glyph SHOULD be drawn.
+                        let want = shaper + stretch + glyphs[at].x_offset as f64;
+                        let off = pen - want;
+
+                        // A jump forward here is a word space being opened, and
+                        // it is only allowed where the new text has one.
+                        if off > 1.0 {
+                            opened.push(at);
+                            stretch += off;
+                        } else {
+                            assert!(off.abs() <= 1.0,
+                                "glyph {at} is drawn {off:.1} thousandths from \
+                                 where the shaper put it");
+                        }
+
+                        pen += embedded.of(id);
+                        shaper += glyphs[at].x_advance as f64;
+                        at += 1;
+                    }
+                }
+                Object::Real(v) => pen -= *v as f64,
+                Object::Integer(v) => pen -= *v as f64,
                 _ => {}
             }
         }
-
-        let glyphs = shaped(NOW);
-        assert_eq!(at, glyphs.len(), "the run does not draw the new text");
+        assert_eq!(at, glyphs.len(), "the run does not draw the whole text");
 
         // ⚠️ AT THE SPACES THEMSELVES, NOT MERELY SOMEWHERE HARMLESS. Asking
         // only that each gap fall on a unit boundary was measured PASSING on
@@ -539,13 +657,16 @@ mod tests {
         // land on a boundary by luck, and one that does is still a gap in the
         // wrong place. The positions the writer should have chosen are known
         // exactly, so demand exactly those.
-        assert_eq!(gaps, spaces_in(&glyphs, NOW),
-            "the writer put its gaps at {gaps:?}, not at the new text's spaces");
+        //
+        // ⚠️ AND THE STRETCH GOES BEFORE THE GLYPH THAT FOLLOWS THE SPACE,
+        // which is the index `spaces_in` names.
+        assert_eq!(opened, spaces_in(&glyphs, NOW),
+            "the writer opened space at {opened:?}, not at the new text's spaces");
 
         // Said again the way the damage shows on the page, so a failure names
         // it: a gap inside a unit draws a mark a space away from its letter.
         let edges = cluster_edges(&glyphs);
-        for gap in &gaps {
+        for gap in &opened {
             assert!(edges.contains(gap),
                 "the writer left a gap at glyph {gap}, which is inside a drawn \
                  unit; the units start at {edges:?}");
@@ -567,6 +688,379 @@ mod tests {
             .expect("the line is gone");
         assert!((now_at - was_at).abs() < 0.01,
             "the line started at {was_at:.2} and now starts at {now_at:.2}");
+    }
+
+    /// Page one of a file, rendered, so a claim about how it is set can be
+    /// checked by looking at it.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_a_page_actually_looks_like() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let out_dir = std::env::temp_dir().join("ayaan-retype-probe");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let to = out_dir.join("page.bgra").to_string_lossy().into_owned();
+        raster(&std::fs::read(FILE).unwrap(), &to);
+        println!("wrote {to}");
+    }
+
+    /// Page one of `pdf`, rendered, written as width, height and BGRA bytes so
+    /// the result can be looked at instead of described.
+    fn raster(pdf: &[u8], to: &str) {
+        // The open takes the call lock itself, so taking it here first is a
+        // deadlock: hold it only over the render.
+        let handle = crate::open_document_from_bytes_inner(pdf.as_ptr(), pdf.len());
+        assert_ne!(handle, 0, "the produced file would not open");
+        let _guard = crate::call_guard();
+        let doc = crate::lock(&crate::core().documents).get(&handle).cloned().unwrap();
+        let g = crate::lock(&doc);
+        let page = g.pages().get(0).unwrap();
+        let (w, h, bgra) = crate::render_page_via_pdfium_page(&page, 1400).unwrap();
+        drop(page);
+        drop(g);
+        drop(doc);
+        let mut out = format!("{w} {h}\n").into_bytes();
+        out.extend_from_slice(&bgra);
+        std::fs::write(to, out).unwrap();
+        drop(_guard);
+        crate::close_document(handle);
+    }
+
+    /// ⚠️ NOT A REGRESSION TEST. What the writer actually leaves in the file
+    /// when it retypes a line of the reader's OWN page, printed operand by
+    /// operand, because reading the page back cannot see a gap dropped inside a
+    /// cluster and the damage the reader reported is exactly that.
+    ///
+    /// Run with
+    ///   cargo test --lib what_the_writer_puts_on_the_users_page -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF and fonts that are not in this repository"]
+    fn what_the_writer_puts_on_the_users_page() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        const FONT: &str = MYANMAR_TEXT;
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(FONT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let read = crate::recover::read_page_with(&doc, page, &indexes);
+
+        // Every line the page draws, and how it is drawn, so a line made of
+        // more than one text object shows up as one.
+        let lines = crate::recover::lines_of(&doc, page);
+        println!("\n=== the page's lines ===");
+        for (i, l) in lines.iter().enumerate() {
+            let says = read
+                .iter()
+                .find(|r| (r.y - l.y).abs() < 1e-9)
+                .and_then(|r| r.text.clone());
+            println!(
+                "{i:>3}  y={:9.3} x={:8.3} size={:5.2} font={:<24} ops={:>3} glyphs={:>4} {}",
+                l.y, l.x, l.size, l.base_font, l.drawn_by.len(), l.glyphs.len(),
+                match &says { Some(t) => format!("“{t}”"), None => "-".into() }
+            );
+        }
+
+        // The line the reader was editing when the damage appeared.
+        let Some(target) = read.iter().find(|r| {
+            r.text.as_deref().is_some_and(|t| t.starts_with("\u{1021}\u{101B}\u{103E}\u{1031}"))
+        }) else {
+            println!("that line is not on this page");
+            return;
+        };
+        let was = target.text.clone().unwrap();
+        println!("\n=== the line ===\ny        {:.4}", target.y);
+        println!("expected “{was}”  ({} chars, ends in a space: {})",
+            was.chars().count(), was.ends_with(' '));
+
+        // ⚠️ HOW MANY LINES SIT ON THAT BASELINE. `write_over` empties the
+        // operations of ONE of them; anything else on the same baseline goes on
+        // drawing its old glyphs underneath the replacement.
+        let sharing: Vec<&Line> = crate::recover::lines_at(&lines, target.y).collect();
+        println!("lines on this baseline: {}", sharing.len());
+        for l in &sharing {
+            println!("   x={:8.3} ops={:>3} glyphs={:>4} adjust={:.1} drawn_by={:?}",
+                l.x, l.drawn_by.len(), l.glyphs.len(), l.adjust, l.drawn_by);
+            println!("   breaks {:?}",
+                l.breaks.iter().map(|b| (b.at, (b.points * 10.0).round() / 10.0))
+                    .collect::<Vec<_>>());
+        }
+
+        // ⚠️ WHAT THE APP SENDS, WHICH IS TRIMMED. `EditSelectedLine` trims
+        // before it hands the text over, so a line recovered with a trailing
+        // space is replaced by one without it.
+        let now = format!("{} X", was.trim());
+        println!("new      “{now}”");
+
+        let out = retype(&bytes, 0, target.y, &was, &now, FONT, Some(&indexes))
+            .expect("the retype was refused");
+
+        // Both files on disk, so the result can be LOOKED AT rather than
+        // reasoned about.
+        let out_dir = std::env::temp_dir().join("ayaan-retype-probe");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let at = |name: &str| out_dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(at("before.pdf"), &bytes).unwrap();
+        std::fs::write(at("after.pdf"), &out).unwrap();
+        println!("wrote {}", out_dir.display());
+        raster(&bytes, &at("before.bgra"));
+        raster(&out, &at("after.bgra"));
+
+        let after = Document::load_mem(&out).unwrap();
+        let (_, &page_after) = after.get_pages().iter().next().unwrap();
+        let content = Content::decode(&after.get_page_content(page_after)).unwrap();
+
+        let mut ours = false;
+        let mut run: Option<Vec<Object>> = None;
+        for op in &content.operations {
+            match op.operator.as_str() {
+                "Tf" => {
+                    ours = matches!(op.operands.first(), Some(Object::Name(n)) if n == RESOURCE);
+                }
+                "TJ" if ours => {
+                    if let Some(Object::Array(a)) = op.operands.first() {
+                        run = Some(a.clone());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let run = run.expect("the replacement is not in the file");
+
+        let mut at = 0usize;
+        let mut gaps: Vec<(usize, f64)> = Vec::new();
+        print!("\n=== the run ===\n");
+        for item in &run {
+            match item {
+                Object::String(b, _) => {
+                    print!("[{} glyphs]", b.len() / 2);
+                    at += b.len() / 2;
+                }
+                Object::Real(v) => {
+                    print!(" {v:.1} ");
+                    gaps.push((at, *v as f64));
+                }
+                Object::Integer(v) => {
+                    print!(" {v} ");
+                    gaps.push((at, *v as f64));
+                }
+                _ => print!("?"),
+            }
+        }
+        println!("\ntotal {at} glyphs, {} gaps", gaps.len());
+
+        let glyphs = crate::provision::provision(Some(FONT), &now, crate::shaped::SHAPING_SIZE)
+            .unwrap()
+            .glyphs;
+        println!("the shaper makes {} glyphs of that text", glyphs.len());
+        println!("gaps at        {:?}", gaps.iter().map(|g| g.0).collect::<Vec<_>>());
+        println!("its spaces at  {:?}", spaces_in(&glyphs, &now));
+
+        let mut edges = vec![0usize];
+        for (i, g) in glyphs.iter().enumerate().skip(1) {
+            if g.cluster != glyphs[i - 1].cluster {
+                edges.push(i);
+            }
+        }
+        edges.push(glyphs.len());
+        for (at, _) in &gaps {
+            if !edges.contains(at) {
+                println!("{}  a gap at glyph {at} is INSIDE a drawn unit", "\u{26a0}");
+            }
+        }
+
+        // ⚠️ AND WHAT IS LEFT DRAWING. Every operation the line was drawn by
+        // should now draw nothing but the one that carries the replacement.
+        println!("\n=== what the page says now ===");
+        for r in crate::recover::read_page_with(&after, page_after, &indexes) {
+            println!("y={:9.3} {}", r.y,
+                match &r.text { Some(t) => format!("“{t}”"), None => "-".into() });
+        }
+    }
+
+    /// How far the writer's flat run is from the shaping it is meant to draw.
+    ///
+    /// A PDF text run has no shaping in it: the viewer advances the pen by the
+    /// font's own width for each glyph and draws it there. So a mark the shaper
+    /// placed under its consonant is drawn at the pen instead, and the pen then
+    /// moves on by the mark's nominal width. This counts, for one real line,
+    /// how many glyphs that is wrong for.
+    #[test]
+    #[ignore = "diagnostic, and needs a font that is not in this repository"]
+    fn how_much_of_the_shaping_a_flat_run_throws_away() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        const LINE: &str = "\u{1021}\u{101B}\u{103E}\u{1031}\u{1037}\u{1019}\u{102D}\u{102F}\u{1038}\u{1000}\u{102F}\u{1015}\u{103A}\u{1005}\u{1000}\u{103A}\u{101D}\u{102D}\u{102F}\u{1004}\u{103A}\u{1038}\u{1019}\u{103E} \u{1021}\u{101B}\u{102F}\u{1023}\u{103A}\u{1026}\u{1038} \u{101B}\u{1031}\u{102C}\u{1004}\u{103A}\u{1014}\u{102E}\u{101E}\u{100A}\u{103A}";
+
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let upem = face.units_per_em() as f64;
+        let glyphs = shaped(LINE);
+
+        let mut moved = 0usize;
+        let mut raised = 0usize;
+        let mut narrowed = 0usize;
+        println!("\n idx   gid   shaped_adv  font_adv   x_off   y_off");
+        for (i, g) in glyphs.iter().enumerate() {
+            // Everything in thousandths of an em, which is what a PDF run
+            // measures in.
+            let k = 1000.0 / crate::shaped::SHAPING_SIZE as f64;
+            let adv = g.x_advance as f64 * k;
+            let xo = g.x_offset as f64 * k;
+            let yo = g.y_offset as f64 * k;
+            let own = face
+                .glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(g.id as u16))
+                .map(|w| w as f64 * 1000.0 / upem)
+                .unwrap_or(0.0);
+
+            if xo.abs() > 0.5 { moved += 1; }
+            if yo.abs() > 0.5 { raised += 1; }
+            if (adv - own).abs() > 0.5 { narrowed += 1; }
+
+            if xo.abs() > 0.5 || yo.abs() > 0.5 || (adv - own).abs() > 0.5 {
+                println!("{i:>4} {:>5}  {adv:>10.1} {own:>9.1} {xo:>7.1} {yo:>7.1}",
+                    g.id);
+            }
+        }
+        println!("\n{} glyphs: {moved} moved sideways, {raised} raised or \
+            lowered, {narrowed} drawn at a width the font does not declare",
+            glyphs.len());
+
+        // And the widths the writer actually EMBEDS, which are what a viewer
+        // advances the pen by. Anything but the shaper's advance is a gap or an
+        // overlap on the page.
+        const HOST: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(HOST).exists() {
+            return;
+        }
+        let host = std::fs::read(HOST).unwrap();
+        let provisioned = crate::provision::provision(
+            Some(MYANMAR_TEXT), LINE, crate::shaped::SHAPING_SIZE).unwrap();
+        let (embedded, font_id) = crate::embed_for_shaping(&host, &provisioned).unwrap();
+        let doc = Document::load_mem(&embedded).unwrap();
+        let widths = crate::shaped::cid_widths(&doc, font_id).unwrap();
+
+        let mut wrong = 0usize;
+        let mut total_off = 0.0f64;
+        println!("\n idx   gid   shaped_adv   embedded_W    difference");
+        for (i, g) in glyphs.iter().enumerate() {
+            let k = 1000.0 / crate::shaped::SHAPING_SIZE as f64;
+            let adv = g.x_advance as f64 * k;
+            let w = widths.of(g.id as u16);
+            if (adv - w).abs() > 0.5 {
+                wrong += 1;
+                total_off += w - adv;
+                println!("{i:>4} {:>5}  {adv:>10.1} {w:>12.1} {:>13.1}",
+                    g.id, w - adv);
+            }
+        }
+        println!("\n{wrong} of {} glyphs are advanced by a width the shaper did \
+            not ask for, {total_off:.1} thousandths in total, which is \
+            {:.2} points at 10.56 point type",
+            glyphs.len(), total_off / 1000.0 * 10.56);
+    }
+
+    /// A glyph, as the shaper hands it over.
+    fn glyph(id: u32, advance: f32, offset: f32) -> crate::ShapedGlyph {
+        crate::ShapedGlyph {
+            id,
+            x_advance: advance,
+            x_offset: offset,
+            y_offset: 0.0,
+            cluster: 0,
+        }
+    }
+
+    /// Where the run's numbers are, and what they say: the glyph index each one
+    /// falls before, and its value.
+    fn numbers(run: &[Object]) -> Vec<(usize, f64)> {
+        let mut at = 0usize;
+        let mut out = Vec::new();
+        for item in run {
+            match item {
+                Object::String(b, _) => at += b.len() / 2,
+                Object::Real(v) => out.push((at, *v as f64)),
+                Object::Integer(v) => out.push((at, *v as f64)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// ⚠️ THE BUG THE READER PHOTOGRAPHED. A PDF run carries no shaping: the
+    /// viewer advances the pen by the width the FILE declares for each glyph
+    /// and draws the next one there. PDFium embeds the font this writer uses,
+    /// and measured on the reader's own line it gives six of the Burmese marks
+    /// the default width of a FULL EM where the shaper advances them by
+    /// nothing at all. Every one of those opened an em of blank page after the
+    /// mark and pushed it off the letter it belongs under: `\u{1021}\u{101B}\u{103E}\u{1031}\u{1037}` came out as
+    /// `\u{1021}\u{101B}\u{1031}\u{1037}` with the medial stranded to the right.
+    ///
+    /// So the run has to say what the shaper decided, glyph by glyph.
+    #[test]
+    fn a_mark_the_font_calls_an_em_wide_advances_by_the_nothing_the_shaper_asked_for() {
+        // A letter of half an em, then a mark the shaper does not advance at
+        // all, then another letter. The file calls the mark a full em, which is
+        // what a viewer would use.
+        let glyphs = [glyph(10, 500.0, 0.0), glyph(11, 0.0, 0.0), glyph(12, 500.0, 0.0)];
+        let widths = crate::shaped::CidWidths::of_these(1000.0, &[(10, 500.0), (12, 500.0)]);
+
+        let out = lay_out(&glyphs, &[], 10.0, &widths);
+
+        // The em the file would have added after the mark is taken straight
+        // back off, so the next letter is drawn against it.
+        assert_eq!(numbers(&out.run), vec![(2, 1000.0)],
+            "the mark was left advancing by the width the file declares");
+
+        // And the line is as wide as the shaper said, not an em wider.
+        assert!((out.advance - 10.0).abs() < 1e-9,
+            "the run advances by {} points, not the 10 the shaper asked for",
+            out.advance);
+    }
+
+    /// ⚠️ AND A GLYPH THE SHAPER MOVED SIDEWAYS IS DRAWN WHERE IT PUT IT.
+    /// Mark attachment is a horizontal nudge as well as a vertical one, and on
+    /// the reader's line fifteen of forty-three glyphs carry one.
+    #[test]
+    fn a_glyph_the_shaper_moved_sideways_is_drawn_where_it_put_it() {
+        // The mark is nudged 40 thousandths to the LEFT of the pen.
+        let glyphs = [glyph(10, 500.0, 0.0), glyph(11, 0.0, -40.0), glyph(12, 500.0, 0.0)];
+        let widths = crate::shaped::CidWidths::of_these(0.0, &[(10, 500.0), (12, 500.0)]);
+
+        let out = lay_out(&glyphs, &[], 10.0, &widths);
+
+        // Moved there before the mark is drawn, and taken back after it, so
+        // nothing downstream of the mark is shifted.
+        assert_eq!(numbers(&out.run), vec![(1, 40.0), (2, -40.0)],
+            "the nudge was dropped, or it was not undone");
+        assert!((out.advance - 10.0).abs() < 1e-9, "{}", out.advance);
+    }
+
+    /// ⚠️ AND THE WORD SPACES STILL GO IN, on top of all of that.
+    #[test]
+    fn the_line_s_word_spaces_are_still_opened_where_they_were_asked_for() {
+        let glyphs = [glyph(10, 500.0, 0.0), glyph(11, 500.0, 0.0)];
+        let widths = crate::shaped::CidWidths::of_these(0.0, &[(10, 500.0), (11, 500.0)]);
+
+        let out = lay_out(&glyphs, &[Break { at: 1, points: 2.0 }], 10.0, &widths);
+
+        // 2 points at 10 point type is 200 thousandths, opened rather than
+        // closed, so the number is negative.
+        assert_eq!(numbers(&out.run), vec![(1, -200.0)]);
+        assert!((out.advance - 12.0).abs() < 1e-9,
+            "the space was not counted into the width: {}", out.advance);
     }
 
     #[test]

@@ -52,6 +52,13 @@ impl CidWidths {
         self.by_cid.get(&cid).copied().unwrap_or(self.default)
     }
 
+    /// A set of widths made up for a test, so a writer can be asked what it
+    /// does with a font that declares a width the shaper disagrees with.
+    #[cfg(test)]
+    pub(crate) fn of_these(default: f64, listed: &[(u16, f64)]) -> Self {
+        CidWidths { default, by_cid: listed.iter().copied().collect() }
+    }
+
     /// Every CID the file lists a width for, which for a subset is every glyph
     /// the WHOLE DOCUMENT uses rather than only the ones on one page.
     pub(crate) fn declared(&self) -> impl Iterator<Item = u16> + use<'_> {
