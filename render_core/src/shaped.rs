@@ -51,6 +51,12 @@ impl CidWidths {
     pub(crate) fn of(&self, cid: u16) -> f64 {
         self.by_cid.get(&cid).copied().unwrap_or(self.default)
     }
+
+    /// Every CID the file lists a width for, which for a subset is every glyph
+    /// the WHOLE DOCUMENT uses rather than only the ones on one page.
+    pub(crate) fn declared(&self) -> impl Iterator<Item = u16> + use<'_> {
+        self.by_cid.keys().copied()
+    }
 }
 
 fn number(o: &Object) -> Option<f64> {

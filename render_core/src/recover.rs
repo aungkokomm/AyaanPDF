@@ -1564,6 +1564,144 @@ mod tests {
         }
     }
 
+    /// What the Myanmar files in the user's test folder are actually made of,
+    /// page by page. Diagnostic: the corpus this work has to cover.
+    #[test]
+    #[ignore = "needs Myanmar PDFs that are not in this repository"]
+    fn what_the_myanmar_corpus_looks_like() {
+        const FOLDER: &str = r"D:\Ayaan PDF Test file";
+        if !std::path::Path::new(FOLDER).exists() {
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(FOLDER)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.to_lowercase().contains("myanmar"))
+            })
+            .collect();
+        files.sort();
+
+        for file in &files {
+            let Ok(doc) = Document::load(file) else {
+                println!("{:?}: would not load", file.file_name().unwrap());
+                continue;
+            };
+            let pages = doc.get_pages();
+            println!("\n{:?}: {} page(s)", file.file_name().unwrap(), pages.len());
+
+            for (n, (_, &page)) in pages.iter().enumerate() {
+                let started = std::time::Instant::now();
+                let lines = lines_of(&doc, page);
+
+                // Every font the page's text is set in, and how many lines each.
+                let mut by_font: BTreeMap<String, usize> = BTreeMap::new();
+                for line in &lines {
+                    *by_font.entry(line.base_font.clone()).or_default() += 1;
+                }
+                let known: Vec<String> = by_font
+                    .keys()
+                    .map(|f| format!("{f} -> {:?}", installed(f).map(|p| {
+                        std::path::Path::new(p)
+                            .file_name().unwrap().to_str().unwrap().to_string()
+                    })))
+                    .collect();
+
+                let indexes = indexes_for(&doc, page);
+                let built = started.elapsed();
+                let read = read_page_with(&doc, page, &indexes);
+                let proven = read.iter().filter(|r| r.text.is_some()).count();
+
+                println!("  page {n}: {} runs, {} lines, {proven} read, \
+                          index {built:.1?}, whole page {:.1?}",
+                    lines.len(), read.len(), started.elapsed());
+                for f in &known {
+                    println!("      {f}");
+                }
+            }
+        }
+    }
+
+    /// What an index COSTS, against how many distinct characters it is asked to
+    /// cover. Diagnostic, and the number that decides whether a document of
+    /// many pages can share one index or must pay for each.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn what_an_index_costs_against_the_characters_it_covers() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+
+        // The characters this page actually uses, found the way indexes_for
+        // finds them: by reading the page and keeping what proved.
+        let doc = Document::load(FILE).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = indexes_for(&doc, page);
+        let read = read_page_with(&doc, page, &indexes);
+        let mut used: BTreeSet<char> = BTreeSet::new();
+        for r in &read {
+            if let Some(text) = &r.text {
+                used.extend(text.chars().filter(|c| !c.is_whitespace()));
+            }
+        }
+        println!("the page uses {} distinct characters", used.len());
+
+        // ⚠️ HOW IT SCALES IS THE WHOLE QUESTION. If the cost is roughly flat
+        // in the character count, a whole document can share ONE index and a
+        // reader pays once instead of once a page. If it climbs steeply, each
+        // page has to be narrowed to its own and there is nothing to share.
+        let whole_block: BTreeSet<char> = ('\u{1000}'..='\u{109F}').collect();
+        let half: BTreeSet<char> = used.iter().take(used.len() / 2).copied().collect();
+
+        for (what, chars) in [
+            ("half the page's characters", &half),
+            ("the page's own characters", &used),
+            ("the whole Myanmar block", &whole_block),
+        ] {
+            let started = std::time::Instant::now();
+            let index = crate::reshape::Index::build(&bytes, Some(chars), None);
+            println!("{:>28}: {:>3} chars, {:>8.1?}, {} spellings",
+                what, chars.len(), started.elapsed(),
+                index.map(|i| i.len()).unwrap_or(0));
+        }
+    }
+
+    /// How many glyphs a PAGE draws, against how many the DOCUMENT's embedded
+    /// subset declares. Diagnostic: the gap between them is what a
+    /// document-wide index would have to cover, and therefore pay for.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn how_much_wider_the_subset_is_than_one_page() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+
+        let mut drawn: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+        for line in lines_of(&doc, page) {
+            drawn.entry(line.base_font).or_default().extend(line.glyphs);
+        }
+
+        // What each font resource DECLARES, from the widths the file lists.
+        let fonts = fonts_of(&doc, page);
+        for (resource, (base_font, widths)) in &fonts {
+            let Some(w) = widths.as_ref() else { continue };
+            let declared = w.declared().count();
+            println!(
+                "{:>16} {base_font:<22} page draws {:>3}, file declares {declared}",
+                String::from_utf8_lossy(resource),
+                drawn.get(base_font).map(|g| g.len()).unwrap_or(0));
+        }
+    }
+
     fn a_subset_tag_is_not_part_of_the_font_s_name() {
         assert_eq!(installed("BCDEEE+MyanmarText"), installed("MyanmarText"));
         assert!(installed("BCDEEE+MyanmarText").is_some());
