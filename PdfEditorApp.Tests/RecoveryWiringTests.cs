@@ -233,6 +233,53 @@ public class RecoveryWiringTests
         Assert.Contains("prepare_recovery(_documentHandle, page)", body, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// ⚠️ A WORD ON A RECOVERED BASELINE IS A FRAGMENT OF THAT LINE, AND THE
+    /// LINE IS WHAT THE READER MEANT.
+    ///
+    /// RecoveredLines.Merge takes PDFium's refused fragments out of the LINE
+    /// list, and nothing was doing the same for the WORD list. A recovered
+    /// line's box is the FACE's height at its size rather than the leading the
+    /// page was set with, so a paragraph has stripes of nothing between its
+    /// lines: measured on a real file, five of one page's twenty-eight gaps are
+    /// wider than the hit tolerance can close, the worst fifteen points. A click
+    /// landing in one fell through to a scrambled fragment beginning with a
+    /// vowel sign, which spells nothing, and was then refused as uneditable
+    /// while the paragraph around it read perfectly.
+    /// </summary>
+    [Fact]
+    public void a_click_on_a_fragment_of_a_recovered_line_gets_the_line()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        int at = vm.IndexOf("public bool SelectTextUnitAt(\n        int pageIndex", StringComparison.Ordinal);
+        if (at < 0)
+        {
+            at = vm.IndexOf("public bool SelectTextUnitAt(\r\n        int pageIndex", StringComparison.Ordinal);
+        }
+        Assert.True(at > 0, "the selecting method is gone");
+
+        string body = vm[at..Math.Min(vm.Length, at + 3000)];
+
+        int found = body.IndexOf("var word = WordAt(pageIndex, normX, normY);", StringComparison.Ordinal);
+        int swapped = body.IndexOf("candidate.Recovered is null", StringComparison.Ordinal);
+        int picked = body.IndexOf("TextUnitSelection? picked =", StringComparison.Ordinal);
+
+        Assert.True(found > 0, "nothing looks for a word");
+        Assert.True(swapped > found, "a fragment is never traded for its line");
+        Assert.True(picked > swapped, "the trade happens after the unit has been chosen");
+
+        // ⚠️ ONLY WHEN THE LINE ITSELF DID NOT ANSWER. A click that landed
+        // squarely on an editable line must keep it; this exists for the ones
+        // that missed.
+        Assert.Contains("if (word is not null && line is not { CanEdit: true })",
+            body, StringComparison.Ordinal);
+
+        // And by baseline, which is the only thing a fragment and its line share.
+        Assert.Contains("Math.Abs(candidate.Baseline - word.Baseline) >= RecoveredWordTolerance",
+            body, StringComparison.Ordinal);
+    }
+
     private static string Source(params string[] parts)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

@@ -1867,6 +1867,68 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT: is there anywhere inside a paragraph where a click lands on
+    /// no line at all?
+    ///
+    /// ⚠️ THE APP FINDS A LINE BY ASKING WHICH BOX A POINT IS IN, and a
+    /// recovered line's box is the FACE's height at that size, not the leading
+    /// the page was set with. A generously leaded paragraph therefore has
+    /// STRIPES OF NOTHING between its lines, and a click landing in one falls
+    /// through to PDFium's word reader, which on a Burmese page returns
+    /// scrambled fragments. That is what "This text cannot be edited in place
+    /// yet" on a paragraph that reads perfectly actually means.
+    ///
+    /// This prints the gaps so the size of them is a number rather than a
+    /// guess. The app's tolerance is 0.004 of the page width.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn where_a_click_inside_a_paragraph_lands_on_no_line() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not here");
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let indexes = indexes_for_document(&doc);
+
+        // The app's own tolerance, from ViewportViewModel::LineAt.
+        const TOLERANCE: f64 = 0.004;
+
+        for (n, &page) in pages.iter().enumerate() {
+            let (_, page_top, page_w) = page_box(&doc, page).unwrap();
+            let mut read: Vec<&Reading> = Vec::new();
+            let all = read_page_with(&doc, page, &indexes);
+            read.extend(all.iter().filter(|r| r.text.is_some()));
+            if read.len() < 2 {
+                continue;
+            }
+
+            // Normalized the way the app draws: down from the top of the page,
+            // both axes over its WIDTH.
+            let mut boxes: Vec<(f64, f64)> = read
+                .iter()
+                .map(|r| ((page_top - r.top) / page_w, (page_top - r.bottom) / page_w))
+                .collect();
+            boxes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            let mut gaps: Vec<f64> = Vec::new();
+            for pair in boxes.windows(2) {
+                let gap = pair[1].0 - pair[0].1;
+                if gap > 0.0 {
+                    gaps.push(gap);
+                }
+            }
+            let dead = gaps.iter().filter(|g| **g > TOLERANCE * 2.0).count();
+            let worst = gaps.iter().cloned().fold(0.0f64, f64::max);
+
+            println!(
+                "page {n}: {} lines read, {} of {} gaps are wider than the tolerance can \
+                 close, worst {:.4} of the page width ({:.1} pt on this page)",
+                read.len(), dead, gaps.len(), worst, worst * page_w);
+        }
+    }
+
     /// MEASUREMENT: can one index serve a whole document, or must every page
     /// pay for its own?
     ///

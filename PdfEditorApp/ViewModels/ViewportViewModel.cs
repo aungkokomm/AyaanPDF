@@ -5255,6 +5255,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// pick's, because a line's bounds hug its glyphs just as tightly and
     /// clicking just under a baseline is still clicking the line.
     /// </summary>
+    /// <summary>
+    /// How close a word's baseline must be to a recovered line's to be a
+    /// fragment of it, as a fraction of the page width. About a point on A4.
+    /// </summary>
+    /// <remarks>
+    /// The same number <see cref="RecoveredLines"/> merges by, and for the same
+    /// reason: a fragment and its line share nothing but the line of type they
+    /// sit on.
+    /// </remarks>
+    private const double RecoveredWordTolerance = 0.002;
+
     private LineSnapshot? LineAt(int pageIndex, double normX, double normY)
     {
         const double Tolerance = 0.004;
@@ -5704,6 +5715,35 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         var line = LineAt(pageIndex, normX, normY);
         var word = WordAt(pageIndex, normX, normY);
+
+        // ⚠️ A WORD ON A RECOVERED BASELINE IS A FRAGMENT OF THAT LINE, AND THE
+        // LINE IS WHAT THE READER MEANT. RecoveredLines.Merge takes PDFium's
+        // refused fragments out of the LINE list, and nothing was doing the same
+        // for the WORD list, so a click that missed a line's box fell straight
+        // through to one of them.
+        //
+        // ⚠️ AND MISSING IS EASY. A recovered line's box is the FACE's height at
+        // its size, not the leading the page was set with, so a paragraph has
+        // stripes of nothing between its lines: measured on the reader's own
+        // file, five of page one's twenty-eight gaps are wider than the hit
+        // tolerance can close, the worst of them fifteen points. A click landing
+        // in one of those selected a scrambled fragment like "ုင်ိုးမှ", which
+        // begins with a vowel sign and spells nothing, and then refused to edit
+        // it. The paragraph read perfectly; only the aim was wrong.
+        if (word is not null && line is not { CanEdit: true })
+        {
+            foreach (var candidate in LinesFor(pageIndex))
+            {
+                if (candidate.Recovered is null) { continue; }
+                if (Math.Abs(candidate.Baseline - word.Baseline) >= RecoveredWordTolerance)
+                {
+                    continue;
+                }
+                line = candidate;
+                word = null;
+                break;
+            }
+        }
 
         TextUnitSelection? picked =
             line is { CanEdit: true } ? TextUnitSelection.From(pageIndex, line)

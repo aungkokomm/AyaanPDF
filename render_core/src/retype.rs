@@ -274,7 +274,14 @@ pub(crate) fn retype(
     // baseline only narrows the field, and a caller whose idea of the line has
     // gone stale finds nothing here rather than overwriting whatever took its
     // place.
-    let indexes = crate::recover::indexes_for(&doc, page);
+    //
+    // ⚠️ AND THE SAME INDEX THE READER USED, WHICH IS THE DOCUMENT'S. This was
+    // scoped to one PAGE while the app read with a document-wide one, so the
+    // writer's idea of what could be read was NARROWER than the reader's: a
+    // line the reader had shown and offered came back here as one that says
+    // nothing, and the retype was refused with the text plainly on screen.
+    // Two answers to "what does this line say" is one too many.
+    let indexes = crate::recover::indexes_for_document(&doc);
     let lines = crate::recover::lines_of(&doc, page);
     if !says_it(&lines, baseline, expected, &indexes, &face) {
         return Err(STATUS_LINE_NOT_REWRITABLE);
@@ -298,7 +305,7 @@ pub(crate) fn retype(
 
     // The line has to be found again: embedding rewrote the document, and the
     // operation indices it carries are indices into that document's stream.
-    let indexes = crate::recover::indexes_for(&doc, page);
+    let indexes = crate::recover::indexes_for_document(&doc);
     let lines = crate::recover::lines_of(&doc, page);
     let Some(line) = the_one_that_says(&lines, baseline, expected, &indexes, &face) else {
         return Err(STATUS_LINE_NOT_REWRITABLE);
