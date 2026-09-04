@@ -525,6 +525,12 @@ public class TextRegionWiringTests
         // milliseconds; doing it per scroll event would spend it continuously
         // for pages that are already off screen again.
         string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        // ⚠️ NORMALIZED FIRST. This repository is checked out with
+        // core.autocrlf, so whether a file arrives with CRLF or LF depends on
+        // the machine and on which tool last wrote it. An assertion that spans
+        // a blank line and names one of the two passes or fails for a reason
+        // having nothing to do with what it is checking.
+        vm = vm.Replace("\r\n", "\n");
         int sharpen = vm.IndexOf("SharpenVisiblePages();\n\n", StringComparison.Ordinal);
         Assert.True(sharpen > 0, "the sharpen debounce is no longer where regions ride");
         Assert.Contains("RefreshTextRegions();",

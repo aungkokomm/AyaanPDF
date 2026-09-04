@@ -1882,6 +1882,70 @@ pub extern "C" fn retype_recovered_line(
     .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
 }
 
+/// Which lines belong to the same paragraph as the one at `baseline`.
+///
+/// Encoding: a `u32` count, then that many `f32` baselines, NORMALIZED the way
+/// the app draws: measured DOWN from the top of the page and divided by its
+/// WIDTH. The one asked about is among them.
+///
+/// ⚠️ SO THE APP NEVER HAS TO KNOW WHERE A PARAGRAPH ENDS. It already holds
+/// every line's box; what it cannot work out is which of them move together,
+/// because that rule lives here and was tuned against real pages. Answering
+/// with baselines rather than with a rectangle keeps it that way, and lets the
+/// app frame each line it is about to move rather than one box round the lot.
+#[unsafe(no_mangle)]
+pub extern "C" fn text_block_baselines(
+    doc_handle: u64,
+    page_index: i32,
+    baseline: f32,
+) -> ByteBuffer {
+    if doc_handle == 0 || page_index < 0 || !baseline.is_finite() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+
+    panic::catch_unwind(move || {
+        let Some(bytes) = document_bytes(doc_handle) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        let Ok(doc) = lopdf::Document::load_mem(&bytes) else {
+            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+        };
+        let pages = doc.get_pages();
+        let Some((_, &page)) = pages.iter().nth(page_index as usize) else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        let Some((_, page_top, page_w)) = recover::page_box(&doc, page) else {
+            return ByteBuffer::err(STATUS_DOC_NOT_REWRITABLE);
+        };
+
+        let at = page_top - (baseline as f64 * page_w);
+        let lines = recover::lines_of(&doc, page);
+        let Some(mine) = lines.iter().position(|l| (l.y - at).abs() < 0.5) else {
+            return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
+        };
+        let Some(group) = shift::blocks_of(&lines).into_iter().find(|g| g.contains(&mine))
+        else {
+            return ByteBuffer::err(STATUS_LINE_NOT_REWRITABLE);
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        out.extend((group.len() as u32).to_le_bytes());
+        for i in &group {
+            out.extend((((page_top - lines[*i].y) / page_w) as f32).to_le_bytes());
+        }
+
+        let mut boxed = out.into_boxed_slice();
+        let buffer = ByteBuffer {
+            data: boxed.as_mut_ptr(),
+            len: boxed.len(),
+            status: STATUS_OK_PDFIUM,
+        };
+        std::mem::forget(boxed);
+        buffer
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
 /// Moves a line, or the whole paragraph it belongs to, across the page.
 ///
 /// Returns the WHOLE NEW DOCUMENT, like [`retype_recovered_line`] and for the

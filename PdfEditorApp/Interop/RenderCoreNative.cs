@@ -746,6 +746,47 @@ internal static partial class RenderCoreNative
     public static extern int recovery_is_ready(ulong docHandle, int pageIndex);
 
     /// <summary>
+    /// Moves a line, or the whole paragraph it belongs to, across the page.
+    /// Returns the WHOLE NEW DOCUMENT.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NOT AN EDIT IN PLACE. This changes the file's own structure rather
+    /// than a PDFium page, so every index the app is holding is stale the moment
+    /// it returns, exactly as after <see cref="retype_recovered_line"/>.
+    ///
+    /// ⚠️ EVERYTHING HERE IS NORMALIZED THE WAY THE APP DRAWS: top-left origin,
+    /// both axes divided by the page WIDTH, and <paramref name="dy"/> therefore
+    /// POSITIVE DOWNWARDS. The core turns it into the page's own coordinates,
+    /// where the crop box is, and through the inverse of any transform in force
+    /// over the text: one real book draws all its text under a scale AND a flip
+    /// of the Y axis, where moving down the page is moving UP in the numbers.
+    ///
+    /// <paramref name="wholeBlock"/> non-zero moves every line of the paragraph
+    /// the baseline falls in; zero moves only that line.
+    ///
+    /// ⚠️ AND IT REFUSES RATHER THAN CARRYING A NEIGHBOUR ALONG. One placement
+    /// can draw several pieces of text; if the ones being moved also draw
+    /// something that was not asked for, nothing is written at all.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern ByteBuffer shift_page_text(
+        ulong docHandle, int pageIndex, float baseline, int wholeBlock, float dx, float dy);
+
+    /// <summary>
+    /// The baselines of every line in the same paragraph as the one given,
+    /// normalized the same way. A <c>u32</c> count then that many <c>f32</c>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ASKED RATHER THAN WORKED OUT HERE. Where a paragraph ends is decided
+    /// by a rule tuned against real pages, and it lives in the core beside the
+    /// block model that shares it. The app holds every line's box already; all
+    /// it is missing is which of them move together.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern ByteBuffer text_block_baselines(
+        ulong docHandle, int pageIndex, float baseline);
+
+    /// <summary>
     /// Retypes one recovered line, returning the whole new document.
     /// </summary>
     /// <remarks>

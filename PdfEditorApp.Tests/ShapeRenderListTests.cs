@@ -320,7 +320,14 @@ public class ShapeRenderListTests
             dir = dir.Parent;
         }
         Assert.NotNull(dir);
-        return File.ReadAllText(Path.Combine(dir!.FullName, path));
+        // ⚠️ NORMALIZED, BECAUSE A LINE ENDING IS NOT A FACT ABOUT THE CODE.
+        // This repository is checked out with core.autocrlf, so whether a file
+        // arrives with CRLF or LF depends on the machine and on which tool last
+        // wrote it. An assertion that spans a line break and happens to name one
+        // of the two is a test that passes or fails for a reason having nothing
+        // to do with what it is checking.
+        return File.ReadAllText(Path.Combine(dir!.FullName, path))
+            .Replace("\r\n", "\n");
     }
 
     [Fact]
@@ -357,7 +364,7 @@ public class ShapeRenderListTests
         string page = ReadSource("PdfEditorApp", "MainPage.xaml.cs");
 
         Assert.Contains(
-            "UpdateInkPreview();\r\n        RefreshSkiaShapeLayer();", page, StringComparison.Ordinal);
+            "UpdateInkPreview();\n        RefreshSkiaShapeLayer();", page, StringComparison.Ordinal);
         Assert.Contains(
             "ViewModel.AllInkStrokes, ViewModel.AllShapes, PreviewShape(), PreviewInkGuide()",
             page, StringComparison.Ordinal);

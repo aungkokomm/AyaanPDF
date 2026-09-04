@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -44,6 +44,17 @@ public sealed partial class MainPage : Page
     /// text, which is a different thing from the reader's copy selection above.
     /// </summary>
     private bool _inPlaceDragging;
+
+    /// <summary>
+    /// Whether a press inside the selected text box might yet turn into a move
+    /// of the document's own text.
+    ///
+    /// ⚠️ ARMED, NOT MOVING. The same press is still a click until the pointer
+    /// travels, because a click inside the box is how a caret gets into the
+    /// line. <see cref="ViewportViewModel.UpdateTextUnitMove"/> decides which
+    /// it turned out to be.
+    /// </summary>
+    private bool _textMoveArmed;
 
     /// <summary>Where a text-selection press started, so the release can tell a
     /// click from a drag.</summary>
@@ -8198,12 +8209,31 @@ public sealed partial class MainPage : Page
                             _dragPointerId = e.Pointer.PointerId;
                             ViewportHost.CapturePointer(e.Pointer);
                         }
-                        else if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny))
+                        else
                         {
-                            // Nothing else holds focus now that there is no
-                            // TextBox, so the keys have to be sent somewhere
-                            // that will hand them to RootGrid_KeyDown.
-                            RootGrid.Focus(FocusState.Programmatic);
+                            // ⚠️ ARMED BEFORE THE EDIT IS BEGUN, AND THE EDIT
+                            // STILL BEGINS. A press inside the box means "type
+                            // here" and it still does; this only remembers
+                            // where the press landed, so that if the pointer
+                            // travels instead of lifting, the reader turns out
+                            // to have been picking the text up rather than
+                            // aiming a caret at it. A press that never travels
+                            // does exactly what it did before.
+                            _textMoveArmed =
+                                ViewModel.BeginTextUnitMove(content.Page, nx, ny);
+                            if (_textMoveArmed)
+                            {
+                                _dragPointerId = e.Pointer.PointerId;
+                                ViewportHost.CapturePointer(e.Pointer);
+                            }
+
+                            if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny))
+                            {
+                                // Nothing else holds focus now that there is no
+                                // TextBox, so the keys have to be sent somewhere
+                                // that will hand them to RootGrid_KeyDown.
+                                RootGrid.Focus(FocusState.Programmatic);
+                            }
                         }
 
                         e.Handled = true;
@@ -8436,6 +8466,27 @@ public sealed partial class MainPage : Page
 
         var content = ContentPoint(e);
 
+        // ⚠️ CARRYING THE TEXT COMES FIRST, because the press that armed it
+        // also put a caret in the line, and without this the very same pointer
+        // movement would be read as selecting through the text it is moving.
+        if (_textMoveArmed)
+        {
+            double mx = content.X / ViewModel.OverlayScale;
+            double my = content.Y / ViewModel.OverlayScale;
+
+            if (ViewModel.UpdateTextUnitMove(mx, my))
+            {
+                // It is a move after all, so the caret the press put in the
+                // line has no business being there.
+                ViewModel.CancelInPlaceEdit();
+            }
+            if (ViewModel.IsMovingTextUnit)
+            {
+                e.Handled = true;
+                return;
+            }
+        }
+
         // ⚠️ DRAGGING THROUGH TEXT SELECTS IT, and comes before every other
         // drag below: while a caret is in the page's own text, moving the
         // pointer means "select to here", not pan, marquee or move an object.
@@ -8552,6 +8603,24 @@ public sealed partial class MainPage : Page
             ViewportHost.ReleasePointerCapture(e.Pointer);
             e.Handled = true;
             return;
+        }
+
+        if (_textMoveArmed)
+        {
+            _textMoveArmed = false;
+
+            // ⚠️ ALT HELD MOVES THE ONE LINE. Without it the whole paragraph
+            // goes, which is what a reader dragging a block of text means; Alt
+            // is the one modifier not already spoken for here, since Shift
+            // extends a selection and Ctrl is the zoom.
+            bool moved = ViewModel.CommitTextUnitMove(IsAltDown());
+            ViewportHost.ReleasePointerCapture(e.Pointer);
+            if (moved)
+            {
+                _inPlaceDragging = false;
+                e.Handled = true;
+                return;
+            }
         }
 
         if (_inPlaceDragging)

@@ -33,6 +33,14 @@ public enum TextUnitKind
 /// Bounds are normalized the way the whole app draws: top-left origin, BOTH
 /// axes divided by the page WIDTH.
 /// </summary>
+/// <param name="Baseline">
+/// Where the type sits, in the same units as the bounds.
+///
+/// ⚠️ CARRIED BECAUSE IT IS THE UNIT'S IDENTITY TO THE CORE. Moving text and
+/// retyping a recovered line are both addressed by the baseline, and a caller
+/// that had to reach through <see cref="Line"/> or <see cref="Word"/> to find it
+/// would have to know which of the two it was holding.
+/// </param>
 public sealed record TextUnitSelection(
     int Page,
     TextUnitKind Kind,
@@ -41,6 +49,7 @@ public sealed record TextUnitSelection(
     double Right,
     double Bottom,
     double FontSizePts,
+    double Baseline,
     string Text,
     bool CanEdit,
     string RefusalReason,
@@ -51,13 +60,13 @@ public sealed record TextUnitSelection(
     public static TextUnitSelection From(int page, LineSnapshot line) =>
         new(page, TextUnitKind.Line,
             line.Left, line.Top, line.Right, line.Bottom, line.FontSizePts,
-            line.Text, line.CanEdit, line.RefusalReason, null, line);
+            line.Baseline, line.Text, line.CanEdit, line.RefusalReason, null, line);
 
     /// <summary>One word, which is what a refused line falls back to.</summary>
     public static TextUnitSelection From(int page, WordClusterSnapshot word) =>
         new(page, TextUnitKind.Word,
             word.Left, word.Top, word.Right, word.Bottom, word.FontSizePts,
-            word.Text, word.CanEdit, word.RefusalReason, word, null);
+            word.Baseline, word.Text, word.CanEdit, word.RefusalReason, word, null);
 
     /// <summary>
     /// Whether a point in normalized page coordinates is inside the box.

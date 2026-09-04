@@ -4529,14 +4529,60 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             double padX = h * TextUnitSelection.FramePadXFactor;
             double padY = h * TextUnitSelection.FramePadYFactor;
 
-            double tl = (word.Left * SlotLayoutWidth) - padX;
-            double tt = (word.Top * SlotLayoutWidth) - padY;
-            double frameBottom = (word.Bottom * SlotLayoutWidth) + padY;
+            // ⚠️ WHILE IT IS BEING DRAGGED THE FRAME GOES WHERE THE POINTER IS,
+            // AND ONLY THE FRAME. The page's own glyphs stay where the file
+            // still draws them until the move is committed, so what the reader
+            // sees is an outline they are carrying over their unaltered
+            // document, which is exactly what it is: nothing has changed yet.
+            (double mx, double my) = _textMove.IsDragging
+                ? (_textMove.Dx, _textMove.Dy)
+                : (0.0, 0.0);
+
+            double tl = ((word.Left + mx) * SlotLayoutWidth) - padX;
+            double tt = ((word.Top + my) * SlotLayoutWidth) - padY;
+            double frameBottom = ((word.Bottom + my) * SlotLayoutWidth) + padY;
             textSlot?.PageTextOutline.Add(new ScaledRect(
                 tl, tt,
-                (word.Right * SlotLayoutWidth) - tl + padX,
+                ((word.Right + mx) * SlotLayoutWidth) - tl + padX,
                 frameBottom - tt,
                 word.CanEdit ? EditableUnitColor : RefusedUnitColor));
+
+            // ⚠️ AND EVERY OTHER LINE THAT IS COMING WITH IT. The default is to
+            // move the whole paragraph, so a reader shown only the line they
+            // grabbed would be told the wrong thing about what they are about
+            // to do. Which lines those are is the core's answer, not one worked
+            // out here: see ShiftGateway.BlockBaselines.
+            if (_textMove.IsDragging && _movingBaselines.Count > 1)
+            {
+                foreach (var other in LinesFor(word.Page))
+                {
+                    if (Math.Abs(other.Baseline - word.Baseline) < BlockBaselineTolerance)
+                    {
+                        continue;
+                    }
+                    bool coming = false;
+                    foreach (double at in _movingBaselines)
+                    {
+                        if (Math.Abs(at - other.Baseline) < BlockBaselineTolerance)
+                        {
+                            coming = true;
+                            break;
+                        }
+                    }
+                    if (!coming) { continue; }
+
+                    double oh = (other.Bottom - other.Top) * SlotLayoutWidth;
+                    double ox = oh * TextUnitSelection.FramePadXFactor;
+                    double oy = oh * TextUnitSelection.FramePadYFactor;
+                    double ol = ((other.Left + mx) * SlotLayoutWidth) - ox;
+                    double ot = ((other.Top + my) * SlotLayoutWidth) - oy;
+                    textSlot?.PageTextOutline.Add(new ScaledRect(
+                        ol, ot,
+                        ((other.Right + mx) * SlotLayoutWidth) - ol + ox,
+                        ((other.Bottom + my) * SlotLayoutWidth) + oy - ot,
+                        EditableUnitColor));
+                }
+            }
 
             // AND WHY, when it cannot be edited. Beside the box rather than in
             // the status bar, because the status bar does not exist: `Status`
@@ -5700,6 +5746,169 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Whether a point falls inside the selected unit's box.</summary>
     public bool TextUnitBoxContains(int pageIndex, double normX, double normY) =>
         _selectedTextUnit?.Contains(pageIndex, normX, normY) ?? false;
+
+    // ---------------- moving the document's own text ----------------
+
+    private readonly DragGesture _textMove = new();
+
+    /// <summary>
+    /// How close two baselines must be to be the same line of type, as a
+    /// fraction of the page width. About a point on A4.
+    /// </summary>
+    /// <remarks>
+    /// The core answers in a 32-bit float and the app holds another, so they
+    /// will not be equal; what matters is that no two lines of a paragraph are
+    /// ever this close together.
+    /// </remarks>
+    private const double BlockBaselineTolerance = 0.002;
+
+    /// <summary>
+    /// The baselines of every line that will move, fetched once when the drag
+    /// starts. Normalized the way the whole overlay is.
+    /// </summary>
+    private IReadOnlyList<double> _movingBaselines = Array.Empty<double>();
+
+    /// <summary>Whether the reader is dragging the document's own text.</summary>
+    public bool IsMovingTextUnit => _textMove.IsDragging;
+
+    /// <summary>How far it has been dragged, for the overlay to draw it there.</summary>
+    public (double X, double Y) TextUnitMoveOffset => (_textMove.Dx, _textMove.Dy);
+
+    /// <summary>Raised whenever the dragged text should be redrawn.</summary>
+    public event Action? TextUnitMoveChanged;
+
+    /// <summary>
+    /// Arms a press inside the selected box that MIGHT become a move.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ARMED, NOT STARTED, AND THE CLICK IS WHY. A press inside the box
+    /// already means "put a caret here", which is how the reader edits anything
+    /// at all. Only once the pointer has travelled does this become a move, and
+    /// a press that never travels is still the click it was.
+    ///
+    /// ⚠️ AND ONLY WHILE NOT ALREADY TYPING. Once there is a caret in the line,
+    /// dragging selects through the text, and taking that over would leave no
+    /// way to select anything.
+    /// </remarks>
+    public bool BeginTextUnitMove(int pageIndex, double normX, double normY)
+    {
+        if (!IsEditMode || IsEditingInPlace) { return false; }
+        if (!TextUnitBoxContains(pageIndex, normX, normY)) { return false; }
+
+        _textMove.Press(pageIndex, normX, normY);
+        return true;
+    }
+
+    /// <summary>
+    /// Takes the pointer's new position. True on the move that turns the press
+    /// into a drag, so the caller can capture the pointer and stop treating it
+    /// as a click.
+    /// </summary>
+    public bool UpdateTextUnitMove(double normX, double normY)
+    {
+        bool started = _textMove.Move(normX, normY);
+        if (started)
+        {
+            // ⚠️ ASKED ONCE, WHEN THE DRAG BEGINS. The answer cannot change
+            // while the reader holds the pointer down, and asking on every
+            // pointer move would put a whole-document parse inside the drag.
+            _movingBaselines = _selectedTextUnit is { } unit && _documentHandle != 0
+                ? Interop.ShiftGateway.BlockBaselines(_documentHandle, unit.Page, unit.Baseline)
+                : Array.Empty<double>();
+        }
+        if (started || _textMove.IsDragging)
+        {
+            RefreshSelectionOutline();
+            TextUnitMoveChanged?.Invoke();
+        }
+        return started;
+    }
+
+    /// <summary>
+    /// Puts the text down where it has been dragged to, or does nothing when
+    /// the press turned out to be a click.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A WHOLE-DOCUMENT REWRITE, like a form edit and like retyping a
+    /// recovered line. The move changes the file's own structure rather than a
+    /// PDFium page, so it comes back as bytes and everything the app is holding
+    /// is stale when it returns.
+    ///
+    /// <paramref name="oneLineOnly"/> is the held modifier: without it the
+    /// whole paragraph moves, which is what a reader dragging a block of text
+    /// expects.
+    /// </remarks>
+    public bool CommitTextUnitMove(bool oneLineOnly)
+    {
+        if (!_textMove.IsDragging)
+        {
+            _textMove.Clear();
+            return false;
+        }
+
+        int page = _textMove.Page;
+        (double dx, double dy) = (_textMove.Dx, _textMove.Dy);
+        var unit = _selectedTextUnit;
+        _textMove.Release();
+        _movingBaselines = Array.Empty<double>();
+
+        if (unit is null || _documentHandle == 0 || page < 0)
+        {
+            RefreshSelectionOutline();
+            return false;
+        }
+
+        // Captured BEFORE the write, because that is the state undo restores,
+        // but only PUSHED after it succeeds: the core leaves the document
+        // untouched when it refuses, and an entry pushed anyway would be a
+        // Ctrl+Z that appears to do nothing.
+        var before = Capture(HistoryScope.Document, "Move text", null);
+
+        byte[]? bytes = Interop.ShiftGateway.Move(
+            _documentHandle, page, unit.Baseline, !oneLineOnly, dx, dy);
+        if (bytes is null)
+        {
+            Diag.Log($"CommitTextUnitMove p{page} refused at baseline {unit.Baseline}");
+            Status = "This text could not be moved.";
+            ShowUnitNotice("This text could not be moved.");
+            RefreshSelectionOutline();
+            return false;
+        }
+
+        RestoreDocumentBytes(bytes);
+
+        // ⚠️ EVERY PER-PAGE CACHE, AND THE READING TOO. The document behind the
+        // handle is a different one now, so the lines, the words, the regions
+        // and whatever the core had read for the old handle all describe a file
+        // that no longer exists.
+        _linesByPage.Clear();
+        _clustersByPage.Clear();
+        _textRegions.Clear();
+        ClearTextUnitSelection();
+        RenderCoreNative.prepare_recovery(_documentHandle, page);
+
+        _history.Push(before);
+        NotifyHistoryChanged();
+
+        InvalidateAllPageRasters();
+        RenderCurrentPage();
+        IsDirty = true;
+
+        Status = oneLineOnly ? "Line moved." : "Text moved.";
+        TextUnitMoveChanged?.Invoke();
+        return true;
+    }
+
+    /// <summary>Abandons a move in progress and puts the frame back.</summary>
+    public void CancelTextUnitMove()
+    {
+        if (_textMove.Page < 0 && !_textMove.IsDragging) { return; }
+
+        _textMove.Clear();
+        _movingBaselines = Array.Empty<double>();
+        RefreshSelectionOutline();
+        TextUnitMoveChanged?.Invoke();
+    }
 
     /// <summary>
     /// Where the caret goes for a click inside the selected unit: how many of
