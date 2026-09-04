@@ -339,6 +339,13 @@ fn merge_placements(
     // the test is generous downwards and unbounded upwards.
     const A_SPACE: f64 = 0.18;
 
+    // How far off the baseline a run that draws only marks may be lifted and
+    // still belong to the line, as a fraction of the type size. Measured: the
+    // one on this page is lifted 3.24 points at 10.56 point type, and the page
+    // sets its lines 19.56 points apart, so there is a wide gap between what
+    // this admits and what it could ever reach.
+    const A_MARK: f64 = 0.5;
+
     // Where a run ENDS: where it was placed, plus everything it advanced by.
     //
     // ⚠️ INCLUDING THE GAPS IT HAS ALREADY BEEN GIVEN. This is asked about a
@@ -353,12 +360,29 @@ fn merge_placements(
         Some(line.x + (drawn + line.adjust) / 1000.0 * line.size + gaps)
     };
 
+    // Whether a run puts ink on the page without moving the pen at all.
+    //
+    // ⚠️ A RUN THAT ADVANCES BY NOTHING IS NOT A LINE. Word lifts the pen off
+    // the baseline to place a below-base Myanmar mark and draws it in a
+    // placement of its own; measured on a real page, one such glyph sat 3.24
+    // points above the line, so the baseline test threw it out, and because it
+    // fell BETWEEN the two halves of a line it stopped those from joining
+    // either. One mark cost two lines, and it split a word down the middle.
+    let draws_only_marks = |line: &Line| -> bool {
+        let Some(widths) = fonts.get(&line.resource).and_then(|(_, w)| w.as_ref()) else {
+            return false;
+        };
+        !line.glyphs.is_empty() && line.glyphs.iter().all(|g| widths.of(*g) == 0.0)
+    };
+
     let mut out: Vec<Line> = Vec::new();
     for line in lines {
         let joins = out.last().is_some_and(|prev| {
-            (prev.y - line.y).abs() < SAME_BASELINE
-                && installed(&prev.base_font) == installed(&line.base_font)
+            let apart = (prev.y - line.y).abs();
+            installed(&prev.base_font) == installed(&line.base_font)
                 && line.x >= prev.x
+                && (apart < SAME_BASELINE
+                    || (apart < A_MARK * line.size && draws_only_marks(&line)))
         });
         if !joins {
             out.push(line);
@@ -651,6 +675,79 @@ fn rect_of(doc: &Document, object: &Object) -> Option<(f64, f64, f64)> {
     (width > 0.0).then_some((x0, y1, width))
 }
 
+/// The line again with any code the font has no glyph for turned into a SKIP,
+/// or nothing when it has none.
+///
+/// ⚠️ A CODE THE FACE CANNOT DRAW IS NOT A LETTER. Measured on a real Word
+/// page: one line ended with code 8224 in a face that has 1028 glyphs, so the
+/// page draws nothing there and nothing ever could. Every one of that line's
+/// other 83 glyphs proved on its own, and the single phantom refused the whole
+/// line of the author's text.
+///
+/// ⚠️ BUT IT STILL MOVES THE PEN, BY WHATEVER THE FILE DECLARES FOR IT. That
+/// one was declared a full em wide, so simply dropping it left the line's
+/// clusters 10.56 points short of where the page's pen finishes. Trailing, that
+/// costs nothing; in the middle of a line it would drag every cluster after it
+/// a whole em to the left, which is a caret on the wrong letter. Turning it
+/// into a skip keeps the geometry exactly as it was and takes only the letter
+/// away.
+///
+/// ⚠️ AND ONLY OUT OF RANGE, NEVER MERELY BLANK. A space has a glyph, an
+/// outline of nothing and a real advance, and treating one as a phantom would
+/// be reading the page's own spaces out of the text. The test here is whether
+/// the face has the glyph at all, which is the one case where no renderer can
+/// put ink down.
+fn without_phantoms(
+    line: &Line,
+    face: &rustybuzz::Face,
+    widths: Option<&crate::shaped::CidWidths>,
+) -> Option<Line> {
+    let glyphs = face.number_of_glyphs();
+    if !line.glyphs.iter().any(|g| *g >= glyphs) {
+        return None;
+    }
+    let scale = line.size / 1000.0;
+
+    // Where each surviving glyph moves to, and what the dropped ones skipped.
+    //
+    // ⚠️ A NUMBER OR A SKIP AT THE DROPPED INDEX STAYS PUT. It was written
+    // BEFORE the phantom, so it moves the pen before whatever now stands there;
+    // only what came after the phantom shifts back by one.
+    let mut moved_to = Vec::with_capacity(line.glyphs.len() + 1);
+    let mut kept: Vec<u16> = Vec::with_capacity(line.glyphs.len());
+    let mut skipped: Vec<Break> = Vec::new();
+    for g in &line.glyphs {
+        moved_to.push(kept.len());
+        if *g < glyphs {
+            kept.push(*g);
+        } else {
+            let points = widths.map(|w| w.of(*g) * scale).unwrap_or(0.0);
+            if points > 0.0 {
+                skipped.push(Break { at: kept.len(), points });
+            }
+        }
+    }
+    moved_to.push(kept.len());
+
+    let end = kept.len();
+    let at = |i: usize| moved_to.get(i).copied().unwrap_or(end);
+
+    let mut breaks: Vec<Break> =
+        line.breaks.iter().map(|b| Break { at: at(b.at), ..*b }).collect();
+    breaks.extend(skipped);
+    breaks.sort_by_key(|b| b.at);
+
+    Some(Line {
+        glyphs: kept,
+        nudges: line.nudges.iter().map(|(i, v)| (at(*i), *v)).collect(),
+        breaks,
+        resource: line.resource.clone(),
+        base_font: line.base_font.clone(),
+        drawn_by: line.drawn_by.clone(),
+        ..*line
+    })
+}
+
 /// One line of a page, and what it says.
 pub(crate) struct Reading {
     /// Where the line sits, in PDF user space.
@@ -762,8 +859,13 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
         .iter()
         .map(|line| {
             let read = faces.get(line.base_font.as_str()).and_then(|(face, index)| {
+                // ⚠️ THE LINE THE PAGE CAN ACTUALLY DRAW, which is not always
+                // the line the file wrote down. See `without_phantoms`.
+                let mine = widths.get(&line.resource).and_then(|(_, w)| w.as_ref());
+                let cleaned = without_phantoms(line, face, mine);
+                let line = cleaned.as_ref().unwrap_or(line);
                 let pieces = pieces_of(index, face, line)?;
-                let clusters = match widths.get(&line.resource).and_then(|(_, w)| w.as_ref()) {
+                let clusters = match mine {
                     Some(w) => clusters_of(line, &pieces, face, w),
                     None => Vec::new(),
                 };
@@ -1113,7 +1215,29 @@ mod tests {
             // written between them, and every skip the page asked for.
             let drawn: f64 = line.glyphs.iter().map(|g| w.of(*g)).sum();
             let gaps: f64 = line.breaks.iter().map(|b| b.points).sum();
-            let ends = line.x + (drawn + line.adjust) / 1000.0 * line.size + gaps;
+
+            // ⚠️ MINUS ANYTHING THE PEN CROSSED AFTER THE LAST INK. A code the
+            // face cannot draw still advances by whatever the file declares for
+            // it, and this page ends one line with a full em of exactly that.
+            // Clusters bound INK: there is nothing out there for one to hold
+            // and no caret position past the end of the text, so the reading
+            // stops at the last thing anybody can see and so does this.
+            let face = indexes
+                .by_font
+                .get(&line.base_font)
+                .and_then(|(bytes, _)| rustybuzz::Face::from_slice(bytes, 0));
+            let phantom = face.map(|f| f.number_of_glyphs()).unwrap_or(u16::MAX);
+            let trailing: f64 = line
+                .glyphs
+                .iter()
+                .rev()
+                .take_while(|g| **g >= phantom)
+                .map(|g| w.of(*g))
+                .sum();
+
+            let ends = line.x
+                + (drawn - trailing + line.adjust) / 1000.0 * line.size
+                + gaps;
             let ours = reading.clusters.last().unwrap().right;
             println!("line at y={:7.1}: {:2} clusters, {} skips worth {:6.2}, ends at {:8.2} against {:8.2}, out by {:5.2}",
                 line.y, reading.clusters.len(), line.breaks.len(), gaps,
@@ -1160,10 +1284,286 @@ mod tests {
                 None => println!("  {n:>2} y={:7.1}  REFUSED", r.y),
             }
         }
-        assert!(proven * 2 > read.len(), "read {proven} of {} lines", read.len());
+        // ⚠️ ALL OF THEM, ON THIS FILE. It was 16 of 18 before a phantom code
+        // and a lifted mark were understood; leaving the bar at half would let
+        // either of them come back unnoticed.
+        assert_eq!(proven, read.len(), "read {proven} of {} lines", read.len());
     }
 
     #[test]
+    /// What the lines recovery DECLINED are made of, and what the lines around
+    /// them are made of, so the two can be compared. Diagnostic: it asserts
+    /// nothing, because the numbers are what this phase is here to change.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn what_the_refused_lines_are_made_of() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = indexes_for(&doc, page);
+        let lines = lines_of(&doc, page);
+        let read = read_page_with(&doc, page, &indexes);
+
+        for (n, (line, r)) in lines.iter().zip(read.iter()).enumerate() {
+            let mark = if r.text.is_some() { " " } else { "*" };
+            println!(
+                "{mark}{n:>2} y={:8.2} x={:7.2} size={:5.2} glyphs={:>3} skips={:>2} font={} ops={:?}",
+                line.y, line.x, line.size, line.glyphs.len(),
+                line.breaks.len(), line.base_font, line.drawn_by);
+            if r.text.is_none() {
+                println!("      glyph ids: {:?}", line.glyphs);
+                // What does each single glyph spell on its own?
+                if let Some((bytes, index)) = indexes.by_font.get(&line.base_font) {
+                    let face = rustybuzz::Face::from_slice(bytes, 0).unwrap();
+                    let one: Vec<String> = line.glyphs.iter()
+                        .map(|g| crate::reshape::prove(&face, index, &[*g])
+                            .unwrap_or_else(|| "?".into()))
+                        .collect();
+                    println!("      one at a time: {one:?}");
+                    // And the longest prefix that CAN be proven.
+                    let mut best = 0;
+                    for cut in 1..=line.glyphs.len() {
+                        if crate::reshape::prove(&face, index, &line.glyphs[..cut]).is_some() {
+                            best = cut;
+                        }
+                    }
+                    println!("      longest provable prefix: {best} of {}", line.glyphs.len());
+                }
+            }
+        }
+    }
+
+    /// A page whose declared widths are the FONT'S OWN, so a mark really does
+    /// advance by nothing and a letter really does advance by its own width.
+    ///
+    /// `phantom` is a code the face has no glyph for, declared a full em wide
+    /// the way a producer's default width declares everything it did not list.
+    fn a_page_measured_by(face: &rustybuzz::Face, operations: Vec<Operation>)
+        -> (Document, ObjectId)
+    {
+        use rustybuzz::ttf_parser::GlyphId;
+
+        let upem = face.units_per_em() as f64;
+        let mut widths: Vec<lopdf::Object> = Vec::new();
+        for id in 0..face.number_of_glyphs() {
+            let advance = face.glyph_hor_advance(GlyphId(id)).unwrap_or(0) as f64;
+            widths.push((id as i64).into());
+            widths.push(vec![(advance / upem * 1000.0).into()].into());
+        }
+
+        let mut doc = Document::with_version("1.7");
+        let descendant = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "BCDEEE+MyanmarText",
+            "W" => widths,
+            "DW" => 1000.0,
+        });
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "BCDEEE+MyanmarText",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![descendant.into()],
+        });
+        let stream = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            Content { operations }.encode().unwrap(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => stream,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        });
+        doc.objects.insert(pages_id, lopdf::Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page.into()],
+            "Count" => 1,
+        }));
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+        (doc, page)
+    }
+
+    fn an_index_of(bytes: &[u8], text: &str) -> Indexes {
+        let chars: BTreeSet<char> = text.chars().collect();
+        let index = crate::reshape::Index::build(bytes, Some(&chars), None).unwrap();
+        Indexes {
+            by_font: [("BCDEEE+MyanmarText".to_string(), (bytes.to_vec(), index))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// ⚠️ A CODE THE FACE CANNOT DRAW MUST NOT COST THE LINE. Measured on a
+    /// real Word page: one line ended with code 8224 in a face that has 1028
+    /// glyphs. Nothing can put ink down for it, every one of that line's other
+    /// 83 glyphs proved on its own, and the single phantom refused the whole
+    /// line of the author's text.
+    #[test]
+    fn a_code_the_font_cannot_draw_does_not_refuse_the_line() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const WORD: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+
+        let mut glyphs = crate::reshape::draws(&face, WORD);
+        let phantom = face.number_of_glyphs() + 7;
+        glyphs.push(phantom);
+
+        let (doc, page) = a_page_measured_by(&face, vec![
+            Operation::new("BT", vec![]),
+            pick(12.0),
+            place(72.0, 700.0),
+            show(&glyphs),
+            Operation::new("ET", vec![]),
+        ]);
+
+        let read = read_page_with(&doc, page, &an_index_of(&bytes, WORD));
+        let one = read.into_iter().next().expect("no line");
+        assert_eq!(one.text.as_deref(), Some(WORD),
+            "one code nothing can draw refused the whole line");
+    }
+
+    /// ⚠️ AND IT STILL MOVES THE PEN. That phantom was declared a full em
+    /// wide, so simply dropping it left everything after it an em to the left,
+    /// which is a caret on the wrong letter.
+    #[test]
+    fn a_code_the_font_cannot_draw_still_takes_up_its_declared_room() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const WORD: &str = "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}";
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let index = an_index_of(&bytes, WORD);
+
+        let drawn = crate::reshape::draws(&face, WORD);
+        let phantom = face.number_of_glyphs() + 7;
+
+        // The same word twice, and again with a phantom between the halves.
+        let mut interrupted = drawn.clone();
+        interrupted.insert(2, phantom);
+
+        let clean = {
+            let (doc, page) = a_page_measured_by(&face, vec![
+                Operation::new("BT", vec![]), pick(12.0), place(72.0, 700.0),
+                show(&drawn), Operation::new("ET", vec![]),
+            ]);
+            read_page_with(&doc, page, &index).into_iter().next().unwrap()
+        };
+        let broken = {
+            let (doc, page) = a_page_measured_by(&face, vec![
+                Operation::new("BT", vec![]), pick(12.0), place(72.0, 700.0),
+                show(&interrupted), Operation::new("ET", vec![]),
+            ]);
+            read_page_with(&doc, page, &index).into_iter().next().unwrap()
+        };
+
+        // A full em at 12 point, exactly what the default width declares.
+        let room = broken.clusters.last().unwrap().right
+            - clean.clusters.last().unwrap().right;
+        assert!((room - 12.0).abs() < 0.01,
+            "the phantom took up {room:.2} points, not the 12 it declared");
+    }
+
+    /// ⚠️ A RUN THAT ADVANCES BY NOTHING IS NOT A LINE OF ITS OWN. Word lifts
+    /// the pen off the baseline to place a below-base Myanmar mark and draws it
+    /// in a placement by itself. Measured on a real page: one such glyph sat
+    /// 3.24 points above its line, so the baseline test threw it out, and
+    /// because it fell BETWEEN the two halves of a line it stopped those from
+    /// joining either. One mark cost two lines and split a word down the middle.
+    #[test]
+    fn a_lifted_mark_belongs_to_the_line_it_interrupts() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        // "ကုန်": the second glyph is a below-base vowel that advances by
+        // nothing, which is what lets it be drawn anywhere.
+        const WORD: &str = "\u{1000}\u{102F}\u{1014}\u{103A}";
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let glyphs = crate::reshape::draws(&face, WORD);
+        assert!(glyphs.len() >= 3, "expected several glyphs for {WORD:?}");
+
+        let mark = glyphs[1];
+        assert_eq!(face.glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(mark)), Some(0),
+            "this test needs a mark that advances by nothing");
+
+        // Drawn the way Word draws it: the head of the word, then the mark
+        // lifted onto its own line, then the tail, all at the same x the pen
+        // had reached.
+        let head = &glyphs[..1];
+        let tail = &glyphs[2..];
+        let upem = face.units_per_em() as f64;
+        let after_head: f64 = head
+            .iter()
+            .map(|g| face.glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(*g)).unwrap_or(0) as f64)
+            .sum::<f64>() / upem * 12.0;
+
+        let (doc, page) = a_page_measured_by(&face, vec![
+            Operation::new("BT", vec![]), pick(12.0), place(72.0, 700.0),
+            show(head), Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]), pick(12.0),
+            place(72.0 + after_head, 703.24),
+            show(&[mark]), Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]), pick(12.0),
+            place(72.0 + after_head, 700.0),
+            show(tail), Operation::new("ET", vec![]),
+        ]);
+
+        let read = read_page_with(&doc, page, &an_index_of(&bytes, WORD));
+        assert_eq!(read.len(), 1, "the lifted mark was read as a line of its own");
+        assert_eq!(read[0].text.as_deref(), Some(WORD),
+            "the mark was dropped, so the word lost a letter");
+    }
+
+    /// Where each line's word spaces come from: a space GLYPH the page draws,
+    /// or a SKIP between two placements that draws nothing. Diagnostic.
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn where_the_word_spaces_come_from() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+        let indexes = indexes_for(&doc, page);
+        let lines = lines_of(&doc, page);
+        let read = read_page_with(&doc, page, &indexes);
+
+        for (n, (line, r)) in lines.iter().zip(read.iter()).enumerate() {
+            let Some(text) = r.text.as_deref() else { continue };
+            let Some((bytes, index)) = indexes.by_font.get(&line.base_font) else { continue };
+            let face = rustybuzz::Face::from_slice(bytes, 0).unwrap();
+
+            // The glyph this font draws for an ordinary space.
+            let space = crate::reshape::draws(&face, " ");
+            let drew = line.glyphs.iter().filter(|g| space.contains(g)).count();
+            let says = text.chars().filter(|c| *c == ' ').count();
+
+            println!(
+                "{n:>2} y={:7.1}  spaces in the reading {says:>2}, \
+                 space glyphs drawn {drew:>2}, skips {:>2} worth {:6.2}",
+                line.y, line.breaks.len(),
+                line.breaks.iter().map(|b| b.points).sum::<f64>());
+        }
+    }
+
     fn a_subset_tag_is_not_part_of_the_font_s_name() {
         assert_eq!(installed("BCDEEE+MyanmarText"), installed("MyanmarText"));
         assert!(installed("BCDEEE+MyanmarText").is_some());
