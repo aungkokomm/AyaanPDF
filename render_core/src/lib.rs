@@ -438,7 +438,14 @@ struct Core {
     /// a reader arriving while a background build is running must WAIT for it
     /// rather than start a second one. Whoever takes the lock first builds;
     /// everyone else blocks and then finds the answer already there.
-    recoveries: Mutex<HashMap<(u64, i32), Arc<Mutex<Option<Arc<recover::Indexes>>>>>>,
+    ///
+    /// ⚠️ KEYED BY THE DOCUMENT, NOT BY THE PAGE, and that is a measured
+    /// choice rather than a tidy-up. One index per page cost N x 17 seconds on
+    /// an N-page Burmese document; one for the whole document costs about 17
+    /// seconds whatever N is, AND reads more lines, because a page-scoped index
+    /// turned out to be too narrow to read its own page. See
+    /// `recover::indexes_for_document`.
+    recoveries: Mutex<HashMap<u64, Arc<Mutex<Option<Arc<recover::Indexes>>>>>>,
 }
 
 static CORE: OnceLock<Core> = OnceLock::new();
@@ -581,7 +588,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
     }
 
     lock(&core.generations).retain(|(doc, _), _| *doc != doc_handle);
-    lock(&core.recoveries).retain(|(doc, _), _| *doc != doc_handle);
+    lock(&core.recoveries).remove(&doc_handle);
 }
 
 /// Returns the page count for a handle, or -1 if the handle is unknown.
@@ -1726,7 +1733,7 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
             if !recover::worth_reading(&doc, page) {
                 return;
             }
-            let _ = indexes_for_page(doc_handle, page_index, &doc, page);
+            let _ = indexes_for_doc(doc_handle, &doc);
         });
     });
 }
@@ -1754,7 +1761,7 @@ pub extern "C" fn recovery_is_ready(doc_handle: u64, page_index: i32) -> i32 {
     }
     let slot = {
         let all = lock(&core().recoveries);
-        all.get(&(doc_handle, page_index)).cloned()
+        all.get(&doc_handle).cloned()
     };
     let Some(slot) = slot else { return 0 };
     match slot.try_lock() {
@@ -1763,10 +1770,28 @@ pub extern "C" fn recovery_is_ready(doc_handle: u64, page_index: i32) -> i32 {
     }
 }
 
-fn already_prepared(doc_handle: u64, page_index: i32) -> bool {
+/// How far the Burmese preparation has got, 0 to 100, or -1 when none is
+/// running.
+///
+/// ⚠️ THE WAIT WAS INVISIBLE AND THAT IS THE DEFECT THIS FIXES. Preparing a
+/// document takes about twenty seconds during which the app said nothing at
+/// all, and a reader can only read that as the app having hung. Cheap enough to
+/// ask on a timer: two atomic loads and no lock.
+///
+/// ⚠️ NOT PER PAGE, because the index is not. One preparation serves the whole
+/// document, so the handle is the whole question.
+#[unsafe(no_mangle)]
+pub extern "C" fn recovery_progress(doc_handle: u64) -> i32 {
+    if doc_handle == 0 {
+        return -1;
+    }
+    recover::progress::percent().unwrap_or(-1)
+}
+
+fn already_prepared(doc_handle: u64, _page_index: i32) -> bool {
     let slot = {
         let all = lock(&core().recoveries);
-        all.get(&(doc_handle, page_index)).cloned()
+        all.get(&doc_handle).cloned()
     };
     let Some(slot) = slot else { return false };
     match slot.try_lock() {
@@ -1794,21 +1819,16 @@ fn document_bytes(doc_handle: u64) -> Option<Vec<u8>> {
 /// ⚠️ AND WAITING IF SOMEBODY IS BUILDING IT NOW. Two threads asking at
 /// once must not both spend the 17 seconds, so the second one blocks on the
 /// first and takes its answer.
-fn indexes_for_page(
-    doc_handle: u64,
-    page_index: i32,
-    doc: &lopdf::Document,
-    page: lopdf::ObjectId,
-) -> Arc<recover::Indexes> {
+fn indexes_for_doc(doc_handle: u64, doc: &lopdf::Document) -> Arc<recover::Indexes> {
     let slot = {
         let mut all = lock(&core().recoveries);
-        Arc::clone(all.entry((doc_handle, page_index)).or_default())
+        Arc::clone(all.entry(doc_handle).or_default())
     };
     let mut held = lock(&slot);
     if let Some(ready) = held.as_ref() {
         return Arc::clone(ready);
     }
-    let built = Arc::new(recover::indexes_for(doc, page));
+    let built = Arc::new(recover::indexes_for_document(doc));
     *held = Some(Arc::clone(&built));
     built
 }
@@ -2044,7 +2064,7 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
     let across = |v: f64| ((v - page_left) / page_w) as f32;
     let down = |v: f64| ((page_top - v) / page_w) as f32;
 
-    let indexes = indexes_for_page(doc_handle, page_index, &doc, page);
+    let indexes = indexes_for_doc(doc_handle, &doc);
     let read = recover::read_page_with(&doc, page, &indexes);
     let mut out: Vec<u8> = Vec::new();
     out.extend((read.len() as u32).to_le_bytes());
@@ -26326,9 +26346,8 @@ p={spread_px:.4},c={rgba:08X})"
         // that the second reading got the SAME INDEX back, and that can simply
         // be asked.
         let doc = lopdf::Document::load_mem(&edited).unwrap();
-        let (_, &first_page) = doc.get_pages().iter().next().unwrap();
-        let one = indexes_for_page(handle, 0, &doc, first_page);
-        let two = indexes_for_page(handle, 0, &doc, first_page);
+        let one = indexes_for_doc(handle, &doc);
+        let two = indexes_for_doc(handle, &doc);
         assert!(Arc::ptr_eq(&one, &two), "the second reading rebuilt the index");
         assert!(!one.is_empty(), "there was no index to keep");
 

@@ -231,6 +231,22 @@ impl Index {
         chars: Option<&BTreeSet<char>>,
         glyphs: Option<&BTreeSet<u16>>,
     ) -> Option<Index> {
+        Index::build_reporting(font, chars, glyphs, None)
+    }
+
+    /// The same, telling someone how far along it is.
+    ///
+    /// ⚠️ THE WAIT IS TWENTY SECONDS AND IT USED TO BE INVISIBLE, which a
+    /// reader could only read as the app having hung. `report` is called with
+    /// how many spellings have been shaped and how many there are, and the
+    /// total is known before the first one because the enumeration is a list
+    /// rather than a stream.
+    pub(crate) fn build_reporting(
+        font: &[u8],
+        chars: Option<&BTreeSet<char>>,
+        glyphs: Option<&BTreeSet<u16>>,
+        report: Option<&(dyn Fn(usize, usize) + Sync)>,
+    ) -> Option<Index> {
         let face = rustybuzz::Face::from_slice(font, 0)?;
         let mut says: HashMap<Vec<u16>, String> = HashMap::new();
         let mut longest = 1usize;
@@ -239,7 +255,22 @@ impl Index {
         // `UnicodeBuffer` per syllable allocates, and this shapes hundreds of
         // thousands of them; `GlyphBuffer::clear` hands the same one back.
         let mut buffer = rustybuzz::UnicodeBuffer::new();
-        for text in syllables(chars, scope_of(&face, glyphs).as_ref()) {
+        let all = syllables(chars, scope_of(&face, glyphs).as_ref());
+        let total = all.len();
+
+        // ⚠️ NOT ON EVERY ONE OF THEM. There are hundreds of thousands, and a
+        // caller that took a lock or woke a UI thread each time would cost more
+        // than the shaping it is reporting on. Every thousandth is about fifty
+        // reports a second at the measured rate, which no eye can tell from
+        // continuous.
+        let every = (total / 1000).max(1);
+
+        for (n, text) in all.into_iter().enumerate() {
+            if let Some(report) = report {
+                if n % every == 0 {
+                    report(n, total);
+                }
+            }
             buffer.push_str(&text);
             let shaped = rustybuzz::shape(&face, &[], buffer);
             let drawn: Vec<u16> =
@@ -269,6 +300,9 @@ impl Index {
                     }
                 }
             }
+        }
+        if let Some(report) = report {
+            report(total, total);
         }
         if says.is_empty() {
             return None;

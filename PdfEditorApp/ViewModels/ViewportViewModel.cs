@@ -5160,6 +5160,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             _linesByPage[pageIndex] = lines;
         }
+        else
+        {
+            // ⚠️ THE ONE PLACE THAT KNOWS A WAIT HAS BEGUN. The gateway is what
+            // starts the preparation and what discovers it is not finished, so
+            // this is where the bar can be put on screen without anyone else
+            // having to guess at it.
+            WatchPreparation();
+        }
         return lines;
     }
 
@@ -6318,6 +6326,82 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         RefreshSelectionOutline();
     }
+
+    // ---------------- saying that the Burmese is being prepared ----------------
+    //
+    // ⚠️ THE WAIT WAS INVISIBLE, AND THAT IS THE WHOLE DEFECT. A Burmese
+    // document cannot be read until its font has been reshaped into an index,
+    // which takes about twenty seconds, and for all of them the app said
+    // nothing whatever. The reader saw scrambled text that refused to be
+    // clicked and no reason for it, which reads as the app having hung.
+
+    private DispatcherQueueTimer? _prepareTimer;
+    private int _preparePercent = -1;
+
+    /// <summary>Whether the document's Burmese is being prepared right now.</summary>
+    public bool IsPreparingText => _preparePercent >= 0;
+
+    /// <summary>How far along, 0 to 100. Meaningless unless preparing.</summary>
+    public int PreparePercent => Math.Max(0, _preparePercent);
+
+    /// <summary>What to tell the reader while they wait.</summary>
+    /// <remarks>
+    /// Says what it is FOR, not what it is doing. "Building a reshaping index"
+    /// is true and tells a reader nothing they can act on; what they want to
+    /// know is that the text will become editable and that waiting is the way
+    /// to get there.
+    /// </remarks>
+    public string PrepareMessage => "Preparing Myanmar text for editing…";
+
+    /// <summary>
+    /// Starts watching a preparation, or keeps watching one already running.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ASKED ON A TIMER RATHER THAN WHEN PAGES ARE DRAWN. The lines are read
+    /// on whatever schedule scrolling happens to produce, so a bar driven by
+    /// that would sit frozen whenever the reader kept still, which is exactly
+    /// when they are watching it.
+    /// </remarks>
+    private void WatchPreparation()
+    {
+        if (_dispatcherQueue is null || _documentHandle == 0) { return; }
+
+        _prepareTimer ??= CreatePrepareTimer();
+        _prepareTimer?.Start();
+    }
+
+    private DispatcherQueueTimer? CreatePrepareTimer()
+    {
+        var queue = _dispatcherQueue;
+        if (queue is null) { return null; }
+
+        var timer = queue.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(PrepareTickMs);
+        timer.IsRepeating = true;
+        timer.Tick += (t, _) =>
+        {
+            int now = _documentHandle == 0
+                ? -1
+                : RenderCoreNative.recovery_progress(_documentHandle);
+
+            if (now == _preparePercent) { return; }
+            _preparePercent = now;
+            OnPropertyChanged(nameof(IsPreparingText));
+            OnPropertyChanged(nameof(PreparePercent));
+
+            // ⚠️ STOPPED WHEN THERE IS NOTHING TO SAY. A repeating timer left
+            // running is a wake-up every quarter second for the life of the
+            // document, on a machine that may be doing nothing else at all.
+            if (now < 0) { t.Stop(); }
+        };
+        return timer;
+    }
+
+    /// <summary>
+    /// How often to ask. Four times a second: fast enough that the bar moves
+    /// visibly, slow enough that it costs nothing.
+    /// </summary>
+    private const int PrepareTickMs = 250;
 
     private DispatcherQueueTimer? CreateUnitNoticeTimer()
     {

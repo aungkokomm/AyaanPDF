@@ -3609,5 +3609,50 @@
                            Visibility="{x:Bind ViewModel.DirtyIndicatorVisibility, Mode=OneWay}" />
             </StackPanel>
         </Border>
+
+        <!--
+            WHAT THE APP IS DOING DURING THE TWENTY SECONDS IT USED TO SPEND IN
+            SILENCE.
+
+            A Burmese page cannot be read until its font has been reshaped into
+            an index, and until that finishes the page shows the scrambled
+            fragments PDFium made of it and refuses to be clicked. For the whole
+            of that wait the app said nothing whatever, which a reader can only
+            read as a hang: they are looking at their own document behaving as
+            though it were broken.
+
+            LAST CHILD OF THE GRID so it floats over the page rather than moving
+            it, and not hit-testable, because it explains a wait rather than
+            asking anything of the reader: a click must reach the document
+            underneath it as if this were not here.
+
+            Bottom centre, clear of the status pill. Out of the way of the text
+            being prepared, which is what the reader is looking at.
+        -->
+        <Border Visibility="{x:Bind ViewModel.IsPreparingText, Mode=OneWay}"
+                IsHitTestVisible="False"
+                HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                Margin="0,0,0,52" Padding="16,12"
+                CornerRadius="8" MinWidth="300"
+                Background="{ThemeResource AcrylicInAppFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1">
+            <Border.Shadow>
+                <ThemeShadow />
+            </Border.Shadow>
+            <StackPanel Spacing="8">
+                <TextBlock Text="{x:Bind ViewModel.PrepareMessage}"
+                           Style="{StaticResource BodyStrongTextBlockStyle}" />
+                <ProgressBar Value="{x:Bind ViewModel.PreparePercent, Mode=OneWay}"
+                             Minimum="0" Maximum="100" />
+                <!--
+                    Says the wait is finite and roughly how much is left, which
+                    is the difference between waiting and wondering.
+                -->
+                <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Text="This happens once per document. The text can be edited when it finishes." />
+            </StackPanel>
+        </Border>
     </Grid>
 </Page>

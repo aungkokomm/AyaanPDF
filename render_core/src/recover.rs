@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use lopdf::{Document, Object, ObjectId};
 
@@ -864,7 +865,7 @@ pub(crate) struct Reading {
 /// milliseconds. It is separate from the reading so a caller can pay for it
 /// once, in advance, and off the thread the reader is waiting on.
 pub(crate) struct Indexes {
-    by_font: BTreeMap<String, (Vec<u8>, crate::reshape::Index)>,
+    by_font: BTreeMap<String, Arc<(Vec<u8>, crate::reshape::Index)>>,
 }
 
 impl Indexes {
@@ -875,7 +876,7 @@ impl Indexes {
 
     /// What this font draws, if it is one that can be read.
     pub(crate) fn index_for(&self, base_font: &str) -> Option<&crate::reshape::Index> {
-        self.by_font.get(base_font).map(|(_, index)| index)
+        self.by_font.get(base_font).map(|face| &face.1)
     }
 }
 
@@ -892,15 +893,148 @@ pub(crate) fn indexes_for(doc: &Document, page: ObjectId) -> Indexes {
     for line in lines_of(doc, page) {
         wanted.entry(line.base_font).or_default().extend(line.glyphs);
     }
+    build_indexes(&wanted)
+}
+
+/// The same, for the WHOLE DOCUMENT, so every page shares one index.
+///
+/// ⚠️ MEASURED BEFORE THIS WAS WRITTEN, on a real three-page Burmese file:
+///
+/// ```text
+///                       page 0   page 1   page 2   total    time
+///     one per page      16/30    26/30    21/21    63/81    50.1s
+///     one per document  20/30    30/30    21/21    71/81    22.6s
+/// ```
+///
+/// It is not a trade. One index is two and a half times faster on three pages
+/// and the saving GROWS with page count, because it no longer depends on it.
+/// And it reads MORE, not less: a page-scoped index was too narrow to read its
+/// own page.
+///
+/// ⚠️ THE SCOPE COMES FROM THE FONT DICTIONARY, NOT FROM THE PAGES. A
+/// producer's embedded subset declares a width for every CID the document uses,
+/// so the document-wide glyph set is there to be read without parsing a single
+/// content stream. That is why this costs no more than one page's index did.
+pub(crate) fn indexes_for_document(doc: &Document) -> Indexes {
+    let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+    let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+    for &page in &pages {
+        for (_, (base_font, widths)) in fonts_of(doc, page) {
+            if let Some(w) = widths {
+                wanted.entry(base_font).or_default().extend(w.declared());
+            }
+        }
+    }
+
+    // ⚠️ AND A FONT THAT DECLARES NOTHING STILL HAS TO BE READABLE. A subset
+    // without a `/W` array leaves nothing to scope by, and an unscoped index is
+    // the 55-second whole-of-Burmese case. Falling back to what the pages
+    // actually draw keeps such a font exactly as readable as it was before this
+    // existed, and costs a content-stream walk only when one turns up.
+    let undeclared: Vec<String> = pages
+        .iter()
+        .flat_map(|&page| fonts_of(doc, page).into_values().map(|(f, _)| f))
+        .filter(|f| !wanted.contains_key(f))
+        .collect();
+    if !undeclared.is_empty() {
+        for &page in &pages {
+            for line in lines_of(doc, page) {
+                if undeclared.contains(&line.base_font) {
+                    wanted.entry(line.base_font).or_default().extend(line.glyphs);
+                }
+            }
+        }
+    }
+
+    build_indexes(&wanted)
+}
+
+/// How far the current preparation has got, for anything that wants to say so.
+///
+/// ⚠️ IT USED TO SAY NOTHING FOR TWENTY SECONDS, and a reader can only read
+/// that as the app having hung. Global rather than threaded through, because
+/// exactly one preparation runs at a time by construction: the slot each is
+/// built under is held for the whole of it, so a second arrival waits rather
+/// than starting its own.
+pub(crate) mod progress {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) static DONE: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+    /// How far along, 0 to 100, or None when nothing is being prepared.
+    pub(crate) fn percent() -> Option<i32> {
+        let total = TOTAL.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        let done = DONE.load(Ordering::Relaxed).min(total);
+        Some(((done as f64 / total as f64) * 100.0).round() as i32)
+    }
+
+    pub(crate) fn began(total: usize) {
+        DONE.store(0, Ordering::Relaxed);
+        TOTAL.store(total, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reached(done: usize) {
+        DONE.store(done, Ordering::Relaxed);
+    }
+
+    /// ⚠️ ALWAYS, INCLUDING WHEN THE BUILD FAILED OR FOUND NOTHING. A bar left
+    /// on screen because an index came back empty is a worse lie than no bar.
+    pub(crate) fn finished() {
+        TOTAL.store(0, Ordering::Relaxed);
+        DONE.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Builds one index per font, over the glyphs each is scoped to.
+fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
+    // ⚠️ ONE INDEX PER FACE, NOT PER NAME. A producer splits a document across
+    // several subsets of one font, and a page names each of them separately:
+    // `BCDEEE+MyanmarText` and `BCDGEE+MyanmarText` are one face, and so are
+    // `ABCDEE+Pyidaungsu` and `ABCDEE+Pyidaungsu,Bold` once the bold falls back
+    // to its family's file. Indexing each name apart pays the seconds twice
+    // over for the same font, and the two halves cannot even read each other's
+    // syllables. Measured on a real three-page file: 40.5s for two names
+    // against the one face they share.
+    let mut per_face: BTreeMap<&'static str, BTreeSet<u16>> = BTreeMap::new();
+    let mut face_of: BTreeMap<&String, &'static str> = BTreeMap::new();
+    for (base_font, glyphs) in wanted {
+        let Some(path) = installed(base_font) else { continue };
+        per_face.entry(path).or_default().extend(glyphs.iter().copied());
+        face_of.insert(base_font, path);
+    }
+
+    let mut built: BTreeMap<&'static str, Arc<(Vec<u8>, crate::reshape::Index)>> = BTreeMap::new();
+    for (path, glyphs) in &per_face {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+
+        // ⚠️ REPORTED PER FACE, because that is where the total is known. In
+        // practice there is one: the whole reason this groups by face is that
+        // every subset of a font now shares its index. A document that really
+        // did use two unrelated readable faces would fill the bar twice.
+        let report = |done: usize, total: usize| {
+            if done == 0 {
+                progress::began(total);
+            } else {
+                progress::reached(done);
+            }
+        };
+        let index = crate::reshape::Index::build_reporting(&bytes, None, Some(glyphs), Some(&report));
+        progress::finished();
+
+        let Some(index) = index else { continue };
+        built.insert(path, Arc::new((bytes, index)));
+    }
 
     let mut by_font = BTreeMap::new();
-    for (base_font, glyphs) in &wanted {
-        let Some(path) = installed(base_font) else { continue };
-        let Ok(bytes) = std::fs::read(path) else { continue };
-        let Some(index) = crate::reshape::Index::build(&bytes, None, Some(glyphs)) else {
-            continue;
-        };
-        by_font.insert(base_font.clone(), (bytes, index));
+    for (base_font, path) in face_of {
+        if let Some(face) = built.get(path) {
+            by_font.insert(base_font.clone(), Arc::clone(face));
+        }
     }
     Indexes { by_font }
 }
@@ -935,7 +1069,8 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
     let faces: BTreeMap<&str, (rustybuzz::Face, &crate::reshape::Index)> = indexes
         .by_font
         .iter()
-        .filter_map(|(name, (bytes, index))| {
+        .filter_map(|(name, face)| {
+            let (bytes, index) = face.as_ref();
             Some((name.as_str(), (rustybuzz::Face::from_slice(bytes, 0)?, index)))
         })
         .collect();
@@ -1312,7 +1447,7 @@ mod tests {
             let face = indexes
                 .by_font
                 .get(&line.base_font)
-                .and_then(|(bytes, _)| rustybuzz::Face::from_slice(bytes, 0));
+                .and_then(|face| rustybuzz::Face::from_slice(&face.0, 0));
             let phantom = face.map(|f| f.number_of_glyphs()).unwrap_or(u16::MAX);
             let trailing: f64 = line
                 .glyphs
@@ -1404,7 +1539,8 @@ mod tests {
             if r.text.is_none() {
                 println!("      glyph ids: {:?}", line.glyphs);
                 // What does each single glyph spell on its own?
-                if let Some((bytes, index)) = indexes.by_font.get(&line.base_font) {
+                if let Some(entry) = indexes.by_font.get(&line.base_font) {
+                    let (bytes, index) = entry.as_ref();
                     let face = rustybuzz::Face::from_slice(bytes, 0).unwrap();
                     let one: Vec<String> = line.glyphs.iter()
                         .map(|g| crate::reshape::prove(&face, index, &[*g])
@@ -1486,7 +1622,7 @@ mod tests {
         let chars: BTreeSet<char> = text.chars().collect();
         let index = crate::reshape::Index::build(bytes, Some(&chars), None).unwrap();
         Indexes {
-            by_font: [("BCDEEE+MyanmarText".to_string(), (bytes.to_vec(), index))]
+            by_font: [("BCDEEE+MyanmarText".to_string(), std::sync::Arc::new((bytes.to_vec(), index)))]
                 .into_iter()
                 .collect(),
         }
@@ -1635,7 +1771,8 @@ mod tests {
 
         for (n, (line, r)) in lines.iter().zip(read.iter()).enumerate() {
             let Some(text) = r.text.as_deref() else { continue };
-            let Some((bytes, index)) = indexes.by_font.get(&line.base_font) else { continue };
+            let Some(entry) = indexes.by_font.get(&line.base_font) else { continue };
+            let (bytes, index) = entry.as_ref();
             let face = rustybuzz::Face::from_slice(bytes, 0).unwrap();
 
             // The glyph this font draws for an ordinary space.
@@ -1800,19 +1937,15 @@ mod tests {
                 glyphs.len());
         }
 
-        // ---- one index for the document, by each scope ----
-        for (label, scope) in [("UNION", &union), ("DECLARED", &declared)] {
+        // ---- one index for the document ----
+        //
+        // ⚠️ THE SHIPPED FUNCTION, not a copy of it. This measurement
+        // decided that the shipped one should exist, so it has to keep asking
+        // the real thing or it stops being evidence about the real thing.
+        for label in ["DOCUMENT"] {
             let started = std::time::Instant::now();
-            let mut by_font = BTreeMap::new();
-            for (base_font, glyphs) in scope {
-                let Some(path) = installed(base_font) else { continue };
-                let Ok(bytes) = std::fs::read(path) else { continue };
-                let Some(index) = crate::reshape::Index::build(&bytes, None, Some(glyphs))
-                else { continue };
-                by_font.insert(base_font.clone(), (bytes, index));
-            }
+            let shared = indexes_for_document(&doc);
             let built = started.elapsed();
-            let shared = Indexes { by_font };
 
             let mut read_total = 0usize;
             let mut lines_total = 0usize;
@@ -1938,7 +2071,7 @@ mod tests {
                     continue;
                 };
                 let mut indexes = Indexes { by_font: BTreeMap::new() };
-                indexes.by_font.insert(font.clone(), (bytes.clone(), index));
+                indexes.by_font.insert(font.clone(), Arc::new((bytes.clone(), index)));
 
                 let read = read_page_with(&doc, page, &indexes);
                 let mine: Vec<&Reading> = read.iter().filter(|r| &r.font == font).collect();
@@ -2195,6 +2328,82 @@ mod tests {
             });
     }
 
+    /// ⚠️ THE WAIT HAS TO BE VISIBLE. Preparing a document is about twenty
+    /// seconds during which the app said nothing at all, and a reader can only
+    /// read that as a hang. This checks the three things a bar on screen needs:
+    /// that it is nothing before, that it moves during, and that it is nothing
+    /// again afterwards.
+    #[test]
+    fn preparing_says_how_far_along_it_is() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        assert_eq!(progress::percent(), None, "something was already preparing");
+
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let glyphs: BTreeSet<u16> = [3u16, 4, 5].into_iter().collect();
+
+        let seen = std::sync::Mutex::new(Vec::<i32>::new());
+        let report = |done: usize, total: usize| {
+            if done == 0 { progress::began(total); } else { progress::reached(done); }
+            if let Some(p) = progress::percent() {
+                seen.lock().unwrap().push(p);
+            }
+        };
+        let _ = crate::reshape::Index::build_reporting(
+            &bytes, None, Some(&glyphs), Some(&report));
+        progress::finished();
+
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.len() > 2, "the bar would have jumped straight to the end");
+        assert_eq!(seen[0], 0, "it did not start at nothing");
+        assert_eq!(seen[seen.len() - 1], 100, "it never reached the end");
+
+        // ⚠️ AND IT ONLY EVER GOES FORWARDS. A bar that goes backwards reads as
+        // the work having been lost and started again.
+        for pair in seen.windows(2) {
+            assert!(pair[1] >= pair[0], "the bar went backwards: {pair:?}");
+        }
+
+        assert_eq!(progress::percent(), None, "the bar was left on screen");
+    }
+
+    /// ⚠️ TWO SUBSETS OF ONE FACE MUST SHARE ONE INDEX. A producer splits a
+    /// document across several subsets and a page names each separately, so
+    /// indexing by NAME paid the seconds twice over for the same font file, and
+    /// neither half could read the other's syllables. Measured on a real
+    /// three-page file: 53s and 71 of 80 lines by name, 22s and 80 of 80 by
+    /// face.
+    #[test]
+    fn two_subsets_of_one_face_get_one_index_between_them() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        // A tiny scope, because this is about the sharing and not the contents.
+        let glyphs: BTreeSet<u16> = [3u16, 4, 5].into_iter().collect();
+        let wanted: BTreeMap<String, BTreeSet<u16>> = [
+            ("BCDEEE+MyanmarText".to_string(), glyphs.clone()),
+            ("BCDGEE+MyanmarText".to_string(), glyphs.clone()),
+            // And the bold name, which falls back to the same family.
+            ("BCDGEE+MyanmarText,Bold".to_string(), glyphs),
+        ]
+        .into_iter()
+        .collect();
+
+        let built = build_indexes(&wanted);
+        let one = built.by_font.get("BCDEEE+MyanmarText").expect("no index");
+        let two = built.by_font.get("BCDGEE+MyanmarText").expect("no index");
+        assert!(Arc::ptr_eq(one, two), "two subsets of one face were indexed apart");
+
+        // The bold name shares whatever file it resolved to, whichever that is.
+        let bold = built.by_font.get("BCDGEE+MyanmarText,Bold").expect("no index");
+        let shared = Arc::ptr_eq(bold, one);
+        assert_eq!(
+            shared,
+            installed("MyanmarText-Bold") == installed("MyanmarText"),
+            "the bold name did not follow the file it resolves to");
+    }
+
     /// ⚠️ A COMMA IS AS GOOD AS A HYPHEN, and on a real file it is what the
     /// producer used: the user's page names its bold `ABCDEE+Pyidaungsu,Bold`.
     /// Splitting on the hyphen alone took that whole string as a family name,
@@ -2250,7 +2459,7 @@ mod tests {
         let chars: BTreeSet<char> = text.chars().collect();
         let index = crate::reshape::Index::build(&bytes, Some(&chars), None).unwrap();
         let indexes = Indexes {
-            by_font: [("BCDEEE+MyanmarText".to_string(), (bytes, index))]
+            by_font: [("BCDEEE+MyanmarText".to_string(), std::sync::Arc::new((bytes, index)))]
                 .into_iter()
                 .collect(),
         };
@@ -2359,7 +2568,7 @@ mod tests {
         let chars: BTreeSet<char> = LEFT.chars().collect();
         let index = crate::reshape::Index::build(&bytes, Some(&chars), None).unwrap();
         let indexes = Indexes {
-            by_font: [("BCDEEE+MyanmarText".to_string(), (bytes, index))]
+            by_font: [("BCDEEE+MyanmarText".to_string(), std::sync::Arc::new((bytes, index)))]
                 .into_iter()
                 .collect(),
         };

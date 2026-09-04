@@ -746,6 +746,22 @@ internal static partial class RenderCoreNative
     public static extern int recovery_is_ready(ulong docHandle, int pageIndex);
 
     /// <summary>
+    /// How far the Burmese preparation has got, 0 to 100, or -1 when none is
+    /// running.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE WAIT WAS INVISIBLE AND THAT IS THE DEFECT THIS FIXES. Preparing a
+    /// document is about twenty seconds during which the app said nothing at
+    /// all, and a reader can only read that as the app having hung.
+    ///
+    /// ⚠️ NOT PER PAGE, because the index is not: one preparation serves the
+    /// whole document. Cheap enough to ask on a timer, being two atomic loads
+    /// and no lock.
+    /// </remarks>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public static extern int recovery_progress(ulong docHandle);
+
+    /// <summary>
     /// Moves a line, or the whole paragraph it belongs to, across the page.
     /// Returns the WHOLE NEW DOCUMENT.
     /// </summary>
