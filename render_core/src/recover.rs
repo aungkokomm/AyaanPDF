@@ -1725,12 +1725,15 @@ mod tests {
             return;
         }
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        const SUPPLIED: &str = r"D:\Ayaan PDF Test file";
         let candidates: Vec<(&str, String)> = vec![
             ("system Pyidaungsu.ttf", r"C:\Windows\Fonts\Pyidaungsu.ttf".to_string()),
             ("per-user 2.5.3 Regular",
              format!(r"{local}\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf")),
             ("per-user 2.5.3 Bold",
              format!(r"{local}\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Bold.ttf")),
+            ("supplied 2.5.3 Numbers",
+             format!(r"{SUPPLIED}\Pyidaungsu-2.5.3_Numbers.ttf")),
             ("BMSTU pyidaungsu-1.2",
              r"C:\Program Files (x86)\BMSTU\MMUDictionary\pyidaungsu-1.2.ttf".to_string()),
         ];
@@ -1750,6 +1753,16 @@ mod tests {
                 lines.iter().filter(|l| &l.base_font == font).count(), glyphs.len());
         }
 
+        // ⚠️ WHAT THE PAGE ACTUALLY ASKS FOR, so a font that reads none of it
+        // can be told apart from a font that is simply absent. A subset numbers
+        // its glyphs from the font it was cut out of, so if a candidate orders
+        // its glyphs differently the same id means a different letter and NOTHING
+        // can ever be proven with it. That is not a bug to fix: it is the wrong
+        // font, and a refusal is the only honest answer.
+        let highest = wanted.values().flatten().max().copied().unwrap_or(0);
+        println!("the page's highest glyph id is {highest}");
+
+
         for (label, path) in &candidates {
             if !std::path::Path::new(path).exists() {
                 println!("\n{label}: not on this machine");
@@ -1757,6 +1770,39 @@ mod tests {
             }
             let bytes = std::fs::read(path).unwrap();
             println!("\n{label} ({} bytes)", bytes.len());
+
+            // Where this font puts a few plain Burmese letters. Two builds that
+            // agree here share a glyph order and can read each other's subsets;
+            // two that disagree cannot, whatever else is true of them.
+            if let Some(face) = rustybuzz::ttf_parser::Face::parse(&bytes, 0).ok() {
+                let where_are: Vec<String> = ['\u{1000}', '\u{1005}', '\u{1010}', '\u{1019}']
+                    .iter()
+                    .map(|c| match face.glyph_index(*c) {
+                        Some(g) => format!("{c}={}", g.0),
+                        None => format!("{c}=none"),
+                    })
+                    .collect();
+                println!("   {} glyphs; {}", face.number_of_glyphs(), where_are.join(" "));
+            }
+
+            // ⚠️ AND WHERE IT PUTS THE JOINED FORMS, which is what actually
+            // decides this. A Burmese line is drawn almost entirely in COMPOSED
+            // glyphs, and those are numbered above the plain letters, exactly
+            // where two builds of one family differ when one carries more
+            // glyphs than the other. Two fonts can agree on every plain letter
+            // and still share not one shaped word.
+            if let Some(face) = rustybuzz::Face::from_slice(&bytes, 0) {
+                let words = [
+                    "\u{1019}\u{103C}\u{1014}\u{103A}\u{1019}\u{102C}",
+                    "\u{1000}\u{103C}\u{1014}\u{103A}",
+                    "\u{1005}\u{102C}",
+                ];
+                let shaped: Vec<String> = words
+                    .iter()
+                    .map(|w| format!("{w}={:?}", crate::reshape::draws(&face, w)))
+                    .collect();
+                println!("   shaped {}", shaped.join("  "));
+            }
 
             for (font, glyphs) in &wanted {
                 let started = std::time::Instant::now();
