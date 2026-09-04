@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using Xunit;
 
@@ -113,6 +113,91 @@ public class TextMoveWiringTests
         Assert.Contains("ViewModel.CancelTextUnitMove();", body, StringComparison.Ordinal);
     }
 
+    // ---------------- nudging ----------------
+
+    /// <summary>
+    /// ⚠️ THE SELECTION IS CARRIED WITH THE TEXT, and without it a nudge works
+    /// exactly once. The write throws away every per-page cache and the frame
+    /// with them, so the second keystroke of a held arrow would find nothing
+    /// selected and do nothing at all, silently: the same shape of defect that
+    /// made dragging move nothing.
+    /// </summary>
+    [Fact]
+    public void a_move_leaves_the_same_text_selected_where_it_landed()
+    {
+        string body = Method(Vm(), "private bool MoveTextUnitBy(", 3400);
+
+        int cleared = body.IndexOf("ClearTextUnitSelection();", StringComparison.Ordinal);
+        int found = body.IndexOf("SelectTextUnitAt(page, atX, atY);", StringComparison.Ordinal);
+
+        Assert.True(cleared > 0, "the stale selection is not dropped");
+        Assert.True(found > cleared, "nothing puts the frame back on the moved text");
+
+        // ⚠️ FOUND BY THE SAME HIT TEST A CLICK USES, so the reader gets the
+        // unit they would have got by clicking there, decided against the
+        // document as it is NOW rather than by a lookup of its own.
+        Assert.Contains("double atX = ((unit.Left + unit.Right) / 2) + dx;", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ ONE UNDO STEP FOR A WHOLE BURST, and no document snapshot per
+    /// keystroke either. Every nudge rewrites the entire document, and a
+    /// capture copies the whole file.
+    /// </summary>
+    [Fact]
+    public void a_held_arrow_is_one_undo_step_and_not_forty()
+    {
+        string vm = Vm();
+        string body = Method(vm, "public bool NudgeTextUnit(", 1200);
+
+        Assert.Contains("!_nudgeRunOpen || _history.NextUndoLabel != NudgeStepLabel",
+            body, StringComparison.Ordinal);
+        Assert.Contains("takeAStep: fresh", body, StringComparison.Ordinal);
+
+        // Nothing is captured when no step is being taken.
+        Assert.Contains("takeAStep ? Capture(HistoryScope.Document, label, null) : null",
+            Method(vm, "private bool MoveTextUnitBy(", 3400), StringComparison.Ordinal);
+
+        // ⚠️ AND A RUN ENDS WHEN THE SELECTION DOES. Nudge, click elsewhere,
+        // nudge is two steps, and the label at the top of the stack reads the
+        // same in both cases, so only this can tell them apart.
+        Assert.Contains("_nudgeRunOpen = false;",
+            Method(vm, "public TextUnitSelection? SelectedTextUnit", 900),
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ NOT WHILE THERE IS A CARET IN THE LINE. The block that claims the
+    /// arrows for a caret lets them through when Alt is held, and Alt is the
+    /// modifier that asks a move for one line, so without this Alt+Arrow while
+    /// typing carried the text out from under the caret.
+    /// </summary>
+    [Fact]
+    public void the_keyboard_does_not_move_text_that_is_being_typed_into()
+    {
+        string body = Method(Vm(), "public bool NudgeTextUnit(", 1200);
+        Assert.Contains("if (IsEditingInPlace) { return false; }", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The arrows reach the text only when no annotation has them, and they
+    /// still scroll the page when nothing at all is selected.
+    /// </summary>
+    [Fact]
+    public void the_arrows_nudge_text_after_annotations_and_before_scrolling()
+    {
+        string body = Method(Page(), "case VirtualKey.Right:", 1400);
+
+        int annotation = body.IndexOf("ViewModel.HasSelectedAnnotationLoaded", StringComparison.Ordinal);
+        int text = body.IndexOf("else if (ViewModel.HasSelectedTextUnit)", StringComparison.Ordinal);
+        int scroll = body.IndexOf("ScrollBy(", StringComparison.Ordinal);
+
+        Assert.True(annotation > 0 && text > annotation, "text answers before annotations do");
+        Assert.True(scroll > text, "the page still scrolls before the text is offered the keys");
+        Assert.Contains("IsShiftDown() ? BigNudgeStep : SmallNudgeStep", body, StringComparison.Ordinal);
+        Assert.Contains("IsAltDown())", body, StringComparison.Ordinal);
+    }
+
     // ---------------- what the reader can see ----------------
 
     /// <summary>
@@ -187,7 +272,7 @@ public class TextMoveWiringTests
     [Fact]
     public void a_refused_move_leaves_no_undo_step_behind()
     {
-        string body = Method(Vm(), "public bool CommitTextUnitMove(", 2600);
+        string body = Method(Vm(), "private bool MoveTextUnitBy(", 3400);
 
         int captured = body.IndexOf("Capture(HistoryScope.Document", StringComparison.Ordinal);
         int wrote = body.IndexOf("ShiftGateway.Move(", StringComparison.Ordinal);
@@ -207,7 +292,7 @@ public class TextMoveWiringTests
     [Fact]
     public void a_move_throws_away_everything_it_invalidated()
     {
-        string body = Method(Vm(), "public bool CommitTextUnitMove(", 2600);
+        string body = Method(Vm(), "private bool MoveTextUnitBy(", 3400);
 
         Assert.Contains("RestoreDocumentBytes(bytes);", body, StringComparison.Ordinal);
         Assert.Contains("_linesByPage.Clear();", body, StringComparison.Ordinal);

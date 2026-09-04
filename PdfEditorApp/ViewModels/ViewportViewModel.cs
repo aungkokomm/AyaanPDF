@@ -5684,6 +5684,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             if (ReferenceEquals(_selectedTextUnit, value)) { return; }
 
+            // ⚠️ AND THAT ENDS ANY RUN OF NUDGES. Nudge, click elsewhere,
+            // nudge is two undo steps and not one, and the label at the top of
+            // the stack says "Nudge text" in both cases, so this is the only
+            // thing that can tell them apart.
+            _nudgeRunOpen = false;
+
             _selectedTextUnit = value;
             OnPropertyChanged(nameof(SelectedTextUnit));
             OnPropertyChanged(nameof(HasSelectedTextUnit));
@@ -5901,34 +5907,70 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        int page = _textMove.Page;
         (double dx, double dy) = (_textMove.Dx, _textMove.Dy);
-        var unit = _selectedTextUnit;
         _textMove.Release();
         _movingBaselines = Array.Empty<double>();
 
-        if (unit is null || _documentHandle == 0 || page < 0)
+        bool moved = MoveTextUnitBy(dx, dy, oneLineOnly, "Move text", takeAStep: true);
+        if (!moved) { RefreshSelectionOutline(); }
+        TextUnitMoveChanged?.Invoke();
+        return moved;
+    }
+
+    /// <summary>
+    /// Writes a displacement of the selected text into the document, and leaves
+    /// the same text selected where it has landed.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A WHOLE-DOCUMENT REWRITE, like a form edit and like retyping a
+    /// recovered line. The move changes the file's own structure rather than a
+    /// PDFium page, so it comes back as bytes and everything the app is holding
+    /// is stale when it returns.
+    ///
+    /// ⚠️ AND THE SELECTION IS TAKEN WITH IT, which is what makes a second
+    /// keystroke possible at all. Everything the app knows about the page is
+    /// thrown away here, the frame included, so a nudge that did not put the
+    /// frame back on the moved text would work exactly once and then quietly
+    /// stop.
+    /// </remarks>
+    /// <param name="takeAStep">
+    /// Whether this move is the start of its own undo step. False for the
+    /// second and later keystrokes of a held arrow, which belong to the step
+    /// the first one pushed.
+    /// </param>
+    private bool MoveTextUnitBy(
+        double dx, double dy, bool oneLineOnly, string label, bool takeAStep)
+    {
+        if (_selectedTextUnit is not { } unit || _documentHandle == 0 || unit.Page < 0)
         {
-            RefreshSelectionOutline();
             return false;
         }
+        int page = unit.Page;
 
         // Captured BEFORE the write, because that is the state undo restores,
         // but only PUSHED after it succeeds: the core leaves the document
         // untouched when it refuses, and an entry pushed anyway would be a
         // Ctrl+Z that appears to do nothing.
-        var before = Capture(HistoryScope.Document, "Move text", null);
+        //
+        // ⚠️ AND NOT CAPTURED AT ALL WHEN NO STEP IS BEING TAKEN. A document
+        // capture snapshots the whole file, which on a long book is not
+        // something to do on every repeat of a held key.
+        var before = takeAStep ? Capture(HistoryScope.Document, label, null) : null;
 
         byte[]? bytes = Interop.ShiftGateway.Move(
             _documentHandle, page, unit.Baseline, !oneLineOnly, dx, dy);
         if (bytes is null)
         {
-            Diag.Log($"CommitTextUnitMove p{page} refused at baseline {unit.Baseline}");
+            Diag.Log($"MoveTextUnitBy p{page} refused at baseline {unit.Baseline}");
             Status = "This text could not be moved.";
             ShowUnitNotice("This text could not be moved.");
-            RefreshSelectionOutline();
             return false;
         }
+
+        // Where to look for the text afterwards: the middle of the box it was
+        // in, carried by the same displacement the text was.
+        double atX = ((unit.Left + unit.Right) / 2) + dx;
+        double atY = ((unit.Top + unit.Bottom) / 2) + dy;
 
         RestoreDocumentBytes(bytes);
 
@@ -5942,17 +5984,71 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         ClearTextUnitSelection();
         RenderCoreNative.prepare_recovery(_documentHandle, page);
 
-        _history.Push(before);
-        NotifyHistoryChanged();
+        if (before is not null)
+        {
+            _history.Push(before);
+            NotifyHistoryChanged();
+        }
 
         InvalidateAllPageRasters();
         RenderCurrentPage();
         IsDirty = true;
 
+        // ⚠️ FOUND AGAIN BY THE SAME HIT TEST A CLICK USES, rather than by a
+        // lookup of its own. That is what keeps the unit the reader gets back
+        // the one they would have got by clicking there: the same rule decides
+        // between a line and a word, and it decides it against the document as
+        // it is NOW. A move that carried the text off the page or under
+        // something else simply finds nothing, and the frame goes, which is
+        // honest about what happened.
+        SelectTextUnitAt(page, atX, atY);
+
         Status = oneLineOnly ? "Line moved." : "Text moved.";
-        TextUnitMoveChanged?.Invoke();
         return true;
     }
+
+    /// <summary>
+    /// Moves the selected text by one step of the keyboard.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONE UNDO STEP FOR A WHOLE BURST. Holding an arrow down repeats it
+    /// many times a second and each repeat rewrites the entire document, so a
+    /// step per keystroke would be both a snapshot of the whole file per
+    /// keystroke and a Ctrl+Z the reader has to press forty times to get back
+    /// to where they started.
+    ///
+    /// A run is over when anything else has been pushed since, or when the
+    /// selection has changed: nudge, click elsewhere, nudge is TWO runs, and
+    /// the label alone cannot tell those apart.
+    /// </remarks>
+    public bool NudgeTextUnit(double dx, double dy, bool oneLineOnly)
+    {
+        if (_selectedTextUnit is null) { return false; }
+
+        // ⚠️ NOT WHILE THERE IS A CARET IN THE LINE, and the guard belongs
+        // here rather than in the key handler. The block that claims the
+        // arrows for the caret lets them through when Alt is held, and Alt is
+        // the modifier that asks a move for one line, so Alt+Arrow while
+        // typing would have carried the text out from under the caret.
+        if (IsEditingInPlace) { return false; }
+
+        bool fresh = !_nudgeRunOpen || _history.NextUndoLabel != NudgeStepLabel;
+        bool moved = MoveTextUnitBy(dx, dy, oneLineOnly, NudgeStepLabel, takeAStep: fresh);
+
+        // ⚠️ SET AFTER THE MOVE, NOT BEFORE. The move reselects the text it
+        // carried, and going through the selection is exactly what closes a
+        // run, so a flag set first would be cleared again before it was read.
+        _nudgeRunOpen = moved;
+        return moved;
+    }
+
+    private const string NudgeStepLabel = "Nudge text";
+
+    /// <summary>
+    /// Whether the step at the top of the undo stack is a run of nudges that
+    /// the next one may join.
+    /// </summary>
+    private bool _nudgeRunOpen;
 
     /// <summary>
     /// Lets an armed press go, and does whichever of the two things it turned

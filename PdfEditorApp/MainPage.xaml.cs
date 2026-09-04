@@ -7525,6 +7525,12 @@ public sealed partial class MainPage : Page
                     double stepD = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
                     ViewModel.NudgeSelected(0, e.Key == VirtualKey.Down ? stepD : -stepD);
                 }
+                else if (ViewModel.HasSelectedTextUnit)
+                {
+                    double stepD = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
+                    ViewModel.NudgeTextUnit(
+                        0, e.Key == VirtualKey.Down ? stepD : -stepD, IsAltDown());
+                }
                 else
                 {
                     ScrollBy(0, e.Key == VirtualKey.Down ? ArrowScrollStep : -ArrowScrollStep);
@@ -7537,6 +7543,21 @@ public sealed partial class MainPage : Page
                 {
                     double stepR = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
                     ViewModel.NudgeSelected(e.Key == VirtualKey.Right ? stepR : -stepR, 0);
+                }
+                else if (ViewModel.HasSelectedTextUnit)
+                {
+                    // ⚠️ THE CARET GUARD IS IN NudgeTextUnit, NOT HERE, and it
+                    // has to be: the block that claims the arrows for a caret
+                    // lets them through when Alt is held, and Alt is exactly
+                    // the modifier passed below.
+                    //
+                    // ⚠️ AND ALT MEANS THE SAME THING IT MEANS TO A DRAG, one
+                    // line rather than the paragraph. A modifier that meant two
+                    // different things in the two gestures that move the same
+                    // text would be worse than not having one.
+                    double stepR = IsShiftDown() ? BigNudgeStep : SmallNudgeStep;
+                    ViewModel.NudgeTextUnit(
+                        e.Key == VirtualKey.Right ? stepR : -stepR, 0, IsAltDown());
                 }
                 else
                 {
