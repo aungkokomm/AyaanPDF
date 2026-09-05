@@ -946,6 +946,7 @@ pub(crate) struct Reading {
 /// takes about 17 seconds; reading a page with one already built takes
 /// milliseconds. It is separate from the reading so a caller can pay for it
 /// once, in advance, and off the thread the reader is waiting on.
+#[derive(Default)]
 pub(crate) struct Indexes {
     by_font: BTreeMap<String, Arc<(Vec<u8>, crate::reshape::Index)>>,
 }
@@ -3208,8 +3209,14 @@ mod tests {
                 if was {
                     before_proves += 1;
                 }
-                let now = reorder_prebase(
-                    &repair_devanagari(&text, &spells, &forms), &prebase);
+                // ⚠️ THE PRODUCTION REPAIR, NOT A COPY OF IT. This diagnostic
+                // is the only thing that measures the reading against a real
+                // page, so it has to be measuring what ships. The page's whole
+                // set of lines goes in together because the drawn-order
+                // question is asked of the page, not of one line.
+                let mut whole: Vec<String> = said.iter().map(|s| s.5.clone()).collect();
+                crate::devanagari::repair_page(&mut whole);
+                let now = whole[i].clone();
                 if now == text {
                     untouched += 1;
                 } else {
@@ -3282,7 +3289,11 @@ mod tests {
 
         println!("\n{lines} lines carrying devanagari");
         println!("   {changed} rewritten, {untouched} left alone");
-        println!("   {before_proves} reproduced the page before the repair");
+        // ⚠️ "BEFORE" IS NO LONGER BEFORE. The reader itself repairs now, so
+        // the text this diagnostic is handed has already been through it and
+        // both counts read the same. The unrepaired numbers are in the commits
+        // that measured them; what this proves today is the shipped path.
+        println!("   {before_proves} reproduced the page as the reader hands it over");
         println!("   {after_proves} reproduce it after ({:.0}%)",
             after_proves as f64 / lines.max(1) as f64 * 100.0);
         println!("   {refused} still refused, {broke} of them broken BY the repair");

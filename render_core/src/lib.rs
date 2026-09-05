@@ -36,6 +36,7 @@
 pub mod form_state;
 pub mod gradient;
 mod block;
+mod devanagari;
 mod justified;
 mod pieces;
 mod provision;
@@ -1731,6 +1732,16 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
             let pages = doc.get_pages();
             let Some((_, &page)) = pages.iter().nth(page_index as usize) else { return };
             if !recover::worth_reading(&doc, page) {
+                // ⚠️ NOTHING TO RECOVER IS STILL AN ANSWER, and the reader has
+                // to be able to tell it from "not yet". Returning in silence
+                // left the slot empty, `recovery_is_ready` saying no forever,
+                // and the caller treating the page as mid-preparation: its
+                // lines were never cached and the progress card never came
+                // down. Any complex script that is not Burmese lands here, and
+                // Devanagari now lands here on every page of every Hindi book,
+                // because its text is repaired where it is read and needs no
+                // reshaping at all.
+                settle_with_nothing(doc_handle);
                 return;
             }
             let _ = indexes_for_doc(doc_handle, &doc);
@@ -1879,6 +1890,27 @@ fn document_bytes(doc_handle: u64) -> Option<Vec<u8>> {
 /// ⚠️ AND WAITING IF SOMEBODY IS BUILDING IT NOW. Two threads asking at
 /// once must not both spend the 17 seconds, so the second one blocks on the
 /// first and takes its answer.
+/// Marks a document as prepared with an index that can read nothing.
+///
+/// ⚠️ THIS IS A REAL ANSWER, NOT A PLACEHOLDER. `read_page_with` on an empty
+/// index reads no line, so every line keeps the text it already had, which for
+/// a Devanagari page is the text the reader repaired. What it buys is that
+/// `recovery_is_ready` says yes, so the caller stops asking and takes its
+/// progress card down.
+fn settle_with_nothing(doc_handle: u64) {
+    let slot = {
+        let mut all = lock(&core().recoveries);
+        Arc::clone(all.entry(doc_handle).or_default())
+    };
+    // Never displaces a real index: a document with one Burmese page and one
+    // Devanagari page must keep what the Burmese page paid for.
+    if let Ok(mut held) = slot.try_lock() {
+        if held.is_none() {
+            *held = Some(Arc::new(recover::Indexes::default()));
+        }
+    }
+}
+
 fn indexes_for_doc(doc_handle: u64, doc: &lopdf::Document) -> Arc<recover::Indexes> {
     let slot = {
         let mut all = lock(&core().recoveries);
@@ -11120,7 +11152,22 @@ fn get_page_lines_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
     }
     let (page_left, page_top) = page_origin(&page);
 
-    let lines = page_lines(&doc_guard, &page, page_w);
+    let mut lines = page_lines(&doc_guard, &page, page_w);
+
+    // ⚠️ DEVANAGARI THAT ARRIVED AS GLYPH IDS IS REPAIRED HERE, AND ONLY HERE.
+    // The text a producer emits for a glyph its `/ToUnicode` does not cover is
+    // the glyph's own id, so this reads it back. It is safe at this point
+    // precisely because the offsets beside it are not: every Devanagari line
+    // already refuses retyping with `LINE_COMPLEX_SCRIPT`, so nothing
+    // downstream is indexing into this text expecting the producer's bytes.
+    // Editing such a line goes through the recovery path, which is untouched.
+    {
+        let mut texts: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
+        devanagari::repair_page(&mut texts);
+        for (l, text) in lines.iter_mut().zip(texts) {
+            l.text = text;
+        }
+    }
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&(lines.len() as u32).to_le_bytes());
@@ -26473,6 +26520,41 @@ p={spread_px:.4},c={rgba:08X})"
         assert!(still.iter().any(|l| l.text.contains("brown")),
             "the live document was modified by a call that only produces bytes");
         assert_eq!(still.len(), 2, "the live document gained or lost a line");
+        close_document(handle);
+    }
+
+    /// \u{26a0}\u{fe0f} "NOTHING TO RECOVER" IS AN ANSWER AND MUST BE REPORTED AS ONE.
+    ///
+    /// The reader asks whether a page is prepared, and treats "not yet" by
+    /// keeping the page uncached and a progress bar on screen. A page with no
+    /// Burmese on it used to answer "not yet" forever, because preparing
+    /// returned in silence without filling the slot. Every complex script that
+    /// is not Burmese lands there, and Devanagari now lands there on every page
+    /// of every Hindi book, since its text is repaired where it is read and
+    /// needs no reshaping at all.
+    #[test]
+    fn a_page_with_nothing_to_recover_still_settles() {
+        let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
+        assert_eq!(recovery_is_ready(handle, 0), 0,
+            "it claimed to be prepared before anything prepared it");
+
+        prepare_recovery(handle, 0);
+
+        // \u{26a0}\u{fe0f} WAITING ON THE ANSWER, NOT ON A DURATION. Preparing runs on
+        // its own thread, and a fixed sleep either flakes under load or wastes
+        // the time on an idle machine.
+        let mut ready = 0;
+        for _ in 0..400 {
+            ready = recovery_is_ready(handle, 0);
+            if ready == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(ready, 1,
+            "a page with nothing to recover never settled, so the reader would \
+             ask again for as long as the document stayed open and never take \
+             its progress bar down");
         close_document(handle);
     }
 
