@@ -10953,6 +10953,29 @@ fn page_lines(
     }
 
     let objects = page.objects();
+
+    // ⚠️ THE PAGE'S TEXT LAYER IS LOADED ONCE, NOT ONCE PER OBJECT.
+    // `PdfPageTextObject::text()` calls `FPDFText_LoadPage` every time it is
+    // asked, which parses the whole page's text layer to read one object's
+    // string. Measured on a Devanagari page of 1693 objects: 8.5 SECONDS to
+    // read them, about five milliseconds each, and the reader asks on every
+    // repaint. `PdfPageText::for_object` takes the handle already loaded here.
+    //
+    // ⚠️ AND EVERY OBJECT IS READ, NOT ONLY THE ONES A LINE ASKS FOR, because
+    // lines share objects and asking per line paid the same cost again.
+    let object_text: Vec<String> = match page.text() {
+        Ok(text_page) => (0..objects.len())
+            .map(|i| match objects.get(i) {
+                Ok(o) => match &o {
+                    PdfPageObject::Text(t) => text_page.for_object(t),
+                    _ => String::new(),
+                },
+                Err(_) => String::new(),
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
     let mut out: Vec<LineCluster> = Vec::new();
 
     for group in &groups {
@@ -10985,9 +11008,8 @@ fn page_lines(
         // replacement carries its own spaces.
         let mut text = String::new();
         for i in first_object..=last_object {
-            let Ok(o) = objects.get(i) else { continue };
-            if let PdfPageObject::Text(t) = &o {
-                text.push_str(&t.text());
+            if let Some(said) = object_text.get(i as usize) {
+                text.push_str(said);
             }
         }
         let prefix = first.prefix;
@@ -26531,6 +26553,53 @@ p={spread_px:.4},c={rgba:08X})"
     /// returned in silence without filling the slot. Every complex script that
     /// is not Burmese lands there, and Devanagari now lands there on every page
     /// of every Hindi book, since its text is repaired where it is read and
+    /// ⚠️ WHAT THE READER ACTUALLY PAYS FOR A HINDI PAGE, on the call it
+    /// makes to draw one. Reported unresponsive on a real file, so this is the
+    /// call reproduced with nothing else in the way.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_a_hindi_page_costs_the_reader() {
+        const FILES: [&str; 2] = [
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf",
+            r"D:\Ayaan PDF Test file\Geeta Darshan Complete 18 Chapters.pdf",
+        ];
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            println!("\n== {} ==", file.rsplit('\\').next().unwrap());
+            let open = std::time::Instant::now();
+            let handle = open_fixture_named(file);
+            if handle == 0 {
+                println!("   would not open");
+                continue;
+            }
+            println!("   opened in {:?}", open.elapsed());
+
+            for page in 0..3 {
+                let clock = std::time::Instant::now();
+                let buffer = get_page_lines(handle, page);
+                let took = clock.elapsed();
+                let n = if buffer.data.is_null() {
+                    0
+                } else {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(buffer.data, buffer.len)
+                    };
+                    u32::from_le_bytes(bytes[..4].try_into().unwrap())
+                };
+                free_byte_buffer(buffer);
+                println!("   page {page}: {n} lines in {took:?}");
+
+                // And again, because the reader asks on every repaint.
+                let clock = std::time::Instant::now();
+                let buffer = get_page_lines(handle, page);
+                free_byte_buffer(buffer);
+                println!("   page {page}: again in {:?}", clock.elapsed());
+            }
+            close_document(handle);
+        }
+    }
     /// needs no reshaping at all.
     #[test]
     fn a_page_with_nothing_to_recover_still_settles() {
