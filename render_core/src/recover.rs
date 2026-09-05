@@ -2553,6 +2553,761 @@ mod tests {
         }
     }
 
+    /// ⚠️ A WRONG CODEPOINT IS NOT WRONG, IT IS THE GLYPH ID.
+    ///
+    /// The producer's `/ToUnicode` does not cover the glyphs that come out
+    /// wrong: measured, resource F2 declares 62 entries and F7 declares 78,
+    /// and NONE of the odd characters is among them. So there is nothing to
+    /// invert. What PDFium does with a CID it has no entry for is emit the CID,
+    /// and under Identity-H the CID is the glyph id, so the character arrives
+    /// with the glyph's own number in it.
+    ///
+    /// That is worth checking rather than admiring, because if it holds the
+    /// whole alignment problem disappears: the text already names the glyph it
+    /// should have drawn, character by character, with no line matching, no run
+    /// pairing and no geometry anywhere in it.
+    ///
+    /// Three that were solved the long way and agree: `Ŋ` is U+014A = 330,
+    /// which is the reph; `ʼ` is U+02BC = 700, which spells `ष्ट`; `Ů` is
+    /// U+016E = 366, which is what the run under `प्रवचन` starts with.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn whether_a_wrong_codepoint_is_simply_the_glyph_id() {
+        if !std::path::Path::new(GEETA_SMALL).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+        let mut suspects = 0usize;
+        let mut is_a_glyph_the_page_draws = 0usize;
+        let mut not = 0usize;
+        let mut which: BTreeMap<char, usize> = BTreeMap::new();
+        let mut strangers: BTreeMap<char, usize> = BTreeMap::new();
+
+        for (n, &page) in pages.iter().enumerate() {
+            // Every glyph this page draws, whatever resource drew it.
+            let drawn: BTreeSet<u16> = lines_of(&doc, page)
+                .iter()
+                .flat_map(|l| l.glyphs.clone())
+                .collect();
+
+            for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                for c in line.5.chars() {
+                    let odd = !('\u{0900}'..='\u{097F}').contains(&c)
+                        && !c.is_ascii()
+                        && !c.is_whitespace()
+                        && !"–—‘’“”…•·".contains(c);
+                    if !odd {
+                        continue;
+                    }
+                    suspects += 1;
+                    if u32::from(c) <= u32::from(u16::MAX)
+                        && drawn.contains(&(u32::from(c) as u16))
+                    {
+                        is_a_glyph_the_page_draws += 1;
+                        *which.entry(c).or_default() += 1;
+                    } else {
+                        not += 1;
+                        *strangers.entry(c).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        println!("{suspects} characters that are neither devanagari nor plain text");
+        println!("   {is_a_glyph_the_page_draws} are the id of a glyph the page draws");
+        println!("   {not} are not");
+        println!("   {} distinct, over {} pages", which.len(), pages.len());
+
+        if !strangers.is_empty() {
+            println!("\nthe ones that are NOT a glyph the page draws:");
+            for (c, n) in strangers.iter().take(20) {
+                println!("   {c:?} U+{:04X} = {} x{n}", u32::from(c.to_owned()),
+                    u32::from(*c));
+            }
+        }
+
+        // And what they spell, read straight out of the face with the id the
+        // character carries. No page, no line, no geometry.
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        let Ok(font) = std::fs::read(NIRMALA) else { return };
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+        let mut inverse: BTreeMap<Vec<u16>, String> = BTreeMap::new();
+        let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
+        for text in devanagari_clusters() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.is_empty() || g.contains(&0) || g.len() > 3 {
+                continue;
+            }
+            if let Some(had) = inverse.insert(g.clone(), text.clone()) {
+                if had != text {
+                    clash.insert(g);
+                }
+            }
+        }
+        for g in &clash {
+            inverse.remove(g);
+        }
+        let reph = {
+            let with = crate::reshape::draws(&face, "र्क");
+            let without = crate::reshape::draws(&face, "क");
+            with.iter().copied().find(|g| !without.contains(g))
+        };
+
+        let mut spelled = 0usize;
+        let mut rephs = 0usize;
+        let mut blank = 0usize;
+        println!("\nwhat each of them spells, by its own id:");
+        for (c, count) in &which {
+            let id = u32::from(*c) as u16;
+            let said = inverse.get(&vec![id]);
+            if Some(id) == reph {
+                rephs += count;
+                println!("   {c:?} U+{:04X} = {id:<5} the reph, x{count}", u32::from(*c));
+            } else if let Some(said) = said {
+                spelled += count;
+                println!("   {c:?} U+{:04X} = {id:<5} {said:?} x{count}", u32::from(*c));
+            } else {
+                blank += count;
+                println!("   {c:?} U+{:04X} = {id:<5} NOTHING SPELLS IT x{count}",
+                    u32::from(*c));
+            }
+        }
+        println!("\n{spelled} occurrences spell a cluster, {rephs} are the reph, \
+            {blank} have no spelling");
+    }
+
+    /// The end of the orthographic syllable that `tail` begins with: past the
+    /// consonant, and past every consonant a virama joins to it. A matra
+    /// belongs after the whole of that, so `कि` and `क्षि` put it in different
+    /// places. None when `tail` does not begin with a syllable at all.
+    fn syllable_end(tail: &str) -> Option<usize> {
+        let consonant = |c: char| ('\u{0915}'..='\u{0939}').contains(&c)
+            || ('\u{0958}'..='\u{095F}').contains(&c);
+        let chars: Vec<(usize, char)> = tail.char_indices().collect();
+        let mut k = 0usize;
+        loop {
+            let (_, c) = *chars.get(k)?;
+            if consonant(c) {
+                break;
+            }
+            // Only another Devanagari mark may stand in front of the base.
+            if !('\u{0900}'..='\u{097F}').contains(&c) {
+                return None;
+            }
+            k += 1;
+        }
+        while k + 2 < chars.len() && chars[k + 1].1 == '\u{094D}'
+            && consonant(chars[k + 2].1)
+        {
+            k += 2;
+        }
+        Some(chars[k].0 + chars[k].1.len_utf8())
+    }
+
+    /// A glyph that is not a letter on its own: the text it carries on each
+    /// side of the syllable it hangs off, and which side of that syllable the
+    /// face draws it.
+    ///
+    /// ⚠️ ONE GLYPH CAN CARRY TEXT ON BOTH SIDES. `को` draws as [248, 316]
+    /// and `र्को` as [248, 342]: the reph and the `ो` are ONE glyph, and its
+    /// text is a `र्` that Unicode writes in front of the syllable and a `ो`
+    /// it writes after it. Treating a form as a single string on a single side
+    /// cannot express that, and glyphs 333, 334, 336, 337, 339 and 342 are all
+    /// of them, 253 characters on one file.
+    ///
+    /// ⚠️ AND `drawn_before` IS ABOUT THE STREAM, NOT THE TEXT. It says
+    /// whether the face puts this glyph in front of the base it belongs to,
+    /// which is what decides where the syllable IS when the repair meets the
+    /// glyph: to the right of it if the face drew it first, to the left if not.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Form {
+        before: String,
+        after: String,
+        drawn_before: bool,
+    }
+
+    /// Every glyph that is a dependent form, learned from the face by putting
+    /// each sign on each base and seeing what one glyph the face adds.
+    fn dependent_forms(face: &rustybuzz::Face) -> BTreeMap<u16, Form> {
+        const VIRAMA: char = '\u{094D}';
+        let consonants: Vec<char> = ('\u{0915}'..='\u{0939}').collect();
+        let matras: Vec<String> = ('\u{093E}'..='\u{094C}')
+            .chain(['\u{0902}', '\u{0903}', '\u{0901}'])
+            .map(|c| c.to_string())
+            .collect();
+        let reph = format!("र{VIRAMA}");
+
+        // What a sign is: text in front of the syllable, text after it.
+        let mut signs: Vec<(String, String)> = Vec::new();
+        for m in &matras {
+            signs.push((String::new(), m.clone()));
+            // ⚠️ AND THE REPH FUSES WITH WHATEVER THE BASE ALREADY CARRIES,
+            // so every pairing of it with a matra is its own glyph.
+            signs.push((reph.clone(), m.clone()));
+        }
+        signs.push((reph.clone(), String::new()));
+        signs.push((String::new(), format!("{VIRAMA}र")));
+
+        let bases = devanagari_clusters();
+        let mut found: BTreeMap<u16, BTreeMap<Form, usize>> = BTreeMap::new();
+        for base in &bases {
+            let plain = crate::reshape::draws(face, base);
+            if plain.is_empty() || plain.contains(&0) {
+                continue;
+            }
+            for (before, after) in &signs {
+                let with = crate::reshape::draws(
+                    face, &format!("{before}{base}{after}"));
+                // Exactly one glyph more than the base, with the base's own
+                // glyphs either side of it. Anything else means the sign
+                // changed the base as well, and there is nothing to learn.
+                if with.len() != plain.len() + 1 || with.contains(&0) {
+                    continue;
+                }
+                let head = with.iter().zip(&plain)
+                    .take_while(|(a, b)| a == b).count();
+                let tail = with.iter().rev().zip(plain.iter().rev())
+                    .take_while(|(a, b)| a == b).count();
+                if head + tail < plain.len() {
+                    continue;
+                }
+                *found.entry(with[head]).or_default()
+                    .entry(Form {
+                        before: before.clone(),
+                        after: after.clone(),
+                        drawn_before: head == 0,
+                    })
+                    .or_default() += 1;
+            }
+        }
+
+        // ⚠️ A HALF FORM IS A GLYPH TOO, and it is not a dependent form at
+        // all: it is the consonant itself, drawn as the half it becomes when a
+        // virama joins it to what follows. It carries nothing on either side.
+        for &c in &consonants {
+            let mut first: Option<u16> = None;
+            let mut steady = true;
+            let mut seen = 0usize;
+            for &d in &consonants {
+                let g = crate::reshape::draws(face, &format!("{c}{VIRAMA}{d}"));
+                if g.len() < 2 || g.contains(&0) {
+                    continue;
+                }
+                seen += 1;
+                match first {
+                    None => first = Some(g[0]),
+                    Some(f) if f != g[0] => {
+                        steady = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(f) = first.filter(|_| steady && seen >= 8) {
+                *found.entry(f).or_default()
+                    .entry(Form {
+                        before: String::new(),
+                        after: format!("{c}{VIRAMA}"),
+                        drawn_before: false,
+                    })
+                    .or_default() += seen;
+            }
+        }
+
+        // ⚠️ WHAT IT MEANS IS WHAT MOST OF ITS BASES SAY IT MEANS, not the
+        // only thing any base ever said. Refusing every glyph two bases
+        // disagree about lost the reph itself: `र्र` puts glyph 330 under the
+        // rakar as well, one base against thirty-four, and the whole reph
+        // repair went with it. A clear majority decides, and a tie refuses.
+        found.into_iter()
+            .filter_map(|(g, what)| {
+                let mut by_count: Vec<(Form, usize)> = what.into_iter().collect();
+                by_count.sort_by(|a, b| b.1.cmp(&a.1));
+                let (best, n) = by_count.first()?.clone();
+                let runner_up = by_count.get(1).map_or(0, |(_, m)| *m);
+                (n >= 3 && n > runner_up * 2).then_some((g, best))
+            })
+            .collect()
+    }
+
+    /// Puts back the pre-base matras the producer wrote where they are DRAWN.
+    ///
+    /// ⚠️ NOT EVERY MISORDERED CHARACTER ARRIVED AS A GLYPH ID. Measured on
+    /// this file: `है कि` reaches the text as `हैिक`, a real U+093F sitting in
+    /// front of the consonant it belongs to, because the producer emitted its
+    /// characters in the order it drew them and this one is drawn first. No
+    /// glyph id is involved and nothing about it is wrong except the order.
+    ///
+    /// ⚠️ AND IT IS DECIDABLE, NOT A GUESS. A pre-base matra is only ever
+    /// written after a consonant. One that is not preceded by a consonant
+    /// cannot be where it belongs, wherever it came from, so this moves exactly
+    /// those and leaves every correctly written one alone, including the ones
+    /// the glyph-id repair has just placed.
+    fn reorder_prebase(text: &str, prebase: &BTreeSet<char>) -> String {
+        let consonant = |c: char| ('\u{0915}'..='\u{0939}').contains(&c)
+            || ('\u{0958}'..='\u{095F}').contains(&c) || c == '\u{093C}';
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            let Some((offset, matra)) = rest.char_indices()
+                .find(|(i, c)| prebase.contains(c)
+                    && !rest[..*i].chars().next_back().is_some_and(consonant))
+            else {
+                break;
+            };
+            let after = offset + matra.len_utf8();
+            match syllable_end(&rest[after..]) {
+                Some(end) => {
+                    out.push_str(&rest[..offset]);
+                    out.push_str(&rest[after..after + end]);
+                    out.push(matra);
+                    rest = &rest[after + end..];
+                }
+                None => {
+                    out.push_str(&rest[..after]);
+                    rest = &rest[after..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Rewrites a line the producer emitted as glyph ids back into Devanagari.
+    ///
+    /// Every character that is neither Devanagari nor plain text carries the id
+    /// of the glyph that should have been drawn. `spells` says what a glyph
+    /// spells outright; `forms` says which glyphs are dependent forms and which
+    /// side of their syllable they belong on.
+    fn repair_devanagari(
+        text: &str,
+        spells: &BTreeMap<Vec<u16>, String>,
+        forms: &BTreeMap<u16, Form>,
+    ) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some((offset, bad)) = rest.char_indices().find(|(_, c)| {
+            !('\u{0900}'..='\u{097F}').contains(c) && !c.is_ascii()
+                && !c.is_whitespace() && !"–—‘’“”…•·".contains(*c)
+        }) {
+            let id = u32::from(bad);
+            let id = if id <= u32::from(u16::MAX) { id as u16 } else { 0 };
+            let after = offset + bad.len_utf8();
+
+            if let Some(said) = spells.get(&vec![id]) {
+                // A whole cluster, in place.
+                out.push_str(&rest[..offset]);
+                out.push_str(said);
+                rest = &rest[after..];
+            } else if let Some(form) = forms.get(&id) {
+                if form.drawn_before {
+                    // The face drew this in FRONT of its base, so the syllable
+                    // it belongs to is still to the right and has not been
+                    // repaired yet.
+                    //
+                    // ⚠️ WHICH IS WHY THE `after` TEXT IS ONLY NAMED HERE, NOT
+                    // MOVED. Measured: moving it now needs the syllable to the
+                    // right, and a `ि` in front of a conjunct still spelled as
+                    // a glyph id found no syllable at all and was left as a raw
+                    // id, 77 times on one file. `reorder_prebase` moves it once
+                    // the whole line reads.
+                    out.push_str(&rest[..offset]);
+                    out.push_str(&form.before);
+                    out.push_str(&form.after);
+                    rest = &rest[after..];
+                } else {
+                    // The face drew it after its base, so the syllable is to
+                    // the left and this pass has already repaired it.
+                    let head = &rest[..offset];
+                    let ins = syllable_start(head);
+                    out.push_str(&head[..ins]);
+                    out.push_str(&form.before);
+                    out.push_str(&head[ins..]);
+                    out.push_str(&form.after);
+                    rest = &rest[after..];
+                }
+            } else {
+                out.push_str(&rest[..after]);
+                rest = &rest[after..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// ⚠️ STEP 3: REPAIR THE TEXT ALONE, THEN PROVE IT AGAINST THE PAGE.
+    ///
+    /// Step 2 repaired a line by walking it against the glyphs the page draws,
+    /// which needed the runs paired to the line, sorted across the page and
+    /// filtered to the face. That is a lot of geometry to be right about, and
+    /// it is what limited the rate: a line stalls on the first thing it cannot
+    /// explain, so one matra variant refuses a line whose every codepoint is
+    /// known.
+    ///
+    /// ⚠️ NONE OF THAT IS NEEDED. Measured: every one of the 1268 odd
+    /// characters on this file is the id of a glyph the page draws, with no
+    /// exceptions, because PDFium emits the CID for a glyph `/ToUnicode` does
+    /// not cover and Identity-H makes the CID the glyph id. The text already
+    /// names the glyph it should have drawn. So the repair reads the text and
+    /// nothing else, and the page is kept for what it is good for: saying
+    /// whether the answer is right.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_a_text_only_repair_reads_off_a_devanagari_page() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA_SMALL).exists()
+            || !std::path::Path::new(NIRMALA).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+
+        let mut spells: BTreeMap<Vec<u16>, String> = BTreeMap::new();
+        let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
+        for text in devanagari_clusters_wide() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.is_empty() || g.contains(&0) || g.len() > 3 {
+                continue;
+            }
+            if let Some(had) = spells.insert(g.clone(), text.clone()) {
+                if had != text {
+                    clash.insert(g);
+                }
+            }
+        }
+        for g in &clash {
+            spells.remove(g);
+        }
+        let forms = dependent_forms(&face);
+        let prebase: BTreeSet<char> = forms.values()
+            .filter(|f| f.drawn_before)
+            .filter_map(|f| {
+                let mut c = f.after.chars();
+                c.next().filter(|_| c.next().is_none())
+            })
+            .collect();
+        println!("{} glyph sequences spell a cluster, {} glyphs are a \
+            dependent form, {prebase:?} are drawn before their base",
+            spells.len(), forms.len());
+        for (g, form) in forms.iter().take(6) {
+            println!("   {g:<5} {:?} .. {:?}, drawn {} its base", form.before,
+                form.after, if form.drawn_before { "before" } else { "after" });
+        }
+
+        let blank: BTreeSet<u16> = crate::reshape::draws(&face, " ")
+            .into_iter().collect();
+        let mut variants: BTreeMap<char, BTreeSet<u16>> = BTreeMap::new();
+        for text in devanagari_clusters_wide() {
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(&text);
+            let out = rustybuzz::shape(&face, &[], buffer);
+            for info in out.glyph_infos() {
+                if info.glyph_id == 0 {
+                    continue;
+                }
+                if let Some(c) = text[info.cluster as usize..].chars().next() {
+                    variants.entry(c).or_default().insert(info.glyph_id as u16);
+                }
+            }
+        }
+        let alternates = |c: char, a: u16, b: u16| {
+            variants.get(&c).is_some_and(|s| s.contains(&a) && s.contains(&b))
+        };
+
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+        // Which resources are the face, asked of their own glyphs.
+        let known: BTreeSet<u16> = spells.keys().flatten().copied()
+            .chain(forms.keys().copied()).collect();
+        let mut devanagari: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut seen: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+            for &page in &pages {
+                for line in lines_of(&doc, page) {
+                    seen.entry(line.base_font.clone()).or_default()
+                        .extend(line.glyphs.iter().copied());
+                }
+            }
+            for (name, ids) in seen {
+                let hit = ids.iter().filter(|g| known.contains(g)).count();
+                if hit as f64 / ids.len().max(1) as f64 > 0.25 {
+                    devanagari.insert(name);
+                }
+            }
+        }
+
+        let mut lines = 0usize;
+        let mut untouched = 0usize;
+        let mut changed = 0usize;
+        let mut before_proves = 0usize;
+        let mut after_proves = 0usize;
+        let mut broke = 0usize;
+        let mut shown = 0usize;
+        let mut refused = 0usize;
+        let mut still_carries_an_id = 0usize;
+        let mut looks_finished_but_refused = 0usize;
+        let mut leftovers: BTreeMap<char, usize> = BTreeMap::new();
+        let mut told = 0usize;
+
+        for (n, &page) in pages.iter().enumerate() {
+            let said = crate::tests::decoded_lines_for(&bytes, n as i32);
+            if said.is_empty() {
+                continue;
+            }
+            let Some((left, top, width)) = page_box(&doc, page) else { continue };
+            let across = |v: f64| ((v - left) / width) as f32;
+            let down = |v: f64| ((top - v) / width) as f32;
+
+            let mut gathered: BTreeMap<usize, Vec<Line>> = BTreeMap::new();
+            for line in lines_of(&doc, page) {
+                if line.glyphs.is_empty() {
+                    continue;
+                }
+                let my_base = down(line.page_y);
+                let my_x = across(line.x);
+                let near = (line.size / width * 0.5).max(0.002) as f32;
+                let best = said.iter().enumerate()
+                    .filter(|(_, s)| (s.4 - my_base).abs() < near)
+                    .min_by(|(_, a), (_, b)| {
+                        (a.0 - my_x).abs().total_cmp(&(b.0 - my_x).abs())
+                    });
+                if let Some((i, _)) = best {
+                    gathered.entry(i).or_default().push(line);
+                }
+            }
+
+            for (i, mut runs) in gathered {
+                runs.sort_by(|a, b| a.x.total_cmp(&b.x));
+                runs.retain(|r| devanagari.contains(&r.base_font));
+                let drawn: usize = runs.iter().map(|r| r.glyphs.len()).sum();
+                let text = said[i].5.clone();
+                if drawn < 4 || !text.chars().any(|c| ('\u{0900}'..='\u{097F}')
+                    .contains(&c))
+                {
+                    continue;
+                }
+                lines += 1;
+
+                // The proof, unchanged from step 2: every run of the page's own
+                // glyphs found in order in the shaping of the text.
+                let proves = |now: &str| -> bool {
+                    let mut buffer = rustybuzz::UnicodeBuffer::new();
+                    buffer.push_str(now);
+                    let out = rustybuzz::shape(&face, &[], buffer);
+                    let ink: Vec<(u16, char)> = out.glyph_infos().iter()
+                        .map(|g| (g.glyph_id as u16,
+                            now[g.cluster as usize..].chars().next().unwrap_or(' ')))
+                        .filter(|(g, _)| !blank.contains(g))
+                        .collect();
+                    let mut at = 0usize;
+                    for run in &runs {
+                        let want: Vec<u16> = run.glyphs.iter().copied()
+                            .filter(|g| !blank.contains(g)).collect();
+                        if want.is_empty() {
+                            continue;
+                        }
+                        let mut found = None;
+                        for q in at..=ink.len().saturating_sub(want.len()) {
+                            if want.iter().zip(&ink[q..]).all(|(a, (b, c))|
+                                a == b || alternates(*c, *a, *b))
+                            {
+                                found = Some(q);
+                                break;
+                            }
+                        }
+                        match found {
+                            Some(q) => at = q + want.len(),
+                            None => return false,
+                        }
+                    }
+                    true
+                };
+
+                let was = proves(&text);
+                if was {
+                    before_proves += 1;
+                }
+                let now = reorder_prebase(
+                    &repair_devanagari(&text, &spells, &forms), &prebase);
+                if now == text {
+                    untouched += 1;
+                } else {
+                    changed += 1;
+                }
+                let is = proves(&now);
+                if is {
+                    after_proves += 1;
+                    if !was && shown < 8 {
+                        shown += 1;
+                        println!("\n  {}", text.chars().take(58).collect::<String>());
+                        println!("  {}", now.chars().take(58).collect::<String>());
+                    }
+                } else {
+                    refused += 1;
+                    let left: Vec<char> = now.chars().filter(|c|
+                        !('\u{0900}'..='\u{097F}').contains(c) && !c.is_ascii()
+                            && !c.is_whitespace() && !"–—‘’“”…•·".contains(*c))
+                        .collect();
+                    if left.is_empty() {
+                        looks_finished_but_refused += 1;
+                        if told < 4 {
+                            told += 1;
+                            println!("\n  REFUSED though nothing is left to repair:");
+                            println!("     {}", now.chars().take(58)
+                                .collect::<String>());
+                        }
+                    } else {
+                        still_carries_an_id += 1;
+                        for c in left {
+                            *leftovers.entry(c).or_default() += 1;
+                        }
+                    }
+                    if was {
+                        broke += 1;
+                        println!("\n  ⚠️ THE REPAIR BROKE A LINE THAT ALREADY READ");
+                        println!("     was “{}”", text.chars().take(58)
+                            .collect::<String>());
+                        println!("     now “{}”", now.chars().take(58)
+                            .collect::<String>());
+                    }
+                }
+            }
+        }
+
+        println!("\n{lines} lines carrying devanagari");
+        println!("   {changed} rewritten, {untouched} left alone");
+        println!("   {before_proves} reproduced the page before the repair");
+        println!("   {after_proves} reproduce it after ({:.0}%)",
+            after_proves as f64 / lines.max(1) as f64 * 100.0);
+        println!("   {refused} still refused, {broke} of them broken BY the repair");
+        println!("      {still_carries_an_id} still carry a glyph id nothing spells");
+        println!("      {looks_finished_but_refused} carry none and are refused anyway");
+        println!("\n   the ids left over, by how much they cost:");
+        let mut worst: Vec<(&char, &usize)> = leftovers.iter().collect();
+        worst.sort_by(|a, b| b.1.cmp(a.1));
+        // ⚠️ AND WHAT ARE THEY? Asked of the face: every cluster whose
+        // shaping contains the glyph, and where in it. A glyph that only ever
+        // turns up in the middle of a cluster is a dependent form of something,
+        // and the something is what the cluster has that the others do not.
+        let mut inside: BTreeMap<u16, Vec<(String, usize, usize)>> = BTreeMap::new();
+        for text in devanagari_clusters_wide() {
+            let g = crate::reshape::draws(&face, &text);
+            for (i, &id) in g.iter().enumerate() {
+                let e = inside.entry(id).or_default();
+                if e.len() < 4 {
+                    e.push((text.clone(), i, g.len()));
+                }
+            }
+        }
+        for (c, n) in worst.iter().take(8) {
+            let id = u32::from(**c) as u16;
+            println!("      {c:?} = glyph {id} x{n}, forms says {:?}, spells says {:?}",
+                forms.get(&id).map(|f| (&f.before, &f.after, f.drawn_before)),
+                spells.get(&vec![id]));
+            match inside.get(&id) {
+                Some(seen) => for (text, i, len) in seen {
+                    println!("           {i} of {len} in {text:?}");
+                },
+                None => println!("           the face never draws it"),
+            }
+        }
+    }
+
+    /// ⚠️ WHICH FACE IS THE PAGE'S FACE, ASKED OF THE CHARACTERS IT FAILED.
+    ///
+    /// The repair names a character by looking its id up in a face. Nirmala
+    /// names all but two of them, and those two are 221 of the 230 it cannot
+    /// do: glyphs 336 and 339, which Nirmala does not draw from ANY Devanagari
+    /// cluster that can be built, checked over every consonant, conjunct and
+    /// pairing of signs. A glyph the page draws 156 times and the face never
+    /// draws is not a gap in the enumeration, it is the wrong face.
+    ///
+    /// So the face is chosen the same way everything else here is decided: by
+    /// which one accounts for what the page actually draws.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn which_installed_face_names_the_most_of_a_devanagari_page() {
+        const CANDIDATES: [(&str, &str); 7] = [
+            ("Nirmala UI", r"C:\Windows\Fonts\NIRMALA.TTF"),
+            ("Nirmala UI Bold", r"C:\Windows\Fonts\NIRMALAB.TTF"),
+            ("Mangal", r"C:\Windows\Fonts\mangal.ttf"),
+            ("Mangal Bold", r"C:\Windows\Fonts\mangalb.ttf"),
+            ("Aparajita", r"C:\Windows\Fonts\APARAJ.TTF"),
+            ("Kokila", r"C:\Windows\Fonts\KOKILA.TTF"),
+            ("Utsaah", r"C:\Windows\Fonts\UTSAAH.TTF"),
+        ];
+        if !std::path::Path::new(GEETA_SMALL).exists() {
+            println!("not on this machine");
+            return;
+        }
+
+        // Every character the file emitted as a glyph id, and how often.
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let mut wanted: BTreeMap<u16, usize> = BTreeMap::new();
+        for n in 0..pages.len() {
+            for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                for c in line.5.chars() {
+                    if !('\u{0900}'..='\u{097F}').contains(&c) && !c.is_ascii()
+                        && !c.is_whitespace() && !"–—‘’“”…•·".contains(c)
+                        && u32::from(c) <= u32::from(u16::MAX)
+                    {
+                        *wanted.entry(u32::from(c) as u16).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let total: usize = wanted.values().sum();
+        println!("{} distinct ids, {total} occurrences\n", wanted.len());
+
+        for (name, path) in CANDIDATES {
+            let Ok(font) = std::fs::read(path) else {
+                println!("   {name:<18} not installed");
+                continue;
+            };
+            let Some(face) = rustybuzz::Face::from_slice(&font, 0) else { continue };
+
+            let mut spells: BTreeMap<Vec<u16>, String> = BTreeMap::new();
+            let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
+            for text in devanagari_clusters_wide() {
+                let g = crate::reshape::draws(&face, &text);
+                if g.is_empty() || g.contains(&0) || g.len() > 3 {
+                    continue;
+                }
+                if let Some(had) = spells.insert(g.clone(), text.clone()) {
+                    if had != text {
+                        clash.insert(g);
+                    }
+                }
+            }
+            for g in &clash {
+                spells.remove(g);
+            }
+            let forms = dependent_forms(&face);
+
+            let named: usize = wanted.iter()
+                .filter(|(g, _)| spells.contains_key(&vec![**g])
+                    || forms.contains_key(g))
+                .map(|(_, n)| n)
+                .sum();
+            let distinct = wanted.keys()
+                .filter(|g| spells.contains_key(&vec![**g]) || forms.contains_key(g))
+                .count();
+            println!("   {name:<18} names {distinct:>3} of {} ids, \
+                {named:>5} of {total} occurrences ({:>3.0}%)",
+                wanted.len(), named as f64 / total.max(1) as f64 * 100.0);
+        }
+    }
+
     const HINDI: [&str; 4] = [
         r"D:\Ayaan PDF Test file\Geeta Darshan Complete 18 Chapters.pdf",
         r"D:\Ayaan PDF Test file\003_Agyat_Ki_Aur.pdf",
@@ -3458,6 +4213,35 @@ mod tests {
             }
             for &d in &consonants {
                 out.push(format!("{c}{VIRAMA}{d}"));
+            }
+        }
+        out
+    }
+
+    /// The clusters, plus a matra on every CONJUNCT as well as on every single
+    /// consonant.
+    ///
+    /// ⚠️ A MATRA ON A CONJUNCT IS NOT THE SAME GLYPH. The `ि` reaches over
+    /// the cluster that follows it, so the face carries a width variant of it
+    /// per cluster, and `क्षि` needs a wider one than `कि` does. Enumerating
+    /// only the single consonants named three of those variants and left the
+    /// rest unspellable: measured, glyphs 336, 339 and 342 alone were 248 of
+    /// the 350 characters the repair could not name.
+    fn devanagari_clusters_wide() -> Vec<String> {
+        const VIRAMA: char = '\u{094D}';
+        let consonants: Vec<char> = ('\u{0915}'..='\u{0939}')
+            .chain('\u{0958}'..='\u{095F}')
+            .collect();
+        let signs: Vec<char> = ('\u{093E}'..='\u{094C}')
+            .chain(['\u{0902}', '\u{0903}', '\u{0901}'])
+            .collect();
+
+        let mut out = devanagari_clusters();
+        for &c in &consonants {
+            for &d in &consonants {
+                for &s in &signs {
+                    out.push(format!("{c}{VIRAMA}{d}{s}"));
+                }
             }
         }
         out
