@@ -414,27 +414,81 @@ public class RecoveredLineTests
     /// about a font one of them has already accepted.
     /// </summary>
     [Theory]
-    [InlineData("ABCDEE+Pyidaungsu,Bold", "Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf")]
-    [InlineData("ABCDEF+Pyidaungsu-Bold", "Pyidaungsu.ttf", "Pyidaungsu-Bold.ttf")]
-    [InlineData("BCDGEE+MyanmarText-Bold", "mmrtext.ttf", "mmrtextb.ttf")]
-    public void a_bold_burmese_name_lands_on_the_bold_file_or_the_family_it_belongs_to(
-        string baseFont, string regular, string boldFile)
+    [InlineData("ABCDEE+Pyidaungsu,Bold", "Pyidaungsu-Bold.ttf")]
+    [InlineData("ABCDEF+Pyidaungsu-Bold", "Pyidaungsu-Bold.ttf")]
+    [InlineData("BCDGEE+MyanmarText-Bold", "mmrtextb.ttf")]
+    public void a_bold_burmese_name_lands_on_the_bold_file_and_nothing_else(
+        string baseFont, string boldFile)
     {
-        // ⚠️ NOT A FIXED ANSWER, because it depends on what is installed. A
-        // bold name resolves to the bold FILE when there is one and to the
-        // family's regular file when there is not: measured, there is no
-        // Pyidaungsu-Bold.ttf on the machine this was written on, and the
-        // regular file proves 9 of the 10 bold lines of a real page.
-        //
-        // ⚠️ AND FALLING BACK CANNOT MISREAD ANYTHING. A line is proven by
-        // shaping candidate text through the font and demanding the page's own
-        // glyph ids back, so a font that does not match yields a refusal.
-        string expected =
-            System.IO.File.Exists(System.IO.Path.Combine(
-                SystemFontMatch.FontsDirectory, boldFile))
-                ? boldFile
-                : regular;
+        Assert.Equal(boldFile, SystemFontMatch.FileNameFor(baseFont));
+    }
 
-        Assert.Equal(expected, SystemFontMatch.FileNameFor(baseFont));
+    /// <summary>
+    /// ⚠️ AND A MISSING BOLD IS A REFUSAL, NOT THE REGULAR WEIGHT.
+    ///
+    /// This used to fall back to the family's regular file, reasoning that a
+    /// wrong font can only be refused because the core proves a line by
+    /// demanding the page's own glyph ids back. That is true of READING, and
+    /// this class is only ever asked by a WRITER. A writer handed the wrong
+    /// weight is not refused; it draws. Measured on a machine carrying
+    /// Pyidaungsu.ttf and no bold: editing a bold heading wrote it back in
+    /// regular and the page lost its weight silently.
+    /// </summary>
+    [Fact]
+    public void a_weight_the_machine_does_not_have_is_refused_rather_than_swapped()
+    {
+        string? answer = SystemFontMatch.PathFor("ABCDEE+Pyidaungsu,Bold");
+
+        // ⚠️ SAID WITHOUT NAMING A FILE, because which file answers depends on
+        // what this machine has installed and where. What must hold everywhere
+        // is the RULE: a bold name is answered by a bold file or by nothing.
+        if (answer is null) { return; }
+
+        Assert.True(System.IO.File.Exists(answer), $"named a file that is not there: {answer}");
+        Assert.Contains("bold",
+            System.IO.Path.GetFileNameWithoutExtension(answer),
+            System.StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// ⚠️ "INSTALL FOR ME" DOES NOT PUT A FONT IN THE WINDOWS FOLDER, and it
+    /// keeps the name it was downloaded under.
+    ///
+    /// Measured on the reader's own machine: they had installed a Pyidaungsu
+    /// bold, the app reported it as not installed, and their bold headings were
+    /// being rewritten in regular because of it. The file was in
+    /// %LOCALAPPDATA%\Microsoft\Windows\Fonts all along, called
+    /// Pyidaungsu-2.5.3_Bold.ttf rather than Pyidaungsu-Bold.ttf, so neither
+    /// the folder nor the name was the one being looked for.
+    /// </summary>
+    [Fact]
+    public void a_font_installed_for_one_user_only_is_still_found()
+    {
+        string canonical = System.IO.Path.Combine(
+            SystemFontMatch.FontsDirectory, "Pyidaungsu-Bold.ttf");
+        if (System.IO.File.Exists(canonical))
+        {
+            // Nothing to prove on a machine that has it the ordinary way.
+            return;
+        }
+        if (!System.IO.Directory.Exists(SystemFontMatch.UserFontsDirectory)) { return; }
+
+        string[] installed = System.IO.Directory
+            .GetFiles(SystemFontMatch.UserFontsDirectory)
+            .Where(p =>
+            {
+                string n = System.IO.Path.GetFileNameWithoutExtension(p).ToLowerInvariant();
+                return n.StartsWith("pyidaungsu", System.StringComparison.Ordinal)
+                    && n.Contains("bold");
+            })
+            .ToArray();
+        if (installed.Length == 0) { return; }
+
+        string? answer = SystemFontMatch.PathFor("ABCDEE+Pyidaungsu,Bold");
+
+        Assert.True(answer is not null,
+            $"the app looked for {SystemFontMatch.FileNameFor("ABCDEE+Pyidaungsu,Bold")} "
+            + $"and missed [{string.Join(", ", installed)}]");
+        Assert.Contains(answer, installed);
     }
 }

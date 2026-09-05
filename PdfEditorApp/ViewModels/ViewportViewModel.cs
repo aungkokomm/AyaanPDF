@@ -5376,7 +5376,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         string? fontPath = SystemFontMatch.PathFor(line.FontName);
         if (fontPath is null)
         {
-            Status = $"{line.FontName} is not installed on this machine, so this line cannot be retyped.";
+            // ⚠️ WITHOUT THE SUBSET TAG, which is the producer's bookkeeping
+            // and means nothing to a reader looking for a font to install.
+            // "ABCDEE+Pyidaungsu,Bold" is not a thing anyone can go and get.
+            string named = line.FontName;
+            int plus = named.LastIndexOf('+');
+            if (plus >= 0) { named = named[(plus + 1)..]; }
+
+            Status = $"{named} is not installed on this machine, so this line "
+                + "cannot be retyped without changing the weight it is set in.";
             return false;
         }
 
@@ -6425,6 +6433,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 : RenderCoreNative.recovery_progress(_documentHandle);
 
             if (now == _preparePercent) { return; }
+            if (_preparePercent < 0 && now >= 0)
+            {
+                Diag.Log($"preparing STARTED on handle {_documentHandle}");
+            }
+            else if (now < 0 && _preparePercent >= 0)
+            {
+                Diag.Log($"preparing finished on handle {_documentHandle}");
+            }
             _preparePercent = now;
             OnPropertyChanged(nameof(IsPreparingText));
             OnPropertyChanged(nameof(PreparePercent));
@@ -14034,7 +14050,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // build the whole thing again after every single edit: measured, 41 ms
         // of writing followed by 12,000 ms of rebuilding the same answer.
         // Before the close, because closing the old handle drops its entry.
+        int readyBefore = RenderCoreNative.recovery_is_ready(_documentHandle, 0);
         RenderCoreNative.adopt_recovery(_documentHandle, restored);
+        int readyAfter = RenderCoreNative.recovery_is_ready(restored, 0);
+        Diag.Log($"handover {_documentHandle}->{restored} ready {readyBefore}->{readyAfter}");
         CloseCurrentDocument();
         _documentHandle = restored;
         _textLayers.Clear();

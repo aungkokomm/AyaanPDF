@@ -1011,6 +1011,171 @@ mod tests {
         assert!(found, "the edited line is not in the saved file: {seen:?}");
     }
 
+    /// The app's own loop, three edits deep: prepare once, then retype, open the
+    /// result, hand the reading over, close the old one, and ask whether the
+    /// next edit still has an index to borrow.
+    ///
+    /// Run with
+    ///   cargo test --release --lib the_apps_own_edit_loop -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn the_apps_own_edit_loop() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf";
+        const FONT: &str = r"C:\Windows\Fonts\Pyidaungsu.ttf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(FONT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let on_disk = std::fs::read(FILE).unwrap();
+
+        let mut handle =
+            crate::open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+        assert_ne!(handle, 0);
+
+        // What the app does when it first sees a Myanmar page. Synchronous here
+        // so the timing is visible; the app does it on a thread.
+        let started = std::time::Instant::now();
+        {
+            let bytes = crate::document_bytes(handle).unwrap();
+            let doc = Document::load_mem(&bytes).unwrap();
+            let _ = crate::indexes_for_doc(handle, &doc);
+        }
+        println!("prepared in {:.1} s", started.elapsed().as_secs_f64());
+        println!("ready: {}", crate::recovery_is_ready(handle, 0));
+
+        for round in 1..=3 {
+            // Find a line to edit, the way the app does.
+            let bytes = crate::document_bytes(handle).unwrap();
+            let doc = Document::load_mem(&bytes).unwrap();
+            let (_, &page) = doc.get_pages().iter().next().unwrap();
+            let Some(indexes) = crate::cached_indexes(handle) else {
+                println!("edit {round}: NOTHING CACHED, the retype will build its own");
+                break;
+            };
+            let read = crate::recover::read_page_with(&doc, page, &indexes);
+            let Some(line) = read
+                .iter()
+                .filter(|r| r.text.is_some())
+                .nth(round - 1)
+            else {
+                println!("edit {round}: no line to edit");
+                break;
+            };
+            let was = line.text.clone().unwrap();
+            let now = format!("{} {round}", was.trim());
+
+            // The FFI the app calls, timed: this is what the reader waits for.
+            let started = std::time::Instant::now();
+            let buffer = crate::retype_recovered_line(
+                handle, 0, line.y as f32,
+                was.as_ptr(), was.len(),
+                now.as_ptr(), now.len(),
+                FONT.as_ptr(), FONT.len(),
+            );
+            let took = started.elapsed().as_secs_f64();
+            if buffer.status != crate::STATUS_OK_PDFIUM {
+                println!("edit {round}: refused with {} after {took:.1} s",
+                    buffer.status);
+                crate::free_byte_buffer(buffer);
+                break;
+            }
+            let produced =
+                unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+            crate::free_byte_buffer(buffer);
+            println!("edit {round}: retype took {took:.1} s");
+
+            // ⚠️ AND WHAT RestoreDocumentBytes DOES, IN ITS ORDER.
+            let restored =
+                crate::open_document_from_bytes(produced.as_ptr(), produced.len());
+            assert_ne!(restored, 0);
+            crate::adopt_recovery(handle, restored);
+            crate::close_document(handle);
+            handle = restored;
+
+            println!("   after handing over, ready: {}",
+                crate::recovery_is_ready(handle, 0));
+
+            // And what the app asks for next, which must cost nothing.
+            let started = std::time::Instant::now();
+            crate::prepare_recovery(handle, 0);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            println!("   prepare_recovery returned in {:.3} s, still ready: {}",
+                started.elapsed().as_secs_f64(),
+                crate::recovery_is_ready(handle, 0));
+        }
+        crate::close_document(handle);
+    }
+
+    /// Whether the bold font the reader has installed PER USER can actually set
+    /// the bold lines of their page.
+    ///
+    /// ⚠️ WRITING AND READING WANT DIFFERENT THINGS FROM A FONT. Reading needs
+    /// one whose glyphs are NUMBERED like the page's subset, and this one is
+    /// not: measured, Pyidaungsu 2.5.3 proves zero lines of that page. Writing
+    /// needs only correct outlines for the text being typed, because the writer
+    /// embeds the face whole and shapes through it. So the question here is
+    /// narrow: does it spell these words at all.
+    #[test]
+    #[ignore = "diagnostic, and needs fonts that are not in this repository"]
+    fn whether_the_users_installed_bold_can_set_their_bold_lines() {
+        let user_fonts = std::env::var("LOCALAPPDATA")
+            .map(|p| std::path::PathBuf::from(p).join(r"Microsoft\Windows\Fonts"))
+            .unwrap_or_default();
+        let Ok(entries) = std::fs::read_dir(&user_fonts) else {
+            println!("no per-user font folder");
+            return;
+        };
+        let mut bolds: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_lowercase())
+                    .is_some_and(|n| n.contains("pyidaungsu") && n.contains("bold"))
+            })
+            .collect();
+        bolds.sort();
+        if bolds.is_empty() {
+            println!("no per-user Pyidaungsu bold installed");
+            return;
+        }
+
+        // The bold lines of the reader's own page, as recovery reads them.
+        const LINES: [&str; 3] = [
+            "\u{1026}\u{1038}\u{1005}\u{102E}\u{1038}\u{1021}\u{101B}\u{102C}\u{101B}\u{103E}\u{102D} \u{1019}\u{103C}\u{102D}\u{102F}\u{1037}\u{1015}\u{103C} \u{101B}\u{102F}\u{1036}\u{1038}",
+            "\u{1006}\u{100A}\u{103A}\u{1019}\u{103C}\u{1031}\u{102C}\u{1004}\u{103A}\u{1038}\u{1014}\u{103E}\u{1004}\u{103A}\u{1037}\u{101B}\u{1031}\u{1021}\u{101E}\u{102F}\u{1036}\u{1038}\u{1001}\u{103B}\u{1019}\u{103E}\u{102F}\u{1005}\u{102E}\u{1019}\u{1036}\u{1001}\u{1014}\u{103A}\u{1037}\u{1001}\u{103D}\u{1032}\u{101B}\u{1031}\u{1038}\u{1026}\u{1038}\u{1005}\u{102E}\u{1038}\u{1013}\u{102C}\u{1014}",
+            "\u{101B}\u{103E}\u{1019}\u{103A}\u{1038}\u{1015}\u{103C}\u{100A}\u{103A}\u{1014}\u{101A}\u{103A}",
+        ];
+
+        for font in &bolds {
+            let path = font.to_string_lossy().into_owned();
+            println!("\n{}", font.file_name().unwrap().to_string_lossy());
+            for (i, line) in LINES.iter().enumerate() {
+                match crate::provision::provision(
+                    Some(&path), line, crate::shaped::SHAPING_SIZE)
+                {
+                    Ok(p) => println!("  line {i}: {} glyphs, spells it", p.glyphs.len()),
+                    Err(e) => println!("  line {i}: REFUSED ({e:?})"),
+                }
+            }
+        }
+
+        // And the control: the regular file the writer uses today, so a failure
+        // above can be told apart from these words being unspellable.
+        const REGULAR: &str = r"C:\Windows\Fonts\Pyidaungsu.ttf";
+        if std::path::Path::new(REGULAR).exists() {
+            println!("\ncontrol, the regular file the writer uses today:");
+            for (i, line) in LINES.iter().enumerate() {
+                match crate::provision::provision(
+                    Some(REGULAR), line, crate::shaped::SHAPING_SIZE)
+                {
+                    Ok(p) => println!("  line {i}: {} glyphs, spells it", p.glyphs.len()),
+                    Err(e) => println!("  line {i}: REFUSED ({e:?})"),
+                }
+            }
+        }
+    }
+
     /// Page one of a file, rendered, so a claim about how it is set can be
     /// checked by looking at it.
     #[test]

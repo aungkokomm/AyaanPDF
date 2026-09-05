@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace PdfEditorApp.Viewport;
@@ -27,11 +28,27 @@ namespace PdfEditorApp.Viewport;
 /// </summary>
 public static class SystemFontMatch
 {
-    /// <summary>Where Windows keeps its fonts.</summary>
+    /// <summary>Where Windows keeps fonts installed for everyone.</summary>
     public static string FontsDirectory { get; } =
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.Windows),
             "Fonts");
+
+    /// <summary>
+    /// Where Windows keeps fonts one user installed without admin rights.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ "INSTALL FOR ME" DOES NOT PUT A FONT IN THE WINDOWS FOLDER, and
+    /// looking only there reports a font the reader installed as missing.
+    /// Measured on the reader's own machine: they had installed a Pyidaungsu
+    /// bold, the app said it was not installed, and their bold headings were
+    /// being rewritten in regular because of it. The file was in here all along
+    /// and under its download name rather than the canonical one.
+    /// </remarks>
+    public static string UserFontsDirectory { get; } =
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft", "Windows", "Fonts");
 
     /// <summary>
     /// The font file for a PDF BaseFont name, or null when nothing matches.
@@ -120,13 +137,19 @@ public static class SystemFontMatch
         // font the core will not accept turns a clean refusal into a failed
         // write after the reader has finished typing.
         //
-        // ⚠️ AND THE FAMILY'S REGULAR FILE ANSWERS FOR A MISSING BOLD, exactly
-        // as recover::installed now does. Measured: there is no
-        // Pyidaungsu-Bold.ttf on the machine this was written on, and the
-        // regular file proves 9 of the 10 bold lines of a real page, because
-        // the two weights of that family number their glyphs alike. Without
-        // this the app would refuse a font the core has just accepted, which is
-        // the drift these two lists exist to avoid.
+        // ⚠️ AND A MISSING BOLD IS A REFUSAL, NOT THE REGULAR FILE. This
+        // used to fall back to the family's regular weight, reasoning that the
+        // core's reader proves a line by demanding the page's own glyph ids
+        // back, so a wrong font can only be refused. That is true of READING
+        // and this class is not used for reading: every caller of it is a
+        // WRITER, and a writer handed the wrong weight does not get refused, it
+        // draws. Measured on the reader's own machine, which carries
+        // Pyidaungsu.ttf and no bold: editing a bold heading silently wrote it
+        // back in regular, and the page lost its weight with no warning at all.
+        //
+        // The core's reader has its own list (recover::installed) and keeps its
+        // own fallback, which is right there and wrong here. The two answer
+        // different questions and are allowed to differ.
         if (name.Contains("myanmartext"))
         {
             return Weight("mmrtext.ttf", "mmrtextb.ttf", bold);
@@ -155,8 +178,65 @@ public static class SystemFontMatch
         string? file = FileNameFor(baseFont);
         if (file is null) { return null; }
 
-        string full = Path.Combine(FontsDirectory, file);
-        return File.Exists(full) ? full : null;
+        // The canonical name, in either place a font can be installed.
+        foreach (string dir in new[] { FontsDirectory, UserFontsDirectory })
+        {
+            string full = Path.Combine(dir, file);
+            if (File.Exists(full)) { return full; }
+        }
+
+        // ⚠️ AND FAILING THAT, BY WHAT THE FILE IS RATHER THAN WHAT IT IS
+        // CALLED. A font installed for one user keeps the name it was
+        // downloaded under, so the family's canonical file name is not there to
+        // find: "Pyidaungsu-2.5.3_Bold.ttf" is the bold of Pyidaungsu and is
+        // not called Pyidaungsu-Bold.ttf. Only reached when the canonical name
+        // is genuinely absent, so nothing that works today changes.
+        return ByFamilyAndWeight(file);
+    }
+
+    /// <summary>
+    /// Any installed file that is the same family and the same weight as
+    /// <paramref name="canonical"/>, or null.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE WEIGHT MUST MATCH EXACTLY. The whole reason this exists is that
+    /// handing a writer the wrong weight does not get refused, it draws, and the
+    /// page loses its bold with no warning at all.
+    /// </remarks>
+    private static string? ByFamilyAndWeight(string canonical)
+    {
+        string bare = Path.GetFileNameWithoutExtension(canonical).ToLowerInvariant();
+        bool bold = bare.Contains("bold");
+
+        // "pyidaungsu-bold" -> "pyidaungsu". A family whose canonical name
+        // carries no separator (mmrtextb) yields a stem nothing will match,
+        // which is the right answer: those ship with Windows and are found
+        // above or not at all.
+        int cut = bare.IndexOfAny(new[] { '-', '_', ',' });
+        string family = cut > 0 ? bare[..cut] : bare;
+        if (family.Length < 4) { return null; }
+
+        var found = new List<string>();
+        foreach (string dir in new[] { FontsDirectory, UserFontsDirectory })
+        {
+            if (!Directory.Exists(dir)) { continue; }
+            foreach (string path in Directory.EnumerateFiles(dir))
+            {
+                string name = Path.GetFileNameWithoutExtension(path).ToLowerInvariant();
+                if (!name.StartsWith(family, StringComparison.Ordinal)) { continue; }
+                if (name.Contains("bold") != bold) { continue; }
+                found.Add(path);
+            }
+        }
+        if (found.Count == 0) { return null; }
+
+        // A family can be installed in several cuts. Prefer the one that says
+        // it is the plain weight, then take the first by name so the answer is
+        // the same every time it is asked.
+        found.Sort(StringComparer.OrdinalIgnoreCase);
+        return found.Find(p =>
+            Path.GetFileNameWithoutExtension(p).ToLowerInvariant().Contains("regular"))
+            ?? found[0];
     }
 
     private static string Pick(
@@ -171,18 +251,15 @@ public static class SystemFontMatch
         };
 
     /// <summary>
-    /// The bold file when it is installed, and the family's regular one when it
-    /// is not. There is no italic in either Burmese family.
+    /// The file for this weight, and no other. There is no italic in either
+    /// Burmese family.
     /// </summary>
     /// <remarks>
-    /// ⚠️ CHECKED HERE RATHER THAN LEFT TO <see cref="PathFor"/>. That returns
-    /// null for a file it cannot find, so a missing bold became "no font at
-    /// all" instead of "the other weight of the same family", and the app
-    /// refused text the core could read.
+    /// ⚠️ NAMED, NOT CHECKED. Whether the file is installed is
+    /// <see cref="PathFor"/>'s question, and a machine without it must refuse
+    /// the edit: substituting the other weight is not a near miss, it is the
+    /// page quietly losing its bold.
     /// </remarks>
-    private static string Weight(string regular, string boldFile, bool bold)
-    {
-        if (!bold) { return regular; }
-        return File.Exists(Path.Combine(FontsDirectory, boldFile)) ? boldFile : regular;
-    }
+    private static string Weight(string regular, string boldFile, bool bold) =>
+        bold ? boldFile : regular;
 }
