@@ -1176,6 +1176,126 @@ mod tests {
         }
     }
 
+    /// Whether a real Devanagari page needs RECOVERY at all, or whether the
+    /// file already says what it says.
+    ///
+    /// Recovery exists because those Burmese pages carry no usable answer: the
+    /// producer wrote no `/ToUnicode`, so the text had to be reconstructed from
+    /// the glyphs by enumerating a language. That is the expensive, the
+    /// script-specific and the fragile part of the whole pipeline. Before any
+    /// of it is generalised, the question worth answering is whether Devanagari
+    /// pages are in the same position or a different one.
+    ///
+    /// Run with
+    ///   cargo test --release --lib whether_devanagari_needs_recovering -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn whether_devanagari_needs_recovering() {
+        const FILES: [&str; 4] = [
+            r"D:\Ayaan PDF Test file\Geeta Darshan Complete 18 Chapters.pdf",
+            r"D:\Ayaan PDF Test file\003_Agyat_Ki_Aur.pdf",
+            r"D:\Ayaan PDF Test file\024_Bharat_Ki_Khoj.pdf",
+            r"D:\Ayaan PDF Test file\Chal Hansa Us Des.pdf",
+        ];
+
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            println!("\n=== {} ===", file.rsplit('\\').next().unwrap());
+
+            // What PDFium extracts, which is what the ordinary writer works from.
+            let bytes = std::fs::read(file).unwrap();
+            let handle = crate::open_document_from_bytes(bytes.as_ptr(), bytes.len());
+            if handle == 0 {
+                println!("would not open");
+                continue;
+            }
+            let pages = crate::get_page_count(handle);
+            println!("{pages} pages");
+
+            let seen = crate::tests::texts_of(handle);
+            let devanagari = |s: &str| s.chars().any(|c| ('\u{0900}'..='\u{097F}').contains(&c));
+            let indic = seen.iter().filter(|s| devanagari(s)).count();
+            println!("page 1: {} text objects, {indic} of them carrying Devanagari",
+                seen.len());
+            for s in seen.iter().filter(|s| devanagari(s)).take(3) {
+                println!("   “{}”", s.chars().take(48).collect::<String>());
+            }
+            // ⚠️ A ZERO IS WHAT AN UNREADABLE PAGE LOOKS LIKE. A producer
+            // with no `/ToUnicode` hands back U+0000 per glyph, which is
+            // exactly the case recovery was built for.
+            let nulls: usize = seen.iter()
+                .map(|s| s.chars().filter(|c| *c == '\u{0}').count())
+                .sum();
+            println!("page 1: {nulls} characters read back as U+0000");
+            crate::close_document(handle);
+
+            // What the page DRAWS, and in what.
+            let Ok(doc) = Document::load_mem(&bytes) else {
+                println!("lopdf would not load it");
+                continue;
+            };
+            let Some((_, &page)) = doc.get_pages().iter().next() else { continue };
+            let lines = crate::recover::lines_of(&doc, page);
+            let mut by_font: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for l in &lines {
+                *by_font.entry(l.base_font.clone()).or_default() += l.glyphs.len();
+            }
+            println!("page 1 draws {} lines in:", lines.len());
+            for (font, glyphs) in &by_font {
+                println!("   {font:<16} {glyphs:>5} glyphs  readable now: {}",
+                    crate::recover::can_read(font));
+            }
+
+            // ⚠️ AND WHAT THE FILE ITSELF SAYS THE FACE IS. `CIDFont+F2`
+            // names no family, so the table that maps a BaseFont to an
+            // installed file has nothing to match on. The embedded subset is
+            // right there in the document though, and a font program carries
+            // its own name.
+            println!("what the embedded subsets call themselves:");
+            for (_, id) in doc.objects.iter().filter_map(|(id, o)| match o {
+                Object::Dictionary(d)
+                    if d.get(b"Type").ok().and_then(|x| x.as_name().ok())
+                        == Some(b"FontDescriptor") => Some((d.clone(), *id)),
+                _ => None,
+            }) {
+                let Ok(Object::Dictionary(d)) = doc.get_object(id) else { continue };
+                let named = |k: &[u8]| d.get(k).ok()
+                    .and_then(|v| v.as_name().ok())
+                    .map(|n| String::from_utf8_lossy(n).into_owned());
+                let program = [&b"FontFile2"[..], b"FontFile3", b"FontFile"]
+                    .iter()
+                    .find_map(|k| d.get(k).ok().and_then(|v| v.as_reference().ok()));
+
+                let mut real = String::from("-");
+                if let Some(pid) = program {
+                    if let Ok(stream) = doc.get_object(pid).and_then(|o| o.as_stream()) {
+                        if let Ok(bytes) = stream.decompressed_content() {
+                            if let Ok(face) = rustybuzz::ttf_parser::Face::parse(&bytes, 0) {
+                                let mut got: Vec<String> = Vec::new();
+                                for name in face.names() {
+                                    if name.name_id == 1 || name.name_id == 6 {
+                                        if let Some(s) = name.to_string() {
+                                            if !got.contains(&s) { got.push(s); }
+                                        }
+                                    }
+                                }
+                                if !got.is_empty() { real = got.join(" / "); }
+                            } else {
+                                real = "(unparseable)".into();
+                            }
+                        }
+                    }
+                }
+                println!("   /FontName {:<20} /FontFamily {:<14} program says: {real}",
+                    named(b"FontName").unwrap_or_else(|| "-".into()),
+                    named(b"FontFamily").unwrap_or_else(|| "-".into()));
+            }
+        }
+    }
+
     /// Page one of a file, rendered, so a claim about how it is set can be
     /// checked by looking at it.
     #[test]

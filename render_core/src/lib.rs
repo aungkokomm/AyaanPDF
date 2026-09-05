@@ -15388,7 +15388,29 @@ mod tests {
     }
 
     pub(crate) fn texts_of(handle: u64) -> Vec<String> {
-        decode_lines(handle, 0).into_iter().map(|l| l.text).collect()
+        texts_of_page(handle, 0)
+    }
+
+    /// Every line PDFium reads off a page, with the geometry it reports:
+    /// (left, top, right, bottom, baseline, text, font).
+    pub(crate) fn decoded_lines_for(
+        bytes: &[u8],
+        page_index: i32,
+    ) -> Vec<(f32, f32, f32, f32, f32, String, String)> {
+        let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        if handle == 0 {
+            return Vec::new();
+        }
+        let out = decode_lines(handle, page_index)
+            .into_iter()
+            .map(|l| (l.left, l.top, l.right, l.bottom, l.baseline, l.text, l.font))
+            .collect();
+        close_document(handle);
+        out
+    }
+
+    pub(crate) fn texts_of_page(handle: u64, page_index: i32) -> Vec<String> {
+        decode_lines(handle, page_index).into_iter().map(|l| l.text).collect()
     }
 
     // ---- what a line IS ----

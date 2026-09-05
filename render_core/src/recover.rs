@@ -420,6 +420,29 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     merge_placements(out, &names)
 }
 
+/// Whether two font names are the same FACE, for the purpose of joining two
+/// placements into one line.
+///
+/// ⚠️ TWO FONTS NOTHING IS KNOWN ABOUT ARE NOT THE SAME FONT. This used to
+/// compare `installed()` of each, which answers None for anything outside the
+/// two Burmese families, so ANY two unrecognised fonts compared equal and their
+/// placements were merged into one line. Measured on a Devanagari book, whose
+/// fonts are all unrecognised: a heading's Devanagari and the en dash beside it
+/// are set in different fonts, they were joined, and the resulting run mixed
+/// glyph ids from two fonts. It agreed with the page for three glyphs and then
+/// diverged on the dash, which is not a reading problem at all.
+///
+/// ⚠️ AND THIS ONLY EVER REFUSES A JOIN. Two subsets of one readable family
+/// still resolve to one file and still join, which is what the Burmese files
+/// rely on; anything else must now be named alike. A join not made costs a
+/// space at worst, where a join wrongly made corrupts the run.
+fn one_face(a: &str, b: &str) -> bool {
+    match (installed(a), installed(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 /// Joins the separately placed runs that make up one visual line.
 ///
 /// ⚠️ A PRODUCER PLACES A LINE IN PIECES, EACH WITH ITS OWN `Tm`. Measured on a
@@ -485,7 +508,7 @@ fn merge_placements(
     for line in lines {
         let joined = out.last().is_some_and(|prev| {
             let apart = (prev.y - line.y).abs();
-            installed(&prev.base_font) == installed(&line.base_font)
+            one_face(&prev.base_font, &line.base_font)
                 && line.x >= prev.x
                 && (apart < SAME_BASELINE
                     || (apart < A_MARK * line.size && draws_only_marks(&line)))
@@ -2029,6 +2052,1677 @@ mod tests {
     /// (`\u{1026}\u{1038} \u{1005}\u{102E}\u{1038}` for text with no spaces in it at all), this says whether those
     /// gaps are genuinely space-sized or whether the threshold is simply too
     /// low for the way that producer sets type.
+    /// ⚠️ TWO FONTS NOTHING IS KNOWN ABOUT ARE NOT THE SAME FONT.
+    ///
+    /// The join used to ask `installed()` of each name and compare the answers.
+    /// That is None for anything outside the two Burmese families, so ANY two
+    /// unrecognised fonts compared equal and their placements were merged into
+    /// one line, mixing glyph ids from two fonts into one run. Measured on a
+    /// Devanagari book: a heading's Devanagari and the en dash beside it are set
+    /// in different fonts, they were joined, and the run diverged from the page
+    /// at the dash. Splitting them took that page from 289 runs to 1641, and
+    /// took the runs that reproduce exactly from 5 to 73.
+    /// A page whose two font resources are named differently, both of them
+    /// names nothing is known about, with one placement in each.
+    fn a_page_in_two_unknown_fonts(operations: Vec<Operation>) -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let mut font_res = lopdf::Dictionary::new();
+
+        for (res, base) in [("F1", "CIDFont+F2"), ("F2", "CIDFont+F7")] {
+            let descendant = doc.add_object(lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType2",
+                "BaseFont" => base,
+                "W" => vec![0.into(), vec![500.0.into()].into()],
+                "DW" => 500.0,
+            });
+            let font = doc.add_object(lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => base,
+                "Encoding" => "Identity-H",
+                "DescendantFonts" => vec![descendant.into()],
+            });
+            font_res.set(res, font);
+        }
+
+        let content = Content { operations };
+        let stream = doc.add_object(lopdf::Stream::new(
+            lopdf::dictionary! {},
+            content.encode().unwrap(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(lopdf::dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => stream,
+            "Resources" => lopdf::dictionary! { "Font" => font_res },
+        });
+        doc.objects.insert(pages_id, Object::Dictionary(lopdf::dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page.into()],
+            "Count" => 1,
+        }));
+        let catalog = doc.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+        (doc, page)
+    }
+
+    /// ⚠️ AND THE JOIN ITSELF MUST HONOUR IT, not merely the helper.
+    ///
+    /// Two placements on one baseline, set in two different fonts, must come
+    /// back as TWO lines. Merged, the run mixes glyph ids from two fonts and
+    /// means nothing: measured on a Devanagari book, a heading's Devanagari and
+    /// the en dash beside it were joined and the run diverged from the page at
+    /// the dash.
+    #[test]
+    fn two_placements_in_different_unknown_fonts_are_two_lines() {
+        let (doc, page) = a_page_in_two_unknown_fonts(vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.0.into()]),
+            place(72.0, 700.0),
+            show(&[10, 11, 12]),
+            Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F2".into(), 12.0.into()]),
+            place(90.0, 700.0),
+            show(&[13, 14]),
+            Operation::new("ET", vec![]),
+        ]);
+
+        let lines = lines_of(&doc, page);
+
+        assert_eq!(lines.len(), 2,
+            "two fonts on one baseline were merged into one run: {:?}",
+            lines.iter().map(|l| (&l.base_font, &l.glyphs)).collect::<Vec<_>>());
+        assert_eq!(lines[0].glyphs, vec![10, 11, 12]);
+        assert_eq!(lines[1].glyphs, vec![13, 14]);
+    }
+
+    #[test]
+    fn two_fonts_nothing_is_known_about_are_not_one_face() {
+        // The bug, said plainly: these are different fonts.
+        assert!(!one_face("CIDFont+F2", "CIDFont+F7"),
+            "two unrecognised fonts were treated as one, so their runs would merge");
+
+        // One font is still itself.
+        assert!(one_face("CIDFont+F2", "CIDFont+F2"));
+
+        // ⚠️ AND THE BURMESE FILES MUST BE UNAFFECTED. Their pages alternate
+        // between subsets of one family line by line, and joining those is what
+        // makes a line readable at all.
+        assert!(one_face("BCDEEE+MyanmarText", "BCDGEE+MyanmarText"),
+            "two subsets of one readable family stopped being one face");
+
+        // And a readable family is never the same as an unreadable font.
+        assert!(!one_face("BCDEEE+MyanmarText", "CIDFont+F2"));
+    }
+
+    /// ⚠️ THE REPAIR, END TO END, GATED BY THE SAME PROOF AS MYANMAR.
+    ///
+    /// Step 1 paired every run with the line the file says it belongs to. This
+    /// puts the pieces back together and asks the only question that settles
+    /// anything: substitute the wrong codepoints for what the page's own glyphs
+    /// say they should be, shape the line again, and demand the page's glyphs.
+    ///
+    /// Three things had to be measured before the loop could even run, and each
+    /// of them changed it:
+    ///
+    /// ⚠️ A RUN IS A FRAGMENT, NOT A LINE. This producer draws one page's
+    /// text as sixteen hundred placements. Sorted by where they sit across the
+    /// page they are the line, and the line is what has to be reproduced.
+    ///
+    /// ⚠️ A LINE IS SET IN MORE THAN ONE FACE. Measured: 240 of this page's
+    /// 246 lines draw out of more than one font resource, and those resources
+    /// are not all one face. Two of them number their glyphs the way the
+    /// resolved Devanagari face does; five draw the spaces, digits and dashes
+    /// out of something else, where the en dash is glyph 177 against the
+    /// Devanagari face's 168. Judging those runs would repair a difference that
+    /// is not an error, so the walk steps over them.
+    ///
+    /// ⚠️ AND A CLUSTER IS NOT ALWAYS ONE GLYPH. `र्श` draws as the consonant
+    /// plus a reph above it. Indexing only the clusters that draw as a single
+    /// glyph made every one of those invisible, so the index is keyed by the
+    /// SEQUENCE a cluster draws, and the repair takes the longest sequence that
+    /// the page's own glyphs begin with.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn how_much_of_a_page_a_codepoint_repair_proves() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA_SMALL).exists()
+            || !std::path::Path::new(NIRMALA).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+        let devanagari_char =
+            |c: char| ('\u{0900}'..='\u{097F}').contains(&c);
+
+        // ⚠️ THE SPACE IS NOT A GLYPH ON THIS PAGE. A run of the page's own
+        // glyphs crosses a space without drawing anything for it, while the
+        // face shapes one, so a run that is really there stops matching in the
+        // middle. Measured: this alone refused most of the lines that carried
+        // no error at all. Both sides drop it, and the position reported for a
+        // repair is still the position in the real shaping.
+        let blank: BTreeSet<u16> = crate::reshape::draws(&face, " ")
+            .into_iter().collect();
+        println!("the face draws a space as {blank:?}");
+
+        // ⚠️ THE REPH IS WRITTEN AFTER ITS BASE, WHICH NO SUBSTITUTION CAN
+        // FIX. `दर्शन` reaches the file as `दशŊन`: the `र्` is a mark drawn
+        // above `श` and the producer emitted it in the order it is DRAWN, one
+        // place after the consonant it belongs to. Unicode has no character for
+        // a standalone reph, so the repair is not a substitution at all, it is
+        // a move. The glyph is named by shaping a reph and the same consonant
+        // without one, and taking what was added.
+        let reph = {
+            let with = crate::reshape::draws(&face, "र्क");
+            let without = crate::reshape::draws(&face, "क");
+            with.iter().copied().find(|g| !without.contains(g))
+        };
+        println!("the face draws a reph as {reph:?}");
+
+        // ⚠️ AND A MATRA IS NOT ONE GLYPH EITHER. The `ि` reaches over the
+        // cluster that follows it, so the face carries a width variant of it
+        // per cluster and the shaper picks one. Measured: the page draws 302
+        // where this shaper picks 228 for the same `ि` in the same word, which
+        // is not a wrong codepoint and cannot be repaired as one. Every variant
+        // a character can produce, gathered from the face itself.
+        let mut variants: BTreeMap<char, BTreeSet<u16>> = BTreeMap::new();
+        for text in devanagari_clusters() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.contains(&0) {
+                continue;
+            }
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(&text);
+            let shaped = rustybuzz::shape(&face, &[], buffer);
+            for (info, &id) in shaped.glyph_infos().iter().zip(&g) {
+                if let Some(c) = text[info.cluster as usize..].chars().next() {
+                    variants.entry(c).or_default().insert(id);
+                }
+            }
+        }
+        let alternates = |c: char, a: u16, b: u16| {
+            variants.get(&c).is_some_and(|s| s.contains(&a) && s.contains(&b))
+        };
+        for c in ['ि', 'ा', 'र'] {
+            println!("the face draws {c:?} as any of {:?}",
+                variants.get(&c).map(|s| s.len()));
+        }
+
+        // The glyph SEQUENCE a cluster draws -> the cluster, where exactly one
+        // cluster draws it. Anything two clusters can draw is dropped.
+        let mut inverse: BTreeMap<Vec<u16>, String> = BTreeMap::new();
+        let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
+        for text in devanagari_clusters() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.is_empty() || g.contains(&0) || g.len() > 3 {
+                continue;
+            }
+            if let Some(had) = inverse.insert(g.clone(), text.clone()) {
+                if had != text {
+                    clash.insert(g);
+                }
+            }
+        }
+        for g in &clash {
+            inverse.remove(g);
+        }
+        let known: BTreeSet<u16> = inverse.keys().flatten().copied().collect();
+        println!("{} glyph sequences have exactly one spelling, over {} glyphs",
+            inverse.len(), known.len());
+
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+        // ⚠️ WHICH RESOURCES ARE EVEN THE SAME FACE, asked of their own
+        // glyphs. The two groups come out at 61% and 68% against five
+        // resources at 0%, so nothing in between has to be judged.
+        let mut seen: BTreeMap<String, (BTreeSet<u16>, usize)> = BTreeMap::new();
+        for &page in &pages {
+            for line in lines_of(&doc, page) {
+                let e = seen.entry(line.base_font.clone()).or_default();
+                e.1 += line.glyphs.len();
+                e.0.extend(line.glyphs.iter().copied());
+            }
+        }
+        println!("\nper font resource, of its distinct glyphs, how many the \
+            resolved face draws:");
+        let mut devanagari: BTreeSet<String> = BTreeSet::new();
+        for (name, (ids, drawn)) in &seen {
+            let hit = ids.iter().filter(|g| known.contains(g)).count();
+            let share = hit as f64 / ids.len().max(1) as f64;
+            if share > 0.25 {
+                devanagari.insert(name.clone());
+            }
+            println!("   {name:<12} {drawn:>5} drawn, {:>4} distinct, {hit:>4} \
+                known ({:>3.0}%), highest id {}{}",
+                ids.len(), share * 100.0, ids.iter().max().copied().unwrap_or(0),
+                if share > 0.25 { "   <- devanagari" } else { "" });
+        }
+
+        let mut lines_judged = 0usize;
+        let mut already = 0usize;
+        let mut proven = 0usize;
+        let mut gave_up = 0usize;
+        let mut runs_judged = 0usize;
+        let mut runs_proven = 0usize;
+        let mut swaps_made: BTreeMap<char, BTreeMap<String, usize>> = BTreeMap::new();
+        let mut stalls: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut shown = 0usize;
+        let mut stalled = 0usize;
+
+        for (n, &page) in pages.iter().enumerate() {
+            let said = crate::tests::decoded_lines_for(&bytes, n as i32);
+            if said.is_empty() {
+                continue;
+            }
+            let Some((left, top, width)) = page_box(&doc, page) else { continue };
+            let across = |v: f64| ((v - left) / width) as f32;
+            let down = |v: f64| ((top - v) / width) as f32;
+
+            // Every run, gathered under the line it was paired with.
+            let mut gathered: BTreeMap<usize, Vec<Line>> = BTreeMap::new();
+            for line in lines_of(&doc, page) {
+                if line.glyphs.is_empty() {
+                    continue;
+                }
+                let my_base = down(line.page_y);
+                let my_x = across(line.x);
+                let near = (line.size / width * 0.5).max(0.002) as f32;
+                let best = said
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| (s.4 - my_base).abs() < near)
+                    .min_by(|(_, a), (_, b)| {
+                        (a.0 - my_x).abs().total_cmp(&(b.0 - my_x).abs())
+                    });
+                if let Some((i, _)) = best {
+                    gathered.entry(i).or_default().push(line);
+                }
+            }
+
+            for (i, mut runs) in gathered {
+                runs.sort_by(|a, b| a.x.total_cmp(&b.x));
+                runs.retain(|r| devanagari.contains(&r.base_font));
+                let drawn: usize = runs.iter().map(|r| r.glyphs.len()).sum();
+                if drawn < 4 {
+                    continue;
+                }
+                let text = said[i].5.clone();
+                if !text.chars().any(devanagari_char) {
+                    continue;
+                }
+                lines_judged += 1;
+                runs_judged += runs.len();
+
+                // ⚠️ EACH DEVANAGARI RUN IS FOUND, NOT COUNTED TO. The runs
+                // between them are drawn by another face and cannot be shaped
+                // here, so their length is not something to rely on: measured,
+                // a line that was otherwise entirely repaired was refused
+                // because the page ends with a space its text does not carry.
+                // Each run is sought at or after where the last one ended, and
+                // the walk fails only when a run is nowhere ahead of it.
+                let walk = |now: &str| -> Result<usize, (usize, Vec<u16>, usize)> {
+                    // The shaping with the blanks taken out, each glyph still
+                    // carrying where it really sits and which character it came
+                    // from, because a character's width variants all count.
+                    let mut buffer = rustybuzz::UnicodeBuffer::new();
+                    buffer.push_str(now);
+                    let out = rustybuzz::shape(&face, &[], buffer);
+                    let ink: Vec<(u16, usize, char)> = out.glyph_infos().iter()
+                        .enumerate()
+                        .map(|(i, g)| (g.glyph_id as u16, i,
+                            now[g.cluster as usize..].chars().next().unwrap_or(' ')))
+                        .filter(|(g, _, _)| !blank.contains(g))
+                        .collect();
+                    let mut at = 0usize;
+                    for (r, run) in runs.iter().enumerate() {
+                        let want: Vec<u16> = run.glyphs.iter().copied()
+                            .filter(|g| !blank.contains(g)).collect();
+                        if want.is_empty() {
+                            continue;
+                        }
+                        let mut best = (0usize, at);
+                        for q in at..=ink.len() {
+                            let m = want.iter().zip(&ink[q..])
+                                .take_while(|(a, (b, _, c))| **a == *b
+                                    || alternates(*c, **a, *b))
+                                .count();
+                            if m > best.0 {
+                                best = (m, q);
+                            }
+                            if m == want.len() {
+                                break;
+                            }
+                        }
+                        if best.0 == want.len() {
+                            at = best.1 + want.len();
+                        } else {
+                            let here = ink.get(best.1 + best.0)
+                                .map(|(_, i, _)| *i)
+                                .unwrap_or(out.len());
+                            return Err((here, want[best.0..].to_vec(), r));
+                        }
+                    }
+                    Ok(runs.len())
+                };
+
+                if walk(&text).is_ok() {
+                    already += 1;
+                    runs_proven += runs.len();
+                    continue;
+                }
+
+                // Repair: one wrong codepoint at a time, reshaping each round.
+                let mut now = text.clone();
+                let mut swaps: Vec<(char, String)> = Vec::new();
+                let mut why = "";
+                for _ in 0..40 {
+                    let Err((at, tail, _)) = walk(&now) else { break };
+                    let Some((offset, bad)) = char_and_offset(&face, &now, at) else {
+                        why = "the divergence is past the end of the text";
+                        break;
+                    };
+                    let after = offset + bad.len_utf8();
+                    let mine = !devanagari_char(bad) && !bad.is_ascii();
+
+                    // The longest run of the page's own glyphs this face can
+                    // spell. Longest, because `र्श` and `श` both begin here.
+                    let spelling = (1..=tail.len().min(3)).rev()
+                        .find_map(|k| inverse.get(&tail[..k]));
+
+                    if let Some(spelling) = spelling.filter(|_| mine) {
+                        // ⚠️ A WRONG CODEPOINT STANDING FOR A WHOLE CLUSTER,
+                        // which is the case this whole investigation began from.
+                        swaps.push((bad, spelling.clone()));
+                        now = format!("{}{spelling}{}", &now[..offset], &now[after..]);
+                    } else if reph == Some(tail[0]) && mine {
+                        // A reph, written where it is drawn. Take the character
+                        // out and put a real `र्` in front of the syllable it
+                        // belongs to.
+                        let ins = syllable_start(&now[..offset]);
+                        swaps.push((bad, "र् moved back".into()));
+                        now = format!("{}र्{}{}", &now[..ins], &now[ins..offset],
+                            &now[after..]);
+                    } else if devanagari_char(bad)
+                        && crate::reshape::draws(&face, &bad.to_string())
+                            .first() == Some(&tail[0])
+                        && now[after..].starts_with('\u{094D}')
+                        && !now[after + '\u{094D}'.len_utf8()..]
+                            .starts_with('\u{200C}')
+                    {
+                        // ⚠️ THE PAGE DID NOT FORM THE CONJUNCT THE FACE DOES.
+                        // Measured: `अध्याय` is drawn as `ध` and `य` either side
+                        // of a visible virama where the face makes one `ध्य`.
+                        // The text is not wrong, it is under-specified: what the
+                        // page shows is the half form refused, which Unicode
+                        // spells with a zero-width non-joiner after the virama.
+                        let cut = after + '\u{094D}'.len_utf8();
+                        swaps.push((bad, "conjunct broken".into()));
+                        now = format!("{}{}{}", &now[..cut], '\u{200C}', &now[cut..]);
+                    } else if spelling.is_none() {
+                        why = "no spelling for the glyphs the page draws";
+                        break;
+                    } else {
+                        why = "the character that diverged is already devanagari";
+                        break;
+                    }
+                }
+
+                match walk(&now) {
+                    Ok(_) => {
+                        proven += 1;
+                        runs_proven += runs.len();
+                        for (bad, spelling) in &swaps {
+                            *swaps_made.entry(*bad).or_default()
+                                .entry(spelling.clone()).or_default() += 1;
+                        }
+                        if shown < 6 && !swaps.is_empty() {
+                            shown += 1;
+                            println!("\n  PROVEN after {} swaps, {drawn} glyphs in {} runs",
+                                swaps.len(), runs.len());
+                            println!("     file said “{}”",
+                                text.chars().take(56).collect::<String>());
+                            println!("     really   “{}”",
+                                now.chars().take(56).collect::<String>());
+                        }
+                    }
+                    Err((at, tail, r)) => {
+                        gave_up += 1;
+                        runs_proven += r;
+                        *stalls.entry(if why.is_empty() {
+                            "still not proven after 40 rounds"
+                        } else { why }).or_default() += 1;
+                        if stalled < 6 {
+                            stalled += 1;
+                            let shaped = crate::reshape::draws(&face, &now);
+                            println!("\n  STOPPED in run {r} of {}, at glyph {at} \
+                                of {} ({} swaps in): {why}",
+                                runs.len(), shaped.len(), swaps.len());
+                            println!("     page draws  {:?}",
+                                &tail[..tail.len().min(5)]);
+                            println!("     text shapes {:?}",
+                                &shaped[at.min(shaped.len())
+                                    ..(at + 5).min(shaped.len())]);
+                            println!("     the character there {:?}",
+                                char_and_offset(&face, &now, at).map(|(_, c)| c));
+                            println!("     glyph {} is {}, one of it spells {:?}, \
+                                two {:?}",
+                                tail[0],
+                                if known.contains(&tail[0]) { "drawn by this face" }
+                                else { "NOT drawn by this face" },
+                                inverse.get(&tail[..1]),
+                                tail.get(..2).and_then(|k| inverse.get(k)));
+                            println!("     text “{}”",
+                                now.chars().take(60).collect::<String>());
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("\n{lines_judged} lines carrying devanagari:");
+        println!("   {already} already read correctly");
+        println!("   {proven} PROVEN after repair");
+        println!("   {gave_up} not proven");
+        for (why, n) in &stalls {
+            println!("      {why} x{n}");
+        }
+        if lines_judged > 0 {
+            println!("   {:.0}% of lines, {:.0}% of runs ({runs_proven} of \
+                {runs_judged})",
+                (already + proven) as f64 / lines_judged as f64 * 100.0,
+                runs_proven as f64 / runs_judged.max(1) as f64 * 100.0);
+        }
+
+        println!("\nthe substitutions that proved:");
+        for (bad, spellings) in &swaps_made {
+            let mut best: Vec<(&String, &usize)> = spellings.iter().collect();
+            best.sort_by(|a, b| b.1.cmp(a.1));
+            let shown: Vec<String> = best.iter().take(2)
+                .map(|(s, n)| format!("{s:?} x{n}")).collect();
+            println!("   {bad:?} (U+{:04X}) -> {}", *bad as u32, shown.join(", "));
+        }
+    }
+
+    const HINDI: [&str; 4] = [
+        r"D:\Ayaan PDF Test file\Geeta Darshan Complete 18 Chapters.pdf",
+        r"D:\Ayaan PDF Test file\003_Agyat_Ki_Aur.pdf",
+        r"D:\Ayaan PDF Test file\024_Bharat_Ki_Khoj.pdf",
+        r"D:\Ayaan PDF Test file\Chal Hansa Us Des.pdf",
+    ];
+
+    /// Every name a page's fonts go by, so it can be settled whether the
+    /// descriptor's name is a safe thing to prefer.
+    ///
+    /// A Devanagari book was measured naming its fonts `CIDFont+F2`, which says
+    /// nothing at all: the table that maps a family to an installed file has
+    /// nothing to match on. The descriptor beside it says `GAGHKL+NirmalaUI`.
+    /// Before preferring one over the other everywhere, the Burmese files have
+    /// to say whether that would change anything they already do.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_a_pages_fonts_are_called_by_each_name_they_have() {
+        let files: Vec<&str> = HINDI
+            .iter()
+            .copied()
+            .chain([
+                r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf",
+                r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf",
+            ])
+            .collect();
+
+        for file in files {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            let Ok(doc) = Document::load(file) else { continue };
+            let Some((_, &page)) = doc.get_pages().iter().next() else { continue };
+            println!("\n=== {} ===", file.rsplit('\\').next().unwrap());
+            println!("{:<10} {:<24} {:<24} {}",
+                "resource", "/BaseFont", "descriptor /FontName", "the program says");
+
+            let Some(fonts) = doc
+                .get_dictionary(page)
+                .ok()
+                .and_then(|p| p.get(b"Resources").ok().and_then(|o| dictionary(&doc, o)))
+                .and_then(|r| r.get(b"Font").ok().and_then(|o| dictionary(&doc, o)))
+            else {
+                println!("no fonts");
+                continue;
+            };
+
+            for (name, obj) in fonts.iter() {
+                let Some(font) = dictionary(&doc, obj) else { continue };
+                let base = font
+                    .get(b"BaseFont")
+                    .ok()
+                    .and_then(|o| o.as_name().ok())
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .unwrap_or_else(|| "-".into());
+                let descriptor = descriptor_name(&doc, &font).unwrap_or_else(|| "-".into());
+                let program = program_family(&doc, &font).unwrap_or_else(|| "-".into());
+                println!("{:<10} {:<24} {:<24} {}",
+                    String::from_utf8_lossy(name), base, descriptor, program);
+            }
+        }
+    }
+
+    /// The family the embedded font PROGRAM calls itself.
+    ///
+    /// ⚠️ THE ONLY PLACE THE TRUTH IS, ON SOME FILES. A Devanagari book was
+    /// measured naming its fonts `CIDFont+F2` in the BaseFont AND in the
+    /// descriptor beside it. The subset it embeds knows perfectly well what it
+    /// is; nothing had ever asked it.
+    fn program_family(doc: &Document, font: &lopdf::Dictionary) -> Option<String> {
+        let holder = match font.get(b"DescendantFonts").ok() {
+            Some(o) => {
+                let arr = match o {
+                    Object::Array(a) => a.clone(),
+                    Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?.clone(),
+                    _ => return None,
+                };
+                dictionary(doc, arr.first()?)?
+            }
+            None => font.clone(),
+        };
+        let d = holder.get(b"FontDescriptor").ok().and_then(|o| dictionary(doc, o))?;
+        let id = [&b"FontFile2"[..], b"FontFile3", b"FontFile"]
+            .iter()
+            .find_map(|k| d.get(k).ok().and_then(|v| v.as_reference().ok()))?;
+        let bytes = doc.get_object(id).ok()?.as_stream().ok()?.decompressed_content().ok()?;
+        let face = rustybuzz::ttf_parser::Face::parse(&bytes, 0).ok()?;
+        face.names()
+            .into_iter()
+            .find(|n| n.name_id == 1)
+            .and_then(|n| n.to_string())
+    }
+
+    /// The name the font DESCRIPTOR gives, following a Type0 down to the
+    /// descendant that carries it.
+    fn descriptor_name(doc: &Document, font: &lopdf::Dictionary) -> Option<String> {
+        let holder = match font.get(b"DescendantFonts").ok() {
+            Some(o) => {
+                let arr = match o {
+                    Object::Array(a) => a.clone(),
+                    Object::Reference(id) => doc.get_object(*id).ok()?.as_array().ok()?.clone(),
+                    _ => return None,
+                };
+                dictionary(doc, arr.first()?)?
+            }
+            None => font.clone(),
+        };
+        let d = holder.get(b"FontDescriptor").ok().and_then(|o| dictionary(doc, o))?;
+        d.get(b"FontName")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+    }
+
+    /// ⚠️ CAN THE FILE'S OWN TEXT BE PROVEN? Devanagari pages, unlike the
+    /// Burmese ones, DO carry a reading: measured, 41 of 42 text objects on one
+    /// page came back as Devanagari and not one character as U+0000. What is
+    /// unknown is whether that reading is RIGHT, and the same test that proves
+    /// a recovered line answers it: shape the text the file gives and demand
+    /// the glyphs the page draws.
+    ///
+    /// This needs no index and no enumeration. It is `draws` and a comparison.
+    /// A page, anywhere in these books, whose Devanagari is set in a face THIS
+    /// MACHINE HAS. Without one there is nothing to shape against and no
+    /// measurement to take.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn where_a_devanagari_page_uses_a_face_we_have() {
+        const LOOK: usize = 60;
+        for file in HINDI {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            let Ok(doc) = Document::load(file) else { continue };
+            let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+            println!("\n=== {} ({} pages, looking at the first {LOOK}) ===",
+                file.rsplit('\\').next().unwrap(), pages.len());
+
+            let mut seen: BTreeMap<String, (usize, bool)> = BTreeMap::new();
+            for (n, &page) in pages.iter().take(LOOK).enumerate() {
+                for name in fonts_named(&doc, page).into_values() {
+                    let have = devanagari_file(&name)
+                        .is_some_and(|f| std::path::Path::new(f).exists());
+                    seen.entry(name).or_insert((n, have));
+                }
+            }
+            for (name, (first, have)) in &seen {
+                println!("   {name:<40} first on page {first:<4} installed here: {have}");
+            }
+        }
+    }
+
+    /// ⚠️ DOES THE REPAIR ACTUALLY PROVE? The lookup answers "what should
+    /// have been here". This asks the only question that matters after that:
+    /// substitute, shape the whole line again, and demand the page's glyphs.
+    ///
+    /// Nothing is accepted on the strength of the lookup alone. A line either
+    /// comes back as the glyphs the page draws or it is not repaired.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn how_many_lines_a_codepoint_repair_can_prove() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA_SMALL).exists()
+            || !std::path::Path::new(NIRMALA).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+
+        // glyph -> the one cluster that draws it.
+        let mut inverse: BTreeMap<u16, String> = BTreeMap::new();
+        let mut clash: BTreeSet<u16> = BTreeSet::new();
+        for text in devanagari_clusters() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.len() != 1 || g[0] == 0 {
+                continue;
+            }
+            if let Some(had) = inverse.insert(g[0], text.clone()) {
+                if had != text {
+                    clash.insert(g[0]);
+                }
+            }
+        }
+        for g in &clash {
+            inverse.remove(g);
+        }
+        println!("{} glyphs have exactly one spelling ({} clashed and were dropped)",
+            inverse.len(), clash.len());
+
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+        // ⚠️ LEARNED PER FONT RESOURCE, NOT PER DOCUMENT. Pooling them gave
+        // one wrong codepoint three different answers: two fonts of a document
+        // number their glyphs differently, so the same stand-in character means
+        // different things in each.
+        let mut learned: BTreeMap<(usize, Vec<u8>), BTreeMap<char, BTreeMap<String, usize>>> =
+            BTreeMap::new();
+
+        let mut total = 0usize;
+        let mut clean = 0usize;
+        let mut repaired = 0usize;
+        let mut partial = 0usize;
+        let mut examples = 0usize;
+
+        for (n, &page) in pages.iter().enumerate() {
+            let said = page_text(&bytes, n);
+            let said: Vec<&String> = said.iter().filter(|s| !s.trim().is_empty()).collect();
+            if said.is_empty() {
+                continue;
+            }
+
+            for line in lines_of(&doc, page) {
+                if line.glyphs.len() < 4 {
+                    continue;
+                }
+                total += 1;
+
+                let Some(start) = said.iter().max_by_key(|s| {
+                    crate::reshape::draws(&face, s)
+                        .iter()
+                        .zip(&line.glyphs)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                }) else { continue };
+
+                if crate::reshape::draws(&face, start) == line.glyphs {
+                    clean += 1;
+                    continue;
+                }
+
+                // Repair, one wrong codepoint at a time, re-shaping each round.
+                let mut text = (*start).clone();
+                let mut swaps: Vec<(char, String)> = Vec::new();
+                for _ in 0..24 {
+                    let drawn = crate::reshape::draws(&face, &text);
+                    if drawn == line.glyphs {
+                        break;
+                    }
+                    let at = drawn
+                        .iter()
+                        .zip(&line.glyphs)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if drawn.get(at) != Some(&0) {
+                        break;
+                    }
+                    let Some(&wanted) = line.glyphs.get(at) else { break };
+                    let Some(spelling) = inverse.get(&wanted) else { break };
+                    let Some((offset, bad)) = char_and_offset(&face, &text, at) else { break };
+
+                    swaps.push((bad, spelling.clone()));
+                    let mut next = String::with_capacity(text.len() + spelling.len());
+                    next.push_str(&text[..offset]);
+                    next.push_str(spelling);
+                    next.push_str(&text[offset + bad.len_utf8()..]);
+                    text = next;
+                }
+
+                let done = crate::reshape::draws(&face, &text) == line.glyphs;
+                if done {
+                    repaired += 1;
+                    let entry = learned
+                        .entry((n, line.resource.clone()))
+                        .or_default();
+                    for (bad, spelling) in &swaps {
+                        *entry.entry(*bad).or_default().entry(spelling.clone()).or_default() += 1;
+                    }
+                    if examples < 4 && !swaps.is_empty() {
+                        examples += 1;
+                        println!("\n  repaired a line of {} glyphs with {} swaps",
+                            line.glyphs.len(), swaps.len());
+                        println!("     was “{}”", start.chars().take(46).collect::<String>());
+                        println!("     now “{}”", text.chars().take(46).collect::<String>());
+                    }
+                } else if !swaps.is_empty() {
+                    partial += 1;
+                }
+            }
+        }
+
+        println!("\n{total} lines: {clean} already exact, {repaired} repaired and PROVEN, \
+            {partial} changed but still unproven, {} untouched",
+            total - clean - repaired - partial);
+
+        println!("\nthe table each font resource learned:");
+        for ((page, resource), table) in &learned {
+            let mut ambiguous = 0usize;
+            for spellings in table.values() {
+                if spellings.len() > 1 {
+                    ambiguous += 1;
+                }
+            }
+            println!("   page {page} {:<6} {} characters, {ambiguous} of them ambiguous",
+                String::from_utf8_lossy(resource), table.len());
+        }
+    }
+
+    /// Where the orthographic syllable that ends `head` begins: back to its
+    /// last consonant, and on back over every consonant a virama joins to it.
+    /// A reph belongs in front of the whole of that, so `कर्ष` and `र्क्ष` put
+    /// it in different places.
+    fn syllable_start(head: &str) -> usize {
+        let consonant = |c: char| ('\u{0915}'..='\u{0939}').contains(&c)
+            || ('\u{0958}'..='\u{095F}').contains(&c);
+        let chars: Vec<(usize, char)> = head.char_indices().collect();
+        let Some(mut k) = chars.iter().rposition(|(_, c)| consonant(*c)) else {
+            return head.len();
+        };
+        while k >= 2 && chars[k - 1].1 == '\u{094D}' && consonant(chars[k - 2].1) {
+            k -= 2;
+        }
+        chars[k].0
+    }
+
+    /// The character of `text` that produced the glyph at `at`, and where it
+    /// starts.
+    fn char_and_offset(face: &rustybuzz::Face, text: &str, at: usize) -> Option<(usize, char)> {
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        let shaped = rustybuzz::shape(face, &[], buffer);
+        let cluster = shaped.glyph_infos().get(at)?.cluster as usize;
+        text[cluster..].chars().next().map(|c| (cluster, c))
+    }
+
+    /// ⚠️ THE REPAIR TABLE COMES OUT OF THE FILE, NOT OUT OF MATCHING LINES.
+    ///
+    /// The producer's `/ToUnicode` already says which character it thinks each
+    /// glyph means. That is exactly the wrong answer we are trying to correct,
+    /// and it is a TABLE: glyph -> the character it wrongly claims. Inverting a
+    /// bounded cluster enumeration gives glyph -> the text that really draws it.
+    /// Composing the two gives, per font, the substitution to make, with no
+    /// line matching anywhere in it.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_the_repair_table_looks_like_composed_from_the_file() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA_SMALL).exists()
+            || !std::path::Path::new(NIRMALA).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+
+        let mut inverse: BTreeMap<u16, String> = BTreeMap::new();
+        let mut clash: BTreeSet<u16> = BTreeSet::new();
+        for text in devanagari_clusters() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.len() != 1 || g[0] == 0 {
+                continue;
+            }
+            if let Some(had) = inverse.insert(g[0], text.clone()) {
+                if had != text {
+                    clash.insert(g[0]);
+                }
+            }
+        }
+        for g in &clash {
+            inverse.remove(g);
+        }
+
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let Some(&page) = pages.first() else { return };
+
+        let Some(fonts) = doc
+            .get_dictionary(page)
+            .ok()
+            .and_then(|p| p.get(b"Resources").ok().and_then(|o| dictionary(&doc, o)))
+            .and_then(|r| r.get(b"Font").ok().and_then(|o| dictionary(&doc, o)))
+        else {
+            println!("no fonts");
+            return;
+        };
+
+        for (name, obj) in fonts.iter() {
+            let Some(font_dict) = dictionary(&doc, obj) else { continue };
+            let Some(map) = to_unicode(&doc, &font_dict) else { continue };
+
+            let mut suspects = 0usize;
+            let mut solved = 0usize;
+            let mut unsolved: Vec<u16> = Vec::new();
+            let mut shown = 0usize;
+
+            println!("\n--- resource {} : /ToUnicode has {} entries ---",
+                String::from_utf8_lossy(name), map.len());
+
+            for (&cid, claimed) in &map {
+                // A claim is suspect when it is not Devanagari and not plain
+                // ASCII: that is what a mis-mapped conjunct looks like.
+                let odd = claimed.chars().any(|c| {
+                    !('\u{0900}'..='\u{097F}').contains(&c) && !c.is_ascii() && !c.is_whitespace()
+                });
+                if !odd {
+                    continue;
+                }
+                suspects += 1;
+                match inverse.get(&cid) {
+                    Some(real) => {
+                        solved += 1;
+                        if shown < 12 {
+                            shown += 1;
+                            println!("   glyph {cid:<5} claims {claimed:?}  really {real:?}");
+                        }
+                    }
+                    None => unsolved.push(cid),
+                }
+            }
+            println!("   {solved} of {suspects} wrong claims resolved to a real cluster");
+            if !unsolved.is_empty() {
+                println!("   unresolved glyphs: {:?}",
+                    &unsolved[..unsolved.len().min(12)]);
+            }
+        }
+    }
+
+    /// The `/ToUnicode` CMap of a font, as glyph code -> the text it claims.
+    ///
+    /// Only what this measurement needs: `beginbfchar` and `beginbfrange` with
+    /// hex operands, which is what every producer writes.
+    fn to_unicode(doc: &Document, font: &lopdf::Dictionary) -> Option<BTreeMap<u16, String>> {
+        let id = font.get(b"ToUnicode").ok()?.as_reference().ok()?;
+        let raw = doc.get_object(id).ok()?.as_stream().ok()?.decompressed_content().ok()?;
+        let text = String::from_utf8_lossy(&raw).into_owned();
+
+        // Every <hex> token of a section, in order. Producers put many entries
+        // on a line, so pairing has to be done on the tokens themselves.
+        fn tokens(section: &str) -> Vec<Vec<u16>> {
+            let mut out = Vec::new();
+            let mut rest = section;
+            while let Some(a) = rest.find('<') {
+                let after = &rest[a + 1..];
+                let Some(b) = after.find('>') else { break };
+                let body = &after[..b];
+                rest = &after[b + 1..];
+                if body.is_empty() || body.len() % 4 != 0 {
+                    out.push(Vec::new());
+                    continue;
+                }
+                let parsed: Option<Vec<u16>> = (0..body.len() / 4)
+                    .map(|i| u16::from_str_radix(&body[i * 4..i * 4 + 4], 16).ok())
+                    .collect();
+                out.push(parsed.unwrap_or_default());
+            }
+            out
+        }
+
+        let say = |v: &[u16]| String::from_utf16_lossy(v);
+        let mut out: BTreeMap<u16, String> = BTreeMap::new();
+
+        let mut rest = text.as_str();
+        while let Some(s) = rest.find("beginbfchar") {
+            let after = &rest[s + "beginbfchar".len()..];
+            let e = after.find("endbfchar").unwrap_or(after.len());
+            let items = tokens(&after[..e]);
+            for pair in items.chunks(2) {
+                if let [from, to] = pair {
+                    if from.len() == 1 && !to.is_empty() {
+                        out.insert(from[0], say(to));
+                    }
+                }
+            }
+            rest = &after[e.min(after.len())..];
+        }
+
+        let mut rest = text.as_str();
+        while let Some(s) = rest.find("beginbfrange") {
+            let after = &rest[s + "beginbfrange".len()..];
+            let e = after.find("endbfrange").unwrap_or(after.len());
+            let section = &after[..e];
+            // Array form is skipped: it maps one code to several strings and
+            // this measurement does not need it.
+            if !section.contains('[') {
+                let items = tokens(section);
+                for three in items.chunks(3) {
+                    if let [a, b, c] = three {
+                        if a.len() == 1 && b.len() == 1 && !c.is_empty() && a[0] <= b[0] {
+                            for (step, code) in (a[0]..=b[0]).enumerate() {
+                                let mut to = c.clone();
+                                let last = to.len() - 1;
+                                to[last] = to[last].saturating_add(step as u16);
+                                out.insert(code, say(&to));
+                            }
+                        }
+                    }
+                }
+            }
+            rest = &after[e.min(after.len())..];
+        }
+        Some(out)
+    }
+
+    /// ⚠️ THE WRONG CODEPOINTS ARE NOT IN THE FILE. THE EXTRACTOR INVENTS THEM.
+    ///
+    /// Measured: these fonts' `/ToUnicode` maps carry 3 to 78 entries while the
+    /// fonts draw hundreds of glyphs, and none of the wrong claims are in them.
+    /// So `Ŋ` and `Ƿ` do not come from the producer's table at all. They come
+    /// from the EMBEDDED SUBSET'S OWN `cmap`, which a subsetter rebuilds by
+    /// handing each retained glyph whatever code was free.
+    ///
+    /// That cmap is readable, and it makes the repair table derivable with no
+    /// line matching and no `/ToUnicode`:
+    ///
+    ///   subset cmap:  wrong codepoint -> glyph
+    ///   inverse index: glyph          -> the cluster that really draws it
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn the_repair_table_read_out_of_the_subsets_own_cmap() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA_SMALL).exists()
+            || !std::path::Path::new(NIRMALA).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+
+        let mut inverse: BTreeMap<u16, String> = BTreeMap::new();
+        let mut clash: BTreeSet<u16> = BTreeSet::new();
+        for text in devanagari_clusters() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.len() != 1 || g[0] == 0 {
+                continue;
+            }
+            if let Some(had) = inverse.insert(g[0], text.clone()) {
+                if had != text {
+                    clash.insert(g[0]);
+                }
+            }
+        }
+        for g in &clash {
+            inverse.remove(g);
+        }
+        println!("{} glyphs of Nirmala have exactly one spelling", inverse.len());
+
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        let Some(&page) = pages.first() else { return };
+
+        for (resource, program) in embedded_programs(&doc, page) {
+            let Ok(subset) = rustybuzz::ttf_parser::Face::parse(&program, 0) else { continue };
+
+            // Which codes the subset's cmap answers to, over the range a
+            // producer's stand-ins land in, plus plain Latin.
+            let mut table: Vec<(char, u16, Option<String>)> = Vec::new();
+            for code in 0x0041u32..0x0500 {
+                let Some(c) = char::from_u32(code) else { continue };
+                if ('\u{0900}'..='\u{097F}').contains(&c) {
+                    continue;
+                }
+                let Some(gid) = subset.glyph_index(c) else { continue };
+                if gid.0 == 0 {
+                    continue;
+                }
+                table.push((c, gid.0, inverse.get(&gid.0).cloned()));
+            }
+            if table.is_empty() {
+                continue;
+            }
+            let solved = table.iter().filter(|(_, _, r)| r.is_some()).count();
+            println!("\n--- {} : {} non-Devanagari codes in its cmap, {solved} \
+                resolve to a Devanagari cluster ---",
+                String::from_utf8_lossy(&resource), table.len());
+
+            let mut shown = 0usize;
+            for (c, gid, real) in &table {
+                if let Some(real) = real {
+                    if shown < 14 {
+                        shown += 1;
+                        println!("   {c:?} (U+{:04X}) -> glyph {gid} -> {real:?}",
+                            *c as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// ⚠️ PAIRING A CONTENT-STREAM LINE WITH THE TEXT PDFIUM READ FOR IT.
+    ///
+    /// The repair needs to know what the file SAYS a given line says. Matching
+    /// by string similarity was measured useless: a 94-glyph line agreed with
+    /// its "closest" text for 2 glyphs, because the two sides segment a page
+    /// differently and the closest string was simply another line.
+    ///
+    /// Geometry settles it. Both sides know where a line sits, so pair them by
+    /// baseline and by where they start across the page, and never by what they
+    /// say.
+    ///
+    /// ⚠️ AND THE LATIN LINES ARE THE GROUND TRUTH. A Latin line has no
+    /// mis-mapped conjuncts, so a correct pairing must reproduce its glyphs
+    /// EXACTLY. That number measures the pairing itself, with nothing about
+    /// Devanagari in it.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn pairing_a_line_with_what_the_file_says_it_says() {
+        const FACES: [(&str, &str); 6] = [
+            ("nirmala", r"C:\Windows\Fonts\NIRMALA.TTF"),
+            ("arial", r"C:\Windows\Fonts\arial.ttf"),
+            ("arialbd", r"C:\Windows\Fonts\arialbd.ttf"),
+            ("times", r"C:\Windows\Fonts\times.ttf"),
+            ("timesbd", r"C:\Windows\Fonts\timesbd.ttf"),
+            ("calibri", r"C:\Windows\Fonts\calibri.ttf"),
+        ];
+        if !std::path::Path::new(GEETA_SMALL).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let loaded: Vec<(&str, Vec<u8>)> = FACES
+            .iter()
+            .filter_map(|(n, path)| std::fs::read(path).ok().map(|b| (*n, b)))
+            .collect();
+
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+        let mut paired = 0usize;
+        let mut unpaired = 0usize;
+        let mut latin_seen = 0usize;
+        let mut latin_exact = 0usize;
+        let mut indic_seen = 0usize;
+        let mut indic_prefix: Vec<(usize, usize)> = Vec::new();
+        let mut shown = 0usize;
+
+        for (n, &page) in pages.iter().enumerate() {
+            let said = crate::tests::decoded_lines_for(&bytes, n as i32);
+            if said.is_empty() {
+                continue;
+            }
+            let Some((left, top, width)) = page_box(&doc, page) else { continue };
+            let lines = lines_of(&doc, page);
+
+            // ⚠️ NORMALIZED THE WAY THE OTHER SIDE ALREADY IS: top-left
+            // origin, both axes over the page WIDTH. See `recover_page_text`.
+            let across = |v: f64| ((v - left) / width) as f32;
+            let down = |v: f64| ((top - v) / width) as f32;
+
+            for line in &lines {
+                if line.glyphs.len() < 4 {
+                    continue;
+                }
+                let my_base = down(line.page_y);
+                let my_x = across(line.x);
+
+                // The nearest baseline, and among those the nearest start.
+                // A line's own height is the scale: half of it is generous
+                // enough for a superscript and far short of the next line.
+                let near = (line.size / width * 0.5).max(0.002) as f32;
+                let best = said
+                    .iter()
+                    .filter(|s| (s.4 - my_base).abs() < near)
+                    .min_by(|a, b| {
+                        (a.0 - my_x).abs().total_cmp(&(b.0 - my_x).abs())
+                    });
+
+                let Some(said_line) = best else {
+                    unpaired += 1;
+                    continue;
+                };
+                paired += 1;
+
+                // ⚠️ A RUN IS A PIECE OF A LINE, NOT A LINE. This producer
+                // places nearly every cluster separately: measured, one page's
+                // forty lines of text are drawn as sixteen hundred runs. So the
+                // question is not whether the line's text SHAPES INTO this run,
+                // it is whether this run APPEARS IN the shaping of the line.
+                // That needs no substring alignment and it survives a line that
+                // changes font partway, which these headings do.
+                let mut top_face: Option<(&str, usize, bool)> = None;
+                for (name, face_bytes) in &loaded {
+                    let Some(face) = rustybuzz::Face::from_slice(face_bytes, 0) else {
+                        continue;
+                    };
+                    let g = crate::reshape::draws(&face, &said_line.5);
+                    let found = g.len() >= line.glyphs.len()
+                        && g.windows(line.glyphs.len()).any(|w| w == line.glyphs);
+                    let agree = if found {
+                        line.glyphs.len()
+                    } else {
+                        g.windows(line.glyphs.len().min(g.len().max(1)))
+                            .map(|w| {
+                                w.iter()
+                                    .zip(&line.glyphs)
+                                    .take_while(|(a, b)| a == b)
+                                    .count()
+                            })
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    if top_face.is_none_or(|(_, a, _)| agree > a) {
+                        top_face = Some((name, agree, found));
+                    }
+                }
+                let Some((face_name, agree, exact)) = top_face else { continue };
+
+                let indic = said_line.5.chars().any(|c| ('\u{0900}'..='\u{097F}').contains(&c));
+                if indic {
+                    indic_seen += 1;
+                    indic_prefix.push((agree, line.glyphs.len()));
+                    if shown < 4 && !exact && agree > 0 {
+                        shown += 1;
+                        println!("  page {n}: run of {} glyphs, {agree} accounted for \
+                            ({face_name})", line.glyphs.len());
+                        println!("     “{}”", said_line.5.chars().take(52).collect::<String>());
+                    }
+                } else {
+                    latin_seen += 1;
+                    if exact {
+                        latin_exact += 1;
+                    }
+                }
+            }
+        }
+
+        println!("\npairing: {paired} lines paired by geometry, {unpaired} with no \
+            line on their baseline");
+        println!("LATIN GROUND TRUTH: {latin_exact} of {latin_seen} paired Latin lines \
+            reproduce their glyphs EXACTLY");
+
+        let total: usize = indic_prefix.iter().map(|(a, _)| a).sum();
+        let glyphs: usize = indic_prefix.iter().map(|(_, l)| l).sum();
+        let full = indic_prefix.iter().filter(|(a, l)| a == l).count();
+        println!("DEVANAGARI: {indic_seen} runs, {full} found whole in the line's \
+            own text ({:.0}%), {total} of {glyphs} glyphs accounted for ({:.0}%)",
+            if indic_seen == 0 { 0.0 } else { full as f64 / indic_seen as f64 * 100.0 },
+            if glyphs == 0 { 0.0 } else { total as f64 / glyphs as f64 * 100.0 });
+    }
+
+    const GEETA_SMALL: &str =
+        r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+
+    /// ⚠️ CAN A WRONG CODEPOINT BE SOLVED RATHER THAN GUESSED?
+    ///
+    /// Measured: a Geeta line shapes glyph for glyph with the page until it
+    /// reaches a character the producer's `/ToUnicode` got wrong, where it
+    /// shapes `.notdef` and the page draws a real glyph. The question this
+    /// answers is whether that real glyph names its own text: whether a bounded
+    /// enumeration of Devanagari CLUSTERS, shaped through the resolved face,
+    /// contains exactly one sequence that draws it.
+    ///
+    /// ⚠️ BOUNDED, AND NOTHING LIKE THE BURMESE ENUMERATION. This is not the
+    /// language: it is consonant, consonant plus virama, virama plus consonant,
+    /// and consonant plus virama plus consonant, over the Devanagari block.
+    /// A few thousand candidates, built in milliseconds, against Burmese's
+    /// millions and eighteen seconds. Nothing here is believed without being
+    /// shaped again.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn whether_a_wrong_codepoint_can_be_looked_up_from_the_glyph_it_should_draw() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA_SMALL).exists()
+            || !std::path::Path::new(NIRMALA).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+
+        // The inverse: every glyph run a bounded set of clusters draws, and
+        // what drew it.
+        let mut inverse: BTreeMap<Vec<u16>, Vec<String>> = BTreeMap::new();
+        let mut built = 0usize;
+        for text in devanagari_clusters() {
+            built += 1;
+            let g = crate::reshape::draws(&face, &text);
+            if g.is_empty() || g.contains(&0) {
+                continue;
+            }
+            inverse.entry(g).or_default().push(text);
+        }
+        println!("{built} clusters shaped, {} distinct glyph runs", inverse.len());
+        let single: usize = inverse.keys().filter(|k| k.len() == 1).count();
+        println!("{single} of them draw as ONE glyph, which is what a wrong \
+            codepoint stands in for");
+        let ambiguous = inverse
+            .iter()
+            .filter(|(k, v)| k.len() == 1 && v.len() > 1)
+            .count();
+        println!("{ambiguous} of those one-glyph runs have more than one spelling");
+
+        // Now the document: every non-Devanagari, non-ASCII character in its
+        // text is a suspect, and the page says which glyph belongs there.
+        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+        println!("\n{} pages", pages.len());
+
+        let mut suspects: BTreeMap<char, usize> = BTreeMap::new();
+        let mut solved: BTreeMap<char, BTreeMap<String, usize>> = BTreeMap::new();
+        let mut lines_seen = 0usize;
+        let mut lines_clean = 0usize;
+
+        for (n, &page) in pages.iter().enumerate().take(4) {
+            let said = page_text(&bytes, n);
+            for s in &said {
+                for c in s.chars() {
+                    let devanagari = ('\u{0900}'..='\u{097F}').contains(&c);
+                    if !devanagari && !c.is_ascii() && !c.is_whitespace() {
+                        *suspects.entry(c).or_default() += 1;
+                    }
+                }
+            }
+
+            for line in lines_of(&doc, page) {
+                if line.glyphs.len() < 4 {
+                    continue;
+                }
+                lines_seen += 1;
+
+                // The text that best explains this line.
+                let Some(text) = said.iter().max_by_key(|s| {
+                    crate::reshape::draws(&face, s)
+                        .iter()
+                        .zip(&line.glyphs)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                }) else { continue };
+
+                let drawn = crate::reshape::draws(&face, text);
+                let agree = drawn
+                    .iter()
+                    .zip(&line.glyphs)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if agree == line.glyphs.len() && drawn.len() == line.glyphs.len() {
+                    lines_clean += 1;
+                    continue;
+                }
+                if agree == 0 {
+                    continue;
+                }
+
+                // At the divergence: the page draws one thing, the text draws
+                // `.notdef`. Ask the inverse what draws the page's glyph.
+                let Some(&wanted) = line.glyphs.get(agree) else { continue };
+                if drawn.get(agree) != Some(&0) {
+                    continue;
+                }
+                // Which character of the text produced that .notdef.
+                let Some(bad) = char_at_glyph(&face, text, agree) else { continue };
+                if let Some(spellings) = inverse.get(&vec![wanted]) {
+                    let entry = solved.entry(bad).or_default();
+                    for s in spellings {
+                        *entry.entry(s.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        println!("{lines_clean} of {lines_seen} lines already shape exactly");
+        println!("\nsuspect characters in the text:");
+        for (c, n) in &suspects {
+            println!("   U+{:04X} {c:?}  {n} times", *c as u32);
+        }
+
+        println!("\nwhat the page says each suspect should have been:");
+        for (bad, spellings) in &solved {
+            let mut best: Vec<(&String, &usize)> = spellings.iter().collect();
+            best.sort_by(|a, b| b.1.cmp(a.1));
+            let shown: Vec<String> = best
+                .iter()
+                .take(3)
+                .map(|(s, n)| format!("{s:?} x{n}"))
+                .collect();
+            println!("   U+{:04X} {bad:?} -> {}", *bad as u32, shown.join(", "));
+        }
+    }
+
+    /// Which character of `text` produced the glyph at `at`.
+    fn char_at_glyph(face: &rustybuzz::Face, text: &str, at: usize) -> Option<char> {
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        let shaped = rustybuzz::shape(face, &[], buffer);
+        let cluster = shaped.glyph_infos().get(at)?.cluster as usize;
+        text[cluster..].chars().next()
+    }
+
+    /// A bounded set of Devanagari clusters: the consonants, each with a
+    /// virama before and after, and each pair joined by one.
+    fn devanagari_clusters() -> Vec<String> {
+        const VIRAMA: char = '\u{094D}';
+        let consonants: Vec<char> = ('\u{0915}'..='\u{0939}')
+            .chain('\u{0958}'..='\u{095F}')
+            .collect();
+        let signs: Vec<char> = ('\u{093E}'..='\u{094C}').chain(['\u{0902}', '\u{0903}', '\u{0901}']).collect();
+
+        let mut out: Vec<String> = Vec::new();
+        for &c in &consonants {
+            out.push(c.to_string());
+            out.push(format!("{c}{VIRAMA}"));
+            out.push(format!("{VIRAMA}{c}"));
+            for &s in &signs {
+                out.push(format!("{c}{s}"));
+            }
+            for &d in &consonants {
+                out.push(format!("{c}{VIRAMA}{d}"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn how_much_of_a_devanagari_page_proves_from_its_own_text() {
+        // Every Devanagari face this machine carries. A page whose font names
+        // itself is matched by name; one that does not is matched by WHICH FACE
+        // PROVES IT, which is the only identification these files allow.
+        const CANDIDATES: [(&str, &str); 7] = [
+            ("Mangal", r"C:\Windows\Fonts\mangal.ttf"),
+            ("Mangal Bold", r"C:\Windows\Fonts\mangalb.ttf"),
+            ("Nirmala UI", r"C:\Windows\Fonts\NIRMALA.TTF"),
+            ("Nirmala UI Bold", r"C:\Windows\Fonts\NIRMALAB.TTF"),
+            ("Aparajita", r"C:\Windows\Fonts\APARAJ.TTF"),
+            ("Kokila", r"C:\Windows\Fonts\KOKILA.TTF"),
+            ("Utsaah", r"C:\Windows\Fonts\UTSAAH.TTF"),
+        ];
+        const PAGES: usize = 3;
+
+        let loaded: Vec<(&str, Vec<u8>)> = CANDIDATES
+            .iter()
+            .filter_map(|(name, path)| std::fs::read(path).ok().map(|b| (*name, b)))
+            .collect();
+        println!("{} candidate faces installed", loaded.len());
+
+        for file in HINDI {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            println!("\n================ {} ================",
+                file.rsplit('\\').next().unwrap());
+
+            let bytes = std::fs::read(file).unwrap();
+            let Ok(doc) = Document::load_mem(&bytes) else { continue };
+            let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+            for (n, &page) in pages.iter().take(PAGES).enumerate() {
+                // What the FILE says this page says, per text object.
+                let said = page_text(&bytes, n);
+                let said: Vec<&String> = said.iter().filter(|s| !s.trim().is_empty()).collect();
+
+                let lines = lines_of(&doc, page);
+                if lines.is_empty() || said.is_empty() {
+                    println!("\n-- page {n}: {} lines, {} text objects, nothing to compare",
+                        lines.len(), said.len());
+                    continue;
+                }
+
+                // Group the page's lines by the font resource that drew them.
+                let mut by_resource: BTreeMap<Vec<u8>, Vec<&Line>> = BTreeMap::new();
+                for line in &lines {
+                    by_resource.entry(line.resource.clone()).or_default().push(line);
+                }
+                let named = fonts_named(&doc, page);
+
+                println!("\n-- page {n}: {} lines, {} text objects",
+                    lines.len(), said.len());
+
+                for (resource, mine) in &by_resource {
+                    // Only the runs long enough to mean something.
+                    let worth: Vec<&&Line> = mine.iter().filter(|l| l.glyphs.len() >= 3).collect();
+                    if worth.is_empty() {
+                        continue;
+                    }
+                    let name = named
+                        .get(resource)
+                        .cloned()
+                        .unwrap_or_else(|| "(unnamed)".into());
+
+                    // Try every face, and let the winner identify the font.
+                    let mut best: Option<(&str, usize, usize)> = None;
+                    for (face_name, face_bytes) in &loaded {
+                        let Some(face) = rustybuzz::Face::from_slice(face_bytes, 0) else {
+                            continue;
+                        };
+                        let shaped: Vec<Vec<u16>> = said
+                            .iter()
+                            .map(|s| crate::reshape::draws(&face, s))
+                            .collect();
+
+                        let mut proven = 0usize;
+                        let mut close = 0usize;
+                        for line in &worth {
+                            if shaped.iter().any(|g| *g == line.glyphs) {
+                                proven += 1;
+                                continue;
+                            }
+                            // How far the best candidate string agrees before
+                            // it diverges: the difference between "wrong face"
+                            // and "right face, damaged text".
+                            let agree = shaped
+                                .iter()
+                                .map(|g| {
+                                    g.iter()
+                                        .zip(&line.glyphs)
+                                        .take_while(|(a, b)| a == b)
+                                        .count()
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            if agree * 2 >= line.glyphs.len() {
+                                close += 1;
+                            }
+                        }
+                        if best.is_none_or(|(_, p, c)| (proven, close) > (p, c)) {
+                            best = Some((face_name, proven, close));
+                        }
+                    }
+
+                    let Some((face_name, proven, close)) = best else { continue };
+                    println!("   {:<20} {:>3} lines: {proven} proven, {close} half-agreeing \
+                        (best face: {face_name})",
+                        name, worth.len());
+
+                    // ⚠️ AND WHAT A FAILURE LOOKS LIKE, on the winning face.
+                    if proven < worth.len() {
+                        let Some((_, face_bytes)) =
+                            loaded.iter().find(|(nm, _)| nm == &face_name) else { continue };
+                        let Some(face) = rustybuzz::Face::from_slice(face_bytes, 0) else {
+                            continue;
+                        };
+                        for line in worth.iter().take(2) {
+                            if said.iter().any(|s| crate::reshape::draws(&face, s) == line.glyphs) {
+                                continue;
+                            }
+                            let best_s = said.iter().max_by_key(|s| {
+                                crate::reshape::draws(&face, s)
+                                    .iter()
+                                    .zip(&line.glyphs)
+                                    .take_while(|(a, b)| a == b)
+                                    .count()
+                            });
+                            if let Some(s) = best_s {
+                                let g = crate::reshape::draws(&face, s);
+                                let agree = g
+                                    .iter()
+                                    .zip(&line.glyphs)
+                                    .take_while(|(a, b)| a == b)
+                                    .count();
+                                println!("      line of {} glyphs, closest text agrees for {agree}",
+                                    line.glyphs.len());
+                                println!("         “{}”", s.chars().take(44).collect::<String>());
+                                println!("         page draws {:?}",
+                                    &line.glyphs[..line.glyphs.len().min(10)]);
+                                println!("         text shapes {:?}",
+                                    &g[..g.len().min(10)]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// What PDFium reads off one page of a document held in memory.
+    fn page_text(bytes: &[u8], page_index: usize) -> Vec<String> {
+        let handle = crate::open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        if handle == 0 {
+            return Vec::new();
+        }
+        let out = crate::tests::texts_of_page(handle, page_index as i32);
+        crate::close_document(handle);
+        out
+    }
+
+    /// Nirmala UI, which is what these books are set in, by whichever name the
+    /// page gives. Local to this measurement on purpose: putting it in
+    /// `installed` would make every Hindi page look worth RECOVERING, and
+    /// recovery means enumerating Burmese.
+    fn devanagari_file(base_font: &str) -> Option<&'static str> {
+        let name = base_font.to_lowercase();
+        let bold = name.contains("bold");
+        if name.contains("nirmala") {
+            return Some(if bold {
+                r"C:\Windows\Fonts\NIRMALAB.TTF"
+            } else {
+                r"C:\Windows\Fonts\NIRMALA.TTF"
+            });
+        }
+        if name.contains("mangal") {
+            return Some(r"C:\Windows\Fonts\mangal.ttf");
+        }
+        None
+    }
+
+    /// The font program each of a page's resources embeds, by resource name.
+    fn embedded_programs(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let Some(fonts) = doc
+            .get_dictionary(page)
+            .ok()
+            .and_then(|p| p.get(b"Resources").ok().and_then(|o| dictionary(doc, o)))
+            .and_then(|r| r.get(b"Font").ok().and_then(|o| dictionary(doc, o)))
+        else {
+            return out;
+        };
+        for (name, obj) in fonts.iter() {
+            let Some(font) = dictionary(doc, obj) else { continue };
+            let holder = match font.get(b"DescendantFonts").ok() {
+                Some(o) => {
+                    let arr = match o {
+                        Object::Array(a) => a.clone(),
+                        Object::Reference(id) => match doc.get_object(*id).ok()
+                            .and_then(|o| o.as_array().ok()) {
+                            Some(a) => a.clone(),
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
+                    match arr.first().and_then(|f| dictionary(doc, f)) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                }
+                None => font.clone(),
+            };
+            let Some(d) = holder.get(b"FontDescriptor").ok().and_then(|o| dictionary(doc, o))
+            else { continue };
+            let Some(id) = [&b"FontFile2"[..], b"FontFile3", b"FontFile"]
+                .iter()
+                .find_map(|k| d.get(k).ok().and_then(|v| v.as_reference().ok()))
+            else { continue };
+            let Some(bytes) = doc
+                .get_object(id)
+                .ok()
+                .and_then(|o| o.as_stream().ok())
+                .and_then(|s| s.decompressed_content().ok())
+            else { continue };
+            if rustybuzz::Face::from_slice(&bytes, 0).is_some() {
+                out.insert(name.to_vec(), bytes);
+            }
+        }
+        out
+    }
+
+    /// Every font resource of a page, by the best name available for it: the
+    /// program's own, falling back to the BaseFont.
+    fn fonts_named(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, String> {
+        let mut out = BTreeMap::new();
+        let Some(fonts) = doc
+            .get_dictionary(page)
+            .ok()
+            .and_then(|p| p.get(b"Resources").ok().and_then(|o| dictionary(doc, o)))
+            .and_then(|r| r.get(b"Font").ok().and_then(|o| dictionary(doc, o)))
+        else {
+            return out;
+        };
+        for (name, obj) in fonts.iter() {
+            let Some(font) = dictionary(doc, obj) else { continue };
+            let best = program_family(doc, &font).or_else(|| {
+                font.get(b"BaseFont")
+                    .ok()
+                    .and_then(|o| o.as_name().ok())
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+            });
+            if let Some(best) = best {
+                out.insert(name.to_vec(), best);
+            }
+        }
+        out
+    }
+
     #[test]
     #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
     fn how_wide_a_producers_gaps_are_against_a_real_space() {
