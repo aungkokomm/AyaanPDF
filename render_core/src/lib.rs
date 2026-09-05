@@ -9698,6 +9698,16 @@ fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
     out.extend_from_slice(&0u32.to_le_bytes()); // count, backfilled below
     let mut count: u32 = 0;
 
+    // ⚠️ THE PAGE'S TEXT LAYER, LOADED ONCE. `PdfPageTextObject::text()` calls
+    // FPDFText_LoadPage every time it is asked, so reading one object's text is
+    // really reading the whole page's, and doing it per object is quadratic. On
+    // a page carrying 1,693 text objects that was 8.99 SECONDS, and it happened
+    // while the document was being opened, which is where the report of a
+    // six-page file taking fifteen seconds came from.
+    //
+    // `for_object` asks the SAME question of an already-loaded layer.
+    let text_page = page.text().ok();
+
     let objects = page.objects();
     for index in 0..objects.len() {
         if count >= MAX_TEXT_OBJECTS {
@@ -9727,7 +9737,8 @@ fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
             continue;
         }
 
-        let text = t.text();
+        let Some(text_page) = text_page.as_ref() else { break };
+        let text = text_page.for_object(t);
         if text.trim().is_empty() {
             continue;
         }
@@ -9766,6 +9777,8 @@ fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
 
     out[0..4].copy_from_slice(&count.to_le_bytes());
 
+    // The loaded text layer borrows the page, so it goes first.
+    drop(text_page);
     drop(page);
     drop(doc_guard);
     drop(doc);
@@ -16829,6 +16842,42 @@ mod tests {
         assert!(lock(&core().sources).contains_key(&handle));
         close_document(handle);
         assert!(!lock(&core().sources).contains_key(&handle));
+    }
+
+    /// ⚠️ READING ONE OBJECT'S TEXT MUST NOT READ THE WHOLE PAGE'S.
+    /// `PdfPageTextObject::text()` calls FPDFText_LoadPage every time it is
+    /// asked, so calling it per object is quadratic in the objects on the page.
+    /// Measured on a real page carrying 1,693 of them: 8.99 SECONDS, paid while
+    /// the document was opening, which is where "a six-page file takes fifteen
+    /// seconds to open" came from. Loading the layer once: 88 ms.
+    ///
+    /// This fixture is one text object per glyph, which is what real producers
+    /// emit, so it is the shape that goes quadratic. Its 472 objects were
+    /// measured at 500 ms the old way and 8.5 ms this way, so the limit below
+    /// sits between them with room on both sides rather than near either.
+    #[test]
+    fn a_pages_text_objects_are_read_without_reloading_the_text_layer() {
+        let handle = open_fixture_named("tests/fixtures/sample_per_glyph.pdf");
+
+        let clock = std::time::Instant::now();
+        let buffer = get_page_text_objects(handle, 0);
+        let took = clock.elapsed();
+
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM);
+        let mut bytes = vec![0u8; buffer.len];
+        unsafe { std::ptr::copy_nonoverlapping(buffer.data, bytes.as_mut_ptr(), buffer.len) };
+        free_byte_buffer(buffer);
+        let count = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+
+        println!("   {count} text objects in {took:?}");
+        assert!(count > 100, "only {count} objects, too few for this to prove anything");
+        assert!(
+            took < std::time::Duration::from_millis(150),
+            "reading {count} text objects took {took:?}, which is the text layer \
+             being loaded once per object again"
+        );
+
+        close_document(handle);
     }
 
     fn open_fixture() -> u64 {
@@ -26806,6 +26855,11 @@ p={spread_px:.4},c={rgba:08X})"
             free_byte_buffer(buffer);
             println!("   get_page_text_runs(0) {:?}", clock.elapsed());
 
+            let clock = std::time::Instant::now();
+            let buffer = get_page_text_objects(handle, 0);
+            free_byte_buffer(buffer);
+            println!("   get_page_text_objects(0) {:?}", clock.elapsed());
+
             // The rest of what the app asks for before it can show anything.
             let clock = std::time::Instant::now();
             let sizes = get_page_sizes(handle);
@@ -26870,6 +26924,50 @@ p={spread_px:.4},c={rgba:08X})"
                 Err(e) => println!("   lopdf would not load it: {e} ({:?})", clock.elapsed()),
             }
         }
+    }
+
+    /// ⚠️ WHAT LOADING A PAGE'S ANNOTATIONS COSTS. Reported as a 6-page file
+    /// taking about 15 seconds to open; the app's own log puts 8.9 of those
+    /// seconds inside the annotation load, which is nine FFI calls for three
+    /// annotations. This is that sequence with no UI in the way.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_loading_a_pages_annotations_costs() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+
+        let clock = std::time::Instant::now();
+        let array = get_annotations(handle, 0);
+        let count = array.len;
+        free_annotation_array(array);
+        println!("   get_annotations(0) {:?} -> {count} annotations", clock.elapsed());
+
+        for i in 0..count as i32 {
+            let clock = std::time::Instant::now();
+            let buffer = get_annotation_id(handle, 0, i);
+            free_byte_buffer(buffer);
+            let read = clock.elapsed();
+
+            let id = "0123456789abcdef0123456789abcdef";
+            let c_id = std::ffi::CString::new(id).unwrap();
+            let clock = std::time::Instant::now();
+            unsafe { set_annotation_id(handle, 0, i, c_id.as_ptr() as *const u8, id.len()) };
+            let wrote = clock.elapsed();
+
+            let clock = std::time::Instant::now();
+            let buffer = get_annotation_group_id(handle, 0, i);
+            free_byte_buffer(buffer);
+            let group = clock.elapsed();
+
+            println!("   #{i}: read id {read:?}, write id {wrote:?}, read group {group:?}");
+        }
+
+        close_document(handle);
     }
 
     /// call reproduced with nothing else in the way.
