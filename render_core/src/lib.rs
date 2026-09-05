@@ -430,6 +430,12 @@ struct Core {
     /// `delete_page`, the one operation that mutates the document itself
     /// rather than just an owned `PdfPage` handle obtained from it.
     documents: Mutex<HashMap<u64, Arc<Mutex<PdfDocument<'static>>>>>,
+    /// The file each open document is STILL the contents of, for the
+    /// questions PDFium has no API for and lopdf has to be asked instead.
+    ///
+    /// Dropped the moment the document under a handle is replaced, so an
+    /// answer read out of a file is never given about different contents.
+    sources: Mutex<HashMap<u64, String>>,
     next_doc_id: AtomicU64,
     cache: Mutex<LruCache<TileKey, CachedTile>>,
     /// Current generation per (doc, page); a fresh `request_high_res` call
@@ -462,6 +468,7 @@ static CORE: OnceLock<Core> = OnceLock::new();
 fn core() -> &'static Core {
     CORE.get_or_init(|| Core {
         documents: Mutex::new(HashMap::new()),
+        sources: Mutex::new(HashMap::new()),
         next_doc_id: AtomicU64::new(1),
         // Deliberately generous: eviction is driven by CACHE_BUDGET_BYTES in
         // cache_put, so this count only exists as a backstop against tiny
@@ -565,6 +572,7 @@ fn open_protected_inner(path: *const c_char, password: *const c_char) -> OpenRes
     let core = core();
     let id = core.next_doc_id.fetch_add(1, Ordering::Relaxed);
     lock(&core.documents).insert(id, Arc::new(Mutex::new(document)));
+    lock(&core.sources).insert(id, path_str.to_string());
 
     OpenResult { handle: id, status: STATUS_OK_PDFIUM }
 }
@@ -586,6 +594,8 @@ pub extern "C" fn close_document(doc_handle: u64) {
         let removed = lock(&core.documents).remove(&doc_handle);
         drop(removed);
     }
+
+    lock(&core.sources).remove(&doc_handle);
 
     {
         let mut cache = lock(&core.cache);
@@ -766,6 +776,9 @@ fn rebuild_page_order_inner(doc_handle: u64, indices: *const i32, count: usize) 
     // Swap the rebuilt document in behind the same handle. Done under CALL_LOCK,
     // so no render or edit can be holding the old one across this.
     lock(&core().documents).insert(doc_handle, Arc::new(Mutex::new(new_doc)));
+    // The document under this handle is no longer the file it was opened
+    // from, so nothing may be answered out of that file's catalog again.
+    lock(&core().sources).remove(&doc_handle);
 
     evict_all_cache_for_doc(doc_handle);
     lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
@@ -2618,6 +2631,9 @@ fn replace_document_contents_inner(doc_handle: u64, data: *const u8, len: usize)
     // `existing` is the only one left; it goes out of scope below, and the
     // document owns the bytes it was loaded from, so they are freed with it.
     lock(&core.documents).insert(doc_handle, Arc::new(Mutex::new(replacement)));
+    // The document under this handle is no longer the file it was opened
+    // from, so nothing may be answered out of that file's catalog again.
+    lock(&core.sources).remove(&doc_handle);
     drop(existing);
 
     // ⚠️ BOTH, NOT JUST THE TILES. A render already in flight when the swap
@@ -8491,6 +8507,40 @@ fn choice_options(
         .collect()
 }
 
+/// The answer for a document with no fillable fields: a count of zero.
+fn no_form_fields() -> ByteBuffer {
+    let mut boxed = 0u32.to_le_bytes().to_vec().into_boxed_slice();
+    let buffer = ByteBuffer {
+        data: boxed.as_mut_ptr(),
+        len: boxed.len(),
+        status: STATUS_OK_PDFIUM,
+    };
+    std::mem::forget(boxed);
+    buffer
+}
+
+/// Whether the file's own catalog says its /AcroForm holds an empty /Fields
+/// array, which is the one case where the pages need not be walked at all.
+///
+/// Only ever true when the answer is certain. A file that will not parse, a
+/// missing /Fields, or a single field anywhere all answer false, because the
+/// cost of being wrong here is a form the reader cannot fill in.
+fn declares_no_form_fields(path: &str) -> bool {
+    let Ok(doc) = lopdf::Document::load(path) else {
+        return false;
+    };
+    let fields = doc
+        .catalog()
+        .ok()
+        .and_then(|c| c.get(b"AcroForm").ok().cloned())
+        .and_then(|a| doc.dereference(&a).ok().map(|(_, o)| o.clone()))
+        .and_then(|a| a.as_dict().ok().cloned())
+        .and_then(|d| d.get(b"Fields").ok().cloned())
+        .and_then(|f| doc.dereference(&f).ok().map(|(_, o)| o.clone()))
+        .and_then(|f| f.as_array().ok().map(|a| a.len()));
+    fields == Some(0)
+}
+
 fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
@@ -8512,14 +8562,22 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     // FPDF_GetFormType reads the catalog and answers in constant time. Almost
     // every PDF that is not a form answers NONE here and never touches a page.
     if doc_guard.form().is_none() {
-        let mut boxed = 0u32.to_le_bytes().to_vec().into_boxed_slice();
-        let buffer = ByteBuffer {
-            data: boxed.as_mut_ptr(),
-            len: boxed.len(),
-            status: STATUS_OK_PDFIUM,
-        };
-        std::mem::forget(boxed);
-        return buffer;
+        return no_form_fields();
+    }
+
+    // FPDF_GetFormType only says the /AcroForm dictionary EXISTS. A book can
+    // carry one whose /Fields array is EMPTY, and then the walk below spends
+    // all its time proving there is nothing to find: measured at 62.6 SECONDS
+    // on a 39,881-page book whose catalog answers the same question in 473ms.
+    // That was most of the two minutes the app took to open it.
+    //
+    // So ask the catalog, and believe it only when it is certain there are no
+    // fields. Anything else -- fields present, no /Fields at all, a file lopdf
+    // will not parse, contents that are no longer the file's -- falls through
+    // to the walk, which is the answer we had before.
+    let source = lock(&core().sources).get(&doc_handle).cloned();
+    if source.is_some_and(|path| declares_no_form_fields(&path)) {
+        return no_form_fields();
     }
 
     let mut out: Vec<u8> = Vec::new();
@@ -8861,6 +8919,9 @@ fn set_form_field_state_inner(
     // every caller responsible for swapping it, which is how a stale handle gets
     // used once and crashes.
     let previous = lock(&core().documents).insert(doc_handle, Arc::new(Mutex::new(document)));
+    // The document under this handle is no longer the file it was opened
+    // from, so nothing may be answered out of that file's catalog again.
+    lock(&core().sources).remove(&doc_handle);
     drop(previous);
 
     drop(_guard);
@@ -16630,6 +16691,144 @@ mod tests {
                 "the next word did not move: {:.4} then {:.4}", bravo.left, moved.left);
 
         close_document(handle);
+    }
+
+    /// A document given the empty /AcroForm a big book turned out to carry.
+    ///
+    /// `source` decides how much of a form is left: sample.pdf has no widgets
+    /// at all, while sample_form.pdf keeps every widget on its pages and loses
+    /// only the catalog's list of them, which is the disagreement the gate has
+    /// to resolve.
+    fn fixture_with_an_empty_acroform(source: &str, name: &str) -> std::path::PathBuf {
+        let mut doc = lopdf::Document::load(source).unwrap();
+        let form = doc.add_object(lopdf::dictionary! { "Fields" => Vec::<lopdf::Object>::new() });
+        let catalog_id = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        doc.get_object_mut(catalog_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("AcroForm", form);
+        let mut path = std::env::temp_dir();
+        path.push(format!("ayaan-{name}-{}.pdf", std::process::id()));
+        doc.save(&path).unwrap();
+        path
+    }
+
+    /// ⚠️ WHAT THE GATE IS WORTH. Both routes give the SAME answer -- PDFium
+    /// reports no fields for a widget the catalog does not list either -- so
+    /// the only thing observable from outside is the time, and the time is the
+    /// entire point: 62.6 SECONDS on a 39,881-page book, which was most of the
+    /// two minutes it took to open.
+    ///
+    /// Forgetting where the document came from is what the replace and close
+    /// paths do, and it is also the only way to make this same call take the
+    /// walk again. So the walk is the test's own control, and there is no
+    /// absolute millisecond limit here to go stale on a faster machine.
+    #[test]
+    fn a_declared_but_empty_form_does_not_cost_a_walk_through_every_page() {
+        let path = fixture_with_an_empty_acroform(
+            "tests/fixtures/sample_300pages.pdf", "empty-acroform-300");
+        let handle = open_fixture_named(path.to_str().unwrap());
+        assert_eq!(get_page_count(handle), 300);
+
+        let clock = std::time::Instant::now();
+        let asked = read_form_field_count(handle);
+        let asking = clock.elapsed();
+
+        // Two, not some larger factor: with the gate gone both calls take
+        // the SAME walk, so anything above one separates them, and the real
+        // book's margin is 132x rather than this fixture's four.
+        // The control: the same call on the same document, with no file to
+        // ask, which is exactly the code that ran before this gate existed.
+        lock(&core().sources).remove(&handle);
+        let clock = std::time::Instant::now();
+        let walked = read_form_field_count(handle);
+        let walking = clock.elapsed();
+
+        println!("   300 pages: asked {asking:?}, walked {walking:?}");
+        assert_eq!(asked, 0);
+        assert_eq!(walked, asked, "the two routes disagree about the fields");
+        assert!(
+            asking * 2 < walking,
+            "asking the catalog took {asking:?} against a {walking:?} walk, so \
+             the pages are still being walked"
+        );
+
+        close_document(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// How many fields `get_form_fields` reports.
+    fn read_form_field_count(handle: u64) -> u32 {
+        let buffer = get_form_fields(handle);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM);
+        assert!(buffer.len >= 4);
+        let mut bytes = vec![0u8; buffer.len];
+        unsafe { std::ptr::copy_nonoverlapping(buffer.data, bytes.as_mut_ptr(), buffer.len) };
+        free_byte_buffer(buffer);
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    /// ⚠️ A DOCUMENT CAN DECLARE A FORM AND HAVE NO FIELDS. FPDF_GetFormType
+    /// says only that the /AcroForm dictionary is there, so the old code went
+    /// looking through every page for fields that were never in the file. On a
+    /// 39,881-page book that was 62.6 seconds of the open.
+    ///
+    /// The first assertion is the one that matters: it proves the cheap gate
+    /// above this one does NOT catch this document, so the answer really is
+    /// coming from the catalog.
+    #[test]
+    fn a_declared_but_empty_form_is_answered_without_walking_the_pages() {
+        let path = fixture_with_an_empty_acroform("tests/fixtures/sample.pdf", "empty-acroform");
+        let handle = open_fixture_named(path.to_str().unwrap());
+
+        {
+            let doc = lock(&core().documents).get(&handle).cloned().unwrap();
+            assert!(
+                lock(&doc).form().is_some(),
+                "the fixture no longer declares a form, so this test proves nothing"
+            );
+        }
+        assert!(
+            declares_no_form_fields(path.to_str().unwrap()),
+            "the catalog should say the /Fields array is empty"
+        );
+
+        assert_eq!(read_form_field_count(handle), 0);
+
+        close_document(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The gate must never answer for a document whose contents are no longer
+    /// the file's, or a filled-in form would come back empty.
+    #[test]
+    fn replacing_a_document_forgets_where_it_came_from() {
+        let path = fixture_with_an_empty_acroform("tests/fixtures/sample.pdf", "forget-source");
+        let handle = open_fixture_named(path.to_str().unwrap());
+        assert!(lock(&core().sources).contains_key(&handle));
+
+        let bytes = std::fs::read("tests/fixtures/sample.pdf").unwrap();
+        let buffer = replace_document_contents(handle, bytes.as_ptr(), bytes.len());
+        free_byte_buffer(buffer);
+
+        assert!(
+            !lock(&core().sources).contains_key(&handle),
+            "the handle still claims to be the file it was opened from"
+        );
+
+        close_document(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Closing must not leave the path behind: handles are handed out in
+    /// sequence, so a stale entry would eventually answer for another file.
+    #[test]
+    fn closing_a_document_forgets_where_it_came_from() {
+        let handle = open_fixture();
+        assert!(lock(&core().sources).contains_key(&handle));
+        close_document(handle);
+        assert!(!lock(&core().sources).contains_key(&handle));
     }
 
     fn open_fixture() -> u64 {
@@ -26607,9 +26806,72 @@ p={spread_px:.4},c={rgba:08X})"
             free_byte_buffer(buffer);
             println!("   get_page_text_runs(0) {:?}", clock.elapsed());
 
+            // The rest of what the app asks for before it can show anything.
+            let clock = std::time::Instant::now();
+            let sizes = get_page_sizes(handle);
+            let sized = sizes.len;
+            free_page_size_array(sizes);
+            println!("   get_page_sizes {:?} -> {sized} sizes", clock.elapsed());
+
+            let clock = std::time::Instant::now();
+            let buffer = get_bookmarks(handle);
+            free_byte_buffer(buffer);
+            println!("   get_bookmarks {:?}", clock.elapsed());
+
+            let clock = std::time::Instant::now();
+            let buffer = get_form_fields(handle);
+            free_byte_buffer(buffer);
+            println!("   get_form_fields {:?}", clock.elapsed());
+
+            let clock = std::time::Instant::now();
+            for p in 0..25.min(pages) {
+                let array = get_annotations(handle, p);
+                free_annotation_array(array);
+            }
+            println!("   get_annotations x25 {:?}", clock.elapsed());
+
             close_document(handle);
         }
     }
+    /// What it costs to ask the CATALOG whether the form has any fields,
+    /// versus the 62 seconds spent discovering the answer by loading 39,881
+    /// pages. `FPDF_GetFormType` only says the /AcroForm dictionary EXISTS.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_asking_the_catalog_about_the_form_costs() {
+        const FILES: [&str; 3] = [
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf",
+            r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf",
+            r"D:\Ayaan PDF Test file\All Osho Books.pdf",
+        ];
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            println!("\n== {} ==", file.rsplit('\\').next().unwrap());
+            let clock = std::time::Instant::now();
+            match lopdf::Document::load(file) {
+                Ok(doc) => {
+                    let loaded = clock.elapsed();
+                    let fields = doc
+                        .catalog()
+                        .ok()
+                        .and_then(|c| c.get(b"AcroForm").ok().cloned())
+                        .and_then(|a| doc.dereference(&a).ok().map(|(_, o)| o.clone()))
+                        .and_then(|a| a.as_dict().ok().cloned())
+                        .and_then(|d| d.get(b"Fields").ok().cloned())
+                        .and_then(|f| doc.dereference(&f).ok().map(|(_, o)| o.clone()))
+                        .and_then(|f| f.as_array().ok().map(|a| a.len()));
+                    println!(
+                        "   lopdf load {loaded:?}, /AcroForm /Fields = {fields:?}, total {:?}",
+                        clock.elapsed()
+                    );
+                }
+                Err(e) => println!("   lopdf would not load it: {e} ({:?})", clock.elapsed()),
+            }
+        }
+    }
+
     /// call reproduced with nothing else in the way.
     #[test]
     #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
