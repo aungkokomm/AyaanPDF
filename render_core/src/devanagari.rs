@@ -586,6 +586,37 @@ mod tests {
         assert_eq!(u32::from('\u{016E}'), 366);
     }
 
+    /// ⚠️ WHAT EVERY CANDIDATE FACE COSTS, because the page that needs naming
+    /// is scored against all of them and a face is only skipped once one has
+    /// clearly won. Reported as a fifteen-second wait to open a six-page file.
+    #[test]
+    #[ignore = "diagnostic, and needs the Devanagari faces installed"]
+    fn what_each_candidate_face_costs_to_build() {
+        let mut total = std::time::Duration::ZERO;
+        for path in CANDIDATES {
+            if !std::path::Path::new(path).exists() {
+                println!("   {:<28} not installed", path.rsplit('\\').next().unwrap());
+                continue;
+            }
+            let bytes = std::fs::read(path).unwrap();
+            let Some(face) = rustybuzz::Face::from_slice(&bytes, 0) else {
+                continue;
+            };
+            let clock = std::time::Instant::now();
+            let spells = spellings(&face);
+            let spelt = clock.elapsed();
+            let forms = dependent_forms(&face);
+            let took = clock.elapsed();
+            total += took;
+            println!("   {:<16} {:>8.2?} total ({:>8.2?} spelling, {:>8.2?} forms) \
+                {} spellings, {} forms",
+                path.rsplit('\\').next().unwrap(), took, spelt, took - spelt,
+                spells.len(), forms.len());
+        }
+        println!("\n   {total:.2?} to build them all, which is what a page pays \
+            when no face clearly wins");
+    }
+
     #[test]
     fn plain_text_is_never_suspect() {
         for c in "Hello, world! 123 — “quoted” … ।॥".chars() {

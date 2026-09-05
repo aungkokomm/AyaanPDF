@@ -1074,9 +1074,24 @@ pub(crate) fn tests_only_blank_page() -> Document {
 /// than starting its own.
 pub(crate) mod progress {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     pub(crate) static DONE: AtomicUsize = AtomicUsize::new(0);
     pub(crate) static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+    /// ⚠️ THE INVARIANT THE GLOBAL RESTS ON, ENFORCED RATHER THAN ASSUMED.
+    ///
+    /// One set of counters can only describe one preparation, and the comment
+    /// above says exactly one runs at a time "by construction". That is true of
+    /// the app, which has one document open, and false of anything that
+    /// prepares two at once: the second `began` resets the first's total and
+    /// the first bar jumps backwards or never arrives.
+    ///
+    /// The test suite is the thing that prepares several at once, and it caught
+    /// this by failing: a bar driven to 100 was read back at 79 because another
+    /// build had restarted the counters underneath it. Holding this for the
+    /// length of a build makes the sentence above true instead of hopeful.
+    pub(crate) static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     /// How far along, 0 to 100, or None when nothing is being prepared.
     pub(crate) fn percent() -> Option<i32> {
@@ -1124,6 +1139,15 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
     }
 
     let mut built: BTreeMap<&'static str, Arc<(Vec<u8>, crate::reshape::Index)>> = BTreeMap::new();
+
+    // ⚠️ ONE PREPARATION AT A TIME, which the progress counters have always
+    // assumed and nothing has ever enforced. See `progress::ONE_AT_A_TIME`.
+    // Poisoning is not a reason to refuse to read a document: the counters are
+    // two integers and a panicking build leaves them stale at worst.
+    let _only_one = progress::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+
     for (path, glyphs) in &per_face {
         let Ok(bytes) = std::fs::read(path) else { continue };
 
@@ -5745,6 +5769,14 @@ mod tests {
         if !std::path::Path::new(MYANMAR_TEXT).exists() {
             return;
         }
+
+        // ⚠️ THIS TEST DRIVES THE COUNTERS BY HAND, so it has to hold what a
+        // real preparation holds. Without it another test's build reset the
+        // total underneath this one and a bar driven to 100 read back as 79.
+        let _only_one = progress::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+
         assert_eq!(progress::percent(), None, "something was already preparing");
 
         let bytes = std::fs::read(MYANMAR_TEXT).unwrap();

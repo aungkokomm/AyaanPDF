@@ -308,12 +308,20 @@ struct CachedModel {
 /// editing one line asks for it TWICE: once to find the line, once to write it.
 static MODEL_CACHE: Mutex<Option<((u64, i32), CachedModel)>> = Mutex::new(None);
 
-/// How many times the memo has answered instead of the page.
+/// How many times the memo has answered instead of the page, PER DOCUMENT.
 ///
 /// ⚠️ SO THE TESTS CAN ASSERT ON BEHAVIOUR RATHER THAN ON A CLOCK. "The
 /// second call was faster" passes on an idle machine and fails under load, and
 /// says nothing about whether the answer came from the right place.
-static MODEL_HITS: AtomicU64 = AtomicU64::new(0);
+///
+/// ⚠️ AND PER DOCUMENT BECAUSE ONE COUNTER CANNOT ANSWER FOR TWO. As a single
+/// number it was every document's hits added together, so a test asking "did
+/// MY second call use the memo" was really asking "did anything, anywhere, use
+/// it exactly once meanwhile". Under a parallel suite that is a coin toss, and
+/// it came up 17 where 1 was expected. The handle makes the question the one
+/// the caller meant.
+static MODEL_HITS: Mutex<std::collections::BTreeMap<u64, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 
 /// Binds PDFium once (relative to the host executable's directory — see
@@ -12702,7 +12710,7 @@ fn page_blocks(doc_handle: u64, page_index: i32)
             && held.epoch == epoch
             && held.objects == objects
         {
-            MODEL_HITS.fetch_add(1, Ordering::SeqCst);
+            *lock(&MODEL_HITS).entry(doc_handle).or_default() += 1;
             return Ok(held.model.clone());
         }
     }
@@ -30201,19 +30209,21 @@ p={spread_px:.4},c={rgba:08X})"
     // second. What these tests are really about is the first: that it can
     // never answer for a page that has since changed.
 
-    fn hits() -> u64 { MODEL_HITS.load(Ordering::SeqCst) }
+    fn hits_for(handle: u64) -> u64 {
+        lock(&MODEL_HITS).get(&handle).copied().unwrap_or(0)
+    }
 
     /// The same page, asked for twice with nothing in between.
     #[test]
     fn the_model_is_remembered_between_two_asks() {
         let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
 
-        let before = hits();
+        let before = hits_for(handle);
         let (first, _) = page_blocks(handle, 0).expect("blocks");
-        assert_eq!(hits(), before, "the first ask should have built the model");
+        assert_eq!(hits_for(handle), before, "the first ask should have built the model");
 
         let (again, _) = page_blocks(handle, 0).expect("blocks");
-        assert_eq!(hits(), before + 1, "the second ask should have used the memo");
+        assert_eq!(hits_for(handle), before + 1, "the second ask should have used the memo");
 
         // And the memo answers the same thing the page would have.
         assert_eq!(first.len(), again.len());
@@ -30279,14 +30289,14 @@ p={spread_px:.4},c={rgba:08X})"
         let handle = open_fixture_named("tests/fixtures/sample_20pages.pdf");
 
         let _ = page_blocks(handle, 0);
-        let before = hits();
+        let before = hits_for(handle);
         let _ = page_blocks(handle, 0);
-        assert_eq!(hits(), before + 1, "page 0 should have been remembered");
+        assert_eq!(hits_for(handle), before + 1, "page 0 should have been remembered");
 
         let _ = page_blocks(handle, 1);
-        let between = hits();
+        let between = hits_for(handle);
         let _ = page_blocks(handle, 0);
-        assert_eq!(hits(), between, "page 0 should have been displaced by page 1");
+        assert_eq!(hits_for(handle), between, "page 0 should have been displaced by page 1");
         close_document(handle);
     }
 
@@ -30297,12 +30307,12 @@ p={spread_px:.4},c={rgba:08X})"
         let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
         let _ = page_blocks(handle, 0);
         let _ = page_blocks(handle, 0);
-        let before = hits();
+        let before = hits_for(handle);
         close_document(handle);
 
         let again = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
         let _ = page_blocks(again, 0);
-        assert_eq!(hits(), before,
+        assert_eq!(hits_for(handle), before,
             "a reopened document was answered from the closed one's model");
         close_document(again);
     }
