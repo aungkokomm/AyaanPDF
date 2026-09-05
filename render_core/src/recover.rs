@@ -2734,25 +2734,50 @@ mod tests {
     /// each sign on each base and seeing what one glyph the face adds.
     fn dependent_forms(face: &rustybuzz::Face) -> BTreeMap<u16, Form> {
         const VIRAMA: char = '\u{094D}';
-        let consonants: Vec<char> = ('\u{0915}'..='\u{0939}').collect();
-        let matras: Vec<String> = ('\u{093E}'..='\u{094C}')
-            .chain(['\u{0902}', '\u{0903}', '\u{0901}'])
-            .map(|c| c.to_string())
+        let consonants: Vec<char> = ('\u{0915}'..='\u{0939}')
+            .chain('\u{0958}'..='\u{095F}')
             .collect();
         let reph = format!("र{VIRAMA}");
 
-        // What a sign is: text in front of the syllable, text after it.
+        // ⚠️ MARKS FUSE IN COMBINATION, NOT ONE AT A TIME. `में` draws as `म`
+        // and ONE more glyph carrying both the `े` and the `ं`; so does `हैं`,
+        // and so does the `र्` with `ों` under it in `वर्षों`. Pairing the reph
+        // with a single matra found none of them: measured, glyphs 336 and 339
+        // alone were 221 of the 230 characters the repair could not name, and
+        // neither is drawn by any single-mark cluster that can be built.
+        //
+        // A sign is therefore an optional reph, an optional matra and an
+        // optional nasal, and what it gives the repair is text in front of the
+        // syllable and text after it.
+        let matras: Vec<String> = std::iter::once(String::new())
+            .chain(('\u{093E}'..='\u{094C}').map(|c| c.to_string()))
+            .collect();
+        let nasals = ["", "\u{0902}", "\u{0903}", "\u{0901}"];
         let mut signs: Vec<(String, String)> = Vec::new();
-        for m in &matras {
-            signs.push((String::new(), m.clone()));
-            // ⚠️ AND THE REPH FUSES WITH WHATEVER THE BASE ALREADY CARRIES,
-            // so every pairing of it with a matra is its own glyph.
-            signs.push((reph.clone(), m.clone()));
+        for wear_reph in [false, true] {
+            for m in &matras {
+                for n in nasals {
+                    if !wear_reph && m.is_empty() && n.is_empty() {
+                        continue;
+                    }
+                    signs.push((
+                        if wear_reph { reph.clone() } else { String::new() },
+                        format!("{m}{n}"),
+                    ));
+                }
+            }
         }
-        signs.push((reph.clone(), String::new()));
         signs.push((String::new(), format!("{VIRAMA}र")));
 
-        let bases = devanagari_clusters();
+        // ⚠️ AND THE BASES NEED ONLY BE WHAT A MARK SITS ON. Every cluster
+        // that is itself a consonant carrying a sign is now reachable as a base
+        // plus one of the signs above, so enumerating those as bases as well
+        // multiplies the work by eighteen and learns nothing new.
+        let bases: Vec<String> = consonants.iter().map(|c| c.to_string())
+            .chain(consonants.iter().flat_map(|c| {
+                consonants.iter().map(move |d| format!("{c}{VIRAMA}{d}"))
+            }))
+            .collect();
         let mut found: BTreeMap<u16, BTreeMap<Form, usize>> = BTreeMap::new();
         for base in &bases {
             let plain = crate::reshape::draws(face, base);
@@ -2823,13 +2848,37 @@ mod tests {
         // disagree about lost the reph itself: `र्र` puts glyph 330 under the
         // rakar as well, one base against thirty-four, and the whole reph
         // repair went with it. A clear majority decides, and a tie refuses.
+        // ⚠️ WHAT A GLYPH MEANS IS THE TEXT, NOT THE SIDE IT SAT ON. The
+        // same `ि` comes out drawn-before over some bases and drawn-after over
+        // others, and counting those as two different answers split the vote:
+        // the `ि` for `र` scored ten against five and was thrown out as a
+        // disagreement, 29 characters on one file, when both were saying the
+        // same thing. The text decides, and the side is a majority within it.
+        //
+        // ⚠️ AND UNANIMOUS IS ENOUGH HOWEVER FEW SAID IT. A matra has a width
+        // variant per base it sits on, so the widest are produced by one or two
+        // bases and no others.
         found.into_iter()
             .filter_map(|(g, what)| {
-                let mut by_count: Vec<(Form, usize)> = what.into_iter().collect();
-                by_count.sort_by(|a, b| b.1.cmp(&a.1));
-                let (best, n) = by_count.first()?.clone();
-                let runner_up = by_count.get(1).map_or(0, |(_, m)| *m);
-                (n >= 3 && n > runner_up * 2).then_some((g, best))
+                let mut by_text: BTreeMap<(String, String), (usize, usize)> =
+                    BTreeMap::new();
+                for (form, n) in what {
+                    let e = by_text.entry((form.before, form.after)).or_default();
+                    e.0 += n;
+                    if form.drawn_before {
+                        e.1 += n;
+                    }
+                }
+                let mut ranked: Vec<((String, String), (usize, usize))> =
+                    by_text.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+                let ((before, after), (n, before_side)) = ranked.first()?.clone();
+                let runner_up = ranked.get(1).map_or(0, |(_, (m, _))| *m);
+                (runner_up == 0 || n > runner_up * 2).then_some((g, Form {
+                    before,
+                    after,
+                    drawn_before: before_side * 2 > n,
+                }))
             })
             .collect()
     }
@@ -2854,8 +2903,7 @@ mod tests {
         let mut rest = text;
         loop {
             let Some((offset, matra)) = rest.char_indices()
-                .find(|(i, c)| prebase.contains(c)
-                    && !rest[..*i].chars().next_back().is_some_and(consonant))
+                .find(|(_, c)| prebase.contains(c))
             else {
                 break;
             };
@@ -2968,15 +3016,17 @@ mod tests {
         let font = std::fs::read(NIRMALA).unwrap();
         let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
 
+        let wide = devanagari_clusters_wide();
+        println!("{} clusters enumerated", wide.len());
         let mut spells: BTreeMap<Vec<u16>, String> = BTreeMap::new();
         let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
-        for text in devanagari_clusters_wide() {
-            let g = crate::reshape::draws(&face, &text);
+        for text in &wide {
+            let g = crate::reshape::draws(&face, text);
             if g.is_empty() || g.contains(&0) || g.len() > 3 {
                 continue;
             }
             if let Some(had) = spells.insert(g.clone(), text.clone()) {
-                if had != text {
+                if had != *text {
                     clash.insert(g);
                 }
             }
@@ -3056,6 +3106,7 @@ mod tests {
         let mut looks_finished_but_refused = 0usize;
         let mut leftovers: BTreeMap<char, usize> = BTreeMap::new();
         let mut told = 0usize;
+        let mut why_refused: BTreeMap<&str, usize> = BTreeMap::new();
 
         for (n, &page) in pages.iter().enumerate() {
             let said = crate::tests::decoded_lines_for(&bytes, n as i32);
@@ -3098,7 +3149,8 @@ mod tests {
 
                 // The proof, unchanged from step 2: every run of the page's own
                 // glyphs found in order in the shaping of the text.
-                let proves = |now: &str| -> bool {
+                let proves = |now: &str|
+                    -> Result<(), (usize, Vec<u16>, Vec<u16>, char)> {
                     let mut buffer = rustybuzz::UnicodeBuffer::new();
                     buffer.push_str(now);
                     let out = rustybuzz::shape(&face, &[], buffer);
@@ -3125,13 +3177,19 @@ mod tests {
                         }
                         match found {
                             Some(q) => at = q + want.len(),
-                            None => return false,
+                            None => return Err((
+                                at,
+                                want,
+                                ink[at.min(ink.len())..(at + 6).min(ink.len())]
+                                    .iter().map(|(g, _)| *g).collect(),
+                                ink.get(at).map_or(' ', |(_, c)| *c),
+                            )),
                         }
                     }
-                    true
+                    Ok(())
                 };
 
-                let was = proves(&text);
+                let was = proves(&text).is_ok();
                 if was {
                     before_proves += 1;
                 }
@@ -3142,8 +3200,8 @@ mod tests {
                 } else {
                     changed += 1;
                 }
-                let is = proves(&now);
-                if is {
+                let outcome = proves(&now);
+                if outcome.is_ok() {
                     after_proves += 1;
                     if !was && shown < 8 {
                         shown += 1;
@@ -3158,9 +3216,34 @@ mod tests {
                         .collect();
                     if left.is_empty() {
                         looks_finished_but_refused += 1;
-                        if told < 4 {
+                        // ⚠️ THE PROOF IS STRICTER THAN THE GOAL. A line can
+                        // carry exactly the right text and still not reproduce
+                        // the page, because the page declined a ligature the
+                        // face forms: `अध्याय` is drawn as `ध`, a visible
+                        // virama and `य` where the face makes one `ध्य`, and
+                        // the text is identical either way. Counting those
+                        // separately is the difference between "not proven"
+                        // and "read wrongly".
+                        let (_, want, _, c) = outcome.clone().unwrap_err();
+                        let alone = crate::reshape::draws(&face, &c.to_string());
+                        *why_refused.entry(
+                            if alone.first() == want.first() {
+                                "the page declined a conjunct the face forms"
+                            } else if want.first().zip(alone.first())
+                                .is_some_and(|(a, b)| alternates(c, *a, *b))
+                            {
+                                "the face and the page chose different variants"
+                            } else {
+                                "something else"
+                            }).or_default() += 1;
+                        if told < 6 {
                             told += 1;
-                            println!("\n  REFUSED though nothing is left to repair:");
+                            let (at, want, got, _) = outcome.clone().unwrap_err();
+                            println!("\n  REFUSED though nothing is left to repair, \
+                                at glyph {at}:");
+                            println!("     page draws  {:?}",
+                                &want[..want.len().min(6)]);
+                            println!("     text shapes {got:?}");
                             println!("     {}", now.chars().take(58)
                                 .collect::<String>());
                         }
@@ -3190,6 +3273,9 @@ mod tests {
         println!("   {refused} still refused, {broke} of them broken BY the repair");
         println!("      {still_carries_an_id} still carry a glyph id nothing spells");
         println!("      {looks_finished_but_refused} carry none and are refused anyway");
+        for (why, n) in &why_refused {
+            println!("         {why} x{n}");
+        }
         println!("\n   the ids left over, by how much they cost:");
         let mut worst: Vec<(&char, &usize)> = leftovers.iter().collect();
         worst.sort_by(|a, b| b.1.cmp(a.1));
@@ -3198,8 +3284,8 @@ mod tests {
         // turns up in the middle of a cluster is a dependent form of something,
         // and the something is what the cluster has that the others do not.
         let mut inside: BTreeMap<u16, Vec<(String, usize, usize)>> = BTreeMap::new();
-        for text in devanagari_clusters_wide() {
-            let g = crate::reshape::draws(&face, &text);
+        for text in &wide {
+            let g = crate::reshape::draws(&face, text);
             for (i, &id) in g.iter().enumerate() {
                 let e = inside.entry(id).or_default();
                 if e.len() < 4 {
@@ -4241,6 +4327,17 @@ mod tests {
             for &d in &consonants {
                 for &s in &signs {
                     out.push(format!("{c}{VIRAMA}{d}{s}"));
+                }
+                // ⚠️ AND A CONJUNCT IS NOT ALWAYS TWO CONSONANTS. `शस्त्र`
+                // draws its `स्त्र` as a single glyph, and no two-consonant
+                // cluster produces it. The third consonant is not free though:
+                // it is the one a virama can carry under a conjunct, which in
+                // practice is the ra, ya and va forms.
+                for tail in ['र', 'य', 'व'] {
+                    out.push(format!("{c}{VIRAMA}{d}{VIRAMA}{tail}"));
+                    for &s in &signs {
+                        out.push(format!("{c}{VIRAMA}{d}{VIRAMA}{tail}{s}"));
+                    }
                 }
             }
         }
