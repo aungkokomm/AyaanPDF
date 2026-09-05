@@ -2572,12 +2572,27 @@ mod tests {
     /// U+016E = 366, which is what the run under `प्रवचन` starts with.
     #[test]
     #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
     fn whether_a_wrong_codepoint_is_simply_the_glyph_id() {
-        if !std::path::Path::new(GEETA_SMALL).exists() {
+        for file in [GEETA_SMALL, CHAL_HANSA] {
+            if !std::path::Path::new(file).exists() {
+                println!("\n== {} is not on this machine ==",
+                    file.rsplit('\\').next().unwrap());
+                continue;
+            }
+            println!("\n================ {} ================",
+                file.rsplit('\\').next().unwrap());
+            how_far_the_glyph_id_assumption_holds(file);
+        }
+    }
+
+    fn how_far_the_glyph_id_assumption_holds(file: &str) {
+        if !std::path::Path::new(file).exists() {
             println!("not on this machine");
             return;
         }
-        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let bytes = std::fs::read(file).unwrap();
         let Ok(doc) = Document::load_mem(&bytes) else { return };
         let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
 
@@ -3320,7 +3335,22 @@ mod tests {
     /// which one accounts for what the page actually draws.
     #[test]
     #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
     fn which_installed_face_names_the_most_of_a_devanagari_page() {
+        for file in [GEETA_SMALL, CHAL_HANSA] {
+            if !std::path::Path::new(file).exists() {
+                println!("\n== {} is not on this machine ==",
+                    file.rsplit('\\').next().unwrap());
+                continue;
+            }
+            println!("\n================ {} ================",
+                file.rsplit('\\').next().unwrap());
+            which_face_names_the_most(file);
+        }
+    }
+
+    fn which_face_names_the_most(file: &str) {
         const CANDIDATES: [(&str, &str); 7] = [
             ("Nirmala UI", r"C:\Windows\Fonts\NIRMALA.TTF"),
             ("Nirmala UI Bold", r"C:\Windows\Fonts\NIRMALAB.TTF"),
@@ -3330,13 +3360,13 @@ mod tests {
             ("Kokila", r"C:\Windows\Fonts\KOKILA.TTF"),
             ("Utsaah", r"C:\Windows\Fonts\UTSAAH.TTF"),
         ];
-        if !std::path::Path::new(GEETA_SMALL).exists() {
+        if !std::path::Path::new(file).exists() {
             println!("not on this machine");
             return;
         }
 
         // Every character the file emitted as a glyph id, and how often.
-        let bytes = std::fs::read(GEETA_SMALL).unwrap();
+        let bytes = std::fs::read(file).unwrap();
         let Ok(doc) = Document::load_mem(&bytes) else { return };
         let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
         let mut wanted: BTreeMap<u16, usize> = BTreeMap::new();
@@ -3391,6 +3421,374 @@ mod tests {
             println!("   {name:<18} names {distinct:>3} of {} ids, \
                 {named:>5} of {total} occurrences ({:>3.0}%)",
                 wanted.len(), named as f64 / total.max(1) as f64 * 100.0);
+        }
+    }
+
+    /// ⚠️ WHAT KIND OF FILE IS THIS, BEFORE ASKING WHAT IS WRONG WITH IT.
+    ///
+    /// The Geeta repair rests on one measured fact: PDFium emits the CID for a
+    /// glyph `/ToUnicode` does not cover, and Identity-H makes the CID the
+    /// glyph id. Both halves of that are properties of the FILE, not of the
+    /// script, so a second Devanagari book can fail either half and still be
+    /// perfectly ordinary Devanagari. This asks each file which it is.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_shape_each_devanagari_file_is() {
+        for file in [GEETA_SMALL, CHAL_HANSA] {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            println!("\n================ {} ================",
+                file.rsplit('\\').next().unwrap());
+            let bytes = std::fs::read(file).unwrap();
+            let Ok(doc) = Document::load_mem(&bytes) else { continue };
+            let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+            // How the text comes out.
+            let mut devanagari = 0usize;
+            let mut ascii = 0usize;
+            let mut odd = 0usize;
+            let mut lines = 0usize;
+            let look = pages.len().min(8);
+            for n in 0..look {
+                for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                    lines += 1;
+                    for c in line.5.chars() {
+                        if ('\u{0900}'..='\u{097F}').contains(&c) {
+                            devanagari += 1;
+                        } else if c.is_ascii() || c.is_whitespace() {
+                            ascii += 1;
+                        } else {
+                            odd += 1;
+                        }
+                    }
+                }
+            }
+            println!("{} pages, first {look} carry {lines} lines: \
+                {devanagari} devanagari characters, {ascii} plain, {odd} odd",
+                pages.len());
+
+            // What the content stream gives up.
+            let mut runs = 0usize;
+            let mut glyphs = 0usize;
+            for &page in pages.iter().take(look) {
+                for line in lines_of(&doc, page) {
+                    runs += 1;
+                    glyphs += line.glyphs.len();
+                }
+            }
+            println!("the stream reader finds {runs} runs, {glyphs} glyphs");
+
+            // And what the fonts are.
+            for (n, &page) in pages.iter().take(2).enumerate() {
+                let Some(fonts) = doc.get_dictionary(page).ok()
+                    .and_then(|p| p.get(b"Resources").ok()
+                        .and_then(|o| dictionary(&doc, o)))
+                    .and_then(|r| r.get(b"Font").ok()
+                        .and_then(|o| dictionary(&doc, o)))
+                else {
+                    continue;
+                };
+                for (name, obj) in fonts.iter() {
+                    let Some(f) = dictionary(&doc, obj) else { continue };
+                    let say = |k: &[u8]| f.get(k).ok()
+                        .map(|v| format!("{v:?}"))
+                        .unwrap_or_else(|| "-".into());
+                    println!("   page {n} {:<4} {:<16} {:<14} encoding {} \
+                        tounicode {}",
+                        String::from_utf8_lossy(name),
+                        say(b"Subtype").trim_matches('"').to_string(),
+                        say(b"BaseFont").trim_matches('"').to_string(),
+                        say(b"Encoding"),
+                        if f.has(b"ToUnicode") { "yes" } else { "NO" });
+                }
+            }
+
+            // A few lines, as they come out.
+            println!("   ---- as extracted ----");
+            for (i, line) in crate::tests::decoded_lines_for(&bytes, 1)
+                .iter().enumerate().take(4)
+            {
+                let _ = i;
+                println!("   {}", line.5.chars().take(64).collect::<String>());
+            }
+        }
+    }
+
+    /// ⚠️ AND IS MANGAL REALLY NAMING THEM, OR JUST HITTING SOMETHING?
+    ///
+    /// The face test says Mangal names 21 of Chal Hansa's 22 odd characters.
+    /// It cannot be taken at face value: that test asks whether the character's
+    /// code point, READ AS A GLYPH ID, is in the face's tables, and 22 small
+    /// numbers will hit a table of ninety thousand by luck alone. The file's
+    /// fonts are simple TrueType with `/WinAnsiEncoding`, where a byte is a
+    /// character code and not a glyph id at all, so the mechanism the Geeta
+    /// repair rests on is not even present.
+    ///
+    /// The only test that settles it is whether the answers read as Hindi.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_the_second_producers_odd_characters_are() {
+        const MANGAL: &str = r"C:\Windows\Fonts\mangal.ttf";
+        if !std::path::Path::new(CHAL_HANSA).exists()
+            || !std::path::Path::new(MANGAL).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let font = std::fs::read(MANGAL).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+        let wide = devanagari_clusters_wide();
+        let mut spells: BTreeMap<Vec<u16>, String> = BTreeMap::new();
+        let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
+        for text in &wide {
+            let g = crate::reshape::draws(&face, text);
+            if g.is_empty() || g.contains(&0) || g.len() > 3 {
+                continue;
+            }
+            if let Some(had) = spells.insert(g.clone(), text.clone()) {
+                if had != *text {
+                    clash.insert(g);
+                }
+            }
+        }
+        for g in &clash {
+            spells.remove(g);
+        }
+        let forms = dependent_forms(&face);
+
+        let bytes = std::fs::read(CHAL_HANSA).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages = doc.get_pages().len();
+
+        let mut seen: BTreeMap<char, (usize, Vec<String>)> = BTreeMap::new();
+        for n in 0..pages.min(40) {
+            for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                for (i, c) in line.5.char_indices() {
+                    if ('\u{0900}'..='\u{097F}').contains(&c) || c.is_ascii()
+                        || c.is_whitespace() || "–—‘’“”…•·".contains(c)
+                    {
+                        continue;
+                    }
+                    let e = seen.entry(c).or_default();
+                    e.0 += 1;
+                    if e.1.len() < 2 {
+                        let from = line.5[..i].char_indices().rev().nth(8)
+                            .map_or(0, |(j, _)| j);
+                        let to = line.5[i..].char_indices().nth(9)
+                            .map_or(line.5.len(), |(j, _)| i + j);
+                        e.1.push(line.5[from..to].to_string());
+                    }
+                }
+            }
+        }
+
+        println!("{} distinct odd characters over the first 40 pages", seen.len());
+        for (c, (n, contexts)) in &seen {
+            let id = u32::from(*c);
+            let said = (id <= u32::from(u16::MAX)).then(|| id as u16).and_then(|g| {
+                spells.get(&vec![g]).cloned()
+                    .or_else(|| forms.get(&g).map(|f| format!("{}..{}",
+                        f.before, f.after)))
+            });
+            println!("\n   {c:?} U+{id:04X} x{n}  mangal-as-id says {said:?}");
+            for ctx in contexts {
+                println!("        ...{ctx}...");
+            }
+        }
+    }
+
+    /// ⚠️ IS THE INFORMATION EVEN THERE? That is the question that decides
+    /// whether a file is repairable at all, and it is not the same question as
+    /// whether the text looks wrong.
+    ///
+    /// The Geeta is repairable because nothing was lost: every character it got
+    /// wrong still carries the id of the glyph that should have been drawn. A
+    /// file that DROPPED characters cannot be repaired from its text however
+    /// clever the tables are, because there is nothing left to repair.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn whether_the_second_producer_lost_anything() {
+        if !std::path::Path::new(CHAL_HANSA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(CHAL_HANSA).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages = doc.get_pages().len();
+
+        let mut shown = 0usize;
+        for n in 4..pages.min(30) {
+            for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                let has_c1 = line.5.chars().any(|c| ('\u{0080}'..='\u{009F}')
+                    .contains(&c));
+                if !has_c1 || line.5.chars().count() < 20 || shown >= 4 {
+                    continue;
+                }
+                shown += 1;
+                println!("\n  page {n}: {}", line.5);
+                print!("    ");
+                for c in line.5.chars().take(46) {
+                    if ('\u{0900}'..='\u{097F}').contains(&c) {
+                        print!("{c}");
+                    } else {
+                        print!("[{:04X}]", u32::from(c));
+                    }
+                }
+                println!();
+            }
+        }
+
+        // And the counts, over the whole book: what is Devanagari, what is
+        // Latin standing where Devanagari belongs, what is a control byte.
+        let mut deva = 0usize;
+        let mut latin = 0usize;
+        let mut control = 0usize;
+        let mut digit = 0usize;
+        let mut space = 0usize;
+        let mut other = 0usize;
+        for n in 0..pages.min(40) {
+            for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                for c in line.5.chars() {
+                    if ('\u{0900}'..='\u{097F}').contains(&c) {
+                        deva += 1;
+                    } else if ('\u{0080}'..='\u{009F}').contains(&c) {
+                        control += 1;
+                    } else if c.is_ascii_alphabetic() {
+                        latin += 1;
+                    } else if c.is_ascii_digit() {
+                        digit += 1;
+                    } else if c.is_whitespace() {
+                        space += 1;
+                    } else {
+                        other += 1;
+                    }
+                }
+            }
+        }
+        let all = deva + latin + control + digit + space + other;
+        println!("\n  over 40 pages, {all} characters:");
+        for (what, n) in [("devanagari", deva), ("latin letters", latin),
+            ("control bytes", control), ("digits", digit), ("spaces", space),
+            ("punctuation and the rest", other)]
+        {
+            println!("     {what:<26} {n:>6} ({:>4.1}%)",
+                n as f64 / all.max(1) as f64 * 100.0);
+        }
+    }
+
+    /// ⚠️ CAN THE SECOND PRODUCER'S BYTES BE TURNED INTO GLYPH IDS?
+    ///
+    /// This is the one question that decides whether the Geeta approach extends
+    /// or was a trick. Nothing is lost in either file: `राष्ट्रपति` reaches
+    /// Chal Hansa's text as `रा`, U+0080, `प`, U+0011, `त`, so U+0080 stands
+    /// for `ष्ट्र` and U+0011 for `ि` and both are still there to be named.
+    ///
+    /// What differs is the bridge from the wrong character to a glyph. The
+    /// Geeta needs none: its fonts are Identity-H, so the CID PDFium falls back
+    /// to IS the glyph id. Chal Hansa's are simple TrueType with
+    /// `/WinAnsiEncoding`, where the byte is a character code and the font's
+    /// own cmap is what turns it into a glyph. If that cmap survived
+    /// subsetting, the same tables finish the job. If it did not, this file
+    /// needs something the Geeta never did.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn whether_the_second_producers_bytes_reach_a_glyph() {
+        const MANGAL: &str = r"C:\Windows\Fonts\mangal.ttf";
+        if !std::path::Path::new(CHAL_HANSA).exists()
+            || !std::path::Path::new(MANGAL).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(CHAL_HANSA).unwrap();
+        let Ok(doc) = Document::load_mem(&bytes) else { return };
+        let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+
+        // The characters that need a bridge, and how often.
+        let mut wanted: BTreeMap<char, usize> = BTreeMap::new();
+        for n in 0..pages.len().min(40) {
+            for line in crate::tests::decoded_lines_for(&bytes, n as i32) {
+                for c in line.5.chars() {
+                    if !('\u{0900}'..='\u{097F}').contains(&c)
+                        && !c.is_whitespace()
+                        && !c.is_ascii_digit()
+                        && !"–—‘’“”…•·।॥.,;:!?()[]{}\"'/\\-_=+*&%$#@~`|<>".contains(c)
+                    {
+                        *wanted.entry(c).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let total: usize = wanted.values().sum();
+        println!("{} distinct characters need a bridge, {total} occurrences",
+            wanted.len());
+
+        // Mangal's own tables, to say what a glyph id means.
+        let font = std::fs::read(MANGAL).unwrap();
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+        let mut spells: BTreeMap<Vec<u16>, String> = BTreeMap::new();
+        let mut clash: BTreeSet<Vec<u16>> = BTreeSet::new();
+        for text in devanagari_clusters_wide() {
+            let g = crate::reshape::draws(&face, &text);
+            if g.is_empty() || g.contains(&0) || g.len() > 3 {
+                continue;
+            }
+            if let Some(had) = spells.insert(g.clone(), text.clone()) {
+                if had != text {
+                    clash.insert(g);
+                }
+            }
+        }
+        for g in &clash {
+            spells.remove(g);
+        }
+        let forms = dependent_forms(&face);
+        let name = |g: u16| spells.get(&vec![g]).cloned()
+            .or_else(|| forms.get(&g).map(|f| format!("{}..{}", f.before, f.after)));
+
+        // The embedded programs, and what their cmaps do with those bytes.
+        for &page in pages.iter().skip(9).take(1) {
+            for (res, program) in embedded_programs(&doc, page) {
+                let Some(sub) = rustybuzz::Face::from_slice(&program, 0) else {
+                    println!("\n   {} : {} bytes, NOT PARSEABLE",
+                        String::from_utf8_lossy(&res), program.len());
+                    continue;
+                };
+                println!("\n   {} : {} bytes, {} glyphs in the subset",
+                    String::from_utf8_lossy(&res), program.len(),
+                    sub.number_of_glyphs());
+
+                let mut reached = 0usize;
+                let mut named = 0usize;
+                let mut shown = 0usize;
+                for (c, n) in &wanted {
+                    // What a viewer does with a byte in a symbolic font: the
+                    // font's own cmap, tried plain and at the F000 offset.
+                    // The font's OWN cmap, the Macintosh subtable a viewer
+                    // uses for a symbolic font, not the Unicode one that
+                    // rustybuzz picks by default. That default is why the
+                    // first attempt reached nothing at all.
+                    let id = sub.tables().cmap.and_then(|cm| cm.subtables
+                        .into_iter()
+                        .find(|s| s.platform_id
+                            == rustybuzz::ttf_parser::PlatformId::Macintosh)
+                        .and_then(|s| s.glyph_index(u32::from(*c))));
+                    let Some(id) = id else { continue };
+                    reached += n;
+                    let said = name(id.0);
+                    if said.is_some() {
+                        named += n;
+                    }
+                    if shown < 12 {
+                        shown += 1;
+                        println!("      {c:?} U+{:04X} x{n} -> glyph {} -> {:?}",
+                            u32::from(*c), id.0, said);
+                    }
+                }
+                println!("      {reached} of {total} occurrences reach a glyph, \
+                    {named} of those are named");
+            }
         }
     }
 
@@ -4129,6 +4527,9 @@ mod tests {
             if indic_seen == 0 { 0.0 } else { full as f64 / indic_seen as f64 * 100.0 },
             if glyphs == 0 { 0.0 } else { total as f64 / glyphs as f64 * 100.0 });
     }
+
+    /// A second Devanagari book, from a producer that is not the Geeta's.
+    const CHAL_HANSA: &str = r"D:\Ayaan PDF Test file\Chal Hansa Us Des.pdf";
 
     const GEETA_SMALL: &str =
         r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
