@@ -26563,6 +26563,53 @@ p={spread_px:.4},c={rgba:08X})"
     /// of every Hindi book, since its text is repaired where it is read and
     /// ⚠️ WHAT THE READER ACTUALLY PAYS FOR A HINDI PAGE, on the call it
     /// makes to draw one. Reported unresponsive on a real file, so this is the
+    /// ⚠️ WHAT OPENING COSTS BEFORE THE APP DOES ANYTHING WITH IT. Reported:
+    /// two minutes to open a large book the first time and 47 seconds the
+    /// second, while most files were quick. This is the core's share of that,
+    /// with no UI in the way.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_opening_a_large_book_costs() {
+        const FILES: [&str; 3] = [
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf",
+            r"D:\Ayaan PDF Test file\21_Lessons_for_the_21st_Century_-_Yuval_Noah_Harari.pdf",
+            r"D:\Ayaan PDF Test file\All Osho Books.pdf",
+        ];
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                continue;
+            }
+            let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            println!("\n== {} ({:.1} MB) ==",
+                file.rsplit('\\').next().unwrap(), size as f64 / 1e6);
+
+            let clock = std::time::Instant::now();
+            let handle = open_fixture_named(file);
+            let opened = clock.elapsed();
+            if handle == 0 {
+                println!("   would not open");
+                continue;
+            }
+            let clock = std::time::Instant::now();
+            let pages = get_page_count(handle);
+            let counted = clock.elapsed();
+            println!("   open_document {opened:?}, get_page_count {counted:?} \
+                -> {pages} pages");
+
+            // What the reader then does with the page it shows.
+            let clock = std::time::Instant::now();
+            let buffer = get_page_lines(handle, 0);
+            free_byte_buffer(buffer);
+            println!("   get_page_lines(0) {:?}", clock.elapsed());
+
+            let clock = std::time::Instant::now();
+            let buffer = get_page_text_runs(handle, 0);
+            free_byte_buffer(buffer);
+            println!("   get_page_text_runs(0) {:?}", clock.elapsed());
+
+            close_document(handle);
+        }
+    }
     /// call reproduced with nothing else in the way.
     #[test]
     #[ignore = "diagnostic, and needs PDFs that are not in this repository"]

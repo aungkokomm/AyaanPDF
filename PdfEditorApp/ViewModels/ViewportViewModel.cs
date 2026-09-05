@@ -1153,9 +1153,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RecoveryStore.Discard(leaving);
         }
 
+        // ⚠️ OPENING IS TIMED STAGE BY STAGE, because "it takes too long" is not
+        // something anyone can act on. Reported: two minutes for a large book
+        // and fifteen seconds for a six-page one, while most files were quick.
+        // A stopwatch per stage in the log turns that into a number and a name.
+        var openClock = System.Diagnostics.Stopwatch.StartNew();
+        var stageClock = System.Diagnostics.Stopwatch.StartNew();
+        void Stage(string what)
+        {
+            Diag.Log($"open: {what} took {stageClock.ElapsedMilliseconds} ms");
+            stageClock.Restart();
+        }
+
         CloseCurrentDocument();
+        Stage("CloseCurrentDocument");
 
         var opened = RenderCoreNative.open_document_protected(path, password);
+        Stage("open_document_protected");
         _documentHandle = opened.Handle;
         _currentDocumentPath = path;
 
@@ -1243,18 +1257,30 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
+        Stage($"get_page_count ({PageCount} pages)");
+
         for (int i = 0; i < PageCount; i++)
         {
             Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
         }
+        Stage($"{PageCount} thumbnail placeholders");
 
         CurrentPageIndex = 0;
         RebuildContinuousLayout();
+        Stage("RebuildContinuousLayout");
         RenderCurrentPage();
+        Stage("RenderCurrentPage");
         ReportExistingAnnotations();
+        Stage("ReportExistingAnnotations");
         LoadFormFields();
+        Stage("LoadFormFields");
         LoadBookmarks();
+        Stage("LoadBookmarks");
         LoadGuidesFromSidecar();
+        Stage("LoadGuidesFromSidecar");
+
+        Diag.Log($"open: {System.IO.Path.GetFileName(path)} " +
+            $"({PageCount} pages) opened in {openClock.ElapsedMilliseconds} ms");
         return DocumentOpenOutcome.Opened;
     }
 

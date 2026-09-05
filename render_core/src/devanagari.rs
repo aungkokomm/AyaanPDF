@@ -39,7 +39,14 @@ const VIRAMA: char = '\u{094D}';
 
 /// A face that accounts for this much of a page's suspect characters is the
 /// page's face, and the search stops.
-const CLEARLY: f64 = 0.90;
+///
+/// ⚠️ IT MEANS CLEARLY BETTER THAN THE ALTERNATIVES, NOT NEARLY PERFECT. Set
+/// at 0.90 nothing ever reached it on the book it was built for: Nirmala
+/// accounts for 82% there, so all seven faces were built and the first Hindi
+/// page of a session paid 1.15 seconds instead of 178 milliseconds. Measured,
+/// the right face and the next best are not close, 82% against 38% on one book
+/// and 98% against 0% on another, so three quarters is a wide moat.
+const CLEARLY: f64 = 0.75;
 
 /// Below this, no face explains the page and nothing is repaired. This is the
 /// guard against mangling a document that merely contains Latin Extended
@@ -615,6 +622,36 @@ mod tests {
         }
         println!("\n   {total:.2?} to build them all, which is what a page pays \
             when no face clearly wins");
+    }
+
+    /// ⚠️ WHAT THE FIRST HINDI PAGE OF A SESSION COSTS, which is the one a
+    /// reader actually waits for. Every later page reuses the tables, so a
+    /// measurement taken after another test has warmed them says nothing.
+    #[test]
+    #[ignore = "diagnostic, and needs the Devanagari faces installed"]
+    fn what_the_first_page_of_a_session_pays_for_its_face() {
+        if !std::path::Path::new(CANDIDATES[0]).exists() {
+            println!("not on this machine");
+            return;
+        }
+        // The characters one real book needs named, and roughly how often.
+        let mut wanted: BTreeMap<u16, usize> = BTreeMap::new();
+        for id in [330u16, 366, 700, 407, 361, 389, 352, 544, 681, 336, 339] {
+            wanted.insert(id, 50);
+        }
+
+        let clock = std::time::Instant::now();
+        let picked = best_face(&wanted);
+        let took = clock.elapsed();
+        match picked {
+            Some((_, share)) => println!(
+                "   resolved to a face naming {:.0}% in {took:?}", share * 100.0),
+            None => println!("   no face resolved, in {took:?}"),
+        }
+        assert!(
+            took < std::time::Duration::from_millis(600),
+            "resolving the face took {took:?}, which a reader waits for"
+        );
     }
 
     #[test]
