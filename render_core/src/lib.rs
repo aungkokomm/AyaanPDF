@@ -306,7 +306,19 @@ struct CachedModel {
 
 /// Assembling a page's blocks costs about 1.8 seconds on a 296-page book, and
 /// editing one line asks for it TWICE: once to find the line, once to write it.
-static MODEL_CACHE: Mutex<Option<((u64, i32), CachedModel)>> = Mutex::new(None);
+/// ⚠️ ONE PAGE PER DOCUMENT, NOT ONE PAGE IN THE WORLD. As a single slot,
+/// any other document being read displaced it, and "ask for the same page
+/// twice and the second is free" then depended on nothing else asking
+/// meanwhile. In the app that is nearly always true and the memo worked; under
+/// a parallel test suite it is nearly always false, and the test that checks
+/// the memo failed about one run in four and latterly every run.
+///
+/// The shape of the question is unchanged: ONE page per document, and a second
+/// page of the same document still displaces the first rather than growing
+/// without bound. It is the same correction MODEL_HITS needed, for the same
+/// reason.
+static MODEL_CACHE: Mutex<std::collections::BTreeMap<u64, ((u64, i32), CachedModel)>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 /// How many times the memo has answered instead of the page, PER DOCUMENT.
 ///
@@ -618,6 +630,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
     }
 
     lock(&core.sources).remove(&doc_handle);
+    lock(&MODEL_CACHE).remove(&doc_handle);
 
     {
         let mut cache = lock(&core.cache);
@@ -12852,7 +12865,7 @@ fn page_blocks(doc_handle: u64, page_index: i32)
         use pdfium_render::prelude::PdfPageObjectsCommon;
         page.objects().len() as usize
     };
-    if let Some((key, held)) = lock(&MODEL_CACHE).as_ref() {
+    if let Some((key, held)) = lock(&MODEL_CACHE).get(&doc_handle) {
         if *key == (doc_handle, page_index)
             && held.epoch == epoch
             && held.objects == objects
@@ -12866,10 +12879,13 @@ fn page_blocks(doc_handle: u64, page_index: i32)
         page_block_inputs(&doc_guard, &page, page_w);
     let model = (block::assemble(lines, &obs, unpaired), logical_runs);
 
-    *lock(&MODEL_CACHE) = Some((
-        (doc_handle, page_index),
-        CachedModel { epoch, objects, model: model.clone() },
-    ));
+    lock(&MODEL_CACHE).insert(
+        doc_handle,
+        (
+            (doc_handle, page_index),
+            CachedModel { epoch, objects, model: model.clone() },
+        ),
+    );
     Ok(model)
 }
 
@@ -31449,23 +31465,55 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     /// The same page, asked for twice with nothing in between.
+    ///
+    /// ⚠️ "NOTHING IN BETWEEN" IS A CONDITION THIS TEST HAS TO ESTABLISH, not
+    /// one it may assume. MODEL_EPOCH is bumped by the guard EVERY core call
+    /// takes, on purpose and by any document: that is what makes the model safe
+    /// by default, and it is not going to be narrowed to one document just to
+    /// make a test easier. So under a parallel suite another test's call lands
+    /// between the two asks, the epoch moves, the memo correctly misses, and
+    /// this failed about one run in four and latterly every run.
+    ///
+    /// It now asks twice and checks the epoch did not move underneath it,
+    /// retrying if it did. The property being tested is unchanged; what has
+    /// changed is that the test now knows when it was in a position to test it.
     #[test]
     fn the_model_is_remembered_between_two_asks() {
-        let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+        for attempt in 0..64 {
+            // ⚠️ A FRESH HANDLE EACH TIME, so the first ask is genuinely cold.
+            // The memo is per document, so a previous attempt's model is still
+            // sitting under the old handle, and reusing it made the first ask
+            // of the second attempt a HIT.
+            let handle = open_fixture_named("tests/fixtures/sample_font_cases.pdf");
+            let epoch = MODEL_EPOCH.load(Ordering::SeqCst);
+            let before = hits_for(handle);
 
-        let before = hits_for(handle);
-        let (first, _) = page_blocks(handle, 0).expect("blocks");
-        assert_eq!(hits_for(handle), before, "the first ask should have built the model");
+            let (first, _) = page_blocks(handle, 0).expect("blocks");
+            let built = hits_for(handle);
+            let (again, _) = page_blocks(handle, 0).expect("blocks");
+            let used = hits_for(handle);
 
-        let (again, _) = page_blocks(handle, 0).expect("blocks");
-        assert_eq!(hits_for(handle), before + 1, "the second ask should have used the memo");
+            // Neither ask bumps the epoch: `page_blocks` is a read. So a change
+            // here is somebody else's call, and this attempt saw a memo it was
+            // never entitled to.
+            if MODEL_EPOCH.load(Ordering::SeqCst) != epoch {
+                close_document(handle);
+                assert!(attempt < 63, "the epoch never held still long enough to look");
+                continue;
+            }
 
-        // And the memo answers the same thing the page would have.
-        assert_eq!(first.len(), again.len());
-        for (a, b) in first.iter().zip(again.iter()) {
-            assert_eq!(a.text, b.text);
+            assert_eq!(built, before, "the first ask should have built the model");
+            assert_eq!(used, before + 1, "the second ask should have used the memo");
+
+            // And the memo answers the same thing the page would have.
+            assert_eq!(first.len(), again.len());
+            for (a, b) in first.iter().zip(again.iter()) {
+                assert_eq!(a.text, b.text);
+            }
+            close_document(handle);
+            return;
         }
-        close_document(handle);
+        unreachable!("the loop returns or asserts");
     }
 
     /// ⚠️ THE ONE THAT MATTERS. A memo that outlives the page it describes
