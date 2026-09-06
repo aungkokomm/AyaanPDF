@@ -28118,6 +28118,184 @@ p={spread_px:.4},c={rgba:08X})"
         let _ = std::fs::remove_file(&path);
     }
 
+    /// ⚠️ WHAT CARET GEOMETRY A HINDI LINE ALREADY HAS. The reading carries a
+    /// box per cluster, and those boxes are what a caret is placed between. The
+    /// Myanmar phases had to build them; this asks how much of that a
+    /// Devanagari page gets for free, and what is wrong with what it gets.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_caret_geometry_a_hindi_line_arrives_with() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        prepare_recovery(handle, 0);
+        for _ in 0..400 {
+            if recovery_is_ready(handle, 0) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let lines = recovered_lines(handle, 0);
+        close_document(handle);
+
+        let read: Vec<&RecoveredLine> = lines.iter().filter(|l| !l.text.is_empty()).collect();
+        let mut no_clusters = 0;
+        let mut gaps = 0;
+        let mut out_of_order = 0;
+        let mut degenerate = 0;
+        let mut whole = 0;
+        for l in &read {
+            if l.clusters.is_empty() {
+                no_clusters += 1;
+                continue;
+            }
+            // Every character has to be inside some cluster, or a caret cannot
+            // be put next to it.
+            let covered: usize = l.clusters.iter().map(|c| c.to - c.from).sum();
+            if covered < l.text.len() {
+                gaps += 1;
+            } else {
+                whole += 1;
+            }
+            if l.clusters.windows(2).any(|p| p[1].left < p[0].left - 0.0001) {
+                out_of_order += 1;
+            }
+            if l.clusters.iter().any(|c| c.right <= c.left) {
+                degenerate += 1;
+            }
+        }
+        println!("{} lines read", read.len());
+        println!("   {no_clusters} with no clusters at all");
+        println!("   {whole} whose clusters cover the whole text");
+        println!("   {gaps} with characters no cluster covers");
+        println!("   {out_of_order} whose boxes run backwards");
+        println!("   {degenerate} with a box of no width");
+
+        // ⚠️ THE REORDERING CASE, which is where geometry goes wrong if it
+        // is going to. This matra is DRAWN in front of the consonant it
+        // follows, so a box that bounded the characters in writing order would
+        // sit to the right of the ink it stands for.
+        let prebase: Vec<&&RecoveredLine> = read.iter()
+            .filter(|l| l.text.contains('\u{093F}'))
+            .collect();
+        println!("\n{} lines carry a pre-base matra", prebase.len());
+        for l in prebase.iter().take(4) {
+            println!("   {:?} in {} clusters", l.text, l.clusters.len());
+            for c in &l.clusters {
+                println!("      {:?} at {:.4}..{:.4}", &l.text[c.from..c.to], c.left, c.right);
+            }
+        }
+
+        for l in read.iter().take(3) {
+            println!("\n   {:?} in {} clusters", l.text, l.clusters.len());
+            for c in &l.clusters {
+                println!("      {:?} at {:.4}..{:.4}", &l.text[c.from..c.to], c.left, c.right);
+            }
+        }
+    }
+
+    /// ⚠️ WHETHER THE APP CAN TELL A RECOVERED LINE FROM PDFIUM'S FRAGMENTS.
+    /// `RecoveredLines.Merge` DROPS every complex-script line PDFium reported
+    /// that a recovered line stands on, and keeps the rest. It decides by
+    /// baseline, within about a point at A4.
+    ///
+    /// That only works if the two agree about where a baseline is, and they do
+    /// not always: measured on this book's WORDS, PDFium's baseline and the
+    /// content stream's differ by 4.6pt on one line and 15.0pt on the next. If
+    /// the same is true of its lines, every fragment survives the merge and the
+    /// reader gets the recovered line WITH PDFium's fragments still lying on
+    /// top of it.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn whether_a_recovered_line_covers_the_fragments_it_replaces() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        prepare_recovery(handle, 0);
+        for _ in 0..400 {
+            if recovery_is_ready(handle, 0) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let fragments = decode_lines(handle, 0);
+        let recovered = recovered_lines(handle, 0);
+        close_document(handle);
+
+        // The app's own rule, in the app's own units.
+        const TOLERANCE: f32 = 0.0012;
+        let read: Vec<&RecoveredLine> = recovered.iter().filter(|l| !l.text.is_empty()).collect();
+
+        let shaped: Vec<&DecodedLine> = fragments
+            .iter()
+            .filter(|l| l.refusal == LINE_COMPLEX_SCRIPT)
+            .collect();
+        let covered = shaped
+            .iter()
+            .filter(|f| read.iter().any(|r| (r.baseline - f.baseline).abs() <= TOLERANCE))
+            .count();
+
+        println!("{} fragments PDFium refused, {} recovered lines read",
+            shaped.len(), read.len());
+        println!("{covered} fragments a recovered line stands on, {} left lying on top",
+            shaped.len() - covered);
+
+        let mut theirs: Vec<f32> = shaped.iter().map(|f| f.baseline).collect();
+        theirs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        theirs.dedup_by(|a, b| (*a - *b).abs() < 0.0001);
+        let mut ours: Vec<f32> = read.iter().map(|r| r.baseline).collect();
+        ours.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ours.dedup_by(|a, b| (*a - *b).abs() < 0.0001);
+        println!("PDFium baselines: {:?}", theirs.iter().take(6).collect::<Vec<_>>());
+        println!("recovered:        {:?}", ours.iter().take(6).collect::<Vec<_>>());
+    }
+
+    /// ⚠️ AND WHETHER THE HORIZONTAL IS IN THE SAME WRONG FRAME. The page is
+    /// drawn under a transform that scales as well as flips, so if the reading
+    /// reports the stream's own x the caret boxes are the wrong WIDTH as well
+    /// as at the wrong height. PDFium reports the page, so its word boxes are
+    /// the control.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn whether_a_readings_boxes_are_in_the_pages_frame() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        prepare_recovery(handle, 0);
+        for _ in 0..400 {
+            if recovery_is_ready(handle, 0) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let words = decode_clusters(handle, 0);
+        let recovered = recovered_lines(handle, 0);
+        close_document(handle);
+
+        // The same word, as PDFium places it and as the reading places it.
+        for want in ["\u{092D}\u{093E}\u{0917}", "\u{0913}\u{0936}\u{094B}"] {
+            let Some(w) = words.iter().find(|w| w.text == want) else { continue };
+            let Some(r) = recovered.iter().find(|r| r.text == want) else { continue };
+            println!("{want:?}");
+            println!("   PDFium   left {:.4} right {:.4} baseline {:.4}",
+                w.left, w.right, w.baseline);
+            println!("   reading  left {:.4} right {:.4} baseline {:.4}",
+                r.left, r.right, r.baseline);
+        }
+    }
+
     fn read_recovered(handle: u64) -> Vec<(f32, String)> {
         read_recovered_page(handle, 0)
     }

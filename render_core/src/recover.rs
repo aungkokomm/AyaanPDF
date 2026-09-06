@@ -123,6 +123,21 @@ impl Matrix {
     fn x(&self) -> f64 {
         self.0[4]
     }
+
+    /// Where this matrix puts a point.
+    fn on(&self, x: f64, y: f64) -> (f64, f64) {
+        let [a, b, c, d, e, f] = self.0;
+        (a * x + c * y + e, b * x + d * y + f)
+    }
+
+    /// How much this matrix scales a vertical distance.
+    ///
+    /// A flip reports the same number as the lift it reverses: a height is a
+    /// length, and a length has no sign.
+    fn vertical_scale(&self) -> f64 {
+        let [_, b, _, d, _, _] = self.0;
+        (b * b + d * d).sqrt()
+    }
 }
 
 /// One line of a page, as the glyphs it draws.
@@ -151,6 +166,14 @@ pub(crate) struct Line {
     /// Equal to `y` on any page that draws its text without a transform, which
     /// is why this went unnoticed: the Myanmar test file is one of those.
     pub(crate) page_y: f64,
+    /// The transform in force where this line is drawn.
+    ///
+    /// ⚠️ KEPT WHOLE, because `page_y` alone is not enough. The same
+    /// transform scales the line's WIDTH and its type size, and a book drawn
+    /// under `cm [0.75 0 0 -0.75 0 841.92]` reported every box a third too wide
+    /// as well as at a height that was off the page. Measured against PDFium on
+    /// one word: left 0.3730 where the page has 0.2807, which is exactly 0.75.
+    ctm: Matrix,
     /// The font resource the line is drawn with, and the name behind it.
     pub(crate) resource: Vec<u8>,
     pub(crate) base_font: String,
@@ -323,6 +346,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     y: line_matrix.y(),
                     x: line_matrix.x(),
                     page_y: on_page.y(),
+                    ctm,
                     resource: resource.clone(),
                     base_font: names
                         .get(&resource)
@@ -1360,15 +1384,37 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
                 .get(line.base_font.as_str())
                 .map(|(face, _)| reach_of(face, line.size))
                 .unwrap_or((0.0, 0.0));
+            // ⚠️ EVERY NUMBER HERE IS IN THE PAGE'S FRAME, and none of
+            // them used to be. `Line::y` is the stream's own placement, and the
+            // app compares what it gets back against a baseline PDFium read off
+            // the PAGE. On a book drawn under `cm [0.75 0 0 -0.75 0 841.92]`
+            // that put every baseline off the page and every box a third too
+            // wide: measured, ALL 1,386 of its lines, and the app's merge then
+            // left 36 of 41 of PDFium's own fragments lying on top of the
+            // lines that were supposed to replace them.
+            //
+            // A flip swaps top and bottom, so they are sorted after mapping
+            // rather than assumed. In PDF space the visual TOP is the larger
+            // number, which is the way round the caller's `down` expects.
+            let reach_up = line.ctm.on(line.x, line.y + top).1;
+            let reach_down = line.ctm.on(line.x, line.y + bottom).1;
+            let scale = line.ctm.vertical_scale();
             Reading {
-                y: line.y,
-                x: line.x,
-                size: line.size,
-                top: line.y + top,
-                bottom: line.y + bottom,
+                y: line.page_y,
+                x: line.ctm.on(line.x, line.y).0,
+                size: line.size * scale,
+                top: reach_up.max(reach_down),
+                bottom: reach_up.min(reach_down),
                 font: line.base_font.clone(),
                 text,
-                clusters,
+                clusters: clusters
+                    .into_iter()
+                    .map(|c| Cluster {
+                        left: line.ctm.on(c.left, line.y).0,
+                        right: line.ctm.on(c.right, line.y).0,
+                        ..c
+                    })
+                    .collect(),
             }
         })
         .collect()
@@ -1383,7 +1429,9 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
 /// settles which was meant, and this only narrows the field.
 pub(crate) fn lines_at(lines: &[Line], baseline: f64) -> impl Iterator<Item = &Line> {
     const NEAR: f64 = 0.5;
-    lines.iter().filter(move |l| (l.y - baseline).abs() < NEAR)
+    // ⚠️ THE PAGE'S FRAME, which is the one the caller was handed and the
+    // only one it can read a baseline off PDFium in. See `Line::page_y`.
+    lines.iter().filter(move |l| (l.page_y - baseline).abs() < NEAR)
 }
 
 /// The same, building the indexes first. For a caller with nothing prepared.
@@ -1636,6 +1684,7 @@ mod tests {
             y: 700.0,
             x: 72.0,
             page_y: 700.0,
+            ctm: Matrix::IDENTITY,
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -1743,6 +1792,7 @@ mod tests {
             y: 700.0,
             x: 72.0,
             page_y: 700.0,
+            ctm: Matrix::IDENTITY,
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -1776,6 +1826,7 @@ mod tests {
             y: 700.0,
             x: 72.0,
             page_y: 700.0,
+            ctm: Matrix::IDENTITY,
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -2017,6 +2068,100 @@ mod tests {
         });
         doc.trailer.set("Root", catalog);
         (doc, page)
+    }
+
+    /// ⚠️ WHICH FRAME THE READING COMES BACK IN. `Reading.y` is `Line::y`,
+    /// the stream's own placement, and the app compares it against a baseline
+    /// PDFium read off the PAGE. `Line::page_y` is the same placement with the
+    /// transform applied, and its doc comment says it is the only address an
+    /// outside caller may use.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn which_frame_a_hindi_reading_comes_back_in() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let (page_left, page_top, page_w) = page_box(&doc, page).unwrap();
+        println!("page box: left {page_left}, top {page_top}, width {page_w}");
+
+        let lines = lines_of(&doc, page);
+        let mut differ = 0;
+        for line in &lines {
+            if (line.y - line.page_y).abs() > 0.01 {
+                differ += 1;
+            }
+        }
+        println!("{} lines, {differ} whose stream placement and page placement differ",
+            lines.len());
+
+        for line in lines.iter().take(6) {
+            println!("   y {:8.2} -> normalized {:7.4}   |   page_y {:8.2} -> normalized {:7.4}",
+                line.y, (page_top - line.y) / page_w,
+                line.page_y, (page_top - line.page_y) / page_w);
+        }
+    }
+
+    /// The transform a real Hindi book is drawn under, and what it does.
+    const FLIPPED: Matrix = Matrix([0.75, 0.0, 0.0, -0.75, 0.0, 841.92]);
+
+    /// ⚠️ A HEIGHT IS A LENGTH, AND A FLIP DOES NOT MAKE IT NEGATIVE, and the
+    /// same flip reverses which way a line reaches. Both were got wrong once:
+    /// sorting top and bottom the obvious way round put every box upside down.
+    #[test]
+    fn a_flipped_and_scaled_page_maps_a_lines_geometry_onto_it() {
+        // A baseline the stream puts at 111.04 is at 758.64 on the page.
+        assert!((FLIPPED.on(0.0, 111.04).1 - 758.64).abs() < 0.01);
+
+        // ⚠️ AND x IS SCALED, NOT MERELY SHIFTED. Reporting the stream's own
+        // x made every caret box a third too wide.
+        assert!((FLIPPED.on(100.0, 0.0).0 - 75.0).abs() < 1e-9);
+
+        assert!((FLIPPED.vertical_scale() - 0.75).abs() < 1e-9);
+
+        let reaches_up = FLIPPED.on(0.0, 111.04 + 8.0).1;
+        let reaches_down = FLIPPED.on(0.0, 111.04 - 2.0).1;
+        assert!(reaches_up < reaches_down,
+            "the flip did not reverse the reach, so top and bottom need no sorting \
+             and this test is not testing anything");
+    }
+
+    /// ⚠️ AND THE LINE HAS TO CARRY THAT TRANSFORM OUT OF THE STREAM. This
+    /// wraps a fixture's content in the transform above and asks where its
+    /// lines say they are. Without the `cm` being tracked, `page_y` is just `y`
+    /// and every one of them is off the page.
+    #[test]
+    fn a_line_drawn_under_a_transform_reports_where_the_page_puts_it() {
+        let mut doc = lopdf::Document::load("tests/fixtures/sample_lines.pdf").unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let plain = lines_of(&doc, page);
+        assert!(!plain.is_empty(), "the fixture draws no lines");
+
+        let content = doc.get_page_content(page);
+        let mut wrapped = b"q 0.75 0 0 -0.75 0 841.92 cm".to_vec();
+        wrapped.push(b'\n');
+        wrapped.extend_from_slice(&content);
+        wrapped.extend_from_slice(b"\nQ");
+        doc.change_page_content(page, wrapped).unwrap();
+
+        let under = lines_of(&doc, page);
+        assert_eq!(under.len(), plain.len(), "the transform changed which lines there are");
+        for (before, after) in plain.iter().zip(&under) {
+            assert!((after.y - before.y).abs() < 1e-9,
+                "the stream's own placement should not have moved");
+            // The added transform composes ON TOP of whatever the fixture
+            // already does, so the line's new place is its old place put
+            // through it. This one has no shear, so y does not depend on x.
+            let want = FLIPPED.on(0.0, before.page_y).1;
+            assert!((after.page_y - want).abs() < 0.001,
+                "line at {} reports {} on the page, and the transform puts it at {want}",
+                before.page_y, after.page_y);
+        }
     }
 
     fn an_index_of(bytes: &[u8], text: &str) -> Indexes {
