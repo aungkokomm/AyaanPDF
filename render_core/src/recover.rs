@@ -130,6 +130,15 @@ impl Matrix {
         (a * x + c * y + e, b * x + d * y + f)
     }
 
+    /// Where this matrix sends a direction, with no translation.
+    ///
+    /// ⚠️ A LENGTH IS NOT A POINT. A reach above a baseline is a direction,
+    /// and putting it through `on` would add the page's own offset to it.
+    fn along(&self, x: f64, y: f64) -> (f64, f64) {
+        let [a, b, c, d, _, _] = self.0;
+        (a * x + c * y, b * x + d * y)
+    }
+
     /// How much this matrix scales a vertical distance.
     ///
     /// A flip reports the same number as the lift it reverses: a height is a
@@ -174,6 +183,16 @@ pub(crate) struct Line {
     /// as well as at a height that was off the page. Measured against PDFium on
     /// one word: left 0.3730 where the page has 0.2807, which is exactly 0.75.
     ctm: Matrix,
+    /// The line's own matrix with the transform applied: text space straight
+    /// onto the page.
+    ///
+    /// ⚠️ NEEDED SEPARATELY FROM `ctm` BECAUSE A REACH IS IN TEXT SPACE. The
+    /// cluster edges are in user space and want `ctm`; how far the type climbs
+    /// above its baseline comes from the FACE, in the text object's own space,
+    /// and wants this. Using `ctm` for both put the ascender BELOW the baseline
+    /// on a book whose text matrix flips to cancel the page's flip, so the
+    /// caret was drawn in the gap under the line instead of on it.
+    on_page: Matrix,
     /// The font resource the line is drawn with, and the name behind it.
     pub(crate) resource: Vec<u8>,
     pub(crate) base_font: String,
@@ -347,6 +366,7 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     x: line_matrix.x(),
                     page_y: on_page.y(),
                     ctm,
+                    on_page,
                     resource: resource.clone(),
                     base_font: names
                         .get(&resource)
@@ -1396,9 +1416,16 @@ pub(crate) fn read_page_with(doc: &Document, page: ObjectId, indexes: &Indexes)
             // A flip swaps top and bottom, so they are sorted after mapping
             // rather than assumed. In PDF space the visual TOP is the larger
             // number, which is the way round the caller's `down` expects.
-            let reach_up = line.ctm.on(line.x, line.y + top).1;
-            let reach_down = line.ctm.on(line.x, line.y + bottom).1;
-            let scale = line.ctm.vertical_scale();
+            // ⚠️ THE REACH IS A DIRECTION IN TEXT SPACE, so it goes
+            // through the line's own matrix as well as the page's. Measured on
+            // a book whose text matrix flips to cancel the page's flip: putting
+            // it through the page transform alone sent the ascender DOWNWARDS,
+            // and the caret was drawn in the gap below the line rather than on
+            // the type. PDFium had the box at 0.1265..0.1399 and this reported
+            // 0.1354..0.1590, which is almost entirely under the baseline.
+            let reach_up = line.page_y + line.on_page.along(0.0, top).1;
+            let reach_down = line.page_y + line.on_page.along(0.0, bottom).1;
+            let scale = line.on_page.vertical_scale();
             Reading {
                 y: line.page_y,
                 x: line.ctm.on(line.x, line.y).0,
@@ -1685,6 +1712,7 @@ mod tests {
             x: 72.0,
             page_y: 700.0,
             ctm: Matrix::IDENTITY,
+            on_page: Matrix::translation(0.0, 700.0),
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -1793,6 +1821,7 @@ mod tests {
             x: 72.0,
             page_y: 700.0,
             ctm: Matrix::IDENTITY,
+            on_page: Matrix::translation(0.0, 700.0),
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -1827,6 +1856,7 @@ mod tests {
             x: 72.0,
             page_y: 700.0,
             ctm: Matrix::IDENTITY,
+            on_page: Matrix::translation(0.0, 700.0),
             resource: b"F1".to_vec(),
             base_font: "BCDEEE+MyanmarText".into(),
             size: 12.0,
@@ -2131,6 +2161,33 @@ mod tests {
              and this test is not testing anything");
     }
 
+    /// ⚠️ A REACH IS IN TEXT SPACE, AND TEXT SPACE IS NOT USER SPACE. A page
+    /// that flips is usually drawn with a text matrix that flips back, so the
+    /// type reads the right way up; the page transform ALONE therefore has the
+    /// wrong sign for it. Putting the ascender through the page transform on
+    /// its own sent it below the baseline, and the caret was drawn in the gap
+    /// under the line instead of on the type. The user saw that before a test
+    /// did, which is why this one is here.
+    #[test]
+    fn a_reach_above_the_baseline_stays_above_it_on_the_page() {
+        // The real book: the page flips and scales, the text matrix flips back.
+        let text = Matrix([1.0, 0.0, 0.0, -1.0, 96.0, 111.04]);
+        let on_page = text.then(FLIPPED);
+
+        assert!(on_page.along(0.0, 10.0).1 > 0.0,
+            "an ascender ended up below the baseline");
+        assert!(on_page.along(0.0, -3.0).1 < 0.0,
+            "a descender ended up above the baseline");
+
+        // ⚠️ AND THE PAGE TRANSFORM ALONE GETS IT WRONG, which is the whole
+        // point: without this the test passes on the broken version too.
+        assert!(FLIPPED.along(0.0, 10.0).1 < 0.0,
+            "the page transform does not flip, so this proves nothing");
+
+        // The composed scale is what a type size has to be measured in.
+        assert!((on_page.vertical_scale() - 0.75).abs() < 1e-9);
+    }
+
     /// ⚠️ AND THE LINE HAS TO CARRY THAT TRANSFORM OUT OF THE STREAM. This
     /// wraps a fixture's content in the transform above and asks where its
     /// lines say they are. Without the `cm` being tracked, `page_y` is just `y`
@@ -2161,6 +2218,26 @@ mod tests {
             assert!((after.page_y - want).abs() < 0.001,
                 "line at {} reports {} on the page, and the transform puts it at {want}",
                 before.page_y, after.page_y);
+        }
+    }
+
+    /// What the matrices actually are on the real book, before guessing at how
+    /// to compose them.
+    #[test]
+    #[ignore = "probe, and needs a PDF that is not in this repository"]
+    fn what_matrices_a_hindi_line_is_drawn_under() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        for line in lines_of(&doc, page).iter().take(4) {
+            println!("size {:.3}  y {:.2} -> page_y {:.2}  x {:.2}",
+                line.size, line.y, line.page_y, line.x);
+            println!("   ctm {:?}", line.ctm.0);
         }
     }
 

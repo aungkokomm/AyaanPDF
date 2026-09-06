@@ -28293,6 +28293,10 @@ p={spread_px:.4},c={rgba:08X})"
                 w.left, w.right, w.baseline);
             println!("   reading  left {:.4} right {:.4} baseline {:.4}",
                 r.left, r.right, r.baseline);
+            println!("   PDFium   top  {:.4} bottom {:.4}  (height {:.4})",
+                w.top, w.bottom, w.bottom - w.top);
+            println!("   reading  top  {:.4} bottom {:.4}  (height {:.4})  size {:.2}pt",
+                r.top, r.bottom, r.bottom - r.top, r.size);
         }
     }
 
