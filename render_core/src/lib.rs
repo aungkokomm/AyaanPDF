@@ -16949,6 +16949,151 @@ mod tests {
         }
     }
 
+    /// ⚠️ WHAT THE APP'S OWN WORD MODEL MAKES OF A HINDI PAGE. The app already
+    /// edits a WORD, not a line, and shows every word with a reason when it
+    /// cannot be rewritten. The writer works at that same granularity: a
+    /// `recover::Line` on this book is a word. So this asks what the reader is
+    /// being told about each Hindi word today, which is what a wiring phase
+    /// would have to change.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_the_word_model_says_about_a_hindi_page() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let clusters = decode_clusters(handle, 0);
+        let lines = decode_lines(handle, 0);
+        close_document(handle);
+
+        let mut by_reason: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        let mut hindi = 0;
+        for c in &clusters {
+            if !c.text.chars().any(crate::devanagari::is_devanagari) {
+                continue;
+            }
+            hindi += 1;
+            *by_reason.entry(c.refusal).or_default() += 1;
+        }
+        println!("{} PDFium lines, {} word clusters, {hindi} of them carrying devanagari",
+            lines.len(), clusters.len());
+        for (reason, n) in &by_reason {
+            let name = match *reason {
+                CLUSTER_OK => "CLUSTER_OK (the app offers a caret)",
+                CLUSTER_NOT_UPRIGHT => "CLUSTER_NOT_UPRIGHT",
+                CLUSTER_MIXED_STYLE => "CLUSTER_MIXED_STYLE",
+                CLUSTER_SPLIT_OBJECTS => "CLUSTER_SPLIT_OBJECTS",
+                CLUSTER_NO_FONT_NAME => "CLUSTER_NO_FONT_NAME",
+                CLUSTER_NO_OBJECTS => "CLUSTER_NO_OBJECTS",
+                CLUSTER_PARTIAL_SPAN => "CLUSTER_PARTIAL_SPAN",
+                CLUSTER_JUSTIFIED => "CLUSTER_JUSTIFIED",
+                _ => "another refusal",
+            };
+            println!("   {n:5} {name} ({reason})");
+        }
+        for c in clusters.iter()
+            .filter(|c| c.text.chars().any(crate::devanagari::is_devanagari))
+            .take(6)
+        {
+            println!("   {:?} refusal {}", c.text.chars().take(24).collect::<String>(),
+                c.refusal);
+        }
+    }
+
+    /// ⚠️ WHAT HAPPENS IF A READER EDITS ONE OF THOSE WORDS TODAY. The word
+    /// model calls 230 of this page's Hindi words CLUSTER_OK, which is the app
+    /// offering a caret. So this is not academic: does the ordinary writer
+    /// refuse such a word, or does it write something?
+    ///
+    /// ⚠️ AND READING THE TEXT BACK CANNOT ANSWER IT. A shaper turns this
+    /// replacement into FOUR glyphs; the six code points drawn one after another
+    /// read back identically and are visibly wrong on the page. So the glyphs
+    /// are counted, and shaped again to see whether the page draws what a
+    /// shaper would have drawn.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_editing_a_hindi_word_does_today() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let clusters = decode_clusters(handle, 0);
+
+        let Some(word) = clusters.iter().find(|c| {
+            c.refusal == CLUSTER_OK && c.text.chars().any(crate::devanagari::is_devanagari)
+        }) else {
+            println!("no editable Hindi word on this page");
+            close_document(handle);
+            return;
+        };
+        println!("the app would offer a caret in {:?}", word.text);
+
+        const NOW: &str = "नमस्ते";
+        let objects: Vec<u32> = word.objects.iter().map(|&o| o as u32).collect();
+        let status = unsafe {
+            set_word_cluster_text(
+                handle,
+                0,
+                objects.as_ptr(),
+                objects.len(),
+                word.prefix as u32,
+                NOW.as_ptr(),
+                NOW.len(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        println!("   set_word_cluster_text -> {status}");
+        if status != STATUS_OK_PDFIUM {
+            close_document(handle);
+            return;
+        }
+
+        let out = std::env::temp_dir()
+            .join(format!("ayaan-word-edit-{}.pdf", std::process::id()));
+        let c_out = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { save_document(handle, c_out.as_ptr()) }, STATUS_OK_PDFIUM);
+        close_document(handle);
+
+        let doc = lopdf::Document::load(&out).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let font_bytes = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+        let want = crate::reshape::draws(&face, NOW);
+        println!("   a shaper draws it as {} glyphs: {want:?}", want.len());
+
+        // The run the writer produced, found by asking what CHANGED.
+        let before = lopdf::Document::load(FILE).unwrap();
+        let page_before = *before.get_pages().values().next().unwrap();
+        let was: std::collections::BTreeSet<(String, Vec<u16>)> =
+            crate::recover::lines_of(&before, page_before)
+                .into_iter()
+                .map(|l| (format!("{:.1},{:.1}", l.x, l.y), l.glyphs))
+                .collect();
+        for line in crate::recover::lines_of(&doc, page) {
+            let key = format!("{:.1},{:.1}", line.x, line.y);
+            if was.iter().any(|(k, g)| *k == key && *g == line.glyphs) {
+                continue;
+            }
+            println!("   the writer left {} glyphs at {key} in {}: {:?}",
+                line.glyphs.len(), line.base_font, line.glyphs);
+            if line.glyphs == want {
+                println!("      which is exactly what a shaper draws");
+            } else {
+                println!("      which is NOT what a shaper draws");
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
     fn open_fixture() -> u64 {
         open_fixture_named("tests/fixtures/sample.pdf")
     }
