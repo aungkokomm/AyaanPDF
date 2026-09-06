@@ -28300,6 +28300,65 @@ p={spread_px:.4},c={rgba:08X})"
         }
     }
 
+    /// ⚠️ PHASE 5: WHAT A WHOLE HINDI BOOK ACTUALLY GIVES A READER. Every
+    /// number so far has been page 0 of one file. This asks every page of every
+    /// Hindi file on this machine: how much reads, how long the reader waits,
+    /// and what is left over.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_every_page_of_a_hindi_book_gives_a_reader() {
+        const FILES: [&str; 2] = [
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf",
+            r"D:\Ayaan PDF Test file\Chal Hansa Us Des.pdf",
+        ];
+        for file in FILES {
+            if !std::path::Path::new(file).exists() {
+                println!("{} is not on this machine", file.rsplit(char::from(92)).next().unwrap());
+                continue;
+            }
+            println!("\n== {} ==", file.rsplit(char::from(92)).next().unwrap());
+            let handle = open_fixture_named(file);
+            let pages = get_page_count(handle);
+
+            let mut total_read = 0usize;
+            let mut total_lines = 0usize;
+            for page in 0..pages.min(8) {
+                let clock = std::time::Instant::now();
+                prepare_recovery(handle, page);
+                let mut ready = 0;
+                for _ in 0..1200 {
+                    ready = recovery_is_ready(handle, page);
+                    if ready == 1 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                let waited = clock.elapsed();
+                if ready != 1 {
+                    println!("   page {page}: never settled after {waited:?}");
+                    continue;
+                }
+                let lines = recovered_lines(handle, page);
+                let read = lines.iter().filter(|l| !l.text.is_empty()).count();
+                total_read += read;
+                total_lines += lines.len();
+
+                let faces: std::collections::BTreeSet<&str> = lines
+                    .iter()
+                    .filter(|l| !l.text.is_empty())
+                    .map(|l| l.font_path.as_str())
+                    .collect();
+                println!("   page {page}: {read} of {} read in {waited:?}, faces {:?}",
+                    lines.len(),
+                    faces.iter().map(|p| p.rsplit(char::from(92)).next().unwrap())
+                        .collect::<Vec<_>>());
+            }
+            println!("   {total_read} of {total_lines} lines over {} pages",
+                pages.min(8));
+            close_document(handle);
+        }
+    }
+
     fn read_recovered(handle: u64) -> Vec<(f32, String)> {
         read_recovered_page(handle, 0)
     }

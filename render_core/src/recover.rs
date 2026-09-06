@@ -2241,6 +2241,57 @@ mod tests {
         }
     }
 
+    /// ⚠️ WHAT THE LINES THAT DO NOT READ ACTUALLY ARE. 3,114 of 8,499 is
+    /// the honest figure for the book, and on its own it reads as a third. But
+    /// a "line" here is a PLACEMENT, and this book places its page numbers, its
+    /// punctuation and its Latin in fonts no Devanagari face has any business
+    /// naming. This asks how many of the unread ones were ever candidates.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_the_lines_that_do_not_read_are() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let indexes = indexes_for_document(&doc);
+
+        let mut no_index = 0usize;
+        let mut refused = 0usize;
+        let mut read = 0usize;
+        let mut one_glyph = 0usize;
+        let mut by_font: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+
+        for (_, &page) in doc.get_pages().iter() {
+            let readings = read_page_with(&doc, page, &indexes);
+            for (line, reading) in lines_of(&doc, page).iter().zip(&readings) {
+                let entry = by_font.entry(line.base_font.clone()).or_default();
+                entry.1 += 1;
+                if reading.text.is_some() {
+                    read += 1;
+                    entry.0 += 1;
+                } else if indexes.index_for(&line.base_font).is_none() {
+                    no_index += 1;
+                } else if line.glyphs.len() <= 1 {
+                    one_glyph += 1;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+        println!("{read} read");
+        println!("{no_index} in a font no Devanagari face names at all");
+        println!("{one_glyph} a single glyph in a font that IS named");
+        println!("{refused} refused though the font is named and there is more than one glyph");
+        println!("\nper font, read of total:");
+        for (font, (ok, all)) in &by_font {
+            println!("   {font:16} {ok:5} of {all:5}   index: {}",
+                if indexes.index_for(font).is_some() { "yes" } else { "no" });
+        }
+    }
+
     fn an_index_of(bytes: &[u8], text: &str) -> Indexes {
         let chars: BTreeSet<char> = text.chars().collect();
         let index = crate::reshape::Index::build(bytes, Some(&chars), None).unwrap();
