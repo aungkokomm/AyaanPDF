@@ -323,6 +323,28 @@ static MODEL_CACHE: Mutex<Option<((u64, i32), CachedModel)>> = Mutex::new(None);
 static MODEL_HITS: Mutex<std::collections::BTreeMap<u64, u64>> =
     Mutex::new(std::collections::BTreeMap::new());
 
+/// How many times `get_form_fields` has walked a document's pages.
+///
+/// ⚠️ THIS EXISTS BECAUSE THE ALTERNATIVE WAS A STOPWATCH. The claim being
+/// tested is that a document declaring an empty form does not walk its pages,
+/// and the first test asked that by timing the two routes against each other.
+/// It passed alone and failed in the parallel suite, where contention inflated
+/// a 4 ms answer and a 15 ms walk to 112 ms and 117 ms and closed the gap. A
+/// count says the thing itself, and says it the same on any machine.
+///
+/// Per document, for the reason MODEL_HITS is: a single number is every
+/// document's walks added together, which no test can ask a question about
+/// while other tests are running.
+#[cfg(test)]
+static FIELD_WALKS: Mutex<std::collections::BTreeMap<u64, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// How many times this document's pages have been walked for form fields.
+#[cfg(test)]
+fn field_walks_for(handle: u64) -> u64 {
+    lock(&FIELD_WALKS).get(&handle).copied().unwrap_or(0)
+}
+
 
 /// Binds PDFium once (relative to the host executable's directory — see
 /// module docs on why cwd can't be trusted) and reuses that single instance
@@ -8584,6 +8606,11 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     out.extend_from_slice(&0u32.to_le_bytes()); // count placeholder, backfilled below
     let mut count: u32 = 0;
 
+    #[cfg(test)]
+    {
+        *lock(&FIELD_WALKS).entry(doc_handle).or_default() += 1;
+    }
+
     for (page_index, page) in doc_guard.pages().iter().enumerate() {
         let page_w = page.width().value;
         if page_w <= 0.0 {
@@ -16729,14 +16756,13 @@ mod tests {
 
     /// ⚠️ WHAT THE GATE IS WORTH. Both routes give the SAME answer -- PDFium
     /// reports no fields for a widget the catalog does not list either -- so
-    /// the only thing observable from outside is the time, and the time is the
-    /// entire point: 62.6 SECONDS on a 39,881-page book, which was most of the
-    /// two minutes it took to open.
+    /// what the fix changes is only whether the pages are walked at all, and on
+    /// a 39,881-page book that walk was 62.6 SECONDS, most of the two minutes
+    /// it took to open.
     ///
     /// Forgetting where the document came from is what the replace and close
     /// paths do, and it is also the only way to make this same call take the
-    /// walk again. So the walk is the test's own control, and there is no
-    /// absolute millisecond limit here to go stale on a faster machine.
+    /// walk again. So the walk is the test's own control.
     #[test]
     fn a_declared_but_empty_form_does_not_cost_a_walk_through_every_page() {
         let path = fixture_with_an_empty_acroform(
@@ -16744,28 +16770,18 @@ mod tests {
         let handle = open_fixture_named(path.to_str().unwrap());
         assert_eq!(get_page_count(handle), 300);
 
-        let clock = std::time::Instant::now();
         let asked = read_form_field_count(handle);
-        let asking = clock.elapsed();
+        assert_eq!(field_walks_for(handle), 0, "the pages were walked anyway");
 
-        // Two, not some larger factor: with the gate gone both calls take
-        // the SAME walk, so anything above one separates them, and the real
-        // book's margin is 132x rather than this fixture's four.
         // The control: the same call on the same document, with no file to
         // ask, which is exactly the code that ran before this gate existed.
         lock(&core().sources).remove(&handle);
-        let clock = std::time::Instant::now();
         let walked = read_form_field_count(handle);
-        let walking = clock.elapsed();
+        assert_eq!(field_walks_for(handle), 1,
+            "the control did not walk either, so this test proves nothing");
 
-        println!("   300 pages: asked {asking:?}, walked {walking:?}");
         assert_eq!(asked, 0);
         assert_eq!(walked, asked, "the two routes disagree about the fields");
-        assert!(
-            asking * 2 < walking,
-            "asking the catalog took {asking:?} against a {walking:?} walk, so \
-             the pages are still being walked"
-        );
 
         close_document(handle);
         let _ = std::fs::remove_file(&path);

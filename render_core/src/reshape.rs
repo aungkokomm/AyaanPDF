@@ -219,6 +219,21 @@ pub(crate) fn draws(face: &rustybuzz::Face, text: &str) -> Vec<u16> {
 }
 
 impl Index {
+    /// Builds an index from spellings ALREADY enumerated and shaped.
+    ///
+    /// The walk this feeds, and `prove` above it, know nothing about Burmese:
+    /// they match glyph runs against a map and demand the reading shape back to
+    /// the same glyphs. Only the enumeration below is Burmese, so a script that
+    /// enumerates its own clusters can use everything else unchanged.
+    /// [`crate::devanagari`] does exactly that.
+    pub(crate) fn from_spellings(
+        spells: impl IntoIterator<Item = (Vec<u16>, String)>,
+    ) -> Index {
+        let says: HashMap<Vec<u16>, String> = spells.into_iter().collect();
+        let longest = says.keys().map(|g| g.len()).max().unwrap_or(1).max(1);
+        Index { says, longest }
+    }
+
     /// Builds the index by shaping every syllable the script allows.
     ///
     /// `chars` and `glyphs`, when given, keep only the syllables spelled with
@@ -384,6 +399,26 @@ mod tests {
         r"%USERPROFILE%\AppData\Local\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf",
         r"C:\Windows\Fonts\Pyidaungsu.ttf",
     ];
+
+    /// An index can be filled by whoever enumerated the clusters, and the walk
+    /// above it does not care who that was.
+    #[test]
+    fn an_index_built_from_given_spellings_reads_them_back() {
+        let index = Index::from_spellings([
+            (vec![10u16, 11], "\u{0915}\u{094D}\u{0937}".to_string()),
+            (vec![12u16], "\u{0930}".to_string()),
+        ]);
+
+        assert_eq!(index.read(&[10, 11]).as_deref(), Some("\u{0915}\u{094D}\u{0937}"));
+        assert_eq!(index.read(&[12]).as_deref(), Some("\u{0930}"));
+        assert_eq!(
+            index.read(&[10, 11, 12]).as_deref(),
+            Some("\u{0915}\u{094D}\u{0937}\u{0930}"),
+            "the walk should join two spellings"
+        );
+        assert_eq!(index.read(&[99]), None, "a glyph nothing spells must not read");
+    }
+
 
     /// Real Burmese, with the reordering and conjuncts that make the glyph
     /// order differ from the typing order.

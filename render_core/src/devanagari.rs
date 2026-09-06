@@ -188,6 +188,34 @@ impl Tables {
     }
 }
 
+/// Which installed Devanagari face a font drawing `glyphs` is, by EVIDENCE.
+///
+/// ⚠️ NEVER BY NAME. The producer of a real book names its fonts `CIDFont+F2`
+/// and `CIDFont+F7`, which say nothing whatever, and asking the font registry
+/// is no better: the user's own Pyidaungsu install reads zero. So the face is
+/// the one that can name the most of what the page actually draws.
+///
+/// ⚠️ A WRONG ANSWER HERE CANNOT PRODUCE A WRONG READING, which is why the bar
+/// is where it is rather than higher. Every reading built on this index is
+/// shaped again and must return the page's own glyphs, so a face that is not
+/// the right one simply fails to read, at a cost of about fifty milliseconds.
+pub(crate) fn face_of(glyphs: &BTreeSet<u16>) -> Option<&'static str> {
+    let wanted: BTreeMap<u16, usize> = glyphs.iter().map(|g| (*g, 1)).collect();
+    match best_face(&wanted) {
+        Some((path, _, share)) if share >= NOT_WORTH_IT => Some(path),
+        _ => None,
+    }
+}
+
+/// What this face draws, as the index the recovery walker reads lines with.
+///
+/// The reader here needs only [`Tables`], which is a different shape; this is
+/// for the WRITER, which finds a line by reading its glyphs back through
+/// `crate::recover` and must therefore be handed that module's index type.
+pub(crate) fn reading_index(face: &rustybuzz::Face) -> crate::reshape::Index {
+    crate::reshape::Index::from_spellings(spellings(face))
+}
+
 /// The glyph sequence each cluster draws, inverted.
 fn spellings(face: &rustybuzz::Face) -> BTreeMap<Vec<u16>, String> {
     let mut spells: BTreeMap<Vec<u16>, String> = BTreeMap::new();
@@ -504,12 +532,12 @@ fn tables_for(path: &'static str) -> Option<Arc<Tables>> {
 }
 
 /// The face that accounts for the most of what a page needs naming.
-fn best_face(wanted: &BTreeMap<u16, usize>) -> Option<(Arc<Tables>, f64)> {
+fn best_face(wanted: &BTreeMap<u16, usize>) -> Option<(&'static str, Arc<Tables>, f64)> {
     let asked: usize = wanted.values().sum();
     if asked == 0 {
         return None;
     }
-    let mut best: Option<(Arc<Tables>, f64)> = None;
+    let mut best: Option<(&'static str, Arc<Tables>, f64)> = None;
     for path in CANDIDATES {
         let Some(tables) = tables_for(path) else { continue };
         let named: usize = wanted
@@ -518,8 +546,8 @@ fn best_face(wanted: &BTreeMap<u16, usize>) -> Option<(Arc<Tables>, f64)> {
             .map(|(_, n)| n)
             .sum();
         let share = named as f64 / asked as f64;
-        if best.as_ref().is_none_or(|(_, b)| share > *b) {
-            best = Some((tables, share));
+        if best.as_ref().is_none_or(|(_, _, b)| share > *b) {
+            best = Some((path, tables, share));
         }
         if share >= CLEARLY {
             break;
@@ -549,7 +577,7 @@ pub(crate) fn repair_page(texts: &mut [String]) {
     if wanted.is_empty() {
         return;
     }
-    let Some((tables, share)) = best_face(&wanted) else { return };
+    let Some((_, tables, share)) = best_face(&wanted) else { return };
     if share < NOT_WORTH_IT {
         return;
     }
@@ -644,7 +672,7 @@ mod tests {
         let picked = best_face(&wanted);
         let took = clock.elapsed();
         match picked {
-            Some((_, share)) => println!(
+            Some((_, _, share)) => println!(
                 "   resolved to a face naming {:.0}% in {took:?}", share * 100.0),
             None => println!("   no face resolved, in {took:?}"),
         }
@@ -679,6 +707,34 @@ mod tests {
         assert_eq!(syllable_end("क्षत"), Some("क्ष".len()));
         assert_eq!(syllable_end("कत"), Some("क".len()));
         assert_eq!(syllable_end(" क"), None);
+    }
+
+    /// ⚠️ A FACE IS CLAIMED ON EVIDENCE, SO IT MUST BE REFUSABLE. The glyph ids
+    /// of a Latin CID font are perfectly good ids in a Devanagari face too, and
+    /// claiming one for them would build an index that reads a book's English
+    /// as Hindi. Nothing names these, so nothing may claim them.
+    #[test]
+    fn a_face_is_not_claimed_for_glyphs_it_cannot_name() {
+        if !std::path::Path::new(CANDIDATES[0]).exists() {
+            return;
+        }
+        let nonsense: BTreeSet<u16> = (60_000u16..60_040).collect();
+        assert_eq!(face_of(&nonsense), None,
+            "a face was claimed for glyphs no face can name");
+    }
+
+    /// And the same question answered the other way, so the refusal above is
+    /// not just a function that always says no.
+    #[test]
+    fn the_face_a_real_devanagari_page_uses_is_recognised() {
+        if !std::path::Path::new(CANDIDATES[0]).exists() {
+            return;
+        }
+        // The ids a real book's Hindi is drawn with: the reph, three conjuncts
+        // and a handful of ordinary letters, all named by Nirmala.
+        let drawn: BTreeSet<u16> =
+            [330u16, 366, 700, 407, 361, 389, 352, 544, 681, 336, 339].into_iter().collect();
+        assert!(face_of(&drawn).is_some(), "a real page's glyphs resolved to no face");
     }
 
     /// ⚠️ THE READING THIS EXISTS FOR. Every one of these was read off a real

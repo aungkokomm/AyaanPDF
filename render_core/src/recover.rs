@@ -1130,11 +1130,28 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
     // over for the same font, and the two halves cannot even read each other's
     // syllables. Measured on a real three-page file: 40.5s for two names
     // against the one face they share.
-    let mut per_face: BTreeMap<&'static str, BTreeSet<u16>> = BTreeMap::new();
+    // ⚠️ AND WHICH SCRIPT'S CLUSTERS FILL EACH FACE'S INDEX. The walk that
+    // reads a line is not Burmese, but the ENUMERATION that fills its index is,
+    // and pouring Burmese syllables through a Devanagari font produces an index
+    // that reads nothing. Measured on a real Hindi book: 14.3 seconds to build
+    // an index that located 0 of its 1,386 lines.
+    let mut per_face: BTreeMap<&'static str, (BTreeSet<u16>, Script)> = BTreeMap::new();
     let mut face_of: BTreeMap<&String, &'static str> = BTreeMap::new();
     for (base_font, glyphs) in wanted {
-        let Some(path) = installed(base_font) else { continue };
-        per_face.entry(path).or_default().extend(glyphs.iter().copied());
+        // ⚠️ AND WHEN THE NAME SAYS NOTHING, ASK THE GLYPHS. `installed` reads
+        // a family out of the font's name, which works for the producers that
+        // write one. A real Hindi book names all seven of its fonts
+        // `CIDFont+F1`..`CIDFont+F7`, so every line on every page was refused
+        // here before the reading even began.
+        let (path, script) = match installed(base_font) {
+            Some(path) => (path, Script::Burmese),
+            None => match crate::devanagari::face_of(glyphs) {
+                Some(path) => (path, Script::Devanagari),
+                None => continue,
+            },
+        };
+        let entry = per_face.entry(path).or_insert_with(|| (BTreeSet::new(), script));
+        entry.0.extend(glyphs.iter().copied());
         face_of.insert(base_font, path);
     }
 
@@ -1148,8 +1165,20 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
         .lock()
         .unwrap_or_else(|held| held.into_inner());
 
-    for (path, glyphs) in &per_face {
+    for (path, (glyphs, script)) in &per_face {
         let Ok(bytes) = std::fs::read(path) else { continue };
+
+        // ⚠️ NO PROGRESS CARD FOR A BUILD THIS SHORT. The Devanagari
+        // enumeration is bounded to a few thousand clusters and shapes in about
+        // fifty milliseconds, against twenty-odd seconds for Burmese, so a
+        // reader would see the card appear and vanish for no reason.
+        if *script == Script::Devanagari {
+            let Some(face) = rustybuzz::Face::from_slice(&bytes, 0) else { continue };
+            let index = crate::devanagari::reading_index(&face);
+            drop(face);
+            built.insert(path, Arc::new((bytes, index)));
+            continue;
+        }
 
         // ⚠️ REPORTED PER FACE, because that is where the total is known. In
         // practice there is one: the whole reason this groups by face is that
@@ -1176,6 +1205,18 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
         }
     }
     Indexes { by_font }
+}
+
+/// Which script's clusters have to be enumerated to fill a face's index.
+///
+/// ⚠️ NOT WHAT THE FACE CONTAINS, but what this document is using it FOR. The
+/// walk that reads a line is script-agnostic; only the list of candidate
+/// clusters is not, and pouring one script's list through another's font
+/// produces an index that reads nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Burmese,
+    Devanagari,
 }
 
 /// Whether a font by this name is one that can be read.
@@ -4947,6 +4988,147 @@ mod tests {
     /// page gives. Local to this measurement on purpose: putting it in
     /// `installed` would make every Hindi page look worth RECOVERING, and
     /// recovery means enumerating Burmese.
+    /// ⚠️ WHAT STOPS THE EXISTING WRITER FROM TOUCHING A HINDI LINE. `retype`
+    /// is not Myanmar-specific: it takes a font path and two plain strings. But
+    /// it finds the line by reading its glyphs back through `recover::Indexes`,
+    /// and that index is keyed on the page's font NAME. This asks what those
+    /// names are on a real Hindi file and what the index makes of them.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_the_writer_makes_of_a_hindi_page() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+
+        let lines = lines_of(&doc, page);
+        let mut by_font: BTreeMap<String, usize> = BTreeMap::new();
+        for line in &lines {
+            *by_font.entry(line.base_font.clone()).or_default() += 1;
+        }
+        println!("{} lines on page 0, drawn by:", lines.len());
+        for (font, n) in &by_font {
+            println!("   {n:5} lines  {font:24}  installed() -> {:?}", installed(font));
+        }
+
+        let clock = std::time::Instant::now();
+        let indexes = indexes_for_document(&doc);
+        println!("\nindexes_for_document took {:?}, empty: {}",
+            clock.elapsed(), indexes.is_empty());
+        for font in by_font.keys() {
+            println!("   index_for({font:24}) -> {}",
+                if indexes.index_for(font).is_some() { "an index" } else { "NOTHING" });
+        }
+    }
+
+    /// ⚠️ THE RISKY END OF EDITING HINDI, ASKED FIRST. The writer finds a line
+    /// by reading its glyphs back through `recover::read_line` and demanding
+    /// the caller's text. That walk is not Burmese; only the enumeration that
+    /// fills its index is. So: fill one with DEVANAGARI clusters and ask the
+    /// same walk to read a real Hindi page.
+    ///
+    /// If it reads, editing Hindi is mostly wiring the existing writer up. If
+    /// it does not, the writer needs a route of its own and this is a much
+    /// larger piece of work.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF and fonts that are not in this repository"]
+    fn whether_the_writers_walk_can_read_a_hindi_line() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        const NIRMALA: &str = r"C:\Windows\Fonts\Nirmala.ttf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(NIRMALA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let font_bytes = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+
+        let clock = std::time::Instant::now();
+        let index = crate::devanagari::reading_index(&face);
+        println!("built a devanagari index in {:?}", clock.elapsed());
+
+        let lines = lines_of(&doc, page);
+        let mut read = 0;
+        let mut devanagari_lines = 0;
+        let mut shown = 0;
+        for line in &lines {
+            // Only the runs long enough to be words; a one-glyph line proves
+            // nothing either way.
+            if line.glyphs.len() < 4 {
+                continue;
+            }
+            devanagari_lines += 1;
+            match read_line(&index, &face, line) {
+                Some(text) if text.chars().any(crate::devanagari::is_devanagari) => {
+                    read += 1;
+                    if shown < 8 {
+                        shown += 1;
+                        println!("   READ {:?}", text.chars().take(48).collect::<String>());
+                    }
+                }
+                _ => {}
+            }
+        }
+        println!("\n{read} of {devanagari_lines} runs read by the writer's own walk");
+    }
+
+    /// ⚠️ THE WRITER'S OWN CHECK, ON A REAL HINDI PAGE. `retype` refuses unless
+    /// it can find the line the caller means, and it finds it by reading the
+    /// line's glyphs back through this index and demanding the caller's text.
+    /// On a book naming its fonts `CIDFont+F1`..`F7` that index was EMPTY, so
+    /// every Hindi line was refused before the writer looked at it.
+    ///
+    /// This asks for the whole chain: the fonts resolve by evidence, the index
+    /// fills with Devanagari, and a line reads back as the words on the page.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF and fonts that are not in this repository"]
+    fn a_hindi_line_can_be_found_the_way_the_writer_finds_one() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+
+        let clock = std::time::Instant::now();
+        let indexes = indexes_for_document(&doc);
+        let built = clock.elapsed();
+        assert!(!indexes.is_empty(), "the fonts still resolve to nothing");
+        println!("indexes_for_document took {built:?}");
+
+        // Every line the writer could now locate, and what it would call it.
+        let lines = lines_of(&doc, page);
+        let mut found = 0;
+        let mut shown = 0;
+        for line in &lines {
+            let Some(entry) = indexes.by_font.get(&line.base_font) else { continue };
+            let Some(face) = rustybuzz::Face::from_slice(&entry.0, 0) else { continue };
+            let Some(text) = read_line(&entry.1, &face, line) else { continue };
+            if !text.chars().any(crate::devanagari::is_devanagari) {
+                continue;
+            }
+            found += 1;
+            if shown < 6 {
+                shown += 1;
+                println!("   at y={:.1}: {:?}", line.y,
+                    text.chars().take(40).collect::<String>());
+            }
+        }
+        println!("\n{found} of {} lines can now be located by the writer", lines.len());
+        assert!(found > 0, "no line reads, so the writer still cannot find one");
+    }
+
     fn devanagari_file(base_font: &str) -> Option<&'static str> {
         let name = base_font.to_lowercase();
         let bold = name.contains("bold");
