@@ -188,6 +188,48 @@ impl Tables {
     }
 }
 
+/// Whether this font's own `/ToUnicode` says it draws Devanagari at all.
+///
+/// ⚠️ THE GLYPH EVIDENCE CANNOT ANSWER THIS, and believing it cost a real
+/// bug. A Devanagari face names low glyph ids as ordinary letters, and a Latin
+/// subset numbers its glyphs from 1, so the two coincide: measured, a page of
+/// Arial and Times scored 0.88 and 0.76 against Aparajita while the actual
+/// Hindi book scored 0.81 and 0.86. There is no threshold between those.
+///
+/// So the FONT is asked instead. The whole premise of the repair is that a
+/// producer's `/ToUnicode` covers most characters and misses some, which is
+/// why a Hindi line arrives already carrying Devanagari; a font that draws
+/// Devanagari therefore says so here, and one that draws Latin does not.
+///
+/// This is the same rule `repair_page` follows when it refuses to touch a line
+/// that carries no Devanagari, and for the same reason.
+pub(crate) fn font_claims_devanagari(doc: &lopdf::Document, font: &lopdf::Dictionary) -> bool {
+    let Ok(entry) = font.get(b"ToUnicode") else { return false };
+    let stream = match entry {
+        lopdf::Object::Reference(id) => {
+            doc.get_object(*id).ok().and_then(|o| o.as_stream().ok()).cloned()
+        }
+        lopdf::Object::Stream(st) => Some(st.clone()),
+        _ => return false,
+    };
+    let Some(stream) = stream else { return false };
+    let cmap = stream
+        .decompressed_content()
+        .unwrap_or_else(|_| stream.content.clone());
+
+    // Every hex string in the map, read as the UTF-16BE the destinations are
+    // written in. A source CODE could in principle sit in the Devanagari range
+    // too, but on the files this exists for the codes ARE glyph ids, which land
+    // in Latin Extended and nowhere near it.
+    crate::justified::tokenize_cmap(&cmap).iter().any(|token| {
+        let crate::justified::CmapToken::Hex(bytes) = token else { return false };
+        bytes
+            .chunks_exact(2)
+            .filter_map(|pair| char::from_u32(u32::from(u16::from_be_bytes([pair[0], pair[1]]))))
+            .any(is_devanagari)
+    })
+}
+
 /// The face a font of this FAMILY is, when the name is a real one.
 ///
 /// ⚠️ THIS IS FOR THE FONTS THAT DO HAVE NAMES, and the first of them is our
@@ -238,6 +280,16 @@ pub(crate) fn face_of(glyphs: &BTreeSet<u16>) -> Option<&'static str> {
         Some((path, _, share)) if share >= NOT_WORTH_IT => Some(path),
         _ => None,
     }
+}
+
+/// What the evidence actually looks like, for choosing where the bar goes.
+#[cfg(test)]
+pub(crate) fn evidence_for(glyphs: &BTreeSet<u16>) -> Option<(&'static str, f64, usize)> {
+    let wanted: BTreeMap<u16, usize> = glyphs.iter().map(|g| (*g, 1)).collect();
+    best_face(&wanted).map(|(path, tables, share)| {
+        let named = glyphs.iter().filter(|g| tables.names(**g)).count();
+        (path, share, named)
+    })
 }
 
 /// What this face draws, as the index the recovery walker reads lines with.

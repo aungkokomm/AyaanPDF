@@ -29,6 +29,14 @@ public class RecoveredLineTests
             float pdfBaseline, float left, float top, float right, float bottom,
             float baseline, float size, string text, string font,
             params (int From, int To, float Left, float Right)[] clusters)
+            => Line(pdfBaseline, left, top, right, bottom, baseline, size, text, font,
+                    @"C:\Windows\Fonts\mmrtext.ttf", clusters);
+
+        /// <summary>The same, saying which FILE the face resolved to.</summary>
+        public Builder Line(
+            float pdfBaseline, float left, float top, float right, float bottom,
+            float baseline, float size, string text, string font, string fontPath,
+            params (int From, int To, float Left, float Right)[] clusters)
         {
             _count++;
             F32(pdfBaseline);
@@ -36,6 +44,7 @@ public class RecoveredLineTests
             F32(size);
             Str(text);
             Str(font);
+            Str(fontPath);
             U32((uint)clusters.Length);
             foreach (var c in clusters)
             {
@@ -198,6 +207,7 @@ public class RecoveredLineTests
             PdfBaseline: 700 - (baseline * 1000), Left: edges[0], Top: baseline - 0.01,
             Right: edges[^1], Bottom: baseline + 0.004, Baseline: baseline,
             FontSizePts: 11, Text: text, FontName: "BCDEEE+MyanmarText",
+            FontPath: @"C:\Windows\Fonts\mmrtext.ttf",
             Clusters: clusters);
     }
 
@@ -385,7 +395,7 @@ public class RecoveredLineTests
     public void a_line_with_no_clusters_offers_no_caret_at_all()
     {
         var line = new RecoveredLine(
-            700, 0, 0, 0, 0, 0, 0, string.Empty, string.Empty,
+            700, 0, 0, 0, 0, 0, 0, string.Empty, string.Empty, string.Empty,
             Array.Empty<RecoveredCluster>());
 
         Assert.Empty(EditGlyphs.Of(line, "#000000"));

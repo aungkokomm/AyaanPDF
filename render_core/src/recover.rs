@@ -253,6 +253,36 @@ pub(crate) fn fonts_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, (Str
     out
 }
 
+/// The page's CID fonts that say they draw Devanagari.
+///
+/// Both halves matter. A font arrives wearing its own glyph ids only where the
+/// encoding is Identity-H, which is what declaring `/W` says; and whether it
+/// draws Devanagari at all is a question only the font can answer, because the
+/// glyph ids of a Latin subset and of a Devanagari face overlap almost exactly.
+fn devanagari_fonts_of(doc: &Document, page: ObjectId) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(page_dict) = doc.get_dictionary(page).ok() else { return out };
+    let Some(resources) = page_dict.get(b"Resources").ok().and_then(|o| dictionary(doc, o))
+    else {
+        return out;
+    };
+    let Some(fonts) = resources.get(b"Font").ok().and_then(|o| dictionary(doc, o)) else {
+        return out;
+    };
+    for (_, obj) in fonts.iter() {
+        let Object::Reference(id) = obj else { continue };
+        if crate::shaped::cid_widths(doc, *id).is_none() {
+            continue;
+        }
+        let Some(font) = dictionary(doc, obj) else { continue };
+        let Ok(base) = font.get(b"BaseFont").and_then(|o| o.as_name()) else { continue };
+        if crate::devanagari::font_claims_devanagari(doc, &font) {
+            out.insert(String::from_utf8_lossy(base).to_string());
+        }
+    }
+    out
+}
+
 /// Every line the page draws, in the order it draws them.
 // The accumulator reset inside `finish!` is read by every expansion except the
 // last one, which is the only place the compiler can see.
@@ -950,6 +980,14 @@ pub(crate) struct Reading {
 #[derive(Default)]
 pub(crate) struct Indexes {
     by_font: BTreeMap<String, Arc<(Vec<u8>, crate::reshape::Index)>>,
+    /// The installed file each font resolved to.
+    ///
+    /// WARN THE CALLER CANNOT WORK THIS OUT FROM THE NAME. A real Hindi book
+    /// names its fonts `CIDFont+F1`..`F7`, which the app looked up, failed to
+    /// find, and reported as "CIDFont+F2 is not installed on this machine".
+    /// The face was resolved HERE, by evidence, so the answer belongs here and
+    /// travels with the reading.
+    paths: BTreeMap<String, &'static str>,
 }
 
 impl Indexes {
@@ -961,6 +999,11 @@ impl Indexes {
     /// What this font draws, if it is one that can be read.
     pub(crate) fn index_for(&self, base_font: &str) -> Option<&crate::reshape::Index> {
         self.by_font.get(base_font).map(|face| &face.1)
+    }
+
+    /// The installed file this font was read with, if any.
+    pub(crate) fn path_for(&self, base_font: &str) -> Option<&'static str> {
+        self.paths.get(base_font).copied()
     }
 }
 
@@ -1204,12 +1247,14 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
     }
 
     let mut by_font = BTreeMap::new();
+    let mut paths = BTreeMap::new();
     for (base_font, path) in face_of {
         if let Some(face) = built.get(path) {
             by_font.insert(base_font.clone(), Arc::clone(face));
+            paths.insert(base_font.clone(), path);
         }
     }
-    Indexes { by_font }
+    Indexes { by_font, paths }
 }
 
 /// Which script's clusters have to be enumerated to fill a face's index.
@@ -1237,7 +1282,38 @@ pub(crate) fn can_read(base_font: &str) -> bool {
 /// Whether this page draws anything in a font that can be read, which is what
 /// says whether building an index for it is worth 17 seconds.
 pub(crate) fn worth_reading(doc: &Document, page: ObjectId) -> bool {
-    lines_of(doc, page).iter().any(|l| can_read(&l.base_font))
+    let lines = lines_of(doc, page);
+    if lines.iter().any(|l| can_read(&l.base_font)) {
+        return true;
+    }
+
+    // ⚠️ AND A FONT WHOSE NAME SAYS NOTHING IS STILL WORTH READING. This
+    // asked `can_read`, which asks a NAME, and a real Hindi book names all
+    // seven of its fonts `CIDFont+F1`..`F7`. Every page of every such book
+    // answered no here and settled with nothing, so the app dutifully asked for
+    // a recovery that was never prepared and offered the reader no way in.
+    //
+    // ⚠️ AND ONLY OF THE CID FONTS. Asking a face which glyphs it can name
+    // means building its tables, and doing that for every candidate takes over
+    // a second the first time. A page of ordinary Latin has nothing to gain
+    // from the question: text arrives wearing its own glyph ids only where the
+    // font is CID and Identity-H, which is what declaring `/W` says. Measured
+    // by a test that timed out waiting for a Latin page to settle.
+    let cid: BTreeSet<String> = devanagari_fonts_of(doc, page);
+    if cid.is_empty() {
+        return false;
+    }
+
+    let mut by_font: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+    for line in lines.iter().filter(|l| cid.contains(&l.base_font)) {
+        by_font
+            .entry(line.base_font.clone())
+            .or_default()
+            .extend(line.glyphs.iter().copied());
+    }
+    by_font
+        .values()
+        .any(|glyphs| crate::devanagari::face_of(glyphs).is_some())
 }
 
 /// Everything a page says that can be PROVEN, line by line.
@@ -1950,6 +2026,7 @@ mod tests {
             by_font: [("BCDEEE+MyanmarText".to_string(), std::sync::Arc::new((bytes.to_vec(), index)))]
                 .into_iter()
                 .collect(),
+            paths: BTreeMap::new(),
         }
     }
 
@@ -5689,7 +5766,7 @@ mod tests {
                     println!("   {font}: no index (the font draws none of these glyphs)");
                     continue;
                 };
-                let mut indexes = Indexes { by_font: BTreeMap::new() };
+                let mut indexes = Indexes { by_font: BTreeMap::new(), paths: BTreeMap::new() };
                 indexes.by_font.insert(font.clone(), Arc::new((bytes.clone(), index)));
 
                 let read = read_page_with(&doc, page, &indexes);
@@ -6089,6 +6166,7 @@ mod tests {
             by_font: [("BCDEEE+MyanmarText".to_string(), std::sync::Arc::new((bytes, index)))]
                 .into_iter()
                 .collect(),
+            paths: BTreeMap::new(),
         };
         let read = read_page_with(&doc, page, &indexes);
         let one = read.into_iter().next().expect("no line");
@@ -6198,6 +6276,7 @@ mod tests {
             by_font: [("BCDEEE+MyanmarText".to_string(), std::sync::Arc::new((bytes, index)))]
                 .into_iter()
                 .collect(),
+            paths: BTreeMap::new(),
         };
         let one = read_page_with(&doc, page, &indexes).into_iter().next().unwrap();
         let text = one.text.expect("nothing read");

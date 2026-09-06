@@ -189,6 +189,23 @@ public class RecoveryWiringTests
     }
 
     /// <summary>
+    /// One method's source, from its signature to the start of the next member.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NOT A FIXED NUMBER OF CHARACTERS. This was `vm[at..(at + 2600)]`, and
+    /// adding seven lines of comment to the method under test silently moved
+    /// its tail outside the window, so two tests failed for having nothing to
+    /// look at rather than for anything being wrong.
+    /// </remarks>
+    private static string MethodBodyAt(string source, int at)
+    {
+        int end = source.IndexOf("\n    private ", at + 1, StringComparison.Ordinal);
+        int alt = source.IndexOf("\n    public ", at + 1, StringComparison.Ordinal);
+        if (alt >= 0 && (end < 0 || alt < end)) { end = alt; }
+        return end < 0 ? source[at..] : source[at..end];
+    }
+
+    /// <summary>
     /// ⚠️ CAPTURED BEFORE, PUSHED AFTER, exactly as a form edit does it. The
     /// core changes nothing when it refuses, and an entry pushed anyway would be
     /// a Ctrl+Z that appears to do nothing.
@@ -199,7 +216,7 @@ public class RecoveryWiringTests
         string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
         int at = vm.IndexOf("private bool EditRecoveredLine(", StringComparison.Ordinal);
         Assert.True(at > 0);
-        string body = vm[at..(at + 2600)];
+        string body = MethodBodyAt(vm, at);
 
         int captured = body.IndexOf("Capture(HistoryScope.Document", StringComparison.Ordinal);
         int wrote = body.IndexOf("RecoveryGateway.Retype(", StringComparison.Ordinal);
@@ -225,7 +242,7 @@ public class RecoveryWiringTests
     {
         string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
         int at = vm.IndexOf("private bool EditRecoveredLine(", StringComparison.Ordinal);
-        string body = vm[at..(at + 2600)];
+        string body = MethodBodyAt(vm, at);
 
         Assert.Contains("RestoreDocumentBytes(bytes);", body, StringComparison.Ordinal);
         Assert.Contains("_linesByPage.Clear();", body, StringComparison.Ordinal);

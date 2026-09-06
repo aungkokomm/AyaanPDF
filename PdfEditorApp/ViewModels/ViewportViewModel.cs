@@ -5399,7 +5399,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // ⚠️ AN INSTALLED FONT, NEVER THE SUBSET THE FILE EMBEDS. A subset has
         // its layout tables pruned, and shaping Burmese through one was
         // measured giving two .notdef and seven wrong glyphs out of twenty-four.
-        string? fontPath = SystemFontMatch.PathFor(line.FontName);
+        //
+        // ⚠️ AND THE CORE'S ANSWER FIRST, because for some documents it is the
+        // only one there is. A real Hindi book names its fonts CIDFont+F1..F7,
+        // which name nothing and no lookup can resolve; the core worked out
+        // which face they are from the glyphs they draw, and it worked it out
+        // in order to READ the line in the first place. Deriving it again from
+        // the name here would refuse a line the core has already read.
+        string? fontPath = string.IsNullOrEmpty(recovered.FontPath)
+            ? SystemFontMatch.PathFor(line.FontName)
+            : recovered.FontPath;
         if (fontPath is null)
         {
             // ⚠️ WITHOUT THE SUBSET TAG, which is the producer's bookkeeping

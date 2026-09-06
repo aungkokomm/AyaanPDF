@@ -56,6 +56,7 @@ public static class RecoveredLineReader
 
             if (!ReadString(bytes, ref at, out string text, out byte[] raw)) { break; }
             if (!ReadString(bytes, ref at, out string font, out _)) { break; }
+            if (!ReadString(bytes, ref at, out string fontPath, out _)) { break; }
 
             if (at + 4 > bytes.Length) { break; }
             uint clusterCount = ReadU32(bytes, ref at);
@@ -82,7 +83,7 @@ public static class RecoveredLineReader
 
             found.Add(new RecoveredLine(
                 pdfBaseline, left, top, right, bottom, baseline, size,
-                text, font, clusters));
+                text, font, fontPath, clusters));
         }
 
         return found;

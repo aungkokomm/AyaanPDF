@@ -1780,10 +1780,13 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
                 // left the slot empty, `recovery_is_ready` saying no forever,
                 // and the caller treating the page as mid-preparation: its
                 // lines were never cached and the progress card never came
-                // down. Any complex script that is not Burmese lands here, and
-                // Devanagari now lands here on every page of every Hindi book,
-                // because its text is repaired where it is read and needs no
-                // reshaping at all.
+                // down. A complex script no installed face can read lands here.
+                //
+                // Devanagari USED to land here on every page of every Hindi
+                // book, back when its text was only repaired for reading. It
+                // is read for properly now, because reading is what the writer
+                // finds a line by, so a page it settles nothing for is a page
+                // that cannot be edited.
                 settle_with_nothing(doc_handle);
                 return;
             }
@@ -2229,6 +2232,12 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
         out.extend(said.as_bytes());
         out.extend((line.font.len() as u32).to_le_bytes());
         out.extend(line.font.as_bytes());
+
+        // The FILE the face resolved to, which the caller cannot derive from
+        // the name above. Empty when nothing resolved.
+        let path = indexes.path_for(&line.font).unwrap_or("");
+        out.extend((path.len() as u32).to_le_bytes());
+        out.extend(path.as_bytes());
 
         out.extend((line.clusters.len() as u32).to_le_bytes());
         for cluster in &line.clusters {
@@ -17181,6 +17190,97 @@ mod tests {
         assert!(editable > 0, "plain Latin words stopped being editable");
     }
 
+    /// ⚠️ WHETHER THE APP'S UNIT AND THE WRITER'S UNIT ARE THE SAME THING.
+    /// The app offers a caret in a WORD CLUSTER, which PDFium's character
+    /// stream defines; `retype` finds its line by baseline plus the text the
+    /// caller expects, which `recover` defines. Phase 3 can only hand one to
+    /// the other where the two agree, so this counts.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn how_often_a_word_the_app_shows_is_a_line_the_writer_can_find() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let words = decode_clusters(handle, 0);
+        let sizes = get_page_sizes(handle);
+        let first = unsafe { *sizes.sizes };
+        let (page_w, page_h) = (first.width, first.height);
+        free_page_size_array(sizes);
+        close_document(handle);
+
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        println!("page {page_w} x {page_h}, {} words, {} readings",
+            words.len(), readings.len());
+
+        // Check the conversion before trusting anything built on it.
+        let mut ys: Vec<f64> = readings.iter().map(|r| r.y).collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        println!("reading baselines run {:.1}..{:.1}", ys.first().unwrap(), ys.last().unwrap());
+        for w in words.iter().filter(|w| !w.text.trim().is_empty()).take(4) {
+            println!("   word {:?} normalized baseline {:.4} -> {:.1}",
+                w.text.chars().take(12).collect::<String>(), w.baseline,
+                page_h as f64 - w.baseline as f64 * page_w as f64);
+        }
+
+        let mut agree = 0;
+        let mut wrong_text = 0;
+        let mut ambiguous = 0;
+        let mut nothing_there = 0;
+        let mut shown = 0;
+        for w in &words {
+            if !w.text.chars().any(crate::devanagari::is_devanagari) {
+                continue;
+            }
+            // The word's baseline is normalized top-left by the page WIDTH.
+            let baseline = page_h as f64 - w.baseline as f64 * page_w as f64;
+            let near: Vec<&crate::recover::Reading> = readings
+                .iter()
+                .filter(|r| (r.y - baseline).abs() < 1.0)
+                .collect();
+            if near.is_empty() {
+                nothing_there += 1;
+                if shown < 8 {
+                    shown += 1;
+                    let closest = readings.iter()
+                        .map(|r| (r.y - baseline).abs())
+                        .fold(f64::INFINITY, f64::min);
+                    println!("   word {:?} at {baseline:.1}: nearest reading is {closest:.1} away",
+                        w.text.chars().take(16).collect::<String>());
+                }
+                continue;
+            }
+            let same: Vec<&&crate::recover::Reading> = near
+                .iter()
+                .filter(|r| r.text.as_deref() == Some(w.text.as_str()))
+                .collect();
+            match same.len() {
+                1 => agree += 1,
+                0 => {
+                    wrong_text += 1;
+                    if shown < 8 {
+                        shown += 1;
+                        println!("   word {:?} is not what any reading on its line says",
+                            w.text.chars().take(24).collect::<String>());
+                    }
+                }
+                _ => ambiguous += 1,
+            }
+        }
+        println!("\n{agree} words the writer could be handed directly");
+        println!("{wrong_text} whose text no reading matches");
+        println!("{ambiguous} that more than one reading claims");
+        println!("{nothing_there} on a baseline the walker found nothing on");
+    }
+
     fn open_fixture() -> u64 {
         open_fixture_named("tests/fixtures/sample.pdf")
     }
@@ -27318,6 +27418,58 @@ p={spread_px:.4},c={rgba:08X})"
     }
     /// needs no reshaping at all.
     #[test]
+    #[ignore = "probe"]
+    fn what_worth_reading_says_about_the_latin_fixture() {
+        for name in ["sample_lines.pdf", "sample.pdf", "sample_complex_script.pdf"] {
+            let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
+            let doc = lopdf::Document::load_mem(&bytes).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let clock = std::time::Instant::now();
+            let worth = crate::recover::worth_reading(&doc, page);
+            println!("{name}: worth_reading = {worth}, asked in {:?}", clock.elapsed());
+            for (font, glyphs) in glyphs_by_cid_font(&doc, page) {
+                println!("      {font}: {} glyphs, evidence {:?}",
+                    glyphs.len(), crate::devanagari::evidence_for(&glyphs));
+            }
+        }
+
+        // And the real book, if it is on this machine.
+        const GEETA: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if std::path::Path::new(GEETA).exists() {
+            let bytes = std::fs::read(GEETA).unwrap();
+            let doc = lopdf::Document::load_mem(&bytes).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let clock = std::time::Instant::now();
+            println!("the Geeta: worth_reading = {}, asked in {:?}",
+                crate::recover::worth_reading(&doc, page), clock.elapsed());
+            for (font, glyphs) in glyphs_by_cid_font(&doc, page) {
+                println!("      {font}: {} glyphs, evidence {:?}",
+                    glyphs.len(), crate::devanagari::evidence_for(&glyphs));
+            }
+        }
+    }
+
+    /// The glyphs each CID font on a page draws.
+    fn glyphs_by_cid_font(doc: &lopdf::Document, page: (u32, u16))
+        -> std::collections::BTreeMap<String, std::collections::BTreeSet<u16>>
+    {
+        let cid: std::collections::BTreeSet<String> = crate::recover::fonts_of(doc, page)
+            .into_values()
+            .filter(|(_, w)| w.is_some())
+            .map(|(f, _)| f)
+            .collect();
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<u16>> =
+            Default::default();
+        for line in crate::recover::lines_of(doc, page) {
+            if cid.contains(&line.base_font) {
+                out.entry(line.base_font.clone()).or_default().extend(line.glyphs);
+            }
+        }
+        out
+    }
+
+    #[test]
     fn a_page_with_nothing_to_recover_still_settles() {
         let handle = open_fixture_named("tests/fixtures/sample_lines.pdf");
         assert_eq!(recovery_is_ready(handle, 0), 0,
@@ -27839,6 +27991,133 @@ p={spread_px:.4},c={rgba:08X})"
     }
 
     /// The same, for a document the caller is holding open.
+    /// ⚠️ THE UNIT PROBLEM, AND WHY PHASE 3 IS NOT A JOIN. The app offers a
+    /// caret in a WORD CLUSTER, which PDFium's character stream defines, and
+    /// `retype` finds its line by the baseline `recover` defines. Measured on a
+    /// real Hindi page: only 2 of 568 words line up, because the two baselines
+    /// are not in the same space at all, and the gap is a different size on
+    /// every line (4.6pt on one, 15.0pt on the next).
+    ///
+    /// So the app does not join them. For a shaped script it takes text AND
+    /// geometry from `recover_page_text`, which is the writer's own unit, and
+    /// that is what Myanmar has always done. This asks whether that call now
+    /// answers for a Devanagari page.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_recover_page_text_makes_of_a_hindi_page() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+
+        let clock = std::time::Instant::now();
+        let buffer = recover_page_text(handle, 0);
+        let status = buffer.status;
+        let len = buffer.len;
+        free_byte_buffer(buffer);
+        println!("recover_page_text -> status {status}, {len} bytes, in {:?}",
+            clock.elapsed());
+
+        if status != STATUS_OK_PDFIUM {
+            close_document(handle);
+            return;
+        }
+        let lines = recovered_lines(handle, 0);
+        let read: Vec<&RecoveredLine> = lines.iter().filter(|l| !l.text.is_empty()).collect();
+        println!("{} lines, {} of them read", lines.len(), read.len());
+        for l in read.iter().take(8) {
+            println!("   at {:.1}: {:?}", l.pdf_baseline,
+                l.text.chars().take(48).collect::<String>());
+        }
+        close_document(handle);
+    }
+
+    /// ⚠️ PHASE 3, END TO END, THE WAY THE APP DOES IT. The app asks for the
+    /// page's lines, sees a complex script, starts a recovery, waits for it to
+    /// settle, and then edits through `retype_recovered_line` using the FONT
+    /// THE CORE RESOLVED. Every one of those steps refused on a Hindi page
+    /// before this phase, the first of them because the page's fonts are named
+    /// `CIDFont+F1`..`F7` and nothing could be looked up under that.
+    #[test]
+    #[ignore = "needs a PDF and fonts that are not in this repository"]
+    fn the_whole_chain_edits_a_hindi_line_the_way_the_app_would() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+
+        // 1. The app sees lines it cannot retype.
+        let lines = decode_lines(handle, 0);
+        let shaped = lines.iter().filter(|l| l.refusal == LINE_COMPLEX_SCRIPT).count();
+        assert!(shaped > 0, "the app would never start a recovery for this page");
+
+        // 2. So it starts one, and waits.
+        prepare_recovery(handle, 0);
+        let mut ready = 0;
+        for _ in 0..400 {
+            ready = recovery_is_ready(handle, 0);
+            if ready == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(ready, 1, "the recovery never settled, so the app would offer nothing");
+
+        // 3. It reads the page, and picks a line it can edit.
+        let recovered = recovered_lines(handle, 0);
+        let line = recovered
+            .iter()
+            .find(|l| {
+                !l.text.is_empty()
+                    && l.text.chars().any(crate::devanagari::is_devanagari)
+                    && recovered.iter().filter(|o| o.text == l.text).count() == 1
+            })
+            .expect("no line on this page can be edited");
+        println!("editing {:?} at {:.1}", line.text, line.pdf_baseline);
+
+        // ⚠️ THE FONT THE CORE RESOLVED, which is the whole point. The app used
+        // to look this up from the name, and "CIDFont+F2" is not a font anyone
+        // can install.
+        assert!(!line.font_path.is_empty(),
+            "the reading names no file, so the app has nothing to write with");
+        println!("   the core resolved {} to {}", line.font, line.font_path);
+
+        // 4. And writes.
+        const NOW: &str = "नमस\u{94D}ते";
+        let out = retype_recovered_line(
+            handle, 0, line.pdf_baseline,
+            line.text.as_ptr(), line.text.len(),
+            NOW.as_ptr(), NOW.len(),
+            line.font_path.as_ptr(), line.font_path.len(),
+        );
+        assert_eq!(out.status, STATUS_OK_PDFIUM, "the writer refused");
+        let mut bytes = vec![0u8; out.len];
+        unsafe { std::ptr::copy_nonoverlapping(out.data, bytes.as_mut_ptr(), out.len) };
+        free_byte_buffer(out);
+        close_document(handle);
+
+        // 5. And the document says so.
+        let path = std::env::temp_dir()
+            .join(format!("ayaan-phase3-{}.pdf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let after = open_fixture_named(path.to_str().unwrap());
+        let said = decode_lines(after, 0)
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        close_document(after);
+        assert!(said.contains(NOW), "the page does not say the new text");
+        println!("   the page now says it");
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn read_recovered(handle: u64) -> Vec<(f32, String)> {
         read_recovered_page(handle, 0)
     }
@@ -27863,6 +28142,8 @@ p={spread_px:.4},c={rgba:08X})"
         size: f32,
         text: String,
         font: String,
+        /// The installed file the face resolved to, or empty.
+        font_path: String,
         clusters: Vec<RecoveredCluster>,
     }
 
@@ -27897,8 +28178,13 @@ p={spread_px:.4},c={rgba:08X})"
             let font_len = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
             let font = String::from_utf8(raw[at..at + font_len].to_vec()).unwrap();
             at += font_len;
+            let path_len = u32::from_le_bytes(take4(&raw, &mut at)) as usize;
+            let font_path = String::from_utf8(raw[at..at + path_len].to_vec()).unwrap();
+            at += path_len;
 
             if !text.is_empty() {
+                assert!(!font_path.is_empty(),
+                    "a line was read but names no file it was read with");
                 assert!(!font.is_empty(), "a line was read but names no font");
                 assert!(size > 0.0, "a line was read at no size");
                 assert!(top < bottom && left <= right,
@@ -27920,7 +28206,7 @@ p={spread_px:.4},c={rgba:08X})"
 
             out.push(RecoveredLine {
                 pdf_baseline, left, top, right, bottom, baseline, size,
-                text, font, clusters,
+                text, font, font_path, clusters,
             });
         }
         assert_eq!(at, raw.len(), "the buffer did not decode exactly");

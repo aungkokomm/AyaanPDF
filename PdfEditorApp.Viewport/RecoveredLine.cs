@@ -48,6 +48,7 @@ public sealed record RecoveredLine(
     double FontSizePts,
     string Text,
     string FontName,
+    string FontPath,
     IReadOnlyList<RecoveredCluster> Clusters)
 {
     /// <summary>
