@@ -8313,6 +8313,20 @@ public sealed partial class MainPage : Page
                     if (ViewModel.IsEditingInPlace)
                     {
                         ViewModel.CommitInPlaceEdit();
+
+                        // ⚠️ AND STRAIGHT ON INTO THE NEXT WORD, in the SAME
+                        // click. Clicking about inside one word moved the caret
+                        // with one click, and moving to the next word took two:
+                        // one to frame it and one to put the caret in. That
+                        // pair is right for arriving at text and wrong for
+                        // carrying on with text already being edited, which is
+                        // what a reader is doing by then.
+                        if (ViewModel.MoveInPlaceEditTo(content.Page, nx, ny))
+                        {
+                            RootGrid.Focus(FocusState.Programmatic);
+                            e.Handled = true;
+                            break;
+                        }
                     }
 
                     ViewModel.ClearTextUnitSelection();

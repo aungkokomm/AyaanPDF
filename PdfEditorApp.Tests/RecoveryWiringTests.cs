@@ -206,6 +206,39 @@ public class RecoveryWiringTests
     }
 
     /// <summary>
+    /// ⚠️ ONE CLICK TO CARRY ON IN THE NEXT WORD, NOT TWO. Clicking about
+    /// inside one word moves the caret with a single click; moving to the next
+    /// word used to take two, one to frame it and one to put the caret in.
+    /// That pair is right for ARRIVING at text and wrong for text a reader is
+    /// already editing.
+    /// </summary>
+    [Fact]
+    public void a_click_on_another_word_carries_the_edit_over_in_one_go()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+        int away = page.IndexOf("Any other press drops the box", StringComparison.Ordinal);
+        Assert.True(away > 0, "the click-away path is no longer where this test looks");
+
+        // ⚠️ THE COMMIT COMES FIRST, or carrying on in the next word would
+        // throw away whatever had been typed into the one being left.
+        int commit = page.IndexOf("CommitInPlaceEdit();", away, StringComparison.Ordinal);
+        int moved = page.IndexOf("MoveInPlaceEditTo(", away, StringComparison.Ordinal);
+        Assert.True(commit > 0, "the click-away path no longer commits");
+        Assert.True(moved > commit, "the edit is carried over before it is committed");
+
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int decl = vm.IndexOf("public bool MoveInPlaceEditTo(", StringComparison.Ordinal);
+        Assert.True(decl > 0);
+        string body = MethodBodyAt(vm, decl);
+
+        // It refuses unless there is an edit to move and somewhere to move it.
+        Assert.Contains("if (!IsEditingInPlace) { return false; }", body, StringComparison.Ordinal);
+        Assert.Contains("SelectTextUnitAt(pageIndex, normX, normY)", body, StringComparison.Ordinal);
+        Assert.Contains("CanEdit: true", body, StringComparison.Ordinal);
+        Assert.Contains("BeginInPlaceEdit(pageIndex, normX, normY)", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// ⚠️ CAPTURED BEFORE, PUSHED AFTER, exactly as a form edit does it. The
     /// core changes nothing when it refuses, and an entry pushed anyway would be
     /// a Ctrl+Z that appears to do nothing.

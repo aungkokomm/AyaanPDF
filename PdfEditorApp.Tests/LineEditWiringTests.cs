@@ -452,12 +452,14 @@ public class LineEditWiringTests
         // away what the reader typed, silently.
         int away = page.IndexOf("Any other press drops the box", StringComparison.Ordinal);
         Assert.True(away > 0, "the click-away path is no longer where this test looks");
-        string drop = page[away..Math.Min(page.Length, away + 900)];
-        Assert.Contains("CommitInPlaceEdit();", drop, StringComparison.Ordinal);
-
-        // And it commits BEFORE it clears, or the typing goes with the box.
-        int commits = drop.IndexOf("CommitInPlaceEdit();", StringComparison.Ordinal);
-        int clears = drop.IndexOf("ClearTextUnitSelection();", StringComparison.Ordinal);
+        // ⚠️ NO WINDOW. This sliced 900 characters and then looked inside
+        // them, so adding a comment to the code under test pushed the clear out
+        // of view and the test failed for seeing half the story. The claim is
+        // an ORDER, and an order needs no window: the first commit after this
+        // point must come before the first clear after it.
+        int commits = page.IndexOf("CommitInPlaceEdit();", away, StringComparison.Ordinal);
+        int clears = page.IndexOf("ClearTextUnitSelection();", away, StringComparison.Ordinal);
+        Assert.True(commits > 0, "the click-away path no longer commits");
         Assert.True(clears > commits, "the selection is dropped before the typing is kept");
     }
 

@@ -11010,6 +11010,31 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// Refuses up front for a unit the core will not rewrite, because being
     /// told before typing is the difference between a limitation and a bug.
     /// </remarks>
+    /// <summary>
+    /// Moves an edit already in progress to whatever editable text was clicked,
+    /// in ONE click.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WITHIN A WORD ONE CLICK MOVES THE CARET; MOVING TO THE NEXT WORD
+    /// TOOK TWO. The first selected and framed it, the second put the caret in,
+    /// which is the right gesture for ARRIVING at text and the wrong one for
+    /// carrying on with text you are already editing. The log showed the pair
+    /// plainly: a SelectTextUnitAt and then a BeginInPlaceEdit about a second
+    /// and a half later, over and over.
+    ///
+    /// Returns false when the click was not on editable text, and then the
+    /// caller does what it did before: commit, drop the box, and let the press
+    /// go on to mean whatever else it means.
+    /// </remarks>
+    public bool MoveInPlaceEditTo(int pageIndex, double normX, double normY)
+    {
+        if (!IsEditingInPlace) { return false; }
+        if (!SelectTextUnitAt(pageIndex, normX, normY)) { return false; }
+        if (_selectedTextUnit is not { CanEdit: true }) { return false; }
+
+        return BeginInPlaceEdit(pageIndex, normX, normY);
+    }
+
     public bool BeginInPlaceEdit(int pageIndex, double normX, double normY)
     {
         if (!IsEditMode) { return false; }
