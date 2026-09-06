@@ -69,7 +69,8 @@ fn installed(base_font: &str) -> Option<&'static str> {
             r"C:\Windows\Fonts\Pyidaungsu.ttf",
             r"C:\Windows\Fonts\Pyidaungsu-Bold.ttf",
         ),
-        _ => return None,
+        // The Devanagari faces answer for themselves, bold and all.
+        _ => return crate::devanagari::face_named(family, bold),
     };
     if !bold {
         return Some(regular);
@@ -1143,12 +1144,18 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
         // write one. A real Hindi book names all seven of its fonts
         // `CIDFont+F1`..`CIDFont+F7`, so every line on every page was refused
         // here before the reading even began.
-        let (path, script) = match installed(base_font) {
-            Some(path) => (path, Script::Burmese),
-            None => match crate::devanagari::face_of(glyphs) {
-                Some(path) => (path, Script::Devanagari),
-                None => continue,
-            },
+        let Some(path) = installed(base_font).or_else(|| crate::devanagari::face_of(glyphs))
+        else {
+            continue;
+        };
+        // ⚠️ FROM THE FACE, NOT FROM WHICHEVER ROUTE FOUND IT. Our own
+        // replacement font is named `NirmalaUI` and resolves by NAME, and
+        // deciding the script by the route would then fill its index with
+        // Burmese and leave the app unable to read what it had just written.
+        let script = if crate::devanagari::owns(path) {
+            Script::Devanagari
+        } else {
+            Script::Burmese
         };
         let entry = per_face.entry(path).or_insert_with(|| (BTreeSet::new(), script));
         entry.0.extend(glyphs.iter().copied());
@@ -1173,9 +1180,7 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
         // fifty milliseconds, against twenty-odd seconds for Burmese, so a
         // reader would see the card appear and vanish for no reason.
         if *script == Script::Devanagari {
-            let Some(face) = rustybuzz::Face::from_slice(&bytes, 0) else { continue };
-            let index = crate::devanagari::reading_index(&face);
-            drop(face);
+            let Some(index) = crate::devanagari::reading_index(path) else { continue };
             built.insert(path, Arc::new((bytes, index)));
             continue;
         }
@@ -5052,7 +5057,8 @@ mod tests {
         let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
 
         let clock = std::time::Instant::now();
-        let index = crate::devanagari::reading_index(&face);
+        let index = crate::devanagari::reading_index(r"C:\Windows\Fonts\NIRMALA.TTF")
+            .expect("no tables for Nirmala");
         println!("built a devanagari index in {:?}", clock.elapsed());
 
         let lines = lines_of(&doc, page);

@@ -430,6 +430,127 @@ pub(crate) fn retype(
 mod tests {
     use super::*;
 
+    const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+    const GEETA: &str =
+        r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+
+    /// ⚠️ REWRITING A REAL HINDI LINE, END TO END. Phase 1 proved the writer
+    /// could FIND one; this changes one and asks the file what it says.
+    ///
+    /// Four things have to hold, and the last two are the ones that bite:
+    ///
+    /// - the file says the new text where PDFium reads it, which is what the
+    ///   app shows;
+    /// - there is one FEWER of the old word than there was. Its mere absence
+    ///   cannot be asked for: this page carries four of the word being changed,
+    ///   and a check for "the old text is gone" fails on a perfect edit;
+    /// - the walker reads OUR OWN RUN back. The writer finds a line by reading
+    ///   it, so a replacement it cannot read is a line that can be edited once
+    ///   and never again. It could not, until the index was given the
+    ///   dependent forms: this face draws `नमस्ते` as four glyphs and the last
+    ///   is the `े` alone, which a table of whole clusters cannot spell;
+    /// - and nothing else on the page moved.
+    ///
+    /// ⚠️ WHAT IT DOES NOT CLAIM IS THE WIDTH. `retype` lands a replacement on
+    /// the old width by opening the line's own spaces, and on this book a
+    /// "line" is a WORD, with no space in it to open. Measured here: 27.5pt
+    /// replaced by 32.6pt. Nothing shifts, because every run on the page is
+    /// positioned absolutely, but a longer word runs closer to its neighbour.
+    #[test]
+    #[ignore = "needs a PDF and fonts that are not in this repository"]
+    fn a_real_hindi_line_can_be_rewritten() {
+        if !std::path::Path::new(GEETA).exists() || !std::path::Path::new(NIRMALA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(GEETA).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let (_, &page) = doc.get_pages().iter().next().unwrap();
+
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let read = crate::recover::read_page_with(&doc, page, &indexes);
+
+        // A line the page will let us read, and one that says something no
+        // other line at its baseline says, so the writer can tell them apart.
+        let mut counts: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        for r in &read {
+            if let Some(text) = &r.text {
+                *counts.entry((format!("{:.1}", r.y), text.clone())).or_default() += 1;
+            }
+        }
+        let line = read
+            .iter()
+            .find(|r| {
+                r.text.as_ref().is_some_and(|t| {
+                    t.chars().any(crate::devanagari::is_devanagari)
+                        && t.chars().count() >= 3
+                        && counts[&(format!("{:.1}", r.y), t.clone())] == 1
+                })
+            })
+            .expect("no line on this page is both readable and unambiguous");
+        let was = line.text.clone().unwrap();
+        println!("rewriting {was:?} at y={:.1}", line.y);
+
+        // Deliberately a different length, so nothing can pass by the old
+        // positions happening to fit.
+        const NOW: &str = "नमस\u{94D}ते";
+        let out = retype(&bytes, 0, line.y, &was, NOW, NIRMALA, Some(&indexes))
+            .expect("the writer refused a line it had just read");
+
+        let path = std::env::temp_dir()
+            .join(format!("ayaan-hindi-retyped-{}.pdf", std::process::id()));
+        std::fs::write(&path, &out).unwrap();
+
+        // What PDFium extracts, which is what the app shows.
+        let (before, after) = (extracted_lines(GEETA), extracted_lines(path.to_str().unwrap()));
+        assert!(after.contains(NOW), "the file does not say the new text");
+        assert_eq!(
+            after.matches(&was).count() + 1,
+            before.matches(&was).count(),
+            "exactly one of the old word should have gone"
+        );
+
+        // And the writer can find its own work, which is what lets a line be
+        // edited a second time.
+        let done = Document::load_mem(&out).unwrap();
+        let (_, &page_after) = done.get_pages().iter().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&done);
+        let ours = crate::recover::lines_of(&done, page_after)
+            .into_iter()
+            .find(|l| l.base_font == "NirmalaUI")
+            .expect("the replacement is not on the page");
+        let index = indexes.index_for(&ours.base_font).expect("our own font resolved to nothing");
+        let face_bytes = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&face_bytes, 0).unwrap();
+        assert_eq!(
+            crate::recover::read_line(index, &face, &ours).as_deref(),
+            Some(NOW),
+            "the writer cannot read its own replacement"
+        );
+
+        println!("   width: {:?} before, {:?} after",
+            crate::recover::lines_of(&doc, page).iter()
+                .find(|l| (l.y - line.y).abs() < 0.01 && (l.x - line.x).abs() < 0.01)
+                .and_then(|l| advance_of(&doc, page, l)),
+            advance_of(&done, page_after, &ours));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Everything PDFium reads off a file's first page, as one string.
+    fn extracted_lines(path: &str) -> String {
+        let c_path = std::ffi::CString::new(path).unwrap();
+        let handle = crate::open_document(c_path.as_ptr());
+        assert_ne!(handle, 0, "{path} will not open");
+        let buffer = crate::get_page_lines(handle, 0);
+        let mut bytes = vec![0u8; buffer.len];
+        unsafe { std::ptr::copy_nonoverlapping(buffer.data, bytes.as_mut_ptr(), buffer.len) };
+        crate::free_byte_buffer(buffer);
+        crate::close_document(handle);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     const MYANMAR_TEXT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
 
     /// Every glyph of `text` as the writer will actually set it: shaped by the

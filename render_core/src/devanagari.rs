@@ -188,6 +188,39 @@ impl Tables {
     }
 }
 
+/// The face a font of this FAMILY is, when the name is a real one.
+///
+/// ⚠️ THIS IS FOR THE FONTS THAT DO HAVE NAMES, and the first of them is our
+/// own. The writer embeds the whole face, so its `/W` declares 1,210 CIDs
+/// covering Latin, Tamil, Telugu and the rest, and asking [`face_of`] about
+/// that set correctly refuses: most of those glyphs are not Devanagari and no
+/// Devanagari face should claim them. The evidence route is for a producer
+/// that names nothing; a font that says what it is should simply be believed.
+///
+/// Without this a reader could edit a Hindi line once and never again, because
+/// the writer finds a line by reading it, and it could not read its own work.
+pub(crate) fn face_named(family: &str, bold: bool) -> Option<&'static str> {
+    let (regular, heavy) = match family {
+        "Nirmala" | "NirmalaUI" => (CANDIDATES[0], Some(CANDIDATES[2])),
+        "Mangal" => (CANDIDATES[1], Some(CANDIDATES[3])),
+        "Aparajita" => (CANDIDATES[4], None),
+        "Kokila" => (CANDIDATES[5], None),
+        "Utsaah" => (CANDIDATES[6], None),
+        _ => return None,
+    };
+    // A family with no bold file of its own reads perfectly well through its
+    // regular one, as Pyidaungsu already does: the two weights are built from
+    // one source and number their glyphs alike, and a reading that does not
+    // reproduce the page is refused anyway.
+    Some(if bold { heavy.unwrap_or(regular) } else { regular })
+}
+
+/// Whether this face is one of ours, and so wants the Devanagari enumeration
+/// rather than the Burmese one filling its index.
+pub(crate) fn owns(path: &str) -> bool {
+    CANDIDATES.contains(&path)
+}
+
 /// Which installed Devanagari face a font drawing `glyphs` is, by EVIDENCE.
 ///
 /// ⚠️ NEVER BY NAME. The producer of a real book names its fonts `CIDFont+F2`
@@ -212,8 +245,31 @@ pub(crate) fn face_of(glyphs: &BTreeSet<u16>) -> Option<&'static str> {
 /// The reader here needs only [`Tables`], which is a different shape; this is
 /// for the WRITER, which finds a line by reading its glyphs back through
 /// `crate::recover` and must therefore be handed that module's index type.
-pub(crate) fn reading_index(face: &rustybuzz::Face) -> crate::reshape::Index {
-    crate::reshape::Index::from_spellings(spellings(face))
+///
+/// ⚠️ THE CLUSTERS ARE NOT ENOUGH ON THEIR OWN. A face draws `नमस्ते` as four
+/// glyphs, and the last of them is the `े` on its own: the conjunct and its
+/// matra are two glyphs, not one cluster glyph, so a table of whole clusters
+/// spells the first three and stops. Measured on the writer's own output,
+/// which it then could not read back, meaning a line could be edited once and
+/// never again.
+///
+/// ⚠️ AND ONLY THE FORMS CONCATENATION CAN EXPRESS. The walk above this joins
+/// entries end to end, so a form is safe here only if its text is a pure
+/// SUFFIX of the syllable it hangs off. A reph belongs in front of a syllable
+/// the face draws it in front of, and there is no order of entries that says
+/// so; those stay out. Nothing is risked either way, because every reading is
+/// shaped again and must return the page's own glyphs, but an index that
+/// cannot be wrong is worth more than one that is merely caught.
+pub(crate) fn reading_index(path: &'static str) -> Option<crate::reshape::Index> {
+    let tables = tables_for(path)?;
+    let mut spells = tables.spells.clone();
+    for (id, form) in &tables.forms {
+        if form.drawn_before || !form.before.is_empty() || form.after.is_empty() {
+            continue;
+        }
+        spells.entry(vec![*id]).or_insert_with(|| form.after.clone());
+    }
+    Some(crate::reshape::Index::from_spellings(spells))
 }
 
 /// The glyph sequence each cluster draws, inverted.
@@ -707,6 +763,28 @@ mod tests {
         assert_eq!(syllable_end("क्षत"), Some("क्ष".len()));
         assert_eq!(syllable_end("कत"), Some("क".len()));
         assert_eq!(syllable_end(" क"), None);
+    }
+
+    /// ⚠️ A CONJUNCT AND ITS MATRA ARE TWO GLYPHS, NOT ONE. The index the
+    /// WRITER reads lines with is built from whole clusters, and this face
+    /// draws that pair as the conjunct plus a matra of its own. Without the
+    /// dependent forms the index spells the first glyph and stops, and the
+    /// writer could not read back a line it had itself just written, which
+    /// makes a line editable once and never again.
+    #[test]
+    fn the_writers_index_can_spell_a_conjunct_and_its_matra() {
+        if !std::path::Path::new(CANDIDATES[0]).exists() {
+            return;
+        }
+        let bytes = std::fs::read(CANDIDATES[0]).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let index = reading_index(CANDIDATES[0]).expect("no tables for this face");
+
+        const WORD: &str = "\u{0938}\u{094D}\u{0924}\u{0947}";
+        let glyphs = crate::reshape::draws(&face, WORD);
+        assert!(glyphs.len() >= 2,
+            "this face draws it as one glyph, so the test proves nothing");
+        assert_eq!(crate::reshape::prove(&face, &index, &glyphs).as_deref(), Some(WORD));
     }
 
     /// ⚠️ A FACE IS CLAIMED ON EVIDENCE, SO IT MUST BE REFUSABLE. The glyph ids
