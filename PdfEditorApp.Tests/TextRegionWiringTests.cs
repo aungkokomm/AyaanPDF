@@ -196,8 +196,12 @@ public class TextRegionWiringTests
         string keys = page[at..Math.Min(page.Length, at + 2200)];
 
         Assert.Contains("bool extend = IsShiftDown();", keys, StringComparison.Ordinal);
-        Assert.Contains("InPlaceMoveLeft(extend)", keys, StringComparison.Ordinal);
-        Assert.Contains("InPlaceMoveRight(extend)", keys, StringComparison.Ordinal);
+
+        // ⚠️ LEFT AND RIGHT GO THROUGH THE CROSSING WRAPPERS NOW, which pass
+        // extend straight down to the plain move unless the caret is at an edge
+        // of the line with nothing selected. Held shift never crosses.
+        Assert.Contains("InPlaceArrowLeft(extend)", keys, StringComparison.Ordinal);
+        Assert.Contains("InPlaceArrowRight(extend)", keys, StringComparison.Ordinal);
         Assert.Contains("InPlaceMoveHome(extend)", keys, StringComparison.Ordinal);
         Assert.Contains("InPlaceMoveEnd(extend)", keys, StringComparison.Ordinal);
     }

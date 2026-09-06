@@ -11028,12 +11028,41 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </remarks>
     public bool MoveInPlaceEditTo(int pageIndex, double normX, double normY)
     {
-        if (!IsEditingInPlace) { return false; }
+        if (!IsEditMode) { return false; }
+
+        // ⚠️ THE COMMIT BELONGS IN HERE, NOT IN THE CALLER. It used to be
+        // the caller's, and CommitInPlaceEdit ENDS the edit, so by the time
+        // this ran IsEditingInPlace was already false and the guard on it
+        // refused every time. The move never once happened.
+        //
+        // Finishing first is still right: it is what clicking away from text
+        // you have typed into means, and a commit can rewrite the document, so
+        // everything below has to be measured against what the page says after.
+        CommitInPlaceEdit();
+
         if (!SelectTextUnitAt(pageIndex, normX, normY)) { return false; }
         if (_selectedTextUnit is not { CanEdit: true }) { return false; }
 
         return BeginInPlaceEdit(pageIndex, normX, normY);
     }
+
+    /// <summary>
+    /// Whether a point is on the LINE the in-place edit is on, as opposed to
+    /// merely inside the box drawn round the unit.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE BOX IS THE BLOCK'S AND THE EDIT IS ONE LINE OF IT. A click
+    /// anywhere in a paragraph's box counted as a click on the line being
+    /// edited, so the caret was placed among that line's glyphs however far
+    /// away it landed, and a reader could not reach any other word without
+    /// leaving the box altogether.
+    /// </remarks>
+    public bool InPlaceEditCovers(int pageIndex, double normX, double normY) =>
+        IsEditingInPlace
+        && _lineEditPage == pageIndex
+        && _lineEditLine is { } line
+        && normX >= line.Left && normX <= line.Right
+        && normY >= line.Top && normY <= line.Bottom;
 
     public bool BeginInPlaceEdit(int pageIndex, double normX, double normY)
     {
@@ -11235,6 +11264,118 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void InPlaceMoveEnd(bool extend = false) =>
         Changed(() => _lineEdit!.MoveEnd(extend));
+
+    // ⚠️ AND THE ARROWS RUN OFF THE END OF A LINE ONTO THE NEXT ONE. The
+    // edit is bound to ONE line, so Left at its start and Right at its end had
+    // nowhere left to go and simply stopped, and Up and Down did nothing
+    // whatever: a reader who wanted the word above had to leave the text
+    // altogether and click back into it. Running off an edge now carries the
+    // edit to the neighbouring line, which is what an arrow key means in every
+    // other piece of text there is.
+
+    public void InPlaceArrowLeft(bool extend)
+    {
+        if (!extend && _lineEdit is { Caret: 0, HasSelection: false }
+            && MoveInPlaceEditAcross(-1, atStart: false))
+        {
+            return;
+        }
+        InPlaceMoveLeft(extend);
+    }
+
+    public void InPlaceArrowRight(bool extend)
+    {
+        if (!extend && _lineEdit is { HasSelection: false } buffer
+            && buffer.Caret == buffer.Text.Length
+            && MoveInPlaceEditAcross(1, atStart: true))
+        {
+            return;
+        }
+        InPlaceMoveRight(extend);
+    }
+
+    // ⚠️ HELD SHIFT DOES NOT CROSS LINES, and that is not an omission. The
+    // buffer holds ONE line, so a selection reaching into the line above is
+    // not a thing it can hold, and pretending otherwise would mean a shape
+    // that no writer here can commit.
+
+    public void InPlaceArrowUp(bool extend)
+    {
+        if (!extend) { MoveInPlaceEditUpDown(-1); }
+    }
+
+    public void InPlaceArrowDown(bool extend)
+    {
+        if (!extend) { MoveInPlaceEditUpDown(1); }
+    }
+
+    /// <summary>
+    /// Carries the edit to the line above or below, at the x the caret was
+    /// already at, the way a caret behaves in any other column of text.
+    /// </summary>
+    private bool MoveInPlaceEditUpDown(int direction)
+    {
+        if (_lineEdit is null || _lineEditLine is null) { return false; }
+
+        // Read before the move, because the move commits and the buffer this
+        // asks is the one being left.
+        double x = CaretXOf(_lineEdit.Caret);
+
+        var next = LineBeyond(_lineEditPage, _lineEditLine.Baseline, direction);
+        if (next is null) { return false; }
+
+        return MoveInPlaceEditTo(
+            _lineEditPage, Math.Clamp(x, next.Left, next.Right), MiddleOf(next));
+    }
+
+    /// <summary>Carries the edit off one end of a line onto the next one.</summary>
+    private bool MoveInPlaceEditAcross(int direction, bool atStart)
+    {
+        if (_lineEditLine is null) { return false; }
+
+        var next = LineBeyond(_lineEditPage, _lineEditLine.Baseline, direction);
+        if (next is null) { return false; }
+
+        return MoveInPlaceEditTo(
+            _lineEditPage, atStart ? next.Left : next.Right, MiddleOf(next));
+    }
+
+    /// <summary>The middle of a line's box, which is the safest y to aim at.</summary>
+    /// <remarks>
+    /// ⚠️ A PARAGRAPH HAS STRIPES OF NOTHING BETWEEN ITS LINES, because a
+    /// recovered line's box is the face's height at its size and not the
+    /// leading the page was set with. Aiming at a line's own edge lands in one
+    /// of those often enough to matter; aiming at its middle never does.
+    /// </remarks>
+    private static double MiddleOf(LineSnapshot line) => (line.Top + line.Bottom) / 2;
+
+    /// <summary>
+    /// The nearest line above or below a baseline, or null at the edge of the
+    /// page's text.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE PAGE'S LINES, NOT THE SELECTED BLOCK'S. A reader arrowing
+    /// upwards out of the top of a paragraph means the line above it, and
+    /// stopping dead at a boundary they cannot see would read as the keyboard
+    /// being broken rather than as a rule being kept.
+    /// </remarks>
+    private LineSnapshot? LineBeyond(int pageIndex, double baseline, int direction)
+    {
+        LineSnapshot? best = null;
+        double nearest = double.MaxValue;
+
+        foreach (var line in LinesFor(pageIndex))
+        {
+            // Positive is "the way that was asked for". Anything on the same
+            // baseline is the line being left, not a line to arrive at.
+            double step = (line.Baseline - baseline) * direction;
+            if (step <= RecoveredWordTolerance || step >= nearest) { continue; }
+
+            best = line;
+            nearest = step;
+        }
+        return best;
+    }
 
     public void InPlaceSelectAll() => Changed(() => _lineEdit!.SelectAll());
 

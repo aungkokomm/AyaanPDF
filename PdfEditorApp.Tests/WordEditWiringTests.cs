@@ -281,10 +281,22 @@ public class WordEditWiringTests
             "private void EditScrim_PointerPressed(", StringComparison.Ordinal);
         Assert.Contains("CommitTextEdit();", code[scrim..(scrim + 700)], StringComparison.Ordinal);
 
+        // ⚠️ AND THE DOCUMENT'S OWN TEXT IS COMMITTED BY THE MOVE. This
+        // used to look for a CommitInPlaceEdit() of its own on this path, and
+        // that call is gone because it had become unreachable: the move commits
+        // before it looks at where the click landed, so by the time it returns
+        // false there is nothing left to commit. What matters is unchanged and
+        // is asserted here in two halves.
         int away = code.IndexOf("Any other press drops the box", StringComparison.Ordinal);
         Assert.True(away > 0);
+        Assert.Contains("MoveInPlaceEditTo(",
+            code[away..Math.Min(code.Length, away + 2000)], StringComparison.Ordinal);
+
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int move = vm.IndexOf("public bool MoveInPlaceEditTo(", StringComparison.Ordinal);
+        Assert.True(move > 0);
         Assert.Contains("CommitInPlaceEdit();",
-            code[away..Math.Min(code.Length, away + 900)], StringComparison.Ordinal);
+            vm[move..Math.Min(vm.Length, move + 1400)], StringComparison.Ordinal);
     }
 
     [Fact]

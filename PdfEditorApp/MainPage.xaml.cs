@@ -7365,8 +7365,10 @@ public sealed partial class MainPage : Page
             Action? act =
                   e.Key == VirtualKey.Back ? ViewModel.InPlaceBackspace
                 : e.Key == VirtualKey.Delete ? ViewModel.InPlaceDelete
-                : e.Key == VirtualKey.Left ? () => ViewModel.InPlaceMoveLeft(extend)
-                : e.Key == VirtualKey.Right ? () => ViewModel.InPlaceMoveRight(extend)
+                : e.Key == VirtualKey.Left ? () => ViewModel.InPlaceArrowLeft(extend)
+                : e.Key == VirtualKey.Right ? () => ViewModel.InPlaceArrowRight(extend)
+                : e.Key == VirtualKey.Up ? () => ViewModel.InPlaceArrowUp(extend)
+                : e.Key == VirtualKey.Down ? () => ViewModel.InPlaceArrowDown(extend)
                 : e.Key == VirtualKey.Home ? () => ViewModel.InPlaceMoveHome(extend)
                 : e.Key == VirtualKey.End ? () => ViewModel.InPlaceMoveEnd(extend)
                 : e.Key == VirtualKey.Enter ? () => ViewModel.CommitInPlaceEdit()
@@ -8254,6 +8256,26 @@ public sealed partial class MainPage : Page
                         // clicking in any text does.
                         if (ViewModel.IsEditingInPlace)
                         {
+                            // ⚠️ THE BOX IS THE BLOCK'S, THE EDIT IS ONE LINE
+                            // OF IT. A paragraph's box covers every word in it,
+                            // so this branch took every click inside it as a
+                            // click on the line being edited and placed the
+                            // caret among THAT line's glyphs. The caret could
+                            // not leave the word it started in, and reaching
+                            // another word meant clicking out of the box and
+                            // back in. A click off the edited line now carries
+                            // the edit to the line that was clicked.
+                            if (!ViewModel.InPlaceEditCovers(content.Page, nx, ny)
+                                && ViewModel.MoveInPlaceEditTo(content.Page, nx, ny))
+                            {
+                                RootGrid.Focus(FocusState.Programmatic);
+                                _inPlaceDragging = true;
+                                _dragPointerId = e.Pointer.PointerId;
+                                ViewportHost.CapturePointer(e.Pointer);
+                                e.Handled = true;
+                                break;
+                            }
+
                             // ⚠️ AND THE PRESS ARMS A DRAG. Holding and
                             // moving selects through the text, which is how
                             // anyone selects anything. A double click on top of
@@ -8312,15 +8334,13 @@ public sealed partial class MainPage : Page
                     // the reader's typing away silently.
                     if (ViewModel.IsEditingInPlace)
                     {
-                        ViewModel.CommitInPlaceEdit();
-
                         // ⚠️ AND STRAIGHT ON INTO THE NEXT WORD, in the SAME
-                        // click. Clicking about inside one word moved the caret
-                        // with one click, and moving to the next word took two:
-                        // one to frame it and one to put the caret in. That
-                        // pair is right for arriving at text and wrong for
-                        // carrying on with text already being edited, which is
-                        // what a reader is doing by then.
+                        // click, which commits the one being left on the way
+                        // past. Clicking about inside one word moved the caret
+                        // with one click, and moving to another took two: one
+                        // to frame it and one to put the caret in. That pair is
+                        // right for arriving at text and wrong for carrying on
+                        // with text already being edited.
                         if (ViewModel.MoveInPlaceEditTo(content.Page, nx, ny))
                         {
                             RootGrid.Focus(FocusState.Programmatic);

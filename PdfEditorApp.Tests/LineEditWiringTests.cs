@@ -455,12 +455,25 @@ public class LineEditWiringTests
         // ⚠️ NO WINDOW. This sliced 900 characters and then looked inside
         // them, so adding a comment to the code under test pushed the clear out
         // of view and the test failed for seeing half the story. The claim is
-        // an ORDER, and an order needs no window: the first commit after this
-        // point must come before the first clear after it.
-        int commits = page.IndexOf("CommitInPlaceEdit();", away, StringComparison.Ordinal);
+        // an ORDER, and an order needs no window: what keeps the typing must
+        // come before the first clear after this point.
+        //
+        // ⚠️ AND WHAT KEEPS IT IS THE MOVE. There is no CommitInPlaceEdit()
+        // on this path any more, because a call that ends the edit and a call
+        // that then wants the edit still open cannot both be the caller's: the
+        // commit went inside MoveInPlaceEditTo, which does it before it looks
+        // at where the click landed and so commits whether or not it finds
+        // anywhere to move to.
+        int commits = page.IndexOf("MoveInPlaceEditTo(", away, StringComparison.Ordinal);
         int clears = page.IndexOf("ClearTextUnitSelection();", away, StringComparison.Ordinal);
         Assert.True(commits > 0, "the click-away path no longer commits");
         Assert.True(clears > commits, "the selection is dropped before the typing is kept");
+
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int move = vm.IndexOf("public bool MoveInPlaceEditTo(", StringComparison.Ordinal);
+        Assert.True(move > 0);
+        Assert.Contains("CommitInPlaceEdit();",
+            vm[move..Math.Min(vm.Length, move + 1400)], StringComparison.Ordinal);
     }
 
     [Fact]

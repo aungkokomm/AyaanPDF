@@ -219,23 +219,144 @@ public class RecoveryWiringTests
         int away = page.IndexOf("Any other press drops the box", StringComparison.Ordinal);
         Assert.True(away > 0, "the click-away path is no longer where this test looks");
 
-        // ⚠️ THE COMMIT COMES FIRST, or carrying on in the next word would
-        // throw away whatever had been typed into the one being left.
-        int commit = page.IndexOf("CommitInPlaceEdit();", away, StringComparison.Ordinal);
         int moved = page.IndexOf("MoveInPlaceEditTo(", away, StringComparison.Ordinal);
-        Assert.True(commit > 0, "the click-away path no longer commits");
-        Assert.True(moved > commit, "the edit is carried over before it is committed");
+        Assert.True(moved > 0, "the click-away path no longer carries the edit over");
 
         string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
         int decl = vm.IndexOf("public bool MoveInPlaceEditTo(", StringComparison.Ordinal);
         Assert.True(decl > 0);
         string body = MethodBodyAt(vm, decl);
 
-        // It refuses unless there is an edit to move and somewhere to move it.
-        Assert.Contains("if (!IsEditingInPlace) { return false; }", body, StringComparison.Ordinal);
-        Assert.Contains("SelectTextUnitAt(pageIndex, normX, normY)", body, StringComparison.Ordinal);
+        // ⚠️ AND THE MOVE COMMITS FOR ITSELF, WHICH IS THE WHOLE BUG. The
+        // commit used to be the CALLER'S, done just before the call, and
+        // CommitInPlaceEdit ENDS the edit: this method then refused at a guard
+        // on IsEditingInPlace, every single time, and the one-click move never
+        // once happened though it was shipped and reported as working. The
+        // guard it is allowed to keep is the mode, which a commit does not
+        // change.
+        Assert.DoesNotContain("if (!IsEditingInPlace) { return false; }", body);
+        Assert.Contains("if (!IsEditMode) { return false; }", body, StringComparison.Ordinal);
+
+        int commit = body.IndexOf("CommitInPlaceEdit();", StringComparison.Ordinal);
+        int select = body.IndexOf("SelectTextUnitAt(pageIndex, normX, normY)", StringComparison.Ordinal);
+        Assert.True(commit > 0, "the move no longer commits the edit it is leaving");
+        Assert.True(
+            select > commit,
+            "the next word is selected before the one being left is committed, "
+            + "which would write the typed text to the wrong unit");
+
         Assert.Contains("CanEdit: true", body, StringComparison.Ordinal);
         Assert.Contains("BeginInPlaceEdit(pageIndex, normX, normY)", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ A CLICK INSIDE THE BOX MUST REACH THE OTHER WORDS IN IT. The box is
+    /// the BLOCK'S and the edit is one LINE of it, so the in-box branch treated
+    /// every click in a paragraph as a click on the line being edited and
+    /// placed the caret among that line's glyphs however far off it landed. The
+    /// caret could not leave the word it started in, and the reader had to
+    /// click out of the box and back in to reach the next one.
+    /// </summary>
+    [Fact]
+    public void a_click_elsewhere_in_the_box_carries_the_edit_to_that_word()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+        int inside = page.IndexOf(
+            "if (ViewModel.TextUnitBoxContains(content.Page, nx, ny))",
+            StringComparison.Ordinal);
+        Assert.True(inside > 0, "the in-box press path is no longer where this test looks");
+
+        // Deep inside a switch, so the lines are short and the indent is not:
+        // 2,000 characters stopped one line above the caret this compares against
+        // and the test failed for not being able to see it.
+        string branch = page[inside..Math.Min(page.Length, inside + 3000)];
+
+        int carried = branch.IndexOf("MoveInPlaceEditTo(", StringComparison.Ordinal);
+        int caret = branch.IndexOf("PlaceInPlaceCaret(", StringComparison.Ordinal);
+        Assert.True(carried > 0, "a click inside the box can no longer reach another word");
+        Assert.True(
+            caret > carried,
+            "the caret is placed in the line being edited before the click is "
+            + "given a chance to move the edit to the line it landed on");
+
+        // And only when the click is NOT on the line being edited, or clicking
+        // about inside one word would commit and reopen it on every click.
+        Assert.Contains("!ViewModel.InPlaceEditCovers(content.Page, nx, ny)",
+            branch, StringComparison.Ordinal);
+
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int decl = vm.IndexOf("public bool InPlaceEditCovers(", StringComparison.Ordinal);
+        Assert.True(decl > 0, "nothing says which line the edit is actually on");
+        string body = vm[decl..Math.Min(vm.Length, decl + 400)];
+
+        // The LINE being edited, not the block's box: the two differ by every
+        // other line of the paragraph, which is the entire point.
+        Assert.Contains("_lineEditLine", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("TextUnitBoxContains", body);
+    }
+
+    /// <summary>
+    /// ⚠️ AND THE ARROWS REACH THE OTHER LINES TOO. Clicking is not the only
+    /// way anyone moves about in text. Left at the start of a line and Right at
+    /// its end had nowhere to go, and Up and Down did nothing at all.
+    /// </summary>
+    [Fact]
+    public void the_arrows_run_off_a_line_onto_the_next_one()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+        int keys = page.IndexOf(
+            "ViewModel.IsEditingInPlace && !IsTextInputFocused", StringComparison.Ordinal);
+        Assert.True(keys > 0);
+        string table = page[keys..Math.Min(page.Length, keys + 2400)];
+
+        foreach (string key in new[] { "Left", "Right", "Up", "Down" })
+        {
+            Assert.Contains(
+                "VirtualKey." + key + " ? () => ViewModel.InPlaceArrow" + key + "(extend)",
+                table, StringComparison.Ordinal);
+        }
+
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        // Left crosses only from the very start of the line, Right only from
+        // the very end: anywhere else they are the ordinary caret moves.
+        int left = vm.IndexOf("public void InPlaceArrowLeft(", StringComparison.Ordinal);
+        Assert.True(left > 0);
+        string leftBody = MethodBodyAt(vm, left);
+        Assert.Contains("Caret: 0", leftBody, StringComparison.Ordinal);
+        Assert.Contains("MoveInPlaceEditAcross(-1", leftBody, StringComparison.Ordinal);
+        Assert.Contains("InPlaceMoveLeft(extend)", leftBody, StringComparison.Ordinal);
+
+        int right = vm.IndexOf("public void InPlaceArrowRight(", StringComparison.Ordinal);
+        Assert.True(right > 0);
+        string rightBody = MethodBodyAt(vm, right);
+        Assert.Contains("buffer.Caret == buffer.Text.Length", rightBody, StringComparison.Ordinal);
+        Assert.Contains("MoveInPlaceEditAcross(1", rightBody, StringComparison.Ordinal);
+        Assert.Contains("InPlaceMoveRight(extend)", rightBody, StringComparison.Ordinal);
+
+        // ⚠️ AND HELD SHIFT CROSSES NOTHING. The buffer holds ONE line, so a
+        // selection reaching into the line above is not a shape it can hold and
+        // no writer here could commit it.
+        foreach (string arrow in new[] { "Left", "Right", "Up", "Down" })
+        {
+            int at = vm.IndexOf(
+                "public void InPlaceArrow" + arrow + "(", StringComparison.Ordinal);
+            Assert.Contains("!extend", MethodBodyAt(vm, at), StringComparison.Ordinal);
+        }
+
+        // The neighbour is found by BASELINE, and aimed at through the middle
+        // of its box, because a paragraph has stripes of nothing between its
+        // lines that a click on an edge falls into.
+        int beyond = vm.IndexOf("private LineSnapshot? LineBeyond(", StringComparison.Ordinal);
+        Assert.True(beyond > 0);
+        string beyondBody = MethodBodyAt(vm, beyond);
+        Assert.Contains("(line.Baseline - baseline) * direction", beyondBody, StringComparison.Ordinal);
+        Assert.Contains("LinesFor(pageIndex)", beyondBody, StringComparison.Ordinal);
+
+        int middle = vm.IndexOf("private static double MiddleOf(", StringComparison.Ordinal);
+        Assert.True(middle > 0);
+        Assert.Contains("(line.Top + line.Bottom) / 2",
+            vm[middle..Math.Min(vm.Length, middle + 200)], StringComparison.Ordinal);
     }
 
     /// <summary>
