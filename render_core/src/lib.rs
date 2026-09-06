@@ -16880,6 +16880,59 @@ mod tests {
         close_document(handle);
     }
 
+    /// ⚠️ WHAT THE APP IS ACTUALLY TOLD ABOUT A REPAIRED HINDI LINE. The repair
+    /// runs AFTER the refusal is decided, on text that at that moment still
+    /// carries glyph ids, and glyph ids are Latin Extended, not Devanagari. So
+    /// the claim written beside the repair, that every Devanagari line already
+    /// refuses as complex script, is a claim about the text AFTER the repair
+    /// and has to be checked against the code that decides.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_refusal_a_repaired_hindi_line_carries() {
+        const FILE: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let lines = decode_lines(handle, 0);
+        close_document(handle);
+
+        let mut by_reason: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        let mut devanagari_lines = 0;
+        let mut editable_devanagari = 0;
+        for l in &lines {
+            if !l.text.chars().any(crate::devanagari::is_devanagari) {
+                continue;
+            }
+            devanagari_lines += 1;
+            *by_reason.entry(l.refusal).or_default() += 1;
+            if l.refusal == LINE_OK {
+                editable_devanagari += 1;
+                if editable_devanagari <= 5 {
+                    let shown: String = l.text.chars().take(40).collect();
+                    println!("   OFFERED FOR EDITING: {shown:?}");
+                }
+            }
+        }
+
+        println!("\n{} lines, {devanagari_lines} of them carrying devanagari", lines.len());
+        for (reason, n) in &by_reason {
+            let name = match *reason {
+                0 => "LINE_OK (the app will offer a text frame)",
+                LINE_COMPLEX_SCRIPT => "LINE_COMPLEX_SCRIPT",
+                LINE_NOT_UPRIGHT => "LINE_NOT_UPRIGHT",
+                LINE_OUT_OF_ORDER => "LINE_OUT_OF_ORDER",
+                LINE_MIXED_STYLE => "LINE_MIXED_STYLE",
+                LINE_NO_OBJECTS => "LINE_NO_OBJECTS",
+                _ => "another refusal",
+            };
+            println!("   {n:5} {name} ({reason})");
+        }
+    }
+
     fn open_fixture() -> u64 {
         open_fixture_named("tests/fixtures/sample.pdf")
     }
