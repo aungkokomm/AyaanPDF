@@ -9864,6 +9864,22 @@ const CLUSTER_PARTIAL_SPAN: u32 = 6;
 /// Read from the line rather than measured again: `mark_justified_words`
 /// copies the answer `mark_justified_lines` already gave.
 const CLUSTER_JUSTIFIED: u32 = 7;
+/// The word is written in a script that has to be SHAPED, and the ordinary
+/// writer cannot shape.
+///
+/// ⚠️ THIS IS NOT A LIMITATION, IT IS A CORRECTION. Measured on a real Hindi
+/// book before this existed: the writer accepted such a word, returned OK, and
+/// left the page drawing SIX glyphs where a shaper draws four, स ् and त one
+/// after another in place of the conjunct स्त. The text read back perfectly
+/// through /ToUnicode, so neither the file nor the app said anything was
+/// wrong. A reader could damage a page and not be told.
+///
+/// ⚠️ AND IT IS WHAT MAKES REPAIRING THE TEXT SAFE. A repaired word is a
+/// different LENGTH from the glyph ids it replaces, and the app addresses a
+/// word by character offset, so showing repaired text to a caller that could
+/// still write through those offsets would be worse than showing none. The
+/// repair and this refusal have to arrive together, and do.
+const CLUSTER_COMPLEX_SCRIPT: u32 = 8;
 
 /// One word of a page's own text, and the objects that draw it.
 struct WordCluster {
@@ -9931,6 +9947,9 @@ impl WordCluster {
         // ending inside another is not: that is two strings to edit at once.
         if self.objects.len() > 1 && (self.prefix > 0 || self.suffix > 0) {
             return CLUSTER_PARTIAL_SPAN;
+        }
+        if needs_shaping(&self.text) {
+            return CLUSTER_COMPLEX_SCRIPT;
         }
         // LAST, because it is the only objection that is not about this word.
         // The word itself is perfectly writable; its LINE is what cannot take
@@ -10207,6 +10226,24 @@ fn get_page_word_clusters_inner(doc_handle: u64, page_index: i32) -> ByteBuffer 
     // told before their refusals are reported.
     let mut clusters = page_word_clusters(&doc_guard, &page);
     mark_justified_words(&mut clusters, &page_lines(&doc_guard, &page, page_w));
+
+    // ⚠️ THE SAME REPAIR THE LINES GET. Without it one page reads two ways:
+    // `get_page_lines` showed "गीता-दर्शन" and this showed "गीता-दशŊन", that Ŋ
+    // being glyph 330 wearing its own id as a character, and the reader was
+    // offered a caret in the second one.
+    //
+    // ⚠️ SAFE ONLY BECAUSE A REPAIRED WORD REFUSES. The repair changes the
+    // text's LENGTH, and a word is addressed by character offset, so a caller
+    // that could still write through those offsets would be writing to the
+    // wrong place. Every word this touches carries Devanagari afterwards and
+    // is therefore refused as CLUSTER_COMPLEX_SCRIPT. See that constant.
+    {
+        let mut texts: Vec<String> = clusters.iter().map(|w| w.text.clone()).collect();
+        devanagari::repair_page(&mut texts);
+        for (w, text) in clusters.iter_mut().zip(texts) {
+            w.text = text;
+        }
+    }
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&(clusters.len() as u32).to_le_bytes());
@@ -16991,6 +17028,7 @@ mod tests {
                 CLUSTER_NO_OBJECTS => "CLUSTER_NO_OBJECTS",
                 CLUSTER_PARTIAL_SPAN => "CLUSTER_PARTIAL_SPAN",
                 CLUSTER_JUSTIFIED => "CLUSTER_JUSTIFIED",
+                CLUSTER_COMPLEX_SCRIPT => "CLUSTER_COMPLEX_SCRIPT",
                 _ => "another refusal",
             };
             println!("   {n:5} {name} ({reason})");
@@ -17092,6 +17130,55 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// ⚠️ THE WORD MODEL MUST REFUSE A SHAPED SCRIPT TOO, and it did not.
+    /// The LINE model has refused these since it was written; the WORD model,
+    /// which is what the app actually offers a caret in, had no such objection
+    /// at all. Measured on a real Hindi book: 230 of its words came back
+    /// editable, and editing one returned OK while leaving the page drawing
+    /// six glyphs where a shaper draws four.
+    ///
+    /// The Latin half is the control: without it this test passes just as well
+    /// on a version that refuses every word on every page.
+    #[test]
+    fn a_word_in_a_script_that_has_to_be_shaped_is_refused() {
+        let handle = open_fixture_named("tests/fixtures/sample_complex_script.pdf");
+        let words = decode_clusters(handle, 0);
+
+        let shaped: Vec<&DecodedCluster> = words
+            .iter()
+            .filter(|w| w.text.chars().any(|c| ('\u{1000}'..='\u{109f}').contains(&c)
+                                            || ('\u{0900}'..='\u{097f}').contains(&c)))
+            .collect();
+        assert!(shaped.len() >= 5, "too few shaped words to prove anything: {words:#?}");
+
+        // What has to be true is that none of them is OFFERED. A word may
+        // refuse for a more specific reason first, and should: a Burmese word
+        // whose marks arrive out of order is SPLIT_OBJECTS, which tells the
+        // reader more than "this script has to be shaped" does.
+        for w in &shaped {
+            assert_ne!(w.refusal, CLUSTER_OK, "{:?} is offered for editing", w.text);
+        }
+        // And at least one has to be refused by THIS objection, or the test
+        // passes just as well with it deleted.
+        assert!(
+            shaped.iter().any(|w| w.refusal == CLUSTER_COMPLEX_SCRIPT),
+            "nothing was refused as a shaped script, so this proves nothing"
+        );
+
+        close_document(handle);
+
+        // The control, on a document of plain Latin: the new objection must not
+        // reach anything it has no business in. Without this the test passes
+        // just as well on a version that refuses every word of every document.
+        let plain = open_fixture_named("tests/fixtures/sample.pdf");
+        let editable = decode_clusters(plain, 0)
+            .iter()
+            .filter(|w| w.refusal == CLUSTER_OK)
+            .count();
+        close_document(plain);
+        assert!(editable > 0, "plain Latin words stopped being editable");
     }
 
     fn open_fixture() -> u64 {

@@ -101,6 +101,7 @@ public static class WordClusterReader
         5 => ClusterRefusal.NoObjects,
         6 => ClusterRefusal.PartialSpan,
         7 => ClusterRefusal.Justified,
+        8 => ClusterRefusal.ComplexScript,
         _ => ClusterRefusal.NoObjects,
     };
 

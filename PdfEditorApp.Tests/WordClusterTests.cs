@@ -123,6 +123,9 @@ public class WordClusterTests
     [InlineData(3u, ClusterRefusal.SplitObjects)]
     [InlineData(4u, ClusterRefusal.NoFontName)]
     [InlineData(5u, ClusterRefusal.NoObjects)]
+    [InlineData(6u, ClusterRefusal.PartialSpan)]
+    [InlineData(7u, ClusterRefusal.Justified)]
+    [InlineData(8u, ClusterRefusal.ComplexScript)]
     public void every_refusal_the_core_can_give_arrives_intact(uint code, ClusterRefusal expected)
     {
         var w = Assert.Single(WordClusterReader.Parse(Buffer(([0], "x", "Arial", code))));

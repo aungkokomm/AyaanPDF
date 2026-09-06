@@ -42,6 +42,17 @@ public enum ClusterRefusal
     /// line; it measures nothing of its own.
     /// </summary>
     Justified = 7,
+
+    /// <summary>
+    /// The word is written in a script that has to be SHAPED, and the ordinary
+    /// writer cannot shape.
+    ///
+    /// ⚠️ THIS IS A CORRECTION, NOT A LIMITATION. Before it, editing a Hindi
+    /// word reported success and left the page drawing six glyphs where a
+    /// shaper draws four, with the text still reading back correctly, so
+    /// nothing told the reader the page had been damaged.
+    /// </summary>
+    ComplexScript = 8,
 }
 
 /// <summary>
@@ -115,6 +126,7 @@ public sealed record WordClusterSnapshot(
         ClusterRefusal.NoFontName => "This text does not name its font, so there is no way to match it.",
         ClusterRefusal.PartialSpan => "This word is split across two pieces of the page and cannot be replaced cleanly.",
         ClusterRefusal.Justified => "This line is justified, and editing justified text is not supported yet.",
+        ClusterRefusal.ComplexScript => "This script has to be shaped, and editing it is not supported yet.",
         _ => "This text cannot be edited.",
     };
 }
