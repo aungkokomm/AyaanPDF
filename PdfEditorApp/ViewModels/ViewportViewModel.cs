@@ -11584,6 +11584,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void InPlaceSelectAll() => Changed(() => _lineEdit!.SelectAll());
 
+    /// <summary>
+    /// Pastes the clipboard into the line, replacing the selection.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CLIPBOARD IS READ ASYNCHRONOUSLY, SO THE EDIT MAY BE GONE by
+    /// the time this is called. Changed() already refuses when there is no
+    /// buffer, which is what makes that safe rather than a race to think about
+    /// at every call site.
+    ///
+    /// ⚠️ AND IT IS THE ONLY WAY TO TYPE A SCRIPT WINDOWS CANNOT. The reader
+    /// writes Hindi and Burmese; when no working input method reaches the page,
+    /// composing the word somewhere that does and pasting it is the difference
+    /// between the editor being usable and not.
+    /// </remarks>
+    public void InPlacePaste(string? text)
+    {
+        string line = LineEditBuffer.OneLine(text);
+        if (line.Length == 0) { return; }
+
+        Changed(() => _lineEdit!.Insert(line));
+    }
+
     /// <summary>Selects the word a double-click landed in.</summary>
     public void InPlaceSelectWordAt(double normX)
     {

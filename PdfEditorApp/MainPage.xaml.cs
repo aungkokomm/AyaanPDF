@@ -7266,6 +7266,42 @@ public sealed partial class MainPage : Page
     /// writes Devanagari and Burmese, where mapping virtual keys to characters
     /// by hand would produce nothing usable at all.
     /// </remarks>
+    /// <summary>
+    /// Puts the clipboard's text into the line being edited.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THIS IS HOW A SCRIPT WINDOWS CANNOT TYPE GETS ONTO THE PAGE. The
+    /// reader writes Hindi and Burmese, and a composing input method needs a
+    /// text document which this page does not have. Until it does, composing
+    /// the word where it works and pasting it here is the whole difference
+    /// between being able to edit these documents and not.
+    ///
+    /// ⚠️ async void IS CORRECT HERE and must never throw. Reading the
+    /// clipboard is asynchronous and can fail for reasons that are nobody's
+    /// fault: another process holding it, or nothing on it at all.
+    /// </remarks>
+    private async void PasteIntoInPlaceEdit()
+    {
+        string text;
+        try
+        {
+            var clipboard = Windows.ApplicationModel.DataTransfer.Clipboard.GetContent();
+            if (!clipboard.Contains(
+                    Windows.ApplicationModel.DataTransfer.StandardDataFormats.Text))
+            {
+                return;
+            }
+            text = await clipboard.GetTextAsync();
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"paste refused: {ex.Message}");
+            return;
+        }
+
+        ViewModel.InPlacePaste(text);
+    }
+
     private void RootGrid_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
     {
         if (!ViewModel.IsEditingInPlace || _isCtrlDown || IsAltDown()) { return; }
@@ -7338,15 +7374,22 @@ public sealed partial class MainPage : Page
         // through, so Ctrl+S still saves while a line is open.
         if (ViewModel.IsEditingInPlace && !IsTextInputFocused && !IsAltDown())
         {
-            // ⚠️ SELECT ALL IS THE ONE CHORD THIS CLAIMS. Every other Ctrl
-            // combination falls through, so Ctrl+S still saves while a line is
-            // open. Ctrl+A while typing into text has to mean that text, not
-            // every annotation on the page.
+            // ⚠️ SELECT ALL AND PASTE ARE THE TWO CHORDS THIS CLAIMS.
+            // Every other Ctrl combination falls through, so Ctrl+S still saves
+            // while a line is open. Ctrl+A while typing into text has to mean
+            // that text rather than every annotation on the page, and Ctrl+V
+            // has to mean this line rather than pasting an annotation onto the
+            // page behind it.
             if (_isCtrlDown)
             {
                 if (e.Key == VirtualKey.A)
                 {
                     ViewModel.InPlaceSelectAll();
+                    e.Handled = true;
+                }
+                else if (e.Key == VirtualKey.V)
+                {
+                    PasteIntoInPlaceEdit();
                     e.Handled = true;
                 }
 

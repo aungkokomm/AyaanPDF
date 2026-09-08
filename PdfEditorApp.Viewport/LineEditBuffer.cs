@@ -148,6 +148,40 @@ public sealed class LineEditBuffer
         Anchor = Caret;
     }
 
+    /// <summary>
+    /// Pasted text, reduced to something a LINE can hold.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A LINE OF A PDF IS ONE LINE, and the clipboard rarely is. Whatever
+    /// was copied may carry newlines, tabs and stray control characters, and
+    /// putting those into a line would ask the writer to draw something the
+    /// page has no room for. Each run of them becomes a single space, which
+    /// keeps the words apart instead of running them together.
+    ///
+    /// ⚠️ AND THE RESULT IS TRIMMED, because copying a line almost always
+    /// takes its newline with it, and nobody means to paste a trailing space.
+    /// </remarks>
+    public static string OneLine(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) { return string.Empty; }
+
+        var line = new System.Text.StringBuilder(text.Length);
+        bool gap = false;
+        foreach (char c in text)
+        {
+            if (c == '\t' || c == '\n' || c == '\r' || char.IsControl(c))
+            {
+                gap = true;
+                continue;
+            }
+            if (gap && line.Length > 0) { line.Append(' '); }
+            gap = false;
+            line.Append(c);
+        }
+
+        return line.ToString().Trim();
+    }
+
     /// <summary>Delete: removes the selection, or the character after the caret.</summary>
     public void Delete()
     {

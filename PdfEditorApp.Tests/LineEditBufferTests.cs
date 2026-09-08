@@ -380,4 +380,59 @@ public class LineEditBufferTests
         Assert.Equal("nx", buffer.Text);
         Assert.Equal(1, buffer.Caret);
     }
+
+    // ---------------- pasting into a line ----------------
+
+    /// <summary>
+    /// ⚠️ A LINE OF A PDF IS ONE LINE, AND THE CLIPBOARD RARELY IS. Whatever
+    /// was copied may carry newlines and tabs, and a line has nowhere to put
+    /// them. Each run becomes ONE space, so the words stay apart rather than
+    /// running together.
+    /// </summary>
+    [Theory]
+    [InlineData("\r" + "\n" + "two lines", "two lines")]
+    [InlineData("two" + "\n" + "lines", "two lines")]
+    [InlineData("two" + "\r" + "\n" + "\r" + "\n" + "lines", "two lines")]
+    [InlineData("a" + "\t" + "b", "a b")]
+    [InlineData("trailing newline" + "\n", "trailing newline")]
+    [InlineData("  kept inside  ", "kept inside")]
+    [InlineData("", "")]
+    [InlineData(null, "")]
+    public void pasted_text_is_reduced_to_something_a_line_can_hold(
+        string? pasted, string expected)
+    {
+        Assert.Equal(expected, LineEditBuffer.OneLine(pasted));
+    }
+
+    /// <summary>
+    /// ⚠️ THE POINT OF ALL THIS. The reader writes Hindi and Burmese, and a
+    /// composing input method needs a text document the page does not have.
+    /// Composing the word where it works and pasting it here has to arrive
+    /// intact, codepoint for codepoint.
+    /// </summary>
+    [Fact]
+    public void a_pasted_devanagari_word_arrives_unchanged()
+    {
+        const string kyon = "\u0915\u094D\u092F\u094B\u0902";
+
+        Assert.Equal(kyon, LineEditBuffer.OneLine(kyon + "\n"));
+
+        var buffer = new LineEditBuffer("", 0);
+        buffer.Insert(LineEditBuffer.OneLine(kyon));
+
+        Assert.Equal(kyon, buffer.Text);
+        Assert.Equal(kyon.Length, buffer.Caret);
+    }
+
+    [Fact]
+    public void pasting_replaces_whatever_was_selected()
+    {
+        var buffer = new LineEditBuffer("Chapter One", 0);
+        buffer.PlaceCaret(8);
+        buffer.PlaceCaret(11, extend: true);
+
+        buffer.Insert(LineEditBuffer.OneLine("Two" + "\n"));
+
+        Assert.Equal("Chapter Two", buffer.Text);
+    }
 }

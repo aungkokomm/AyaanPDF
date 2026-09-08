@@ -491,4 +491,49 @@ public class LineEditWiringTests
         // untouched while the reader is only looking at it.
         Assert.Contains("if (!_lineEdit.IsChanged) { return null; }", body, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// ⚠️ CTRL+V HAS TO MEAN THIS LINE, NOT THE PAGE BEHIND IT. The canvas
+    /// claims Ctrl+V for pasting an ANNOTATION, and if the in-place path let
+    /// the chord fall through, pasting while editing text would drop a copied
+    /// annotation onto the page instead of putting the text in the line.
+    ///
+    /// ⚠️ AND IT IS WHAT MAKES THESE DOCUMENTS EDITABLE AT ALL for a reader
+    /// whose script Windows cannot type into this page. Composing the word
+    /// somewhere that works and pasting it here is the only route there is
+    /// until the page becomes a text document.
+    /// </summary>
+    [Fact]
+    public void control_v_pastes_into_the_line_and_not_onto_the_page()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+
+        int at = page.IndexOf("ViewModel.IsEditingInPlace && !IsTextInputFocused",
+                              StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing routes keys to an in-place edit");
+
+        // The chord is claimed inside the Ctrl block, which returns, so the
+        // canvas case for Ctrl+V below it can never run while editing.
+        string chords = page[at..Math.Min(page.Length, at + 1400)];
+        Assert.Contains("e.Key == VirtualKey.V", chords, StringComparison.Ordinal);
+        Assert.Contains("PasteIntoInPlaceEdit();", chords, StringComparison.Ordinal);
+        Assert.Contains("e.Handled = true;", chords, StringComparison.Ordinal);
+
+        // ⚠️ AND A LINE IS NOT A DOCUMENT. Whatever was copied is reduced to
+        // one line before it goes in.
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int paste = vm.IndexOf("public void InPlacePaste(", StringComparison.Ordinal);
+        Assert.True(paste > 0, "the view model cannot paste");
+        Assert.Contains("LineEditBuffer.OneLine(text)",
+            vm[paste..Math.Min(vm.Length, paste + 400)], StringComparison.Ordinal);
+
+        // Reading the clipboard is asynchronous, and by the time it answers the
+        // edit may be over. Nothing may throw out of that.
+        int reader = page.IndexOf("private async void PasteIntoInPlaceEdit()",
+                                  StringComparison.Ordinal);
+        Assert.True(reader > 0);
+        string body = page[reader..Math.Min(page.Length, reader + 900)];
+        Assert.Contains("catch (Exception", body, StringComparison.Ordinal);
+        Assert.Contains("StandardDataFormats.Text", body, StringComparison.Ordinal);
+    }
 }
