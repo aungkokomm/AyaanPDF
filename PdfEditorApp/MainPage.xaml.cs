@@ -7100,13 +7100,27 @@ public sealed partial class MainPage : Page
         double fontDip = Math.Max(1, tail.FontSizePts * dipsPerPoint);
         var ink = HexBrush(tail.ColorHex);
 
-        // 1. Paint out the glyphs this replaces, and ONLY those. The cover stops
-        //    at the old text's own right edge, because that is as far as the
-        //    page drew, and it is the page's own colour rather than an assumed
-        //    white.
+        // 1. Paint out the glyphs this replaces, in the page's own colour
+        //    rather than an assumed white.
+        //
+        //    ⚠️ AS FAR AS THE OLD TEXT REACHED, OR AS FAR AS THE NEW TEXT
+        //    DOES, WHICHEVER IS FURTHER. It used to stop at the old text's
+        //    right edge on the reasoning that this is as far as the page drew,
+        //    and that is true but not the question. When the replacement comes
+        //    out longer, the extra runs on OVER the word after it and the
+        //    reader watches two pieces of Devanagari sitting on top of each
+        //    other. The file itself is right: committing pushes the rest of the
+        //    line along (see `retype`'s reflow). Only this preview was wrong.
+        //
+        //    ⚠️ AND THE NEIGHBOURS GO UNDER THE COVER UNTIL THEN, because
+        //    this app cannot redraw the page's own type faithfully: it does not
+        //    have the page's subset font and would be guessing at the shaping.
+        //    A clean gap that fills back in on commit is honest; overlapping
+        //    letters are not.
+        double drawn = RunWidth(tail.Text, tail, fontDip, ink);
         var cover = new Rectangle
         {
-            Width = Math.Max(0, (tail.CoverRight - tail.Left) * scale),
+            Width = Math.Max(Math.Max(0, (tail.CoverRight - tail.Left) * scale), drawn),
             Height = height,
             Fill = HexBrush(tail.CoverColorHex),
         };

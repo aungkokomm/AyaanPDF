@@ -654,4 +654,39 @@ public class LineEditWiringTests
             input[Math.Max(0, made - 400)..Math.Min(input.Length, made + 400)],
             StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// ⚠️ THE PREVIEW MUST NOT LET TWO WORDS SIT ON TOP OF EACH OTHER. The
+    /// cover paints out the glyphs the replacement stands in for, and it used
+    /// to stop at the OLD text's right edge. Type something longer and the
+    /// extra ran straight over the next word, which is what the reader saw:
+    /// "I type text overlaps while typing and after clicking out of frame it
+    /// settled". The file was already right by then, because committing
+    /// reflows the line; only this preview was not.
+    /// </summary>
+    [Fact]
+    public void the_preview_covers_as_far_as_the_typed_text_reaches()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+
+        int at = page.IndexOf("private void DrawInPlaceTail(", StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing draws the text being typed");
+
+        string body = page[at..Math.Min(page.Length, at + 2600)];
+
+        // The cover takes the wider of the two, never just the old extent.
+        int cover = body.IndexOf("var cover = new Rectangle", StringComparison.Ordinal);
+        Assert.True(cover > 0, "nothing paints out the old glyphs");
+        string rect = body[cover..Math.Min(body.Length, cover + 300)];
+
+        Assert.Contains("tail.CoverRight", rect, StringComparison.Ordinal);
+        Assert.Contains("drawn", rect, StringComparison.Ordinal);
+        Assert.Contains("Math.Max", rect, StringComparison.Ordinal);
+
+        // And the width it is compared against is the tail's own measured one,
+        // in the font the tail is actually drawn in.
+        int measured = body.IndexOf("double drawn = RunWidth(tail.Text,", StringComparison.Ordinal);
+        Assert.True(measured > 0, "the typed text's width is never measured");
+        Assert.True(measured < cover, "the cover is built before the width it needs");
+    }
 }
