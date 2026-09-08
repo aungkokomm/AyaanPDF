@@ -536,4 +536,122 @@ public class LineEditWiringTests
         Assert.Contains("catch (Exception", body, StringComparison.Ordinal);
         Assert.Contains("StandardDataFormats.Text", body, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// ⚠️ THE PAGE MUST BE A TEXT DOCUMENT, OR HINDI CANNOT BE TYPED INTO IT.
+    /// A composing input method does not send characters; it asks the focused
+    /// control for its text, revises a range of it, and asks again. The page is
+    /// a `Grid`, which can answer none of that, so a phonetic keyboard produced
+    /// nothing on it while typing Devanagari into Ayaan's own Find box, an
+    /// ordinary `TextBox`, worked. `CoreTextEditContext` is what gives the page
+    /// the document it was missing.
+    /// </summary>
+    [Fact]
+    public void the_page_offers_a_text_document_for_an_input_method()
+    {
+        string input = Source("PdfEditorApp", "PageTextInput.cs");
+
+        Assert.Contains("CoreTextServicesManager.GetForCurrentView()", input,
+            StringComparison.Ordinal);
+        Assert.Contains("CreateEditContext()", input, StringComparison.Ordinal);
+
+        // Every question Text Services can ask has to be answered, or the
+        // composition stalls with no error anywhere.
+        foreach (string handler in new[]
+        {
+            "TextRequested", "SelectionRequested", "TextUpdating",
+            "SelectionUpdating", "LayoutRequested", "FocusRemoved",
+        })
+        {
+            Assert.Contains($"_context.{handler} +=", input, StringComparison.Ordinal);
+        }
+
+        // And it has to be told when the reader starts and stops editing.
+        Assert.Contains("NotifyFocusEnter()", input, StringComparison.Ordinal);
+        Assert.Contains("NotifyFocusLeave()", input, StringComparison.Ordinal);
+        Assert.Contains("NotifyTextChanged(", input, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ OR EVERY LETTER IS TYPED TWICE. A keystroke that Text Services turns
+    /// into a `TextUpdating` still arrives at the window as a character, so the
+    /// character path has to stand down for exactly as long as an input method
+    /// is being hosted.
+    /// </summary>
+    [Fact]
+    public void the_character_path_stands_down_while_an_input_method_is_hosted()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+
+        int at = page.IndexOf("private void RootGrid_CharacterReceived(",
+                              StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing receives typed characters");
+
+        string body = page[at..Math.Min(page.Length, at + 700)];
+        Assert.Contains("_textInput is { IsActive: true }", body, StringComparison.Ordinal);
+
+        // The guard has to come BEFORE anything is inserted.
+        int guard = body.IndexOf("_textInput is { IsActive: true }", StringComparison.Ordinal);
+        int insert = body.IndexOf("InPlaceInsert", StringComparison.Ordinal);
+        Assert.True(insert > guard,
+            "the character is inserted before the input method is checked for");
+    }
+
+    /// <summary>
+    /// ⚠️ APPLYING AN UPDATE MUST NOT BE REPORTED BACK AS ONE. Writing what
+    /// Text Services asked for raises the view model's changed event, and
+    /// answering that by telling Text Services the text changed describes a
+    /// change it is in the middle of making. That tears a composition in half.
+    /// </summary>
+    [Fact]
+    public void a_change_an_input_method_made_is_not_reported_back_to_it()
+    {
+        string input = Source("PdfEditorApp", "PageTextInput.cs");
+
+        int at = input.IndexOf("private void OnTextUpdating(", StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing applies an input method's text");
+
+        string body = input[at..Math.Min(input.Length, at + 1200)];
+        Assert.Contains("_applying = true;", body, StringComparison.Ordinal);
+        Assert.Contains("finally", body, StringComparison.Ordinal);
+        Assert.Contains("_applying = false;", body, StringComparison.Ordinal);
+
+        // And the report is what consults the flag.
+        int changed = input.IndexOf("public void Changed()", StringComparison.Ordinal);
+        Assert.True(changed > 0);
+        Assert.Contains("_applying",
+            input[changed..Math.Min(input.Length, changed + 300)], StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ AND IT IS DRIVEN FROM THE ONE PLACE THAT ALREADY KNOWS. The view
+    /// model raises a single event when a line edit begins, changes and ends,
+    /// so the edit context is entered, updated and left from that handler rather
+    /// than from every call site that could start or finish an edit.
+    /// </summary>
+    [Fact]
+    public void the_edit_context_follows_the_line_edit_it_belongs_to()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+
+        Assert.Contains("ViewModel.InPlaceEditChanged += OnInPlaceEditChanged;", page,
+            StringComparison.Ordinal);
+
+        int at = page.IndexOf("private void SyncTextInput()", StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing keeps text services in step with the edit");
+
+        string body = page[at..Math.Min(page.Length, at + 900)];
+        Assert.Contains("_textInput?.Leave();", body, StringComparison.Ordinal);
+        Assert.Contains(".Enter();", body, StringComparison.Ordinal);
+        Assert.Contains(".Changed();", body, StringComparison.Ordinal);
+
+        // ⚠️ AND IT DEGRADES TO WHAT WAS THERE BEFORE. A machine where the
+        // manager cannot be had must keep typing on the character path rather
+        // than losing it, so construction may not throw.
+        string input = Source("PdfEditorApp", "PageTextInput.cs");
+        int made = input.IndexOf("CreateEditContext()", StringComparison.Ordinal);
+        Assert.Contains("catch (Exception",
+            input[Math.Max(0, made - 400)..Math.Min(input.Length, made + 400)],
+            StringComparison.Ordinal);
+    }
 }

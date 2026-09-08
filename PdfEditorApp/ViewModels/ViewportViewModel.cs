@@ -11379,6 +11379,28 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void InPlaceInsert(string text) => Changed(() => _lineEdit!.Insert(text));
 
+    /// <summary>
+    /// Rewrites one range of the line, for an input method.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ AN INPUT METHOD DOES NOT TYPE LETTERS, IT REVISES A RANGE. See
+    /// <see cref="PageTextInput"/>: composing a Hindi word is the same few
+    /// characters written over and over as the reader narrows down what they
+    /// meant, so this and not <see cref="InPlaceInsert"/> is what hosting one
+    /// takes.
+    /// </remarks>
+    public void InPlaceReplaceRange(int start, int end, string text) =>
+        Changed(() => _lineEdit!.ReplaceRange(start, end, text));
+
+    /// <summary>
+    /// Puts the selection where an input method asks for it.
+    /// </summary>
+    public void InPlaceSetSelection(int start, int end) => Changed(() =>
+    {
+        _lineEdit!.PlaceCaret(start);
+        if (end != start) { _lineEdit.PlaceCaret(end, extend: true); }
+    });
+
     public void InPlaceBackspace() => Changed(() => _lineEdit!.Backspace());
 
     public void InPlaceDelete() => Changed(() => _lineEdit!.Delete());

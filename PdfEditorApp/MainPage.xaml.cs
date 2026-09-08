@@ -112,7 +112,7 @@ public sealed partial class MainPage : Page
 
         // The caret and the redrawn tail follow the page: SelectionVisualsChanged
         // covers scrolling and zooming, InPlaceEditChanged covers typing.
-        ViewModel.InPlaceEditChanged += RenderInPlaceEdit;
+        ViewModel.InPlaceEditChanged += OnInPlaceEditChanged;
         ViewModel.SelectionVisualsChanged += RenderInPlaceEdit;
         ViewModel.InkStrokes.CollectionChanged += OnInkStrokesCollectionChanged;
         // Shapes are a SEPARATE collection but share the ink canvas, so without
@@ -6969,6 +6969,69 @@ public sealed partial class MainPage : Page
     /// </summary>
     private const string SelectionWashHex = "#552D6FC4";
 
+    /// <summary>
+    /// The line being edited has started, changed or finished.
+    /// </summary>
+    private void OnInPlaceEditChanged()
+    {
+        RenderInPlaceEdit();
+        SyncTextInput();
+    }
+
+    /// <summary>
+    /// Keeps Windows Text Services told about the line the reader is editing.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ BUILT ON FIRST USE, NOT AT STARTUP. Creating it asks the system for
+    /// a text services manager, and a document that is never edited should not
+    /// pay for that or fail because of it.
+    /// </remarks>
+    private void SyncTextInput()
+    {
+        if (!ViewModel.IsEditingInPlace)
+        {
+            _textInput?.Leave();
+            return;
+        }
+
+        _textInput ??= new PageTextInput(ViewModel, InPlaceLayer, CaretOnScreen);
+        if (_textInput.IsActive)
+        {
+            _textInput.Changed();
+        }
+        else
+        {
+            _textInput.Enter();
+        }
+    }
+
+    private PageTextInput? _textInput;
+
+    /// <summary>
+    /// Where the caret is on the DESKTOP, for an input method to hang its
+    /// candidate list off.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ NOTHING DEPENDS ON THIS BEING RIGHT. It places a suggestion list,
+    /// so getting it wrong is untidy rather than broken, and it is null while
+    /// the caret is out in the typed tail, which the page is not drawing.
+    /// </remarks>
+    private Windows.Foundation.Rect? CaretOnScreen()
+    {
+        if (!ViewModel.IsEditingInPlace) { return null; }
+
+        int page = ViewModel.InPlacePage;
+        double scale = ViewModel.OverlayScale;
+        if (page < 0 || scale <= 0) { return null; }
+        if (ViewModel.InPlaceCaretOnPage() is not { } caret) { return null; }
+
+        double top = (caret.Top * scale) + ViewModel.SlotTopOf(page);
+        var local = new Windows.Foundation.Rect(
+            caret.X * scale, top, 1, Math.Max(1, (caret.Bottom - caret.Top) * scale));
+
+        return PageTextInput.OnScreen(InPlaceLayer, local);
+    }
+
     private void RenderInPlaceEdit()
     {
         InPlaceLayer.Children.Clear();
@@ -7257,16 +7320,6 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// Typed text, while the reader is editing the page's own text.
-    /// </summary>
-    /// <remarks>
-    /// ⚠️ CharacterReceived, NOT KeyDown MAPPED TO LETTERS. This is the event
-    /// that has already been through the keyboard layout, the dead keys and the
-    /// IME, so it delivers what the reader actually meant to type. This user
-    /// writes Devanagari and Burmese, where mapping virtual keys to characters
-    /// by hand would produce nothing usable at all.
-    /// </remarks>
-    /// <summary>
     /// Puts the clipboard's text into the line being edited.
     /// </summary>
     /// <remarks>
@@ -7302,9 +7355,28 @@ public sealed partial class MainPage : Page
         ViewModel.InPlacePaste(text);
     }
 
+    /// <summary>
+    /// Typed text, while the reader is editing the page's own text.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ CharacterReceived, NOT KeyDown MAPPED TO LETTERS. This is the event
+    /// that has already been through the keyboard layout and the dead keys, so
+    /// it delivers what the reader actually meant to type. This user writes
+    /// Devanagari and Burmese, where mapping virtual keys to characters by hand
+    /// would produce nothing usable at all.
+    ///
+    /// ⚠️ AND IT STANDS DOWN FOR AN INPUT METHOD. A composing keyboard hands
+    /// its text over through <see cref="PageTextInput"/> instead, and the same
+    /// keystroke still arrives here as a character: taking both types every
+    /// letter twice. This route is what is left for a keyboard that injects
+    /// finished characters rather than composing them, which is what the
+    /// reader's Burmese one does, and for any machine where text services
+    /// cannot be had at all.
+    /// </remarks>
     private void RootGrid_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
     {
         if (!ViewModel.IsEditingInPlace || _isCtrlDown || IsAltDown()) { return; }
+        if (_textInput is { IsActive: true }) { return; }
 
         // Enter, Escape, Backspace and Tab arrive here too. They are keys, not
         // text, and RootGrid_KeyDown has already dealt with them.

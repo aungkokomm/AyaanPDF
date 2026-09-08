@@ -128,6 +128,34 @@ public sealed class LineEditBuffer
     }
 
     /// <summary>
+    /// Replaces the characters from <paramref name="start"/> to
+    /// <paramref name="end"/> with <paramref name="text"/>, leaving the caret
+    /// after what was put in.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THIS IS WHAT AN INPUT METHOD NEEDS, AND ONLY IT. Windows Text
+    /// Services does not type characters at a caret; it hands over a RANGE and
+    /// what that range should now say, and it moves that range around while a
+    /// word is being composed. Typing `kyon` on a Hindi phonetic keyboard is
+    /// one range rewritten five times, not five separate letters, so an editor
+    /// that can only insert at its own caret cannot host one.
+    ///
+    /// ⚠️ AND THE RANGE COMES FROM OUTSIDE, so it is clamped rather than
+    /// trusted. A composition that is interrupted can name a range that no
+    /// longer exists.
+    /// </remarks>
+    public void ReplaceRange(int start, int end, string text)
+    {
+        start = Clamp(start);
+        end = Clamp(end);
+        if (end < start) { (start, end) = (end, start); }
+
+        Text = Text[..start] + text + Text[end..];
+        Caret = start + (text?.Length ?? 0);
+        Anchor = Caret;
+    }
+
+    /// <summary>
     /// Backspace: removes the selection, or the character before the caret.
     /// </summary>
     /// <remarks>

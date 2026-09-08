@@ -435,4 +435,80 @@ public class LineEditBufferTests
 
         Assert.Equal("Chapter Two", buffer.Text);
     }
+
+    // ---------------- what an input method needs ----------------
+
+    /// <summary>
+    /// ⚠️ AN INPUT METHOD REVISES A RANGE, IT DOES NOT TYPE LETTERS. Windows
+    /// Text Services hands over a range and what that range should now say, and
+    /// while a word is being composed it rewrites the SAME range over and over.
+    /// </summary>
+    [Theory]
+    [InlineData("Chapter One", 8, 11, "Two", "Chapter Two", 11)]
+    [InlineData("Chapter One", 0, 0, "The ", "The Chapter One", 4)]
+    [InlineData("Chapter One", 0, 11, "", "", 0)]
+    [InlineData("abc", 1, 2, "XY", "aXYc", 3)]
+    public void a_range_can_be_rewritten_and_the_caret_lands_after_it(
+        string start, int from, int to, string put, string expected, int caret)
+    {
+        var buffer = new LineEditBuffer(start, 0);
+
+        buffer.ReplaceRange(from, to, put);
+
+        Assert.Equal(expected, buffer.Text);
+        Assert.Equal(caret, buffer.Caret);
+        Assert.False(buffer.HasSelection);
+    }
+
+    /// <summary>
+    /// ⚠️ COMPOSING A HINDI WORD IS ONE RANGE WRITTEN FIVE TIMES. This is
+    /// what a phonetic keyboard actually does, and it is the thing the page
+    /// could not host: `kyon` narrows down to a word, each keystroke replacing
+    /// what the last one put there.
+    /// </summary>
+    [Fact]
+    public void a_composition_rewrites_what_it_wrote_before()
+    {
+        var buffer = new LineEditBuffer("", 0);
+
+        // k -> ka -> kya -> kyo -> kyon, each replacing the whole composition.
+        string[] steps =
+        {
+            "\u0915",
+            "\u0915",
+            "\u0915\u094D\u092F",
+            "\u0915\u094D\u092F\u094B",
+            "\u0915\u094D\u092F\u094B\u0902",
+        };
+
+        int from = 0, to = 0;
+        foreach (string step in steps)
+        {
+            buffer.ReplaceRange(from, to, step);
+            to = from + step.Length;
+        }
+
+        Assert.Equal("\u0915\u094D\u092F\u094B\u0902", buffer.Text);
+        Assert.Equal(buffer.Text.Length, buffer.Caret);
+    }
+
+    /// <summary>
+    /// ⚠️ THE RANGE COMES FROM OUTSIDE THIS PROCESS, so it is clamped rather
+    /// than trusted. An interrupted composition can name a range the line no
+    /// longer has, and throwing there would take the reader's edit down with it.
+    /// </summary>
+    [Theory]
+    [InlineData(-5, 2, "X", "Xc")]
+    [InlineData(1, 99, "X", "aX")]
+    [InlineData(99, 99, "X", "abcX")]
+    [InlineData(2, 1, "X", "aXc")]
+    public void a_range_that_the_line_does_not_have_is_clamped_not_thrown(
+        int from, int to, string put, string expected)
+    {
+        var buffer = new LineEditBuffer("abc", 0);
+
+        buffer.ReplaceRange(from, to, put);
+
+        Assert.Equal(expected, buffer.Text);
+    }
 }
