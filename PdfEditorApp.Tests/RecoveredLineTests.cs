@@ -501,4 +501,104 @@ public class RecoveredLineTests
             + $"and missed [{string.Join(", ", installed)}]");
         Assert.Contains(answer, installed);
     }
+
+    // ---------------- what the page's text turned out to be ----------------
+
+    /// <summary>
+    /// ⚠️ SUPERSESSION IS A FACT ABOUT THE PAGE, AND IT WAS BEING THROWN
+    /// AWAY. Dropping a fragment because a recovered line stands where it does
+    /// IS "recovery owns this page's text", and every subsystem downstream used
+    /// to work it out again for itself.
+    /// </summary>
+    [Fact]
+    public void merging_says_when_recovery_took_the_fragments_over()
+    {
+        var lines = new[] { Fragment(0.13, LineRefusal.ComplexScript, "င") };
+
+        var merged = RecoveredLines.Merge(
+            lines, new[] { Read(0.13, Burmese, 0.12, 0.5, 0.88) }, out bool superseded);
+
+        Assert.True(superseded);
+        Assert.Single(merged);
+    }
+
+    /// <summary>
+    /// ⚠️ AND A PAGE CAN BE SHAPED, BE FINISHED, AND STILL OWN NOTHING. When
+    /// recovery declines every line, the fragments are all the page has. A flag
+    /// that collapsed "this page needed reshaping" into "recovery owns it"
+    /// would take them away and leave the reader clicking on nothing.
+    /// </summary>
+    [Fact]
+    public void a_page_recovery_could_not_read_supersedes_nothing()
+    {
+        var lines = new[] { Fragment(0.13, LineRefusal.ComplexScript, "င") };
+
+        var merged = RecoveredLines.Merge(lines, Array.Empty<RecoveredLine>(), out bool superseded);
+
+        Assert.False(superseded);
+        Assert.Single(merged);
+        Assert.Equal(LineRefusal.ComplexScript, merged[0].Refusal);
+    }
+
+    /// <summary>
+    /// ⚠️ AND A FRAGMENT NOWHERE NEAR A RECOVERED LINE IS NOT SUPERSEDED
+    /// EITHER. Supersession is per line, not per page: a page can be read in
+    /// part.
+    /// </summary>
+    [Fact]
+    public void a_fragment_on_its_own_baseline_is_not_superseded()
+    {
+        var lines = new[] { Fragment(0.60, LineRefusal.ComplexScript, "င") };
+
+        var merged = RecoveredLines.Merge(
+            lines, new[] { Read(0.13, Burmese, 0.12, 0.5, 0.88) }, out bool superseded);
+
+        Assert.False(superseded);
+        Assert.Equal(2, merged.Count);
+    }
+
+    /// <summary>
+    /// ⚠️ THE THREE FLAGS ARE THREE QUESTIONS. A plain page needs no
+    /// reshaping and is finished; a page still being read needs reshaping, is
+    /// NOT finished, and owns nothing yet. Collapsing any pair of them is how
+    /// a reader ends up with a page that answers no click.
+    /// </summary>
+    [Fact]
+    public void a_context_keeps_shaped_settled_and_owned_apart()
+    {
+        var plain = PageTextContext.Plain(3, Array.Empty<LineSnapshot>());
+        Assert.False(plain.Shaped);
+        Assert.True(plain.Settled);
+        Assert.False(plain.RecoveryOwnsText);
+
+        var preparing = PageTextContext.Preparing(
+            3, new[] { Fragment(0.13, LineRefusal.ComplexScript, "င") });
+        Assert.True(preparing.Shaped);
+        Assert.False(preparing.Settled);
+        Assert.False(preparing.RecoveryOwnsText);
+        Assert.Single(preparing.Lines);
+    }
+
+    /// <summary>
+    /// ⚠️ THE FACE IS THE CORE'S ANSWER, LOOKED UP BY THE NAME THE PAGE USES.
+    /// The writer asks by font name, which is the same key `SystemFontMatch`
+    /// uses for its own copy of the core's table; asking what the page was
+    /// actually READ with cannot drift from itself.
+    /// </summary>
+    [Fact]
+    public void a_context_reports_the_face_a_font_was_read_with()
+    {
+        var context = new PageTextContext(
+            Page: 0, Lines: Array.Empty<LineSnapshot>(),
+            Shaped: true, Settled: true, RecoveryOwnsText: true,
+            Direction: TextDirection.LeftToRight,
+            Faces: new Dictionary<string, string>
+            {
+                ["BCDEEE+MyanmarText"] = @"C:\Windows\Fonts\mmrtext.ttf",
+            });
+
+        Assert.Equal(@"C:\Windows\Fonts\mmrtext.ttf", context.FaceFor("BCDEEE+MyanmarText"));
+        Assert.Null(context.FaceFor("Calibri"));
+        Assert.Null(PageTextContext.Plain(0, Array.Empty<LineSnapshot>()).FaceFor("anything"));
+    }
 }

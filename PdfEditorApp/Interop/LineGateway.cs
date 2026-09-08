@@ -29,17 +29,31 @@ internal static class LineGateway
     public static IReadOnlyList<LineSnapshot> Load(
         ulong docHandle, int pageIndex, out bool settled)
     {
-        settled = true;
-        var found = Read(docHandle, pageIndex, ref settled);
-        return found;
+        var context = Context(docHandle, pageIndex);
+        settled = context.Settled;
+        return context.Lines;
     }
 
     /// <summary>The same, for callers that do not keep the result.</summary>
     public static IReadOnlyList<LineSnapshot> Load(ulong docHandle, int pageIndex) =>
         Load(docHandle, pageIndex, out _);
 
-    private static IReadOnlyList<LineSnapshot> Read(
-        ulong docHandle, int pageIndex, ref bool settled)
+    /// <summary>
+    /// Everything this page's text is, as one answer.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE WORK WAS ALREADY BEING DONE AND THE CONCLUSION THROWN AWAY.
+    /// Reading a page already establishes whether its text needs reshaping,
+    /// whether the background read has finished, whether recovery took the
+    /// fragments over and which face it proved them with. All four were
+    /// discarded at the `return`, leaving every subsystem downstream to work
+    /// them out again. This is the same call doing the same work and keeping
+    /// what it found.
+    /// </remarks>
+    public static PageTextContext Context(ulong docHandle, int pageIndex) =>
+        Read(docHandle, pageIndex);
+
+    private static PageTextContext Read(ulong docHandle, int pageIndex)
     {
         var buffer = RenderCoreNative.get_page_lines(docHandle, pageIndex);
         try
@@ -48,7 +62,7 @@ internal static class LineGateway
                 || buffer.Data == IntPtr.Zero
                 || buffer.Len == 0)
             {
-                return Array.Empty<LineSnapshot>();
+                return PageTextContext.Plain(pageIndex, Array.Empty<LineSnapshot>());
             }
 
             byte[] bytes = new byte[(int)buffer.Len];
@@ -63,7 +77,7 @@ internal static class LineGateway
             // clicked on anything. Started when they click, they wait for it.
             if (!LineReader.NeedsReshaping(lines))
             {
-                return lines;
+                return PageTextContext.Plain(pageIndex, lines);
             }
 
             RenderCoreNative.prepare_recovery(docHandle, pageIndex);
@@ -76,10 +90,32 @@ internal static class LineGateway
             // caller asks again: see the settled flag.
             if (RenderCoreNative.recovery_is_ready(docHandle, pageIndex) == 0)
             {
-                settled = false;
-                return lines;
+                return PageTextContext.Preparing(pageIndex, lines);
             }
-            return RecoveredLines.Merge(lines, RecoveryGateway.Load(docHandle, pageIndex));
+
+            var recovered = RecoveryGateway.Load(docHandle, pageIndex);
+            var merged = RecoveredLines.Merge(lines, recovered, out bool superseded);
+
+            // ⚠️ THE FACE IS THE CORE'S OWN ANSWER. A recovered line carries
+            // the font file its reading was PROVEN with, so collecting them is
+            // not a second opinion about which font a name means; it is the
+            // only opinion, recorded by the code that had to be right about it.
+            var faces = new Dictionary<string, string>();
+            if (recovered is not null)
+            {
+                foreach (var line in recovered)
+                {
+                    if (line.WasRead && !string.IsNullOrEmpty(line.FontPath))
+                    {
+                        faces[line.FontName] = line.FontPath;
+                    }
+                }
+            }
+
+            return new PageTextContext(
+                pageIndex, merged,
+                Shaped: true, Settled: true, RecoveryOwnsText: superseded,
+                TextDirection.LeftToRight, faces);
         }
         finally
         {

@@ -130,8 +130,10 @@ public class RecoveryWiringTests
         Assert.True(asked < loaded, "the reading is asked for before anyone checks it is ready");
 
         // And an unready page says so, or the caller would cache PDFium's
-        // fragments and never look again.
-        Assert.Contains("settled = false;", source, StringComparison.Ordinal);
+        // fragments and never look again. What it says is a context whose
+        // Settled is false; that the flag really is false is asserted where it
+        // can be run, in RecoveredLineTests.
+        Assert.Contains("PageTextContext.Preparing(", source, StringComparison.Ordinal);
     }
 
     /// <summary>

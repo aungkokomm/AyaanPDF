@@ -35,8 +35,27 @@ public static class RecoveredLines
     /// </remarks>
     public static IReadOnlyList<LineSnapshot> Merge(
         IReadOnlyList<LineSnapshot>? lines,
-        IReadOnlyList<RecoveredLine>? recovered)
+        IReadOnlyList<RecoveredLine>? recovered) =>
+        Merge(lines, recovered, out _);
+
+    /// <summary>
+    /// The same, and says whether recovery actually took anything over.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE ANSWER WAS ALWAYS COMPUTED AND ALWAYS THROWN AWAY. Dropping a
+    /// fragment because a recovered line stands where it does IS the fact that
+    /// "recovery owns this page's text", and every subsystem downstream had to
+    /// work it out again for itself. It is reported here rather than inferred
+    /// from the shape of the result, because a page can be shaped, be finished,
+    /// and still have recovery decline every line on it: there the fragments
+    /// are all the page has and nothing has been superseded at all.
+    /// </remarks>
+    public static IReadOnlyList<LineSnapshot> Merge(
+        IReadOnlyList<LineSnapshot>? lines,
+        IReadOnlyList<RecoveredLine>? recovered,
+        out bool superseded)
     {
+        superseded = false;
         lines ??= Array.Empty<LineSnapshot>();
         if (recovered is null || recovered.Count == 0) { return lines; }
 
@@ -48,6 +67,7 @@ public static class RecoveredLines
         {
             if (line.Refusal == LineRefusal.ComplexScript && CoveredBy(read, line))
             {
+                superseded = true;
                 continue;
             }
             kept.Add(line);
