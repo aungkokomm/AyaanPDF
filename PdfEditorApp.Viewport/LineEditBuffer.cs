@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 
 namespace PdfEditorApp.Viewport;
@@ -30,6 +31,30 @@ public sealed class LineEditBuffer
         Caret = Clamp(caret);
         Anchor = Caret;
     }
+
+    /// <summary>
+    /// The offsets the PAGE can actually put a caret at, ascending.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE BUFFER IS TOLD, IT DOES NOT WORK THIS OUT. What may be stood
+    /// between is a question about the SHAPING of the page's own type, and the
+    /// answer differs by script and by font. Nothing here knows what a cluster
+    /// is; it is handed the list and walks it, so Devanagari, Burmese and
+    /// whatever comes next all move correctly without a line of script-specific
+    /// code in the buffer.
+    ///
+    /// ⚠️ AND IT DESCRIBES THE TEXT THE PAGE DREW, so it is authority only as
+    /// far as <see cref="UnchangedPrefix"/>. Past there the reader has typed and
+    /// the page no longer draws it: the tail is laid out by the text engine,
+    /// which snaps a caret to its own clusters, so text elements are the right
+    /// answer there and the fall-through below is not a compromise.
+    ///
+    /// Empty means nobody knew, and the old behaviour is kept exactly.
+    /// </remarks>
+    public void SetPlaceableOffsets(IReadOnlyList<int>? offsets) =>
+        _placeable = offsets ?? (IReadOnlyList<int>)Array.Empty<int>();
+
+    private IReadOnlyList<int> _placeable = Array.Empty<int>();
 
     /// <summary>What the page draws today, unchanged for the life of the edit.</summary>
     public string Original { get; }
@@ -245,6 +270,19 @@ public sealed class LineEditBuffer
     {
         if (at <= 0) { return 0; }
 
+        // The page's own cluster boundaries first, while they still describe
+        // what is on the page. See SetPlaceableOffsets.
+        if (_placeable.Count > 0 && at <= UnchangedPrefix)
+        {
+            int best = -1;
+            for (int i = 0; i < _placeable.Count; i++)
+            {
+                if (_placeable[i] >= at) { break; }
+                best = _placeable[i];
+            }
+            if (best >= 0) { return best; }
+        }
+
         // StringInfo walks text elements, which is what a reader calls a
         // character: a base letter plus whatever combines onto it.
         var e = StringInfo.GetTextElementEnumerator(Text);
@@ -264,6 +302,27 @@ public sealed class LineEditBuffer
     {
         if (at >= Text.Length) { return Text.Length; }
 
+        if (_placeable.Count > 0 && at < UnchangedPrefix)
+        {
+            for (int i = 0; i < _placeable.Count; i++)
+            {
+                if (_placeable[i] <= at) { continue; }
+
+                // Only while the page still draws it. A cluster straddling the
+                // end of the unchanged prefix belongs to text the reader has
+                // already changed, so its far edge is not a position the page
+                // has any more.
+                return _placeable[i] <= UnchangedPrefix
+                    ? _placeable[i]
+                    : NextTextElement(at);
+            }
+        }
+
+        return NextTextElement(at);
+    }
+
+    private int NextTextElement(int at)
+    {
         var e = StringInfo.GetTextElementEnumerator(Text);
         while (e.MoveNext())
         {

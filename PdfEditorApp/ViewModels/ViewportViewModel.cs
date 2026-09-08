@@ -10965,6 +10965,47 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private List<EditGlyph> _lineEditGlyphs = new();
 
     /// <summary>
+    /// Every position a caret may stand at on the VISUAL LINE being edited, in
+    /// the order the page draws them.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CARET SPANS THE LINE; THE WRITER STILL TAKES ONE PIECE. A
+    /// recovered Hindi line arrives as separately placed WORDS and a Burmese one
+    /// as a single piece, and each piece is a whole unit to the recovery and to
+    /// `retype`. Concatenating their stops lets the caret cross a word without
+    /// the reader doing anything, while a commit still goes back one piece at a
+    /// time with its identity untouched. Nothing about the recovery or the
+    /// writer changes.
+    ///
+    /// ⚠️ AND IT IS BUILT ONLY FOR RECOVERED LINES. An ordinary line is
+    /// already one visual line as PDFium reports it, so there is nothing to
+    /// join and this stays empty, which leaves that path exactly as it was.
+    /// </remarks>
+    private List<CaretStop> _caretStops = new();
+
+    /// <summary>The pieces of that visual line, left to right.</summary>
+    private List<LineSnapshot> _caretPieces = new();
+
+    /// <summary>Which of them the buffer is holding, or -1.</summary>
+    private int _caretPiece = -1;
+
+    /// <summary>
+    /// The column a run of Up/Down presses is trying to keep.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ TAKEN ONCE, AT THE START OF THE RUN. Re-deriving it from the caret
+    /// on every press means passing through a short word loses the reader's
+    /// place in the paragraph for good, which is the thing every text editor
+    /// remembers a column in order to avoid.
+    /// </remarks>
+    private double? _caretDesiredX;
+
+    /// <summary>
+    /// A colour for stop-building, which needs one and never uses it.
+    /// </summary>
+    private const string CaretInkHex = "#000000";
+
+    /// <summary>
     /// Where the type sits on this line, in normalized page units.
     /// </summary>
     /// <remarks>
@@ -11116,6 +11157,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lineEditCoverHex = SamplePageBackground(pageIndex, line);
         _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
 
+        // ⚠️ THIS PATH IS LEFT EXACTLY AS IT WAS, and deliberately. PDFium's
+        // line IS the visual line, so there are no sibling pieces to join. And
+        // its units are CHARACTERS rather than shaped clusters, so handing them
+        // over as caret stops would let the caret step between a Latin letter
+        // and a combining accent, which is a position text elements rightly
+        // refuse and nothing here has measured. The stops answer a question
+        // about SHAPING, and this route did not shape anything.
+        ForgetCaretStops();
+
         Diag.Log($"BeginInPlaceEdit p{pageIndex} caret={_lineEdit.Caret} text={unit.Text}");
         InPlaceEditChanged?.Invoke();
         return true;
@@ -11167,6 +11217,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lineEditGlyphs = glyphs;
         _lineEditCoverHex = SamplePageBackground(pageIndex, _lineEditLine);
         _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
+        _lineEdit.SetPlaceableOffsets(
+            CaretStops.OffsetsOf(CaretStops.Of(glyphs, unit.Text.Length)));
+        BuildCaretStops(pageIndex, unit.Line);
 
         Diag.Log($"BeginInPlaceEdit p{pageIndex} recovered caret={_lineEdit.Caret} text={unit.Text}");
         InPlaceEditChanged?.Invoke();
@@ -11231,8 +11284,90 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // reach them. They used to be here, which meant the arithmetic that decides
     // which letter a click lands on was only ever checked by running the app.
 
-    private static int CaretOffsetIn(List<EditGlyph> glyphs, string text, double x) =>
-        EditGlyphs.OffsetAt(glyphs, text, x);
+    /// <remarks>
+    /// ⚠️ THE NEAREST STOP, WHICH IS THE SAME RULE AS BEFORE AND A WIDER ONE.
+    /// Nearest-boundary and "the midpoint of the cluster decides" are the same
+    /// function when the clusters are in x order, which is what
+    /// <c>EditGlyphs.OffsetAt</c> assumed. Asking the stops does not assume it,
+    /// so a run whose draw order is not its reading order resolves correctly
+    /// too, and the trailing edge of the last cluster becomes a position a click
+    /// can reach in its own right.
+    /// </remarks>
+    private static int CaretOffsetIn(List<EditGlyph> glyphs, string text, double x)
+    {
+        var stops = CaretStops.Of(glyphs, text.Length);
+        int at = CaretStops.NearestTo(stops, x);
+        return at < 0
+            ? EditGlyphs.OffsetAt(glyphs, text, x)
+            : Math.Clamp(stops[at].Offset, 0, text.Length);
+    }
+
+    // ---------------- the stops of a visual line ----------------
+
+    /// <summary>
+    /// The recovered pieces sharing a baseline, left to right: one VISUAL LINE.
+    /// </summary>
+    private List<LineSnapshot> VisualLineAt(int pageIndex, double baseline)
+    {
+        var pieces = new List<LineSnapshot>();
+        foreach (var line in LinesFor(pageIndex))
+        {
+            if (line.Recovered is null) { continue; }
+            if (Math.Abs(line.Baseline - baseline) >= RecoveredWordTolerance) { continue; }
+
+            pieces.Add(line);
+        }
+        pieces.Sort(static (a, b) => a.Left.CompareTo(b.Left));
+        return pieces;
+    }
+
+    /// <summary>Every caret position on a visual line, in the order it draws.</summary>
+    private static List<CaretStop> StopsOf(IReadOnlyList<LineSnapshot> pieces)
+    {
+        var all = new List<CaretStop>();
+        for (int i = 0; i < pieces.Count; i++)
+        {
+            if (pieces[i].Recovered is not { } recovered) { continue; }
+
+            all.AddRange(CaretStops.Of(
+                EditGlyphs.Of(recovered, CaretInkHex),
+                recovered.Text.Length,
+                TextDirection.LeftToRight,
+                i));
+        }
+        return CaretStops.InVisualOrder(all);
+    }
+
+    /// <summary>Works out the visual line the edit has just been put on.</summary>
+    private void BuildCaretStops(int pageIndex, LineSnapshot owner)
+    {
+        _caretPieces = VisualLineAt(pageIndex, owner.Baseline);
+        _caretPiece = _caretPieces.IndexOf(owner);
+        if (_caretPiece < 0)
+        {
+            _caretPieces = new List<LineSnapshot> { owner };
+            _caretPiece = 0;
+        }
+        _caretStops = StopsOf(_caretPieces);
+    }
+
+    private void ForgetCaretStops()
+    {
+        _caretStops = new List<CaretStop>();
+        _caretPieces = new List<LineSnapshot>();
+        _caretPiece = -1;
+    }
+
+    /// <summary>The furthest offset the page has a position for in a piece.</summary>
+    private int LastStopOffset(int piece)
+    {
+        int last = 0;
+        foreach (var stop in _caretStops)
+        {
+            if (stop.Piece == piece && stop.Offset > last) { last = stop.Offset; }
+        }
+        return last;
+    }
 
     /// <summary>Where on the page an offset in the UNCHANGED text sits.</summary>
     private double CaretXOf(int offset) => EditGlyphs.XOf(_lineEditGlyphs, offset);
@@ -11259,11 +11394,43 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public void InPlaceMoveRight(bool extend = false) =>
         Changed(() => _lineEdit!.MoveRight(extend));
 
-    public void InPlaceMoveHome(bool extend = false) =>
-        Changed(() => _lineEdit!.MoveHome(extend));
+    // ⚠️ HOME AND END MEAN THE LINE, NOT THE PIECE. On the Hindi book a
+    // recovered piece is one WORD, so these reached the ends of a word and were
+    // very close to useless. They now run to the ends of the visual line, which
+    // is what the keys are for.
 
-    public void InPlaceMoveEnd(bool extend = false) =>
+    public void InPlaceMoveHome(bool extend = false)
+    {
+        _caretDesiredX = null;
+        if (!extend && MoveToLineEdge(first: true)) { return; }
+
+        Changed(() => _lineEdit!.MoveHome(extend));
+    }
+
+    public void InPlaceMoveEnd(bool extend = false)
+    {
+        _caretDesiredX = null;
+        if (!extend && MoveToLineEdge(first: false)) { return; }
+
         Changed(() => _lineEdit!.MoveEnd(extend));
+    }
+
+    /// <summary>Runs to one end of the visual line, across pieces if need be.</summary>
+    private bool MoveToLineEdge(bool first)
+    {
+        // Once the reader has typed, the stops describe text the buffer no
+        // longer holds, so the buffer's own answer is the honest one.
+        if (_lineEdit is null || _lineEdit.IsChanged) { return false; }
+        if (_caretStops.Count == 0 || _caretPiece < 0) { return false; }
+
+        var stop = first ? _caretStops[0] : _caretStops[^1];
+        if (stop.Piece == _caretPiece)
+        {
+            InPlacePlaceCaret(stop.Offset);
+            return true;
+        }
+        return MoveToStopOn(_caretPieces, stop);
+    }
 
     // ⚠️ AND THE ARROWS RUN OFF THE END OF A LINE ONTO THE NEXT ONE. The
     // edit is bound to ONE line, so Left at its start and Right at its end had
@@ -11273,108 +11440,146 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // edit to the neighbouring line, which is what an arrow key means in every
     // other piece of text there is.
 
-    public void InPlaceArrowLeft(bool extend)
+    // ⚠️ THE ARROWS WALK THE STOPS, NOT THE STRING. Left and Right ask the
+    // buffer first, and the buffer is now walking the page's OWN cluster
+    // boundaries; only when it will not move is the caret at an end of its
+    // piece, and then the visual line says what is next door. Nothing in here
+    // knows which script it is looking at.
+
+    public void InPlaceArrowLeft(bool extend) => Arrow(-1, extend);
+
+    public void InPlaceArrowRight(bool extend) => Arrow(1, extend);
+
+    private void Arrow(int step, bool extend)
     {
-        if (!extend && _lineEdit is { Caret: 0, HasSelection: false }
-            && MoveInPlaceEditAcross(-1, atStart: false))
-        {
-            return;
-        }
-        InPlaceMoveLeft(extend);
+        if (_lineEdit is null) { return; }
+
+        // A horizontal move is the reader choosing a new column.
+        _caretDesiredX = null;
+
+        // ⚠️ A COLLAPSING SELECTION LOOKS LIKE A CARET THAT DID NOT MOVE.
+        // Left with a selection up puts the caret at its start, which may be
+        // where it already was, and without this that reads as "stuck at the
+        // edge" and would carry the edit into the word next door.
+        bool hadSelection = _lineEdit.HasSelection;
+        int before = _lineEdit.Caret;
+
+        if (step < 0) { InPlaceMoveLeft(extend); } else { InPlaceMoveRight(extend); }
+
+        // ⚠️ HELD SHIFT DOES NOT CROSS, and that is not an omission. The
+        // buffer holds ONE piece, so a selection reaching into the word next
+        // door is not a shape it can hold and no writer here could commit it.
+        if (extend || hadSelection || _lineEdit.Caret != before) { return; }
+
+        CrossFromEdge(step);
     }
 
-    public void InPlaceArrowRight(bool extend)
-    {
-        if (!extend && _lineEdit is { HasSelection: false } buffer
-            && buffer.Caret == buffer.Text.Length
-            && MoveInPlaceEditAcross(1, atStart: true))
-        {
-            return;
-        }
-        InPlaceMoveRight(extend);
-    }
-
-    // ⚠️ HELD SHIFT DOES NOT CROSS LINES, and that is not an omission. The
-    // buffer holds ONE line, so a selection reaching into the line above is
-    // not a thing it can hold, and pretending otherwise would mean a shape
-    // that no writer here can commit.
+    // ⚠️ UP AND DOWN CROSS BY DESIGN, and held shift still does not.
 
     public void InPlaceArrowUp(bool extend)
     {
-        if (!extend) { MoveInPlaceEditUpDown(-1); }
+        if (!extend) { Vertical(-1); }
     }
 
     public void InPlaceArrowDown(bool extend)
     {
-        if (!extend) { MoveInPlaceEditUpDown(1); }
+        if (!extend) { Vertical(1); }
     }
 
     /// <summary>
-    /// Carries the edit to the line above or below, at the x the caret was
-    /// already at, the way a caret behaves in any other column of text.
+    /// Carries the edit to whichever piece of the next visual line lies under
+    /// the column the reader is keeping.
     /// </summary>
-    private bool MoveInPlaceEditUpDown(int direction)
+    private bool Vertical(int direction)
     {
-        if (_lineEdit is null || _lineEditLine is null) { return false; }
+        if (_lineEdit is null || _caretPiece < 0) { return false; }
 
-        // Read before the move, because the move commits and the buffer this
-        // asks is the one being left.
-        double x = CaretXOf(_lineEdit.Caret);
+        double column = _caretDesiredX ?? CaretXOf(_lineEdit.Caret);
 
-        var next = LineBeyond(_lineEditPage, _lineEditLine.Baseline, direction);
-        if (next is null) { return false; }
+        var line = NextVisualLine(direction);
+        if (line.Count == 0) { return false; }
 
-        return MoveInPlaceEditTo(
-            _lineEditPage, Math.Clamp(x, next.Left, next.Right), MiddleOf(next));
+        var stops = StopsOf(line);
+        int at = CaretStops.NearestTo(stops, column);
+        if (at < 0) { return false; }
+
+        if (!MoveToStopOn(line, stops[at])) { return false; }
+
+        // Kept AFTER the move, because the move clears it.
+        _caretDesiredX = column;
+        return true;
     }
-
-    /// <summary>Carries the edit off one end of a line onto the next one.</summary>
-    private bool MoveInPlaceEditAcross(int direction, bool atStart)
-    {
-        if (_lineEditLine is null) { return false; }
-
-        var next = LineBeyond(_lineEditPage, _lineEditLine.Baseline, direction);
-        if (next is null) { return false; }
-
-        return MoveInPlaceEditTo(
-            _lineEditPage, atStart ? next.Left : next.Right, MiddleOf(next));
-    }
-
-    /// <summary>The middle of a line's box, which is the safest y to aim at.</summary>
-    /// <remarks>
-    /// ⚠️ A PARAGRAPH HAS STRIPES OF NOTHING BETWEEN ITS LINES, because a
-    /// recovered line's box is the face's height at its size and not the
-    /// leading the page was set with. Aiming at a line's own edge lands in one
-    /// of those often enough to matter; aiming at its middle never does.
-    /// </remarks>
-    private static double MiddleOf(LineSnapshot line) => (line.Top + line.Bottom) / 2;
 
     /// <summary>
-    /// The nearest line above or below a baseline, or null at the edge of the
-    /// page's text.
+    /// The caret is at an end of its piece, so go to the position next door.
     /// </summary>
-    /// <remarks>
-    /// ⚠️ THE PAGE'S LINES, NOT THE SELECTED BLOCK'S. A reader arrowing
-    /// upwards out of the top of a paragraph means the line above it, and
-    /// stopping dead at a boundary they cannot see would read as the keyboard
-    /// being broken rather than as a rule being kept.
-    /// </remarks>
-    private LineSnapshot? LineBeyond(int pageIndex, double baseline, int direction)
+    private bool CrossFromEdge(int step)
     {
-        LineSnapshot? best = null;
-        double nearest = double.MaxValue;
+        if (_lineEdit is null || _caretPiece < 0 || _caretStops.Count == 0) { return false; }
 
-        foreach (var line in LinesFor(pageIndex))
+        // ⚠️ ASKED BY OFFSET, ANSWERED BY POSITION. Which visual stop the
+        // logical start of a piece is depends on which way the run runs, and
+        // that is precisely what the stop list already knows. Nothing here has
+        // to be told the direction.
+        int want = _lineEdit.Caret <= 0 ? 0 : LastStopOffset(_caretPiece);
+        int at = CaretStops.IndexOf(_caretStops, _caretPiece, want);
+        if (at < 0) { return false; }
+
+        int next = at + step;
+        if (next < 0 || next >= _caretStops.Count) { return false; }
+
+        return MoveToStopOn(_caretPieces, _caretStops[next]);
+    }
+
+    /// <summary>Puts the edit on the piece a stop belongs to, and the caret on it.</summary>
+    private bool MoveToStopOn(IReadOnlyList<LineSnapshot> pieces, CaretStop stop)
+    {
+        if (stop.Piece < 0 || stop.Piece >= pieces.Count) { return false; }
+
+        var piece = pieces[stop.Piece];
+
+        // ⚠️ THE SAME MOVE A CLICK MAKES, deliberately. It commits what is
+        // being left and opens the piece under the point, so arrowing into a
+        // word and clicking into it end in exactly the same state.
+        //
+        // ⚠️ AND AIMED AT THE MIDDLE OF THE BOX. A recovered line's box is the
+        // face's height at its size rather than the leading the page was set
+        // with, so a paragraph has stripes of nothing between its lines that an
+        // edge falls into.
+        if (!MoveInPlaceEditTo(_lineEditPage, stop.X, (piece.Top + piece.Bottom) / 2))
         {
-            // Positive is "the way that was asked for". Anything on the same
-            // baseline is the line being left, not a line to arrive at.
-            double step = (line.Baseline - baseline) * direction;
+            return false;
+        }
+
+        InPlacePlaceCaret(stop.Offset);
+        return true;
+    }
+
+    /// <summary>The visual line above or below the one being edited.</summary>
+    private List<LineSnapshot> NextVisualLine(int direction)
+    {
+        if (_caretPieces.Count == 0) { return new List<LineSnapshot>(); }
+
+        double from = _caretPieces[0].Baseline;
+        double nearest = double.MaxValue;
+        double found = 0;
+
+        foreach (var line in LinesFor(_lineEditPage))
+        {
+            if (line.Recovered is null) { continue; }
+
+            // Positive is the way that was asked for. Anything on this baseline
+            // belongs to the line being left, not to a line to arrive at.
+            double step = (line.Baseline - from) * direction;
             if (step <= RecoveredWordTolerance || step >= nearest) { continue; }
 
-            best = line;
             nearest = step;
+            found = line.Baseline;
         }
-        return best;
+
+        return nearest == double.MaxValue
+            ? new List<LineSnapshot>()
+            : VisualLineAt(_lineEditPage, found);
     }
 
     public void InPlaceSelectAll() => Changed(() => _lineEdit!.SelectAll());
@@ -11449,6 +11654,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void Changed(Action act)
     {
         if (_lineEdit is null) { return; }
+
+        // ⚠️ ANYTHING THAT TOUCHES THE CARET ENDS THE VERTICAL RUN. A column
+        // is only worth keeping while the reader is going straight up or down;
+        // one click or one typed letter and it is a different column. Vertical
+        // puts it back deliberately, after its move.
+        _caretDesiredX = null;
+
         act();
         InPlaceEditChanged?.Invoke();
     }
@@ -11499,6 +11711,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lineEditUnit = null;
         _lineEditPage = -1;
         _lineEditGlyphs = new List<EditGlyph>();
+        _caretDesiredX = null;
+        ForgetCaretStops();
         InPlaceEditChanged?.Invoke();
     }
 

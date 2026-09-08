@@ -318,45 +318,147 @@ public class RecoveryWiringTests
 
         string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
 
-        // Left crosses only from the very start of the line, Right only from
-        // the very end: anywhere else they are the ordinary caret moves.
-        int left = vm.IndexOf("public void InPlaceArrowLeft(", StringComparison.Ordinal);
-        Assert.True(left > 0);
-        string leftBody = MethodBodyAt(vm, left);
-        Assert.Contains("Caret: 0", leftBody, StringComparison.Ordinal);
-        Assert.Contains("MoveInPlaceEditAcross(-1", leftBody, StringComparison.Ordinal);
-        Assert.Contains("InPlaceMoveLeft(extend)", leftBody, StringComparison.Ordinal);
-
-        int right = vm.IndexOf("public void InPlaceArrowRight(", StringComparison.Ordinal);
-        Assert.True(right > 0);
-        string rightBody = MethodBodyAt(vm, right);
-        Assert.Contains("buffer.Caret == buffer.Text.Length", rightBody, StringComparison.Ordinal);
-        Assert.Contains("MoveInPlaceEditAcross(1", rightBody, StringComparison.Ordinal);
-        Assert.Contains("InPlaceMoveRight(extend)", rightBody, StringComparison.Ordinal);
-
-        // ⚠️ AND HELD SHIFT CROSSES NOTHING. The buffer holds ONE line, so a
-        // selection reaching into the line above is not a shape it can hold and
-        // no writer here could commit it.
-        foreach (string arrow in new[] { "Left", "Right", "Up", "Down" })
+        // ⚠️ THE ARROWS ASK THE BUFFER FIRST AND CROSS ONLY WHEN IT WILL NOT
+        // MOVE. That test is what makes the whole thing script-independent: the
+        // buffer is walking the PAGE'S cluster boundaries, so "it did not move"
+        // means the caret is genuinely at an end of its piece, whatever the
+        // script decided a cluster was.
+        foreach (string side in new[] { "Left", "Right" })
         {
             int at = vm.IndexOf(
-                "public void InPlaceArrow" + arrow + "(", StringComparison.Ordinal);
-            Assert.Contains("!extend", MethodBodyAt(vm, at), StringComparison.Ordinal);
+                "public void InPlaceArrow" + side + "(", StringComparison.Ordinal);
+            Assert.True(at > 0);
+            Assert.Contains("Arrow(", MethodBodyAt(vm, at), StringComparison.Ordinal);
         }
 
-        // The neighbour is found by BASELINE, and aimed at through the middle
-        // of its box, because a paragraph has stripes of nothing between its
-        // lines that a click on an edge falls into.
-        int beyond = vm.IndexOf("private LineSnapshot? LineBeyond(", StringComparison.Ordinal);
-        Assert.True(beyond > 0);
-        string beyondBody = MethodBodyAt(vm, beyond);
-        Assert.Contains("(line.Baseline - baseline) * direction", beyondBody, StringComparison.Ordinal);
-        Assert.Contains("LinesFor(pageIndex)", beyondBody, StringComparison.Ordinal);
+        string arrow = MethodBodyAt(vm, vm.IndexOf(
+            "private void Arrow(int step, bool extend)", StringComparison.Ordinal));
 
-        int middle = vm.IndexOf("private static double MiddleOf(", StringComparison.Ordinal);
-        Assert.True(middle > 0);
-        Assert.Contains("(line.Top + line.Bottom) / 2",
-            vm[middle..Math.Min(vm.Length, middle + 200)], StringComparison.Ordinal);
+        int moved = arrow.IndexOf("InPlaceMoveLeft(extend)", StringComparison.Ordinal);
+        int crossed = arrow.IndexOf("CrossFromEdge(step)", StringComparison.Ordinal);
+        Assert.True(moved > 0, "the arrows no longer ask the buffer");
+        Assert.True(crossed > moved, "the edit is carried away before the buffer has been asked");
+
+        // ⚠️ AND A COLLAPSING SELECTION IS NOT A CARET THAT WOULD NOT MOVE.
+        // Left with a selection up puts the caret at its start, which may be
+        // where it already was, and that would read as an edge and carry the
+        // edit into the word next door.
+        Assert.Contains("hadSelection", arrow, StringComparison.Ordinal);
+
+        // Held shift never crosses, on any of the four.
+        foreach (string key in new[] { "Left", "Right", "Up", "Down" })
+        {
+            int at = vm.IndexOf(
+                "public void InPlaceArrow" + key + "(", StringComparison.Ordinal);
+            string body = MethodBodyAt(vm, at);
+            Assert.True(
+                body.Contains("extend", StringComparison.Ordinal),
+                "InPlaceArrow" + key + " no longer considers held shift");
+        }
+        Assert.Contains("if (extend || hadSelection", arrow, StringComparison.Ordinal);
+
+        // ⚠️ WHERE THE CARET GOES IS ASKED OF THE STOPS, NOT OF A BASELINE.
+        // The old crossing searched for the nearest line in a direction and so
+        // could not reach the next WORD, because every word of a line shares its
+        // baseline and was excluded by the tolerance.
+        string cross = MethodBodyAt(vm, vm.IndexOf(
+            "private bool CrossFromEdge(int step)", StringComparison.Ordinal));
+        Assert.Contains("CaretStops.IndexOf(_caretStops", cross, StringComparison.Ordinal);
+        Assert.Contains("at + step", cross, StringComparison.Ordinal);
+        Assert.DoesNotContain("Baseline", cross);
+
+        // Up and Down keep a column, and put it back after the move that clears
+        // it: without that, passing through a short word loses the reader's
+        // place in the paragraph for good.
+        string vertical = MethodBodyAt(vm, vm.IndexOf(
+            "private bool Vertical(int direction)", StringComparison.Ordinal));
+        Assert.Contains("_caretDesiredX ?? CaretXOf", vertical, StringComparison.Ordinal);
+        Assert.Contains("CaretStops.NearestTo(stops, column)", vertical, StringComparison.Ordinal);
+        int move = vertical.IndexOf("MoveToStopOn(line", StringComparison.Ordinal);
+        int keep = vertical.IndexOf("_caretDesiredX = column", StringComparison.Ordinal);
+        Assert.True(move > 0 && keep > move, "the column is kept before the move clears it");
+
+        // The neighbouring line is still found by baseline, and still aimed at
+        // through the middle of its box, because a paragraph has stripes of
+        // nothing between its lines that an edge falls into.
+        string next = MethodBodyAt(vm, vm.IndexOf(
+            "private List<LineSnapshot> NextVisualLine(int direction)", StringComparison.Ordinal));
+        Assert.Contains("(line.Baseline - from) * direction", next, StringComparison.Ordinal);
+        Assert.Contains("VisualLineAt(_lineEditPage, found)", next, StringComparison.Ordinal);
+
+        string onto = MethodBodyAt(vm, vm.IndexOf(
+            "private bool MoveToStopOn(", StringComparison.Ordinal));
+        Assert.Contains("(piece.Top + piece.Bottom) / 2", onto, StringComparison.Ordinal);
+        Assert.Contains("MoveInPlaceEditTo(_lineEditPage, stop.X", onto, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ HOME AND END MEAN THE VISUAL LINE. A recovered piece on the Hindi
+    /// book is one WORD, so these reached the ends of a word and were very close
+    /// to useless.
+    /// </summary>
+    [Fact]
+    public void home_and_end_run_to_the_ends_of_the_visual_line()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        foreach (var (name, first) in new[] { ("Home", "true"), ("End", "false") })
+        {
+            int at = vm.IndexOf(
+                "public void InPlaceMove" + name + "(bool extend = false)", StringComparison.Ordinal);
+            Assert.True(at > 0, "InPlaceMove" + name + " is no longer where this test looks");
+
+            string body = MethodBodyAt(vm, at);
+            Assert.Contains("MoveToLineEdge(first: " + first + ")", body, StringComparison.Ordinal);
+
+            // And held shift still selects within the piece, as it always did.
+            Assert.Contains("_lineEdit!.Move" + name + "(extend)", body, StringComparison.Ordinal);
+        }
+
+        string edge = MethodBodyAt(vm, vm.IndexOf(
+            "private bool MoveToLineEdge(bool first)", StringComparison.Ordinal));
+
+        // ⚠️ AND IT STANDS DOWN ONCE THE READER HAS TYPED. The stops describe
+        // the text the PAGE drew; past that the buffer's own answer is the
+        // honest one.
+        Assert.Contains("_lineEdit.IsChanged", edge, StringComparison.Ordinal);
+        Assert.Contains("_caretStops[0]", edge, StringComparison.Ordinal);
+        Assert.Contains("_caretStops[^1]", edge, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ THE CARET SPANS THE LINE, THE WRITER STILL TAKES ONE PIECE. This is
+    /// the promise that keeps the recovery and the writer out of the caret
+    /// change: a commit still goes back one recovered line at a time, with its
+    /// identity handed over exactly as it came.
+    /// </summary>
+    [Fact]
+    public void a_visual_line_is_joined_for_the_caret_and_not_for_the_writer()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        string visual = MethodBodyAt(vm, vm.IndexOf(
+            "private List<LineSnapshot> VisualLineAt(", StringComparison.Ordinal));
+        Assert.Contains("line.Recovered is null", visual, StringComparison.Ordinal);
+        Assert.Contains("RecoveredWordTolerance", visual, StringComparison.Ordinal);
+        Assert.Contains("a.Left.CompareTo(b.Left)", visual, StringComparison.Ordinal);
+
+        // Each piece keeps its own offsets and its own identity: the stops carry
+        // a piece number rather than being renumbered into one long string.
+        string stops = MethodBodyAt(vm, vm.IndexOf(
+            "private static List<CaretStop> StopsOf(", StringComparison.Ordinal));
+        Assert.Contains("recovered.Text.Length", stops, StringComparison.Ordinal);
+        Assert.Contains("TextDirection.LeftToRight", stops, StringComparison.Ordinal);
+        Assert.Contains("CaretStops.InVisualOrder(all)", stops, StringComparison.Ordinal);
+
+        // Nothing about how a line is written has been touched.
+        Assert.Contains("Interop.RecoveryGateway.Retype(", vm, StringComparison.Ordinal);
+        Assert.Contains("EditRecoveredLine(line, _selectedLinePage, newText)", vm, StringComparison.Ordinal);
+
+        // ⚠️ AND THE ORDINARY PATH IS LEFT ALONE. PDFium's line already IS the
+        // visual line, so there is nothing to join and the crossing stays inert.
+        int plain = vm.IndexOf("public bool BeginInPlaceEdit(", StringComparison.Ordinal);
+        Assert.Contains("ForgetCaretStops();", MethodBodyAt(vm, plain), StringComparison.Ordinal);
     }
 
     /// <summary>
