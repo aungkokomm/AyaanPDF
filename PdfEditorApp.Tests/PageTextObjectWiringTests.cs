@@ -238,4 +238,82 @@ public class PageTextObjectWiringTests
         Assert.Contains("PageTextOutline", Source("PdfEditorApp", "ViewModels", "PageSlot.cs"),
             StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// ⚠️ A COMPLEX SCRIPT'S OBJECT IS NOT A WORD, AND MUST NOT BE FRAMED.
+    /// This snapshot says what PDFium reports a text object contains, and on a
+    /// shaped script that is the glyphs in the order the FILE stores them.
+    /// Measured on a real Burmese page: one click reported
+    /// `objs=[198] font=ABCDEE+Pyidaungsu refusal=ComplexScript` holding a
+    /// single meaningless letter, and a box was drawn round it INSIDE the
+    /// correct frame recovery had just drawn round the whole line.
+    ///
+    /// ⚠️ AND EVERY OTHER REFUSAL STILL FRAMES. They describe a word that
+    /// was read correctly and merely cannot be rewritten, and the reader is
+    /// entitled to point at one and be told why. Latin selection is untouched
+    /// because nothing Latin is refused this way.
+    /// </summary>
+    [Theory]
+    [InlineData(ClusterRefusal.ComplexScript, false)]
+    [InlineData(ClusterRefusal.None, true)]
+    [InlineData(ClusterRefusal.NotUpright, true)]
+    [InlineData(ClusterRefusal.MixedStyle, true)]
+    [InlineData(ClusterRefusal.SplitObjects, true)]
+    public void only_a_scrambled_complex_script_object_goes_unframed(
+        ClusterRefusal refusal, bool framed)
+    {
+        Assert.Equal(framed, Cluster(refusal).CanFrame);
+    }
+
+    /// <summary>
+    /// ⚠️ AND FRAMING IS NOT EDITING. A word can be perfectly readable and
+    /// still refuse a rewrite, so the two answers must not collapse into one:
+    /// making CanFrame mean CanEdit would take the frame away from every
+    /// refusal and with it the only way a reader learns why.
+    /// </summary>
+    [Fact]
+    public void a_word_that_cannot_be_edited_is_still_framed()
+    {
+        var refused = Cluster(ClusterRefusal.NotUpright);
+
+        Assert.False(refused.CanEdit);
+        Assert.True(refused.CanFrame);
+        Assert.NotEqual(string.Empty, refused.RefusalReason);
+    }
+
+    /// <summary>One text object, as the picker would hand it over.</summary>
+    private static WordClusterSnapshot Cluster(ClusterRefusal refusal) =>
+        new(FirstObjectIndex: 198,
+            ObjectIndices: new[] { 198 },
+            Left: 0.1, Top: 0.1, Right: 0.2, Bottom: 0.12,
+            Baseline: 0.12, FontSizePts: 13, ColorRgb: 0,
+            Refusal: refusal, PrefixChars: 0,
+            Text: "င", FontName: "ABCDEE+Pyidaungsu");
+
+    /// <summary>
+    /// ⚠️ AND THE VIEW MODEL HAS TO ASK. The property above decides nothing
+    /// on its own; the picker is what must drop a refused object BEFORE it sets
+    /// the frame, or a box flashes round a scrambled glyph on every click.
+    /// </summary>
+    [Fact]
+    public void the_picker_drops_an_unframeable_object_before_it_frames_one()
+    {
+        string code = ViewModel();
+
+        int at = code.IndexOf("public bool SelectPageTextAt(", StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing picks page text");
+        int shut = code.IndexOf("private WordClusterSnapshot? WordAt(", at, StringComparison.Ordinal);
+        Assert.True(shut > at, "the picker does not end");
+        string body = code[at..shut];
+
+        int dropped = body.IndexOf("CanFrame: false", StringComparison.Ordinal);
+        int framed = body.IndexOf("SelectedWord = picked;", StringComparison.Ordinal);
+        Assert.True(dropped > 0, "the picker never asks whether the object can be framed");
+        Assert.True(framed > dropped, "the frame is set before the refused object is dropped");
+
+        // ⚠️ AND THE LOG LINE SURVIVES IT. That line is what diagnosed this,
+        // and it must keep reporting the object the click really landed on.
+        int logged = body.IndexOf("SelectPageTextAt p{pageIndex} objs=", StringComparison.Ordinal);
+        Assert.True(logged > 0 && logged < dropped, "the refused object is no longer logged");
+    }
 }

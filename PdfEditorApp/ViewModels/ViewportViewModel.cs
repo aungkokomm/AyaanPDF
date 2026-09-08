@@ -5034,16 +5034,41 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         var picked = WordAt(pageIndex, normX, normY);
 
-        SelectedWord = picked;
-        _selectedWordPage = picked is null ? -1 : pageIndex;
-
         if (picked is not null)
         {
             Diag.Log(
                 $"SelectPageTextAt p{pageIndex} objs=[{string.Join(",", picked.ObjectIndices)}] "
                 + $"font={picked.FontName} {picked.FontSizePts:0.#}pt "
                 + $"refusal={picked.Refusal} text={picked.Text}");
+        }
 
+        // ⚠️ A COMPLEX SCRIPT'S OBJECT IS NOT A WORD, so nothing is framed
+        // round it. This reader asks PDFium what a text object says, and on a
+        // shaped script the answer is the glyphs in the order the FILE stores
+        // them, which is not the order they are read in. Measured on the
+        // reader's own Burmese page: one click reported
+        // `objs=[198] font=ABCDEE+Pyidaungsu refusal=ComplexScript text=င`,
+        // a single meaningless letter, and drew a box round it.
+        //
+        // ⚠️ AND THE SAME CLICK IS ALREADY ANSWERED PROPERLY. Recovery reads
+        // the line by reshaping it and demanding the page's own glyph ids back,
+        // and on that same click it returned the whole line and said it could
+        // be edited. Two frames appeared, one round the real line and one round
+        // a scrambled glyph inside it. Only the refused one goes.
+        //
+        // ⚠️ NOTHING ELSE CHANGES. A script this reader CAN read is framed
+        // exactly as before, refusals of every other kind still frame and still
+        // explain themselves, and the recovery frame is untouched.
+        if (picked is { CanFrame: false })
+        {
+            picked = null;
+        }
+
+        SelectedWord = picked;
+        _selectedWordPage = picked is null ? -1 : pageIndex;
+
+        if (picked is not null)
+        {
             Status = SelectedWordDescription;
         }
 

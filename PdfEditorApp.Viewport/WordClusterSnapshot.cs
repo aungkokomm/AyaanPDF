@@ -113,6 +113,22 @@ public sealed record WordClusterSnapshot(
     /// <summary>Whether the core would accept a rewrite of this word.</summary>
     public bool CanEdit => Refusal == ClusterRefusal.None;
 
+    /// <summary>Whether a frame should be drawn round this object at all.</summary>
+    /// <remarks>
+    /// ⚠️ A COMPLEX SCRIPT'S OBJECT IS NOT A WORD. This snapshot says what
+    /// PDFium reports a text object contains, and on a shaped script that is
+    /// the glyphs in the order the FILE stores them, which is not the order
+    /// they are read in. Measured on a real Burmese page: one click reported a
+    /// single meaningless letter and a box was drawn round it, INSIDE the
+    /// correct frame that recovery had just drawn round the whole line.
+    ///
+    /// ⚠️ EVERY OTHER REFUSAL STILL FRAMES. They describe a word that was
+    /// read correctly and merely cannot be rewritten, and the reader is
+    /// entitled to point at it and be told why. Only this one means the reading
+    /// itself is nonsense.
+    /// </remarks>
+    public bool CanFrame => Refusal != ClusterRefusal.ComplexScript;
+
     /// <summary>
     /// What to tell a reader who tried to edit this word, in their terms rather
     /// than the core's.
