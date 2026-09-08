@@ -11210,14 +11210,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lineEditCoverHex = SamplePageBackground(pageIndex, line);
         _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
 
-        // ⚠️ THIS PATH IS LEFT EXACTLY AS IT WAS, and deliberately. PDFium's
-        // line IS the visual line, so there are no sibling pieces to join. And
-        // its units are CHARACTERS rather than shaped clusters, so handing them
-        // over as caret stops would let the caret step between a Latin letter
-        // and a combining accent, which is a position text elements rightly
-        // refuse and nothing here has measured. The stops answer a question
-        // about SHAPING, and this route did not shape anything.
-        ForgetCaretStops();
+        // ⚠️ NO STOPS HERE, AND THE PAGE IS WHAT SAYS SO. PDFium's line IS
+        // the visual line, so there are no sibling pieces to join, and its
+        // units are CHARACTERS rather than shaped clusters: handing those over
+        // as caret stops would let the caret step between a Latin letter and a
+        // combining accent, a position text elements rightly refuse and nothing
+        // here has measured.
+        ApplyCaretStops(pageIndex, shaped: null, glyphs, unit.Text.Length);
 
         Diag.Log($"BeginInPlaceEdit p{pageIndex} caret={_lineEdit.Caret} text={unit.Text}");
         InPlaceEditChanged?.Invoke();
@@ -11270,9 +11269,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lineEditGlyphs = glyphs;
         _lineEditCoverHex = SamplePageBackground(pageIndex, _lineEditLine);
         _lineEdit = new LineEditBuffer(unit.Text, CaretOffsetIn(glyphs, unit.Text, normX));
-        _lineEdit.SetPlaceableOffsets(
-            CaretStops.OffsetsOf(CaretStops.Of(glyphs, unit.Text.Length)));
-        BuildCaretStops(pageIndex, unit.Line);
+        ApplyCaretStops(pageIndex, unit.Line, glyphs, unit.Text.Length);
 
         Diag.Log($"BeginInPlaceEdit p{pageIndex} recovered caret={_lineEdit.Caret} text={unit.Text}");
         InPlaceEditChanged?.Invoke();
@@ -11392,6 +11389,45 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Works out the visual line the edit has just been put on.</summary>
+    /// <summary>
+    /// Gives the caret its stops, or takes them away.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE STOPS ANSWER A QUESTION ABOUT SHAPING, and this asks the PAGE
+    /// rather than inferring the answer from which route happened to arrive
+    /// here. Both routes used to decide for themselves, one by calling
+    /// BuildCaretStops and the other by calling ForgetCaretStops, and the fact
+    /// they were deciding the same thing was recorded only in a comment.
+    ///
+    /// ⚠️ AND IT NEEDS BOTH HALVES. The page having been shaped says the
+    /// stops would MEAN something; a shaped line to build them from says they
+    /// CAN be built. While recovery is still running, a page is shaped and the
+    /// line on offer is still one of PDFium's fragments, which has no shaped
+    /// clusters to place a caret by.
+    /// </remarks>
+    private void ApplyCaretStops(
+        int pageIndex, LineSnapshot? shaped, IReadOnlyList<EditGlyph> glyphs, int textLength)
+    {
+        bool page = ContextFor(pageIndex).Shaped;
+        if (page != (shaped is not null))
+        {
+            // Never seen: the routes and the page have always agreed. Logged
+            // rather than assumed, so a disagreement is visible instead of
+            // silently costing the reader their caret stops.
+            Diag.Log($"caret stops: page shaped={page} but line shaped={shaped is not null}");
+        }
+
+        if (!page || shaped is null)
+        {
+            ForgetCaretStops();
+            return;
+        }
+
+        _lineEdit!.SetPlaceableOffsets(
+            CaretStops.OffsetsOf(CaretStops.Of(glyphs, textLength)));
+        BuildCaretStops(pageIndex, shaped);
+    }
+
     private void BuildCaretStops(int pageIndex, LineSnapshot owner)
     {
         _caretPieces = VisualLineAt(pageIndex, owner.Baseline);

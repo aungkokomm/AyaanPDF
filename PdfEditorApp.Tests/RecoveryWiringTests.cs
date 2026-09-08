@@ -459,8 +459,11 @@ public class RecoveryWiringTests
 
         // ⚠️ AND THE ORDINARY PATH IS LEFT ALONE. PDFium's line already IS the
         // visual line, so there is nothing to join and the crossing stays inert.
+        // It says so by offering no shaped line to build stops from; that this
+        // means no stops is asserted in ApplyCaretStops itself.
         int plain = vm.IndexOf("public bool BeginInPlaceEdit(", StringComparison.Ordinal);
-        Assert.Contains("ForgetCaretStops();", MethodBodyAt(vm, plain), StringComparison.Ordinal);
+        Assert.Contains("ApplyCaretStops(pageIndex, shaped: null,",
+            MethodBodyAt(vm, plain), StringComparison.Ordinal);
     }
 
     /// <summary>
