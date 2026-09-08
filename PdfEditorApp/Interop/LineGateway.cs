@@ -151,13 +151,26 @@ internal static class LineGateway
     /// already does. Passing null when nothing matches is what makes the core
     /// refuse instead of substituting something that merely looks close.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ THE FACE THE CORE READ THIS PAGE WITH, WHEN IT HAS ONE. It is
+    /// resolved by the code that had to be right about it in order to read the
+    /// line at all, so it cannot drift from itself. `SystemFontMatch` keeps its
+    /// own family-to-file list and its own comment warning that it must not
+    /// drift from `recover::installed`, and a font offered here that the core
+    /// will not accept turns a clean refusal into a failed write after the
+    /// reader has finished typing.
+    ///
+    /// ⚠️ AND THE NAME LOOKUP REMAINS FOR EVERYTHING ELSE. Most pages are
+    /// never recovered and have no such answer: there the name is all there is,
+    /// and matching it is what has always happened.
+    /// </remarks>
     public static int Write(
         ulong docHandle, int pageIndex, int firstObject, int lastObject, int prefixChars,
-        string fontName, string newText, string? expected = null)
+        string fontName, string newText, string? expected = null, string? face = null)
     {
         byte[] text = Encoding.UTF8.GetBytes(newText);
 
-        string? fontPath = SystemFontMatch.PathFor(fontName);
+        string? fontPath = face ?? SystemFontMatch.PathFor(fontName);
         byte[]? font = fontPath is null ? null : Encoding.UTF8.GetBytes(fontPath);
 
         int status = RenderCoreNative.set_line_text(

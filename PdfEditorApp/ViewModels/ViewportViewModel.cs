@@ -5135,7 +5135,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         BeginEdit("Edit text");
         RecordEdit(new WordTextRecord(page, word.ObjectIndices, word.Text, newText));
 
-        int status = Interop.WordClusterGateway.Write(_documentHandle, page, word, newText);
+        int status = Interop.WordClusterGateway.Write(
+            _documentHandle, page, word, newText, FaceFor(page, word.FontName));
 
         if (status != RenderStatus.OkPdfium)
         {
@@ -5148,7 +5149,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 RenderStatus.TooWide =>
                     "That is too long to fit on the line. Try fewer letters.",
                 RenderStatus.Unsupported =>
-                    SystemFontMatch.PathFor(word.FontName) is null
+                    FaceFor(page, word.FontName) is null
                         ? $"\u201c{word.FontName}\u201d is not a font this app can match, so the word cannot be retyped."
                         : "This word cannot be rewritten with the letters it needs.",
                 _ => "That word no longer matches the page. Select it again.",
@@ -5214,6 +5215,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// alternative is what was here before, four subsystems each deciding the
     /// nature of a page's text for themselves and disagreeing at the edges.
     /// </remarks>
+    /// <summary>
+    /// The font file to write a name's text with: the face the core proved this
+    /// page's reading with, or the name lookup when it has none.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CORE'S ANSWER FIRST, because for some documents it is the only
+    /// one there is. A real Hindi book names its fonts CIDFont+F1..F7, which
+    /// name nothing and no lookup can resolve; the core worked out which face
+    /// they are from the GLYPHS they draw, and it worked that out in order to
+    /// read the line at all. Deriving it again from the name here would refuse
+    /// a line the core has already read.
+    ///
+    /// ⚠️ AND THE LOOKUP REMAINS FOR EVERYTHING ELSE. Most pages are never
+    /// recovered and have no such answer; there the name is all there is.
+    /// </remarks>
+    private string? FaceFor(int pageIndex, string fontName) =>
+        ContextFor(pageIndex).FaceFor(fontName) ?? SystemFontMatch.PathFor(fontName);
+
     private PageTextContext ContextFor(int pageIndex)
     {
         if (_documentHandle == 0)
@@ -5559,7 +5578,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     line.Text, newText)
                 : Interop.LineGateway.Write(
                     _documentHandle, page, line.FirstObject, line.LastObject, line.PrefixChars,
-                    line.FontName, newText, line.Text));
+                    line.FontName, newText, line.Text, FaceFor(page, line.FontName)));
         }
         catch (Exception ex)
         {
@@ -5596,7 +5615,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 RenderStatus.Unsupported when line.Route == LineWriter.BlockWriter =>
                     "This line cannot be rewritten with the letters it needs.",
                 RenderStatus.Unsupported =>
-                    SystemFontMatch.PathFor(line.FontName) is null
+                    FaceFor(page, line.FontName) is null
                         ? $"“{line.FontName}” is not a font this app can match, so the line cannot be retyped."
                         : "This line cannot be rewritten with the letters it needs.",
                 _ => "That line no longer matches the page. Select it again.",
@@ -14388,7 +14407,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        int status = Interop.WordClusterGateway.Write(_documentHandle, record.Page, word, wanted);
+        int status = Interop.WordClusterGateway.Write(
+            _documentHandle, record.Page, word, wanted, FaceFor(record.Page, word.FontName));
         if (status != RenderStatus.OkPdfium)
         {
             Diag.Log($"undo word: the core refused with {status}");
@@ -14443,7 +14463,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 line.Text, wanted)
             : Interop.LineGateway.Write(
                 _documentHandle, record.Page, line.FirstObject, line.LastObject,
-                line.PrefixChars, line.FontName, wanted, line.Text);
+                line.PrefixChars, line.FontName, wanted, line.Text,
+                FaceFor(record.Page, line.FontName));
 
         if (status != RenderStatus.OkPdfium)
         {

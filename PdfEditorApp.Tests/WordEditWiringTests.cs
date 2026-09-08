@@ -212,8 +212,10 @@ public class WordEditWiringTests
         // And the geometry handed to the core stays the TIGHT box: the write
         // takes the cluster straight from the model, so a padded rect could
         // only get there by someone padding the model itself.
-        Assert.Contains("WordClusterGateway.Write(_documentHandle, page, word, newText)",
-            code, StringComparison.Ordinal);
+        // Asserted in two parts because the call is wrapped across lines
+        // and this file is mixed CRLF and LF.
+        Assert.Contains("WordClusterGateway.Write(", code, StringComparison.Ordinal);
+        Assert.Contains("_documentHandle, page, word, newText,", code, StringComparison.Ordinal);
     }
 
     [Fact]

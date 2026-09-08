@@ -178,10 +178,12 @@ public class LineEditWiringTests
         string edit = EditPath();
         // The trailing paren differs between the two: the edit call sits inside a
         // Task.Run lambda now. What matters is the argument, not the wrapping.
-        Assert.Contains("line.FontName, newText, line.Text)", edit, StringComparison.Ordinal);
+        Assert.Contains("line.FontName, newText, line.Text, FaceFor(page, line.FontName))",
+            edit, StringComparison.Ordinal);
 
         string undo = Body(ViewModel(), "private void ApplyLineText(LineTextRecord record, bool backwards)");
-        Assert.Contains("line.FontName, wanted, line.Text);", undo, StringComparison.Ordinal);
+        Assert.Contains("line.FontName, wanted, line.Text,", undo, StringComparison.Ordinal);
+        Assert.Contains("FaceFor(record.Page, line.FontName));", undo, StringComparison.Ordinal);
     }
 
     [Fact]
