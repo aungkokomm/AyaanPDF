@@ -1043,7 +1043,7 @@ pub(crate) struct Reading {
 /// takes about 17 seconds; reading a page with one already built takes
 /// milliseconds. It is separate from the reading so a caller can pay for it
 /// once, in advance, and off the thread the reader is waiting on.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Indexes {
     by_font: BTreeMap<String, Arc<(Vec<u8>, crate::reshape::Index)>>,
     /// The installed file each font resolved to.
@@ -1054,6 +1054,50 @@ pub(crate) struct Indexes {
     /// The face was resolved HERE, by evidence, so the answer belongs here and
     /// travels with the reading.
     paths: BTreeMap<String, &'static str>,
+
+    /// The glyphs each face's index was built over.
+    ///
+    /// ⚠️ THIS IS WHAT AN INDEX ACTUALLY IS. `Index::build` keeps a syllable
+    /// only when every glyph it draws is in the set it was given, so an index
+    /// reads exactly those clusters whose glyphs are a subset of this and
+    /// nothing else. Recording it is what lets a later page ask "is my page
+    /// already covered" instead of rebuilding or, worse, reading against an
+    /// index that cannot spell its syllables and calling the page unreadable.
+    covered: BTreeMap<&'static str, Covers>,
+
+    /// Bumped whenever a font resolves to a face or a face's coverage grows.
+    ///
+    /// ⚠️ EVERY CHANGE TO THIS VALUE IS AN IMPROVEMENT, which is what makes
+    /// one counter enough. Coverage only ever grows, and a font's face is
+    /// decided once and never revisited, so a reading taken at an earlier
+    /// generation can only be poorer than one taken now, never wrong. A page
+    /// records the generation it was read at and is eligible again the moment
+    /// this moves past it.
+    generation: u64,
+}
+
+/// What a face's index can read.
+///
+/// ⚠️ THE TWO SCRIPTS INDEX DIFFERENTLY, and pretending otherwise costs a
+/// rebuild per page. A Burmese index is filled by enumerating the syllables a
+/// GIVEN glyph set can spell, so it reads that set and no more. A Devanagari
+/// one is filled from the font's own tables and is never given a set at all,
+/// so it already reads everything the face can draw. Recording a Devanagari
+/// face as covering only the glyphs of the page that happened to build it
+/// would rebuild it, and bump the generation, on every page after the first.
+#[derive(Clone)]
+enum Covers {
+    Everything,
+    Only(BTreeSet<u16>),
+}
+
+impl Covers {
+    fn all_of(&self, glyphs: &BTreeSet<u16>) -> bool {
+        match self {
+            Covers::Everything => true,
+            Covers::Only(had) => glyphs.iter().all(|g| had.contains(g)),
+        }
+    }
 }
 
 impl Indexes {
@@ -1071,6 +1115,240 @@ impl Indexes {
     pub(crate) fn path_for(&self, base_font: &str) -> Option<&'static str> {
         self.paths.get(base_font).copied()
     }
+
+    /// Which improvement of the recovery resources this is.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Takes in everything `wanted` asks for, and says whether anything about
+    /// this changed and so has to be kept.
+    ///
+    /// ⚠️ FONT IDENTITY IS DECIDED ONCE AND IS STICKY. `devanagari::face_of`
+    /// picks the face that names the largest SHARE of a glyph set, and a single
+    /// page is a much smaller sample than a document: two faces can both clear
+    /// the bar on one page and the winner would be whichever the candidate list
+    /// reaches first. Re-deciding per page would let two pages of one book read
+    /// the same font as two different faces. Once `paths` has an answer it is
+    /// never asked again.
+    ///
+    /// ⚠️ AND WHERE A PAGE'S OWN EVIDENCE IS NOT ENOUGH, THE SEARCH WIDENS
+    /// FOR THAT FONT ALONE. A font first met on a page that draws four of its
+    /// glyphs may resolve to nothing, and refusing it there would make the page
+    /// unreadable for a reason that is an accident of where the reader started.
+    /// `wanted_for_font` collects that one font across the document, which is
+    /// the whole-document walk this exists to avoid, paid once per font that
+    /// needs it rather than once per page.
+    ///
+    /// ⚠️ COVERAGE, BY CONTRAST, IS SAFELY PER PAGE, for every font that
+    /// declares its widths. A larger glyph set only ever ADDS entries to an
+    /// index: shaping does not depend on the set, and the keep test is that a
+    /// syllable's glyphs are contained by it. So a face rebuilt over a union is
+    /// a superset of what it was, and no reading that was possible before
+    /// becomes impossible. The fonts that declare nothing are named in
+    /// [`Wanted::unbounded`] and widened where the build is paid for.
+    pub(crate) fn grow(&mut self, doc: &Document, wanted: &Wanted) -> bool {
+        let mut changed = false;
+
+        // 1. Identity, for fonts that do not have one yet.
+        for (base_font, glyphs) in &wanted.by_font {
+            if self.paths.contains_key(base_font) {
+                continue;
+            }
+            let path = match installed(base_font) {
+                Some(path) => Some(path),
+                None => match crate::devanagari::face_of(glyphs) {
+                    Some(path) => Some(path),
+                    // The targeted widen, and only here.
+                    None => crate::devanagari::face_of(&wanted_for_font(doc, base_font)),
+                },
+            };
+            if let Some(path) = path {
+                self.paths.insert(base_font.clone(), path);
+                changed = true;
+            }
+        }
+
+        // 2. What each face is now asked to cover.
+        let mut asked: BTreeMap<&'static str, BTreeSet<u16>> = BTreeMap::new();
+        for (base_font, glyphs) in &wanted.by_font {
+            let Some(&path) = self.paths.get(base_font) else { continue };
+            asked.entry(path).or_default().extend(glyphs.iter().copied());
+        }
+
+        // 3. Rebuild only the faces that are asked for something they have not
+        //    got, over the UNION so the set grows monotonically and a face is
+        //    rebuilt fewer and fewer times as a document is read.
+        let mut grew = false;
+        for (path, glyphs) in &asked {
+            let have = self.covered.get(path);
+            if have.is_some_and(|had| had.all_of(glyphs)) {
+                continue;
+            }
+            let mut union = match have {
+                Some(Covers::Only(had)) => had.clone(),
+                _ => BTreeSet::new(),
+            };
+            union.extend(glyphs.iter().copied());
+
+            // ⚠️ AND A FONT THIS PAGE CANNOT BOUND IS WIDENED BEFORE PAYING.
+            // Asked for a font that declares no widths, the page can only say
+            // what it draws itself, which the next page exceeds; scoping the
+            // build to that would rebuild the face, at twenty seconds a time,
+            // on page after page. The document is walked for those fonts only,
+            // and only here, where a build is about to be paid for anyway.
+            for base_font in &wanted.unbounded {
+                if self.paths.get(base_font) == Some(path) {
+                    union.extend(wanted_for_font(doc, base_font));
+                }
+            }
+
+            let script = if crate::devanagari::owns(path) {
+                Script::Devanagari
+            } else {
+                Script::Burmese
+            };
+            let Some((face, covers)) = build_face(path, &union, script) else { continue };
+
+            for (base_font, at) in &self.paths {
+                if at == path {
+                    self.by_font.insert(base_font.clone(), Arc::clone(&face));
+                }
+            }
+            self.covered.insert(path, covers);
+            grew = true;
+        }
+
+        // 4. And a name that resolved to a face somebody else already built
+        //    still needs to be handed that face.
+        //
+        // ⚠️ THE COVERAGE TEST ANSWERS FOR THE FACE, NOT FOR THE NAME.
+        // `BCDEEE+MyanmarText` and `BCDGEE+MyanmarText` are one file, so the
+        // second name met is asked for glyphs the face already covers and step
+        // 3 rightly builds nothing. Without this it would be left with a
+        // resolved path and no index, which reads as a font that cannot be
+        // read: two subsets of one face sharing one index is the whole reason
+        // this is keyed by face.
+        let adopt: Vec<(String, Arc<(Vec<u8>, crate::reshape::Index)>)> = self
+            .paths
+            .iter()
+            .filter(|(base_font, _)| !self.by_font.contains_key(*base_font))
+            .filter_map(|(base_font, &path)| {
+                Some((base_font.clone(), self.face_at(path)?))
+            })
+            .collect();
+        for (base_font, face) in adopt {
+            self.by_font.insert(base_font, face);
+            grew = true;
+        }
+
+        // ⚠️ A BUMP MEANS A BETTER READING IS AVAILABLE, and nothing else.
+        // Resolving a name to a face that then failed to build changes this and
+        // must be kept, so that the widen is not paid again on the next page,
+        // but it makes no page readable that was not readable before and a page
+        // re-read on the strength of it would find exactly what it found last
+        // time.
+        if grew {
+            self.generation += 1;
+        }
+        changed || grew
+    }
+
+    /// A face already built, found by the file it was built from.
+    fn face_at(&self, path: &'static str) -> Option<Arc<(Vec<u8>, crate::reshape::Index)>> {
+        self.paths
+            .iter()
+            .find(|(_, at)| **at == path)
+            .and_then(|(base_font, _)| self.by_font.get(base_font).cloned())
+    }
+}
+
+/// Resources that claim to be a given improvement, for asking a caller what it
+/// does when one page's reading has been overtaken by another's.
+#[cfg(test)]
+pub(crate) fn tests_only_at_generation(generation: u64) -> Indexes {
+    Indexes { generation, ..Default::default() }
+}
+
+/// Everything one PAGE draws, as the glyphs each of its fonts declares.
+///
+/// ⚠️ THE PAGE, NOT THE DOCUMENT. `indexes_for_document` walks every page of
+/// the file to answer a question about one of them, which on a book of tens of
+/// thousands of pages is the whole cost of preparing anything. A page can only
+/// draw the glyphs it contains, so its own fonts are all that its own reading
+/// can need.
+pub(crate) fn wanted_for_page(doc: &Document, page: ObjectId) -> Wanted {
+    let mut by_font: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+    for (_, (base_font, widths)) in fonts_of(doc, page) {
+        if let Some(w) = widths {
+            by_font.entry(base_font).or_default().extend(w.declared());
+        }
+    }
+
+    // ⚠️ AND A FONT THAT DECLARES NOTHING STILL HAS TO BE READABLE, exactly
+    // as the whole-document walk handles it: a subset without a `/W` array
+    // leaves nothing to scope by, so what the page DRAWS is asked instead.
+    let undeclared: Vec<String> = fonts_of(doc, page)
+        .into_values()
+        .map(|(f, _)| f)
+        .filter(|f| !by_font.contains_key(f))
+        .collect();
+    if !undeclared.is_empty() {
+        for line in lines_of(doc, page) {
+            if undeclared.contains(&line.base_font) {
+                by_font.entry(line.base_font).or_default().extend(line.glyphs);
+            }
+        }
+    }
+    Wanted { by_font, unbounded: undeclared.into_iter().collect() }
+}
+
+/// What one page needs, and how far the page can be trusted to know it.
+pub(crate) struct Wanted {
+    /// Every glyph each of the page's fonts is known to draw.
+    pub(crate) by_font: BTreeMap<String, BTreeSet<u16>>,
+
+    /// The fonts among them whose extent this page CANNOT bound.
+    ///
+    /// ⚠️ A SUBSET'S `/W` IS ALREADY DOCUMENT-WIDE, and that is the whole
+    /// reason a page can be prepared on its own: the array declares a width for
+    /// every CID the WHOLE DOCUMENT uses of that font, so one page's
+    /// declaration is every page's and the second page of a book finds itself
+    /// covered. A font without one leaves only what is drawn HERE, which the
+    /// next page will exceed, and a Burmese index rebuilt per page is twenty
+    /// seconds per page. Naming them is what lets the build widen just those.
+    unbounded: BTreeSet<String>,
+}
+
+/// Every glyph ONE font declares, or is seen to draw, anywhere in the document.
+///
+/// ⚠️ THE ONLY WHOLE-DOCUMENT WALK LEFT, and it is asked for one font at a
+/// time, only from inside [`Indexes::grow`], and only for the two things a
+/// single page genuinely cannot answer: which face a font is, and how far a
+/// font that declares no widths extends. The alternative to the first is that
+/// where a reader happens to open a book decides which of its fonts can ever be
+/// read; the alternative to the second is rebuilding a face on page after
+/// page.
+fn wanted_for_font(doc: &Document, base_font: &str) -> BTreeSet<u16> {
+    let mut glyphs = BTreeSet::new();
+    for &page in doc.get_pages().values() {
+        for (_, (name, widths)) in fonts_of(doc, page) {
+            if name != base_font {
+                continue;
+            }
+            match widths {
+                Some(w) => glyphs.extend(w.declared()),
+                None => {
+                    for line in lines_of(doc, page) {
+                        if line.base_font == base_font {
+                            glyphs.extend(line.glyphs.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    glyphs
 }
 
 /// Builds what is needed to read this page: one index per font, over the
@@ -1271,56 +1549,76 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
         face_of.insert(base_font, path);
     }
 
-    let mut built: BTreeMap<&'static str, Arc<(Vec<u8>, crate::reshape::Index)>> = BTreeMap::new();
-
-    // ⚠️ ONE PREPARATION AT A TIME, which the progress counters have always
-    // assumed and nothing has ever enforced. See `progress::ONE_AT_A_TIME`.
-    // Poisoning is not a reason to refuse to read a document: the counters are
-    // two integers and a panicking build leaves them stale at worst.
-    let _only_one = progress::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|held| held.into_inner());
-
+    let mut built: BTreeMap<&'static str, (Arc<(Vec<u8>, crate::reshape::Index)>, Covers)> =
+        BTreeMap::new();
     for (path, (glyphs, script)) in &per_face {
-        let Ok(bytes) = std::fs::read(path) else { continue };
-
-        // ⚠️ NO PROGRESS CARD FOR A BUILD THIS SHORT. The Devanagari
-        // enumeration is bounded to a few thousand clusters and shapes in about
-        // fifty milliseconds, against twenty-odd seconds for Burmese, so a
-        // reader would see the card appear and vanish for no reason.
-        if *script == Script::Devanagari {
-            let Some(index) = crate::devanagari::reading_index(path) else { continue };
-            built.insert(path, Arc::new((bytes, index)));
-            continue;
+        if let Some(face) = build_face(path, glyphs, *script) {
+            built.insert(path, face);
         }
-
-        // ⚠️ REPORTED PER FACE, because that is where the total is known. In
-        // practice there is one: the whole reason this groups by face is that
-        // every subset of a font now shares its index. A document that really
-        // did use two unrelated readable faces would fill the bar twice.
-        let report = |done: usize, total: usize| {
-            if done == 0 {
-                progress::began(total);
-            } else {
-                progress::reached(done);
-            }
-        };
-        let index = crate::reshape::Index::build_reporting(&bytes, None, Some(glyphs), Some(&report));
-        progress::finished();
-
-        let Some(index) = index else { continue };
-        built.insert(path, Arc::new((bytes, index)));
     }
 
     let mut by_font = BTreeMap::new();
     let mut paths = BTreeMap::new();
     for (base_font, path) in face_of {
-        if let Some(face) = built.get(path) {
+        if let Some((face, _)) = built.get(path) {
             by_font.insert(base_font.clone(), Arc::clone(face));
             paths.insert(base_font.clone(), path);
         }
     }
-    Indexes { by_font, paths }
+    let covered = built.into_iter().map(|(path, (_, covers))| (path, covers)).collect();
+    Indexes { by_font, paths, covered, generation: 1 }
+}
+
+/// One face's index, built over exactly the glyphs it is given.
+///
+/// ⚠️ ONE PREPARATION AT A TIME, which the progress counters have always
+/// assumed and nothing has ever enforced. See `progress::ONE_AT_A_TIME`.
+/// Poisoning is not a reason to refuse to read a document: the counters are two
+/// integers and a panicking build leaves them stale at worst.
+///
+/// ⚠️ AND THE LOCK IS HELD ACROSS THE WHOLE BUILD, which is what lets a
+/// caller record a face's coverage the moment this returns: nobody can be
+/// half-way through building the same face and about to record a different set.
+fn build_face(
+    path: &'static str,
+    glyphs: &BTreeSet<u16>,
+    script: Script,
+) -> Option<(Arc<(Vec<u8>, crate::reshape::Index)>, Covers)> {
+    let _only_one = progress::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+
+    let bytes = std::fs::read(path).ok()?;
+
+    // ⚠️ NO PROGRESS CARD FOR A BUILD THIS SHORT. The Devanagari enumeration
+    // is bounded to a few thousand clusters and shapes in about fifty
+    // milliseconds, against twenty-odd seconds for Burmese, so a reader would
+    // see the card appear and vanish for no reason.
+    //
+    // ⚠️ AND IT IGNORES THE GLYPH SET ENTIRELY, which is why it reports
+    // `Everything`: `reading_index` is asked only for a path, so its coverage
+    // is total by construction and no later page can ask it for anything it
+    // has not already got.
+    if script == Script::Devanagari {
+        let index = crate::devanagari::reading_index(path)?;
+        return Some((Arc::new((bytes, index)), Covers::Everything));
+    }
+
+    // ⚠️ REPORTED PER FACE, because that is where the total is known. In
+    // practice there is one: the whole reason this groups by face is that every
+    // subset of a font shares its index. A document that really did use two
+    // unrelated readable faces would fill the bar twice.
+    let report = |done: usize, total: usize| {
+        if done == 0 {
+            progress::began(total);
+        } else {
+            progress::reached(done);
+        }
+    };
+    let index = crate::reshape::Index::build_reporting(&bytes, None, Some(glyphs), Some(&report));
+    progress::finished();
+
+    Some((Arc::new((bytes, index?)), Covers::Only(glyphs.clone())))
 }
 
 /// Which script's clusters have to be enumerated to fill a face's index.
@@ -2322,6 +2620,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             paths: BTreeMap::new(),
+            ..Default::default()
         }
     }
 
@@ -6061,7 +6360,7 @@ mod tests {
                     println!("   {font}: no index (the font draws none of these glyphs)");
                     continue;
                 };
-                let mut indexes = Indexes { by_font: BTreeMap::new(), paths: BTreeMap::new() };
+                let mut indexes = Indexes::default();
                 indexes.by_font.insert(font.clone(), Arc::new((bytes.clone(), index)));
 
                 let read = read_page_with(&doc, page, &indexes);
@@ -6438,6 +6737,321 @@ mod tests {
         }
     }
 
+    // ---- what one page has to pay for ----
+
+    /// A document of two pages, each drawing in a font of its own, each font
+    /// declaring a width for exactly the CIDs it is given.
+    fn two_pages_in_their_own_fonts(
+        first: (&str, &[u16]), second: (&str, &[u16]),
+    ) -> (Document, Vec<ObjectId>) {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut pages = Vec::new();
+
+        for (base, cids) in [first, second] {
+            let widths: Vec<Object> = cids
+                .iter()
+                .flat_map(|c| [Object::Integer(*c as i64), vec![Object::Real(500.0)].into()])
+                .collect();
+            let descendant = doc.add_object(lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "CIDFontType2",
+                "BaseFont" => base,
+                "W" => widths,
+                "DW" => 500.0,
+            });
+            let font = doc.add_object(lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => base,
+                "Encoding" => "Identity-H",
+                "DescendantFonts" => vec![descendant.into()],
+            });
+            let content = Content { operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.0.into()]),
+                place(72.0, 700.0),
+                show(cids),
+                Operation::new("ET", vec![]),
+            ] };
+            let stream = doc.add_object(lopdf::Stream::new(
+                lopdf::dictionary! {}, content.encode().unwrap()));
+            pages.push(doc.add_object(lopdf::dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => stream,
+                "Resources" => lopdf::dictionary! {
+                    "Font" => lopdf::dictionary! { "F1" => font } },
+            }));
+        }
+
+        doc.objects.insert(pages_id, Object::Dictionary(lopdf::dictionary! {
+            "Type" => "Pages",
+            "Kids" => pages.iter().map(|p| Object::Reference(*p)).collect::<Vec<_>>(),
+            "Count" => pages.len() as i64,
+        }));
+        let catalog = doc.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+        (doc, pages)
+    }
+
+    /// ⚠️ THE WHOLE POINT OF THE PAGE-SCOPED PREPARATION. Preparing one page
+    /// used to walk every page of the document, so opening a book of tens of
+    /// thousands of pages paid for all of them to read the first. A page can
+    /// only draw the glyphs it contains.
+    #[test]
+    fn a_page_asks_only_for_the_fonts_it_draws_with() {
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("AAAAAA+First", &[3, 4, 5]), ("BBBBBB+Second", &[7, 8]));
+
+        let first = wanted_for_page(&doc, pages[0]).by_font;
+        assert_eq!(first.keys().collect::<Vec<_>>(), vec!["AAAAAA+First"],
+            "preparing one page asked for another page's font");
+        assert_eq!(first["AAAAAA+First"], [3u16, 4, 5].into_iter().collect::<BTreeSet<_>>());
+
+        let second = wanted_for_page(&doc, pages[1]).by_font;
+        assert_eq!(second.keys().collect::<Vec<_>>(), vec!["BBBBBB+Second"]);
+    }
+
+    /// ⚠️ AND THE DOCUMENT-WIDE ANSWER IS STILL AVAILABLE, unchanged, for
+    /// the one thing that needs it: a font whose own page could not identify
+    /// it. Both pages' fonts must be in it or the widen would be narrower than
+    /// the thing it is widening.
+    #[test]
+    fn one_font_can_still_be_asked_for_across_the_whole_document() {
+        let (doc, _) = two_pages_in_their_own_fonts(
+            ("AAAAAA+Same", &[3, 4, 5]), ("AAAAAA+Same", &[9]));
+
+        assert_eq!(
+            wanted_for_font(&doc, "AAAAAA+Same"),
+            [3u16, 4, 5, 9].into_iter().collect::<BTreeSet<_>>(),
+            "the widen missed a page");
+    }
+
+    /// ⚠️ AND IT CANNOT DEPEND ON WHICH PAGE ASKED. `wanted_for_font` is a
+    /// union over the document, so the evidence a font is identified from is
+    /// the same evidence wherever a reader happens to open the book. Page order
+    /// deciding which face a font resolves to would let two pages of one
+    /// document read the same font as two different faces.
+    #[test]
+    fn the_widened_evidence_is_the_same_whichever_page_asks() {
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("AAAAAA+Same", &[3, 4, 5]), ("AAAAAA+Same", &[9]));
+
+        let across = wanted_for_font(&doc, "AAAAAA+Same");
+
+        // Genuinely wider than either page on its own, which is the only
+        // reason it is worth asking for.
+        for &page in &pages {
+            let own = wanted_for_page(&doc, page).by_font;
+            assert!(own["AAAAAA+Same"].len() < across.len(),
+                "a page's own evidence was not narrower than the document's");
+            assert!(own["AAAAAA+Same"].iter().all(|g| across.contains(g)));
+        }
+    }
+
+    /// One page's reading, already paid for.
+    ///
+    /// ⚠️ SCOPED BY THE CHARACTERS, NOT BY THE GLYPHS, and that is the only
+    /// reason these tests are affordable. Enumerating what a Burmese glyph set
+    /// can spell is six minutes of a debug build, and what the bookkeeping does
+    /// with an index it already has does not depend on how wide that index is:
+    /// these ask which faces are BUILT and which are REUSED, so an index built
+    /// over one character answers exactly as well as one built over a font.
+    fn already_paid_for(covers: &[u16]) -> Indexes {
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let chars: BTreeSet<char> = "\u{1019}".chars().collect();
+        let index = crate::reshape::Index::build(&bytes, Some(&chars), None).unwrap();
+        Indexes {
+            by_font: [("BCDEEE+MyanmarText".to_string(), Arc::new((bytes, index)))]
+                .into_iter()
+                .collect(),
+            paths: [("BCDEEE+MyanmarText".to_string(), MYANMAR_TEXT)].into_iter().collect(),
+            covered: [(MYANMAR_TEXT, Covers::Only(covers.iter().copied().collect()))]
+                .into_iter()
+                .collect(),
+            generation: 1,
+        }
+    }
+
+    /// Leaves a document's fonts with nothing for a page to scope them by.
+    ///
+    /// ⚠️ NOT BY EMPTYING `/W`, WHICH IS NOT THE SAME THING. A Type0 font
+    /// with no width array still answers `cid_widths`, out of `/DW`, and so
+    /// still counts as having declared its extent. What produces a font nothing
+    /// can bound is one the reader cannot read a CID width out of at all.
+    fn nothing_to_scope_the_fonts_by(doc: &mut Document) {
+        let ids: Vec<ObjectId> = doc.objects.keys().copied().collect();
+        for id in ids {
+            if let Some(d) = doc.get_object_mut(id).ok().and_then(|o| o.as_dict_mut().ok()) {
+                d.remove(b"DescendantFonts");
+            }
+        }
+    }
+
+    /// ⚠️ AND A FONT THAT DECLARES NOTHING IS NOT BOUNDED BY ONE PAGE. Page
+    /// scoping is free because a subset's `/W` is already document-wide: it
+    /// lists every CID the whole file uses, so the second page finds itself
+    /// covered. A font without one leaves only what is drawn HERE, which the
+    /// next page exceeds, and a face rebuilt per page is twenty seconds per
+    /// page. Such fonts are named so the build can widen exactly those.
+    #[test]
+    fn a_font_that_declares_no_widths_is_not_taken_at_one_pages_word() {
+        let (mut doc, pages) = two_pages_in_their_own_fonts(
+            ("AAAAAA+Same", &[3, 4]), ("AAAAAA+Same", &[9]));
+        nothing_to_scope_the_fonts_by(&mut doc);
+
+        let first = wanted_for_page(&doc, pages[0]);
+        assert_eq!(first.by_font["AAAAAA+Same"], [3u16, 4].into_iter().collect::<BTreeSet<_>>(),
+            "the page did not fall back to what it draws");
+        assert!(first.unbounded.contains("AAAAAA+Same"),
+            "a font with nothing to scope by was taken at one page's word");
+
+        // And what the build widens such a font to is the whole document.
+        assert_eq!(wanted_for_font(&doc, "AAAAAA+Same"),
+            [3u16, 4, 9].into_iter().collect::<BTreeSet<_>>());
+
+        // A font that DOES declare its widths is not widened, because it does
+        // not need to be: its own declaration already covers every page.
+        let (declared, pages) = two_pages_in_their_own_fonts(
+            ("AAAAAA+Same", &[3, 4]), ("AAAAAA+Same", &[9]));
+        assert!(wanted_for_page(&declared, pages[0]).unbounded.is_empty(),
+            "a font that declares its widths was walked for anyway");
+    }
+
+    /// ⚠️ AND ONCE A FONT HAS A FACE IT IS NEVER ASKED AGAIN. Identity is
+    /// statistical: `face_of` picks whichever face names the largest share of a
+    /// glyph set, and a page is a much smaller sample than a document. Deciding
+    /// it afresh on each page is how one font becomes two faces in one book.
+    #[test]
+    fn a_font_that_has_a_face_keeps_it_however_many_pages_ask() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("BCDEEE+MyanmarText", &[3]), ("BCDEEE+MyanmarText", &[4]));
+
+        // Resolved to something no name lookup would have chosen, so that a
+        // second opinion would be visible if one were taken.
+        let mut indexes = already_paid_for(&[3, 4]);
+        indexes.paths.insert("BCDEEE+MyanmarText".to_string(), r"C:\Windows\Fonts\NIRMALA.TTF");
+
+        indexes.grow(&doc, &wanted_for_page(&doc, pages[1]));
+        assert_eq!(indexes.path_for("BCDEEE+MyanmarText"), Some(r"C:\Windows\Fonts\NIRMALA.TTF"),
+            "a second page re-decided which face a font is");
+    }
+
+    /// ⚠️ A FACE ALREADY WIDE ENOUGH IS NOT BUILT AGAIN, which is what makes
+    /// the second page of a book free. Seventeen seconds is paid by whichever
+    /// page needs it first and by nobody after.
+    #[test]
+    fn a_page_covered_by_what_is_already_built_costs_nothing() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("BCDEEE+MyanmarText", &[3, 4, 5]), ("BCDEEE+MyanmarText", &[3, 4]));
+
+        let mut indexes = already_paid_for(&[3, 4, 5]);
+        let built = indexes.generation();
+        let face = Arc::clone(&indexes.by_font["BCDEEE+MyanmarText"]);
+
+        // The second page draws a SUBSET of the first, which is the ordinary
+        // case: a subset's /W declares what the whole document uses of it.
+        assert!(!indexes.grow(&doc, &wanted_for_page(&doc, pages[1])),
+            "a page already covered rebuilt the index");
+        assert_eq!(indexes.generation(), built,
+            "a reading that changed nothing was announced as an improvement");
+        assert!(Arc::ptr_eq(&face, &indexes.by_font["BCDEEE+MyanmarText"]),
+            "the face was replaced by an identical one");
+
+        // And the page that paid for it is covered too, which is what stops the
+        // document rebuilding the same face for ever.
+        assert!(!indexes.grow(&doc, &wanted_for_page(&doc, pages[0])),
+            "the page that built the face was not covered by it");
+    }
+
+    /// ⚠️ AND A PAGE THAT NEEDS MORE GETS MORE, AND SAYS SO. The generation
+    /// is what tells a page read earlier that a better reading is available.
+    ///
+    /// Asked of a Devanagari face, whose index is built from the font's own
+    /// tables in about fifty milliseconds.
+    #[test]
+    fn a_page_that_needs_more_grows_the_face_and_the_reading() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(NIRMALA).exists() {
+            return;
+        }
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("NirmalaUI", &[3, 4]), ("NirmalaUI", &[3, 4, 5, 6]));
+
+        // As if the first page had been read for and nothing else had.
+        let mut indexes = Indexes {
+            paths: [("NirmalaUI".to_string(), NIRMALA)].into_iter().collect(),
+            covered: [(NIRMALA, Covers::Only([3u16, 4].into_iter().collect()))]
+                .into_iter()
+                .collect(),
+            generation: 1,
+            ..Default::default()
+        };
+        let built = indexes.generation();
+
+        assert!(indexes.grow(&doc, &wanted_for_page(&doc, pages[1])),
+            "a page asking for glyphs nothing covered was refused");
+        assert!(indexes.generation() > built, "the better reading was not announced");
+        assert!(indexes.by_font.contains_key("NirmalaUI"), "the face was not built");
+    }
+
+    /// ⚠️ AND A SECOND NAME FOR A FACE ALREADY BUILT MUST BE HANDED IT. Two
+    /// subsets of one font are one file and share one index, so the second name
+    /// met asks for glyphs the face already covers and rightly builds nothing.
+    /// Left there it would have a resolved face and no index, which reads as a
+    /// font that cannot be read at all.
+    #[test]
+    fn a_new_name_for_a_face_already_built_shares_its_index() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("BCDEEE+MyanmarText", &[3, 4, 5]), ("BCDGEE+MyanmarText", &[3, 4]));
+
+        let mut indexes = already_paid_for(&[3, 4, 5]);
+        assert!(indexes.grow(&doc, &wanted_for_page(&doc, pages[1])),
+            "a name with no index was left without one");
+
+        let one = indexes.by_font.get("BCDEEE+MyanmarText").expect("no index");
+        let two = indexes.by_font.get("BCDGEE+MyanmarText")
+            .expect("the second subset was left with no index");
+        assert!(Arc::ptr_eq(one, two), "two subsets of one face were indexed apart");
+    }
+
+    /// ⚠️ AND A DEVANAGARI FACE IS BUILT ONCE, FULL STOP. Its index is
+    /// filled from the font's own tables and is never given a glyph set, so
+    /// recording it as covering only the page that built it would rebuild it,
+    /// and announce a new reading, on every page of a Hindi book after the
+    /// first.
+    #[test]
+    fn a_devanagari_face_is_never_rebuilt_for_a_wider_page() {
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(NIRMALA).exists() {
+            return;
+        }
+        let (doc, pages) = two_pages_in_their_own_fonts(
+            ("NirmalaUI", &[3, 4]), ("NirmalaUI", &[500, 501]));
+
+        let mut indexes = Indexes::default();
+        assert!(indexes.grow(&doc, &wanted_for_page(&doc, pages[0])),
+            "the Devanagari face did not build");
+        let built = indexes.generation();
+
+        assert!(!indexes.grow(&doc, &wanted_for_page(&doc, pages[1])),
+            "a Devanagari face was rebuilt for glyphs its index already reads");
+        assert_eq!(indexes.generation(), built);
+    }
+
     /// A page drawing exactly `text`, and what recovery makes of it.
     ///
     /// Every glyph is declared half an em wide, so at 12 point each advances
@@ -6462,6 +7076,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             paths: BTreeMap::new(),
+        ..Default::default()
         };
         let read = read_page_with(&doc, page, &indexes);
         let one = read.into_iter().next().expect("no line");
@@ -6572,6 +7187,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             paths: BTreeMap::new(),
+        ..Default::default()
         };
         let one = read_page_with(&doc, page, &indexes).into_iter().next().unwrap();
         let text = one.text.expect("nothing read");

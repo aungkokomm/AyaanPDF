@@ -752,13 +752,20 @@ internal static partial class RenderCoreNative
 
     /// <summary>
     /// Whether <see cref="recover_page_text"/> can answer at once, or would
-    /// wait for <see cref="prepare_recovery"/> to finish. 1 or 0.
+    /// wait for <see cref="prepare_recovery"/> to finish. 0 is no.
     /// </summary>
     /// <remarks>
     /// ⚠️ ASK THIS BEFORE ASKING FOR THE TEXT, ON THE UI THREAD ALWAYS.
     /// Reading a page for the first time is about seventeen seconds, and the
     /// call to read it will block for every one of them. Until this says yes,
     /// carry on with the lines PDFium gave and ask again next time.
+    ///
+    /// ⚠️ AND A NON-ZERO ANSWER SAYS WHICH READING, not merely yes. The core
+    /// builds what a page needs when that page is asked for, so a document's
+    /// recovery resources grow as it is read and a page read early can be
+    /// readable now in ways it was not then. The number changes when they
+    /// improve, and only then, so a caller holding an answer can tell a kept
+    /// one from a stale one by asking again and comparing.
     /// </remarks>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern int recovery_is_ready(ulong docHandle, int pageIndex);

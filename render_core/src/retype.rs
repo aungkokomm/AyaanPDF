@@ -1294,7 +1294,8 @@ mod tests {
         {
             let bytes = crate::document_bytes(handle).unwrap();
             let doc = Document::load_mem(&bytes).unwrap();
-            let _ = crate::indexes_for_doc(handle, &doc);
+            let page = *doc.get_pages().values().next().expect("no page");
+            let _ = crate::indexes_for_doc(handle, &doc, page);
         }
         println!("prepared in {:.1} s", started.elapsed().as_secs_f64());
         println!("ready: {}", crate::recovery_is_ready(handle, 0));

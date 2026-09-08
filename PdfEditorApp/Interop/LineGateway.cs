@@ -53,6 +53,19 @@ internal static class LineGateway
     public static PageTextContext Context(ulong docHandle, int pageIndex) =>
         Read(docHandle, pageIndex);
 
+    /// <summary>
+    /// Which reading of the document's recovery resources this page currently
+    /// has, or 0 while it has none.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ CHEAP ENOUGH TO ASK BEFORE TRUSTING A CACHED ANSWER, which is the
+    /// only reason it is separate from <see cref="Context"/>. It looks two
+    /// numbers up and parses nothing, where reading the page means asking
+    /// PDFium for its text.
+    /// </remarks>
+    public static int Reading(ulong docHandle, int pageIndex) =>
+        docHandle == 0 ? 0 : RenderCoreNative.recovery_is_ready(docHandle, pageIndex);
+
     private static PageTextContext Read(ulong docHandle, int pageIndex)
     {
         var buffer = RenderCoreNative.get_page_lines(docHandle, pageIndex);
@@ -88,7 +101,8 @@ internal static class LineGateway
             // freeze prepare_recovery exists to prevent. Until it is ready the
             // page keeps the lines PDFium gave it, refusals and all, and the
             // caller asks again: see the settled flag.
-            if (RenderCoreNative.recovery_is_ready(docHandle, pageIndex) == 0)
+            int reading = RenderCoreNative.recovery_is_ready(docHandle, pageIndex);
+            if (reading == 0)
             {
                 return PageTextContext.Preparing(pageIndex, lines);
             }
@@ -115,7 +129,7 @@ internal static class LineGateway
             return new PageTextContext(
                 pageIndex, merged,
                 Shaped: true, Settled: true, RecoveryOwnsText: superseded,
-                TextDirection.LeftToRight, faces);
+                TextDirection.LeftToRight, faces, reading);
         }
         finally
         {

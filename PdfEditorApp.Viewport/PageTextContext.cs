@@ -33,7 +33,8 @@ public sealed record PageTextContext(
     bool Settled,
     bool RecoveryOwnsText,
     TextDirection Direction,
-    IReadOnlyDictionary<string, string> Faces)
+    IReadOnlyDictionary<string, string> Faces,
+    int Generation = 0)
 {
     /// <summary>A page whose text PDFium reads correctly, which is most of them.</summary>
     public static PageTextContext Plain(int page, IReadOnlyList<LineSnapshot> lines) =>
@@ -83,6 +84,24 @@ public sealed record PageTextContext(
     /// </remarks>
     public string? FaceFor(string fontName) =>
         fontName is not null && Faces.TryGetValue(fontName, out string? path) ? path : null;
+
+    /// <summary>
+    /// Which reading of the document's recovery resources this was taken from.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THIS IS WHAT MAKES A CACHED CONTEXT SAFE TO KEEP. The core builds
+    /// what a page needs when that page is asked for, so a document's resources
+    /// GROW as it is read, and a page read early can be readable now in ways it
+    /// was not then. Caching the first answer for ever would freeze the first
+    /// page of a book at whatever the first page happened to prove.
+    ///
+    /// ⚠️ AND COMPARING IT IS THE ONLY THING THAT REVISITS A PAGE. Growth
+    /// does not go back and re-read anything: a stale context is noticed when
+    /// its own page is next asked for, and pages nobody looks at again are
+    /// never touched. A page that is not recovered at all sits at zero and
+    /// matches for ever.
+    /// </remarks>
+    public int Generation { get; init; } = Generation;
 
     private static readonly IReadOnlyDictionary<string, string> EmptyFaces =
         new Dictionary<string, string>();

@@ -5240,7 +5240,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return PageTextContext.Plain(pageIndex, Array.Empty<LineSnapshot>());
         }
 
-        if (_contextByPage.TryGetValue(pageIndex, out var found))
+        // ⚠️ AND A KEPT ANSWER IS ONLY GOOD FOR THE READING IT CAME FROM.
+        // The core builds what a page needs when that page is asked for, so a
+        // document's recovery resources GROW as it is read: a page looked at
+        // early can be readable now in ways it was not then. Nothing goes back
+        // and re-reads anything, which would mean a page deep in a book paying
+        // to revisit every page before it; the staleness is noticed here, when
+        // this page is next asked for, and nowhere else.
+        if (_contextByPage.TryGetValue(pageIndex, out var found)
+            && found.Generation == Interop.LineGateway.Reading(_documentHandle, pageIndex))
         {
             return found;
         }

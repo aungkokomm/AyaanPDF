@@ -495,6 +495,22 @@ struct Core {
     /// turned out to be too narrow to read its own page. See
     /// `recover::indexes_for_document`.
     recoveries: Mutex<HashMap<u64, Arc<Mutex<Option<Arc<recover::Indexes>>>>>>,
+
+    /// Which generation of the recovery resources each page was last read
+    /// against.
+    ///
+    /// ⚠️ A PAGE IS PREPARED, NOT A DOCUMENT, and that is the whole of this
+    /// map. `already_prepared` used to ignore its page argument and answer for
+    /// the document, so the first page to finish latched every other one: a
+    /// book whose first-read page had nothing to recover installed an empty
+    /// index and no later page ever built anything.
+    ///
+    /// ⚠️ AND A PAGE THAT CAME BACK WITH NOTHING IS RECORDED, NOT FORGOTTEN.
+    /// Recovery resources grow as pages are visited, so "read at generation 3"
+    /// and "found nothing at generation 3" are the same kind of fact: both stop
+    /// the page being asked again until the resources improve, and both stop
+    /// applying the moment they do.
+    prepared: Mutex<HashMap<u64, HashMap<i32, u64>>>,
 }
 
 static CORE: OnceLock<Core> = OnceLock::new();
@@ -513,6 +529,7 @@ fn core() -> &'static Core {
         requests: Mutex::new(HashMap::new()),
         next_request_id: AtomicU64::new(1),
             recoveries: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
     })
 }
 
@@ -643,6 +660,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
 
     lock(&core.generations).retain(|(doc, _), _| *doc != doc_handle);
     lock(&core.recoveries).remove(&doc_handle);
+    lock(&core.prepared).remove(&doc_handle);
 }
 
 /// Returns the page count for a handle, or -1 if the handle is unknown.
@@ -1800,10 +1818,11 @@ pub extern "C" fn prepare_recovery(doc_handle: u64, page_index: i32) {
                 // is read for properly now, because reading is what the writer
                 // finds a line by, so a page it settles nothing for is a page
                 // that cannot be edited.
-                settle_with_nothing(doc_handle);
+                settle_with_nothing(doc_handle, page_index);
                 return;
             }
-            let _ = indexes_for_doc(doc_handle, &doc);
+            let indexes = indexes_for_doc(doc_handle, &doc, page);
+            mark_prepared(doc_handle, page_index, indexes.generation());
         });
     });
 }
@@ -1856,6 +1875,16 @@ pub extern "C" fn adopt_recovery(from_handle: u64, to_handle: u64) {
     // document as it now is.
     if held.is_none() {
         *held = Some(ready);
+
+        // ⚠️ AND WHICH PAGES WERE READ FOR COMES WITH IT. Readiness is per
+        // page now, so handing over the resources alone would leave every page
+        // of the replacement reporting itself unprepared and the app building
+        // the same index all over again, which is the whole thing this exists
+        // to prevent.
+        let marks = lock(&core().prepared).get(&from_handle).cloned();
+        if let Some(marks) = marks {
+            lock(&core().prepared).insert(to_handle, marks);
+        }
     }
 }
 
@@ -1880,10 +1909,29 @@ pub extern "C" fn recovery_is_ready(doc_handle: u64, page_index: i32) -> i32 {
         all.get(&doc_handle).cloned()
     };
     let Some(slot) = slot else { return 0 };
-    match slot.try_lock() {
-        Ok(held) => i32::from(held.is_some()),
-        Err(_) => 0,
-    }
+    let now = match slot.try_lock() {
+        Ok(held) => match held.as_ref() {
+            Some(ready) => ready.generation(),
+            None => return 0,
+        },
+        Err(_) => return 0,
+    };
+
+    // ⚠️ NON-ZERO STILL MEANS READY, AND THE NUMBER SAYS WHICH READING. The
+    // caller cached a page's answer the moment this said yes, which was right
+    // while an index was built once and never changed. Recovery resources now
+    // grow as pages are visited, so a cached answer has to be able to notice
+    // that a better one is available: the value changes when they improve, and
+    // a caller comparing it re-asks exactly then and at no other time.
+    //
+    // ⚠️ AND IT IS PER PAGE. A page that has not been read against the
+    // current generation is not ready, however much has been built for others.
+    let settled = lock(&core().prepared)
+        .get(&doc_handle)
+        .and_then(|pages| pages.get(&page_index).copied())
+        .is_some_and(|at| at == now);
+
+    if settled { (now + 1).min(i32::MAX as u64) as i32 } else { 0 }
 }
 
 /// How far the Burmese preparation has got, 0 to 100, or -1 when none is
@@ -1918,18 +1966,45 @@ fn cached_indexes(doc_handle: u64) -> Option<Arc<recover::Indexes>> {
     held.as_ref().map(Arc::clone)
 }
 
-fn already_prepared(doc_handle: u64, _page_index: i32) -> bool {
+fn already_prepared(doc_handle: u64, page_index: i32) -> bool {
     let slot = {
         let all = lock(&core().recoveries);
         all.get(&doc_handle).cloned()
     };
     let Some(slot) = slot else { return false };
-    match slot.try_lock() {
-        Ok(held) => held.is_some(),
+    let now = match slot.try_lock() {
+        Ok(held) => match held.as_ref() {
+            Some(ready) => ready.generation(),
+            None => return false,
+        },
         // Held by whoever is building it, or poisoned by one that died trying.
         // Either way there is nothing useful to add.
-        Err(_) => true,
-    }
+        Err(_) => return true,
+    };
+
+    // ⚠️ THIS PAGE, AT THIS GENERATION. An index existing says nothing about
+    // whether THIS page has been read against it, and a page read against an
+    // earlier one is eligible again: the resources only ever improve, so a
+    // second look can only do better.
+    lock(&core().prepared)
+        .get(&doc_handle)
+        .and_then(|pages| pages.get(&page_index).copied())
+        .is_some_and(|at| at == now)
+}
+
+/// Records that this page has been read for, against the resources as they
+/// stood when it was.
+///
+/// ⚠️ THE GENERATION IS PASSED IN, NOT LOOKED UP. Going back for it would
+/// have to take the recovery lock again, and by then another page's preparation
+/// can hold it: the mark would be dropped, the page would report itself not
+/// ready, and nothing would ever ask for it again. The caller has just held
+/// that lock and knows the answer.
+fn mark_prepared(doc_handle: u64, page_index: i32, at: u64) {
+    lock(&core().prepared)
+        .entry(doc_handle)
+        .or_default()
+        .insert(page_index, at);
 }
 
 /// The document as bytes, for the readers that work on PDF structure rather
@@ -1956,32 +2031,60 @@ fn document_bytes(doc_handle: u64) -> Option<Vec<u8>> {
 /// a Devanagari page is the text the reader repaired. What it buys is that
 /// `recovery_is_ready` says yes, so the caller stops asking and takes its
 /// progress card down.
-fn settle_with_nothing(doc_handle: u64) {
+fn settle_with_nothing(doc_handle: u64, page_index: i32) {
     let slot = {
         let mut all = lock(&core().recoveries);
         Arc::clone(all.entry(doc_handle).or_default())
     };
     // Never displaces a real index: a document with one Burmese page and one
     // Devanagari page must keep what the Burmese page paid for.
-    if let Ok(mut held) = slot.try_lock() {
-        if held.is_none() {
-            *held = Some(Arc::new(recover::Indexes::default()));
-        }
+    //
+    // ⚠️ AND IT NO LONGER LATCHES THE OTHER PAGES EITHER. This used to be the
+    // only record that anything had happened, so an empty index installed here
+    // made `already_prepared` true for every page in the book and nothing was
+    // ever built again. The page is what is settled now; the empty index is
+    // only so that a document with nothing to recover still has a generation to
+    // report.
+    let mut held = lock(&slot);
+    if held.is_none() {
+        *held = Some(Arc::new(recover::Indexes::default()));
     }
+    let at = held.as_ref().map(|ready| ready.generation()).unwrap_or(0);
+    drop(held);
+    mark_prepared(doc_handle, page_index, at);
 }
 
-fn indexes_for_doc(doc_handle: u64, doc: &lopdf::Document) -> Arc<recover::Indexes> {
+fn indexes_for_doc(
+    doc_handle: u64,
+    doc: &lopdf::Document,
+    page: lopdf::ObjectId,
+) -> Arc<recover::Indexes> {
     let slot = {
         let mut all = lock(&core().recoveries);
         Arc::clone(all.entry(doc_handle).or_default())
     };
     let mut held = lock(&slot);
-    if let Some(ready) = held.as_ref() {
-        return Arc::clone(ready);
+
+    // ⚠️ WHAT THIS PAGE NEEDS, NOT WHAT THE DOCUMENT CONTAINS. The whole
+    // scan walked every page of the file to prepare one of them, which on a
+    // book of tens of thousands of pages is the entire cost of opening
+    // anything. A page can only draw the glyphs it contains.
+    let wanted = recover::wanted_for_page(doc, page);
+
+    let mut grown = match held.as_ref() {
+        Some(ready) => recover::Indexes::clone(ready),
+        None => recover::Indexes::default(),
+    };
+
+    // ⚠️ AND A FACE ALREADY WIDE ENOUGH IS NOT REBUILT. `grow` compares what
+    // this page asks for against what each face already covers, so the second
+    // and every later page of a book normally costs nothing at all: the
+    // seventeen seconds are paid once, by whichever page needs them first.
+    if grown.grow(doc, &wanted) || held.is_none() {
+        *held = Some(Arc::new(grown));
     }
-    let built = Arc::new(recover::indexes_for_document(doc));
-    *held = Some(Arc::clone(&built));
-    built
+
+    Arc::clone(held.as_ref().expect("just filled"))
 }
 
 /// Replaces the text of one line whose old text was RECOVERED, returning the
@@ -2221,7 +2324,7 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
     let across = |v: f64| ((v - page_left) / page_w) as f32;
     let down = |v: f64| ((page_top - v) / page_w) as f32;
 
-    let indexes = indexes_for_doc(doc_handle, &doc);
+    let indexes = indexes_for_doc(doc_handle, &doc, page);
     let read = recover::read_page_with(&doc, page, &indexes);
     let mut out: Vec<u8> = Vec::new();
     out.extend((read.len() as u32).to_le_bytes());
@@ -16510,7 +16613,9 @@ mod tests {
         assert_ne!(handle, 0);
         // Prepared with whatever this document needs, which is nothing: an
         // empty index is still an index, and it is the CACHING that is on test.
-        let _ = indexes_for_doc(handle, &doc);
+        let page = *doc.get_pages().values().next().expect("no page");
+        let indexes = indexes_for_doc(handle, &doc, page);
+        mark_prepared(handle, 0, indexes.generation());
         handle
     }
 
@@ -16576,6 +16681,98 @@ mod tests {
         let handle = open_document_from_bytes_inner(bytes.as_ptr(), bytes.len());
         assert_ne!(handle, 0);
         handle
+    }
+
+    // ---- readiness is per page, and only for the reading it was taken at ----
+
+    /// Puts resources of a given improvement in front of a handle, which is
+    /// what another page finding something new does to the pages read before
+    /// it.
+    fn hand_it_better_resources(doc_handle: u64, generation: u64) {
+        let slot = {
+            let mut all = lock(&core().recoveries);
+            Arc::clone(all.entry(doc_handle).or_default())
+        };
+        *lock(&slot) = Some(Arc::new(recover::tests_only_at_generation(generation)));
+    }
+
+    /// ⚠️ ONE PAGE FINDING NOTHING USED TO SETTLE THE WHOLE BOOK. Settling
+    /// installed an empty index against the DOCUMENT, and that was the only
+    /// record that anything had happened, so every other page reported itself
+    /// prepared and nothing was ever built for any of them.
+    #[test]
+    fn a_page_that_settles_nothing_leaves_the_other_pages_alone() {
+        let handle = a_prepared_handle_unprepared();
+
+        settle_with_nothing(handle, 0);
+
+        assert!(already_prepared(handle, 0), "the page that settled was not recorded");
+        assert!(!already_prepared(handle, 1),
+            "one page settling nothing latched every other page of the document");
+        assert_ne!(recovery_is_ready(handle, 0), 0, "the settled page is not ready");
+        assert_eq!(recovery_is_ready(handle, 1), 0,
+            "a page nobody has read for reported itself ready");
+
+        close_document(handle);
+    }
+
+    /// ⚠️ AND A PAGE READ AGAINST AN OLDER READING IS ELIGIBLE AGAIN.
+    /// Resources grow as pages are visited, so a page read early can be
+    /// readable now in ways it was not then; it is not revisited eagerly, but
+    /// the next time anyone asks about it the answer has to be taken again.
+    #[test]
+    fn a_page_is_asked_again_once_the_reading_has_improved() {
+        let handle = a_prepared_handle();
+        assert_ne!(recovery_is_ready(handle, 0), 0, "the control is wrong");
+
+        hand_it_better_resources(handle, 7);
+
+        assert_eq!(recovery_is_ready(handle, 0), 0,
+            "a page read against an older reading still called itself ready");
+        assert!(!already_prepared(handle, 0),
+            "a page read against an older reading refused to be read again");
+
+        // And reading it again settles it, at the reading it was taken from.
+        mark_prepared(handle, 0, 7);
+        assert!(already_prepared(handle, 0));
+        assert_eq!(recovery_is_ready(handle, 0), 8,
+            "the caller cannot tell which reading it was given");
+
+        close_document(handle);
+    }
+
+    /// ⚠️ AND WHICH PAGES WERE READ FOR TRAVELS WITH THE RESOURCES. An edit
+    /// hands the app a new document under a new handle; readiness being per
+    /// page now, handing over the index alone would leave every page of the
+    /// replacement unprepared and the app building the same index again, which
+    /// is the whole thing `adopt_recovery` exists to prevent.
+    #[test]
+    fn the_pages_already_read_for_are_handed_on_with_the_reading() {
+        let from = a_prepared_handle();
+        let to = a_prepared_handle_unprepared();
+
+        adopt_recovery(from, to);
+
+        assert!(already_prepared(to, 0), "the replacement was left to read page 0 again");
+        assert_eq!(recovery_is_ready(to, 1), 0,
+            "adoption claimed a page nobody had ever read for");
+
+        close_document(from);
+        close_document(to);
+    }
+
+    /// ⚠️ AND CLOSING A DOCUMENT FORGETS ITS PAGES. Handles are reused, and
+    /// a new document inheriting the last one's marks would report pages ready
+    /// that nothing has ever read.
+    #[test]
+    fn closing_a_document_forgets_which_of_its_pages_were_read_for() {
+        let handle = a_prepared_handle();
+        assert!(already_prepared(handle, 0), "the control is wrong");
+
+        close_document(handle);
+
+        assert!(lock(&core().prepared).get(&handle).is_none(),
+            "a closed document kept its pages");
     }
 
     // ---- the content order a line edit has to leave alone ----
@@ -27549,8 +27746,9 @@ p={spread_px:.4},c={rgba:08X})"
         // that the second reading got the SAME INDEX back, and that can simply
         // be asked.
         let doc = lopdf::Document::load_mem(&edited).unwrap();
-        let one = indexes_for_doc(handle, &doc);
-        let two = indexes_for_doc(handle, &doc);
+        let page = *doc.get_pages().values().next().expect("no page");
+        let one = indexes_for_doc(handle, &doc, page);
+        let two = indexes_for_doc(handle, &doc, page);
         assert!(Arc::ptr_eq(&one, &two), "the second reading rebuilt the index");
         assert!(!one.is_empty(), "there was no index to keep");
 

@@ -601,4 +601,29 @@ public class RecoveredLineTests
         Assert.Null(context.FaceFor("Calibri"));
         Assert.Null(PageTextContext.Plain(0, Array.Empty<LineSnapshot>()).FaceFor("anything"));
     }
+
+    /// <summary>
+    /// ⚠️ A CONTEXT SAYS WHICH READING IT CAME FROM, so a kept one can be
+    /// told from a stale one. The core builds what a page needs when that page
+    /// is asked for, so a document's recovery resources grow as it is read and
+    /// a page looked at early can be readable now in ways it was not then.
+    /// Without this the first answer would be kept for ever.
+    /// </summary>
+    [Fact]
+    public void a_context_says_which_reading_it_was_taken_from()
+    {
+        var first = new PageTextContext(
+            Page: 0, Lines: Array.Empty<LineSnapshot>(),
+            Shaped: true, Settled: true, RecoveryOwnsText: true,
+            Direction: TextDirection.LeftToRight,
+            Faces: new Dictionary<string, string>(),
+            Generation: 3);
+        Assert.Equal(3, first.Generation);
+
+        // ⚠️ AND A PAGE NOTHING WAS RECOVERED FOR SITS AT ZERO AND MATCHES
+        // FOR EVER. Most pages are never recovered, and a reading that moves
+        // for them would throw their text away on every look.
+        Assert.Equal(0, PageTextContext.Plain(0, Array.Empty<LineSnapshot>()).Generation);
+        Assert.Equal(0, PageTextContext.Preparing(0, Array.Empty<LineSnapshot>()).Generation);
+    }
 }

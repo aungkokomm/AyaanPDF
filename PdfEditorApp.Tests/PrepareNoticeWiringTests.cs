@@ -31,13 +31,39 @@ public class PrepareNoticeWiringTests
     [Fact]
     public void the_bar_goes_up_when_a_page_comes_back_unsettled()
     {
-        string body = Method(Vm(), "private PageTextContext ContextFor(", 1600);
+        string body = Method(Vm(), "private PageTextContext ContextFor(", 2400);
 
         int settled = body.IndexOf("if (context.Settled)", StringComparison.Ordinal);
         int watch = body.IndexOf("WatchPreparation();", StringComparison.Ordinal);
 
         Assert.True(settled > 0, "the page is no longer cached on settling");
         Assert.True(watch > settled, "nothing starts watching when the answer is not final");
+    }
+
+    /// <summary>
+    /// ⚠️ AND A KEPT ANSWER IS ONLY GOOD FOR THE READING IT CAME FROM. The
+    /// core builds what a page needs when that page is asked for, so recovery
+    /// resources GROW as a document is read and a page looked at early can be
+    /// readable now in ways it was not then. Nothing goes back and re-reads
+    /// anything, which would mean a page deep in a book paying to revisit every
+    /// page before it: the staleness is noticed here, when this page is next
+    /// asked for, and nowhere else.
+    /// </summary>
+    [Fact]
+    public void a_cached_page_is_kept_only_while_the_reading_has_not_moved()
+    {
+        string body = Method(Vm(), "private PageTextContext ContextFor(", 2400);
+
+        int hit = body.IndexOf("_contextByPage.TryGetValue(pageIndex, out var found)",
+            StringComparison.Ordinal);
+        int compared = body.IndexOf("found.Generation ==", StringComparison.Ordinal);
+        int returned = body.IndexOf("return found;", StringComparison.Ordinal);
+
+        Assert.True(hit > 0, "the cache is no longer read here");
+        Assert.True(compared > hit && compared < returned,
+            "a cached page is handed back without asking whether its reading still stands");
+        Assert.Contains("LineGateway.Reading(_documentHandle, pageIndex)",
+            body, StringComparison.Ordinal);
     }
 
     /// <summary>
