@@ -244,6 +244,28 @@ pub(crate) struct Line {
     pub(crate) drawn_by: Vec<usize>,
 }
 
+impl Line {
+    /// Where the line STARTS on the page, in PDF user space.
+    ///
+    /// ⚠️ NOT [`Line::x`], WHICH IS THE STREAM'S OWN FRAME. Two lines drawn
+    /// under different transforms cannot be ordered against each other by that
+    /// one, and ordering them is the whole reason to ask.
+    pub(crate) fn page_x(&self) -> f64 {
+        self.on_page.x()
+    }
+
+    /// Where a distance measured ALONG this line's baseline lands on the page.
+    ///
+    /// ⚠️ AN ADVANCE IS IN UNSCALED TEXT SPACE, AND THE PAGE IS NOT. A width
+    /// in points is what the pen travels before `Tm` and the transform in force
+    /// over it have had their say. Handing that number straight to something
+    /// that moves text across the PAGE moves the wrong distance on every book
+    /// that draws its text under a `cm`, which is most of them.
+    pub(crate) fn along_baseline(&self, distance: f64) -> (f64, f64) {
+        self.on_page.along(distance, 0.0)
+    }
+}
+
 /// A word space inside a line: which glyph it comes before, and how wide it is
 /// in points.
 #[derive(Clone, Copy, Debug)]

@@ -147,6 +147,70 @@ pub(crate) fn lay_out(
     Replacement { run, advance: advance / 1000.0 * size }
 }
 
+/// How close two baselines must be to be the same one, in PDF points. Read
+/// back out of a stream that wrote them as decimals, so never exact.
+const BASELINE_TOLERANCE: f64 = 0.5;
+
+/// Below this many points, nothing on the page has visibly moved. A justified
+/// line absorbs its whole difference into its own spaces and lands here.
+const SETTLED: f64 = 0.05;
+
+/// What has to move out of a replacement's way, and how far.
+pub(crate) struct Reflow {
+    /// The operations to move, as indices into the stream the replacement is
+    /// about to be written into.
+    showing: Vec<usize>,
+    /// How far, in PDF user space.
+    by: (f64, f64),
+}
+
+/// Everything drawn to the RIGHT of `line` on the same baseline.
+///
+/// ⚠️ A RECOVERED LINE IS OFTEN ONE WORD. On the reader's Hindi book a
+/// "line" is a single word, so what comes after it on the page is its own
+/// neighbours, and they are what has to move when the replacement is a
+/// different width. On the Burmese file the same call finds nothing, because
+/// there a line really is the whole line. Correct both times, for one reason.
+///
+/// ⚠️ AND THE PAGE'S FRAME, NOT THE STREAM'S. `Line::x` is the `Tm`
+/// translation as written, so two lines drawn under different transforms sort
+/// against each other by nothing at all.
+fn after_on_the_baseline(lines: &[Line], line: &Line) -> Vec<usize> {
+    let mine = line.page_x();
+    let mut showing: Vec<usize> = Vec::new();
+    for other in lines {
+        if std::ptr::eq(other, line) {
+            continue;
+        }
+        if (other.page_y - line.page_y).abs() > BASELINE_TOLERANCE {
+            continue;
+        }
+        if other.page_x() <= mine {
+            continue;
+        }
+        showing.extend(other.drawn_by.iter().copied());
+    }
+    showing.sort_unstable();
+    showing.dedup();
+    showing
+}
+
+/// What the rest of the line has to do to make room for `replacement`.
+///
+/// ⚠️ ONLY WHAT THE REPLACEMENT COULD NOT ABSORB. `share` opens the new
+/// text's own word spaces so the line ends where it ended, and when that works
+/// there is nothing left over and nothing moves. It cannot work on a line that
+/// has no spaces to open, which is every line of a book that draws one word per
+/// line, and that is the case this exists for: without it a longer word is
+/// simply drawn over the top of the next one.
+fn reflow_for(lines: &[Line], line: &Line, replacement: &Replacement, was: Option<f64>) -> Reflow {
+    let slack = was.map_or(0.0, |target| replacement.advance - target);
+    if slack.abs() <= SETTLED {
+        return Reflow { showing: Vec::new(), by: (0.0, 0.0) };
+    }
+    Reflow { showing: after_on_the_baseline(lines, line), by: line.along_baseline(slack) }
+}
+
 /// Puts `replacement` where `line` was drawn, in a font of our own.
 ///
 /// ⚠️ EVERY OPERATION THE LINE WAS DRAWN BY IS ACCOUNTED FOR. A real page draws
@@ -158,6 +222,7 @@ pub(crate) fn write_over(
     page: ObjectId,
     line: &Line,
     replacement: Replacement,
+    reflow: Reflow,
     font: ObjectId,
     text: &str,
 ) -> Result<Vec<u8>, i32> {
@@ -181,6 +246,18 @@ pub(crate) fn write_over(
         // this every later line on the page would be set in ours.
         Operation::new("Tf", vec![Object::Name(line.resource.clone()), size]),
     ];
+
+    // ⚠️ THE REST OF THE LINE MOVES FIRST, BEFORE THE SPLICE BELOW. Moving
+    // rewrites `Tm` operands and changes no index; the splice inserts five
+    // operations where one was, so every index past it means something else
+    // afterwards. The reflow was collected against the stream as it is here.
+    //
+    // ⚠️ AND A REFLOW THAT CANNOT BE DONE EXACTLY REFUSES THE WHOLE EDIT. It
+    // is only ever asked for when the replacement is a visibly different width,
+    // and going ahead without it draws the new text over the top of the word
+    // after it. Text the reader can see is wrong is worse than an edit that
+    // declines.
+    crate::shift::move_placements(&mut content, &reflow.showing, reflow.by.0, reflow.by.1)?;
 
     // Everything else the line was drawn by draws nothing now. Emptied rather
     // than removed, so every other operation keeps the index it had.
@@ -416,14 +493,19 @@ pub(crate) fn retype(
     // Laid out once as the shaper set it, to find out how wide it comes, then
     // again with its own spaces opened so it ends where the old line ended.
     let natural = lay_out(glyphs, &[], line.size, &widths);
-    let replacement = match advance_of(&doc, page, line) {
+    let was = advance_of(&doc, page, line);
+    let replacement = match was {
         Some(target) => {
             let gaps = share(&spaces, target - natural.advance);
             lay_out(glyphs, &gaps, line.size, &widths)
         }
         None => natural,
     };
-    write_over(&doc, page, line, replacement, font_id, new_text)
+
+    // And whatever the new text could not absorb, the rest of the line absorbs
+    // by moving.
+    let reflow = reflow_for(&lines, line, &replacement, was);
+    write_over(&doc, page, line, replacement, reflow, font_id, new_text)
 }
 
 #[cfg(test)]
@@ -451,11 +533,13 @@ mod tests {
     ///   is the `े` alone, which a table of whole clusters cannot spell;
     /// - and nothing else on the page moved.
     ///
-    /// ⚠️ WHAT IT DOES NOT CLAIM IS THE WIDTH. `retype` lands a replacement on
-    /// the old width by opening the line's own spaces, and on this book a
-    /// "line" is a WORD, with no space in it to open. Measured here: 27.5pt
-    /// replaced by 32.6pt. Nothing shifts, because every run on the page is
-    /// positioned absolutely, but a longer word runs closer to its neighbour.
+    /// ⚠️ AND THE REST OF THE LINE MAKES ROOM. `retype` first tries to land a
+    /// replacement on the old width by opening the line's own spaces, and on
+    /// this book a "line" is a WORD, with no space in it to open: measured,
+    /// 27.5pt replaced by 32.6pt. Every run on the page is positioned
+    /// absolutely, so nothing used to shift and the longer word simply ran into
+    /// its neighbour. What is asked here is the thing the reader can see: the
+    /// GAP between this word and the next one along is the gap it was.
     #[test]
     #[ignore = "needs a PDF and fonts that are not in this repository"]
     fn a_real_hindi_line_can_be_rewritten() {
@@ -529,11 +613,62 @@ mod tests {
             "the writer cannot read its own replacement"
         );
 
+        // ⚠️ AND THE WORD AFTER IT IS STILL THE SAME DISTANCE AWAY. Asked as
+        // a GAP rather than as a position, because a gap is the same number in
+        // both files however wide the replacement came out, and it is what the
+        // reader is looking at when they say the words ran together.
+        // ⚠️ A `Reading` IS IN THE PAGE'S FRAME AND A `Line` IS IN THE
+        // STREAM'S. This book draws its text under a `cm`, so the two disagree,
+        // and looking the line up by `Line::y`/`Line::x` finds nothing at all.
+        // It went unnoticed because the only thing that used to ask was a
+        // `println!` that printed `None` and said nothing about it.
+        let was_lines = crate::recover::lines_of(&doc, page);
+        let mine = was_lines
+            .iter()
+            .find(|l| {
+                (l.page_y - line.y).abs() < 0.01 && (l.page_x() - line.x).abs() < 0.01
+            })
+            .expect("the line being edited is not on the page");
+        let now_lines = crate::recover::lines_of(&done, page_after);
+
         println!("   width: {:?} before, {:?} after",
-            crate::recover::lines_of(&doc, page).iter()
-                .find(|l| (l.y - line.y).abs() < 0.01 && (l.x - line.x).abs() < 0.01)
-                .and_then(|l| advance_of(&doc, page, l)),
-            advance_of(&done, page_after, &ours));
+            advance_of(&doc, page, mine), advance_of(&done, page_after, &ours));
+
+        // ⚠️ PAIRED BY POSITION ALONG THE BASELINE, NOT BY WHAT THEY SAY. A
+        // page repeats words, and pairing them by the glyphs they draw matched
+        // one neighbour against a copy of itself 58 points away and reported
+        // that as a move.
+        let along = |lines: &[Line], y: f64| {
+            let mut on: Vec<&Line> = lines
+                .iter()
+                .filter(|l| (l.page_y - y).abs() < BASELINE_TOLERANCE)
+                .collect();
+            on.sort_by(|a, b| a.page_x().total_cmp(&b.page_x()));
+            on.into_iter().map(|l| l.page_x()).collect::<Vec<f64>>()
+        };
+        let before_xs = along(&was_lines, mine.page_y);
+        let after_xs = along(&now_lines, ours.page_y);
+        assert_eq!(before_xs.len(), after_xs.len(),
+            "the baseline is drawn by a different number of runs now");
+
+        // How far the replacement pushes, on the PAGE. The widths are in the
+        // text object's own space, and this book draws under a `cm`.
+        let old_width = advance_of(&doc, page, mine).expect("the old line has no width");
+        let new_width = advance_of(&done, page_after, &ours).expect("the new line has no width");
+        let pushed = mine.along_baseline(new_width - old_width).0;
+        println!("   the replacement pushes {pushed:.2} points along the page");
+
+        let mut moved = 0;
+        for (i, (&was_x, &now_x)) in before_xs.iter().zip(&after_xs).enumerate() {
+            let want = if was_x > mine.page_x() { pushed } else { 0.0 };
+            println!("   run {i} at {was_x:.2} is now at {now_x:.2} (asked to move {want:.2})");
+            assert!((now_x - was_x - want).abs() < 0.05,
+                "the run at {was_x:.2} moved {:.2}, not {want:.2}", now_x - was_x);
+            if want != 0.0 {
+                moved += 1;
+            }
+        }
+        println!("   {moved} run(s) made room, {} stayed put", before_xs.len() - moved);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -213,7 +213,45 @@ pub(crate) fn shift(
         return Err(STATUS_DOC_NOT_REWRITABLE);
     };
 
-    let places = placements(&content);
+    move_placements(&mut content, showing, dx, dy)?;
+
+    let mut out = doc.clone();
+    let Ok(encoded) = content.encode() else {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    };
+    if out.change_page_content(page, encoded).is_err() {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    }
+    let mut bytes = Vec::new();
+    if out.save_to(&mut bytes).is_err() {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    }
+    Ok(bytes)
+}
+
+/// Moves the placements that draw `showing` by `(dx, dy)` in PDF user space,
+/// in a content stream the caller is already holding.
+///
+/// ⚠️ ALL OF A PLACEMENT OR NONE OF IT. One `Tm` can place several showing
+/// operations, and moving it moves all of them. If any operation it governs was
+/// not asked for, this refuses rather than dragging a neighbour along: text
+/// moving that the reader did not touch is worse than a move that declines.
+///
+/// ⚠️ AND IT CHANGES NO INDEX. Only the operands of `Tm` operations are
+/// rewritten, never the shape of the list. That is what lets the writer collect
+/// what it wants moved, move it, and only THEN splice its replacement in, which
+/// it must do in that order because splicing shifts every index after it.
+pub(crate) fn move_placements(
+    content: &mut Content,
+    showing: &[usize],
+    dx: f64,
+    dy: f64,
+) -> Result<(), i32> {
+    if showing.is_empty() {
+        return Ok(());
+    }
+
+    let places = placements(content);
     let mut moving: BTreeMap<usize, Linear> = BTreeMap::new();
     for at in showing {
         let Some((tm, ctm)) = places.get(at).copied() else {
@@ -222,8 +260,6 @@ pub(crate) fn shift(
         moving.insert(tm, ctm);
     }
 
-    // ⚠️ NOTHING ELSE MAY BE CARRIED ALONG. Asked once per placement being
-    // moved: does it also draw something that was not asked for?
     for (at, (tm, _)) in &places {
         if moving.contains_key(tm) && !showing.contains(at) {
             return Err(STATUS_LINE_NOT_REWRITABLE);
@@ -252,18 +288,7 @@ pub(crate) fn shift(
         );
     }
 
-    let mut out = doc.clone();
-    let Ok(encoded) = content.encode() else {
-        return Err(STATUS_DOC_NOT_REWRITABLE);
-    };
-    if out.change_page_content(page, encoded).is_err() {
-        return Err(STATUS_DOC_NOT_REWRITABLE);
-    }
-    let mut bytes = Vec::new();
-    if out.save_to(&mut bytes).is_err() {
-        return Err(STATUS_DOC_NOT_REWRITABLE);
-    }
-    Ok(bytes)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,6 +365,50 @@ mod tests {
             show("two"),
             Operation::new("ET", vec![]),
         ])
+    }
+
+    /// ⚠️ THE PROPERTY THE WRITER'S REFLOW STANDS ON: moving text rewrites
+    /// `Tm` OPERANDS AND NOTHING ELSE. `retype` collects the operations it
+    /// wants moved, moves them, and only then splices its replacement in, which
+    /// inserts five operations where one was and shifts every index past it.
+    /// That order is only safe while moving leaves the list the same shape, so
+    /// this asks directly rather than trusting the reading.
+    #[test]
+    fn moving_text_changes_no_operation_but_the_matrices() {
+        let (doc, page) = two_lines();
+        let before = Content::decode(&doc.get_page_content(page)).unwrap();
+
+        let mut content = Content::decode(&doc.get_page_content(page)).unwrap();
+        move_placements(&mut content, &[2], 12.0, -5.0).expect("refused");
+
+        assert_eq!(content.operations.len(), before.operations.len());
+        for (n, (a, b)) in before.operations.iter().zip(&content.operations).enumerate() {
+            assert_eq!(a.operator, b.operator, "operation {n} is a different one now");
+            if a.operator != "Tm" {
+                assert_eq!(a.operands, b.operands, "operation {n} draws something else now");
+            }
+        }
+
+        let moved: Vec<f64> =
+            content.operations[1].operands.iter().filter_map(number).collect();
+        assert!((moved[4] - 84.0).abs() < 0.01, "{moved:?}");
+        assert!((moved[5] - 695.0).abs() < 0.01, "{moved:?}");
+    }
+
+    /// Asking for nothing moves nothing, and is not an error. A replacement
+    /// that lands on the old width has no neighbours to push.
+    #[test]
+    fn moving_nothing_is_allowed_and_does_nothing() {
+        let (doc, page) = two_lines();
+        let mut content = Content::decode(&doc.get_page_content(page)).unwrap();
+        let before = content.operations.clone();
+
+        move_placements(&mut content, &[], 12.0, 0.0).expect("refused an empty move");
+
+        assert_eq!(content.operations.len(), before.len());
+        for (a, b) in before.iter().zip(&content.operations) {
+            assert_eq!(a.operands, b.operands);
+        }
     }
 
     #[test]
