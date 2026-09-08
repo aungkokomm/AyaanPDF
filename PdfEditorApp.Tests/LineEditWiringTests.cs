@@ -698,12 +698,19 @@ public class LineEditWiringTests
 
         int at = page.IndexOf("private void SlideTheRestOfTheLine(", StringComparison.Ordinal);
         Assert.True(at > 0, "nothing moves the rest of the line");
-        string body = page[at..Math.Min(page.Length, at + 2600)];
+        string body = page[at..Math.Min(page.Length, at + 4200)];
 
         // It copies bitmaps that are already on the page card.
         Assert.Contains("Source = img.Source", body, StringComparison.Ordinal);
-        Assert.Contains("ViewModels.PageTile", body, StringComparison.Ordinal);
-        Assert.Contains("ViewModels.PageSlot", body, StringComparison.Ordinal);
+
+        // ⚠️ BY WHAT THE IMAGE HOLDS, NOT BY ITS DataContext. The tiles
+        // come from an ItemsControl, which sets one; the page card comes from
+        // an ItemsRepeater with an x:Bind template, which does not. Asking for
+        // the DataContext found the tiles and never the page, so at ordinary
+        // zoom the cover went down and nothing was put back.
+        Assert.Contains("img.Source is Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap",
+            body, StringComparison.Ordinal);
+        Assert.DoesNotContain("img.DataContext", body, StringComparison.Ordinal);
 
         // It never copies itself.
         Assert.Contains("ReferenceEquals(child, InPlaceLayer)", body, StringComparison.Ordinal);

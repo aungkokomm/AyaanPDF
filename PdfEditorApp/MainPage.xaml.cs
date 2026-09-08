@@ -7282,6 +7282,7 @@ public sealed partial class MainPage : Page
     private void SlideTheRestOfTheLine(Windows.Foundation.Rect strip, double delta)
     {
         if (strip.Width <= 0 || strip.Height <= 0) { return; }
+        _slid = 0;
 
         void Copy(Image img)
         {
@@ -7310,6 +7311,7 @@ public sealed partial class MainPage : Page
             Canvas.SetLeft(copy, where.X + delta);
             Canvas.SetTop(copy, where.Y);
             InPlaceLayer.Children.Add(copy);
+            _slid++;
         }
 
         void Walk(DependencyObject node)
@@ -7322,12 +7324,22 @@ public sealed partial class MainPage : Page
                 // Never the overlay itself, or this would copy its own copies.
                 if (ReferenceEquals(child, InPlaceLayer)) { continue; }
 
+                // ⚠️ BY WHAT THE IMAGE HOLDS, NOT BY ITS DataContext. The
+                // deep-zoom tiles come from an `ItemsControl`, which sets one,
+                // but the page card itself comes from an `ItemsRepeater` with
+                // an `x:Bind` template, which does NOT. Asking for the
+                // DataContext therefore found the tiles and never the page, so
+                // at ordinary zoom, where there are no tiles, the cover went
+                // down and nothing was ever put back: the reader watched the
+                // rest of the line vanish as they typed.
+                //
+                // ⚠️ A PAGE RENDER IS A `WriteableBitmap`, which is what both
+                // the base render and every tile are, and what the pictures
+                // inside annotations are not.
                 if (child is Image img
-                    && img.Source is not null
+                    && img.Source is Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap
                     && img.ActualWidth > 0
-                    && img.ActualHeight > 0
-                    && (img.DataContext is ViewModels.PageTile
-                        || img.DataContext is ViewModels.PageSlot))
+                    && img.ActualHeight > 0)
                 {
                     Copy(img);
                 }
@@ -7337,7 +7349,11 @@ public sealed partial class MainPage : Page
         }
 
         Walk(PageScroller);
+        Diag.Log($"slide {delta:F1} dip: {_slid} piece(s) of page copied");
     }
+
+    /// <summary>How many pieces the last slide moved. Diagnostic only.</summary>
+    private int _slid;
 
     private static double RunWidth(string text, LiveTextTail tail, double fontDip, Brush ink)
     {
