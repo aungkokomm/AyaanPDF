@@ -240,63 +240,23 @@ public class PageTextObjectWiringTests
     }
 
     /// <summary>
-    /// ⚠️ A COMPLEX SCRIPT'S OBJECT IS NOT A WORD, AND MUST NOT BE FRAMED.
-    /// This snapshot says what PDFium reports a text object contains, and on a
-    /// shaped script that is the glyphs in the order the FILE stores them.
-    /// Measured on a real Burmese page: one click reported
+    /// ⚠️ WHERE RECOVERY OWNS THE TEXT, THE OBJECT READER STANDS DOWN. It
+    /// asks PDFium what a text object says, and on a shaped script the answer
+    /// is the glyphs in the order the FILE stores them. Measured on a real
+    /// Burmese page, one click reported
     /// `objs=[198] font=ABCDEE+Pyidaungsu refusal=ComplexScript` holding a
-    /// single meaningless letter, and a box was drawn round it INSIDE the
-    /// correct frame recovery had just drawn round the whole line.
+    /// single meaningless letter, while recovery returned the whole line and
+    /// said it could be edited.
     ///
-    /// ⚠️ AND EVERY OTHER REFUSAL STILL FRAMES. They describe a word that
-    /// was read correctly and merely cannot be rewritten, and the reader is
-    /// entitled to point at one and be told why. Latin selection is untouched
-    /// because nothing Latin is refused this way.
-    /// </summary>
-    [Theory]
-    [InlineData(ClusterRefusal.ComplexScript, false)]
-    [InlineData(ClusterRefusal.None, true)]
-    [InlineData(ClusterRefusal.NotUpright, true)]
-    [InlineData(ClusterRefusal.MixedStyle, true)]
-    [InlineData(ClusterRefusal.SplitObjects, true)]
-    public void only_a_scrambled_complex_script_object_goes_unframed(
-        ClusterRefusal refusal, bool framed)
-    {
-        Assert.Equal(framed, Cluster(refusal).CanFrame);
-    }
-
-    /// <summary>
-    /// ⚠️ AND FRAMING IS NOT EDITING. A word can be perfectly readable and
-    /// still refuse a rewrite, so the two answers must not collapse into one:
-    /// making CanFrame mean CanEdit would take the frame away from every
-    /// refusal and with it the only way a reader learns why.
+    /// ⚠️ ASKED OF THE PAGE, NOT OF THE OBJECT. That is the difference from
+    /// the per-object flag this replaces: a page can need reshaping, have
+    /// finished being read, and still have recovery decline every line on it,
+    /// and there the fragments are all the page has. That distinction is
+    /// asserted where it can be RUN, in RecoveredLineTests; this asserts that
+    /// the picker consults it, and consults it in time.
     /// </summary>
     [Fact]
-    public void a_word_that_cannot_be_edited_is_still_framed()
-    {
-        var refused = Cluster(ClusterRefusal.NotUpright);
-
-        Assert.False(refused.CanEdit);
-        Assert.True(refused.CanFrame);
-        Assert.NotEqual(string.Empty, refused.RefusalReason);
-    }
-
-    /// <summary>One text object, as the picker would hand it over.</summary>
-    private static WordClusterSnapshot Cluster(ClusterRefusal refusal) =>
-        new(FirstObjectIndex: 198,
-            ObjectIndices: new[] { 198 },
-            Left: 0.1, Top: 0.1, Right: 0.2, Bottom: 0.12,
-            Baseline: 0.12, FontSizePts: 13, ColorRgb: 0,
-            Refusal: refusal, PrefixChars: 0,
-            Text: "င", FontName: "ABCDEE+Pyidaungsu");
-
-    /// <summary>
-    /// ⚠️ AND THE VIEW MODEL HAS TO ASK. The property above decides nothing
-    /// on its own; the picker is what must drop a refused object BEFORE it sets
-    /// the frame, or a box flashes round a scrambled glyph on every click.
-    /// </summary>
-    [Fact]
-    public void the_picker_drops_an_unframeable_object_before_it_frames_one()
+    public void the_object_reader_stands_down_where_recovery_owns_the_text()
     {
         string code = ViewModel();
 
@@ -306,14 +266,20 @@ public class PageTextObjectWiringTests
         Assert.True(shut > at, "the picker does not end");
         string body = code[at..shut];
 
-        int dropped = body.IndexOf("CanFrame: false", StringComparison.Ordinal);
+        int dropped = body.IndexOf("ContextFor(pageIndex).RecoveryOwnsText", StringComparison.Ordinal);
         int framed = body.IndexOf("SelectedWord = picked;", StringComparison.Ordinal);
-        Assert.True(dropped > 0, "the picker never asks whether the object can be framed");
-        Assert.True(framed > dropped, "the frame is set before the refused object is dropped");
+        Assert.True(dropped > 0, "the picker never asks whether recovery owns this page");
+        Assert.True(framed > dropped, "the object is offered before the page is asked");
 
         // ⚠️ AND THE LOG LINE SURVIVES IT. That line is what diagnosed this,
         // and it must keep reporting the object the click really landed on.
         int logged = body.IndexOf("SelectPageTextAt p{pageIndex} objs=", StringComparison.Ordinal);
         Assert.True(logged > 0 && logged < dropped, "the refused object is no longer logged");
+
+        // ⚠️ AND NOTHING IS DECIDED PER OBJECT ANY MORE. A per-object flag
+        // cannot tell "this reading is nonsense" from "this word merely cannot
+        // be rewritten", which is why it took the fragments away from a page
+        // recovery had declined.
+        Assert.DoesNotContain("CanFrame", code, StringComparison.Ordinal);
     }
 }

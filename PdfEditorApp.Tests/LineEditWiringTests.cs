@@ -412,8 +412,8 @@ public class LineEditWiringTests
         // this is about showing the reader the truth.
         string code = ViewModel();
 
-        Assert.Equal(Count(code, "_clustersByPage.Clear()"), Count(code, "_linesByPage.Clear()"));
-        Assert.Contains("_linesByPage.Remove(pageIndex);", code, StringComparison.Ordinal);
+        Assert.Equal(Count(code, "_clustersByPage.Clear()"), Count(code, "_contextByPage.Clear()"));
+        Assert.Contains("_contextByPage.Remove(pageIndex);", code, StringComparison.Ordinal);
     }
 
     // ---------------- the gesture ----------------

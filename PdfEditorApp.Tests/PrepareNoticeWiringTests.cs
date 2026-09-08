@@ -31,12 +31,12 @@ public class PrepareNoticeWiringTests
     [Fact]
     public void the_bar_goes_up_when_a_page_comes_back_unsettled()
     {
-        string body = Method(Vm(), "private IReadOnlyList<LineSnapshot> LinesFor(", 1600);
+        string body = Method(Vm(), "private PageTextContext ContextFor(", 1600);
 
-        int settled = body.IndexOf("if (settled)", StringComparison.Ordinal);
+        int settled = body.IndexOf("if (context.Settled)", StringComparison.Ordinal);
         int watch = body.IndexOf("WatchPreparation();", StringComparison.Ordinal);
 
-        Assert.True(settled > 0, "the lines are no longer cached on settling");
+        Assert.True(settled > 0, "the page is no longer cached on settling");
         Assert.True(watch > settled, "nothing starts watching when the answer is not final");
     }
 

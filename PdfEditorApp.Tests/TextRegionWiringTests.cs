@@ -82,7 +82,7 @@ public class TextRegionWiringTests
         // reader is not looking at.
         string build = BuildBody(vm);
         Assert.Contains("bytes ?? SnapshotDocumentBytes(handle)", build, StringComparison.Ordinal);
-        Assert.Contains("TextRegionReader.Build(b, at, lines)", build, StringComparison.Ordinal);
+        Assert.Contains("TextRegionReader.Build(b, at, context.Lines)", build, StringComparison.Ordinal);
         Assert.DoesNotContain("File.ReadAllBytes", build);
     }
 
@@ -414,17 +414,18 @@ public class TextRegionWiringTests
         string build = BuildBody(Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs"));
 
         // Consulted before the read.
-        Assert.Contains("_linesByPage.TryGetValue(page, out var have)", build, StringComparison.Ordinal);
+        Assert.Contains("_contextByPage.TryGetValue(page, out var have)", build, StringComparison.Ordinal);
         // Read on the pool, not through LinesFor.
         Assert.Contains("Task.Run(", build, StringComparison.Ordinal);
         // ⚠️ AND TOLD WHETHER THE ANSWER IS FINAL. A page of shaped text is
         // read on another thread again, and until that finishes the gateway can
         // only report what PDFium made of it; caching that would mean the
-        // reading finished and this page never noticed.
-        Assert.Contains("Interop.LineGateway.Load(handle, at, out ready)", build, StringComparison.Ordinal);
+        // reading finished and this page never noticed. The context carries
+        // that in Settled, which is what the write-back below consults.
+        Assert.Contains("Interop.LineGateway.Context(handle, at)", build, StringComparison.Ordinal);
         Assert.DoesNotContain("LinesFor(", build);
         // And given back afterwards.
-        Assert.Contains("result.Settled) { _linesByPage[page] = result.Lines; }", build, StringComparison.Ordinal);
+        Assert.Contains("cached is null && result.Context.Settled", build, StringComparison.Ordinal);
     }
 
     /// <summary>

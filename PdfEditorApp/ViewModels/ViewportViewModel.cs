@@ -1397,7 +1397,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // The LINES have the same lifetime as the words: both are read from the
         // page's content and both describe the document that is being closed.
-        _linesByPage.Clear();
+        _contextByPage.Clear();
         _selectedLine = null;
         _selectedLinePage = -1;
         SelectedTextUnit = null;
@@ -5042,24 +5042,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 + $"refusal={picked.Refusal} text={picked.Text}");
         }
 
-        // ⚠️ A COMPLEX SCRIPT'S OBJECT IS NOT A WORD, so nothing is framed
-        // round it. This reader asks PDFium what a text object says, and on a
-        // shaped script the answer is the glyphs in the order the FILE stores
-        // them, which is not the order they are read in. Measured on the
-        // reader's own Burmese page: one click reported
-        // `objs=[198] font=ABCDEE+Pyidaungsu refusal=ComplexScript text=င`,
-        // a single meaningless letter, and drew a box round it.
+        // ⚠️ WHERE RECOVERY OWNS THE TEXT, THIS READER DOES NOT. It asks
+        // PDFium what a text object says, and on a shaped script the answer is
+        // the glyphs in the order the FILE stores them, which is not the order
+        // they are read in. Measured on the reader's own Burmese page: one
+        // click reported a single meaningless letter where recovery had just
+        // returned the whole line and said it could be edited.
         //
-        // ⚠️ AND THE SAME CLICK IS ALREADY ANSWERED PROPERLY. Recovery reads
-        // the line by reshaping it and demanding the page's own glyph ids back,
-        // and on that same click it returned the whole line and said it could
-        // be edited. Two frames appeared, one round the real line and one round
-        // a scrambled glyph inside it. Only the refused one goes.
-        //
-        // ⚠️ NOTHING ELSE CHANGES. A script this reader CAN read is framed
-        // exactly as before, refusals of every other kind still frame and still
-        // explain themselves, and the recovery frame is untouched.
-        if (picked is { CanFrame: false })
+        // ⚠️ ASKED OF THE PAGE, NOT OF THE OBJECT, and that is the whole
+        // difference from the flag this replaces. A page can need reshaping,
+        // have finished being read, and still have recovery decline every line
+        // on it: there PDFium's fragments are all the page has, and taking them
+        // away would leave a strip that answers no click at all. The line
+        // reader has always drawn this distinction, in RecoveredLines.Merge,
+        // and this is the same rule reaching the object reader.
+        if (picked is not null && ContextFor(pageIndex).RecoveryOwnsText)
         {
             picked = null;
         }
@@ -5182,7 +5179,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     // Its own fields, like the words and the links, because none of the thirty
     // operations hanging off the annotation selection mean anything here.
 
-    private readonly Dictionary<int, IReadOnlyList<LineSnapshot>> _linesByPage = new();
+    /// <summary>
+    /// What each page's text turned out to be, read once and kept until the
+    /// page changes.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONE CACHE, NOT TWO IN STEP. The lines are one field of the answer,
+    /// and keeping them beside the rest in a second dictionary would mean two
+    /// things to invalidate on every write and a page that could disagree with
+    /// itself about whether recovery owns it.
+    /// </remarks>
+    private readonly Dictionary<int, PageTextContext> _contextByPage = new();
 
     private LineSnapshot? _selectedLine;
     private int _selectedLinePage = -1;
@@ -5195,7 +5202,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (_documentHandle == 0) { return Array.Empty<LineSnapshot>(); }
 
-        if (_linesByPage.TryGetValue(pageIndex, out var found))
+        return ContextFor(pageIndex).Lines;
+    }
+
+    /// <summary>
+    /// Everything this page's text is: what it says, whether it had to be
+    /// reshaped to be read, and whether recovery owns it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE ONE ANSWER EVERY SUBSYSTEM READS. See PageTextContext: the
+    /// alternative is what was here before, four subsystems each deciding the
+    /// nature of a page's text for themselves and disagreeing at the edges.
+    /// </remarks>
+    private PageTextContext ContextFor(int pageIndex)
+    {
+        if (_documentHandle == 0)
+        {
+            return PageTextContext.Plain(pageIndex, Array.Empty<LineSnapshot>());
+        }
+
+        if (_contextByPage.TryGetValue(pageIndex, out var found))
         {
             return found;
         }
@@ -5206,10 +5232,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // reading finished and the page never noticed: the reader would be
         // clicking fragments of scrambled text for as long as the document
         // stayed open.
-        var lines = Interop.LineGateway.Load(_documentHandle, pageIndex, out bool settled);
-        if (settled)
+        var context = Interop.LineGateway.Context(_documentHandle, pageIndex);
+        if (context.Settled)
         {
-            _linesByPage[pageIndex] = lines;
+            _contextByPage[pageIndex] = context;
         }
         else
         {
@@ -5219,7 +5245,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             // having to guess at it.
             WatchPreparation();
         }
-        return lines;
+        return context;
     }
 
     /// <summary>The line of the document's own text that is selected, or null.</summary>
@@ -5467,7 +5493,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // reason prepare_recovery exists.
         // ⚠️ THE WORDS GO WITH THE LINES, ALWAYS. They are read from the same
         // content and describe the same document, and this rewrote all of it.
-        _linesByPage.Clear();
+        _contextByPage.Clear();
         _clustersByPage.Clear();
         _textRegions.Clear();
         RenderCoreNative.prepare_recovery(_documentHandle, page);
@@ -5664,7 +5690,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         CommitEdit();
 
-        _linesByPage.Remove(page);
+        _contextByPage.Remove(page);
         _clustersByPage.Remove(page);
         InvalidateLoadedPage(page);
         ClearTextUnitSelection();
@@ -5699,7 +5725,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _linesByPage.Remove(record.Page);
+        _contextByPage.Remove(record.Page);
         _clustersByPage.Remove(record.Page);
     }
 
@@ -6168,7 +6194,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // handle is a different one now, so the lines, the words, the regions
         // and whatever the core had read for the old handle all describe a file
         // that no longer exists.
-        _linesByPage.Clear();
+        _contextByPage.Clear();
         _clustersByPage.Clear();
         _textRegions.Clear();
         ClearTextUnitSelection();
@@ -10892,19 +10918,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 if (_textRegions.ContainsKey(page)) { continue; }
 
                 byte[]? bytes = _textRegionBytes;
-                IReadOnlyList<LineSnapshot>? cached =
-                    _linesByPage.TryGetValue(page, out var have) ? have : null;
+                PageTextContext? cached =
+                    _contextByPage.TryGetValue(page, out var have) ? have : null;
                 int at = page;
 
                 var result = await Task.Run(() =>
                 {
                     byte[]? b = bytes ?? SnapshotDocumentBytes(handle);
-                    bool ready = true;
-                    var lines = cached ?? Interop.LineGateway.Load(handle, at, out ready);
+                    var context = cached ?? Interop.LineGateway.Context(handle, at);
                     var regions = b is null
                         ? (IReadOnlyList<TextRegion>)Array.Empty<TextRegion>()
-                        : TextRegionReader.Build(b, at, lines);
-                    return (Bytes: b, Lines: lines, Regions: regions, Settled: ready);
+                        : TextRegionReader.Build(b, at, context.Lines);
+                    return (Bytes: b, Context: context, Regions: regions);
                 });
 
                 if (handle != _documentHandle || epoch != _textRegionEpoch || !IsEditMode)
@@ -10918,7 +10943,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 // the reason LinesFor gives: what is on offer until then is
                 // PDFium's reading, which for a shaped script is fragments of
                 // visual-order text.
-                if (cached is null && result.Settled) { _linesByPage[page] = result.Lines; }
+                if (cached is null && result.Context.Settled)
+                {
+                    _contextByPage[page] = result.Context;
+                }
 
                 // Always recorded, even when empty, or a page the reader cannot
                 // be offered anything on would be rebuilt on every single paint.
@@ -12047,7 +12075,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // And its lines, which are built from those same words and carry an
         // object RANGE that an edit renumbers.
-        _linesByPage.Remove(pageIndex);
+        _contextByPage.Remove(pageIndex);
 
         // So do its links. They ARE annotations, so an edit that renumbers the
         // page renumbers them, and a cached link would hand a stale annotation
@@ -14357,7 +14385,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         string expected = backwards ? record.After : record.Before;
         string wanted = backwards ? record.Before : record.After;
 
-        _linesByPage.Remove(record.Page);
+        _contextByPage.Remove(record.Page);
         _clustersByPage.Remove(record.Page);
 
         var line = LinesFor(record.Page)
@@ -14388,7 +14416,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _linesByPage.Remove(record.Page);
+        _contextByPage.Remove(record.Page);
         _clustersByPage.Remove(record.Page);
     }
 

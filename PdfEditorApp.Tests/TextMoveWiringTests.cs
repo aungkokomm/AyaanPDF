@@ -322,7 +322,7 @@ public class TextMoveWiringTests
         string body = Method(Vm(), "private bool MoveTextUnitBy(", 4200);
 
         Assert.Contains("RestoreDocumentBytes(bytes);", body, StringComparison.Ordinal);
-        Assert.Contains("_linesByPage.Clear();", body, StringComparison.Ordinal);
+        Assert.Contains("_contextByPage.Clear();", body, StringComparison.Ordinal);
         Assert.Contains("_clustersByPage.Clear();", body, StringComparison.Ordinal);
         Assert.Contains("_textRegions.Clear();", body, StringComparison.Ordinal);
         Assert.Contains("prepare_recovery(_documentHandle, page)", body, StringComparison.Ordinal);
