@@ -7101,32 +7101,49 @@ public sealed partial class MainPage : Page
         var ink = HexBrush(tail.ColorHex);
 
         // 1. Paint out the glyphs this replaces, in the page's own colour
-        //    rather than an assumed white.
+        //    rather than an assumed white, and move what follows them out of
+        //    the way.
         //
-        //    ⚠️ AS FAR AS THE OLD TEXT REACHED, OR AS FAR AS THE NEW TEXT
-        //    DOES, WHICHEVER IS FURTHER. It used to stop at the old text's
-        //    right edge on the reasoning that this is as far as the page drew,
-        //    and that is true but not the question. When the replacement comes
-        //    out longer, the extra runs on OVER the word after it and the
-        //    reader watches two pieces of Devanagari sitting on top of each
-        //    other. The file itself is right: committing pushes the rest of the
-        //    line along (see `retype`'s reflow). Only this preview was wrong.
+        //    ⚠️ THE REST OF THE LINE HAS TO MOVE AS THE READER TYPES. The
+        //    file has done this since the reflow went in: committing pushes the
+        //    following words along. But the preview did not, so a longer
+        //    replacement first ran ON TOP of the next word, and then, once the
+        //    cover was widened, simply hid it. Neither is what typing feels
+        //    like. The reader: "that should feel natural while typing".
         //
-        //    ⚠️ AND THE NEIGHBOURS GO UNDER THE COVER UNTIL THEN, because
-        //    this app cannot redraw the page's own type faithfully: it does not
-        //    have the page's subset font and would be guessing at the shaping.
-        //    A clean gap that fills back in on commit is honest; overlapping
-        //    letters are not.
+        //    ⚠️ AND IT MOVES THE PAGE'S OWN PIXELS, NOT A REDRAWING OF THEM.
+        //    This app cannot set the page's type itself: it has neither the
+        //    page's subset font nor its shaping, so anything it drew would be
+        //    a guess that changed font as the reader typed and changed back on
+        //    commit. Copying what is already on screen keeps every neighbour
+        //    exactly as it looks.
         double drawn = RunWidth(tail.Text, tail, fontDip, ink);
+        double wasRight = tail.CoverRight * scale;
+        double nowRight = left + drawn;
+        double delta = nowRight - wasRight;
+
+        // Below half a pixel nothing has visibly moved, and the old behaviour
+        // (cover just the glyphs being replaced) is exactly right.
+        bool sliding = Math.Abs(delta) >= 0.5;
+        double coverTo = sliding ? Math.Max(nowRight, scale) : Math.Max(wasRight, nowRight);
+
         var cover = new Rectangle
         {
-            Width = Math.Max(Math.Max(0, (tail.CoverRight - tail.Left) * scale), drawn),
+            Width = Math.Max(0, coverTo - left),
             Height = height,
             Fill = HexBrush(tail.CoverColorHex),
         };
         Canvas.SetLeft(cover, left);
         Canvas.SetTop(cover, top);
         InPlaceLayer.Children.Add(cover);
+
+        if (sliding)
+        {
+            SlideTheRestOfTheLine(
+                new Windows.Foundation.Rect(
+                    wasRight, top, Math.Max(0, scale - wasRight), height),
+                delta);
+        }
 
         // 2. The selection inside the tail, measured in the font the tail is
         //    drawn in. Under the text for the same reason as above.
@@ -7241,6 +7258,87 @@ public sealed partial class MainPage : Page
     /// proportional font gives no shortcut. Measuring the very run that is
     /// drawn is the only thing that cannot drift from it.
     /// </remarks>
+    /// <summary>
+    /// Draws the part of the page inside <paramref name="strip"/> again,
+    /// <paramref name="delta"/> further along the line.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE PAGE'S OWN PIXELS, COPIED. Each page card carries an `Image` of
+    /// its base render and, at deep zoom, an `Image` per tile over the top. Both
+    /// are bitmaps already on screen, so the rest of the line can be shown in its
+    /// new position by placing clipped copies of them, rather than by this app
+    /// trying to set the page's type itself, which it cannot do: it has neither
+    /// the page's subset font nor its shaping.
+    ///
+    /// ⚠️ THE CLIP IS IN THE COPY'S OWN SPACE AND THE OFFSET IS OUTSIDE IT.
+    /// Clipping keeps the pixels that were at the strip; moving the whole copy
+    /// then puts them where they belong. Doing it the other way round clips away
+    /// the very part being moved.
+    ///
+    /// ⚠️ AND `UseLayoutRounding` STAYS FALSE, for the reason the tile layer
+    /// itself sets it: rounding a bitmap to whole physical pixels at deep zoom
+    /// opens seams between neighbouring pieces.
+    /// </remarks>
+    private void SlideTheRestOfTheLine(Windows.Foundation.Rect strip, double delta)
+    {
+        if (strip.Width <= 0 || strip.Height <= 0) { return; }
+
+        void Copy(Image img)
+        {
+            var where = img.TransformToVisual(InPlaceLayer).TransformBounds(
+                new Windows.Foundation.Rect(0, 0, img.ActualWidth, img.ActualHeight));
+
+            double x = Math.Max(where.X, strip.X);
+            double y = Math.Max(where.Y, strip.Y);
+            double right = Math.Min(where.X + where.Width, strip.X + strip.Width);
+            double bottom = Math.Min(where.Y + where.Height, strip.Y + strip.Height);
+            if (right <= x || bottom <= y) { return; }
+
+            var copy = new Image
+            {
+                Source = img.Source,
+                Stretch = Stretch.Fill,
+                Width = where.Width,
+                Height = where.Height,
+                UseLayoutRounding = false,
+                Clip = new RectangleGeometry
+                {
+                    Rect = new Windows.Foundation.Rect(
+                        x - where.X, y - where.Y, right - x, bottom - y),
+                },
+            };
+            Canvas.SetLeft(copy, where.X + delta);
+            Canvas.SetTop(copy, where.Y);
+            InPlaceLayer.Children.Add(copy);
+        }
+
+        void Walk(DependencyObject node)
+        {
+            int count = VisualTreeHelper.GetChildrenCount(node);
+            for (int i = 0; i < count; i++)
+            {
+                var child = VisualTreeHelper.GetChild(node, i);
+
+                // Never the overlay itself, or this would copy its own copies.
+                if (ReferenceEquals(child, InPlaceLayer)) { continue; }
+
+                if (child is Image img
+                    && img.Source is not null
+                    && img.ActualWidth > 0
+                    && img.ActualHeight > 0
+                    && (img.DataContext is ViewModels.PageTile
+                        || img.DataContext is ViewModels.PageSlot))
+                {
+                    Copy(img);
+                }
+
+                Walk(child);
+            }
+        }
+
+        Walk(PageScroller);
+    }
+
     private static double RunWidth(string text, LiveTextTail tail, double fontDip, Brush ink)
     {
         if (string.IsNullOrEmpty(text)) { return 0; }

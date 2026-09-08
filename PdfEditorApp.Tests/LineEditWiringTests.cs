@@ -656,37 +656,71 @@ public class LineEditWiringTests
     }
 
     /// <summary>
-    /// ⚠️ THE PREVIEW MUST NOT LET TWO WORDS SIT ON TOP OF EACH OTHER. The
-    /// cover paints out the glyphs the replacement stands in for, and it used
-    /// to stop at the OLD text's right edge. Type something longer and the
-    /// extra ran straight over the next word, which is what the reader saw:
-    /// "I type text overlaps while typing and after clicking out of frame it
-    /// settled". The file was already right by then, because committing
-    /// reflows the line; only this preview was not.
+    /// ⚠️ THE REST OF THE LINE MOVES AS THE READER TYPES. Typing something
+    /// longer than the word being replaced first drew the extra ON TOP of the
+    /// next word, and then, once the cover was widened, hid it instead. The
+    /// reader on both: "that should feel natural while typing".
+    ///
+    /// ⚠️ AND IT MOVES THE PAGE'S OWN PIXELS. This app has neither the page's
+    /// subset font nor its shaping, so anything it drew itself would change
+    /// font as the reader typed and change back on commit. The page card's own
+    /// bitmaps are already on screen, so the neighbours are shown in their new
+    /// place by copying those.
     /// </summary>
     [Fact]
-    public void the_preview_covers_as_far_as_the_typed_text_reaches()
+    public void the_rest_of_the_line_moves_while_the_reader_types()
     {
         string page = Source("PdfEditorApp", "MainPage.xaml.cs");
 
         int at = page.IndexOf("private void DrawInPlaceTail(", StringComparison.Ordinal);
         Assert.True(at > 0, "nothing draws the text being typed");
+        string body = page[at..Math.Min(page.Length, at + 3000)];
 
+        // How much wider the typed text came out, measured in the font it is
+        // actually drawn in.
+        Assert.Contains("double drawn = RunWidth(tail.Text,", body, StringComparison.Ordinal);
+        Assert.Contains("tail.CoverRight", body, StringComparison.Ordinal);
+        Assert.Contains("SlideTheRestOfTheLine(", body, StringComparison.Ordinal);
+
+        // And nothing moves for a difference too small to see.
+        Assert.Contains("Math.Abs(delta)", body, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ THE COPIES ARE OF THE PAGE, AND NEVER OF THE OVERLAY. The overlay
+    /// is inside the scroller it walks, so a walk that did not skip it would
+    /// copy its own copies, and every keystroke would leave more of them.
+    /// </summary>
+    [Fact]
+    public void the_line_is_moved_by_copying_the_pages_own_pixels()
+    {
+        string page = Source("PdfEditorApp", "MainPage.xaml.cs");
+
+        int at = page.IndexOf("private void SlideTheRestOfTheLine(", StringComparison.Ordinal);
+        Assert.True(at > 0, "nothing moves the rest of the line");
         string body = page[at..Math.Min(page.Length, at + 2600)];
 
-        // The cover takes the wider of the two, never just the old extent.
-        int cover = body.IndexOf("var cover = new Rectangle", StringComparison.Ordinal);
-        Assert.True(cover > 0, "nothing paints out the old glyphs");
-        string rect = body[cover..Math.Min(body.Length, cover + 300)];
+        // It copies bitmaps that are already on the page card.
+        Assert.Contains("Source = img.Source", body, StringComparison.Ordinal);
+        Assert.Contains("ViewModels.PageTile", body, StringComparison.Ordinal);
+        Assert.Contains("ViewModels.PageSlot", body, StringComparison.Ordinal);
 
-        Assert.Contains("tail.CoverRight", rect, StringComparison.Ordinal);
-        Assert.Contains("drawn", rect, StringComparison.Ordinal);
-        Assert.Contains("Math.Max", rect, StringComparison.Ordinal);
+        // It never copies itself.
+        Assert.Contains("ReferenceEquals(child, InPlaceLayer)", body, StringComparison.Ordinal);
 
-        // And the width it is compared against is the tail's own measured one,
-        // in the font the tail is actually drawn in.
-        int measured = body.IndexOf("double drawn = RunWidth(tail.Text,", StringComparison.Ordinal);
-        Assert.True(measured > 0, "the typed text's width is never measured");
-        Assert.True(measured < cover, "the cover is built before the width it needs");
+        // ⚠️ THE OFFSET IS OUTSIDE THE CLIP. Clipping keeps the pixels that
+        // were at the strip and the placement puts them where they belong;
+        // adding the offset inside the clip would cut away the very part being
+        // moved.
+        Assert.Contains("Canvas.SetLeft(copy, where.X + delta)", body, StringComparison.Ordinal);
+        int clip = body.IndexOf("Clip = new RectangleGeometry", StringComparison.Ordinal);
+        Assert.True(clip > 0, "the copy is not clipped to the strip");
+        int shut = body.IndexOf("};", clip, StringComparison.Ordinal);
+        Assert.True(shut > clip, "the copy's initialiser does not end");
+        Assert.DoesNotContain("delta", body[clip..shut], StringComparison.Ordinal);
+
+        // ⚠️ AND ROUNDING STAYS OFF, for the reason the tile layer sets it:
+        // snapping a bitmap to whole physical pixels at deep zoom opens seams.
+        Assert.Contains("UseLayoutRounding = false", body, StringComparison.Ordinal);
     }
 }
