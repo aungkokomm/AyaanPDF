@@ -17,9 +17,11 @@ use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, ObjectId};
 
 use crate::recover::{Break, Line};
+use std::collections::BTreeMap;
+
 use crate::{
     STATUS_DOC_NOT_REWRITABLE, STATUS_FONT_UNUSABLE, STATUS_INVALID_INPUT,
-    STATUS_LINE_NOT_REWRITABLE,
+    STATUS_LINE_NOT_REWRITABLE, STATUS_TOO_WIDE,
 };
 
 /// The resource the replacement's font is named by on the page.
@@ -156,12 +158,35 @@ const BASELINE_TOLERANCE: f64 = 0.5;
 const SETTLED: f64 = 0.05;
 
 /// What has to move out of a replacement's way, and how far.
+///
+/// ⚠️ SEVERAL MOVES, NOT ONE, since the carry. Sliding the rest of a line
+/// right is one move; carrying its tail down to the next line and pushing that
+/// line along is two more, and a paragraph that cascades is two more again per
+/// line. They are all applied to the same stream before anything is spliced
+/// into it, and moving a placement rewrites its `Tm` operands and changes no
+/// index, so the order between them does not matter.
+#[derive(Default)]
 pub(crate) struct Reflow {
-    /// The operations to move, as indices into the stream the replacement is
-    /// about to be written into.
-    showing: Vec<usize>,
-    /// How far, in PDF user space.
-    by: (f64, f64),
+    /// Each group of operations to move, as indices into the stream the
+    /// replacement is about to be written into, and how far in PDF user space.
+    moves: Vec<(Vec<usize>, (f64, f64))>,
+}
+
+/// The room the app says this paragraph has, on the page.
+///
+/// ⚠️ THE APP KNOWS THIS AND THE CORE DOES NOT. A paragraph is what the
+/// reader clicked into, and the block model the app frames it with already has
+/// its edges and its baselines. Two attempts to work them out down here failed
+/// on the reader's own books: the Myanmar letterhead joined into one fake
+/// paragraph, and the Hindi page gave no stacked paragraph at all in eight
+/// pages, because down here a "line" is a placement and one visual line is 52
+/// of them.
+pub(crate) struct Room<'a> {
+    /// Where the paragraph starts and how far right it may reach.
+    pub(crate) left: f64,
+    pub(crate) column: f64,
+    /// The baselines UNDER the line being retyped, nearest first.
+    pub(crate) below: &'a [f64],
 }
 
 /// Everything drawn to the RIGHT of `line` on the same baseline.
@@ -206,9 +231,151 @@ fn after_on_the_baseline(lines: &[Line], line: &Line) -> Vec<usize> {
 fn reflow_for(lines: &[Line], line: &Line, replacement: &Replacement, was: Option<f64>) -> Reflow {
     let slack = was.map_or(0.0, |target| replacement.advance - target);
     if slack.abs() <= SETTLED {
-        return Reflow { showing: Vec::new(), by: (0.0, 0.0) };
+        return Reflow::default();
     }
-    Reflow { showing: after_on_the_baseline(lines, line), by: line.along_baseline(slack) }
+    Reflow {
+        moves: vec![(after_on_the_baseline(lines, line), line.along_baseline(slack))],
+    }
+}
+
+/// One placement of a line, as reflow sees it: where it will be drawn once the
+/// replacement has been written, and which operations draw it.
+struct Placed {
+    left: f64,
+    right: f64,
+    drawn_by: Vec<usize>,
+}
+
+/// A separator this narrow is hung into the margin rather than indenting the
+/// line it is carried to, as a fraction of the type size.
+///
+/// ⚠️ A WORD SPACE IS A PLACEMENT OF ITS OWN ON A REAL BOOK, and it reads as
+/// nothing, so it cannot be told from a word by reading it. Measured on the
+/// Geeta book: a line of 52 placements is 26 words and 26 spaces, every space
+/// 2.93 points at 10.56 point type (0.277 em) and the narrowest word 5.49
+/// points (0.52 em). Anything under this is a separator on that evidence.
+const A_SEPARATOR: f64 = 0.4;
+
+/// Every placement drawn on `baseline`, left to right, after `slid` has been
+/// applied to everything right of the line being retyped.
+fn placements_on(
+    lines: &[Line],
+    widths: &BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)>,
+    baseline: f64,
+    retyping: Option<(&Line, f64, f64)>,
+) -> Option<Vec<Placed>> {
+    let mut out: Vec<Placed> = Vec::new();
+    for other in lines {
+        if (other.page_y - baseline).abs() > BASELINE_TOLERANCE {
+            continue;
+        }
+        let (_, Some(w)) = widths.get(&other.resource)? else { return None };
+        let mut left = other.page_x();
+        // The line being retyped keeps its place and takes its new width; what
+        // is drawn to the right of it has already been slid out of the way.
+        let mut width = other.along_baseline(crate::recover::advance_of(other, w)).0;
+        if let Some((line, replacing, slid)) = retyping {
+            if std::ptr::eq(other, line) {
+                width = other.along_baseline(replacing).0;
+            } else if other.page_x() > line.page_x() {
+                left += slid;
+            }
+        }
+        out.push(Placed { left, right: left + width, drawn_by: other.drawn_by.clone() });
+    }
+    out.sort_by(|a, b| a.left.partial_cmp(&b.left).unwrap_or(std::cmp::Ordering::Equal));
+    Some(out)
+}
+
+/// Carries whatever no longer fits down through the paragraph, line by line.
+///
+/// ⚠️ WHOLE PLACEMENTS, AND NO TEXT IS READ TO DO IT. This is the whole
+/// reason placement reflow exists: on the reader's Hindi book only 514 of 1,386
+/// placements can be read at all, and every one of the other 872 still has a
+/// width the file declares and a `Tm` that can be rewritten. A word is a
+/// placement there, so moving placements moves words.
+///
+/// ⚠️ AND IT REFUSES RATHER THAN OVERFLOWING THE PARAGRAPH. When the last
+/// baseline the app gave still cannot take what reached it, the paragraph needs
+/// a line it does not have, and making one is not this. Writing anyway would
+/// draw the tail of the paragraph over whatever is under it.
+fn carry(
+    doc: &Document,
+    page: ObjectId,
+    lines: &[Line],
+    line: &Line,
+    replacement: &Replacement,
+    slid: f64,
+    room: &Room,
+) -> Result<Vec<(Vec<usize>, (f64, f64))>, i32> {
+    let widths = crate::recover::fonts_of(doc, page);
+    let mut moves: Vec<(Vec<usize>, (f64, f64))> = Vec::new();
+    let mut at = line.page_y;
+    let mut on_it = placements_on(lines, &widths, at, Some((line, replacement.advance, slid)))
+        .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+
+    for &next in room.below {
+        let Some(first) = on_it.iter().position(|p| p.right > room.column + SETTLED) else {
+            return Ok(moves);
+        };
+        // ⚠️ THE FIRST PLACEMENT CANNOT BE CARRIED ANYWHERE. Nothing is left
+        // to hold the line, and the word is simply wider than the column.
+        if first == 0 {
+            return Err(STATUS_TOO_WIDE);
+        }
+        let carried = &on_it[first..];
+        // A space that leads a carried group hangs into the margin, so the
+        // line it joins starts with its first word and not with an indent.
+        let hang = if carried[0].right - carried[0].left < line.size * A_SEPARATOR {
+            carried[0].right - carried[0].left
+        } else {
+            0.0
+        };
+        let dx = room.left - carried[0].left - hang;
+        let dy = next - at;
+        moves.push((
+            carried.iter().flat_map(|p| p.drawn_by.iter().copied()).collect(),
+            (dx, dy),
+        ));
+
+        // What was already on the line below is pushed along to make room for
+        // what has just landed on it.
+        // ⚠️ AND NO GAP IS ADDED BETWEEN THEM. The space that separated the
+        // carried words from the one before them is itself a placement and is
+        // carried with them, so the group already ends in one. Adding another
+        // would open a double space at every line this cascades through.
+        let taken = carried[carried.len() - 1].right - carried[0].left - hang;
+        let below = placements_on(lines, &widths, next, None)
+            .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        let push = taken;
+        if !below.is_empty() {
+            moves.push((
+                below.iter().flat_map(|p| p.drawn_by.iter().copied()).collect(),
+                line.along_baseline(push),
+            ));
+        }
+
+        // And the line below, as it now stands, is the one to check next.
+        on_it = carried
+            .iter()
+            .map(|p| Placed {
+                left: p.left + dx,
+                right: p.right + dx,
+                drawn_by: p.drawn_by.clone(),
+            })
+            .chain(below.into_iter().map(|p| Placed {
+                left: p.left + push,
+                right: p.right + push,
+                drawn_by: p.drawn_by,
+            }))
+            .collect();
+        at = next;
+    }
+
+    if on_it.iter().any(|p| p.right > room.column + SETTLED) {
+        return Err(STATUS_TOO_WIDE);
+    }
+    Ok(moves)
 }
 
 /// Puts `replacement` where `line` was drawn, in a font of our own.
@@ -257,7 +424,9 @@ pub(crate) fn write_over(
     // and going ahead without it draws the new text over the top of the word
     // after it. Text the reader can see is wrong is worse than an edit that
     // declines.
-    crate::shift::move_placements(&mut content, &reflow.showing, reflow.by.0, reflow.by.1)?;
+    for (showing, (dx, dy)) in &reflow.moves {
+        crate::shift::move_placements(&mut content, showing, *dx, *dy)?;
+    }
 
     // Everything else the line was drawn by draws nothing now. Emptied rather
     // than removed, so every other operation keeps the index it had.
@@ -290,18 +459,7 @@ pub(crate) fn write_over(
 fn advance_of(doc: &Document, page: ObjectId, line: &Line) -> Option<f64> {
     let fonts = crate::recover::fonts_of(doc, page);
     let (_, widths) = fonts.get(&line.resource)?;
-    let widths = widths.as_ref()?;
-    let drawn: f64 = line.glyphs.iter().map(|g| widths.of(*g)).sum();
-    // ⚠️ AND THE GAPS BETWEEN ITS PLACEMENTS, WHICH ARE NOT IN `adjust`. A
-    // producer draws one line in several placements and the space between two
-    // of them is made by starting the next one further along, not by any
-    // number inside a run. `merge_placements` keeps those as `breaks` for
-    // exactly this reason, and leaving them out measured the reader's own line
-    // 46.7 points shorter than it is: the replacement was told it was already
-    // too wide, no stretch was shared into it at all, and the line came back
-    // with its right edge pulled 46.7 points in from the margin.
-    let gaps: f64 = line.breaks.iter().map(|b| b.points).sum();
-    Some((drawn + line.adjust) / 1000.0 * line.size + gaps)
+    Some(crate::recover::advance_of(line, widths.as_ref()?))
 }
 
 /// Widens or narrows the line's word spaces so the replacement ends where the
@@ -416,6 +574,25 @@ pub(crate) fn retype(
     font_path: &str,
     lent: Option<&crate::recover::Indexes>,
 ) -> Result<Vec<u8>, i32> {
+    retype_within(bytes, page_index, baseline, expected, new_text, font_path, lent, None)
+}
+
+/// The same, told what room the paragraph has, so a replacement too long for
+/// its line can be carried down through the lines under it.
+///
+/// ⚠️ `room` OF NONE IS EXACTLY WHAT [`retype`] ALWAYS DID: the rest of the
+/// line slides and nothing else moves. Only a caller that knows the paragraph
+/// can ask for more, because only it knows where the paragraph ends.
+pub(crate) fn retype_within(
+    bytes: &[u8],
+    page_index: i32,
+    baseline: f64,
+    expected: &str,
+    new_text: &str,
+    font_path: &str,
+    lent: Option<&crate::recover::Indexes>,
+    room: Option<&Room>,
+) -> Result<Vec<u8>, i32> {
     if new_text.is_empty() || expected.is_empty() {
         return Err(STATUS_INVALID_INPUT);
     }
@@ -504,7 +681,11 @@ pub(crate) fn retype(
 
     // And whatever the new text could not absorb, the rest of the line absorbs
     // by moving.
-    let reflow = reflow_for(&lines, line, &replacement, was);
+    let mut reflow = reflow_for(&lines, line, &replacement, was);
+    if let Some(room) = room {
+        let slid = reflow.moves.first().map_or(0.0, |(_, by)| by.0);
+        reflow.moves.extend(carry(&doc, page, &lines, line, &replacement, slid, room)?);
+    }
     write_over(&doc, page, line, replacement, reflow, font_id, new_text)
 }
 
@@ -515,6 +696,204 @@ mod tests {
     const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
     const GEETA: &str =
         r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+
+    /// Every placement on each of a paragraph's baselines, left to right.
+    fn paragraph_geometry(bytes: &[u8], baselines: &[f64]) -> Vec<(f64, usize, f64, f64)> {
+        let doc = Document::load_mem(bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let widths = crate::recover::fonts_of(&doc, page);
+        let lines = crate::recover::lines_of(&doc, page);
+        baselines
+            .iter()
+            .map(|&y| {
+                let mut n = 0usize;
+                let (mut left, mut right) = (f64::MAX, f64::MIN);
+                for l in lines.iter().filter(|l| (l.page_y - y).abs() < BASELINE_TOLERANCE) {
+                    let Some((_, Some(w))) = widths.get(&l.resource) else { continue };
+                    n += 1;
+                    left = left.min(l.page_x());
+                    right = right
+                        .max(l.page_x() + l.along_baseline(crate::recover::advance_of(l, w)).0);
+                }
+                (y, n, left, right)
+            })
+            .collect()
+    }
+
+    /// ⚠️ THE WHOLE SCENARIO ON THE READER'S OWN BOOK: a word is replaced with
+    /// a longer one, the words it displaces move down through the paragraph,
+    /// and nothing ends up past the column.
+    ///
+    /// The control matters as much as the result. `room` of None is what the
+    /// writer did before this existed, and it is run first so the overflow it
+    /// leaves is on the record next to the reflow that fixes it.
+    ///
+    ///     cargo test --release a_longer_word_reflows_a_real_paragraph -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn a_longer_word_reflows_a_real_paragraph() {
+        if !std::path::Path::new(GEETA).exists() || !std::path::Path::new(NIRMALA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let on_disk = std::fs::read(GEETA).unwrap();
+        let handle = crate::open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+        let bytes = crate::document_bytes(handle).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+
+        // The paragraph as the APP frames it, which is where a paragraph comes
+        // from. Nothing below reconstructs one from placements.
+        let (blocks, _) = crate::page_blocks(handle, 0).expect("no blocks");
+        let block = blocks
+            .iter()
+            .filter(|b| b.lines.len() >= 3)
+            .max_by_key(|b| b.lines.len())
+            .expect("no paragraph of three lines on this page");
+        let baselines: Vec<f64> = block.lines.iter().map(|l| l.baseline as f64).collect();
+        let left = block.lines.iter().map(|l| l.left).fold(f32::MAX, f32::min) as f64;
+        let column = block.lines.iter().map(|l| l.right).fold(f32::MIN, f32::max) as f64;
+        println!("a paragraph of {} lines, left {left:.2}, column {column:.2}",
+            baselines.len());
+
+        // A word on its first line that recovery can read, and that no other
+        // placement on that line says: the writer finds the placement it is to
+        // replace by what that placement says, and refuses a tie.
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let on_line: Vec<_> = lines
+            .iter()
+            .zip(&readings)
+            .filter(|(l, _)| (l.page_y - baselines[0]).abs() < BASELINE_TOLERANCE)
+            .collect();
+        let (target, was) = on_line
+            .iter()
+            .find_map(|(l, r)| {
+                let t = r.text.clone()?;
+                let said = on_line.iter().filter(|(_, o)| o.text.as_ref() == Some(&t)).count();
+                (said == 1 && t.chars().count() >= 2 && t.trim() == t).then_some((*l, t))
+            })
+            .expect("nothing on the paragraph's first line is readable and unambiguous");
+        let now = format!("{was}{was}{was}");
+        println!("replacing {was:?} with {now:?} at y {:.2}\n", target.page_y);
+
+        // ⚠️ THE UNTOUCHED PAGE IS THE REFERENCE, NOT THE COLUMN. The block
+        // model's right edge is PDFium's measurement of the ink and this
+        // measures the advances the file declares, and on this page one line
+        // reaches 2.34 points past the column before anything is edited at all.
+        // Asking for "inside the column" would fail on a line the edit never
+        // touched. What the reader can see is whether a line got WORSE.
+        let untouched = paragraph_geometry(&bytes, &baselines);
+        for (y, n, l, r) in &untouched {
+            println!("   y {y:7.2}  {n:3} placements  {l:7.2} .. {r:7.2}");
+        }
+        println!();
+
+        for (label, room) in [
+            ("BEFORE ANY OF THIS (room: None)", None),
+            ("WITH THE PARAGRAPH'S ROOM", Some(Room { left, column, below: &baselines[1..] })),
+        ] {
+            println!("---- {label}");
+            let out = retype_within(
+                &bytes, 0, target.page_y, &was, &now, NIRMALA, Some(&indexes), room.as_ref());
+            let produced = out.unwrap_or_else(|status| {
+                panic!("{label} refused with status {status}");
+            });
+            let mut worse = 0usize;
+            for ((y, n, l, r), (_, was_n, _, was_r)) in
+                paragraph_geometry(&produced, &baselines).iter().zip(&untouched)
+            {
+                let note = if r > &(was_r.max(column) + SETTLED) {
+                    worse += 1;
+                    "  FURTHER RIGHT THAN IT STARTED"
+                } else {
+                    ""
+                };
+                println!("   y {y:7.2}  {n:3} placements ({:+})  {l:7.2} .. {r:7.2}{note}",
+                    *n as i64 - *was_n as i64);
+            }
+            match room {
+                // The old behaviour is the control: without the paragraph's
+                // room the longer word runs off the end of its line, and if it
+                // did not there would be nothing here to fix.
+                None => assert!(worse > 0, "the control did not overflow, so this proves nothing"),
+                Some(_) => assert_eq!(worse, 0, "{worse} lines ended further right than they began"),
+            }
+            println!();
+        }
+        crate::close_document(handle);
+    }
+
+    /// ⚠️ AND PLACEMENT REFLOW CANNOT SERVE THE MYANMAR BOOK AT ALL. Its
+    /// producer draws a whole line in ONE placement: measured on page one,
+    /// 29 lines and 29 placements, the widest 461 points of text in a single
+    /// `TJ`. There is no boundary inside it to break at, so there is nothing to
+    /// carry and the line can only be refused.
+    ///
+    /// ⚠️ WHICH IS THE OPPOSITE OF THE HINDI BOOK, AND FOR THE SAME REASON.
+    /// One placement per line is also a line recovery reads whole: 29 of 29
+    /// there against 514 of 1,386 on the Hindi page. A book that cannot be
+    /// reflowed by moving placements can be reflowed by rewriting its text, and
+    /// that is the path Myanmar has to take.
+    ///
+    ///     cargo test --release a_myanmar_line_is_one_placement -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF and fonts that are not in this repository"]
+    fn a_myanmar_line_is_one_placement() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf";
+        const FONT: &str = r"C:\Windows\Fonts\Pyidaungsu.ttf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(FONT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let on_disk = std::fs::read(FILE).unwrap();
+        let handle = crate::open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+        let bytes = crate::document_bytes(handle).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+
+        let (blocks, _) = crate::page_blocks(handle, 0).expect("no blocks");
+        let block = blocks
+            .iter()
+            .filter(|b| b.lines.len() >= 2)
+            .max_by_key(|b| b.lines.len())
+            .expect("no paragraph of two lines on this page");
+        let baselines: Vec<f64> = block.lines.iter().map(|l| l.baseline as f64).collect();
+        let left = block.lines.iter().map(|l| l.left).fold(f32::MAX, f32::min) as f64;
+        let column = block.lines.iter().map(|l| l.right).fold(f32::MIN, f32::max) as f64;
+        println!("a paragraph of {} lines, left {left:.2}, column {column:.2}",
+            baselines.len());
+        for (y, n, l, r) in paragraph_geometry(&bytes, &baselines) {
+            println!("   y {y:7.2}  {n:3} placements  {l:7.2} .. {r:7.2}");
+        }
+
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let (target, was) = lines
+            .iter()
+            .zip(&readings)
+            .filter(|(l, _)| (l.page_y - baselines[0]).abs() < BASELINE_TOLERANCE)
+            .find_map(|(l, r)| Some((l, r.text.clone()?)))
+            .expect("nothing readable on the paragraph's first line");
+        let now = format!("{was}{was}");
+        println!("\ndoubling the first line, {} characters to {}",
+            was.chars().count(), now.chars().count());
+
+        let room = Room { left, column, below: &baselines[1..] };
+        let out = retype_within(
+            &bytes, 0, target.page_y, &was, &now, FONT, Some(&indexes), Some(&room));
+        match out {
+            Ok(_) => panic!("the line was reflowed, so this book is no longer one placement a line"),
+            Err(status) => {
+                println!("refused with status {status}, which is the honest answer here");
+                assert_eq!(status, STATUS_TOO_WIDE,
+                    "a line with nothing to carry should say it is too wide");
+            }
+        }
+        crate::close_document(handle);
+    }
 
     /// ⚠️ REWRITING A REAL HINDI LINE, END TO END. Phase 1 proved the writer
     /// could FIND one; this changes one and asks the file what it says.

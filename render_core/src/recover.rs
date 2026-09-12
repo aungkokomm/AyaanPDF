@@ -818,6 +818,40 @@ pub(crate) struct Cluster {
 /// numbers are where the stretch lives. Laying the text out from the font's
 /// natural advances instead would drift further along the line, which is the
 /// end a reader is most likely to click.
+/// How far the page's pen travels drawing this placement, in PDF user space.
+///
+/// ⚠️ NO READING REQUIRED, AND THAT IS THE WHOLE VALUE OF IT. This is the
+/// file's own arithmetic: the widths it declares for the glyphs it draws, less
+/// the numbers it wrote between them, plus the gaps it skipped. `clusters_of`
+/// can only measure a placement it has READ, because it re-shapes the reading
+/// to find the cluster edges. On the reader's Hindi book a placement is one
+/// word and only about seven in ten can be read, so a measurement that needs
+/// the reading cannot say where three in ten of them end.
+///
+/// ⚠️ AND IT MIRRORS `clusters_of` OPERATION FOR OPERATION, because the two
+/// must not disagree about where a line ends. Same scale, same nudges with the
+/// same sign, same skips. Measured on both real books by
+/// `the_two_ways_of_measuring_a_placement`: 0.011 points apart at worst.
+///
+/// ⚠️ THE SKIPS COUNT, AND THEY ARE NOT IN THE NUDGES. A producer draws one
+/// line in several placements and the space between two of them is made by
+/// starting the next one further along, not by any number inside a run.
+/// Leaving them out measured the reader's own line 46.7 points shorter than it
+/// is: the replacement was told it was already too wide, no stretch was shared
+/// into it, and the line came back with its right edge 46.7 points in from the
+/// margin.
+///
+/// ⚠️ AND IT IS IN TEXT SPACE, NOT ON THE PAGE. Put it through
+/// [`Line::along_baseline`] before moving anything by it.
+pub(crate) fn advance_of(line: &Line, widths: &crate::shaped::CidWidths) -> f64 {
+    let scale = line.size / 1000.0;
+    let glyphs: f64 = line.glyphs.iter().map(|g| widths.of(*g)).sum();
+    // A positive number moves the pen LEFT, so it takes width away.
+    let nudges: f64 = line.nudges.iter().map(|(_, v)| *v).sum();
+    let skips: f64 = line.breaks.iter().map(|b| b.points).sum();
+    (glyphs - nudges) * scale + skips
+}
+
 pub(crate) fn clusters_of(
     line: &Line,
     pieces: &[Piece],
@@ -7106,6 +7140,126 @@ mod tests {
         assert_eq!(clusters[1].to, 12);
         assert_eq!(clusters[2].from, 12);
         assert_eq!(clusters[2].to, 18);
+    }
+
+    /// ⚠️ THE TWO MEASUREMENTS MUST NOT DISAGREE ABOUT WHERE A PLACEMENT ENDS.
+    /// `clusters_of` re-shapes a placement's reading to find its cluster edges,
+    /// so it can only measure what it could read. `advance_of` adds up the
+    /// file's own declared widths and reads nothing. Reflow slides placements by
+    /// the second while the app frames them from the first, so a page where they
+    /// differ is a page where a word lands somewhere other than its box.
+    ///
+    ///     cargo test --release the_two_ways_of_measuring_a_placement -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn the_two_ways_of_measuring_a_placement() {
+        for (what, file) in [
+            ("HINDI", r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf"),
+            ("MYANMAR", r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf"),
+        ] {
+            println!("\n================ {what}");
+            if !std::path::Path::new(file).exists() {
+                println!("not on this machine");
+                continue;
+            }
+            let doc = Document::load(file).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let indexes = indexes_for_document(&doc);
+            let lines = lines_of(&doc, page);
+            let readings = read_page_with(&doc, page, &indexes);
+            let fonts = fonts_of(&doc, page);
+
+            let (mut both, mut worst, mut only_mine, mut unmeasurable) = (0usize, 0.0f64, 0usize, 0usize);
+            for (line, reading) in lines.iter().zip(&readings) {
+                let Some((_, Some(widths))) = fonts.get(&line.resource) else {
+                    unmeasurable += 1;
+                    continue;
+                };
+                // ⚠️ AN ADVANCE IS IN TEXT SPACE AND A CLUSTER IS ON THE PAGE.
+                // Comparing them raw disagreed by up to 320 points on the Hindi
+                // book, all of it the `cm [0.75 0 0 -0.75 0 841.92]` it draws
+                // under. `advance_of` is in the frame `along_baseline` expects,
+                // which is the frame reflow already moves things in.
+                let mine = advance_of(line, widths);
+                assert!(mine.is_finite(), "a placement could not be measured");
+                let Some(last) = reading.clusters.last() else {
+                    // The whole point: an unread placement still has an extent.
+                    only_mine += 1;
+                    continue;
+                };
+                let off = (line.ctm.along(mine, 0.0).0 - (last.right - reading.x)).abs();
+                if off > worst {
+                    worst = off;
+                    println!("   worst so far {off:.3} pt on {:?}",
+                        reading.text.as_deref().unwrap_or("").chars().take(20).collect::<String>());
+                }
+                both += 1;
+            }
+            println!("{both} placements measured both ways, worst disagreement {worst:.3} pt");
+            println!("{only_mine} placements nothing could read, all still measured");
+            println!("{unmeasurable} placements in a font with no declared widths");
+            assert!(worst < 0.5,
+                "the two measurements disagree by {worst:.3} points, so a placement \
+                 moved by one will not land where the other draws its box");
+        }
+    }
+
+    /// ⚠️ WHERE A LINE CAN BE BROKEN WITHOUT READING IT. Carrying a word to
+    /// the next line means moving whole placements, so a line can only reflow
+    /// at the boundaries between the placements it is drawn in. This says how
+    /// many boundaries each real line actually offers.
+    ///
+    ///     cargo test --release where_a_real_line_can_be_broken -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn where_a_real_line_can_be_broken() {
+        for (what, file) in [
+            ("HINDI", r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf"),
+            ("MYANMAR", r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf"),
+        ] {
+            println!("\n================ {what}");
+            if !std::path::Path::new(file).exists() {
+                println!("not on this machine");
+                continue;
+            }
+            let doc = Document::load(file).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let lines = lines_of(&doc, page);
+            let fonts = fonts_of(&doc, page);
+            let indexes = indexes_for_document(&doc);
+            let readings = read_page_with(&doc, page, &indexes);
+
+            // Every placement, gathered onto the baseline it is drawn on.
+            let mut rows: Vec<(f64, Vec<(f64, f64, String, String)>)> = Vec::new();
+            for (line, reading) in lines.iter().zip(&readings) {
+                let Some((_, Some(w))) = fonts.get(&line.resource) else { continue };
+                let left = line.page_x();
+                let span = (
+                    left,
+                    left + line.ctm.along(advance_of(line, w), 0.0).0,
+                    line.base_font.clone(),
+                    reading.text.clone().unwrap_or_else(|| "?".into()),
+                );
+                match rows.iter_mut().find(|(y, _)| (y - line.page_y).abs() < 0.5) {
+                    Some((_, on_it)) => on_it.push(span),
+                    None => rows.push((line.page_y, vec![span])),
+                }
+            }
+            for (_, on_it) in rows.iter_mut() {
+                on_it.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            }
+
+            let alone = rows.iter().filter(|(_, on_it)| on_it.len() == 1).count();
+            println!("{} visual lines, {alone} of them drawn as a single placement",
+                rows.len());
+            let widest = rows.iter().max_by_key(|(_, on_it)| on_it.len()).unwrap();
+            println!("the most divided line is at y {:.2}, {} placements:",
+                widest.0, widest.1.len());
+            for (n, (left, right, font, text)) in widest.1.iter().enumerate() {
+                println!("   {n:3}  x {left:7.2} .. {right:7.2}  {:>6.2} wide  {font:14} {:?}",
+                    right - left, text.chars().take(16).collect::<String>());
+            }
+        }
     }
 
     /// Two glyphs at half an em each, at 12 point, from x=72.
