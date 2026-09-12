@@ -13210,7 +13210,112 @@ fn set_block_line_text_inner(
     edited.push_str(new_text);
     edited.extend(chars[line.end..].iter());
 
+    // ⚠️ THE OVERFLOW GOES TO THE NEXT LINE RATHER THAN OFF THE MARGIN.
+    // A line typed longer than its paragraph's column used to run out over the
+    // right margin, because the width the emitter checks is measured from the
+    // last PIECE's origin rather than from where the line's ink ends, and on a
+    // line drawn in one piece that is the line's LEFT edge. The words that will
+    // not fit move down now, and carry on down.
+    //
+    // ⚠️ AND NOTHING HAPPENS UNLESS A LINE ACTUALLY PASSES THE COLUMN.
+    // `refilled` answers `None` when the paragraph does not say where its
+    // column is, when it cannot be measured, or when nothing had to move, and
+    // then this is the same call it always was with the same text.
+    let edited = refilled(doc_handle, page_index, bi, &edited, li).unwrap_or(edited);
     emit_block(doc_handle, page_index, bi, &edited, None)
+}
+
+/// Whether two font names mean the same face, subset tag or no subset tag.
+///
+/// ⚠️ A PRODUCER'S SUBSET WEARS A TAG AND ITS RESOURCE MAY NOT.
+/// `BCDEEE+ArialMT` and `ArialMT` are the same face, and comparing them whole
+/// says they are not.
+fn same_face(a: &str, b: &str) -> bool {
+    let strip = |n: &str| n.rsplit('+').next().unwrap_or(n).to_string();
+    strip(a) == strip(b)
+}
+
+/// The block's text with its words refilled from line `from` onwards, so that
+/// no line below the edit is wider than the room the paragraph gives it.
+///
+/// `None` when nothing had to move, when the paragraph cannot be measured, or
+/// when the words will not go into the lines it has. All three mean the caller
+/// writes what it was going to write anyway: a paragraph that needs to GAIN a
+/// line is a different piece of work, because a line that was never drawn has
+/// no baseline, no objects and no anchor for any writer here to address.
+fn refilled(
+    doc_handle: u64,
+    page_index: i32,
+    block_index: usize,
+    edited: &str,
+    from: usize,
+) -> Option<String> {
+    let (blocks, _) = page_blocks(doc_handle, page_index).ok()?;
+    let target = blocks.get(block_index)?;
+
+    let lines: Vec<String> = edited.split('\n').map(str::to_string).collect();
+    if lines.len() != target.lines.len() || from >= lines.len() {
+        return None;
+    }
+
+    // ⚠️ IT TAKES MORE THAN ONE LINE TO SHOW WHERE A COLUMN ENDS. A
+    // paragraph that wrapped proved that its widest line is about as wide as
+    // its column gets, because the producer broke it there. One line proves
+    // nothing: there may be inches of white space to its right, and there is
+    // nowhere for a word to move to anyway.
+    if target.lines.len() < 2 {
+        return None;
+    }
+    let limit = target.lines.iter().map(|l| l.right as f64).fold(f64::MIN, f64::max);
+
+    let snap = snapshot_document(doc_handle);
+    if snap.status != STATUS_OK_PDFIUM {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(snap.data, snap.len) }.to_vec();
+    free_byte_buffer(snap);
+
+    let doc = lopdf::Document::load_mem(&bytes).ok()?;
+    let page = *doc.get_pages().values().nth(page_index as usize)?;
+
+    // ⚠️ EVERY LINE THAT COULD MOVE HAS TO BE MEASURABLE, or none of them
+    // are. Filling a line whose width cannot be read would pour the whole
+    // paragraph into it, so a font this cannot measure means no refill at all.
+    //
+    // ⚠️ AND THE TWO NAME A FONT DIFFERENTLY, which is easy to miss because
+    // both are called the font's name. The block model records what the FONT
+    // calls itself, `ArialMT`, and the page's resources are keyed by what the
+    // PAGE called it, `F1`. Asking the resources for `ArialMT` finds nothing,
+    // and that arrives as "this font cannot be measured".
+    let resources = recover::fonts_of(&doc, page);
+    let mut measures = Vec::new();
+    for line in &target.lines[from..] {
+        let (name, _) = resources
+            .iter()
+            .find(|(_, (base, _))| same_face(base, &line.font))?;
+        measures.push(justified::font_metrics(
+            &doc, page, name, line.size as f64).ok()?);
+    }
+
+    let room = |i: usize, text: &str| -> Option<bool> {
+        let m = measures.get(i.checked_sub(from)?)?;
+        let width = m.width_of(&m.encode(text)?)?;
+        Some(target.lines.get(i)?.left as f64 + width <= limit + 0.5)
+    };
+
+    // Nothing to do unless the line that was typed has actually passed the
+    // column. An edit that fits takes the path it always took, with the text
+    // it always had: a greedy refill can break lines in different places from
+    // the producer, and a paragraph nobody overflowed must not move.
+    if room(from, &lines[from]).unwrap_or(true) {
+        return None;
+    }
+
+    // A line whose text this font cannot even write does not fit, which pushes
+    // it down and ends as the refusal it would have been rather than as a
+    // silent mangling.
+    let refilled = block::rewrap_from(&lines, from, |i, text| room(i, text).unwrap_or(false))?;
+    Some(refilled.join("\n"))
 }
 
 /// Rewrites a whole block from its edited logical text, and commits once.
@@ -13250,8 +13355,9 @@ fn emit_block(
         return STATUS_BLOCK_NOT_EDITABLE;
     }
 
+
     // How far right the paragraph is already allowed to reach. A line may grow
-    // into it, but not past it, because past it is reflow's problem.
+    // into it, but not past it: past it, the words move down instead.
     let right_limit = target
         .lines
         .iter()
@@ -33035,6 +33141,34 @@ p={spread_px:.4},c={rgba:08X})"
         let edited = "The quick green fox jumps over the lazy dog\nand rests here quietly.";
         assert_eq!(emit_block(handle, 0, 0, edited, None), STATUS_OK_PDFIUM);
         assert_eq!(block_text(handle), edited);
+        close_document(handle);
+    }
+
+    /// ⚠️ THE OVERFLOW GOES DOWN THE PARAGRAPH INSTEAD OF OFF THE MARGIN.
+    /// A line that grew past the room the paragraph gives it used to be the end
+    /// of the edit: the reader was told it was too long and their text snapped
+    /// back. The words that will not fit move to the line below now.
+    #[test]
+    fn a_line_that_grew_past_the_margin_pushes_its_words_down() {
+        let handle = editable_block_document();
+        let (blocks, _) = page_blocks(handle, 0).expect("no blocks");
+        let line = &blocks[0].lines[0];
+        let (first, last) = (line.first_object, line.last_object);
+        let was = line.drawn.clone();
+
+        // Longer than the line has room for, and short enough that the
+        // paragraph can still hold it in the two lines it has.
+        let now = format!("{} today", was.trim_end());
+        let status = retype_via_block(handle, 0, first, last, &was, &now);
+        assert_eq!(status, STATUS_OK_PDFIUM,
+            "the overflow was refused instead of moved down");
+
+        let text = block_text(handle);
+        assert!(text.contains("today"), "the typed word is not in the paragraph: {text}");
+        assert_eq!(text.matches('\n').count(), 1,
+            "the paragraph gained or lost a line: {text}");
+        assert!(!text.split('\n').next().unwrap().contains("today"),
+            "the word that did not fit stayed on the line that could not hold it: {text}");
         close_document(handle);
     }
 

@@ -880,6 +880,60 @@ pub(crate) fn lay_out(b: &Block, edited: &str, needs_reflow: i32) -> Result<Vec<
     Ok(out)
 }
 
+/// The paragraph's lines refilled from `first` onwards, so no line from there
+/// is wider than the room it has.
+///
+/// ⚠️ LINES BEFORE `first` ARE NOT TOUCHED. An edit on the fifth line has no
+/// business moving the second, and refilling the whole paragraph would put
+/// every line at risk of a refusal for the sake of one. `emit_block` is all or
+/// nothing, so every line this moves is a line that can refuse the edit.
+///
+/// ⚠️ AND THE WORDS ARE THE ONLY THING THAT MOVES. No line changes its
+/// place, its font or its size: this decides which words sit on which of the
+/// lines the paragraph already has, and nothing else. A paragraph that needs a
+/// line it has not got comes back as `None`, because drawing a line that was
+/// never there is a different piece of work.
+///
+/// `fits` is asked whether a candidate line's text sits in line `i`'s room.
+pub(crate) fn rewrap_from(
+    lines: &[String],
+    first: usize,
+    fits: impl Fn(usize, &str) -> bool,
+) -> Option<Vec<String>> {
+    if first >= lines.len() {
+        return None;
+    }
+
+    // Every word from the edited line to the end of the paragraph, which is
+    // exactly the text that is allowed to move.
+    let mut words: std::collections::VecDeque<&str> =
+        lines[first..].iter().flat_map(|l| l.split_whitespace()).collect();
+
+    let mut out: Vec<String> = lines[..first].to_vec();
+    for i in first..lines.len() {
+        let mut line = String::new();
+        while let Some(word) = words.front() {
+            let candidate = if line.is_empty() {
+                (*word).to_string()
+            } else {
+                format!("{line} {word}")
+            };
+            // ⚠️ A WORD TOO WIDE FOR ANY LINE STILL HAS TO GO SOMEWHERE. A
+            // single word longer than the measure is a real thing in a narrow
+            // column, and breaking out of an empty line would drop it and spin.
+            if !line.is_empty() && !fits(i, &candidate) {
+                break;
+            }
+            line = candidate;
+            words.pop_front();
+        }
+        out.push(line);
+    }
+
+    // Words left over means the paragraph has to GAIN a line.
+    if words.is_empty() { Some(out) } else { None }
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1254,6 +1308,80 @@ mod tests {
         assert_eq!(
             plan(&b, changes[0].at, changes[0].len, 14, 16, 15, 1).err(),
             Some(16));
+    }
+
+    /// Everything up to and including `room` characters fits, which is a
+    /// measure a test can do arithmetic in.
+    fn room(room: usize) -> impl Fn(usize, &str) -> bool {
+        move |_, text: &str| text.chars().count() <= room
+    }
+
+    /// ⚠️ THE OVERFLOW GOES TO THE NEXT LINE RATHER THAN PAST THE MARGIN.
+    /// This is the whole point: a justified line that grew used to run out over
+    /// the right margin or refuse outright, because nothing was allowed to
+    /// carry the excess.
+    #[test]
+    fn a_word_that_no_longer_fits_moves_to_the_line_below() {
+        let lines = vec!["aaa bbb ccc".to_string(), "ddd".to_string()];
+
+        let out = rewrap_from(&lines, 0, room(11)).expect("it fits in two lines");
+        assert_eq!(out, vec!["aaa bbb ccc", "ddd"], "nothing needed to move");
+
+        // One character wider, and the last word has to go down.
+        let lines = vec!["aaa bbbb ccc".to_string(), "ddd".to_string()];
+        let out = rewrap_from(&lines, 0, room(11)).expect("it fits in two lines");
+        assert_eq!(out, vec!["aaa bbbb", "ccc ddd"]);
+    }
+
+    /// ⚠️ AND IT CASCADES. Pushing a word onto the next line can push that
+    /// line's last word onto the one after it, all the way down the paragraph.
+    #[test]
+    fn the_push_carries_on_down_the_paragraph() {
+        // One character too long on the first line, and every line below it
+        // has to take a word from the one above.
+        let lines = vec![
+            "aaaaa bbbb".to_string(),
+            "cccc dddd".to_string(),
+            "eeee".to_string(),
+        ];
+        let out = rewrap_from(&lines, 0, room(9)).expect("five words, three lines");
+        assert_eq!(out, vec!["aaaaa", "bbbb cccc", "dddd eeee"],
+            "the push stopped before the end of the paragraph");
+    }
+
+    /// ⚠️ LINES ABOVE THE EDIT ARE LEFT ALONE, byte for byte. Every line
+    /// this moves is a line that can refuse, and `emit_block` is all or
+    /// nothing, so moving one that did not need to move risks the whole edit.
+    #[test]
+    fn the_lines_above_the_edit_are_not_touched() {
+        let lines = vec![
+            "keep me exactly".to_string(),
+            "aaa bbbb".to_string(),
+            "ccc".to_string(),
+        ];
+        let out = rewrap_from(&lines, 1, room(8)).expect("it fits");
+        assert_eq!(out[0], "keep me exactly",
+            "a line above the edit was re-filled and could now refuse");
+    }
+
+    /// ⚠️ A PARAGRAPH THAT NEEDS A LINE IT HAS NOT GOT IS REFUSED, not
+    /// half-done. Drawing a line that was never there is a different piece of
+    /// work, and silently dropping the words would lose the reader's text.
+    #[test]
+    fn words_that_do_not_go_into_the_lines_there_are_refuse() {
+        let lines = vec!["aaa bbb ccc ddd".to_string()];
+        assert!(rewrap_from(&lines, 0, room(7)).is_none(),
+            "four words were squeezed into one line's room");
+    }
+
+    /// ⚠️ A WORD WIDER THAN THE MEASURE STILL HAS TO GO SOMEWHERE. A single
+    /// long word in a narrow column is ordinary, and an empty line that refuses
+    /// it would drop it and spin.
+    #[test]
+    fn a_word_wider_than_the_line_is_still_placed() {
+        let lines = vec!["antidisestablishmentarianism".to_string()];
+        let out = rewrap_from(&lines, 0, room(5)).expect("it has nowhere else to go");
+        assert_eq!(out, vec!["antidisestablishmentarianism"]);
     }
 
     #[test]
