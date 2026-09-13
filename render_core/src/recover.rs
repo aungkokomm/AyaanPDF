@@ -296,6 +296,110 @@ fn dictionary(doc: &Document, o: &Object) -> Option<lopdf::Dictionary> {
 /// ⚠️ THE WIDTHS COME FROM THE FILE, NOT FROM THE INSTALLED FONT. They are what
 /// the producer actually advanced by, which is what decides where one placed
 /// run ends and whether a space stands between it and the next.
+/// The `/ToUnicode` CMap of a font, as glyph code -> the text it claims.
+///
+/// ⚠️ A CLAIM, NOT A READING. This is the producer's own table, and on the
+/// Devanagari book it carries a handful of entries for fonts that draw hundreds
+/// of glyphs, so it cannot say what a word is. It is kept for the one question
+/// reflow asks of it, where a line may be broken; see
+/// `what_the_page_claims_around_a_break` for what it actually holds.
+///
+/// Only what this measurement needs: `beginbfchar` and `beginbfrange` with
+/// hex operands, which is what every producer writes.
+pub(crate) fn to_unicode(doc: &Document, font: &lopdf::Dictionary) -> Option<BTreeMap<u16, String>> {
+    let id = font.get(b"ToUnicode").ok()?.as_reference().ok()?;
+    let raw = doc.get_object(id).ok()?.as_stream().ok()?.decompressed_content().ok()?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+
+    // Every <hex> token of a section, in order. Producers put many entries
+    // on a line, so pairing has to be done on the tokens themselves.
+    fn tokens(section: &str) -> Vec<Vec<u16>> {
+        let mut out = Vec::new();
+        let mut rest = section;
+        while let Some(a) = rest.find('<') {
+            let after = &rest[a + 1..];
+            let Some(b) = after.find('>') else { break };
+            let body = &after[..b];
+            rest = &after[b + 1..];
+            if body.is_empty() || body.len() % 4 != 0 {
+                out.push(Vec::new());
+                continue;
+            }
+            let parsed: Option<Vec<u16>> = (0..body.len() / 4)
+                .map(|i| u16::from_str_radix(&body[i * 4..i * 4 + 4], 16).ok())
+                .collect();
+            out.push(parsed.unwrap_or_default());
+        }
+        out
+    }
+
+    let say = |v: &[u16]| String::from_utf16_lossy(v);
+    let mut out: BTreeMap<u16, String> = BTreeMap::new();
+
+    let mut rest = text.as_str();
+    while let Some(s) = rest.find("beginbfchar") {
+        let after = &rest[s + "beginbfchar".len()..];
+        let e = after.find("endbfchar").unwrap_or(after.len());
+        let items = tokens(&after[..e]);
+        for pair in items.chunks(2) {
+            if let [from, to] = pair {
+                if from.len() == 1 && !to.is_empty() {
+                    out.insert(from[0], say(to));
+                }
+            }
+        }
+        rest = &after[e.min(after.len())..];
+    }
+
+    let mut rest = text.as_str();
+    while let Some(s) = rest.find("beginbfrange") {
+        let after = &rest[s + "beginbfrange".len()..];
+        let e = after.find("endbfrange").unwrap_or(after.len());
+        let section = &after[..e];
+        // Array form is skipped: it maps one code to several strings and
+        // this measurement does not need it.
+        if !section.contains('[') {
+            let items = tokens(section);
+            for three in items.chunks(3) {
+                if let [a, b, c] = three {
+                    if a.len() == 1 && b.len() == 1 && !c.is_empty() && a[0] <= b[0] {
+                        for (step, code) in (a[0]..=b[0]).enumerate() {
+                            let mut to = c.clone();
+                            let last = to.len() - 1;
+                            to[last] = to[last].saturating_add(step as u16);
+                            out.insert(code, say(&to));
+                        }
+                    }
+                }
+            }
+        }
+        rest = &after[e.min(after.len())..];
+    }
+    Some(out)
+}
+
+/// What each font on a page claims its glyph codes say, by resource name.
+///
+/// ⚠️ KEYED BY WHAT THE PAGE CALLS THE FONT, like [`fonts_of`], because
+/// that is what a [`Line`] carries in `resource`.
+pub(crate) fn claims_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, BTreeMap<u16, String>> {
+    let mut out = BTreeMap::new();
+    let Some(page) = doc.get_dictionary(page).ok() else { return out };
+    let Some(resources) = page.get(b"Resources").ok().and_then(|o| dictionary(doc, o)) else {
+        return out;
+    };
+    let Some(fonts) = resources.get(b"Font").ok().and_then(|o| dictionary(doc, o)) else {
+        return out;
+    };
+    for (name, obj) in fonts.iter() {
+        let Some(font) = dictionary(doc, obj) else { continue };
+        if let Some(map) = to_unicode(doc, &font) {
+            out.insert(name.to_vec(), map);
+        }
+    }
+    out
+}
+
 pub(crate) fn fonts_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)> {
     let mut out = BTreeMap::new();
     let Some(page) = doc.get_dictionary(page).ok() else { return out };
@@ -5017,81 +5121,6 @@ mod tests {
         }
     }
 
-    /// The `/ToUnicode` CMap of a font, as glyph code -> the text it claims.
-    ///
-    /// Only what this measurement needs: `beginbfchar` and `beginbfrange` with
-    /// hex operands, which is what every producer writes.
-    fn to_unicode(doc: &Document, font: &lopdf::Dictionary) -> Option<BTreeMap<u16, String>> {
-        let id = font.get(b"ToUnicode").ok()?.as_reference().ok()?;
-        let raw = doc.get_object(id).ok()?.as_stream().ok()?.decompressed_content().ok()?;
-        let text = String::from_utf8_lossy(&raw).into_owned();
-
-        // Every <hex> token of a section, in order. Producers put many entries
-        // on a line, so pairing has to be done on the tokens themselves.
-        fn tokens(section: &str) -> Vec<Vec<u16>> {
-            let mut out = Vec::new();
-            let mut rest = section;
-            while let Some(a) = rest.find('<') {
-                let after = &rest[a + 1..];
-                let Some(b) = after.find('>') else { break };
-                let body = &after[..b];
-                rest = &after[b + 1..];
-                if body.is_empty() || body.len() % 4 != 0 {
-                    out.push(Vec::new());
-                    continue;
-                }
-                let parsed: Option<Vec<u16>> = (0..body.len() / 4)
-                    .map(|i| u16::from_str_radix(&body[i * 4..i * 4 + 4], 16).ok())
-                    .collect();
-                out.push(parsed.unwrap_or_default());
-            }
-            out
-        }
-
-        let say = |v: &[u16]| String::from_utf16_lossy(v);
-        let mut out: BTreeMap<u16, String> = BTreeMap::new();
-
-        let mut rest = text.as_str();
-        while let Some(s) = rest.find("beginbfchar") {
-            let after = &rest[s + "beginbfchar".len()..];
-            let e = after.find("endbfchar").unwrap_or(after.len());
-            let items = tokens(&after[..e]);
-            for pair in items.chunks(2) {
-                if let [from, to] = pair {
-                    if from.len() == 1 && !to.is_empty() {
-                        out.insert(from[0], say(to));
-                    }
-                }
-            }
-            rest = &after[e.min(after.len())..];
-        }
-
-        let mut rest = text.as_str();
-        while let Some(s) = rest.find("beginbfrange") {
-            let after = &rest[s + "beginbfrange".len()..];
-            let e = after.find("endbfrange").unwrap_or(after.len());
-            let section = &after[..e];
-            // Array form is skipped: it maps one code to several strings and
-            // this measurement does not need it.
-            if !section.contains('[') {
-                let items = tokens(section);
-                for three in items.chunks(3) {
-                    if let [a, b, c] = three {
-                        if a.len() == 1 && b.len() == 1 && !c.is_empty() && a[0] <= b[0] {
-                            for (step, code) in (a[0]..=b[0]).enumerate() {
-                                let mut to = c.clone();
-                                let last = to.len() - 1;
-                                to[last] = to[last].saturating_add(step as u16);
-                                out.insert(code, say(&to));
-                            }
-                        }
-                    }
-                }
-            }
-            rest = &after[e.min(after.len())..];
-        }
-        Some(out)
-    }
 
     /// ⚠️ THE WRONG CODEPOINTS ARE NOT IN THE FILE. THE EXTRACTOR INVENTS THEM.
     ///

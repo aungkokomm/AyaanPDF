@@ -401,6 +401,26 @@ fn reflow_for(lines: &[Line], line: &Line, replacement: &Replacement, was: Optio
 /// What a page declares for the fonts it draws with, keyed by resource name.
 type Widths = BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)>;
 
+/// What each of a page's fonts claims its codes say, keyed by resource name.
+type Claims = BTreeMap<Vec<u8>, BTreeMap<u16, String>>;
+
+/// Characters a line may not begin with, because they belong to the word
+/// before them.
+///
+/// ⚠️ FOUND THE HARD WAY, ON THE READER'S OWN PARAGRAPH: a carry split a line
+/// between a word and the comma after it, and the next line opened with
+/// ", था नहीं!". The recovery reader could not see it, the comma read as
+/// nothing, but the producer's `/ToUnicode` names it plainly: `000F=","` in the
+/// fonts that draw the page's spaces and punctuation, and `0361="\u{964}"` in the
+/// Devanagari ones.
+const BELONGS_TO_THE_WORD_BEFORE: &str =
+    ",.;:!?)]}\u{bb}\u{201d}\u{2019}\u{2026}\u{964}\u{965}\u{104a}\u{104b}";
+
+/// Whether a line may begin with this placement.
+fn may_open_a_line(p: &Placed) -> bool {
+    !p.claims.trim_start().starts_with(|c: char| BELONGS_TO_THE_WORD_BEFORE.contains(c))
+}
+
 /// Operands as PDF reals.
 fn reals(v: &[f64]) -> Vec<Object> {
     v.iter().map(|n| Object::Real(*n as f32)).collect()
@@ -439,6 +459,12 @@ struct Placed {
     left: f64,
     right: f64,
     drawn_by: Vec<usize>,
+    /// What the font claims these glyphs say. Empty where it claims nothing.
+    ///
+    /// ⚠️ A CLAIM, NOT A READING. It cannot spell a Devanagari word on this
+    /// book and is never asked to: it is asked only whether a placement is a
+    /// space or a mark of punctuation, which is where a line may be broken.
+    claims: String,
 }
 
 /// A separator this narrow is hung into the margin rather than indenting the
@@ -458,6 +484,7 @@ fn placements_on(
     widths: &Widths,
     baseline: f64,
     retyping: Option<(&Line, f64, f64)>,
+    claims: &Claims,
 ) -> Option<Vec<Placed>> {
     let mut out: Vec<Placed> = Vec::new();
     for other in lines {
@@ -476,7 +503,16 @@ fn placements_on(
                 left += slid;
             }
         }
-        out.push(Placed { left, right: left + width, drawn_by: other.drawn_by.clone() });
+        let said: String = claims
+            .get(&other.resource)
+            .map(|map| other.glyphs.iter().filter_map(|g| map.get(g).cloned()).collect())
+            .unwrap_or_default();
+        out.push(Placed {
+            left,
+            right: left + width,
+            drawn_by: other.drawn_by.clone(),
+            claims: said,
+        });
     }
     out.sort_by(|a, b| a.left.partial_cmp(&b.left).unwrap_or(std::cmp::Ordering::Equal));
     Some(out)
@@ -547,8 +583,10 @@ fn carry(
 
     let mut moves: Vec<(Vec<usize>, (f64, f64))> = Vec::new();
     let mut at = line.page_y;
-    let mut on_it = placements_on(lines, &widths, at, Some((line, replacement.advance, slid)))
-        .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+    let claims = crate::recover::claims_of(doc, page);
+    let mut on_it =
+        placements_on(lines, &widths, at, Some((line, replacement.advance, slid)), &claims)
+            .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
 
     // ⚠️ COMPUTED ONCE, FROM THE PAGE AS IT STANDS. Every line the paragraph
     // gains pushes this same set down by one more leading, and the deltas add
@@ -563,7 +601,21 @@ fn carry(
         let Some(over) = on_it.iter().position(|p| p.right > room.column + SETTLED) else {
             return Ok(moves);
         };
-        let first = breakable(&on_it, over);
+        // ⚠️ TWO RULES FOR WHERE A LINE MAY BREAK, AND EITHER CAN MOVE THE
+        // OTHER. The tail must be a set whose pens draw nothing else, and the
+        // next line may not open with punctuation that belongs to the word
+        // before it. Both only ever move the split earlier, so this settles.
+        let mut first = over;
+        loop {
+            let mut next = breakable(&on_it, first);
+            while next > 0 && !may_open_a_line(&on_it[next]) {
+                next -= 1;
+            }
+            if next == first {
+                break;
+            }
+            first = next;
+        }
         // ⚠️ THE FIRST PLACEMENT CANNOT BE CARRIED ANYWHERE. Nothing is left
         // to hold the line, and the word is simply wider than the column. The
         // same answer covers a line the page draws with a single pen: there is
@@ -599,7 +651,15 @@ fn carry(
         // what the `Tf` says, and a placement's width here has been through the
         // page's transform already.
         let em = line.along_baseline(line.size).0.abs();
-        let hang = if carried[0].right - carried[0].left < em * A_SEPARATOR {
+        // ⚠️ BY WHAT IT CLAIMS WHERE THE FONT SAYS, BY WIDTH ONLY WHERE IT
+        // DOES NOT. A space is a placement of its own on this book and its
+        // font names it `0003=" "`; the width rule guessed, and a comma is as
+        // narrow as a space.
+        let a_space = match carried[0].claims.as_str() {
+            "" => carried[0].right - carried[0].left < em * A_SEPARATOR,
+            said => said.trim().is_empty(),
+        };
+        let hang = if a_space {
             carried[0].right - carried[0].left
         } else {
             0.0
@@ -620,7 +680,7 @@ fn carry(
         // and has already been moved out of the way.
         let below = match fresh {
             true => Vec::new(),
-            false => placements_on(lines, &widths, next, None)
+            false => placements_on(lines, &widths, next, None, &claims)
                 .ok_or(STATUS_LINE_NOT_REWRITABLE)?,
         };
         let push = taken;
@@ -639,15 +699,139 @@ fn carry(
                 left: p.left + dx,
                 right: p.right + dx,
                 drawn_by: p.drawn_by.clone(),
+                claims: p.claims.clone(),
             })
             .chain(below.into_iter().map(|p| Placed {
                 left: p.left + push,
                 right: p.right + push,
                 drawn_by: p.drawn_by,
+                claims: p.claims,
             }))
             .collect();
         at = next;
     }
+}
+
+/// Takes every placement that moved to another line out of the place it was
+/// drawn in the stream and draws it again at the end, above everything else.
+///
+/// ⚠️ STREAM ORDER IS PAINT ORDER, AND A LINE'S BACKGROUND IS PAINTED FIRST.
+/// The reader's Hindi book puts a full-width path under every line, drawn just
+/// before that line's text. A word carried down to the next line kept its old
+/// place in the stream, which is BEFORE the next line's path, so the path was
+/// painted straight over it: its position was exactly right, the content
+/// stream said so, and on the reader's screen it simply was not there. PDFium,
+/// asked object by object, had the carried words at the margin with line two's
+/// background path one object later.
+///
+/// ⚠️ EMPTIED IN PLACE AND DRAWN AGAIN AT THE END, so no index moves. The same
+/// pattern the line being retyped already uses, and the reason the splice after
+/// this can still trust every index it holds.
+///
+/// ⚠️ AND ONLY WHERE THE END OF THE STREAM IS UNDER THE SAME TRANSFORM. A copy
+/// appended after the last operation is drawn with whatever `cm` is in force
+/// there. So the copy applies again every `cm` a still-open scope had applied
+/// where its text object began, and this refuses only when a top-level `cm`
+/// comes later, which would move the copy somewhere else entirely.
+fn drawn_on_top(content: &mut Content, moved: &[usize]) -> Result<(), i32> {
+    let mine: std::collections::BTreeSet<usize> = moved.iter().copied().collect();
+
+    // ⚠️ WHAT DECIDES THE TRANSFORM IS WHICH `cm`s ARE IN FORCE, NOT HOW
+    // DEEP IN `q` AN OPERATION SITS. This first asked for depth zero and
+    // refused the reader's own page: its invisible text layer is drawn one `q`
+    // deep, under a `q` that sets no transform of its own, so a copy at the end
+    // of the stream is drawn exactly where it was. What does move a copy is a
+    // `cm` applied inside a scope that is still open, or a top-level one that
+    // arrives later.
+    //
+    // ⚠️ AND THE COLOUR AND THE FONT IN FORCE GO WITH IT. Both are graphics
+    // state, both can be set before the text object opens, and a copy that
+    // left them behind would be drawn in whatever was set last on the page.
+    //
+    // ⚠️ AND A SCOPED `cm` IS NOT A REASON TO REFUSE, IT IS PART OF THE COPY.
+    // The reader's page draws some of its words as
+    // `q rg q Q cm BT … ET BT … ET Q`: a transform set once, inside a scope,
+    // for several text objects after it. Walking back from a `BT` to find "its"
+    // `q` found the first object's and refused the second. What a copy needs is
+    // simply every `cm` still in force where its text object opened, applied
+    // again, in order, inside the copy's own `q`.
+    type InForce = (Vec<usize>, Option<Operation>, Option<Operation>);
+    let mut scopes: Vec<InForce> = Vec::new();
+    let mut top: InForce = (Vec::new(), None, None);
+    let mut at_text: BTreeMap<usize, InForce> = BTreeMap::new();
+    for (at, op) in content.operations.iter().enumerate() {
+        match op.operator.as_str() {
+            "q" => {
+                let current = scopes.last().unwrap_or(&top);
+                let (fill, font) = (current.1.clone(), current.2.clone());
+                scopes.push((Vec::new(), fill, font));
+            }
+            "Q" => {
+                scopes.pop();
+            }
+            "cm" => scopes.last_mut().unwrap_or(&mut top).0.push(at),
+            "rg" | "g" | "k" | "sc" | "scn" => {
+                scopes.last_mut().unwrap_or(&mut top).1 = Some(op.clone())
+            }
+            "Tf" => scopes.last_mut().unwrap_or(&mut top).2 = Some(op.clone()),
+            "BT" => {
+                let current = scopes.last().unwrap_or(&top);
+                let (fill, font) = (current.1.clone(), current.2.clone());
+                let cms = scopes.iter().flat_map(|s| s.0.iter().copied()).collect();
+                at_text.insert(at, (cms, fill, font));
+            }
+            _ => {}
+        }
+    }
+    let top_level_cm = top.0;
+
+    let mut redraw: Vec<Operation> = Vec::new();
+    let mut done: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for &at in moved {
+        if done.contains(&at) {
+            continue;
+        }
+        if !matches!(content.operations[at].operator.as_str(), "TJ" | "Tj" | "'" | "\"") {
+            continue;
+        }
+        let opens_text = (0..at)
+            .rev()
+            .find(|i| content.operations[*i].operator == "BT")
+            .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        let closes_text = (at..content.operations.len())
+            .find(|i| content.operations[*i].operator == "ET")
+            .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        if top_level_cm.iter().any(|c| *c > at) {
+            return Err(STATUS_LINE_NOT_REWRITABLE);
+        }
+        let (cms, fill, font) = &at_text[&opens_text];
+
+        redraw.push(Operation::new("q", vec![]));
+        // What was in force when the text object opened; its own settings,
+        // copied after these, still win.
+        redraw.extend(cms.iter().map(|cm| content.operations[*cm].clone()));
+        redraw.extend(fill.iter().cloned());
+        redraw.extend(font.iter().cloned());
+        for i in opens_text..=closes_text {
+            let op = &content.operations[i];
+            // Somebody else's text in the same object stays where it was.
+            if matches!(op.operator.as_str(), "TJ" | "Tj" | "'" | "\"") {
+                if !mine.contains(&i) {
+                    continue;
+                }
+                done.insert(i);
+            }
+            redraw.push(op.clone());
+        }
+        redraw.push(Operation::new("Q", vec![]));
+    }
+
+    // Emptied rather than removed, so every other operation keeps its index.
+    for &at in &done {
+        content.operations[at] = Operation::new("TJ", vec![Object::Array(Vec::new())]);
+    }
+    content.operations.extend(redraw);
+    Ok(())
 }
 
 /// Puts `replacement` where `line` was drawn, in a font of our own.
@@ -698,6 +882,20 @@ pub(crate) fn write_over(
     // declines.
     for (showing, (dx, dy)) in &reflow.moves {
         crate::shift::move_placements(&mut content, showing, *dx, *dy)?;
+    }
+
+    // ⚠️ AND WHAT WENT TO ANOTHER LINE IS DRAWN ABOVE THAT LINE'S BACKGROUND.
+    // See `drawn_on_top`. Only vertical moves: sliding along its own line keeps
+    // a word over its own line's background, where it always was.
+    let vertical: Vec<usize> = reflow
+        .moves
+        .iter()
+        .filter(|(_, (_, dy))| dy.abs() > SETTLED)
+        .flat_map(|(showing, _)| showing.iter().copied())
+        .filter(|at| !line.drawn_by.contains(at))
+        .collect();
+    if !vertical.is_empty() {
+        drawn_on_top(&mut content, &vertical)?;
     }
 
     // Everything else the line was drawn by draws nothing now. Emptied rather
@@ -1905,6 +2103,53 @@ mod tests {
             "the wrong copy of the word was changed");
     }
 
+    /// ⚠️ WHERE A LINE MAY BE BROKEN IS A QUESTION ABOUT PUNCTUATION, and the
+    /// recovery reader cannot answer it on this book: the comma that ended up
+    /// starting the reader's third line reads as nothing. This prints what each
+    /// font's `/ToUnicode` CLAIMS for the placements around that break, to see
+    /// whether the producer's own table knows a comma from a word.
+    ///
+    ///     cargo test --release what_the_page_claims_around_a_break -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_the_page_claims_around_a_break() {
+        if !std::path::Path::new(GEETA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(GEETA).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let claims = crate::recover::claims_of(&doc, page);
+        println!("{} fonts on the page carry a /ToUnicode", claims.len());
+        for (name, map) in &claims {
+            let sample: Vec<String> = map.iter()
+                .filter(|(_, t)| t.chars().all(|c| !c.is_alphanumeric()))
+                .take(12)
+                .map(|(c, t)| format!("{c:04X}={t:?}"))
+                .collect();
+            println!("   /{}  {} entries; not letters: {}",
+                String::from_utf8_lossy(name), map.len(), sample.join(" "));
+        }
+        let lines = crate::recover::lines_of(&doc, page);
+        for y in [297.48, 283.44, 269.52] {
+            println!("\nthe end of the line at {y:.2}:");
+            let mut on: Vec<&Line> = lines.iter()
+                .filter(|l| (l.page_y - y).abs() < BASELINE_TOLERANCE && l.page_x() > 440.0)
+                .collect();
+            on.sort_by(|a, b| a.page_x().total_cmp(&b.page_x()));
+            for l in on {
+                let map = claims.get(&l.resource);
+                let said: String = l.glyphs.iter()
+                    .map(|g| map.and_then(|m| m.get(g)).cloned().unwrap_or_else(|| "?".into()))
+                    .collect();
+                println!("   x {:7.2}  /{:<4} codes {:?}  claims {said:?}",
+                    l.page_x(), String::from_utf8_lossy(&l.resource),
+                    l.glyphs.iter().map(|g| format!("{g:04X}")).collect::<Vec<_>>());
+            }
+        }
+    }
+
     /// Every baseline the page draws on, top first, and how many placements.
     fn every_baseline(bytes: &[u8]) -> Vec<(f64, usize)> {
         let doc = Document::load_mem(bytes).unwrap();
@@ -2037,6 +2282,18 @@ mod tests {
         let produced =
             retype_in_paragraph(&bytes, 0, &para, &now, NIRMALA, Some(&indexes), None)
                 .expect("the paragraph refused to grow");
+
+        // ⚠️ RENDERED, BECAUSE A POSITION IS NOT A PIXEL. Everything under a
+        // paragraph that gains a line moves DOWN, and on this book every line
+        // has a white path under it painted just before its text; text that
+        // keeps its old place in the stream is painted over by the path of the
+        // line it moved onto.
+        let dir = std::env::temp_dir().join("ayaan-gained-line");
+        let _ = std::fs::create_dir_all(&dir);
+        raster(&bytes, &dir.join("before.bgra").to_string_lossy());
+        raster(&produced, &dir.join("after.bgra").to_string_lossy());
+        println!("rendered to {} (paragraph last line at {:.2})", dir.display(),
+            baselines.last().unwrap());
         let after = every_baseline(&produced);
 
         println!("\nthe paragraph, before and after:");
@@ -3215,6 +3472,152 @@ mod tests {
         let to = out_dir.join("page.bgra").to_string_lossy().into_owned();
         raster(&std::fs::read(FILE).unwrap(), &to);
         println!("wrote {to}");
+    }
+
+    /// ⚠️ THE READER'S EDIT, RENDERED, BECAUSE POSITIONS ARE NOT PIXELS. The
+    /// content stream said the carried words sat at the margin of the lines
+    /// below, and on the reader's screen they were not there at all. This
+    /// renders before and after with PDFium, which is what the app draws with,
+    /// and prints what surrounds the carried text in the stream so anything
+    /// that would hide it, a clip above all, can be seen.
+    ///
+    ///     cargo test --release what_the_readers_edit_looks_like -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn what_the_readers_edit_looks_like() {
+        if !std::path::Path::new(GEETA).exists() || !std::path::Path::new(NIRMALA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        const AT: f64 = 297.48;
+        const WORD: &str = "\u{92f}\u{941}\u{926}\u{94d}\u{927}";
+        let on_disk = std::fs::read(GEETA).unwrap();
+        let handle = crate::open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+        let bytes = crate::document_bytes(handle).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let (page_left, _, page_w) = crate::recover::page_box(&doc, page).unwrap();
+        let target = lines.iter().zip(&readings)
+            .find(|(l, r)| (l.page_y - AT).abs() < 0.5 && r.text.as_deref() == Some(WORD))
+            .map(|(l, _)| l)
+            .expect("the reader's word is not on that line");
+        let at_left = ((target.page_x() - page_left) / page_w) as f32;
+
+        let now = format!("{WORD} \u{914}\u{930} \u{927}\u{930}\u{94d}\u{92e}");
+        let (want, text, font) = (WORD.as_bytes(), now.as_bytes(), NIRMALA.as_bytes());
+        let buffer = crate::retype_recovered_line(
+            handle, 0, AT as f32, at_left,
+            want.as_ptr(), want.len(), text.as_ptr(), text.len(), font.as_ptr(), font.len());
+        assert_eq!(buffer.status, crate::STATUS_OK_PDFIUM, "the edit was refused");
+        let out = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        crate::free_byte_buffer(buffer);
+        crate::close_document(handle);
+
+        let dir = std::env::temp_dir().join("ayaan-readers-edit");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("before.pdf"), &bytes).unwrap();
+        std::fs::write(dir.join("after.pdf"), &out).unwrap();
+        raster(&bytes, &dir.join("before.bgra").to_string_lossy());
+        raster(&out, &dir.join("after.bgra").to_string_lossy());
+        println!("wrote {}", dir.display());
+
+        // What surrounds the text that moved. Every operation between the last
+        // `q` before it and the `Q` that closes that, with clips called out.
+        let after = Document::load_mem(&out).unwrap();
+        let pg = *after.get_pages().values().next().unwrap();
+        let content = Content::decode(&after.get_page_content(pg)).unwrap();
+        let all = crate::recover::lines_of(&after, pg);
+        let moved: Vec<&Line> = all.iter()
+            .filter(|l| (l.page_y - 283.44).abs() < 0.5 && l.page_x() < 100.0)
+            .collect();
+        println!("\n{} placements at the start of the line at 283.44 after the edit", moved.len());
+        for l in moved.iter().take(2) {
+            let first = *l.drawn_by.first().unwrap();
+            let from = first.saturating_sub(14);
+            println!("\n  placement at x {:.2}, op {first}", l.page_x());
+            for (i, op) in content.operations[from..(first + 3).min(content.operations.len())]
+                .iter().enumerate()
+            {
+                let at = from + i;
+                let flag = match op.operator.as_str() {
+                    "W" | "W*" => "   <-- CLIP",
+                    "re" => "   <-- rect",
+                    "q" | "Q" => "   <-- state",
+                    _ if at == first => "   <-- THE TEXT",
+                    _ => "",
+                };
+                let args: Vec<String> = op.operands.iter().take(6).map(|o| match o {
+                    Object::Real(r) => format!("{r:.2}"),
+                    Object::Integer(i) => i.to_string(),
+                    Object::Name(n) => format!("/{}", String::from_utf8_lossy(n)),
+                    _ => "..".into(),
+                }).collect();
+                println!("    {at:6} {:<3} {}{flag}", op.operator, args.join(" "));
+            }
+        }
+
+        // And how many clips the page sets at all.
+        let clips = content.operations.iter().filter(|o| o.operator == "W" || o.operator == "W*")
+            .count();
+        println!("\nthe page sets {clips} clipping paths in {} operations",
+            content.operations.len());
+    }
+
+    /// ⚠️ WHAT PDFIUM ITSELF HOLDS WHERE THE CARRIED WORDS SHOULD BE. The
+    /// stream places them at the start of the lines below, lopdf reads them
+    /// there, and PDFium's render shows nothing there. This asks PDFium, object
+    /// by object, what it has in that corner of the paragraph, before and after.
+    ///
+    ///     cargo test --release what_pdfium_holds_where_the_words_went -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs files written by what_the_readers_edit_looks_like"]
+    fn what_pdfium_holds_where_the_words_went() {
+        let dir = std::env::temp_dir().join("ayaan-readers-edit");
+        for name in ["before.pdf", "after.pdf"] {
+            let path = dir.join(name);
+            let Ok(pdf) = std::fs::read(&path) else {
+                println!("run what_the_readers_edit_looks_like first");
+                return;
+            };
+            println!("\n================ {name}");
+            let handle = crate::open_document_from_bytes_inner(pdf.as_ptr(), pdf.len());
+            assert_ne!(handle, 0);
+            {
+                use pdfium_render::prelude::*;
+                let _guard = crate::call_guard();
+                let doc = crate::lock(&crate::core().documents).get(&handle).cloned().unwrap();
+                let g = crate::lock(&doc);
+                let page = g.pages().get(0).unwrap();
+                let text_page = page.text().ok();
+                let objects = page.objects();
+                let mut shown = 0usize;
+                for index in 0..objects.len() {
+                    let Ok(obj) = objects.get(index) else { continue };
+                    let Ok(b) = obj.bounds() else { continue };
+                    let (l, r, t, bt) =
+                        (b.left().value, b.right().value, b.top().value, b.bottom().value);
+                    // The start of the paragraph's second and third lines.
+                    if r < 60.0 || l > 130.0 || t < 262.0 || bt > 300.0 {
+                        continue;
+                    }
+                    let what = match &obj {
+                        pdfium_render::prelude::PdfPageObject::Text(tx) => {
+                            let said = text_page.as_ref().map(|tp| tp.for_object(tx))
+                                .unwrap_or_default();
+                            format!("text  {:?}", said.chars().take(12).collect::<String>())
+                        }
+                        other => format!("OTHER {:?}", other.object_type()),
+                    };
+                    println!("   #{index:5}  x {l:7.2}..{r:7.2}  y {bt:7.2}..{t:7.2}  {what}");
+                    shown += 1;
+                }
+                println!("{shown} objects in that corner, of {} on the page", objects.len());
+            }
+            crate::close_document(handle);
+        }
     }
 
     /// Page one of `pdf`, rendered, written as width, height and BGRA bytes so
