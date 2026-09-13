@@ -672,9 +672,26 @@ fn is_letter_spaced(line: &Line, joins: usize) -> bool {
 /// come back from the index like any other character. Measured: reading gaps
 /// above a threshold as spaces split `အရှေ့မိုးကုပ်` into two words that the
 /// author had typed as one.
-pub(crate) fn read_line(index: &crate::reshape::Index, face: &rustybuzz::Face, line: &Line)
-    -> Option<String>
-{
+/// ⚠️ THE SAME CLEANING THE PAGE READER DOES, AND FOR THE SAME REASON. This
+/// used to read the line exactly as written while [`read_page_with`] first put
+/// it through [`without_phantoms`], so a line with one undrawable code read as
+/// the author's text on screen and as NOTHING to the writer that had to find
+/// it. Measured on the reader's Myanmar book: 84 glyphs, one of them a phantom,
+/// the app showed the line and every retype of it was refused with status 10.
+/// Two answers to "what does this line say" is one too many.
+///
+/// ⚠️ AND THE WIDTHS ARE PART OF THE ANSWER, not decoration. A dropped
+/// phantom becomes a skip as wide as the file declares it, and a wide enough
+/// skip is read as a SPACE, so a caller that cannot supply the page's widths
+/// gets a different sentence from one that can.
+pub(crate) fn read_line(
+    index: &crate::reshape::Index,
+    face: &rustybuzz::Face,
+    line: &Line,
+    widths: Option<&crate::shaped::CidWidths>,
+) -> Option<String> {
+    let cleaned = without_phantoms(line, face, widths);
+    let line = cleaned.as_ref().unwrap_or(line);
     Some(said_by(&pieces_of(index, face, line)?))
 }
 
@@ -2078,12 +2095,12 @@ mod tests {
             drawn_by: Vec::new(),
         };
 
-        assert_eq!(read_line(&index, &face, &line).as_deref(),
+        assert_eq!(read_line(&index, &face, &line, None).as_deref(),
             Some(format!("{A} {B} {C}").as_str()),
             "the control is wrong: gaps should read as spaces when they mean spaces");
 
         line.tracked = true;
-        assert_eq!(read_line(&index, &face, &line).as_deref(),
+        assert_eq!(read_line(&index, &face, &line, None).as_deref(),
             Some(format!("{A}{B}{C}").as_str()),
             "a letter-spaced line still came back with spaces in it");
     }
@@ -2186,7 +2203,7 @@ mod tests {
             breaks: vec![Break { at: left.len(), points: 3.0 }],
             drawn_by: Vec::new(),
         };
-        assert_eq!(read_line(&index, &face, &line).as_deref(),
+        assert_eq!(read_line(&index, &face, &line, None).as_deref(),
             Some(format!("{LEFT} {RIGHT}").as_str()));
     }
 
@@ -2222,7 +2239,7 @@ mod tests {
             breaks: vec![Break { at: 1, points: 3.0 }],
             drawn_by: Vec::new(),
         };
-        assert_eq!(read_line(&index, &face, &line).as_deref(), Some(WORD),
+        assert_eq!(read_line(&index, &face, &line, None).as_deref(), Some(WORD),
             "an impossible break took the line down with it");
     }
 
@@ -5777,7 +5794,7 @@ mod tests {
                 continue;
             }
             devanagari_lines += 1;
-            match read_line(&index, &face, line) {
+            match read_line(&index, &face, line, None) {
                 Some(text) if text.chars().any(crate::devanagari::is_devanagari) => {
                     read += 1;
                     if shown < 8 {
@@ -5825,7 +5842,7 @@ mod tests {
         for line in &lines {
             let Some(entry) = indexes.by_font.get(&line.base_font) else { continue };
             let Some(face) = rustybuzz::Face::from_slice(&entry.0, 0) else { continue };
-            let Some(text) = read_line(&entry.1, &face, line) else { continue };
+            let Some(text) = read_line(&entry.1, &face, line, None) else { continue };
             if !text.chars().any(crate::devanagari::is_devanagari) {
                 continue;
             }

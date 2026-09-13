@@ -189,6 +189,105 @@ pub(crate) struct Room<'a> {
     pub(crate) below: &'a [f64],
 }
 
+/// The paragraph the reader is editing, as the app knows it.
+pub(crate) struct Paragraph<'a> {
+    /// Each line's baseline, the top of the paragraph first, in the page frame.
+    pub(crate) baselines: &'a [f64],
+    /// What each of those lines says now, and nothing where nothing read it.
+    pub(crate) says: &'a [Option<String>],
+    /// Which of them is being retyped.
+    pub(crate) edited: usize,
+    pub(crate) left: f64,
+    pub(crate) column: f64,
+}
+
+impl Paragraph<'_> {
+    /// Whether the words of this paragraph can be re-broken between its lines.
+    ///
+    /// ⚠️ WHICH IS A PROPERTY OF THE FILE, NOT OF THE SCRIPT. A rewrap moves
+    /// whole words, so it needs every line from the edited one down to read
+    /// whole. Measured on the reader's three books: the Myanmar body text gives
+    /// one readable fragment a line with six to eight words in it, and the
+    /// Hindi book gives eleven to twenty-two fragments a line and no whole line
+    /// at all. So this is true for one and false for the other, and the two
+    /// mechanisms divide exactly where the evidence does.
+    fn can_be_rewrapped(&self) -> bool {
+        self.says[self.edited..].iter().all(Option::is_some)
+    }
+}
+
+/// What has to happen to the lines of a paragraph to take a longer word.
+enum Refill {
+    /// It already fits. This is the ordinary single-line write.
+    Fits,
+    /// Each line's new text, the whole paragraph, top first.
+    Rewrapped(Vec<String>),
+    /// The words need a line the paragraph has not got.
+    WontFit,
+    /// Nothing here could be measured, so nothing here may decide anything.
+    Unmeasurable,
+}
+
+/// How wide `text` is set in `font_bytes` at `size`, in PDF user space.
+fn width_of(font_bytes: &[u8], text: &str, size: f64) -> Option<f64> {
+    let glyphs = crate::shape_run(font_bytes, text, crate::shaped::SHAPING_SIZE)?;
+    Some(crate::shaped_width(&glyphs) as f64 * size / crate::shaped::SHAPING_SIZE as f64)
+}
+
+/// What each line of the paragraph has to become once `new_text` is on the
+/// edited one.
+///
+/// ⚠️ MEASURED IN THE FONT THE REPLACEMENT WILL BE SET IN, not the page's. A
+/// line this rewrites is rewritten in the font being embedded, so its width is
+/// that font's width. Measuring with the page's subset would answer a question
+/// about text that is about to stop existing.
+fn refill(
+    doc: &Document,
+    page: ObjectId,
+    para: &Paragraph,
+    new_text: &str,
+    font_bytes: &[u8],
+) -> Refill {
+    let lines = crate::recover::lines_of(doc, page);
+    let size_at = |y: f64| -> Option<f64> {
+        lines.iter().find(|l| (l.page_y - y).abs() < BASELINE_TOLERANCE).map(|l| l.size)
+    };
+
+    let mut wanted: Vec<String> =
+        para.says.iter().map(|s| s.clone().unwrap_or_default()).collect();
+    wanted[para.edited] = new_text.to_string();
+
+    let mut measurable = true;
+    let fits = |i: usize, text: &str| -> bool {
+        let Some(size) = size_at(para.baselines[i]) else { return false };
+        let Some(width) = width_of(font_bytes, text, size) else { return false };
+        para.left + width <= para.column + SETTLED
+    };
+    for (i, text) in wanted.iter().enumerate().skip(para.edited) {
+        if size_at(para.baselines[i]).is_none()
+            || width_of(font_bytes, text, 1.0).is_none()
+        {
+            measurable = false;
+        }
+    }
+    if !measurable {
+        return Refill::Unmeasurable;
+    }
+
+    // ⚠️ AN EDIT THAT STILL FITS IS NOT REWRAPPED. A greedy refill breaks
+    // lines where IT would break them, which is not always where the producer
+    // did, so running it on a paragraph that did not need it would reflow the
+    // whole thing under the reader for the sake of one letter.
+    if fits(para.edited, &wanted[para.edited]) {
+        return Refill::Fits;
+    }
+
+    match crate::block::rewrap_from(&wanted, para.edited, fits) {
+        Some(out) => Refill::Rewrapped(out),
+        None => Refill::WontFit,
+    }
+}
+
 /// Everything drawn to the RIGHT of `line` on the same baseline.
 ///
 /// ⚠️ A RECOVERED LINE IS OFTEN ONE WORD. On the reader's Hindi book a
@@ -238,6 +337,9 @@ fn reflow_for(lines: &[Line], line: &Line, replacement: &Replacement, was: Optio
     }
 }
 
+/// What a page declares for the fonts it draws with, keyed by resource name.
+type Widths = BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)>;
+
 /// One placement of a line, as reflow sees it: where it will be drawn once the
 /// replacement has been written, and which operations draw it.
 struct Placed {
@@ -260,7 +362,7 @@ const A_SEPARATOR: f64 = 0.4;
 /// applied to everything right of the line being retyped.
 fn placements_on(
     lines: &[Line],
-    widths: &BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)>,
+    widths: &Widths,
     baseline: f64,
     retyping: Option<(&Line, f64, f64)>,
 ) -> Option<Vec<Placed>> {
@@ -518,17 +620,24 @@ fn share(spaces: &[usize], by: f64) -> Vec<Break> {
 /// ⚠️ EXACTLY ONE. Two lines on a baseline saying the same thing is not a
 /// line this can safely edit, because there is nothing to choose between them
 /// and choosing wrongly overwrites the other.
+///
+/// ⚠️ AND IT READS THE LINE THE WAY THE PAGE READER DID, which means it
+/// needs the widths the page declares. See `recover::read_line`: without them a
+/// line carrying an undrawable code is shown to the reader and then refused to
+/// the writer.
 fn the_one_that_says<'a>(
     lines: &'a [Line],
     baseline: f64,
     expected: &str,
     indexes: &crate::recover::Indexes,
     face: &rustybuzz::Face,
+    widths: &Widths,
 ) -> Option<&'a Line> {
     let mut found = None;
     for line in crate::recover::lines_at(lines, baseline) {
         let Some(index) = indexes.index_for(&line.base_font) else { continue };
-        if crate::recover::read_line(index, face, line).as_deref() != Some(expected) {
+        let mine = widths.get(&line.resource).and_then(|(_, w)| w.as_ref());
+        if crate::recover::read_line(index, face, line, mine).as_deref() != Some(expected) {
             continue;
         }
         if found.is_some() {
@@ -545,8 +654,9 @@ fn says_it(
     expected: &str,
     indexes: &crate::recover::Indexes,
     face: &rustybuzz::Face,
+    widths: &Widths,
 ) -> bool {
-    the_one_that_says(lines, baseline, expected, indexes, face).is_some()
+    the_one_that_says(lines, baseline, expected, indexes, face, widths).is_some()
 }
 
 /// Replaces the text of one recovered line, returning the document's new bytes.
@@ -575,6 +685,100 @@ pub(crate) fn retype(
     lent: Option<&crate::recover::Indexes>,
 ) -> Result<Vec<u8>, i32> {
     retype_within(bytes, page_index, baseline, expected, new_text, font_path, lent, None)
+}
+
+/// Retypes one line of a paragraph and reflows the paragraph to take it.
+///
+/// ⚠️ THE FILE CHOOSES THE MECHANISM, NOT THE SCRIPT. There are two ways to
+/// make room for a longer word and each of the reader's books can use exactly
+/// one of them:
+///
+/// - a paragraph whose lines READ WHOLE is rewrapped, moving words between
+///   lines and rewriting the lines that changed. The Myanmar body text gives
+///   one readable fragment a line with six to eight words in it;
+/// - a paragraph whose lines are MANY PLACEMENTS has those placements carried
+///   down instead, which reads nothing. The Hindi book gives eleven to
+///   twenty-two fragments a line, most of them unreadable, and one word is one
+///   placement.
+///
+/// The two conditions are near enough opposites, because a line drawn in one
+/// placement is a line recovery reads whole. Nothing here asks what language
+/// the text is in.
+pub(crate) fn retype_in_paragraph(
+    bytes: &[u8],
+    page_index: i32,
+    para: &Paragraph,
+    new_text: &str,
+    font_path: &str,
+    lent: Option<&crate::recover::Indexes>,
+) -> Result<Vec<u8>, i32> {
+    if para.baselines.len() != para.says.len() || para.edited >= para.baselines.len() {
+        return Err(STATUS_INVALID_INPUT);
+    }
+    let at = para.baselines[para.edited];
+    let Some(was) = para.says[para.edited].as_deref() else {
+        return Err(STATUS_LINE_NOT_REWRITABLE);
+    };
+
+    // ⚠️ BUILT ONCE FOR ALL OF IT. Reshaping a font into an index is about
+    // twenty seconds, and a rewrap writes several lines of the same document.
+    // Letting each write build its own paid for one answer once per line.
+    let held;
+    let indexes = match lent {
+        Some(ready) => ready,
+        None => match Document::load_mem(bytes) {
+            Ok(doc) => {
+                held = crate::recover::indexes_for_document(&doc);
+                &held
+            }
+            Err(_) => return Err(STATUS_DOC_NOT_REWRITABLE),
+        },
+    };
+
+    let room = Room {
+        left: para.left,
+        column: para.column,
+        below: &para.baselines[para.edited + 1..],
+    };
+    let carry_instead =
+        || retype_within(bytes, page_index, at, was, new_text, font_path, Some(indexes), Some(&room));
+
+    if !para.can_be_rewrapped() {
+        return carry_instead();
+    }
+
+    let (Ok(font_bytes), Ok(doc)) = (std::fs::read(font_path), Document::load_mem(bytes)) else {
+        return carry_instead();
+    };
+    let Some(&page) = doc.get_pages().values().nth(page_index as usize) else {
+        return Err(STATUS_INVALID_INPUT);
+    };
+
+    let rewrapped = match refill(&doc, page, para, new_text, &font_bytes) {
+        Refill::Rewrapped(lines) => lines,
+        // Nothing to reflow, so this is the write it always was.
+        Refill::Fits | Refill::Unmeasurable => {
+            return retype(bytes, page_index, at, was, new_text, font_path, Some(indexes));
+        }
+        // ⚠️ AND THE PARAGRAPH IS ONLY ALLOWED THE LINES IT HAS. Gaining one
+        // is the next step; until then, saying so beats writing off the end.
+        Refill::WontFit => return Err(STATUS_TOO_WIDE),
+    };
+
+    // ⚠️ EVERY LINE IS THE SAME SINGLE-LINE WRITE, CHAINED. Nothing here knows
+    // how to write a line, only which lines have to be written. A line the
+    // refill left alone still says what it said, so its anchor still finds it
+    // in the bytes the write before it produced.
+    let mut carried = bytes.to_vec();
+    for (n, text) in rewrapped.iter().enumerate() {
+        let Some(before) = para.says[n].as_deref() else { continue };
+        if text == before {
+            continue;
+        }
+        carried = retype(
+            &carried, page_index, para.baselines[n], before, text, font_path, Some(indexes))?;
+    }
+    Ok(carried)
 }
 
 /// The same, told what room the paragraph has, so a replacement too long for
@@ -631,7 +835,7 @@ pub(crate) fn retype_within(
         }
     };
     let lines = crate::recover::lines_of(&doc, page);
-    if !says_it(&lines, baseline, expected, indexes, &face) {
+    if !says_it(&lines, baseline, expected, indexes, &face, &crate::recover::fonts_of(&doc, page)) {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     }
 
@@ -660,7 +864,8 @@ pub(crate) fn retype_within(
     // them still reads it. Building another here was twenty seconds spent
     // arriving at the answer already in hand.
     let lines = crate::recover::lines_of(&doc, page);
-    let Some(line) = the_one_that_says(&lines, baseline, expected, indexes, &face) else {
+    let declared = crate::recover::fonts_of(&doc, page);
+    let Some(line) = the_one_that_says(&lines, baseline, expected, indexes, &face, &declared) else {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     };
 
@@ -825,6 +1030,259 @@ mod tests {
         crate::close_document(handle);
     }
 
+    const MYANMAR_BOOK: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+    
+
+    /// What each of a paragraph's baselines says, as recovery reads it.
+    fn paragraph_says(bytes: &[u8], baselines: &[f64]) -> Vec<Option<String>> {
+        let doc = Document::load_mem(bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        baselines
+            .iter()
+            .map(|&y| {
+                lines
+                    .iter()
+                    .zip(&readings)
+                    .find(|(l, r)| {
+                        (l.page_y - y).abs() < BASELINE_TOLERANCE && r.text.is_some()
+                    })
+                    .and_then(|(_, r)| r.text.clone())
+            })
+            .collect()
+    }
+
+    /// ⚠️ THE WHOLE SCENARIO ON THE MYANMAR BOOK, THE OTHER WAY ROUND. Its
+    /// lines read whole and are drawn in one placement each, so there is
+    /// nothing to carry and everything to rewrap: the words move between the
+    /// lines and every line that changed is written again.
+    ///
+    ///     cargo test --release a_longer_word_rewraps_a_myanmar_paragraph -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn a_longer_word_rewraps_a_myanmar_paragraph() {
+        if !std::path::Path::new(MYANMAR_BOOK).exists()
+            || !std::path::Path::new(MYANMAR_TEXT).exists()
+        {
+            println!("not on this machine");
+            return;
+        }
+        let on_disk = std::fs::read(MYANMAR_BOOK).unwrap();
+        let handle = crate::open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+        let bytes = crate::document_bytes(handle).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+
+        // ⚠️ THE PARAGRAPH WITH ROOM AT THE BOTTOM OF IT. A rewrap can only
+        // put words where there is space for them, and on this page most
+        // paragraphs are two full lines: growing a word there genuinely needs a
+        // third line, which is a different step. `WontFit` is asserted on its
+        // own below.
+        let (blocks, _) = crate::page_blocks(handle, 0).expect("no blocks");
+        let candidates: Vec<&crate::block::Block> =
+            blocks.iter().filter(|b| b.lines.len() >= 2).collect();
+        assert!(!candidates.is_empty(), "no paragraph of two lines on this page");
+
+        // ⚠️ SLACK MEASURED THE WAY THE RESULT IS MEASURED. The block model's
+        // own `right` disagreed with the placements by 411 points on this very
+        // page, so choosing by it picked a paragraph with no room at all and
+        // called it the roomiest. Both numbers here come from the placements.
+        let every: Vec<f64> =
+            candidates.iter().flat_map(|b| b.lines.iter().map(|l| l.baseline as f64)).collect();
+        let reach = paragraph_geometry(&bytes, &every);
+        let right_at = |y: f64| {
+            reach.iter().find(|(at, ..)| (at - y).abs() < BASELINE_TOLERANCE).map(|(.., r)| *r)
+        };
+        let spare = |x: &crate::block::Block| {
+            let column = x.lines.iter()
+                .filter_map(|l| right_at(l.baseline as f64))
+                .fold(f64::MIN, f64::max);
+            column - right_at(x.lines.last().unwrap().baseline as f64).unwrap_or(column)
+        };
+        for (n, c) in candidates.iter().enumerate() {
+            println!("   candidate {n}: {} lines, {:.1} points spare on the last",
+                c.lines.len(), spare(c));
+        }
+        let block = candidates
+            .iter()
+            .max_by(|a, b| spare(a).partial_cmp(&spare(b)).unwrap())
+            .unwrap();
+        let baselines: Vec<f64> = block.lines.iter().map(|l| l.baseline as f64).collect();
+        let left = block.lines.iter().map(|l| l.left).fold(f32::MAX, f32::min) as f64;
+        let column = baselines.iter().filter_map(|y| right_at(*y)).fold(f64::MIN, f64::max);
+        let says = paragraph_says(&bytes, &baselines);
+        println!("a paragraph of {} lines, left {left:.2}, column {column:.2}",
+            baselines.len());
+        println!("the last line leaves {:.1} points spare", spare(block));
+        for (y, s) in baselines.iter().zip(&says) {
+            println!("   y {y:7.2}  {:2} words  {:?}",
+                s.as_deref().unwrap_or("").split_whitespace().count(),
+                s.as_deref().unwrap_or("<unreadable>").chars().take(30).collect::<String>());
+        }
+
+        // ⚠️ TWO ANSWERS TO "WHAT DOES THIS LINE SAY" IS ONE TOO MANY. The app
+        // shows what the PAGE reader made of the line and the writer finds the
+        // line by what the LINE reader makes of it, and the two do not go
+        // through the same cleaning. Print both before asking for a write.
+        {
+            let page = *doc.get_pages().values().next().unwrap();
+            let all = crate::recover::lines_of(&doc, page);
+            let font_bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+            let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+            for l in all.iter().filter(|l| (l.page_y - baselines[0]).abs() < BASELINE_TOLERANCE) {
+                let by_line = indexes
+                    .index_for(&l.base_font)
+                    .and_then(|ix| crate::recover::read_line(ix, &face, l,
+                        crate::recover::fonts_of(&doc, page).get(&l.resource)
+                            .and_then(|(_, w)| w.as_ref())));
+                println!("\n   at the baseline: {} in {}", l.glyphs.len(), l.base_font);
+                println!("      the page reader: {:?}",
+                    says[0].as_deref().unwrap_or("<none>").chars().take(24).collect::<String>());
+                println!("      the line reader: {:?}",
+                    by_line.as_deref().unwrap_or("<none>").chars().take(24).collect::<String>());
+                println!("      they agree: {}", by_line.as_deref() == says[0].as_deref());
+            }
+        }
+
+        // The reader replaces one word on the first line with a longer word.
+        let was = says[0].clone().expect("the first line could not be read");
+        let word = was
+            .split_whitespace()
+            .min_by_key(|w| w.chars().count())
+            .expect("no word to lengthen")
+            .to_string();
+        let font_bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let size = block.lines[0].size as f64;
+        // ⚠️ BIG ENOUGH TO BEAT THE SQUEEZE, AND FOUND BY WRITING IT. A
+        // single-line write first tries to land on the old width by closing the
+        // replacement's own word spaces, and on a line of seven words that
+        // absorbs a doubled word completely. How much squeeze is left is not
+        // worth predicting, so this grows the word until the page really does
+        // carry ink past the column.
+        let untouched = paragraph_geometry(&bytes, &baselines);
+        let over_the_column = |produced: &[u8]| -> usize {
+            paragraph_geometry(produced, &baselines)
+                .iter()
+                .zip(&untouched)
+                .filter(|((_, _, _, r), (.., was_r))| *r > was_r.max(column) + SETTLED)
+                .count()
+        };
+        let mut longer = word.clone();
+        let (now, alone) = loop {
+            longer.push_str(&word);
+            let now = was.replacen(&word, &longer, 1);
+            let alone = retype(&bytes, 0, baselines[0], &was, &now, MYANMAR_TEXT, Some(&indexes))
+                .expect("the one-line write was refused");
+            if over_the_column(&alone) > 0 {
+                break (now, alone);
+            }
+            assert!(longer.chars().count() < word.chars().count() * 12,
+                "nothing this test can type overflows the line");
+        };
+        let _ = (&font_bytes, size);
+        println!("\nreplacing {:?} with {} copies of itself",
+            word.chars().take(12).collect::<String>(),
+            longer.chars().count() / word.chars().count().max(1));
+        assert_ne!(now, was, "the replacement changed nothing");
+
+        let para = Paragraph {
+            baselines: &baselines,
+            says: &says,
+            edited: 0,
+            left,
+            column,
+        };
+        assert!(para.can_be_rewrapped(), "this paragraph should take the rewrap path");
+
+        // The old behaviour: one line, written past the end of its column.
+        println!("\n---- BEFORE ANY OF THIS (one line, no paragraph)");
+        for ((y, _, _, r), (.., was_r)) in
+            paragraph_geometry(&alone, &baselines).iter().zip(&untouched)
+        {
+            let past = if r > &(was_r.max(column) + SETTLED) { "  PAST THE COLUMN" } else { "" };
+            println!("   y {y:7.2}  reaches {r:7.2}{past}");
+        }
+
+        // ⚠️ AND WITH THE PARAGRAPH IT SAYS SO INSTEAD OF WRITING OFF THE END.
+        // Every paragraph on this page is two full lines: measured, 0.2, 2.6
+        // and 10.5 points spare on the last line of the three of them. There is
+        // nowhere for a word to go, so the honest answer is that the paragraph
+        // needs a line it has not got. Gaining one is the next step, and when
+        // it lands this assertion is what changes.
+        println!("\n---- WITH THE PARAGRAPH");
+        match retype_in_paragraph(&bytes, 0, &para, &now, MYANMAR_TEXT, Some(&indexes)) {
+            Ok(_) => panic!("the paragraph took a word it has no room for"),
+            Err(status) => {
+                println!("   refused with status {status}, the paragraph needs another line");
+                assert_eq!(status, STATUS_TOO_WIDE);
+            }
+        }
+        crate::close_document(handle);
+    }
+
+    /// ⚠️ WHERE A REWRAP CAN BREAK A LINE, WHICH IS NOT WHERE A PLACEMENT CAN.
+    /// `block::rewrap_from` moves whole words and finds them with
+    /// `split_whitespace`, so a paragraph it can reflow is one whose lines
+    /// carry spaces. Burmese does not always space its words, and a line that
+    /// is one unbroken run is one word to a rewrap however wide it is.
+    ///
+    ///     cargo test --release how_many_words_a_real_paragraph_offers -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn how_many_words_a_real_paragraph_offers() {
+        for (what, file) in [
+            ("HINDI", GEETA),
+            ("MYANMAR", r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf"),
+            ("MYANMAR 2", r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf"),
+        ] {
+            println!("\n================ {what}");
+            if !std::path::Path::new(file).exists() {
+                println!("not on this machine");
+                continue;
+            }
+            let on_disk = std::fs::read(file).unwrap();
+            let handle = crate::open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+            let bytes = crate::document_bytes(handle).unwrap();
+            let doc = Document::load_mem(&bytes).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let indexes = crate::recover::indexes_for_document(&doc);
+            let lines = crate::recover::lines_of(&doc, page);
+            let readings = crate::recover::read_page_with(&doc, page, &indexes);
+
+            let (blocks, _) = crate::page_blocks(handle, 0).expect("no blocks");
+            for block in blocks.iter().filter(|b| b.lines.len() >= 2) {
+                let column =
+                    block.lines.iter().map(|l| l.right).fold(f32::MIN, f32::max);
+                println!("-- a paragraph of {} lines, column {column:.1}", block.lines.len());
+                for bl in &block.lines {
+                    // What the RECOVERY writer would be given for this line,
+                    // which is what a rewrap would have to work with.
+                    let said: Vec<&str> = lines
+                        .iter()
+                        .zip(&readings)
+                        .filter(|(l, r)| {
+                            (l.page_y - bl.baseline as f64).abs() < BASELINE_TOLERANCE
+                                && r.text.is_some()
+                        })
+                        .map(|(_, r)| r.text.as_deref().unwrap())
+                        .collect();
+                    let whole = said.len() == 1;
+                    let words = said.first().map_or(0, |t| t.split_whitespace().count());
+                    println!(
+                        "   y {:7.2}  {} readable fragment(s){}  {words:3} words  {:?}",
+                        bl.baseline,
+                        said.len(),
+                        if whole { ", the whole line" } else { "" },
+                        said.first().unwrap_or(&"").chars().take(28).collect::<String>(),
+                    );
+                }
+            }
+            crate::close_document(handle);
+        }
+    }
+
     /// ⚠️ AND PLACEMENT REFLOW CANNOT SERVE THE MYANMAR BOOK AT ALL. Its
     /// producer draws a whole line in ONE placement: measured on page one,
     /// 29 lines and 29 placements, the widest 461 points of text in a single
@@ -987,7 +1445,9 @@ mod tests {
         let face_bytes = std::fs::read(NIRMALA).unwrap();
         let face = rustybuzz::Face::from_slice(&face_bytes, 0).unwrap();
         assert_eq!(
-            crate::recover::read_line(index, &face, &ours).as_deref(),
+            crate::recover::read_line(index, &face, &ours,
+                crate::recover::fonts_of(&done, page_after).get(&ours.resource)
+                    .and_then(|(_, w)| w.as_ref())).as_deref(),
             Some(NOW),
             "the writer cannot read its own replacement"
         );
