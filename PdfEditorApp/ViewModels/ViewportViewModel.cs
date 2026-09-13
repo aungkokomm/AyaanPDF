@@ -5956,6 +5956,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public bool SelectTextUnitAt(int pageIndex, double normX, double normY) =>
         SelectTextUnitAt(pageIndex, normX, normY, oneLineOnly: false, add: false);
 
+    /// <summary>
+    /// The text at a click, picked again because the unit already selected
+    /// cannot be edited; null when the fresh pick cannot be edited either.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A REFUSAL IS ASKED AGAIN BEFORE IT IS BELIEVED. On a Myanmar page the
+    /// first click usually lands while the text is still being prepared, so it
+    /// picks up one of PDFium's scrambled fragments and is rightly refused. Its
+    /// frame is the whole block, so every later click landed inside it and was
+    /// taken as "type here" on that same stale fragment: the reader was told the
+    /// script could not be retyped with the recovered line under the pointer.
+    /// The user's diag.log had four clicks after "preparing finished" and not one
+    /// new selection.
+    /// </remarks>
+    private TextUnitSelection? PickedAgainAt(int pageIndex, double normX, double normY) =>
+        SelectTextUnitAt(pageIndex, normX, normY)
+        && _selectedTextUnit is { CanEdit: true } fresh && fresh.Page == pageIndex
+            ? fresh
+            : null;
+
     /// <summary>Drops the selected unit and its box.</summary>
     public void ClearTextUnitSelection()
     {
@@ -11195,6 +11215,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         if (!IsEditMode) { return false; }
         if (_selectedTextUnit is not { } unit || unit.Page != pageIndex) { return false; }
+        if (!unit.CanEdit && PickedAgainAt(pageIndex, normX, normY) is { } fresh) { unit = fresh; }
 
         if (!unit.CanEdit)
         {

@@ -238,6 +238,25 @@ public class TextUnitGestureTests
     }
 
     [Fact]
+    public void a_refused_unit_is_picked_again_at_the_click_before_the_refusal_is_shown()
+    {
+        // ⚠️ A Myanmar click made while the text is still being prepared selects a
+        // scrambled fragment, and every later click inside its block frame used
+        // to go straight to that stale refusal. The pick must be asked again
+        // first, and only a fresh pick that still cannot be edited is refused.
+        string body = Body(ViewModel(), "public bool BeginInPlaceEdit(");
+
+        int again = body.IndexOf("PickedAgainAt(pageIndex, normX, normY)", StringComparison.Ordinal);
+        int refused = body.IndexOf("ShowUnitNotice(unit.RefusalReason)", StringComparison.Ordinal);
+        Assert.True(again > 0, "a refused unit is never picked again");
+        Assert.True(again < refused, "the refusal is shown before the unit is picked again");
+
+        string helper = Body(ViewModel(), "private TextUnitSelection? PickedAgainAt(");
+        Assert.Contains("SelectTextUnitAt(pageIndex, normX, normY)", helper, StringComparison.Ordinal);
+        Assert.Contains("CanEdit: true", helper, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void a_click_anywhere_else_drops_the_box()
     {
         string select = SelectCase();
