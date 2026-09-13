@@ -55,9 +55,14 @@ internal static class RecoveryGateway
     /// ⚠️ <paramref name="expected"/> MUST BE EXACTLY WHAT WAS READ. The core
     /// re-derives the page's lines and refuses if none of them still says this,
     /// which is what stops a stale selection overwriting whatever is there now.
+    ///
+    /// ⚠️ AND <paramref name="atLeft"/> IS WHAT LETS A REPEATED WORD BE
+    /// EDITED. A baseline and a word do not name a placement when the line says
+    /// the same word twice; this is the left edge of the one the reader picked,
+    /// normalized the way the whole app draws.
     /// </remarks>
     public static byte[]? Retype(
-        ulong docHandle, int pageIndex, double pdfBaseline,
+        ulong docHandle, int pageIndex, double pdfBaseline, double atLeft,
         string expected, string newText, string fontPath)
     {
         byte[] want = Encoding.UTF8.GetBytes(expected);
@@ -65,7 +70,7 @@ internal static class RecoveryGateway
         byte[] font = Encoding.UTF8.GetBytes(fontPath);
 
         var buffer = RenderCoreNative.retype_recovered_line(
-            docHandle, pageIndex, (float)pdfBaseline,
+            docHandle, pageIndex, (float)pdfBaseline, (float)atLeft,
             want, (nuint)want.Length,
             text, (nuint)text.Length,
             font, (nuint)font.Length);

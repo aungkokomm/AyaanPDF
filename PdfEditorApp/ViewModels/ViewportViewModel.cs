@@ -5504,10 +5504,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         var before = Capture(HistoryScope.Document, "Edit line", null);
 
         byte[]? bytes = Interop.RecoveryGateway.Retype(
-            _documentHandle, page, recovered.PdfBaseline, recovered.Text, newText, fontPath);
+            _documentHandle, page, recovered.PdfBaseline, recovered.Left,
+            recovered.Text, newText, fontPath);
         if (bytes is null)
         {
-            Diag.Log($"EditRecoveredLine p{page} refused at baseline {recovered.PdfBaseline}");
+            Diag.Log($"EditRecoveredLine p{page} refused at baseline "
+                + $"{recovered.PdfBaseline} left {recovered.Left}");
+            // ⚠️ AND THE READER IS TOLD, rather than watching their typing
+            // disappear. `Status` is displayed nowhere; the notice is what the
+            // refusal paths beside this one already use.
+            ShowUnitNotice("This text could not be retyped.");
             Status = "This line could not be retyped.";
             return false;
         }

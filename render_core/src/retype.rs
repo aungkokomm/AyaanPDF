@@ -781,6 +781,14 @@ fn share(spaces: &[usize], by: f64) -> Vec<Break> {
 /// needs the widths the page declares. See `recover::read_line`: without them a
 /// line carrying an undrawable code is shown to the reader and then refused to
 /// the writer.
+///
+/// ⚠️ AND A WORD THAT APPEARS TWICE ON ITS LINE NEEDS `at` TO BE EDITED AT
+/// ALL. A baseline and a word do not name a placement on a book that draws one
+/// word per placement: measured on the Geeta page, 103 of its 514 readable
+/// placements have a twin on their own line, and one line of prose carries two
+/// each of four different words. Refusing all of them is right when there is
+/// nothing to choose by, and `at` is that something: where the reader clicked,
+/// in PDF user space.
 fn the_one_that_says<'a>(
     lines: &'a [Line],
     baseline: f64,
@@ -788,20 +796,32 @@ fn the_one_that_says<'a>(
     indexes: &crate::recover::Indexes,
     face: &rustybuzz::Face,
     widths: &Widths,
+    at: Option<f64>,
 ) -> Option<&'a Line> {
-    let mut found = None;
+    let mut said: Vec<&Line> = Vec::new();
     for line in crate::recover::lines_at(lines, baseline) {
         let Some(index) = indexes.index_for(&line.base_font) else { continue };
         let mine = widths.get(&line.resource).and_then(|(_, w)| w.as_ref());
-        if crate::recover::read_line(index, face, line, mine).as_deref() != Some(expected) {
-            continue;
+        if crate::recover::read_line(index, face, line, mine).as_deref() == Some(expected) {
+            said.push(line);
         }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(line);
     }
-    found
+    match (said.len(), at) {
+        (1, _) => said.into_iter().next(),
+        (0, _) | (_, None) => None,
+        // ⚠️ NEAREST, AND ONLY IF IT IS REALLY NEAR. A hint that lands
+        // nowhere close to any of them is a stale selection, and picking the
+        // least distant of several wrong answers would edit a word the reader
+        // is not looking at.
+        (_, Some(at)) => {
+            let near = said
+                .into_iter()
+                .min_by(|a, b| {
+                    (a.page_x() - at).abs().total_cmp(&(b.page_x() - at).abs())
+                })?;
+            ((near.page_x() - at).abs() <= near.size * 2.0).then_some(near)
+        }
+    }
 }
 
 fn says_it(
@@ -811,8 +831,9 @@ fn says_it(
     indexes: &crate::recover::Indexes,
     face: &rustybuzz::Face,
     widths: &Widths,
+    at: Option<f64>,
 ) -> bool {
-    the_one_that_says(lines, baseline, expected, indexes, face, widths).is_some()
+    the_one_that_says(lines, baseline, expected, indexes, face, widths, at).is_some()
 }
 
 /// Replaces the text of one recovered line, returning the document's new bytes.
@@ -840,7 +861,7 @@ pub(crate) fn retype(
     font_path: &str,
     lent: Option<&crate::recover::Indexes>,
 ) -> Result<Vec<u8>, i32> {
-    retype_within(bytes, page_index, baseline, expected, new_text, font_path, lent, None)
+    retype_within(bytes, page_index, baseline, expected, new_text, font_path, lent, None, None)
 }
 
 /// Gives the paragraph one more line to write into, and moves the page below it
@@ -972,9 +993,10 @@ pub(crate) fn retype_in_paragraph(
     new_text: &str,
     font_path: &str,
     lent: Option<&crate::recover::Indexes>,
+    at: Option<f64>,
 ) -> Result<Vec<u8>, i32> {
     retype_in_paragraph_within(
-        bytes, page_index, para, new_text, font_path, lent, para.baselines.len())
+        bytes, page_index, para, new_text, font_path, lent, para.baselines.len(), at)
 }
 
 /// The same, remembering how many lines the paragraph started with so a
@@ -987,11 +1009,12 @@ fn retype_in_paragraph_within(
     font_path: &str,
     lent: Option<&crate::recover::Indexes>,
     growing: usize,
+    at: Option<f64>,
 ) -> Result<Vec<u8>, i32> {
     if para.baselines.len() != para.says.len() || para.edited >= para.baselines.len() {
         return Err(STATUS_INVALID_INPUT);
     }
-    let at = para.baselines[para.edited];
+    let on = para.baselines[para.edited];
     let Some(was) = para.says[para.edited].as_deref() else {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     };
@@ -1017,8 +1040,10 @@ fn retype_in_paragraph_within(
         below: &para.baselines[para.edited + 1..],
         leading: leading_of(para.baselines),
     };
-    let carry_instead =
-        || retype_within(bytes, page_index, at, was, new_text, font_path, Some(indexes), Some(&room));
+    let carry_instead = || {
+        retype_within(
+            bytes, page_index, on, was, new_text, font_path, Some(indexes), Some(&room), at)
+    };
 
     if !para.can_be_rewrapped() {
         return carry_instead();
@@ -1035,7 +1060,8 @@ fn retype_in_paragraph_within(
         Refill::Rewrapped(lines) => lines,
         // Nothing to reflow, so this is the write it always was.
         Refill::Fits | Refill::Unmeasurable => {
-            return retype(bytes, page_index, at, was, new_text, font_path, Some(indexes));
+            return retype_within(
+                bytes, page_index, on, was, new_text, font_path, Some(indexes), None, at);
         }
         // ⚠️ OR THE PARAGRAPH TAKES ANOTHER LINE AND TRIES AGAIN. The copy
         // says what the line it was copied from says, so the paragraph handed
@@ -1075,7 +1101,7 @@ fn retype_in_paragraph_within(
                 return Err(STATUS_TOO_WIDE);
             }
             return retype_in_paragraph_within(
-                &grown, page_index, &bigger, new_text, font_path, None, growing);
+                &grown, page_index, &bigger, new_text, font_path, None, growing, at);
         }
     };
 
@@ -1110,6 +1136,7 @@ pub(crate) fn retype_within(
     font_path: &str,
     lent: Option<&crate::recover::Indexes>,
     room: Option<&Room>,
+    at: Option<f64>,
 ) -> Result<Vec<u8>, i32> {
     if new_text.is_empty() || expected.is_empty() {
         return Err(STATUS_INVALID_INPUT);
@@ -1149,7 +1176,9 @@ pub(crate) fn retype_within(
         }
     };
     let lines = crate::recover::lines_of(&doc, page);
-    if !says_it(&lines, baseline, expected, indexes, &face, &crate::recover::fonts_of(&doc, page)) {
+    if !says_it(
+        &lines, baseline, expected, indexes, &face, &crate::recover::fonts_of(&doc, page), at)
+    {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     }
 
@@ -1179,7 +1208,9 @@ pub(crate) fn retype_within(
     // arriving at the answer already in hand.
     let lines = crate::recover::lines_of(&doc, page);
     let declared = crate::recover::fonts_of(&doc, page);
-    let Some(line) = the_one_that_says(&lines, baseline, expected, indexes, &face, &declared) else {
+    let Some(line) =
+        the_one_that_says(&lines, baseline, expected, indexes, &face, &declared, at)
+    else {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     };
 
@@ -1303,7 +1334,8 @@ mod tests {
         ] {
             println!("---- {label}");
             let out = retype_within(
-                &bytes, 0, target.page_y, &was, &now, NIRMALA, Some(&indexes), room.as_ref());
+                &bytes, 0, target.page_y, &was, &now, NIRMALA, Some(&indexes), room.as_ref(),
+                None);
             let produced = out.unwrap_or_else(|status| {
                 panic!("{label} refused with status {status}");
             });
@@ -1518,7 +1550,7 @@ mod tests {
             .map(|(y, _)| *y).fold(f64::MAX, f64::min);
         let was_floor = floor(&bytes);
 
-        let grown = retype_in_paragraph(&bytes, 0, &para, &now, MYANMAR_TEXT, Some(&indexes))
+        let grown = retype_in_paragraph(&bytes, 0, &para, &now, MYANMAR_TEXT, Some(&indexes), None)
             .expect("the paragraph refused to grow");
 
         let dropped = was_floor - floor(&grown);
@@ -1643,7 +1675,7 @@ mod tests {
                 continue;
             }
             if let Some(found) =
-                the_one_that_says(lines, baseline, &text, indexes, &face, &widths)
+                the_one_that_says(lines, baseline, &text, indexes, &face, &widths, None)
             {
                 return Some((found, text));
             }
@@ -1697,6 +1729,166 @@ mod tests {
                 println!("the object around the first of them: {ops:?}");
             }
         }
+    }
+
+    /// ⚠️ HOW MANY OF A PAGE'S WORDS THE WRITER CAN ACTUALLY FIND. It finds
+    /// the placement to replace by what that placement SAYS, and refuses when
+    /// two placements on one baseline say the same thing, because it cannot
+    /// tell which the reader meant. On a book that draws one word per placement
+    /// that tie is not rare at all: the same short word appears several times
+    /// in one line of prose.
+    ///
+    ///     cargo test --release how_many_words_the_writer_can_find -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn how_many_words_the_writer_can_find() {
+        for (what, file, font) in [
+            ("HINDI", GEETA, NIRMALA),
+            ("MYANMAR", MYANMAR_BOOK, MYANMAR_TEXT),
+        ] {
+            println!("\n================ {what}");
+            if !std::path::Path::new(file).exists() || !std::path::Path::new(font).exists() {
+                println!("not on this machine");
+                continue;
+            }
+            let bytes = std::fs::read(file).unwrap();
+            let doc = Document::load_mem(&bytes).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let indexes = crate::recover::indexes_for_document(&doc);
+            let lines = crate::recover::lines_of(&doc, page);
+            let readings = crate::recover::read_page_with(&doc, page, &indexes);
+            let widths = crate::recover::fonts_of(&doc, page);
+            let font_bytes = std::fs::read(font).unwrap();
+            let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+
+            let (mut readable, mut findable, mut with_a_hint) = (0usize, 0usize, 0usize);
+            let mut ties: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for (line, reading) in lines.iter().zip(&readings) {
+                let Some(text) = reading.text.as_deref() else { continue };
+                readable += 1;
+                if the_one_that_says(&lines, line.page_y, text, &indexes, &face, &widths, None)
+                    .is_some()
+                {
+                    findable += 1;
+                } else {
+                    *ties.entry(text.to_string()).or_default() += 1;
+                }
+                // And again the way the app asks now, saying where it clicked.
+                if the_one_that_says(
+                    &lines, line.page_y, text, &indexes, &face, &widths, Some(line.page_x()))
+                    .is_some()
+                {
+                    with_a_hint += 1;
+                }
+            }
+            println!("{readable} readable placements, {findable} findable by text alone, \n                      {with_a_hint} findable when the app says where it clicked");
+            println!("{} it cannot, because another placement on the same line says the same",
+                readable - findable);
+            let mut worst: Vec<(&String, &usize)> = ties.iter().collect();
+            worst.sort_by(|a, b| b.1.cmp(a.1));
+            for (text, n) in worst.iter().take(8) {
+                println!("   {n:3} x {:?}", text.chars().take(18).collect::<String>());
+            }
+        }
+    }
+
+    /// ⚠️ THE WORD THE READER ACTUALLY LOST. On the Geeta page, line 297.48
+    /// says four different words twice each, and every one of them was refused
+    /// because a baseline and a word do not name a placement. The reader's own
+    /// log: three `EditRecoveredLine p0 refused at baseline 297.48004150390625`
+    /// in five minutes, and the app dropped the typing without a word.
+    ///
+    ///     cargo test --release a_repeated_word_is_edited_where_it_was_clicked -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn a_repeated_word_is_edited_where_it_was_clicked() {
+        if !std::path::Path::new(GEETA).exists() || !std::path::Path::new(NIRMALA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(GEETA).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let widths = crate::recover::fonts_of(&doc, page);
+        let font_bytes = std::fs::read(NIRMALA).unwrap();
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+
+        // A word that really is said twice on one line of this book.
+        let mut twice: Option<(f64, String, Vec<f64>)> = None;
+        for (line, reading) in lines.iter().zip(&readings) {
+            let Some(text) = reading.text.clone() else { continue };
+            if text.chars().count() < 2 {
+                continue;
+            }
+            let xs: Vec<f64> = lines.iter().zip(&readings)
+                .filter(|(l, r)| (l.page_y - line.page_y).abs() < BASELINE_TOLERANCE
+                    && r.text.as_ref() == Some(&text))
+                .map(|(l, _)| l.page_x())
+                .collect();
+            if xs.len() >= 2 {
+                twice = Some((line.page_y, text, xs));
+                break;
+            }
+        }
+        let Some((baseline, text, xs)) = twice else {
+            println!("no word is said twice on any line of this page");
+            return;
+        };
+        println!("{:?} is said {} times on the line at {baseline:.2}, at x {:?}",
+            text.chars().take(14).collect::<String>(), xs.len(),
+            xs.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>());
+
+        // ⚠️ WITHOUT THE HINT IT IS REFUSED, and that is still right: there
+        // is nothing to choose by.
+        assert!(
+            the_one_that_says(&lines, baseline, &text, &indexes, &face, &widths, None).is_none(),
+            "a word said twice on its line should not be guessed at");
+
+        // ⚠️ AND WITH IT, EACH ONE IS ITSELF.
+        for want in &xs {
+            let found = the_one_that_says(
+                &lines, baseline, &text, &indexes, &face, &widths, Some(*want))
+                .expect("the writer could not find the word the reader clicked");
+            println!("   asked at {want:7.2}  found the one at {:7.2}", found.page_x());
+            assert!((found.page_x() - want).abs() < 0.01,
+                "asked for the word at {want:.2} and got the one at {:.2}", found.page_x());
+        }
+
+        // ⚠️ AND A HINT FROM NOWHERE NEAR IS STILL REFUSED, or a stale
+        // selection would quietly edit whichever word happened to be closest.
+        assert!(
+            the_one_that_says(&lines, baseline, &text, &indexes, &face, &widths, Some(-500.0))
+                .is_none(),
+            "a hint that lands nowhere near should not pick a word anyway");
+
+        // And the whole write goes through, on the SECOND of them.
+        let last = xs.iter().cloned().fold(f64::MIN, f64::max);
+        let now = format!("{text}{text}");
+        let out = retype_within(
+            &bytes, 0, baseline, &text, &now, NIRMALA, Some(&indexes), None, Some(last))
+            .expect("the writer refused a word it had just found");
+
+        let after = Document::load_mem(&out).unwrap();
+        let p2 = *after.get_pages().values().next().unwrap();
+        let ix = crate::recover::indexes_for_document(&after);
+        let said: Vec<String> = crate::recover::lines_of(&after, p2)
+            .iter()
+            .zip(&crate::recover::read_page_with(&after, p2, &ix))
+            .filter(|(l, _)| (l.page_y - baseline).abs() < BASELINE_TOLERANCE)
+            .filter_map(|(_, r)| r.text.clone())
+            .collect();
+        println!("   after the write the line says {} x {:?} and {} x the doubled one",
+            said.iter().filter(|t| **t == text).count(),
+            text.chars().take(14).collect::<String>(),
+            said.iter().filter(|t| **t == now).count());
+        assert_eq!(said.iter().filter(|t| **t == now).count(), 1,
+            "the doubled word is not on the line");
+        assert_eq!(said.iter().filter(|t| **t == text).count(), xs.len() - 1,
+            "the wrong copy of the word was changed");
     }
 
     /// Every baseline the page draws on, top first, and how many placements.
@@ -1829,7 +2021,7 @@ mod tests {
             "the Hindi paragraph should take the placement path, not the rewrap");
 
         let produced =
-            retype_in_paragraph(&bytes, 0, &para, &now, NIRMALA, Some(&indexes))
+            retype_in_paragraph(&bytes, 0, &para, &now, NIRMALA, Some(&indexes), None)
                 .expect("the paragraph refused to grow");
         let after = every_baseline(&produced);
 
@@ -1943,7 +2135,7 @@ mod tests {
 
         let room = Room { left, column, below: &baselines[1..], leading: leading_of(&baselines) };
         let out = retype_within(
-            &bytes, 0, target.page_y, &was, &now, FONT, Some(&indexes), Some(&room));
+            &bytes, 0, target.page_y, &was, &now, FONT, Some(&indexes), Some(&room), None);
         match out {
             Ok(_) => panic!("the line was reflowed, so this book is no longer one placement a line"),
             Err(status) => {
@@ -2765,7 +2957,7 @@ mod tests {
             // The FFI the app calls, timed: this is what the reader waits for.
             let started = std::time::Instant::now();
             let buffer = crate::retype_recovered_line(
-                handle, 0, line.y as f32,
+                handle, 0, line.y as f32, -1.0,
                 was.as_ptr(), was.len(),
                 now.as_ptr(), now.len(),
                 FONT.as_ptr(), FONT.len(),

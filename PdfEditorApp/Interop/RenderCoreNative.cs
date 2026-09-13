@@ -828,6 +828,14 @@ internal static partial class RenderCoreNative
     /// the page and refuses if no line still says this, so a stale selection
     /// cannot overwrite whatever now sits at that baseline.
     ///
+    /// ⚠️ AND THOSE TWO ARE NOT ENOUGH ON THEIR OWN. On a book that draws one
+    /// word per placement the same word appears twice in a line of prose, and
+    /// the core refuses what it cannot tell apart: measured on a real Hindi
+    /// page, 103 of 514 readable placements have a twin on their own line, so a
+    /// fifth of its words could not be edited at all. <paramref name="atLeft"/>
+    /// is the left edge of the one the reader picked, normalized exactly as
+    /// <c>recover_page_text</c> reported it. Negative means no hint.
+    ///
     /// <paramref name="fontPathUtf8"/> is an INSTALLED font file, never the
     /// subset the document embeds: a subset has its layout tables pruned, and
     /// shaping through one was measured producing two .notdef and seven wrong
@@ -835,7 +843,7 @@ internal static partial class RenderCoreNative
     /// </remarks>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     public static extern ByteBuffer retype_recovered_line(
-        ulong docHandle, int pageIndex, float baseline,
+        ulong docHandle, int pageIndex, float baseline, float atLeft,
         [In] byte[] expectedUtf8, nuint expectedLen,
         [In] byte[] newTextUtf8, nuint newTextLen,
         [In] byte[] fontPathUtf8, nuint fontPathLen);

@@ -2102,12 +2102,21 @@ fn indexes_for_doc(
 /// The line is named by its page and baseline, and by `expected_utf8`, what the
 /// caller believes it says. The line is recovered again here and must still say
 /// exactly that, so a stale selection cannot overwrite what has replaced it.
+///
+/// ⚠️ AND BY `at_left`, WITHOUT WHICH A REPEATED WORD CANNOT BE EDITED. A
+/// baseline and a word do not name a placement on a book that draws one word
+/// per placement, and the writer refuses what it cannot tell apart: measured on
+/// the Geeta page, 103 of 514 readable placements have a twin on their own
+/// line, and the reader hit one of them. This is the left edge of the placement
+/// they picked, NORMALIZED THE WAY THE APP DRAWS, the same number
+/// `recover_page_text` reported for it. Pass a negative value for no hint.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn retype_recovered_line(
     doc_handle: u64,
     page_index: i32,
     baseline: f32,
+    at_left: f32,
     expected_utf8: *const u8,
     expected_len: usize,
     new_text_utf8: *const u8,
@@ -2143,6 +2152,19 @@ pub extern "C" fn retype_recovered_line(
         // nothing has prepared the document, retype builds its own as before.
         let ready = cached_indexes(doc_handle);
 
+        // ⚠️ BACK INTO PDF USER SPACE, WHERE THE PLACEMENTS ARE. The app
+        // reports every x divided by the page WIDTH from the crop box's left,
+        // and `recover_page_text` is what told it so; this is that same sum
+        // undone. See `recover::page_box`.
+        let at = (at_left >= 0.0)
+            .then(|| {
+                let doc = lopdf::Document::load_mem(&bytes).ok()?;
+                let page = *doc.get_pages().values().nth(page_index as usize)?;
+                let (page_left, _, page_w) = recover::page_box(&doc, page)?;
+                Some(page_left + at_left as f64 * page_w)
+            })
+            .flatten();
+
         // ⚠️ AND THE PARAGRAPH GOES WITH IT WHENEVER THERE IS ONE. A line
         // edited on its own can only slide what is beside it; a line edited
         // inside its paragraph can reflow, carry words down, and gain a line.
@@ -2165,10 +2187,11 @@ pub extern "C" fn retype_recovered_line(
                 &new_text,
                 &font_path,
                 ready.as_deref(),
+                at,
             ),
-            None => retype::retype(
+            None => retype::retype_within(
                 &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
-                ready.as_deref(),
+                ready.as_deref(), None, at,
             ),
         };
 
@@ -2177,9 +2200,9 @@ pub extern "C" fn retype_recovered_line(
         // keystroke because the paragraph is full would be a worse answer than
         // the one the app gave before any of this existed.
         let written = match written {
-            Err(_) if framed.is_some() => retype::retype(
+            Err(_) if framed.is_some() => retype::retype_within(
                 &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
-                ready.as_deref(),
+                ready.as_deref(), None, at,
             ),
             other => other,
         };
@@ -28509,7 +28532,7 @@ p={spread_px:.4},c={rgba:08X})"
         let text = new_text.as_bytes();
         let path = font.as_bytes();
         let buffer = retype_recovered_line(
-            handle, 0, baseline,
+            handle, 0, baseline, -1.0,
             want.as_ptr(), want.len(),
             text.as_ptr(), text.len(),
             path.as_ptr(), path.len());
@@ -28633,7 +28656,7 @@ p={spread_px:.4},c={rgba:08X})"
         // 4. And writes.
         const NOW: &str = "नमस\u{94D}ते";
         let out = retype_recovered_line(
-            handle, 0, line.pdf_baseline,
+            handle, 0, line.pdf_baseline, -1.0,
             line.text.as_ptr(), line.text.len(),
             NOW.as_ptr(), NOW.len(),
             line.font_path.as_ptr(), line.font_path.len(),
