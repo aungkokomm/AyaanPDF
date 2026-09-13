@@ -70,7 +70,21 @@ impl Linear {
 /// relative to the line matrix that `Tm` set. Moving the `Tm` carries every
 /// relative step taken after it, which is exactly what is wanted, and it is
 /// also why one `Tm` can govern more than one showing operation.
-fn placements(content: &Content) -> BTreeMap<usize, (usize, Linear)> {
+/// Which `Tm` places each showing operation, and the transform in force.
+///
+/// ⚠️ SEVERAL PLACEMENTS CAN SHARE ONE `Tm`. A producer that writes one `Tm`
+/// and then several `TJ`s has drawn them all with one pen, so they can only
+/// move together: [`move_placements`] refuses a set that would take one of them
+/// and leave its neighbour. Anything choosing where to split a line has to know
+/// this before it chooses.
+///
+/// ⚠️ AND A TEXT OBJECT NEED NOT WRITE A `Tm` AT ALL. One that opens with
+/// `Td` or `TD` starts from the identity, and that offset is then the only
+/// thing placing it. Measured on the Geeta book: 30 of its 1,651 showing
+/// operations are `BT Tr Tf TD Tj ET`, and treating them as unplaceable meant
+/// no paragraph on the page could push the page below it down, because the
+/// whole move was refused for the sake of 1.8% of it.
+pub(crate) fn placements(content: &Content) -> BTreeMap<usize, (usize, Linear)> {
     let mut out = BTreeMap::new();
     let mut stack: Vec<Linear> = Vec::new();
     let mut ctm = Linear::IDENTITY;
@@ -89,6 +103,9 @@ fn placements(content: &Content) -> BTreeMap<usize, (usize, Linear)> {
             "BT" => placed = None,
             "ET" => placed = None,
             "Tm" => placed = Some(at),
+            // Only the FIRST of them, and only with no `Tm` before it: after
+            // that the pen has an anchor already and these move relative to it.
+            "Td" | "TD" if placed.is_none() => placed = Some(at),
             "TJ" | "Tj" => {
                 if let Some(tm) = placed {
                     out.insert(at, (tm, ctm));
@@ -266,18 +283,26 @@ pub(crate) fn move_placements(
         }
     }
 
+    // ⚠️ A `TD` ALSO SETS THE LEADING, so moving one by changing its second
+    // operand would change how far every later `T*` drops. None of the objects
+    // this was written for has one, and the ones that do are left alone rather
+    // than quietly re-spaced.
+    let leading_matters = |from: usize| -> bool {
+        content.operations[from..]
+            .iter()
+            .take_while(|op| op.operator != "ET")
+            .any(|op| matches!(op.operator.as_str(), "T*" | "'" | "\""))
+    };
+
+    let mut rewrite: Vec<(usize, Vec<Object>)> = Vec::new();
     for (tm, ctm) in &moving {
         let Some((de, df)) = ctm.undo(dx, dy) else {
             return Err(STATUS_LINE_NOT_REWRITABLE);
         };
-        let op = &mut content.operations[*tm];
+        let op = &content.operations[*tm];
         let m: Vec<f64> = op.operands.iter().filter_map(number).collect();
-        if m.len() != 6 {
-            return Err(STATUS_LINE_NOT_REWRITABLE);
-        }
-        *op = Operation::new(
-            "Tm",
-            vec![
+        let operands = match (op.operator.as_str(), m.len()) {
+            ("Tm", 6) => vec![
                 Object::Real(m[0] as f32),
                 Object::Real(m[1] as f32),
                 Object::Real(m[2] as f32),
@@ -285,7 +310,24 @@ pub(crate) fn move_placements(
                 Object::Real((m[4] + de) as f32),
                 Object::Real((m[5] + df) as f32),
             ],
-        );
+            // ⚠️ AND THE OFFSET IS IN THE SAME FRAME AS A `Tm`'s. With no
+            // `Tm` before it the text matrix is the identity, so what `Td`
+            // writes is what `Tm` would have written in positions five and six.
+            ("Td", 2) => vec![
+                Object::Real((m[0] + de) as f32),
+                Object::Real((m[1] + df) as f32),
+            ],
+            ("TD", 2) if !leading_matters(*tm) => vec![
+                Object::Real((m[0] + de) as f32),
+                Object::Real((m[1] + df) as f32),
+            ],
+            _ => return Err(STATUS_LINE_NOT_REWRITABLE),
+        };
+        rewrite.push((*tm, operands));
+    }
+    for (at, operands) in rewrite {
+        let operator = content.operations[at].operator.clone();
+        content.operations[at] = Operation::new(&operator, operands);
     }
 
     Ok(())
