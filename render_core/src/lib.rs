@@ -2142,10 +2142,49 @@ pub extern "C" fn retype_recovered_line(
         // turns forty seconds of work into none. Asked without blocking: if
         // nothing has prepared the document, retype builds its own as before.
         let ready = cached_indexes(doc_handle);
-        match retype::retype(
-            &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
-            ready.as_deref(),
-        ) {
+
+        // ⚠️ AND THE PARAGRAPH GOES WITH IT WHENEVER THERE IS ONE. A line
+        // edited on its own can only slide what is beside it; a line edited
+        // inside its paragraph can reflow, carry words down, and gain a line.
+        // Which of those happens is decided from what the paragraph's lines
+        // turn out to say, not from the script they are written in.
+        let framed = paragraph_around(doc_handle, page_index, baseline as f64, &expected);
+        let written = match &framed {
+            Some((baselines, says, edited, left, column, complete)) => retype::retype_in_paragraph(
+                &bytes,
+                page_index,
+                &retype::Paragraph {
+                    baselines,
+                    says,
+                    edited: *edited,
+                    left: *left,
+                    column: *column,
+                    complete: *complete,
+                    copied: 0,
+                },
+                &new_text,
+                &font_path,
+                ready.as_deref(),
+            ),
+            None => retype::retype(
+                &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
+                ready.as_deref(),
+            ),
+        };
+
+        // ⚠️ AND A PARAGRAPH THAT CANNOT TAKE IT STILL LETS THE LINE BE
+        // EDITED. Reflow is what the edit would LIKE to do; refusing the
+        // keystroke because the paragraph is full would be a worse answer than
+        // the one the app gave before any of this existed.
+        let written = match written {
+            Err(_) if framed.is_some() => retype::retype(
+                &bytes, page_index, baseline as f64, &expected, &new_text, &font_path,
+                ready.as_deref(),
+            ),
+            other => other,
+        };
+
+        match written {
             Ok(out) => {
                 let mut boxed = out.into_boxed_slice();
                 let buffer = ByteBuffer {
@@ -2162,6 +2201,93 @@ pub extern "C" fn retype_recovered_line(
     .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
 }
 
+
+/// The paragraph the app has framed around this baseline, ready for the reflow.
+///
+/// ⚠️ THE BLOCK MODEL IS THE APP'S PARAGRAPH, and this asks it rather than
+/// working one out again. It is what frames the text the reader clicked into,
+/// so it is the paragraph they think they are editing. Two attempts to derive
+/// one from placements instead failed on these very books.
+///
+/// ⚠️ AND THE COLUMN IS MEASURED FROM THE PLACEMENTS, NOT TAKEN FROM THE
+/// BLOCK. `BlockLine::right` is PDFium's idea of where the ink stops and the
+/// reflow moves text by the advances the file declares; on the Geeta page the
+/// two disagree by 411 points on one line, which is the difference between a
+/// paragraph with room in it and one without.
+///
+/// Nothing here decides HOW the paragraph will reflow. `retype_in_paragraph`
+/// does that from what the lines turn out to say.
+fn paragraph_around(
+    doc_handle: u64,
+    page_index: i32,
+    baseline: f64,
+    expected: &str,
+) -> Option<(Vec<f64>, Vec<Option<String>>, usize, f64, f64, bool)> {
+    const NEAR: f64 = 0.5;
+
+    let (blocks, _) = page_blocks(doc_handle, page_index).ok()?;
+    let block = blocks.iter().find(|b| {
+        b.lines.len() >= 2
+            && b.lines.iter().any(|l| (l.baseline as f64 - baseline).abs() < NEAR)
+    })?;
+    let baselines: Vec<f64> = block.lines.iter().map(|l| l.baseline as f64).collect();
+    let edited = baselines.iter().position(|y| (y - baseline).abs() < NEAR)?;
+
+    let bytes = document_bytes(doc_handle)?;
+    let doc = lopdf::Document::load_mem(&bytes).ok()?;
+    let page = *doc.get_pages().values().nth(page_index as usize)?;
+    let lines = recover::lines_of(&doc, page);
+    let widths = recover::fonts_of(&doc, page);
+
+    let held;
+    let indexes = match cached_indexes(doc_handle) {
+        Some(ready) => ready,
+        None => {
+            held = std::sync::Arc::new(recover::indexes_for_document(&doc));
+            held
+        }
+    };
+    let readings = recover::read_page_with(&doc, page, &indexes);
+
+    // What each line says, and where the ink on it really stops.
+    let mut says: Vec<Option<String>> = vec![None; baselines.len()];
+    let (mut left, mut column) = (f64::MAX, f64::MIN);
+    for (line, reading) in lines.iter().zip(&readings) {
+        let Some(i) = baselines.iter().position(|y| (line.page_y - y).abs() < NEAR) else {
+            continue;
+        };
+        if says[i].is_none() {
+            says[i] = reading.text.clone();
+        }
+        left = left.min(line.page_x());
+        if let Some((_, Some(w))) = widths.get(&line.resource) {
+            column = column
+                .max(line.page_x() + line.along_baseline(recover::advance_of(line, w)).0);
+        }
+    }
+    // ⚠️ THE CALLER'S OWN WORD FOR THE LINE IT IS EDITING. On a book whose
+    // visual line is many placements there is no one thing that line "says",
+    // and what the writer must look for is the fragment the reader clicked.
+    says[edited] = Some(expected.to_string());
+
+    // ⚠️ AND WHETHER WHAT WE HAVE IS THE LINES OR ONLY PIECES OF THEM. A
+    // baseline drawn by a single placement is a line recovery reads whole; one
+    // drawn by several is a line we have fragments of, whatever those fragments
+    // happen to say. Only the first kind may be rewrapped.
+    let mut drawn = vec![0usize; baselines.len()];
+    for line in &lines {
+        if let Some(i) = baselines.iter().position(|y| (line.page_y - y).abs() < NEAR) {
+            drawn[i] += 1;
+        }
+    }
+    let complete = drawn.iter().all(|n| *n == 1)
+        && lines.iter().zip(&readings).all(|(l, r)| {
+            !baselines.iter().any(|y| (l.page_y - y).abs() < NEAR) || r.text.is_some()
+        });
+
+    (left < f64::MAX && column > f64::MIN)
+        .then_some((baselines, says, edited, left, column, complete))
+}
 
 /// Moves a line, or the whole paragraph it belongs to, across the page.
 ///
@@ -28278,6 +28404,102 @@ p={spread_px:.4},c={rgba:08X})"
         let now: Vec<String> = after.iter().filter(|(ry, _)| (ry - y).abs() >= 0.5)
             .map(|(_, t)| t.clone()).collect();
         assert_eq!(before, now, "another line changed");
+    }
+
+    /// ⚠️ THE WHOLE THING THROUGH THE CALL THE APP ACTUALLY MAKES, on both
+    /// of the reader's scripts, with no paragraph passed in and none asked for:
+    /// `retype_recovered_line` finds the paragraph itself and the two books
+    /// take the two different mechanisms without being told which.
+    ///
+    ///     cargo test --release both_scripts_reflow_through_the_app_s_own_call -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn both_scripts_reflow_through_the_app_s_own_call() {
+        const HINDI: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        const MYANMAR: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf";
+
+        for (what, file, font) in [
+            ("HINDI", HINDI, r"C:\Windows\Fonts\NIRMALA.TTF"),
+            ("MYANMAR", MYANMAR, r"C:\Windows\Fonts\mmrtext.ttf"),
+        ] {
+            println!("\n================ {what}");
+            if !std::path::Path::new(file).exists() || !std::path::Path::new(font).exists() {
+                println!("not on this machine");
+                continue;
+            }
+            let on_disk = std::fs::read(file).unwrap();
+            let handle = open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+            let bytes = document_bytes(handle);
+            let doc = lopdf::Document::load_mem(&bytes).unwrap();
+            let page = *doc.get_pages().values().next().unwrap();
+            let indexes = recover::indexes_for_document(&doc);
+            let lines = recover::lines_of(&doc, page);
+            let readings = recover::read_page_with(&doc, page, &indexes);
+
+            // Any line the app could offer, inside a paragraph it has framed.
+            let Some((baseline, was, framed)) = lines.iter().zip(&readings).find_map(|(l, r)| {
+                let text = r.text.clone()?;
+                if text.chars().count() < 2 || text.trim() != text {
+                    return None;
+                }
+                let framed = paragraph_around(handle, 0, l.page_y, &text)?;
+                Some((l.page_y, text, framed))
+            }) else {
+                println!("nothing on page one is both readable and inside a paragraph");
+                close_document(handle);
+                continue;
+            };
+            let (baselines, says, edited, left, column, complete) = &framed;
+            let readable = says.iter().filter(|s| s.is_some()).count();
+            println!("a paragraph of {} lines, {readable} of them readable, \
+                      editing line {edited}, left {left:.1} column {column:.1}",
+                baselines.len());
+            println!("the mechanism this picks: {}",
+                if *complete && says[*edited..].iter().all(Option::is_some) {
+                    "rewrap the text"
+                } else {
+                    "carry the placements"
+                });
+
+            // Long enough that the line it is on cannot hold it.
+            let now = was.repeat(3);
+            let floor = |b: &[u8]| {
+                let d = lopdf::Document::load_mem(b).unwrap();
+                let pg = *d.get_pages().values().next().unwrap();
+                recover::lines_of(&d, pg).iter().map(|l| l.page_y).fold(f64::MAX, f64::min)
+            };
+            let before = floor(&bytes);
+
+            match retype_ffi(handle, baseline as f32, &was, &now, font) {
+                Ok(out) => {
+                    let d = lopdf::Document::load_mem(&out).unwrap();
+                    let pg = *d.get_pages().values().next().unwrap();
+                    let widths = recover::fonts_of(&d, pg);
+                    let after = recover::lines_of(&d, pg);
+                    let mut over = 0usize;
+                    for y in baselines {
+                        let reach = after.iter()
+                            .filter(|l| (l.page_y - y).abs() < 0.5)
+                            .filter_map(|l| {
+                                let (_, Some(w)) = widths.get(&l.resource)? else { return None };
+                                Some(l.page_x()
+                                    + l.along_baseline(recover::advance_of(l, w)).0)
+                            })
+                            .fold(f64::MIN, f64::max);
+                        if reach > column + 0.5 {
+                            over += 1;
+                        }
+                        println!("   y {y:7.2}  reaches {reach:7.2}{}",
+                            if reach > column + 0.5 { "  PAST THE COLUMN" } else { "" });
+                    }
+                    println!("   the page below moved down {:.2}", before - floor(&out));
+                    assert_eq!(over, 0, "{over} lines of the paragraph are past its column");
+                }
+                Err(status) => panic!("the app's own call was refused with status {status}"),
+            }
+            close_document(handle);
+        }
     }
 
     fn retype_ffi(handle: u64, baseline: f32, expected: &str, new_text: &str, font: &str)

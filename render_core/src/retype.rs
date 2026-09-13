@@ -236,6 +236,15 @@ pub(crate) struct Paragraph<'a> {
     pub(crate) edited: usize,
     pub(crate) left: f64,
     pub(crate) column: f64,
+    /// Whether `says` holds each line WHOLE, rather than one fragment of it.
+    ///
+    /// ⚠️ A READABLE FRAGMENT IS NOT A READABLE LINE, and the difference
+    /// decides which mechanism the paragraph can use. On the Myanmar book a
+    /// line is one placement, so what recovery reads of it is all of it. On the
+    /// Hindi book a visual line is up to 52 placements and what reads is one
+    /// word: rewrapping from that would rewrite every line of the paragraph
+    /// with a single word of itself and throw the rest away.
+    pub(crate) complete: bool,
     /// How many lines at the BOTTOM of it are copies the reflow just made.
     ///
     /// ⚠️ A COPY IS SOMEWHERE TO WRITE, NOT SOMETHING TO READ. A gained line
@@ -257,7 +266,7 @@ impl Paragraph<'_> {
     /// at all. So this is true for one and false for the other, and the two
     /// mechanisms divide exactly where the evidence does.
     fn can_be_rewrapped(&self) -> bool {
-        self.says[self.edited..].iter().all(Option::is_some)
+        self.complete && self.says[self.edited..].iter().all(Option::is_some)
     }
 }
 
@@ -1056,6 +1065,7 @@ fn retype_in_paragraph_within(
                 edited: para.edited,
                 left: para.left,
                 column: para.column,
+                complete: para.complete,
                 copied: para.copied + 1,
             };
             // ⚠️ AND ONE LINE AT A TIME, so a paragraph that can never fit
@@ -1484,6 +1494,7 @@ mod tests {
             edited: 0,
             left,
             column,
+            complete: true,
             copied: 0,
         };
         assert!(para.can_be_rewrapped(), "this paragraph should take the rewrap path");
@@ -1811,6 +1822,7 @@ mod tests {
             edited: 0,
             left,
             column,
+            complete: false,
             copied: 0,
         };
         assert!(!para.can_be_rewrapped(),
