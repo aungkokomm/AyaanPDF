@@ -315,10 +315,19 @@ fn refill(
     wanted[para.edited] = new_text.to_string();
 
     let mut measurable = true;
+    // ⚠️ EACH LINE FROM ITS OWN LEFT EDGE. A paragraph's first line is often
+    // indented, 36 points on the reader's Myanmar page, and measuring it from the
+    // paragraph's left edge gave it that much room it does not have.
+    let left_at = |y: f64| -> f64 {
+        lines
+            .iter()
+            .find(|l| (l.page_y - y).abs() < BASELINE_TOLERANCE)
+            .map_or(para.left, |l| l.page_x())
+    };
     let fits = |i: usize, text: &str| -> bool {
         let Some(size) = size_at(para.baselines[i]) else { return false };
         let Some(width) = width_of(font_bytes, text, size) else { return false };
-        para.left + width <= para.column + SETTLED
+        left_at(para.baselines[i]) + width <= para.column + SETTLED
     };
     for (i, text) in wanted.iter().enumerate().skip(para.edited) {
         // ⚠️ AN EMPTY LINE IS MEASURABLE AND ITS WIDTH IS NOTHING. A line
@@ -755,35 +764,7 @@ fn drawn_on_top(content: &mut Content, moved: &[usize]) -> Result<(), i32> {
     // `q` found the first object's and refused the second. What a copy needs is
     // simply every `cm` still in force where its text object opened, applied
     // again, in order, inside the copy's own `q`.
-    type InForce = (Vec<usize>, Option<Operation>, Option<Operation>);
-    let mut scopes: Vec<InForce> = Vec::new();
-    let mut top: InForce = (Vec::new(), None, None);
-    let mut at_text: BTreeMap<usize, InForce> = BTreeMap::new();
-    for (at, op) in content.operations.iter().enumerate() {
-        match op.operator.as_str() {
-            "q" => {
-                let current = scopes.last().unwrap_or(&top);
-                let (fill, font) = (current.1.clone(), current.2.clone());
-                scopes.push((Vec::new(), fill, font));
-            }
-            "Q" => {
-                scopes.pop();
-            }
-            "cm" => scopes.last_mut().unwrap_or(&mut top).0.push(at),
-            "rg" | "g" | "k" | "sc" | "scn" => {
-                scopes.last_mut().unwrap_or(&mut top).1 = Some(op.clone())
-            }
-            "Tf" => scopes.last_mut().unwrap_or(&mut top).2 = Some(op.clone()),
-            "BT" => {
-                let current = scopes.last().unwrap_or(&top);
-                let (fill, font) = (current.1.clone(), current.2.clone());
-                let cms = scopes.iter().flat_map(|s| s.0.iter().copied()).collect();
-                at_text.insert(at, (cms, fill, font));
-            }
-            _ => {}
-        }
-    }
-    let top_level_cm = top.0;
+    let (at_text, top_level_cm) = text_state(content);
 
     let mut redraw: Vec<Operation> = Vec::new();
     let mut done: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
@@ -832,6 +813,44 @@ fn drawn_on_top(content: &mut Content, moved: &[usize]) -> Result<(), i32> {
     }
     content.operations.extend(redraw);
     Ok(())
+}
+
+/// What is in force where a text object opens: every `cm` a still-open scope
+/// applied, in order, then the fill colour and the font.
+type InForce = (Vec<usize>, Option<Operation>, Option<Operation>);
+
+/// [`InForce`] at every `BT` of the stream, keyed by its index, and the `cm`s
+/// applied at the top level, which no copy can carry and so a copy made after
+/// one of them would be drawn somewhere else.
+fn text_state(content: &Content) -> (BTreeMap<usize, InForce>, Vec<usize>) {
+    let mut scopes: Vec<InForce> = Vec::new();
+    let mut top: InForce = (Vec::new(), None, None);
+    let mut at_text: BTreeMap<usize, InForce> = BTreeMap::new();
+    for (at, op) in content.operations.iter().enumerate() {
+        match op.operator.as_str() {
+            "q" => {
+                let current = scopes.last().unwrap_or(&top);
+                let (fill, font) = (current.1.clone(), current.2.clone());
+                scopes.push((Vec::new(), fill, font));
+            }
+            "Q" => {
+                scopes.pop();
+            }
+            "cm" => scopes.last_mut().unwrap_or(&mut top).0.push(at),
+            "rg" | "g" | "k" | "sc" | "scn" => {
+                scopes.last_mut().unwrap_or(&mut top).1 = Some(op.clone())
+            }
+            "Tf" => scopes.last_mut().unwrap_or(&mut top).2 = Some(op.clone()),
+            "BT" => {
+                let current = scopes.last().unwrap_or(&top);
+                let (fill, font) = (current.1.clone(), current.2.clone());
+                let cms = scopes.iter().flat_map(|s| s.0.iter().copied()).collect();
+                at_text.insert(at, (cms, fill, font));
+            }
+            _ => {}
+        }
+    }
+    (at_text, top.0)
 }
 
 /// Puts `replacement` where `line` was drawn, in a font of our own.
@@ -1109,20 +1128,16 @@ fn with_another_line(
         .collect();
     crate::shift::move_placements(&mut content, &under, 0.0, -leading)?;
 
-    // ⚠️ THE COPY IS BUILT, NOT SLICED OUT. Several lines commonly live in
-    // one `BT`/`ET`, so copying that span would draw all of them a second time:
-    // measured, the Myanmar book wraps a whole paragraph in one. What is copied
-    // instead is the state the page had set by the time it drew this line, plus
-    // this line's own placement and text, in the order they appear.
-    let (Some(&first), Some(&end)) = (last.drawn_by.first(), last.drawn_by.last()) else {
-        return Err(STATUS_LINE_NOT_REWRITABLE);
-    };
-    let opens = (0..=first)
-        .rev()
-        .find(|at| content.operations[*at].operator == "BT")
-        .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
-    let (_, ctm) = *pen.get(&first).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
-    let (de, df) = ctm.undo(0.0, -leading).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+    // ⚠️ THE COPY IS BUILT, NOT SLICED OUT, AND IT KEEPS THE PAGE'S OWN SHAPE.
+    // A line may share one `BT` with the rest of its paragraph (the Myanmar book
+    // this was first built on), or be many text objects of its own, each in a
+    // `q`, a clip and marked content (the reader's Myanmar page draws every run
+    // of a line that way, with its spaces in another font). So each of this
+    // line's runs is copied as the text object it is: `q`, what was in force
+    // where that object opened, the object with everybody else's text left out
+    // and its pen one leading lower, and `Q`. Pasting the pieces of several
+    // objects into one `BT` put `q`, `re` and `Q` inside a text object, and the
+    // copy read back as a different line, so the rewrap could not find it.
     let mine: std::collections::BTreeSet<usize> = last.drawn_by.iter().copied().collect();
 
     // ⚠️ EVERY PEN THAT PLACES OUR OWN TEXT, NOT JUST THE FIRST. A line the
@@ -1140,31 +1155,71 @@ fn with_another_line(
         }
     }
 
-    let mut copy: Vec<Operation> = vec![Operation::new("BT", vec![])];
-    for at in opens..=end {
-        let op = &content.operations[at];
-        let m: Vec<f64> = op.operands.iter().filter_map(number_in).collect();
-        match op.operator.as_str() {
-            // Somebody else's text, and the pen that placed it.
-            "TJ" | "Tj" if !mine.contains(&at) => continue,
-            "Tm" | "Td" | "TD" if !ours.contains(&at) => continue,
-            // The pens that place ours, each one line further down the page.
-            "Tm" if m.len() == 6 => copy.push(Operation::new("Tm", reals(
-                &[m[0], m[1], m[2], m[3], m[4] + de, m[5] + df]))),
-            "Td" | "TD" if m.len() == 2 => copy.push(Operation::new(
-                &op.operator.clone(), reals(&[m[0] + de, m[1] + df]))),
-            // ⚠️ AND NOBODY'S LINE ADVANCE. `T*` and its relatives move the
-            // pen relative to a text line this copy does not reproduce.
-            "T*" | "'" | "\"" | "BT" | "ET" => continue,
-            // Everything else is state the page had set by then: the font, the
-            // size, the rendering mode, the colour.
-            _ => copy.push(op.clone()),
+    let (at_text, top_level_cm) = text_state(&content);
+    let mut copy: Vec<Operation> = Vec::new();
+    let mut done: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for &at in &last.drawn_by {
+        if done.contains(&at)
+            || !matches!(content.operations[at].operator.as_str(), "TJ" | "Tj" | "'" | "\"")
+        {
+            continue;
         }
+        let opens = (0..at)
+            .rev()
+            .find(|i| content.operations[*i].operator == "BT")
+            .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        let closes = (at..content.operations.len())
+            .find(|i| content.operations[*i].operator == "ET")
+            .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        // A top-level `cm` after the object would move a copy at the end of the
+        // stream somewhere else entirely.
+        if top_level_cm.iter().any(|c| *c > opens) {
+            return Err(STATUS_LINE_NOT_REWRITABLE);
+        }
+        let (_, ctm) = *pen.get(&at).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        let (de, df) = ctm.undo(0.0, -leading).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+        let (cms, fill, font) = at_text.get(&opens).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+
+        copy.push(Operation::new("q", vec![]));
+        copy.extend(cms.iter().map(|cm| content.operations[*cm].clone()));
+        copy.extend(fill.iter().cloned());
+        copy.extend(font.iter().cloned());
+        // Only the object's FIRST placement is absolute to the new line; a
+        // `Td` after it is relative to that and already right.
+        let mut placed = false;
+        for i in opens..=closes {
+            let op = &content.operations[i];
+            let m: Vec<f64> = op.operands.iter().filter_map(number_in).collect();
+            match op.operator.as_str() {
+                // Somebody else's text.
+                "TJ" | "Tj" | "'" | "\"" if !mine.contains(&i) => continue,
+                "TJ" | "Tj" | "'" | "\"" => {
+                    done.insert(i);
+                    copy.push(op.clone());
+                }
+                // The pens that place ours, one line further down the page.
+                "Tm" if m.len() == 6 => {
+                    placed = true;
+                    copy.push(Operation::new(
+                        "Tm", reals(&[m[0], m[1], m[2], m[3], m[4] + de, m[5] + df])));
+                }
+                "Td" | "TD" if m.len() == 2 && !placed => {
+                    placed = true;
+                    copy.push(Operation::new(
+                        &op.operator.clone(), reals(&[m[0] + de, m[1] + df])));
+                }
+                // Marked content belongs to the page's structure, not the copy.
+                "BDC" | "BMC" | "EMC" => continue,
+                // Everything else is state inside the object: the font, the
+                // size, the rendering mode, the colour.
+                _ => copy.push(op.clone()),
+            }
+        }
+        copy.push(Operation::new("Q", vec![]));
     }
     if !copy.iter().any(|op| matches!(op.operator.as_str(), "Tm" | "Td" | "TD")) {
         return Err(STATUS_LINE_NOT_REWRITABLE);
     }
-    copy.push(Operation::new("ET", vec![]));
     content.operations.extend(copy);
 
     let mut out = doc.clone();
@@ -1321,14 +1376,23 @@ fn retype_in_paragraph_within(
     // how to write a line, only which lines have to be written. A line the
     // refill left alone still says what it said, so its anchor still finds it
     // in the bytes the write before it produced.
+    //
+    // ⚠️ AND EACH LINE SET THE WAY A PARAGRAPH SETS IT: justified to the
+    // column, except the last, which keeps its natural spacing. Every line used
+    // to be stretched to the width the OLD line had, so on the reader's Myanmar
+    // page a line copied from a full one to take the overflow came out as two
+    // words with the whole column between them.
+    let last = rewrapped.len().saturating_sub(1);
     let mut carried = bytes.to_vec();
     for (n, text) in rewrapped.iter().enumerate() {
         let Some(before) = para.says[n].as_deref() else { continue };
         if text == before {
             continue;
         }
-        carried = retype(
-            &carried, page_index, para.baselines[n], before, text, font_path, Some(indexes))?;
+        let width = if n == last { Width::Natural } else { Width::Column(para.column) };
+        carried = retype_sized(
+            &carried, page_index, para.baselines[n], before, text, font_path, Some(indexes),
+            None, None, width)?;
     }
     Ok(carried)
 }
@@ -1349,6 +1413,36 @@ pub(crate) fn retype_within(
     lent: Option<&crate::recover::Indexes>,
     room: Option<&Room>,
     at: Option<f64>,
+) -> Result<Vec<u8>, i32> {
+    retype_sized(
+        bytes, page_index, baseline, expected, new_text, font_path, lent, room, at, Width::AsItWas)
+}
+
+/// How wide a retyped line is set.
+#[derive(Clone, Copy)]
+pub(crate) enum Width {
+    /// Its spaces opened until it ends where the old line ended, which is what
+    /// a single edit has always done.
+    AsItWas,
+    /// Justified to this right edge, in the page frame: a line of a paragraph
+    /// that is not its last.
+    Column(f64),
+    /// As the shaper sets it: a paragraph's last line, which is never stretched.
+    Natural,
+}
+
+/// The same, told how wide the line is to be set.
+fn retype_sized(
+    bytes: &[u8],
+    page_index: i32,
+    baseline: f64,
+    expected: &str,
+    new_text: &str,
+    font_path: &str,
+    lent: Option<&crate::recover::Indexes>,
+    room: Option<&Room>,
+    at: Option<f64>,
+    width: Width,
 ) -> Result<Vec<u8>, i32> {
     if new_text.is_empty() || expected.is_empty() {
         return Err(STATUS_INVALID_INPUT);
@@ -1433,7 +1527,18 @@ pub(crate) fn retype_within(
     // again with its own spaces opened so it ends where the old line ended.
     let natural = lay_out(glyphs, &[], line.size, &widths);
     let was = advance_of(&doc, page, line);
-    let replacement = match was {
+    // ⚠️ A COLUMN IS A PAGE DISTANCE AND AN ADVANCE IS NOT. The right edge is
+    // where the page puts ink; the stretch is shared out in the line's own text
+    // space, so the distance from the line's left edge is turned back into it.
+    let target = match width {
+        Width::AsItWas => was,
+        Width::Natural => None,
+        Width::Column(right) => {
+            let scale = line.along_baseline(1.0).0.abs();
+            (scale > 0.0).then(|| (right - line.page_x()) / scale)
+        }
+    };
+    let replacement = match target {
         Some(target) => {
             let gaps = share(&spaces, target - natural.advance);
             lay_out(glyphs, &gaps, line.size, &widths)
@@ -3648,7 +3753,8 @@ mod tests {
                 .map(|t| (l.page_y, t.to_string())))
             .expect("the reader's line is not on the page");
         let at: usize = was.char_indices().nth(20).map(|(i, _)| i).unwrap();
-        let now = format!("{}အလွန်အမင်း {}", &was[..at], &was[at..]);
+        // What the reader actually typed on 3.45.7.
+        let now = format!("{}မှောင်နေသည်၊ ငှက်ကလေးများလည်း {}", &was[..at], &was[at..]);
         println!("line at {baseline:.2}\n  was {was}\n  now {now}");
 
         let dir = std::env::temp_dir().join("ayaan-myanmar-edit");
@@ -3656,6 +3762,55 @@ mod tests {
         raster(&bytes, &dir.join("before.bgra").to_string_lossy());
 
         let handle = crate::open_document_from_bytes(bytes.as_ptr(), bytes.len());
+
+        // ⚠️ WHICH LINES THE APP CALLS THIS PARAGRAPH, and what the rewrap
+        // would put on each of them.
+        match crate::paragraph_around(handle, 0, baseline, &was) {
+            None => println!("no paragraph around the line"),
+            Some((baselines, says, edited, left, column, complete)) => {
+                println!("paragraph: {} lines, editing {edited}, left {left:.2} column {column:.2} complete {complete}",
+                    baselines.len());
+                for (y, s) in baselines.iter().zip(&says) {
+                    println!("   y {y:7.2}  {}", s.as_deref().unwrap_or("<unread>"));
+                }
+                let all_lines = crate::recover::lines_of(&doc, page);
+                println!("paragraphs by the writer's own lines (shift::blocks_of):");
+                for group in crate::shift::blocks_of(&all_lines) {
+                    println!("   {:?}", group.iter()
+                        .map(|i| format!("{:.2}@{:.0}", all_lines[*i].page_y, all_lines[*i].page_x()))
+                        .collect::<Vec<_>>());
+                }
+                println!("every line on the page:");
+                for (l, r) in all_lines.iter().zip(&readings) {
+                    if !baselines.iter().any(|y| (l.page_y - y).abs() < BASELINE_TOLERANCE) {
+                        continue;
+                    }
+                    println!("   y {:7.2}  x {:7.2}  tracked {}  glyphs {}  breaks {:?}",
+                        l.page_y, l.page_x(), l.tracked, l.glyphs.len(),
+                        l.breaks.iter().map(|b| format!("{}:{:.2}", b.at, b.points)).collect::<Vec<_>>());
+                    println!("            reads {}", r.text.as_deref().unwrap_or("<unread>"));
+                }
+                let para = Paragraph {
+                    baselines: &baselines, says: &says, edited, left, column, complete, copied: 0,
+                };
+                let font_bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+                match refill(&doc, page, &para, &now, &font_bytes) {
+                    Refill::Fits => println!("refill: fits"),
+                    Refill::WontFit => println!("refill: needs another line"),
+                    Refill::Unmeasurable => println!("refill: unmeasurable"),
+                    Refill::Rewrapped(lines) => {
+                        println!("refill: rewrapped");
+                        for (n, t) in lines.iter().enumerate() {
+                            println!("   line {n}: {t}");
+                        }
+                    }
+                }
+                match retype_in_paragraph(&bytes, 0, &para, &now, MYANMAR_TEXT, Some(&indexes), None) {
+                    Ok(out) => raster(&out, &dir.join("rewrap.bgra").to_string_lossy()),
+                    Err(s) => println!("the rewrap refused with status {s}"),
+                }
+            }
+        }
         let (want, text, path) = (was.as_bytes(), now.as_bytes(), MYANMAR_TEXT.as_bytes());
         let buffer = crate::retype_recovered_line(
             handle, 0, baseline as f32, -1.0,
@@ -3674,6 +3829,23 @@ mod tests {
             Ok(out) => raster(&out, &dir.join("single-line.bgra").to_string_lossy()),
             Err(s) => println!("the single-line retype refused with status {s}"),
         }
+
+        // And a short word that fits, through the app's call: nothing but its
+        // own line may change.
+        let short = format!("{}ပြီး {}", &was[..at], &was[at..]);
+        let handle = crate::open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        let text = short.as_bytes();
+        let buffer = crate::retype_recovered_line(
+            handle, 0, baseline as f32, -1.0,
+            want.as_ptr(), want.len(), text.as_ptr(), text.len(), path.as_ptr(), path.len());
+        if buffer.status == crate::STATUS_OK_PDFIUM {
+            let out = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+            raster(&out, &dir.join("app-short.bgra").to_string_lossy());
+        } else {
+            println!("the short edit refused with status {}", buffer.status);
+        }
+        crate::free_byte_buffer(buffer);
+        crate::close_document(handle);
         println!("rendered to {}", dir.display());
     }
 

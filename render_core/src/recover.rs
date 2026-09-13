@@ -705,6 +705,27 @@ fn merge_placements(
     // between its words.
     let mut joins: Vec<usize> = Vec::new();
 
+    // ⚠️ WHERE THE LAST RUN JOINED INTO EACH LINE ENDED, MEASURED IN ITS OWN
+    // FONT. A line joined from runs of two subsets of one face carries the FIRST
+    // run's resource, so asking `ends_at` about the whole joined line measured
+    // every later run's glyphs with the wrong font's widths. Measured on the
+    // reader's Myanmar page, whose lines alternate between two subsets of
+    // Myanmar Text: the end drifted, only 2 of a line's 6 word spaces were
+    // found, and the reading ran "သတ္တလောကအားအမြိုက်" together. A run that
+    // draws only marks sits inside the text before it and never moves this end
+    // back; a run whose widths are unknown leaves no end to measure from.
+    //
+    // ⚠️ BUT IT ONLY EVER ADDS A SPACE, IT NEVER TAKES ONE AWAY. Used on its
+    // own, the exact end took spaces OUT of lines the reader has always been
+    // given: diffed against the previous reader on every Myanmar and Pyidaungsu
+    // test file, the letter's heading lost two ("မြောက် ပိုင်း ၊ လား" read
+    // "မြောက်ပိုင်း ၊လား") and a date lost two ("၈ ၂၀၂၆ ရက်စွဲ" read
+    // "၈၂၀၂၆ရက်စွဲ"). Those gaps are the ambiguous kind the reader said not to
+    // guess at. So where the old measure already finds a space, that gap is kept
+    // exactly as it was, width and all, and the run-by-run end is asked only
+    // where the old measure found none.
+    let mut ends: Vec<Option<f64>> = Vec::new();
+
     let mut out: Vec<Line> = Vec::new();
     for line in lines {
         let joined = out.last().is_some_and(|prev| {
@@ -715,12 +736,25 @@ fn merge_placements(
                     || (apart < A_MARK * line.size && draws_only_marks(&line)))
         });
         if !joined {
+            ends.push(ends_at(&line));
             out.push(line);
             joins.push(0);
             continue;
         }
         *joins.last_mut().unwrap() += 1;
-        let gap = ends_at(out.last().unwrap()).map(|end| line.x - end);
+        let as_it_was = ends_at(out.last().unwrap()).map(|end| line.x - end);
+        let run_by_run = ends.last().copied().flatten().map(|end| line.x - end);
+        let gap = match as_it_was {
+            Some(g) if g >= A_SPACE * line.size => Some(g),
+            _ => run_by_run,
+        };
+        let own_end = ends_at(&line);
+        if let Some(last) = ends.last_mut() {
+            *last = match (*last, own_end) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+        }
         let prev = out.last_mut().unwrap();
         let at = prev.glyphs.len();
         if let Some(points) = gap.filter(|g| *g >= A_SPACE * line.size) {
@@ -6042,6 +6076,54 @@ mod tests {
                      gaps(em)=[{}]\n     “{says}”",
                     line.size, line.drawn_by.len(), line.tracked, widths.join(" ")
                 );
+            }
+        }
+    }
+
+    /// Every line's reading on every Myanmar and Pyidaungsu test file, one row
+    /// a line, so two versions of the reader can be diffed line by line.
+    ///
+    /// ⚠️ A COUNT OF LINES READ CANNOT SEE A WORD THAT CHANGED. This exists
+    /// because a fix to where a joined line's runs end changed how every Burmese
+    /// line is read, and "read 21 of 21" before and after would have hidden a
+    /// line that read differently.
+    ///
+    ///     cargo test --release --lib every_myanmar_reading_for_a_diff -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs Myanmar PDFs that are not in this repository"]
+    fn every_myanmar_reading_for_a_diff() {
+        const FOLDER: &str = r"D:\Ayaan PDF Test file";
+        if !std::path::Path::new(FOLDER).exists() {
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(FOLDER)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_lowercase())
+                    .is_some_and(|n| {
+                        (n.contains("myanmar") || n.contains("pyidaungsu")) && n.ends_with(".pdf")
+                    })
+            })
+            .collect();
+        files.sort();
+        for file in &files {
+            let Ok(doc) = Document::load(file) else { continue };
+            let name = file.file_name().unwrap().to_string_lossy().to_string();
+            for (n, (_, &page)) in doc.get_pages().iter().enumerate() {
+                let lines = lines_of(&doc, page);
+                let indexes = indexes_for(&doc, page);
+                let read = read_page_with(&doc, page, &indexes);
+                for line in &lines {
+                    let says = read
+                        .iter()
+                        .find(|r| (r.y - line.y).abs() < 1e-9)
+                        .and_then(|r| r.text.clone())
+                        .unwrap_or_else(|| "-".into());
+                    println!("READING\t{name}\t{n}\t{:.2}\t{:.2}\t{says}", line.y, line.x);
+                }
             }
         }
     }

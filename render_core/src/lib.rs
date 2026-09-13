@@ -2170,15 +2170,7 @@ pub extern "C" fn retype_recovered_line(
         // inside its paragraph can reflow, carry words down, and gain a line.
         // Which of those happens is decided from what the paragraph's lines
         // turn out to say, not from the script they are written in.
-        //
-        // ⚠️ BUT NEVER THE REWRAP. A paragraph whose every line is one
-        // placement (the reader's Myanmar books) is written one line at a time,
-        // exactly as it was on 2026-09-04 when Myanmar editing worked. Rendered
-        // on the reader's own page (`what_the_readers_myanmar_edit_looks_like`),
-        // the rewrap threw one word onto a line of its own, lost the justified
-        // edge and broke the paragraph; the single-line write kept it intact.
-        let framed = paragraph_around(doc_handle, page_index, baseline as f64, &expected)
-            .filter(|(.., complete)| !*complete);
+        let framed = paragraph_around(doc_handle, page_index, baseline as f64, &expected);
         let written = match &framed {
             Some((baselines, says, edited, left, column, complete)) => retype::retype_in_paragraph(
                 &bytes,
@@ -2257,12 +2249,13 @@ fn paragraph_around(
     const NEAR: f64 = 0.5;
 
     let (blocks, _) = page_blocks(doc_handle, page_index).ok()?;
-    let block = blocks.iter().find(|b| {
-        b.lines.len() >= 2
-            && b.lines.iter().any(|l| (l.baseline as f64 - baseline).abs() < NEAR)
-    })?;
-    let baselines: Vec<f64> = block.lines.iter().map(|l| l.baseline as f64).collect();
-    let edited = baselines.iter().position(|y| (y - baseline).abs() < NEAR)?;
+    let framed: Option<Vec<f64>> = blocks
+        .iter()
+        .find(|b| {
+            b.lines.len() >= 2
+                && b.lines.iter().any(|l| (l.baseline as f64 - baseline).abs() < NEAR)
+        })
+        .map(|b| b.lines.iter().map(|l| l.baseline as f64).collect());
 
     let bytes = document_bytes(doc_handle)?;
     let doc = lopdf::Document::load_mem(&bytes).ok()?;
@@ -2279,6 +2272,34 @@ fn paragraph_around(
         }
     };
     let readings = recover::read_page_with(&doc, page, &indexes);
+
+    // ⚠️ A PARAGRAPH OF WHOLE LINES IS TAKEN FROM THE LINES THE WRITER EDITS.
+    // The block model groups PDFium's objects, and on the reader's Myanmar page
+    // PDFium reads a hundred and fifty scrambled fragments: it ended the
+    // paragraph "နက်မှောင်သော…" one line early, so the rewrap had nowhere to put
+    // the overflow but a line it made up, and pushed the paragraph's real last
+    // line down under it. `shift::blocks_of` applies the same rule to the
+    // content stream's own lines and gets all three. A book whose lines are many
+    // placements (the Hindi one) is not whole and keeps the block model.
+    let whole = |ys: &[f64]| -> bool {
+        ys.iter().all(|y| {
+            let on: Vec<usize> =
+                (0..lines.len()).filter(|i| (lines[*i].page_y - y).abs() < NEAR).collect();
+            on.len() == 1 && readings.get(on[0]).is_some_and(|r| r.text.is_some())
+        })
+    };
+    let written: Option<Vec<f64>> = shift::blocks_of(&lines)
+        .into_iter()
+        .find(|g| g.iter().any(|i| (lines[*i].page_y - baseline).abs() < NEAR))
+        .map(|g| {
+            let mut ys: Vec<f64> = g.iter().map(|i| lines[*i].page_y).collect();
+            ys.sort_by(|a, b| b.total_cmp(a));
+            ys.dedup_by(|a, b| (*a - *b).abs() < NEAR);
+            ys
+        })
+        .filter(|ys| ys.len() >= 2 && whole(ys));
+    let baselines = written.or(framed)?;
+    let edited = baselines.iter().position(|y| (y - baseline).abs() < NEAR)?;
 
     // What each line says, and where the ink on it really stops.
     let mut says: Vec<Option<String>> = vec![None; baselines.len()];
@@ -28525,12 +28546,7 @@ p={spread_px:.4},c={rgba:08X})"
                             if reach > column + 0.5 { "  PAST THE COLUMN" } else { "" });
                     }
                     println!("   the page below moved down {:.2}", before - floor(&out));
-                    // ⚠️ MYANMAR IS NOT REFLOWED BY THE APP ANY MORE: it is written
-                    // one line at a time, as on 2026-09-04, because the rewrap broke
-                    // the reader's paragraph. Only the carry is held to the column.
-                    if !*complete {
-                        assert_eq!(over, 0, "{over} lines of the paragraph are past its column");
-                    }
+                    assert_eq!(over, 0, "{over} lines of the paragraph are past its column");
                 }
                 Err(status) => panic!("the app's own call was refused with status {status}"),
             }
