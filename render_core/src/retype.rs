@@ -3620,6 +3620,63 @@ mod tests {
         }
     }
 
+    /// ⚠️ THE READER'S MYANMAR EDIT ON 3.45.5, RENDERED. They typed a word into
+    /// the first line of the second paragraph ("နက်မှောင်သော ညတာသည်…", caret 20),
+    /// pressed Enter, and reported text past the frame and the paragraph flow
+    /// broken. Writes three pages to `%TEMP%\ayaan-myanmar-edit`: before, what
+    /// the app's own call produces now, and the single-line retype the app used
+    /// on 2026-09-04 when Myanmar editing worked.
+    ///
+    ///     cargo test --release what_the_readers_myanmar_edit_looks_like -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF and fonts that are not in this repository"]
+    fn what_the_readers_myanmar_edit_looks_like() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file .pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let (baseline, was) = lines.iter().zip(&readings)
+            .find_map(|(l, r)| r.text.as_deref()
+                .filter(|t| t.starts_with("နက်မှောင်သော"))
+                .map(|t| (l.page_y, t.to_string())))
+            .expect("the reader's line is not on the page");
+        let at: usize = was.char_indices().nth(20).map(|(i, _)| i).unwrap();
+        let now = format!("{}အလွန်အမင်း {}", &was[..at], &was[at..]);
+        println!("line at {baseline:.2}\n  was {was}\n  now {now}");
+
+        let dir = std::env::temp_dir().join("ayaan-myanmar-edit");
+        let _ = std::fs::create_dir_all(&dir);
+        raster(&bytes, &dir.join("before.bgra").to_string_lossy());
+
+        let handle = crate::open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        let (want, text, path) = (was.as_bytes(), now.as_bytes(), MYANMAR_TEXT.as_bytes());
+        let buffer = crate::retype_recovered_line(
+            handle, 0, baseline as f32, -1.0,
+            want.as_ptr(), want.len(), text.as_ptr(), text.len(), path.as_ptr(), path.len());
+        let status = buffer.status;
+        let app = (status == crate::STATUS_OK_PDFIUM)
+            .then(|| unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec());
+        crate::free_byte_buffer(buffer);
+        crate::close_document(handle);
+        match &app {
+            Some(out) => raster(out, &dir.join("app-now.bgra").to_string_lossy()),
+            None => println!("the app's own call refused with status {status}"),
+        }
+
+        match retype(&bytes, 0, baseline, &was, &now, MYANMAR_TEXT, Some(&indexes)) {
+            Ok(out) => raster(&out, &dir.join("single-line.bgra").to_string_lossy()),
+            Err(s) => println!("the single-line retype refused with status {s}"),
+        }
+        println!("rendered to {}", dir.display());
+    }
+
     /// Page one of `pdf`, rendered, written as width, height and BGRA bytes so
     /// the result can be looked at instead of described.
     fn raster(pdf: &[u8], to: &str) {

@@ -2170,7 +2170,15 @@ pub extern "C" fn retype_recovered_line(
         // inside its paragraph can reflow, carry words down, and gain a line.
         // Which of those happens is decided from what the paragraph's lines
         // turn out to say, not from the script they are written in.
-        let framed = paragraph_around(doc_handle, page_index, baseline as f64, &expected);
+        //
+        // ⚠️ BUT NEVER THE REWRAP. A paragraph whose every line is one
+        // placement (the reader's Myanmar books) is written one line at a time,
+        // exactly as it was on 2026-09-04 when Myanmar editing worked. Rendered
+        // on the reader's own page (`what_the_readers_myanmar_edit_looks_like`),
+        // the rewrap threw one word onto a line of its own, lost the justified
+        // edge and broke the paragraph; the single-line write kept it intact.
+        let framed = paragraph_around(doc_handle, page_index, baseline as f64, &expected)
+            .filter(|(.., complete)| !*complete);
         let written = match &framed {
             Some((baselines, says, edited, left, column, complete)) => retype::retype_in_paragraph(
                 &bytes,
@@ -28517,7 +28525,12 @@ p={spread_px:.4},c={rgba:08X})"
                             if reach > column + 0.5 { "  PAST THE COLUMN" } else { "" });
                     }
                     println!("   the page below moved down {:.2}", before - floor(&out));
-                    assert_eq!(over, 0, "{over} lines of the paragraph are past its column");
+                    // ⚠️ MYANMAR IS NOT REFLOWED BY THE APP ANY MORE: it is written
+                    // one line at a time, as on 2026-09-04, because the rewrap broke
+                    // the reader's paragraph. Only the carry is held to the column.
+                    if !*complete {
+                        assert_eq!(over, 0, "{over} lines of the paragraph are past its column");
+                    }
                 }
                 Err(status) => panic!("the app's own call was refused with status {status}"),
             }
