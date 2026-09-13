@@ -236,6 +236,14 @@ pub(crate) struct Paragraph<'a> {
     pub(crate) edited: usize,
     pub(crate) left: f64,
     pub(crate) column: f64,
+    /// How many lines at the BOTTOM of it are copies the reflow just made.
+    ///
+    /// ⚠️ A COPY IS SOMEWHERE TO WRITE, NOT SOMETHING TO READ. A gained line
+    /// is made by copying the paragraph's last one, so it SAYS what that line
+    /// says and the writer can find it by that. Counting what it says as
+    /// content as well would hand the rewrap the whole last line twice, and a
+    /// paragraph can never be made to fit text it did not have.
+    pub(crate) copied: usize,
 }
 
 impl Paragraph<'_> {
@@ -292,6 +300,9 @@ fn refill(
 
     let mut wanted: Vec<String> =
         para.says.iter().map(|s| s.clone().unwrap_or_default()).collect();
+    for line in wanted.iter_mut().rev().take(para.copied) {
+        line.clear();
+    }
     wanted[para.edited] = new_text.to_string();
 
     let mut measurable = true;
@@ -301,8 +312,12 @@ fn refill(
         para.left + width <= para.column + SETTLED
     };
     for (i, text) in wanted.iter().enumerate().skip(para.edited) {
+        // ⚠️ AN EMPTY LINE IS MEASURABLE AND ITS WIDTH IS NOTHING. A line
+        // the reflow has just made carries no words yet, and a shaper handed no
+        // text answers nothing, which marked the whole paragraph unmeasurable
+        // and quietly turned the rewrap back into a one-line write.
         if size_at(para.baselines[i]).is_none()
-            || width_of(font_bytes, text, 1.0).is_none()
+            || (!text.is_empty() && width_of(font_bytes, text, 1.0).is_none())
         {
             measurable = false;
         }
@@ -376,6 +391,20 @@ fn reflow_for(lines: &[Line], line: &Line, replacement: &Replacement, was: Optio
 
 /// What a page declares for the fonts it draws with, keyed by resource name.
 type Widths = BTreeMap<Vec<u8>, (String, Option<crate::shaped::CidWidths>)>;
+
+/// Operands as PDF reals.
+fn reals(v: &[f64]) -> Vec<Object> {
+    v.iter().map(|n| Object::Real(*n as f32)).collect()
+}
+
+/// A PDF number, whichever way the file wrote it.
+fn number_in(o: &Object) -> Option<f64> {
+    match o {
+        Object::Real(r) => Some(*r as f64),
+        Object::Integer(i) => Some(*i as f64),
+        _ => None,
+    }
+}
 
 /// One placement of a line, as reflow sees it: where it will be drawn once the
 /// replacement has been written, and which operations draw it.
@@ -805,6 +834,111 @@ pub(crate) fn retype(
     retype_within(bytes, page_index, baseline, expected, new_text, font_path, lent, None)
 }
 
+/// Gives the paragraph one more line to write into, and moves the page below it
+/// down to make the space.
+///
+/// ⚠️ THE NEW LINE IS A COPY OF THE LAST ONE, NOT SOMETHING DRAWN FROM
+/// NOTHING. A text object carries a font, a size, a rendering mode and whatever
+/// transform is in force over it, and inventing all of that again for a fresh
+/// object is inventing four chances to differ from the paragraph it joins.
+/// Copying the paragraph's own last line and moving the copy down by one
+/// leading gets every one of them right by construction. The copy says what the
+/// line it came from says, so the caller's rewrap simply writes over both.
+fn with_another_line(
+    doc: &Document,
+    page: ObjectId,
+    lines: &[Line],
+    last: &Line,
+    leading: f64,
+) -> Result<Vec<u8>, i32> {
+    let Ok(mut content) = Content::decode(&doc.get_page_content(page)) else {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    };
+    let pen = crate::shift::placements(&content);
+
+    // Everything under the paragraph goes down, so the strip under it is free.
+    let (under, _) = below_the_paragraph(lines, last.page_y);
+    let tms: std::collections::BTreeSet<usize> =
+        under.iter().filter_map(|at| pen.get(at).map(|(tm, _)| *tm)).collect();
+    let under: Vec<usize> = pen
+        .iter()
+        .filter(|(_, (tm, _))| tms.contains(tm))
+        .map(|(at, _)| *at)
+        .collect();
+    crate::shift::move_placements(&mut content, &under, 0.0, -leading)?;
+
+    // ⚠️ THE COPY IS BUILT, NOT SLICED OUT. Several lines commonly live in
+    // one `BT`/`ET`, so copying that span would draw all of them a second time:
+    // measured, the Myanmar book wraps a whole paragraph in one. What is copied
+    // instead is the state the page had set by the time it drew this line, plus
+    // this line's own placement and text, in the order they appear.
+    let (Some(&first), Some(&end)) = (last.drawn_by.first(), last.drawn_by.last()) else {
+        return Err(STATUS_LINE_NOT_REWRITABLE);
+    };
+    let opens = (0..=first)
+        .rev()
+        .find(|at| content.operations[*at].operator == "BT")
+        .ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+    let (_, ctm) = *pen.get(&first).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+    let (de, df) = ctm.undo(0.0, -leading).ok_or(STATUS_LINE_NOT_REWRITABLE)?;
+    let mine: std::collections::BTreeSet<usize> = last.drawn_by.iter().copied().collect();
+
+    // ⚠️ EVERY PEN THAT PLACES OUR OWN TEXT, NOT JUST THE FIRST. A line the
+    // reader sees as one placement is often several runs, and the GAPS between
+    // where each was placed are what its spaces are made of. Keeping only the
+    // first pen drew all the runs end to end: the copy came back saying the
+    // line with every space missing, and the writer could no longer find it.
+    let ours: std::collections::BTreeSet<usize> =
+        mine.iter().filter_map(|at| pen.get(at).map(|(tm, _)| *tm)).collect();
+    // And if one of those pens also places somebody else's text, this line
+    // cannot be copied on its own at all.
+    for (at, (tm, _)) in &pen {
+        if ours.contains(tm) && !mine.contains(at) {
+            return Err(STATUS_LINE_NOT_REWRITABLE);
+        }
+    }
+
+    let mut copy: Vec<Operation> = vec![Operation::new("BT", vec![])];
+    for at in opens..=end {
+        let op = &content.operations[at];
+        let m: Vec<f64> = op.operands.iter().filter_map(number_in).collect();
+        match op.operator.as_str() {
+            // Somebody else's text, and the pen that placed it.
+            "TJ" | "Tj" if !mine.contains(&at) => continue,
+            "Tm" | "Td" | "TD" if !ours.contains(&at) => continue,
+            // The pens that place ours, each one line further down the page.
+            "Tm" if m.len() == 6 => copy.push(Operation::new("Tm", reals(
+                &[m[0], m[1], m[2], m[3], m[4] + de, m[5] + df]))),
+            "Td" | "TD" if m.len() == 2 => copy.push(Operation::new(
+                &op.operator.clone(), reals(&[m[0] + de, m[1] + df]))),
+            // ⚠️ AND NOBODY'S LINE ADVANCE. `T*` and its relatives move the
+            // pen relative to a text line this copy does not reproduce.
+            "T*" | "'" | "\"" | "BT" | "ET" => continue,
+            // Everything else is state the page had set by then: the font, the
+            // size, the rendering mode, the colour.
+            _ => copy.push(op.clone()),
+        }
+    }
+    if !copy.iter().any(|op| matches!(op.operator.as_str(), "Tm" | "Td" | "TD")) {
+        return Err(STATUS_LINE_NOT_REWRITABLE);
+    }
+    copy.push(Operation::new("ET", vec![]));
+    content.operations.extend(copy);
+
+    let mut out = doc.clone();
+    let Ok(encoded) = content.encode() else {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    };
+    if out.change_page_content(page, encoded).is_err() {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    }
+    let mut bytes = Vec::new();
+    if out.save_to(&mut bytes).is_err() {
+        return Err(STATUS_DOC_NOT_REWRITABLE);
+    }
+    Ok(bytes)
+}
+
 /// Retypes one line of a paragraph and reflows the paragraph to take it.
 ///
 /// ⚠️ THE FILE CHOOSES THE MECHANISM, NOT THE SCRIPT. There are two ways to
@@ -829,6 +963,21 @@ pub(crate) fn retype_in_paragraph(
     new_text: &str,
     font_path: &str,
     lent: Option<&crate::recover::Indexes>,
+) -> Result<Vec<u8>, i32> {
+    retype_in_paragraph_within(
+        bytes, page_index, para, new_text, font_path, lent, para.baselines.len())
+}
+
+/// The same, remembering how many lines the paragraph started with so a
+/// paragraph that grows can be stopped growing.
+fn retype_in_paragraph_within(
+    bytes: &[u8],
+    page_index: i32,
+    para: &Paragraph,
+    new_text: &str,
+    font_path: &str,
+    lent: Option<&crate::recover::Indexes>,
+    growing: usize,
 ) -> Result<Vec<u8>, i32> {
     if para.baselines.len() != para.says.len() || para.edited >= para.baselines.len() {
         return Err(STATUS_INVALID_INPUT);
@@ -879,9 +1028,45 @@ pub(crate) fn retype_in_paragraph(
         Refill::Fits | Refill::Unmeasurable => {
             return retype(bytes, page_index, at, was, new_text, font_path, Some(indexes));
         }
-        // ⚠️ AND THE PARAGRAPH IS ONLY ALLOWED THE LINES IT HAS. Gaining one
-        // is the next step; until then, saying so beats writing off the end.
-        Refill::WontFit => return Err(STATUS_TOO_WIDE),
+        // ⚠️ OR THE PARAGRAPH TAKES ANOTHER LINE AND TRIES AGAIN. The copy
+        // says what the line it was copied from says, so the paragraph handed
+        // to the next attempt is the real one: one line longer, and every line
+        // of it still findable by what it says.
+        Refill::WontFit => {
+            let Some(leading) = leading_of(para.baselines) else {
+                return Err(STATUS_TOO_WIDE);
+            };
+            let at_last = *para.baselines.last().unwrap();
+            let lines = crate::recover::lines_of(&doc, page);
+            let Some(last) = crate::recover::lines_at(&lines, at_last).next() else {
+                return Err(STATUS_TOO_WIDE);
+            };
+            let Some(said) = para.says.last().cloned().flatten() else {
+                return Err(STATUS_TOO_WIDE);
+            };
+            let grown = with_another_line(&doc, page, &lines, last, leading)?;
+
+            let mut baselines = para.baselines.to_vec();
+            baselines.push(at_last - leading);
+            let mut says = para.says.to_vec();
+            says.push(Some(said));
+            let bigger = Paragraph {
+                baselines: &baselines,
+                says: &says,
+                edited: para.edited,
+                left: para.left,
+                column: para.column,
+                copied: para.copied + 1,
+            };
+            // ⚠️ AND ONE LINE AT A TIME, so a paragraph that can never fit
+            // stops instead of growing until the page is full. Four is more
+            // lines than any single word can need.
+            if para.baselines.len() >= growing.saturating_add(4) {
+                return Err(STATUS_TOO_WIDE);
+            }
+            return retype_in_paragraph_within(
+                &grown, page_index, &bigger, new_text, font_path, None, growing);
+        }
     };
 
     // ⚠️ EVERY LINE IS THE SAME SINGLE-LINE WRITE, CHAINED. Nothing here knows
@@ -1299,6 +1484,7 @@ mod tests {
             edited: 0,
             left,
             column,
+            copied: 0,
         };
         assert!(para.can_be_rewrapped(), "this paragraph should take the rewrap path");
 
@@ -1311,20 +1497,49 @@ mod tests {
             println!("   y {y:7.2}  reaches {r:7.2}{past}");
         }
 
-        // ⚠️ AND WITH THE PARAGRAPH IT SAYS SO INSTEAD OF WRITING OFF THE END.
+        // ⚠️ AND WITH THE PARAGRAPH IT REWRAPS, GAINING A LINE TO DO IT.
         // Every paragraph on this page is two full lines: measured, 0.2, 2.6
-        // and 10.5 points spare on the last line of the three of them. There is
-        // nowhere for a word to go, so the honest answer is that the paragraph
-        // needs a line it has not got. Gaining one is the next step, and when
-        // it lands this assertion is what changes.
+        // and 10.5 points spare on the last line of the three of them. So there
+        // is nowhere for a word to go until the paragraph makes somewhere.
         println!("\n---- WITH THE PARAGRAPH");
-        match retype_in_paragraph(&bytes, 0, &para, &now, MYANMAR_TEXT, Some(&indexes)) {
-            Ok(_) => panic!("the paragraph took a word it has no room for"),
-            Err(status) => {
-                println!("   refused with status {status}, the paragraph needs another line");
-                assert_eq!(status, STATUS_TOO_WIDE);
-            }
+        let leading = leading_of(&baselines).expect("the paragraph has no leading");
+        let floor = |b: &[u8]| every_baseline(b).iter()
+            .map(|(y, _)| *y).fold(f64::MAX, f64::min);
+        let was_floor = floor(&bytes);
+
+        let grown = retype_in_paragraph(&bytes, 0, &para, &now, MYANMAR_TEXT, Some(&indexes))
+            .expect("the paragraph refused to grow");
+
+        let dropped = was_floor - floor(&grown);
+        println!("   the lowest line on the page went down {dropped:.2}, \
+                  which is {:.2} lines", dropped / leading);
+        assert!((dropped - leading).abs() < BASELINE_TOLERANCE,
+            "the page should have moved down one leading and moved {dropped:.2}");
+
+        let every: Vec<f64> =
+            baselines.iter().copied().chain([*baselines.last().unwrap() - leading]).collect();
+        let said = paragraph_says(&grown, &every);
+        for ((y, n, _, r), s) in paragraph_geometry(&grown, &every).iter().zip(&said) {
+            println!("   y {y:7.2}  {n} placements  reaches {r:7.2}  {:2} words  {:?}",
+                s.as_deref().unwrap_or("").split_whitespace().count(),
+                s.as_deref().unwrap_or("<unreadable>").chars().take(26).collect::<String>());
+            assert!(*n == 0 || *r <= column + SETTLED,
+                "the line at {y:.2} reaches {r:.2}, past the column at {column:.2}");
         }
+        assert!(said.last().is_some_and(|s| s.is_some()),
+            "the line the paragraph gained says nothing");
+
+        // ⚠️ AND NOT ONE WORD OF IT WAS LOST OR INVENTED. A rewrap moves
+        // words between lines, so the only honest check is on the paragraph as
+        // a whole.
+        let before: Vec<&str> = says.iter().filter_map(|s| s.as_deref())
+            .flat_map(str::split_whitespace).collect();
+        let after: Vec<&str> = said.iter().filter_map(|s| s.as_deref())
+            .flat_map(str::split_whitespace).collect();
+        println!("   {} words before, {} after", before.len(), after.len());
+        assert_eq!(before.len() + 0, after.len(),
+            "the paragraph should still have every word it had:\nbefore {before:?}\nafter  {after:?}");
+
         crate::close_document(handle);
     }
 
@@ -1596,6 +1811,7 @@ mod tests {
             edited: 0,
             left,
             column,
+            copied: 0,
         };
         assert!(!para.can_be_rewrapped(),
             "the Hindi paragraph should take the placement path, not the rewrap");
