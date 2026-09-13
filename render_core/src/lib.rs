@@ -28525,6 +28525,146 @@ p={spread_px:.4},c={rgba:08X})"
         }
     }
 
+    /// ⚠️ THE READER'S OWN EDIT, ON THE READER'S OWN PARAGRAPH. They put two
+    /// words into the line at y 297.48 of the Geeta page and the paragraph came
+    /// back with words missing and the two lines under it indented. This is
+    /// that edit, through the call the app makes, printing every placement of
+    /// the paragraph before and after so the damage can be seen.
+    ///
+    ///     cargo test --release what_the_readers_edit_did -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn what_the_readers_edit_did() {
+        const GEETA: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        const NIRMALA: &str = r"C:\Windows\Fonts\NIRMALA.TTF";
+        if !std::path::Path::new(GEETA).exists() || !std::path::Path::new(NIRMALA).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let on_disk = std::fs::read(GEETA).unwrap();
+        let handle = open_document_from_bytes(on_disk.as_ptr(), on_disk.len());
+        let bytes = document_bytes(handle);
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = recover::indexes_for_document(&doc);
+        let (page_left, _, page_w) = recover::page_box(&doc, page).unwrap();
+
+        // The word they edited: युद्ध, on the line their log named.
+        const AT: f64 = 297.48;
+        const WORD: &str = "\u{92f}\u{941}\u{926}\u{94d}\u{927}";
+        let lines = recover::lines_of(&doc, page);
+        let readings = recover::read_page_with(&doc, page, &indexes);
+        let Some((target, _)) = lines.iter().zip(&readings).find(|(l, r)| {
+            (l.page_y - AT).abs() < 0.5 && r.text.as_deref() == Some(WORD)
+        }) else {
+            println!("that word is not on that line any more");
+            close_document(handle);
+            return;
+        };
+        let at_left = ((target.page_x() - page_left) / page_w) as f32;
+
+        let framed = paragraph_around(handle, 0, AT, WORD).expect("no paragraph there");
+        let (baselines, says, edited, left, column, complete) = &framed;
+        println!("paragraph {:?}", baselines.iter().map(|y| format!("{y:.2}"))
+            .collect::<Vec<_>>());
+        println!("left {left:.2} column {column:.2} editing {edited} complete {complete}");
+        println!("{} of {} lines readable",
+            says.iter().filter(|s| s.is_some()).count(), says.len());
+
+        let show = |label: &str, b: &[u8]| -> Vec<(f64, usize, f64, f64)> {
+            let mut seen: Vec<(f64, usize, f64, f64)> = Vec::new();
+            let d = lopdf::Document::load_mem(b).unwrap();
+            let pg = *d.get_pages().values().next().unwrap();
+            let ix = recover::indexes_for_document(&d);
+            let ls = recover::lines_of(&d, pg);
+            let rs = recover::read_page_with(&d, pg, &ix);
+            let w = recover::fonts_of(&d, pg);
+            println!("\n---- {label}");
+            let mut rows: Vec<f64> = Vec::new();
+            for l in &ls {
+                if !rows.iter().any(|y| (y - l.page_y).abs() < 0.5) { rows.push(l.page_y); }
+            }
+            rows.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            for y in rows.iter().filter(|y| **y < 310.0 && **y > 255.0) {
+                let mut on: Vec<(f64, f64, String)> = Vec::new();
+                for (l, r) in ls.iter().zip(&rs) {
+                    if (l.page_y - y).abs() >= 0.5 { continue; }
+                    let right = match w.get(&l.resource) {
+                        Some((_, Some(cw))) =>
+                            l.page_x() + l.along_baseline(recover::advance_of(l, cw)).0,
+                        _ => f64::NAN,
+                    };
+                    on.push((l.page_x(), right,
+                        r.text.clone().unwrap_or_else(|| "?".into())));
+                }
+                on.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let text: String = on.iter().map(|(_, _, t)| t.as_str())
+                    .collect::<Vec<_>>().join(" ");
+                println!("   y {y:7.2}  {:2} placements  {:6.1}..{:6.1}  {}",
+                    on.len(),
+                    on.first().map(|p| p.0).unwrap_or(f64::NAN),
+                    on.iter().map(|p| p.1).fold(f64::MIN, f64::max),
+                    text.chars().take(78).collect::<String>());
+                seen.push((
+                    *y,
+                    on.len(),
+                    on.first().map(|p| p.0).unwrap_or(f64::NAN),
+                    on.iter().map(|p| p.1).fold(f64::MIN, f64::max),
+                ));
+            }
+            seen
+        };
+        let before = show("BEFORE", &bytes);
+
+        let now = format!("{WORD} \u{914}\u{930} \u{927}\u{930}\u{94d}\u{92e}");
+        println!("\nreplacing {WORD:?} with {now:?}, hint at_left {at_left:.4}");
+        let out = retype_ffi_at(handle, AT as f32, at_left, WORD, &now, NIRMALA)
+            .expect("the reader's own edit was refused");
+        let after = show("AFTER", &out);
+
+        // ⚠️ NOTHING LEFT OF THE MARGIN. That is what the reader saw: a word
+        // that shared a pen with one being carried down went along with it and
+        // landed nine points into the margin, out of the line's word order.
+        for (y, _, starts, _) in &after {
+            assert!(*starts >= left - 0.5,
+                "the line at {y:.2} starts at {starts:.2}, left of the margin at {left:.2}");
+        }
+        // ⚠️ NOTHING PAST THE COLUMN, which is the whole point of reflowing.
+        for (y, _, _, reaches) in &after {
+            assert!(*reaches <= column + 0.5,
+                "the line at {y:.2} reaches {reaches:.2}, past the column at {column:.2}");
+        }
+        // ⚠️ AND EVERY PLACEMENT STILL ON THE PAGE. Reflow moves text about; it
+        // may never lose any.
+        let count = |rows: &[(f64, usize, f64, f64)]| rows.iter().map(|(_, n, ..)| n).sum::<usize>();
+        println!("\n{} placements before, {} after", count(&before), count(&after));
+        assert_eq!(count(&before), count(&after),
+            "the paragraph lost or gained placements");
+        close_document(handle);
+    }
+
+    fn retype_ffi_at(
+        handle: u64, baseline: f32, at_left: f32, expected: &str, new_text: &str, font: &str,
+    ) -> Result<Vec<u8>, i32> {
+        let want = expected.as_bytes();
+        let text = new_text.as_bytes();
+        let path = font.as_bytes();
+        let buffer = retype_recovered_line(
+            handle, 0, baseline, at_left,
+            want.as_ptr(), want.len(),
+            text.as_ptr(), text.len(),
+            path.as_ptr(), path.len());
+        if buffer.status != STATUS_OK_PDFIUM {
+            let status = buffer.status;
+            free_byte_buffer(buffer);
+            return Err(status);
+        }
+        let out = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+        Ok(out)
+    }
+
     fn retype_ffi(handle: u64, baseline: f32, expected: &str, new_text: &str, font: &str)
         -> Result<Vec<u8>, i32>
     {

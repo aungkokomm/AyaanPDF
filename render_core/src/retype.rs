@@ -415,6 +415,24 @@ fn number_in(o: &Object) -> Option<f64> {
     }
 }
 
+/// A distance already measured ON THE PAGE, as a page displacement along this
+/// line's baseline.
+///
+/// ⚠️ NOT [`Line::along_baseline`], WHICH TAKES A TEXT-SPACE ADVANCE. That one
+/// scales as well as turns, and everything reflow measures from a `Placed` is
+/// in page points already. Passing one to it scaled the page down a second
+/// time: on the Geeta book, whose `cm` is 0.75, a line that had to move over by
+/// 39.81 points moved 29.86, and the words carried onto it landed on top of the
+/// ones already there.
+fn along_the_page(line: &Line, distance: f64) -> (f64, f64) {
+    let (x, y) = line.along_baseline(1.0);
+    let unit = (x * x + y * y).sqrt();
+    if unit <= f64::EPSILON {
+        return (distance, 0.0);
+    }
+    (x / unit * distance, y / unit * distance)
+}
+
 /// One placement of a line, as reflow sees it: where it will be drawn once the
 /// replacement has been written, and which operations draw it.
 struct Placed {
@@ -497,38 +515,31 @@ fn carry(
         return Err(STATUS_DOC_NOT_REWRITABLE);
     };
     let pen = crate::shift::placements(&content);
-    let pen_of = |p: &Placed| -> std::collections::BTreeSet<usize> {
-        p.drawn_by.iter().filter_map(|at| pen.get(at).map(|(tm, _)| *tm)).collect()
+    // ⚠️ A SET IS ONLY MOVABLE IF THE PENS THAT DRAW IT DRAW NOTHING ELSE.
+    // This used to force the set closed instead, adding whatever else those
+    // pens drew, and that quietly dragged text off other lines: the reader's
+    // own page came back with a word from the line above sitting nine points
+    // into the left margin, because it shared a `Tm` with a word being carried
+    // down and went along with it. Whole placements or none, and the same
+    // answer `move_placements` gives.
+    let ops_of = |ps: &[Placed]| -> Vec<usize> {
+        ps.iter().flat_map(|p| p.drawn_by.iter().copied()).collect()
     };
-    // ⚠️ AND A MOVE TAKES EVERYTHING THAT PEN DREW, not just the part that
-    // was asked for. A mark the producer lifted off the baseline is a placement
-    // of its own to the reader and the same text object to the file, so a set
-    // that left it behind would tear it off its line. `move_placements` refuses
-    // such a set outright: measured on the Geeta book, pushing one line of 54
-    // operations along failed because a neighbour shared its pen.
-    let everything_that_pen_drew = |ops: Vec<usize>| -> Vec<usize> {
+    let closed = |ops: &[usize]| -> bool {
         let tms: std::collections::BTreeSet<usize> =
             ops.iter().filter_map(|at| pen.get(at).map(|(tm, _)| *tm)).collect();
-        let mut out: Vec<usize> = pen
-            .iter()
-            .filter(|(_, (tm, _))| tms.contains(tm))
-            .map(|(at, _)| *at)
-            .chain(ops)
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+        let mine: std::collections::BTreeSet<usize> = ops.iter().copied().collect();
+        // Every one of them placeable, and nothing else drawn by those pens.
+        ops.iter().all(|at| pen.contains_key(at))
+            && pen.iter().all(|(at, (tm, _))| !tms.contains(tm) || mine.contains(at))
     };
-    // The first index at or before `first` where nothing above the split shares
-    // a pen with anything below it.
+    // ⚠️ AND THE SPLIT MOVES UP THE LINE UNTIL THE TAIL IS ONE OF THOSE SETS.
+    // A line can only be broken where the page re-places its pen, and the pen
+    // it shares may belong to a placement on another line entirely, which no
+    // amount of looking along this one would find.
     let breakable = |on_it: &[Placed], first: usize| -> usize {
         let mut at = first;
-        while at > 0 {
-            let above: std::collections::BTreeSet<usize> =
-                on_it[..at].iter().flat_map(|p| pen_of(p)).collect();
-            if on_it[at..].iter().flat_map(|p| pen_of(p)).all(|tm| !above.contains(&tm)) {
-                break;
-            }
+        while at > 0 && !closed(&ops_of(&on_it[at..])) {
             at -= 1;
         }
         at
@@ -572,7 +583,10 @@ fn carry(
                 if lowest < f64::MAX && lowest - leading * (gained + 1) as f64 <= 0.0 {
                     return Err(STATUS_TOO_WIDE);
                 }
-                moves.push((everything_that_pen_drew(pushed.clone()), (0.0, -leading)));
+                if !closed(&pushed) {
+                    return Err(STATUS_LINE_NOT_REWRITABLE);
+                }
+                moves.push((pushed.clone(), (0.0, -leading)));
                 gained += 1;
                 (at - leading, true)
             }
@@ -581,18 +595,18 @@ fn carry(
         let carried = &on_it[first..];
         // A space that leads a carried group hangs into the margin, so the
         // line it joins starts with its first word and not with an indent.
-        let hang = if carried[0].right - carried[0].left < line.size * A_SEPARATOR {
+        // ⚠️ AND THE TYPE SIZE ON THE PAGE, for the same reason: `size` is
+        // what the `Tf` says, and a placement's width here has been through the
+        // page's transform already.
+        let em = line.along_baseline(line.size).0.abs();
+        let hang = if carried[0].right - carried[0].left < em * A_SEPARATOR {
             carried[0].right - carried[0].left
         } else {
             0.0
         };
         let dx = room.left - carried[0].left - hang;
         let dy = next - at;
-        moves.push((
-            everything_that_pen_drew(
-                carried.iter().flat_map(|p| p.drawn_by.iter().copied()).collect()),
-            (dx, dy),
-        ));
+        moves.push((ops_of(carried), (dx, dy)));
 
         // What was already on the line below is pushed along to make room for
         // what has just landed on it.
@@ -611,11 +625,11 @@ fn carry(
         };
         let push = taken;
         if !below.is_empty() {
-            moves.push((
-                everything_that_pen_drew(
-                    below.iter().flat_map(|p| p.drawn_by.iter().copied()).collect()),
-                line.along_baseline(push),
-            ));
+            let shifting = ops_of(&below);
+            if !closed(&shifting) {
+                return Err(STATUS_LINE_NOT_REWRITABLE);
+            }
+            moves.push((shifting, along_the_page(line, push)));
         }
 
         // And the line below, as it now stands, is the one to check next.
