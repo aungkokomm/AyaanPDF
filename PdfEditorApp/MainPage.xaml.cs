@@ -6995,6 +6995,14 @@ public sealed partial class MainPage : Page
         }
 
         _textInput ??= new PageTextInput(ViewModel, InPlaceLayer, CaretOnScreen);
+
+        // ⚠️ Not for a Burmese line: see TypingRoute. KeyMagic's letters were dropped.
+        if (!TypingRoute.HostsTextServices(ViewModel.SelectedTextUnit?.Text))
+        {
+            _textInput.Leave();
+            return;
+        }
+
         if (_textInput.IsActive)
         {
             _textInput.Changed();
