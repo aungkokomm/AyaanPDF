@@ -11544,7 +11544,13 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (end != start) { _lineEdit.PlaceCaret(end, extend: true); }
     });
 
-    public void InPlaceBackspace() => Changed(() => _lineEdit!.Backspace());
+    // ⚠️ ONE CHARACTER ON A BURMESE LINE: KeyMagic corrects by backspacing and
+    // counts on each backspace taking one character. See BackspaceOneCodePoint.
+    public void InPlaceBackspace() => Changed(() =>
+    {
+        if (TypingRoute.IsBurmese(_lineEdit!.Original)) { _lineEdit.BackspaceOneCodePoint(); }
+        else { _lineEdit.Backspace(); }
+    });
 
     public void InPlaceDelete() => Changed(() => _lineEdit!.Delete());
 

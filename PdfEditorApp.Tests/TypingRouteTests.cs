@@ -38,6 +38,56 @@ public class TypingRouteTests
     }
 
     [Fact]
+    public void keymagic_replacing_what_it_just_typed_leaves_the_line_before_it_alone()
+    {
+        // KeyMagic's correction: type N characters, send N backspaces, type the
+        // corrected ones. "မှေ" is three characters and ONE syllable, so the
+        // cluster backspace took it in one and then ate "ည်" and "သ".
+        const string before = "နက်မှောင်သော ညတာသည်";
+        var buffer = new LineEditBuffer(before, before.Length);
+        buffer.Insert("မှေ");
+        for (int i = 0; i < "မှေ".Length; i++) { buffer.BackspaceOneCodePoint(); }
+        Assert.Equal(before, buffer.Text);
+
+        buffer.Insert("မှော");
+        Assert.Equal(before + "မှော", buffer.Text);
+
+        var cluster = new LineEditBuffer(before, before.Length);
+        cluster.Insert("မှေ");
+        for (int i = 0; i < "မှေ".Length; i++) { cluster.Backspace(); }
+        Assert.NotEqual(before, cluster.Text);
+    }
+
+    [Fact]
+    public void one_code_point_backspace_keeps_a_surrogate_pair_whole()
+    {
+        var buffer = new LineEditBuffer("a\U0001F600", 3);
+        buffer.BackspaceOneCodePoint();
+        Assert.Equal("a", buffer.Text);
+        Assert.Equal(1, buffer.Caret);
+    }
+
+    [Fact]
+    public void a_burmese_line_backspaces_one_character_and_other_lines_keep_theirs()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        string path = Path.Combine("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, path)))
+        {
+            dir = dir.Parent;
+        }
+        Assert.NotNull(dir);
+        string vm = File.ReadAllText(Path.Combine(dir!.FullName, path));
+
+        int at = vm.IndexOf("public void InPlaceBackspace()", StringComparison.Ordinal);
+        Assert.True(at > 0, "InPlaceBackspace is gone");
+        string body = vm[at..Math.Min(vm.Length, at + 300)];
+        Assert.Contains("TypingRoute.IsBurmese(_lineEdit!.Original)", body, StringComparison.Ordinal);
+        Assert.Contains("BackspaceOneCodePoint()", body, StringComparison.Ordinal);
+        Assert.Contains("_lineEdit.Backspace()", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void the_page_asks_the_route_before_it_hands_input_to_text_services()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

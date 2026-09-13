@@ -177,6 +177,34 @@ public sealed class LineEditBuffer
     }
 
     /// <summary>
+    /// Backspace that removes exactly one character (one code point), the way a
+    /// Windows text box does.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHAT KEYMAGIC NEEDS, AND WHY BURMESE CANNOT USE <see cref="Backspace"/>.
+    /// KeyMagic reorders Burmese as it is typed by sending backspaces and then
+    /// the corrected characters, and it counts on each backspace taking ONE
+    /// character. The cluster backspace took a whole syllable, so its second
+    /// backspace ate into text already on the line: the reader typed
+    /// "မှောင်မိုက်နေသည် သို့သော်" after "ညတာသည်" and the page got
+    /// "ညတာသှောင်နေသည်သော်".
+    /// </remarks>
+    public void BackspaceOneCodePoint()
+    {
+        if (DeleteSelection()) { return; }
+        if (Caret <= 0) { return; }
+
+        int start = Caret - 1;
+        if (start > 0 && char.IsLowSurrogate(Text[start]) && char.IsHighSurrogate(Text[start - 1]))
+        {
+            start--;
+        }
+        Text = Text[..start] + Text[Caret..];
+        Caret = start;
+        Anchor = Caret;
+    }
+
+    /// <summary>
     /// Pasted text, reduced to something a LINE can hold.
     /// </summary>
     /// <remarks>

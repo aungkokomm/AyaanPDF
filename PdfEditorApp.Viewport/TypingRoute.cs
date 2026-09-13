@@ -20,14 +20,20 @@ public static class TypingRoute
     /// Whether text services should host input for a line that says
     /// <paramref name="line"/> when its edit begins.
     /// </summary>
-    public static bool HostsTextServices(string? line)
+    public static bool HostsTextServices(string? line) => !IsBurmese(line);
+
+    /// <summary>
+    /// Whether a line has Burmese in it, and so is typed with KeyMagic: through
+    /// the character path, and with a backspace that takes one character.
+    /// </summary>
+    public static bool IsBurmese(string? line)
     {
-        if (line is null) { return true; }
+        if (line is null) { return false; }
         foreach (char c in line)
         {
-            if (IsBurmese(c)) { return false; }
+            if (IsBurmese(c)) { return true; }
         }
-        return true;
+        return false;
     }
 
     /// <summary>Myanmar, Myanmar Extended-A and Extended-B.</summary>
