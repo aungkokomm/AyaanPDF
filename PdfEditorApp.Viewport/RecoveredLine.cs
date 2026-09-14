@@ -37,6 +37,9 @@ public sealed record RecoveredCluster(int From, int To, double Left, double Righ
 /// user space because that is the identity the core takes back. Everything else
 /// is normalized the way the whole app draws: top-left origin, BOTH axes
 /// divided by the page WIDTH.
+///
+/// <see cref="Paragraph"/> is the same number on every line the core would
+/// rewrap together, and -1 on a line it keeps in no paragraph.
 /// </remarks>
 public sealed record RecoveredLine(
     double PdfBaseline,
@@ -49,7 +52,8 @@ public sealed record RecoveredLine(
     string Text,
     string FontName,
     string FontPath,
-    IReadOnlyList<RecoveredCluster> Clusters)
+    IReadOnlyList<RecoveredCluster> Clusters,
+    int Paragraph = -1)
 {
     /// <summary>
     /// Whether the core could prove what this line says.

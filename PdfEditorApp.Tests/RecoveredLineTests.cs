@@ -24,6 +24,14 @@ public class RecoveredLineTests
     {
         private readonly List<byte> _bytes = new();
         private int _count;
+        private uint _paragraph = uint.MaxValue;
+
+        /// <summary>The paragraph every line added after this is in.</summary>
+        public Builder InParagraph(int paragraph)
+        {
+            _paragraph = unchecked((uint)paragraph);
+            return this;
+        }
 
         public Builder Line(
             float pdfBaseline, float left, float top, float right, float bottom,
@@ -53,6 +61,7 @@ public class RecoveredLineTests
                 F32(c.Left);
                 F32(c.Right);
             }
+            U32(_paragraph);
             return this;
         }
 
@@ -161,6 +170,27 @@ public class RecoveredLineTests
         Assert.Empty(line.Text);
         Assert.Empty(line.Clusters);
         Assert.False(line.WasRead);
+    }
+
+    /// <summary>
+    /// Every line says which paragraph the core would rewrap it with, and a
+    /// line in none arrives as -1 rather than as paragraph 4294967295.
+    /// </summary>
+    [Fact]
+    public void a_line_says_which_paragraph_it_is_in()
+    {
+        byte[] bytes = new Builder()
+            .InParagraph(4)
+            .Line(700f, 0.1f, 0.1f, 0.9f, 0.13f, 0.128f, 11f, Burmese, "MyanmarText",
+                (0, 6, 0.1f, 0.4f))
+            .InParagraph(-1)
+            .Line(680f, 0.1f, 0.2f, 0.9f, 0.23f, 0.228f, 11f, Burmese, "MyanmarText",
+                (0, 6, 0.1f, 0.4f))
+            .Build();
+
+        var found = RecoveredLineReader.Parse(bytes);
+
+        Assert.Equal(new[] { 4, -1 }, found.Select(l => l.Paragraph));
     }
 
     [Fact]

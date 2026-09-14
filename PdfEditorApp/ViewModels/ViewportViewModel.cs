@@ -5879,7 +5879,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             : word is not null ? TextUnitSelection.From(pageIndex, word)
             : null;
 
-        var block = BlockAt(pageIndex, normX, normY, oneLineOnly);
+        var block = BlockAt(pageIndex, normX, normY, oneLineOnly, picked);
 
         // ⚠️ THE BLOCKS ARE SET BEFORE THE ANCHOR, because assigning the anchor
         // refreshes the overlay and the overlay draws the blocks. The other
@@ -6023,8 +6023,36 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// looking at.
     /// </remarks>
     private TextBlockSelection? BlockAt(
-        int pageIndex, double normX, double normY, bool oneLineOnly)
+        int pageIndex, double normX, double normY, bool oneLineOnly, TextUnitSelection? picked)
     {
+        // ⚠️ A RECOVERED LINE'S PARAGRAPH IS THE CORE'S, not the regions'. See
+        // TextBlockSelection.Of. Only where the core numbered one: a line in no
+        // paragraph (a Hindi line the writer reflows by the block model) keeps
+        // the regions below, exactly as before.
+        var numbered = LinesFor(pageIndex)
+            .Select(l => l.Recovered)
+            .OfType<RecoveredLine>()
+            .Where(l => l.Paragraph >= 0)
+            .ToList();
+        if (picked?.Line?.Recovered is { Paragraph: >= 0 } recovered)
+        {
+            return TextBlockSelection.Of(
+                pageIndex, oneLineOnly ? Array.Empty<RecoveredLine>() : numbered, recovered);
+        }
+
+        // ⚠️ AND A CLICK BETWEEN ITS LINES IS STILL IN IT. A recovered line's
+        // box is the face's height, not the leading, so a paragraph has stripes
+        // no line answers; a click there got PdfPig's region instead, which is
+        // why the same paragraph selected differently from click to click.
+        if (picked is null && !oneLineOnly)
+        {
+            foreach (var member in numbered)
+            {
+                var paragraph = TextBlockSelection.Of(pageIndex, numbered, member);
+                if (paragraph.Contains(pageIndex, normX, normY)) { return paragraph; }
+            }
+        }
+
         var line = TextRegionHitTest.LineAt(
             TextRegionsFor(pageIndex), normX, normY, offerableOnly: false);
         if (oneLineOnly)

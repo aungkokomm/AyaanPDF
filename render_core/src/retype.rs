@@ -3846,7 +3846,91 @@ mod tests {
         }
         crate::free_byte_buffer(buffer);
         crate::close_document(handle);
+        // ⚠️ LOCKED IN, 2026-09-14: the reader confirmed this exact result on
+        // 3.45.8 ("the one I was editing has good results for paragraph flowing
+        // lock it in"). The app's own call must REFLOW this paragraph: never
+        // refuse, never run past the column, never lose, add or reorder a word,
+        // and move the paragraph under it down by exactly one line.
+        let out = app.as_deref().expect("the app's own call refused the reader's Myanmar edit");
+        let leading = 494.11 - 474.55;
+        let grown: Vec<f64> = (0..4).map(|i| baseline - leading * i as f64).collect();
+        let column = paragraph_geometry(&bytes, &grown[..3])
+            .iter()
+            .map(|(.., right)| *right)
+            .fold(f64::MIN, f64::max);
+        for (y, n, _, right) in paragraph_geometry(out, &grown) {
+            assert!(n > 0, "the line at {y:.2} of the reflowed paragraph is empty");
+            assert!(right <= column + 0.5,
+                "the line at {y:.2} reaches {right:.2}, past the column at {column:.2}");
+        }
+        let said_at = |y: f64| -> String {
+            lines.iter().zip(&readings)
+                .find(|(l, _)| (l.page_y - y).abs() < BASELINE_TOLERANCE)
+                .and_then(|(_, r)| r.text.clone())
+                .expect("a line of the original page reads as nothing")
+        };
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let expected: Vec<String> = [now.clone(), said_at(grown[1]), said_at(grown[2])]
+            .iter()
+            .flat_map(|s| words(s))
+            .collect();
+        let got: Vec<String> = paragraph_says(out, &grown)
+            .iter()
+            .map(|s| s.clone().expect("a line of the reflowed paragraph reads as nothing"))
+            .flat_map(|s| words(&s))
+            .collect();
+        assert_eq!(got, expected, "the reflowed paragraph lost, gained or reordered a word");
+        let next = said_at(grown[3]);
+        assert_eq!(paragraph_says(out, &[grown[3] - leading])[0].as_deref(), Some(next.as_str()),
+            "the paragraph under it did not move down exactly one line");
+
         println!("rendered to {}", dir.display());
+    }
+
+    /// ⚠️ WHY A CLICK ON THE PYIDAUNGSU LETTER SELECTS ONE LINE AND A FRAME
+    /// THAT STOPS SHORT. The reader clicked the paragraph "၂။ သို့ဖြစ်ပါ၍ …" on
+    /// page 3 and got a frame round one line, ending before "ဌာန၊", and a
+    /// different line on each click. Prints, per line of that page: where its
+    /// letters end by the reading (what the frame is drawn from), where its ink
+    /// really ends by the file's own widths, and what it says; then the page's
+    /// paragraphs as the writer groups them.
+    ///
+    ///     cargo test --release how_the_pyidaungsu_page_divides_into_paragraphs -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF and fonts that are not in this repository"]
+    fn how_the_pyidaungsu_page_divides_into_paragraphs() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages 2.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().nth(2).unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let fonts = crate::recover::fonts_of(&doc, page);
+        println!("{} lines, {} readings", lines.len(), readings.len());
+        for (i, (l, r)) in lines.iter().zip(&readings).enumerate() {
+            let ink = fonts.get(&l.resource).and_then(|(_, w)| w.as_ref()).map(|w| {
+                l.page_x() + l.along_baseline(crate::recover::advance_of(l, w)).0
+            });
+            let (first, last) = (r.clusters.first().map(|c| c.left), r.clusters.last().map(|c| c.right));
+            println!("{i:3} y {:7.2} x {:7.2} ink to {} letters {} to {}  font {} breaks {} tracked {}\n      {}",
+                l.page_y, l.page_x(),
+                ink.map_or("?".into(), |v| format!("{v:7.2}")),
+                first.map_or("?".into(), |v| format!("{v:7.2}")),
+                last.map_or("?".into(), |v| format!("{v:7.2}")),
+                l.base_font, l.breaks.len(), l.tracked,
+                r.text.as_deref().unwrap_or("<unread>"));
+        }
+        println!("\nparagraphs by the writer's lines (shift::blocks_of):");
+        for group in crate::shift::blocks_of(&lines) {
+            println!("   {:?}", group.iter()
+                .map(|i| format!("{:.2}@{:.0}", lines[*i].page_y, lines[*i].page_x()))
+                .collect::<Vec<_>>());
+        }
     }
 
     /// Page one of `pdf`, rendered, written as width, height and BGRA bytes so

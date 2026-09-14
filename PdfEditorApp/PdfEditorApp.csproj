@@ -51,7 +51,7 @@
       still at the SDK default of 1.0.0 while the installer said 1.15.0, and
       the About dialog dutifully reported the wrong one.
     -->
-    <Version>3.45.8</Version>
+    <Version>3.45.9</Version>
 
     <!--
       The SDK otherwise appends "+<git sha>" to the informational version, which

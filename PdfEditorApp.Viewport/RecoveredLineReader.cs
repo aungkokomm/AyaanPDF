@@ -15,7 +15,7 @@ namespace PdfEditorApp.Viewport;
 /// Little-endian: a line count, then per line the baseline in PDF user space,
 /// four normalized bounds, a normalized baseline, a font size in points, two
 /// length-prefixed UTF-8 strings, and a cluster count followed by a first byte,
-/// a last byte, a left and a right for each.
+/// a last byte, a left and a right for each, then the line's paragraph number.
 /// </summary>
 public static class RecoveredLineReader
 {
@@ -81,9 +81,13 @@ public static class RecoveredLineReader
                 clusters.Add(new RecoveredCluster(fromChar, toChar, cl, cr));
             }
 
+            // u32::MAX for a line in no paragraph, which is -1 here.
+            if (at + 4 > bytes.Length) { break; }
+            int paragraph = unchecked((int)ReadU32(bytes, ref at));
+
             found.Add(new RecoveredLine(
                 pdfBaseline, left, top, right, bottom, baseline, size,
-                text, font, fontPath, clusters));
+                text, font, fontPath, clusters, paragraph));
         }
 
         return found;

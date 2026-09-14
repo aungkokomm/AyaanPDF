@@ -142,6 +142,74 @@ public class TextBlockSelectionTests
             .IsSameAs(TextBlockSelection.Of(0, Line(0.10, 0.20, 0.80, 0.22))));
     }
 
+    private static RecoveredLine Recovered(
+        int paragraph, double left, double right, double baseline) =>
+        new(PdfBaseline: 700, Left: left, Top: baseline - 0.015, Right: right,
+            Bottom: baseline + 0.004, Baseline: baseline, FontSizePts: 11,
+            Text: "မြန်မာ", FontName: "Pyidaungsu", FontPath: "",
+            Clusters: Array.Empty<RecoveredCluster>(), Paragraph: paragraph);
+
+    /// <summary>
+    /// ⚠️ THE READER'S PYIDAUNGSU PAGE. A click on any line of a paragraph the
+    /// core numbered gets all of it, framed from the lines' own edges, and
+    /// nothing from the paragraph beside it.
+    /// </summary>
+    [Fact]
+    public void a_recovered_paragraph_is_every_line_the_core_numbered_with_it()
+    {
+        var heading = Recovered(0, 0.30, 0.70, 0.10);
+        var first = Recovered(1, 0.10, 0.90, 0.20);
+        var second = Recovered(1, 0.10, 0.92, 0.23);
+        var last = Recovered(1, 0.10, 0.50, 0.26);
+        var page = new[] { heading, first, second, last };
+
+        var block = TextBlockSelection.Of(4, page, second);
+
+        Assert.Equal(new[] { 0.20, 0.23, 0.26 }, block.Baselines);
+        Assert.Equal(0.10, block.Left, 6);
+        Assert.Equal(0.92, block.Right, 6);
+        Assert.Equal(first.Top, block.Top, 6);
+        Assert.Equal(last.Bottom, block.Bottom, 6);
+
+        // The same block whichever of its lines was clicked.
+        Assert.True(block.IsSameAs(TextBlockSelection.Of(4, page, first)));
+        Assert.True(block.IsSameAs(TextBlockSelection.Of(4, page, last)));
+        Assert.False(block.IsSameAs(TextBlockSelection.Of(4, page, heading)));
+    }
+
+    /// <summary>
+    /// A line the core put in no paragraph is a block of one, even beside
+    /// other lines in none.
+    /// </summary>
+    [Fact]
+    public void a_recovered_line_in_no_paragraph_is_a_block_of_one()
+    {
+        var alone = Recovered(-1, 0.10, 0.90, 0.20);
+        var other = Recovered(-1, 0.10, 0.90, 0.23);
+
+        var block = TextBlockSelection.Of(0, new[] { alone, other }, alone);
+
+        Assert.Equal(new[] { 0.20 }, block.Baselines);
+        Assert.Equal(alone.Bottom - alone.Top, block.LineHeight, 6);
+    }
+
+    /// <summary>
+    /// Two runs on one line of type are one baseline, or a shift-click could
+    /// not tell the paragraph from itself.
+    /// </summary>
+    [Fact]
+    public void two_runs_on_one_line_of_type_are_one_baseline()
+    {
+        var left = Recovered(2, 0.10, 0.40, 0.20);
+        var right = Recovered(2, 0.42, 0.90, 0.2005);
+        var below = Recovered(2, 0.10, 0.90, 0.23);
+
+        var block = TextBlockSelection.Of(0, new[] { left, right, below }, left);
+
+        Assert.Equal(2, block.Baselines.Count);
+        Assert.Equal(0.90, block.Right, 6);
+    }
+
     [Fact]
     public void a_point_on_another_page_is_never_inside()
     {

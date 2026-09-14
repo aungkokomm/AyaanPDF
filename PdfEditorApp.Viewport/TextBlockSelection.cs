@@ -51,6 +51,48 @@ public sealed record TextBlockSelection(
             line.Bottom - line.Top, new[] { line.Baseline });
 
     /// <summary>
+    /// The paragraph a recovered line is in: every line the core gave the same
+    /// number, framed from their own edges.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE CORE'S PARAGRAPH, NOT THE SEGMENTER'S. On a Burmese page the
+    /// regions are built from glyphs PDFium reads as scrambled fragments, and on
+    /// the reader's Pyidaungsu page that frame stopped short of the lines and
+    /// split the paragraph. The core numbers recovered lines by the rule its
+    /// rewrap uses, so the box a click draws is the paragraph an edit reflows.
+    /// An anchor numbered -1 is a block of one.
+    /// </remarks>
+    public static TextBlockSelection Of(
+        int page, IEnumerable<RecoveredLine> lines, RecoveredLine anchor)
+    {
+        var members = lines
+            .Where(l => anchor.Paragraph >= 0 && l.Paragraph == anchor.Paragraph && l != anchor)
+            .Append(anchor)
+            .OrderBy(l => l.Baseline)
+            .ToList();
+
+        // One baseline per line of type, however many runs draw it.
+        var baselines = new List<double>();
+        foreach (var line in members)
+        {
+            if (baselines.Count == 0 || line.Baseline - baselines[^1] > SameBaseline)
+            {
+                baselines.Add(line.Baseline);
+            }
+        }
+
+        double height = members
+            .Where(l => l.Bottom > l.Top)
+            .Select(l => l.Bottom - l.Top)
+            .FirstOrDefault();
+
+        return new(page,
+            members.Min(l => l.Left), members.Min(l => l.Top),
+            members.Max(l => l.Right), members.Max(l => l.Bottom),
+            height, baselines);
+    }
+
+    /// <summary>
     /// The first line's height, which is what the frame is padded by.
     /// </summary>
     /// <remarks>

@@ -2281,23 +2281,10 @@ fn paragraph_around(
     // line down under it. `shift::blocks_of` applies the same rule to the
     // content stream's own lines and gets all three. A book whose lines are many
     // placements (the Hindi one) is not whole and keeps the block model.
-    let whole = |ys: &[f64]| -> bool {
-        ys.iter().all(|y| {
-            let on: Vec<usize> =
-                (0..lines.len()).filter(|i| (lines[*i].page_y - y).abs() < NEAR).collect();
-            on.len() == 1 && readings.get(on[0]).is_some_and(|r| r.text.is_some())
-        })
-    };
     let written: Option<Vec<f64>> = shift::blocks_of(&lines)
         .into_iter()
         .find(|g| g.iter().any(|i| (lines[*i].page_y - baseline).abs() < NEAR))
-        .map(|g| {
-            let mut ys: Vec<f64> = g.iter().map(|i| lines[*i].page_y).collect();
-            ys.sort_by(|a, b| b.total_cmp(a));
-            ys.dedup_by(|a, b| (*a - *b).abs() < NEAR);
-            ys
-        })
-        .filter(|ys| ys.len() >= 2 && whole(ys));
+        .and_then(|g| written_paragraph(&lines, &readings, &g));
     let baselines = written.or(framed)?;
     let edited = baselines.iter().position(|y| (y - baseline).abs() < NEAR)?;
 
@@ -2458,7 +2445,9 @@ pub extern "C" fn shift_page_text(
 /// PDF USER SPACE, the bounds and baseline NORMALIZED, the font size in points,
 /// two length-prefixed UTF-8 strings (the text and the font name), and a `u32`
 /// cluster count followed by `u32` first byte, `u32` last byte, `f32` left and
-/// `f32` right for each. A line nothing could prove has no text and no
+/// `f32` right for each, then a `u32` paragraph: the same number on every line
+/// of one paragraph, `u32::MAX` on a line in none (see [`written_paragraph`]).
+/// A line nothing could prove has no text and no
 /// clusters, and is still reported so a caller can match it by baseline.
 ///
 /// ⚠️ TWO COORDINATE SYSTEMS ON PURPOSE, because two callers need two
@@ -2472,6 +2461,33 @@ pub extern "C" fn shift_page_text(
 /// it: `မြ` is drawn as one unit with the medial before the consonant it
 /// follows, so the page has no position between the two of them. See
 /// [`crate::recover::Cluster`].
+/// The baselines of a paragraph of whole lines, top first, or nothing when the
+/// group is not one.
+///
+/// ⚠️ ONE RULE FOR THE WRITER AND THE SELECTION. `paragraph_around` rewraps
+/// this paragraph and `recover_page_text` tells the app which lines are in it,
+/// so the frame a click draws is the paragraph an edit reflows. Whole means two
+/// lines or more, each baseline drawn by exactly one line that reads. A book
+/// whose lines are many placements (the Hindi one) is not whole, and keeps the
+/// block model on both sides.
+fn written_paragraph(
+    lines: &[recover::Line],
+    readings: &[recover::Reading],
+    group: &[usize],
+) -> Option<Vec<f64>> {
+    const NEAR: f64 = 0.5;
+
+    let mut ys: Vec<f64> = group.iter().map(|i| lines[*i].page_y).collect();
+    ys.sort_by(|a, b| b.total_cmp(a));
+    ys.dedup_by(|a, b| (*a - *b).abs() < NEAR);
+    let whole = ys.iter().all(|y| {
+        let on: Vec<usize> =
+            (0..lines.len()).filter(|i| (lines[*i].page_y - y).abs() < NEAR).collect();
+        on.len() == 1 && readings.get(on[0]).is_some_and(|r| r.text.is_some())
+    });
+    (ys.len() >= 2 && whole).then_some(ys)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn recover_page_text(doc_handle: u64, page_index: i32) -> ByteBuffer {
     if doc_handle == 0 || page_index < 0 {
@@ -2504,9 +2520,25 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
 
     let indexes = indexes_for_doc(doc_handle, &doc, page);
     let read = recover::read_page_with(&doc, page, &indexes);
+
+    // Which paragraph each line is in, by the rule the rewrap uses. Readings
+    // are one per line of `lines_of`, so a group's indices address both.
+    let lines = recover::lines_of(&doc, page);
+    let mut paragraph = vec![u32::MAX; read.len()];
+    for (n, group) in shift::blocks_of(&lines).iter().enumerate() {
+        if written_paragraph(&lines, &read, group).is_none() {
+            continue;
+        }
+        for &i in group {
+            if let Some(slot) = paragraph.get_mut(i) {
+                *slot = n as u32;
+            }
+        }
+    }
+
     let mut out: Vec<u8> = Vec::new();
     out.extend((read.len() as u32).to_le_bytes());
-    for line in &read {
+    for (i, line) in read.iter().enumerate() {
         out.extend((line.y as f32).to_le_bytes());
 
         // The line's own extent is where its clusters start and stop, not where
@@ -2540,6 +2572,7 @@ fn recover_page_text_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
             out.extend(across(cluster.left).to_le_bytes());
             out.extend(across(cluster.right).to_le_bytes());
         }
+        out.extend(paragraph[i].to_le_bytes());
     }
 
     let mut boxed = out.into_boxed_slice();
@@ -29120,6 +29153,8 @@ p={spread_px:.4},c={rgba:08X})"
         /// The installed file the face resolved to, or empty.
         font_path: String,
         clusters: Vec<RecoveredCluster>,
+        /// Which paragraph, or `u32::MAX` for none.
+        paragraph: u32,
     }
 
     /// Everything `recover_page_text` reported, decoded, with the invariants
@@ -29178,10 +29213,11 @@ p={spread_px:.4},c={rgba:08X})"
                     "a cluster names bytes {from}..{to} of {text:?}");
                 clusters.push(RecoveredCluster { from, to, left: cl, right: cr });
             }
+            let paragraph = u32::from_le_bytes(take4(&raw, &mut at));
 
             out.push(RecoveredLine {
                 pdf_baseline, left, top, right, bottom, baseline, size,
-                text, font, font_path, clusters,
+                text, font, font_path, clusters, paragraph,
             });
         }
         assert_eq!(at, raw.len(), "the buffer did not decode exactly");
@@ -29193,6 +29229,57 @@ p={spread_px:.4},c={rgba:08X})"
             .into_iter()
             .map(|l| (l.pdf_baseline, l.text))
             .collect()
+    }
+
+    /// ⚠️ A CLICK SELECTS THE PARAGRAPH AN EDIT REFLOWS. On the reader's
+    /// Pyidaungsu page the app framed this paragraph from PdfPig's segments,
+    /// which stopped short of the lines and split it. The core now numbers the
+    /// recovered lines by the rule the rewrap uses, and all four of these lines
+    /// must carry one number that no other line carries.
+    #[test]
+    fn a_pyidaungsu_paragraph_arrives_numbered_as_one() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages 2.pdf";
+        const HINDI: &str =
+            r"D:\Ayaan PDF Test file\Pages from Geeta Darshan Complete 18 Chapters.pdf";
+        if !std::path::Path::new(FILE).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let lines = recovered_lines(handle, 2);
+        close_document(handle);
+
+        let paragraph = [514.97f32, 491.78, 468.45, 445.15];
+        let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let ids: Vec<u32> = paragraph
+            .iter()
+            .map(|y| {
+                lines
+                    .iter()
+                    .find(|l| near(l.pdf_baseline, *y) && !l.text.is_empty())
+                    .unwrap_or_else(|| panic!("no line read at {y}"))
+                    .paragraph
+            })
+            .collect();
+        assert!(ids[0] != u32::MAX && ids.iter().all(|id| *id == ids[0]),
+            "the paragraph arrived split: {ids:?}");
+        let members: Vec<f32> = lines
+            .iter()
+            .filter(|l| l.paragraph == ids[0])
+            .map(|l| l.pdf_baseline)
+            .collect();
+        assert!(members.iter().all(|y| paragraph.iter().any(|p| near(*p, *y))),
+            "other lines joined the paragraph: {members:?}");
+
+        // Measured, not asserted: how many Hindi lines the new number reaches.
+        // A Hindi line in no paragraph keeps the selection it had.
+        if std::path::Path::new(HINDI).exists() {
+            let handle = open_fixture_named(HINDI);
+            let hindi = recovered_lines(handle, 0);
+            close_document(handle);
+            let numbered = hindi.iter().filter(|l| l.paragraph != u32::MAX).count();
+            println!("hindi page 0: {numbered} of {} lines in a paragraph", hindi.len());
+        }
     }
 
     /// \u{26a0}\u{fe0f} THE WHOLE CHAIN, ON A PAGE THIS TEST WROTE. Path B draws
