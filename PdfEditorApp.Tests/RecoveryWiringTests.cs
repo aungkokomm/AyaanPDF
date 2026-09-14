@@ -591,6 +591,38 @@ public class RecoveryWiringTests
             "the reading is handed over after the close, which has already dropped it");
     }
 
+    /// <summary>
+    /// ⚠️ AND AN UNDO HANDS IT OVER TOO. The reader's undo on the Pyidaungsu
+    /// file opened the old bytes on a new handle with nothing handed over and
+    /// prepared for 63 seconds; replayed with a handover, the page read at once.
+    /// The generation comes across with the index, so what was read off the
+    /// edited document has to go or the undone text would still be offered.
+    /// </summary>
+    [Fact]
+    public void an_undo_hands_the_reading_over_and_forgets_the_edited_text()
+    {
+        string vm = Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        int at = vm.IndexOf("private void ApplyHistoryEntryCore(", StringComparison.Ordinal);
+        Assert.True(at > 0, "the undo method is gone");
+        string body = MethodBodyAt(vm, at);
+
+        int document = body.IndexOf("entry.Scope == HistoryScope.Document", StringComparison.Ordinal);
+        Assert.True(document > 0, "the document-scope undo is gone");
+        string restore = body[document..];
+
+        int opened = restore.IndexOf("open_document_from_bytes", StringComparison.Ordinal);
+        int handed = restore.IndexOf("adopt_recovery(_documentHandle, restored)", StringComparison.Ordinal);
+        int closed = restore.IndexOf("CloseCurrentDocument()", StringComparison.Ordinal);
+
+        Assert.True(opened > 0, "nothing opens the restored document");
+        Assert.True(handed > opened, "an undo builds the whole index over again");
+        Assert.True(closed > handed, "the reading is handed over after the close has dropped it");
+        Assert.Contains("_contextByPage.Clear();", restore, StringComparison.Ordinal);
+        Assert.Contains("_clustersByPage.Clear();", restore, StringComparison.Ordinal);
+        Assert.Contains("_textRegions.Clear();", restore, StringComparison.Ordinal);
+    }
+
     private static string Source(params string[] parts)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

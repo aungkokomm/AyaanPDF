@@ -1874,18 +1874,52 @@ pub extern "C" fn adopt_recovery(from_handle: u64, to_handle: u64) {
     // have been prepared on its own account, and that index was built for the
     // document as it now is.
     if held.is_none() {
-        *held = Some(ready);
+        *held = Some(Arc::clone(&ready));
+        drop(held);
 
         // ⚠️ AND WHICH PAGES WERE READ FOR COMES WITH IT. Readiness is per
         // page now, so handing over the resources alone would leave every page
         // of the replacement reporting itself unprepared and the app building
         // the same index all over again, which is the whole thing this exists
         // to prevent.
+        //
+        // ⚠️ BUT ONLY FOR A PAGE THE INDEX STILL READS WITHOUT GROWING. A
+        // rewrite can ask for more than the old document did, and a mark
+        // carried across anyway tells the app the page is ready: it reads on
+        // the UI thread and the growing happens there. Measured on the reader's
+        // Pyidaungsu retype, 57.5 seconds of "not responding". Unmarked, the
+        // page is prepared on the background thread like any other.
         let marks = lock(&core().prepared).get(&from_handle).cloned();
         if let Some(marks) = marks {
-            lock(&core().prepared).insert(to_handle, marks);
+            let kept = if ready.reads_every_glyph() {
+                marks
+            } else {
+                still_read(to_handle, &ready, marks)
+            };
+            lock(&core().prepared).insert(to_handle, kept);
         }
     }
+}
+
+/// The marked pages of the document behind `to_handle` that `ready` reads
+/// without building anything. See [`recover::Indexes::covers`].
+fn still_read(
+    to_handle: u64,
+    ready: &recover::Indexes,
+    marks: HashMap<i32, u64>,
+) -> HashMap<i32, u64> {
+    let Some(bytes) = document_bytes(to_handle) else { return HashMap::new() };
+    let Ok(doc) = lopdf::Document::load_mem(&bytes) else { return HashMap::new() };
+    let pages: Vec<lopdf::ObjectId> = doc.get_pages().values().copied().collect();
+    marks
+        .into_iter()
+        .filter(|(index, _)| {
+            usize::try_from(*index)
+                .ok()
+                .and_then(|i| pages.get(i))
+                .is_some_and(|&page| ready.covers(&recover::wanted_for_page(&doc, page)))
+        })
+        .collect()
 }
 
 /// Whether a page's shaped text has been read and is waiting to be asked for.
@@ -28748,6 +28782,134 @@ p={spread_px:.4},c={rgba:08X})"
         Ok(out)
     }
 
+    /// MEASUREMENT: what the reader waited for on the Pyidaungsu file. Their
+    /// log showed "Preparing" twice on one handle before any edit, 58.6 seconds
+    /// of silence after committing a line of the four-line paragraph, and 63
+    /// seconds of preparing after an undo. This replays that session call by
+    /// call, timing each one on the thread the app makes it on.
+    #[test]
+    #[ignore = "needs a PDF and fonts that are not in this repository"]
+    fn what_a_pyidaungsu_edit_costs_the_ui_thread() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages 2.pdf";
+        const FONT: &str = r"C:\Windows\Fonts\Pyidaungsu.ttf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(FONT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let secs = |t: std::time::Instant| t.elapsed().as_secs_f64();
+        let generation = |h: u64| cached_indexes(h).map(|i| i.generation());
+        let fonts_on = |b: &[u8], p: usize| {
+            let d = lopdf::Document::load_mem(b).unwrap();
+            let pg = *d.get_pages().values().nth(p).unwrap();
+            recover::fonts_of(&d, pg)
+                .into_values()
+                .map(|(name, w)| format!("{name} declares {}",
+                    w.map(|w| w.declared().count()).unwrap_or(0)))
+                .collect::<Vec<_>>()
+        };
+
+        // 1. Preparing, page by page, in the order the reader looked at them.
+        let handle = open_fixture_named(FILE);
+        let bytes = document_bytes(handle);
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        // The reader's session prepared page 2 and whatever else came into
+        // view; AYAAN_PREPARE="2" replays only page 2.
+        let order: Vec<i32> = std::env::var("AYAAN_PREPARE")
+            .unwrap_or_else(|_| "2,1,0".into())
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        for page_index in order {
+            let page = *doc.get_pages().values().nth(page_index as usize).unwrap();
+            let t = std::time::Instant::now();
+            let ix = indexes_for_doc(handle, &doc, page);
+            mark_prepared(handle, page_index, ix.generation());
+            println!("prepare page {page_index}: {:5.1}s  generation {}", secs(t), ix.generation());
+        }
+        println!("page 2 fonts before: {:?}", fonts_on(&bytes, 2));
+
+        // 2. The reader's edit: new words into a line of the four-line paragraph.
+        let lines = recovered_lines(handle, 2);
+        let line = lines
+            .iter()
+            .find(|l| l.text.starts_with("လားရှိုး"))
+            .expect("the paragraph's line is not on page 2");
+        let at = line.text.char_indices().nth(20).map(|(i, _)| i).unwrap();
+        let now = format!("{}မှောင်နေသည်၊ ငှက်ကလေးများလည်း {}", &line.text[..at], &line.text[at..]);
+
+        // Where a commit's time goes: finding the paragraph, then writing it.
+        let t = std::time::Instant::now();
+        let framed = paragraph_around(handle, 2, line.pdf_baseline as f64, &line.text);
+        println!("paragraph_around: {:5.1}s  {} lines", secs(t),
+            framed.as_ref().map(|f| f.0.len()).unwrap_or(0));
+
+        let t = std::time::Instant::now();
+        let buffer = retype_recovered_line(
+            handle, 2, line.pdf_baseline, line.left,
+            line.text.as_ptr(), line.text.len(),
+            now.as_ptr(), now.len(),
+            FONT.as_ptr(), FONT.len());
+        println!("retype_recovered_line: {:5.1}s  status {}", secs(t), buffer.status);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "the edit was refused");
+        let out = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        free_byte_buffer(buffer);
+        println!("page 2 fonts after:  {:?}", fonts_on(&out, 2));
+
+        // 3. The commit as the app makes it: open, hand over, ask, then read.
+        let t = std::time::Instant::now();
+        let next = open_fixture_named_from(&out);
+        println!("open the edited bytes: {:5.1}s", secs(t));
+        adopt_recovery(handle, next);
+        println!("after handover: ready(page 2) = {}, generation {:?}",
+            recovery_is_ready(next, 2), generation(next));
+        for page_index in [2i32, 1, 0] {
+            // Asked BEFORE reading, as the app asks.
+            let was_ready = recovery_is_ready(next, page_index) != 0;
+            let t = std::time::Instant::now();
+            let buffer = recover_page_text(next, page_index);
+            let status = buffer.status;
+            free_byte_buffer(buffer);
+            let took = secs(t);
+            println!("recover_page_text(page {page_index}) on the UI thread: {took:5.1}s  \
+                      status {status}  generation {:?}", generation(next));
+
+            // ⚠️ THE FREEZE. The app reads a page this says is ready on the UI
+            // thread, so a ready page must read at once.
+            if was_ready {
+                assert!(took < 5.0,
+                    "page {page_index} was reported ready and took {took:.1}s to read");
+            }
+        }
+
+        // 4. Undo: the original bytes back, WITH a handover, which the app's
+        //    undo does not do today.
+        let back = open_fixture_named_from(&bytes);
+        adopt_recovery(next, back);
+        let t = std::time::Instant::now();
+        let buffer = recover_page_text(back, 2);
+        free_byte_buffer(buffer);
+        println!("undo with a handover, recover_page_text(page 2): {:5.1}s  ready {}",
+            secs(t), recovery_is_ready(back, 2));
+
+        for h in [handle, next, back] {
+            close_document(h);
+        }
+    }
+
+    /// ⚠️ A SUBSET SAYS WHAT A DOCUMENT USES, A WHOLE FONT DOES NOT. Every
+    /// font the reader's files arrive with is tagged, the Hindi book's
+    /// `CIDFont+F1` included, and keeps being scoped by its `/W`. The face this
+    /// app embeds to retype a line is not, and its `/W` lists all 463 glyphs.
+    #[test]
+    fn a_font_embedded_whole_does_not_scope_an_index() {
+        assert!(recover::declares_usage("ABCDEE+Pyidaungsu"));
+        assert!(recover::declares_usage("ABCDEE+Pyidaungsu,Bold"));
+        assert!(recover::declares_usage("BCDEEE+MyanmarText"));
+        assert!(recover::declares_usage("CIDFont+F1"));
+        assert!(!recover::declares_usage("Pyidaungsu"));
+        assert!(!recover::declares_usage("NirmalaUI"));
+    }
+
     /// What `recover_page_text` reported, decoded.
     fn recovered(bytes: &[u8], page: i32) -> Vec<(f32, String)> {
         let handle = open_document_from_bytes(bytes.as_ptr(), bytes.len());
@@ -28827,14 +28989,17 @@ p={spread_px:.4},c={rgba:08X})"
         // 2. So it starts one, and waits.
         prepare_recovery(handle, 0);
         let mut ready = 0;
+        // ⚠️ ANY NON-ZERO ANSWER IS READY. Since readiness says WHICH reading
+        // (`42435da`), a page read against the first built index answers 2,
+        // and waiting for exactly 1 failed with the page ready all along.
         for _ in 0..400 {
             ready = recovery_is_ready(handle, 0);
-            if ready == 1 {
+            if ready != 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        assert_eq!(ready, 1, "the recovery never settled, so the app would offer nothing");
+        assert_ne!(ready, 0, "the recovery never settled, so the app would offer nothing");
 
         // 3. It reads the page, and picks a line it can edit.
         let recovered = recovered_lines(handle, 0);

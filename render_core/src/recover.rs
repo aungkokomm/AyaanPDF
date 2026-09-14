@@ -47,6 +47,19 @@ pub(crate) fn family_of(base_font: &str) -> &str {
     base_font.rsplit('+').next().unwrap_or(base_font)
 }
 
+/// Whether a font's `/W` says which glyphs the document USES.
+///
+/// ⚠️ ONLY A SUBSET'S DOES. A producer's subset lists a width for every CID
+/// the document draws, which is what lets it scope an index. A font embedded
+/// WHOLE, as this app embeds the face it retypes a line in, lists every glyph
+/// the face has: measured on the reader's Pyidaungsu file, 463 where the page
+/// drew a few dozen. Scoped by that, one retype rebuilt the Burmese index over
+/// the whole face, 57.5 seconds on the UI thread, and the app stopped
+/// responding. A subset is named with a tag and a `+`; a whole font is not.
+pub(crate) fn declares_usage(base_font: &str) -> bool {
+    base_font.contains('+')
+}
+
 fn installed(base_font: &str) -> Option<&'static str> {
     // "BCDEEE+MyanmarText" is one font, wearing a subset tag.
     let name = family_of(base_font);
@@ -1310,6 +1323,39 @@ impl Indexes {
         self.generation
     }
 
+    /// Whether reading a page that wants this would build nothing.
+    ///
+    /// ⚠️ `grow` WITHOUT THE BUILD, so a caller that must not wait can ask.
+    /// The reader's retype on the Pyidaungsu file handed its index to the new
+    /// document along with every page's "prepared" mark, the app took page 2
+    /// as ready, and reading it grew the index for 57.5 seconds on the UI
+    /// thread. A name no face has answered for counts as not covered when it
+    /// now resolves, because reading it would build or adopt a face.
+    pub(crate) fn covers(&self, wanted: &Wanted) -> bool {
+        let mut asked: BTreeMap<&'static str, BTreeSet<u16>> = BTreeMap::new();
+        for (base_font, glyphs) in &wanted.by_font {
+            match self.paths.get(base_font) {
+                Some(&path) => {
+                    if !self.by_font.contains_key(base_font) {
+                        return false;
+                    }
+                    asked.entry(path).or_default().extend(glyphs.iter().copied());
+                }
+                None if installed(base_font).is_some() => return false,
+                None => {}
+            }
+        }
+        asked
+            .iter()
+            .all(|(path, glyphs)| self.covered.get(path).is_some_and(|c| c.all_of(glyphs)))
+    }
+
+    /// Whether every face here already reads every glyph it can draw, so no
+    /// page can ever ask it for more. The Devanagari faces are built that way.
+    pub(crate) fn reads_every_glyph(&self) -> bool {
+        self.covered.values().all(|c| matches!(c, Covers::Everything))
+    }
+
     /// Takes in everything `wanted` asks for, and says whether anything about
     /// this changed and so has to be kept.
     ///
@@ -1470,13 +1516,17 @@ pub(crate) fn wanted_for_page(doc: &Document, page: ObjectId) -> Wanted {
     let mut by_font: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
     for (_, (base_font, widths)) in fonts_of(doc, page) {
         if let Some(w) = widths {
-            by_font.entry(base_font).or_default().extend(w.declared());
+            if declares_usage(&base_font) {
+                by_font.entry(base_font).or_default().extend(w.declared());
+            }
         }
     }
 
     // ⚠️ AND A FONT THAT DECLARES NOTHING STILL HAS TO BE READABLE, exactly
     // as the whole-document walk handles it: a subset without a `/W` array
-    // leaves nothing to scope by, so what the page DRAWS is asked instead.
+    // leaves nothing to scope by, so what the page DRAWS is asked instead. So
+    // does a font embedded whole, whose `/W` names every glyph it has (see
+    // `declares_usage`).
     let undeclared: Vec<String> = fonts_of(doc, page)
         .into_values()
         .map(|(f, _)| f)
@@ -1526,8 +1576,8 @@ fn wanted_for_font(doc: &Document, base_font: &str) -> BTreeSet<u16> {
                 continue;
             }
             match widths {
-                Some(w) => glyphs.extend(w.declared()),
-                None => {
+                Some(w) if declares_usage(base_font) => glyphs.extend(w.declared()),
+                _ => {
                     for line in lines_of(doc, page) {
                         if line.base_font == base_font {
                             glyphs.extend(line.glyphs.iter().copied());
@@ -1582,11 +1632,14 @@ pub(crate) fn indexes_for_document(doc: &Document) -> Indexes {
     for &page in &pages {
         for (_, (base_font, widths)) in fonts_of(doc, page) {
             if let Some(w) = widths {
-                wanted.entry(base_font).or_default().extend(w.declared());
+                if declares_usage(&base_font) {
+                    wanted.entry(base_font).or_default().extend(w.declared());
+                }
             }
         }
     }
 
+    // A font embedded whole is scoped by what is drawn too: see `declares_usage`.
     // ⚠️ AND A FONT THAT DECLARES NOTHING STILL HAS TO BE READABLE. A subset
     // without a `/W` array leaves nothing to scope by, and an unscoped index is
     // the 55-second whole-of-Burmese case. Falling back to what the pages

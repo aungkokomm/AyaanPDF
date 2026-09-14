@@ -14986,8 +14986,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             if (restored != 0)
             {
+                // ⚠️ THE READING GOES WITH AN UNDO TOO, as it does with the edit
+                // in RestoreDocumentBytes. Without it the reader's undo on the
+                // Pyidaungsu file prepared for 63 seconds; with it the page reads
+                // at once. The index only ever grows, so the one built for the
+                // edited document still reads the document as it was before.
+                RenderCoreNative.adopt_recovery(_documentHandle, restored);
+                Diag.Log($"undo handover {_documentHandle}->{restored}");
                 CloseCurrentDocument();
                 _documentHandle = restored;
+
+                // ⚠️ AND WHAT WAS READ OFF THE EDITED DOCUMENT GOES. A kept page
+                // is trusted while its reading generation matches, and the
+                // handover carries the generation across, so without this the
+                // undone text would still be offered for editing.
+                _contextByPage.Clear();
+                _clustersByPage.Clear();
+                _textRegions.Clear();
 
                 // A document-scope undo can restore a different page count and
                 // ordering, so index-keyed layers are no longer trustworthy.
