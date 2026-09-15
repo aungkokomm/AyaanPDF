@@ -96,6 +96,22 @@ impl PdfFontToken {
     pub(crate) fn handle(&self) -> FPDF_FONT {
         self.0
     }
+
+    /// The token as a plain address, so it can be remembered where a raw pointer
+    /// cannot be kept (a static). Ayaan PDF loads each OCR font into a document
+    /// once and reuses it; loading it per page embedded a copy per page.
+    #[inline]
+    pub fn to_address(&self) -> usize {
+        self.0 as usize
+    }
+
+    /// A token back from [PdfFontToken::to_address]. It names a real font only
+    /// while the document it was loaded into still holds it: check with
+    /// [PdfFonts::get] before using it.
+    #[inline]
+    pub fn from_address(address: usize) -> Self {
+        Self(address as FPDF_FONT)
+    }
 }
 
 /// Allows font-handling functions to take either a [PdfFont] owned instance, a [PdfFont] reference,

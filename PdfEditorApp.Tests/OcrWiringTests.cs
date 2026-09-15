@@ -84,14 +84,21 @@ public class OcrWiringTests
     }
 
     [Fact]
-    public void a_page_just_read_selects_as_text_straight_away_and_needs_saving()
+    public void a_page_just_read_selects_as_text_straight_away_without_being_redrawn()
     {
-        string written = MethodBody(Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs"), "public void TextRecognizedOnPage(");
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        int at = IndexIn(vm, "public void TextRecognizedOnPage(");
+        string written = vm[at..vm.IndexOf("\n    }\n", at, StringComparison.Ordinal)];
 
-        Assert.Contains("InvalidateLoadedPage(pageIndex);", written, StringComparison.Ordinal);
+        Assert.Contains("InvalidateTextRegions();", written, StringComparison.Ordinal);
         // ⚠️ The text layers are cached for the document's lifetime.
         Assert.Contains("ForgetTextLayers();", written, StringComparison.Ordinal);
         Assert.Contains("IsDirty = true;", written, StringComparison.Ordinal);
+
+        // ⚠️ The layer draws nothing. Repainting every recognised page rendered
+        // pages nobody was looking at and held a bitmap for each.
+        Assert.DoesNotContain("InvalidateLoadedPage(", written, StringComparison.Ordinal);
+        Assert.DoesNotContain("RedrawPage(", written, StringComparison.Ordinal);
     }
 
     [Fact]

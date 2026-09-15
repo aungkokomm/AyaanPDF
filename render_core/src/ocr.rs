@@ -139,6 +139,44 @@ pub unsafe extern "C" fn add_ocr_words(
         .unwrap_or(-STATUS_PANIC)
 }
 
+/// The font each open document's OCR layers are written in, by document and font
+/// file, as the token's address.
+///
+/// ⚠️ LOADED ONCE PER DOCUMENT. Loading it for every page put a whole copy of the
+/// font into the document for every page recognised: a 359-page Hindi book grew
+/// by about 680 KB a page, in memory and in every recovery snapshot, and the app
+/// went down about 80% of the way through.
+static LOADED_FONTS: std::sync::Mutex<std::collections::BTreeMap<(u64, String), usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Forgets a closed document's fonts.
+pub(crate) fn forget_document(doc_handle: u64) {
+    lock(&LOADED_FONTS).retain(|(doc, _), _| *doc != doc_handle);
+}
+
+/// The document's font for this file, loaded the first time it is asked for.
+/// A remembered token is used only after the document confirms it still holds
+/// that font, so a stale entry can never hand PDFium a font it does not have.
+fn ocr_font(
+    doc_handle: u64,
+    doc: &mut pdfium_render::prelude::PdfDocument<'_>,
+    font_path: Option<&str>,
+) -> pdfium_render::prelude::PdfFontToken {
+    use pdfium_render::prelude::PdfFontToken;
+
+    let key = (doc_handle, font_path.unwrap_or_default().to_string());
+    if let Some(address) = lock(&LOADED_FONTS).get(&key).copied() {
+        let token = PdfFontToken::from_address(address);
+        if doc.fonts().get(token).is_some() {
+            return token;
+        }
+    }
+
+    let token = resolve_text_font(doc, font_path);
+    lock(&LOADED_FONTS).insert(key, token.to_address());
+    token
+}
+
 fn add_ocr_words_inner(doc_handle: u64, page_index: i32, words: &[Word], font_path: Option<&str>) -> i32 {
     use pdfium_render::prelude::*;
 
@@ -154,7 +192,8 @@ fn add_ocr_words_inner(doc_handle: u64, page_index: i32, words: &[Word], font_pa
 
     // Loaded against the DOCUMENT, so before the page is borrowed, and found
     // before anything is removed, so a failure leaves the old layer as it was.
-    let token = resolve_text_font(&mut doc_guard, font_path);
+    // Once per document: see LOADED_FONTS.
+    let token = ocr_font(doc_handle, &mut doc_guard, font_path);
     let Some(font) = doc_guard.fonts().get(token) else {
         return -STATUS_UNSUPPORTED;
     };
@@ -304,6 +343,7 @@ mod tests {
     use std::ffi::CString;
 
     const BLANK: &str = "tests/fixtures/blank.pdf";
+    const TWENTY_PAGES: &str = "tests/fixtures/sample_20pages.pdf";
     const DEVANAGARI_FONT: &str = r"C:\Windows\Fonts\Nirmala.ttf";
     const MYANMAR_FONT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
 
@@ -542,6 +582,46 @@ mod tests {
 
         close_document(reopened);
         free_byte_buffer(saved);
+        close_document(h);
+    }
+
+    /// The saved size of the document as it stands.
+    fn saved_len(handle: u64) -> usize {
+        let saved = snapshot_document(handle);
+        assert_eq!(saved.status, STATUS_OK_PDFIUM);
+        let len = saved.len;
+        free_byte_buffer(saved);
+        len
+    }
+
+    #[test]
+    fn a_font_goes_into_the_document_once_however_many_pages_are_recognised() {
+        // ⚠️ A 359-page Hindi book once took a copy of Nirmala (1.3 MB) into
+        // the document for EVERY page it recognised: memory and recovery
+        // snapshots grew until the app went down about 80% of the way through.
+        if !std::path::Path::new(DEVANAGARI_FONT).exists() {
+            println!("{DEVANAGARI_FONT} is not on this machine");
+            return;
+        }
+        let h = open(TWENTY_PAGES);
+        assert_eq!(write(h, 0, &[("क्षमा", [0.1, 0.1, 0.3, 0.14])], Some(DEVANAGARI_FONT)), 1);
+        let one_page = saved_len(h);
+
+        for page in 1..6 {
+            assert_eq!(write(h, page, &[("कीजिए", [0.1, 0.1, 0.3, 0.14])], Some(DEVANAGARI_FONT)), 1);
+        }
+        let six_pages = saved_len(h);
+
+        // Five more words cost a few kilobytes. Another copy of the font is
+        // hundreds of kilobytes each.
+        assert!(
+            six_pages - one_page < 50_000,
+            "five more pages added {} bytes to the file",
+            six_pages - one_page
+        );
+        // The sample's pages already say "Page N of 20"; the recognised word comes after.
+        let last = visible_text(h, 5);
+        assert!(last.ends_with("कीजिए"), "control: the last page's word must really be there, got {last}");
         close_document(h);
     }
 

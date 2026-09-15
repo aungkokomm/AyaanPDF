@@ -648,6 +648,7 @@ pub extern "C" fn close_document(doc_handle: u64) {
 
     lock(&core.sources).remove(&doc_handle);
     lock(&MODEL_CACHE).remove(&doc_handle);
+    ocr::forget_document(doc_handle);
 
     {
         let mut cache = lock(&core.cache);

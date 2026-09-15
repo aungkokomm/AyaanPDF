@@ -1714,18 +1714,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// A page has just had its OCR layer written. It renders exactly as before,
+    /// A page has just had its OCR layer written. It looks exactly as before,
     /// but its text changed, so what selection and the text regions know about
     /// it is thrown away, and the document now needs saving.
     /// </summary>
     /// <remarks>
-    /// ⚠️ The text layers are cached for the document's lifetime and
-    /// InvalidateLoadedPage does not drop them: without ForgetTextLayers a page
-    /// read a moment ago would still select as the empty picture it was.
+    /// ⚠️ NOT REPAINTED. The layer draws nothing, so the picture on screen is
+    /// already right. Going through InvalidateLoadedPage rendered every
+    /// recognised page, on screen or not, and each bitmap stayed until the next
+    /// scroll: a 359-page Hindi book stalled the window for seconds at a time and
+    /// the app went down about 80% of the way through.
+    ///
+    /// ⚠️ The text layers are cached for the document's lifetime: without
+    /// ForgetTextLayers a page read a moment ago would still select as the empty
+    /// picture it was.
     /// </remarks>
     public void TextRecognizedOnPage(int pageIndex)
     {
-        InvalidateLoadedPage(pageIndex);
+        InvalidateTextRegions();
         ForgetTextLayers();
         IsDirty = true;
     }
