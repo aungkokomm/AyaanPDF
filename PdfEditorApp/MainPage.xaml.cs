@@ -1205,10 +1205,67 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        // One Myanmar or Hindi line: its label in bold, then the meanings in
+        // that language's font.
+        void AddLine(Microsoft.UI.Xaml.Controls.TextBlock block, string label, IReadOnlyList<string> meanings)
+        {
+            bool myanmar = ReferenceEquals(block, DefinitionMyanmar);
+            if (block.Inlines.Count > 0)
+            {
+                block.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
+            }
+
+            block.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = label + ": ",
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            });
+            block.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = string.Join(myanmar ? "၊ " : ", ", meanings),
+                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily(myanmar ? "Pyidaungsu, Myanmar Text" : "Nirmala UI"),
+            });
+        }
+
+        // The divider and whichever translation blocks have lines.
+        void ShowTranslations(int myanmarLines, int hindiLines)
+        {
+            DefinitionTranslationsRule.Visibility = myanmarLines + hindiLines > 0 ? Visibility.Visible : Visibility.Collapsed;
+            DefinitionMyanmar.Visibility = myanmarLines > 0 ? Visibility.Visible : Visibility.Collapsed;
+            DefinitionHindi.Visibility = hindiLines > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
         if (dictionary.Lookup(word) is not { } found)
         {
-            Diag.Log($"define: no entry for \"{word}\"");
-            DefinitionText.Text = $"No definition found for \"{word}\".";
+            // No English entry, but the Myanmar and Hindi lists may still know
+            // the word ("something" is not in WordNet), so each one switched on
+            // shows its meanings on its own, under its own parts of speech.
+            // Grammar words stay refused: the lists file those under a part of
+            // speech too ("and" as a noun), as wrong a label as WordNet's matches.
+            bool grammarWord = WordDefinitions.IsGrammarWord(word);
+            var none = Array.Empty<(string PartOfSpeech, IReadOnlyList<string> Meanings)>();
+            var myanmarOnly = grammarWord || glosses is null ? none : glosses.ForWord(word);
+            var hindiOnly = grammarWord || hindi is null ? none : hindi.ForWord(word);
+            if (myanmarOnly.Count + hindiOnly.Count == 0)
+            {
+                Diag.Log($"define: no entry for \"{word}\"");
+                DefinitionText.Text = $"No definition found for \"{word}\".";
+                return;
+            }
+
+            DefinitionText.Text = "No English definition.";
+            foreach (var (partOfSpeech, meanings) in myanmarOnly)
+            {
+                AddLine(DefinitionMyanmar, partOfSpeech, meanings);
+            }
+
+            foreach (var (partOfSpeech, meanings) in hindiOnly)
+            {
+                AddLine(DefinitionHindi, partOfSpeech, meanings);
+            }
+
+            ShowTranslations(myanmarOnly.Count, hindiOnly.Count);
+            Diag.Log($"define: no English entry for \"{word}\", {(glosses is null ? "Myanmar off or unavailable" : $"{myanmarOnly.Count} Myanmar line(s)")}, {(hindi is null ? "Hindi off or unavailable" : $"{hindiOnly.Count} Hindi line(s)")}");
             return;
         }
 
@@ -1264,21 +1321,8 @@ public sealed partial class MainPage : Page
                 continue;
             }
 
-            if (myanmarLines++ > 0)
-            {
-                DefinitionMyanmar.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
-            }
-
-            DefinitionMyanmar.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
-            {
-                Text = LabelFor(sense) + ": ",
-                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            });
-            DefinitionMyanmar.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
-            {
-                Text = string.Join("၊ ", meanings),
-                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Pyidaungsu, Myanmar Text"),
-            });
+            myanmarLines++;
+            AddLine(DefinitionMyanmar, LabelFor(sense), meanings);
         }
 
         // Hindi under that, in the same shape: one line for each part of
@@ -1292,37 +1336,11 @@ public sealed partial class MainPage : Page
                 continue;
             }
 
-            if (hindiLines++ > 0)
-            {
-                DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
-            }
-
-            DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
-            {
-                Text = LabelFor(sense) + ": ",
-                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            });
-            DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
-            {
-                Text = string.Join(", ", hindiMeanings),
-                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Nirmala UI"),
-            });
+            hindiLines++;
+            AddLine(DefinitionHindi, LabelFor(sense), hindiMeanings);
         }
 
-        if (myanmarLines + hindiLines > 0)
-        {
-            DefinitionTranslationsRule.Visibility = Visibility.Visible;
-        }
-
-        if (myanmarLines > 0)
-        {
-            DefinitionMyanmar.Visibility = Visibility.Visible;
-        }
-
-        if (hindiLines > 0)
-        {
-            DefinitionHindi.Visibility = Visibility.Visible;
-        }
+        ShowTranslations(myanmarLines, hindiLines);
 
         Diag.Log($"define: \"{word}\" found {found.Senses.Count} part(s) of speech, first {found.Senses[0].PartOfSpeech} \"{found.Senses[0].Headword}\", {(glosses is null ? "Myanmar off or unavailable" : $"{myanmarLines} Myanmar line(s)")}, {(hindi is null ? "Hindi off or unavailable" : $"{hindiLines} Hindi line(s)")}");
     }

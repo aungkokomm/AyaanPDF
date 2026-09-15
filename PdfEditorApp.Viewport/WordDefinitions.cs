@@ -60,6 +60,9 @@ public sealed class WordDefinitions
         "am", "is", "are", "was", "were", "be", "been", "does", "may",
     };
 
+    /// <summary>Whether <paramref name="word"/> is one Define refuses as a grammar word.</summary>
+    public static bool IsGrammarWord(string word) => GrammarWords.Contains(word.Trim().ToLowerInvariant());
+
     private readonly Dictionary<string, List<(string Pos, string[] Definitions, string? Example)>> _entries = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Pos, string Form), List<string>> _irregular = new();
 

@@ -29,7 +29,7 @@ internal static class DefinitionDictionary
         Path.Combine(AppContext.BaseDirectory, "Assets", "Dictionary", "hindi-en-hi.tsv.gz");
 
     private static readonly Lazy<Task<HindiGlosses?>> LoadedHindi =
-        new(() => Task.Run(() => Read(HindiFilePath, HindiGlosses.Load, g => $"{g.Count} Hindi words")));
+        new(() => Task.Run(() => Read(HindiFilePath, HindiGlosses.Load, g => $"{g.Count} Hindi word/part-of-speech entries")));
 
     public static Task<HindiGlosses?> LoadHindiAsync() => LoadedHindi.Value;
 

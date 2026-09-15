@@ -69,4 +69,23 @@ public sealed class HindiGlosses
             ? found
             : Array.Empty<string>();
     }
+
+    /// <summary>
+    /// Every part of speech the list has for <paramref name="word"/>, in the
+    /// order noun, verb, adjective, adverb: for a word the English dictionary
+    /// has no entry for, so no part of speech was settled on to look up by.
+    /// </summary>
+    public IReadOnlyList<(string PartOfSpeech, IReadOnlyList<string> Meanings)> ForWord(string word)
+    {
+        var found = new List<(string, IReadOnlyList<string>)>();
+        foreach (string partOfSpeech in new[] { "noun", "verb", "adjective", "adverb" })
+        {
+            if (For(word, partOfSpeech) is { Count: > 0 } meanings)
+            {
+                found.Add((partOfSpeech, meanings));
+            }
+        }
+
+        return found;
+    }
 }

@@ -54,6 +54,17 @@ public class MyanmarGlossesTests
         Assert.Equal(["ပြေးသည်"], Sample().For(sense.Headword, sense.PartOfSpeech));
     }
 
+    [Fact]
+    public void a_word_with_no_part_of_speech_settled_gets_every_one_the_file_has_in_order()
+    {
+        var book = Sample().ForWord("Book");
+
+        Assert.Equal(2, book.Count);
+        Assert.Equal(("noun", "verb"), (book[0].PartOfSpeech, book[1].PartOfSpeech));
+        Assert.Equal(["စာအုပ်", "ကျမ်း"], book[0].Meanings);
+        Assert.Empty(Sample().ForWord("xyzzy"));
+    }
+
     // ---------------- The file the app ships ----------------
 
     private static string PathTo(params string[] relative)

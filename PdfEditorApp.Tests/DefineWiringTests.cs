@@ -335,6 +335,25 @@ public class DefineWiringTests
     }
 
     [Fact]
+    public void a_word_without_an_english_entry_still_shows_the_meanings_switched_on()
+    {
+        string fill = MethodBody(PageCode(), "private void FillDefinition(");
+
+        // Only after English has come up empty, only from a list that was
+        // loaded (null when switched off), never for a grammar word.
+        Assert.True(IndexIn(fill, "dictionary.Lookup(word) is not { } found") < IndexIn(fill, "glosses.ForWord(word)"));
+        Assert.Contains("grammarWord || glosses is null ? none : glosses.ForWord(word)", fill, StringComparison.Ordinal);
+        Assert.Contains("grammarWord || hindi is null ? none : hindi.ForWord(word)", fill, StringComparison.Ordinal);
+        Assert.True(IndexIn(fill, "hindi.ForWord(word)") < IndexIn(fill, "Diag.Log($\"define: no entry for"));
+        Assert.Contains("Diag.Log($\"define: no English entry for", fill, StringComparison.Ordinal);
+
+        // "something" is the case: WordNet has no entry for it.
+        Assert.Null(Shipped.Value.Lookup("something"));
+        Assert.True(WordDefinitions.IsGrammarWord("And"));
+        Assert.False(WordDefinitions.IsGrammarWord("something"));
+    }
+
+    [Fact]
     public void the_hindi_block_has_no_fixed_line_height_to_clip_its_marks()
     {
         string xaml = File.ReadAllText(PathTo("PdfEditorApp", "MainPage.xaml"));

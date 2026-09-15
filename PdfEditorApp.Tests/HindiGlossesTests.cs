@@ -58,6 +58,25 @@ public class HindiGlossesTests
         Assert.Equal(["दौड़ना"], Sample().For(sense.Headword, sense.PartOfSpeech));
     }
 
+    [Fact]
+    public void a_word_with_no_part_of_speech_settled_gets_every_one_the_list_has_in_order()
+    {
+        var journey = Sample().ForWord("Journey");
+
+        Assert.Equal(new[] { "noun", "verb" }, journey.Select(line => line.PartOfSpeech).ToArray());
+        Assert.Equal(["यात्रा", "सफर"], journey[0].Meanings);
+        Assert.Empty(Sample().ForWord("xyzzy"));
+    }
+
+    [Fact]
+    public void a_word_the_english_dictionary_lacks_still_has_its_hindi()
+    {
+        var something = Shipped.Value.ForWord("something");
+
+        Assert.Equal("noun", something[0].PartOfSpeech);
+        Assert.Contains("कुछ", something[0].Meanings);
+    }
+
     // ---------------- The file the app ships ----------------
 
     private static string PathTo(params string[] relative)
