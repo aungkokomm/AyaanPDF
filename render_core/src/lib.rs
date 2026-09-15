@@ -15222,6 +15222,41 @@ mod tests {
         close_document(handle);
     }
 
+    /// Prints how page shapes vary across a reader's own file. A stack layout
+    /// that estimates unrealized pages from the ones it has measured lands on
+    /// the wrong page far down a book whose early pages are a different shape.
+    /// Ignored because the file lives on the reader's machine: AYAAN_SIZES_PDF
+    /// names it, AYAAN_SIZES_PAGE the page to look around (default 39174).
+    #[test]
+    #[ignore]
+    fn how_page_shapes_vary_in_a_real_file() {
+        let path = std::env::var("AYAAN_SIZES_PDF").expect("set AYAAN_SIZES_PDF");
+        let handle = open_fixture_named(&path);
+        let array = get_page_sizes(handle);
+        println!("status {}", array.status);
+        let sizes = unsafe { std::slice::from_raw_parts(array.sizes, array.len) };
+        let n = sizes.len();
+
+        let aspect = |s: &PageSize| (s.height / s.width) as f64;
+        let mean = |r: &[PageSize]| r.iter().map(aspect).sum::<f64>() / r.len().max(1) as f64;
+        let at: usize = std::env::var("AYAAN_SIZES_PAGE")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(39174)
+            .min(n - 1);
+
+        println!("pages {n}");
+        println!("mean aspect, first 6 pages: {:.4}", mean(&sizes[..6.min(n)]));
+        println!("mean aspect, pages before {at}: {:.4}", mean(&sizes[..at]));
+        println!("mean aspect, whole file: {:.4}", mean(sizes));
+        for i in (0..6.min(n)).chain(at.saturating_sub(2)..(at + 3).min(n)) {
+            println!("page {i}: {} x {} (aspect {:.4})", sizes[i].width, sizes[i].height, aspect(&sizes[i]));
+        }
+
+        free_page_size_array(array);
+        close_document(handle);
+    }
+
     #[test]
     fn an_internal_link_cannot_be_retargeted_as_a_url() {
         // PDFium has no destination setter, so writing a URI action over one

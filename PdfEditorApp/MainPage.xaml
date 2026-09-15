@@ -611,10 +611,18 @@
                     the moment the layout is built, whether or not a container
                     for it exists. Nothing in the code-behind looks a page card
                     up by container either.
+
+                    ⚠️ NOT StackLayout, which ESTIMATES where a card it has not
+                    measured sits from the average of the ones it has. A book
+                    whose opening pages are taller than the rest put a jump to
+                    page 39175 among blank cards for pages near 36000, while the
+                    right page was rendered into a card off screen.
+                    PageStackLayout places every card at its exact top. Its
+                    Spacing must equal the view model's page gap.
                 -->
                 <ItemsRepeater ItemsSource="{x:Bind ViewModel.PageSlots}" HorizontalAlignment="Center">
                     <ItemsRepeater.Layout>
-                        <StackLayout Orientation="Vertical" Spacing="16" />
+                        <controls:PageStackLayout Spacing="16" />
                     </ItemsRepeater.Layout>
                     <ItemsRepeater.ItemTemplate>
                         <DataTemplate x:DataType="viewmodels:PageSlot">
@@ -3373,7 +3381,7 @@
                         BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}">
                     <StackPanel Orientation="Horizontal" Spacing="3"
                                 VerticalAlignment="Center">
-                        <TextBox x:Name="PageJumpBox" Width="26" MinWidth="0"
+                        <TextBox x:Name="PageJumpBox" Width="36" MinWidth="0"
                                  VerticalAlignment="Center" VerticalContentAlignment="Center"
                                  BorderThickness="0" Background="Transparent"
                                  TextAlignment="Right" FontSize="12" InputScope="Number"
