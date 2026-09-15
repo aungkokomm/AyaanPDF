@@ -10351,6 +10351,33 @@ public sealed partial class MainPage : Page
         window.Activate();
     }
 
+    private OcrWindow? _ocrWindow;
+
+    /// <summary>
+    /// Page > Recognize text: reads scanned pages and writes what they say into
+    /// them as invisible text. Starts on the pages chosen in the thumbnails when
+    /// several are.
+    /// </summary>
+    private void RecognizeText_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.PageCount == 0)
+        {
+            return;
+        }
+
+        if (_ocrWindow is not null)
+        {
+            _ocrWindow.Activate();
+            return;
+        }
+
+        var chosen = ThumbnailList.SelectedItems.OfType<PageThumbnail>().Select(t => t.PageIndex).Order().ToList();
+        var window = new OcrWindow(ViewModel, chosen);
+        window.Closed += (_, _) => _ocrWindow = null;
+        _ocrWindow = window;
+        window.Activate();
+    }
+
     private PagePickerWindow? _insertPagesWindow;
 
     /// <summary>

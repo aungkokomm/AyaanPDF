@@ -36,3 +36,9 @@ render_core/tests/fixtures/.dense_timing.pdf
 # Checking that in would redistribute a licensed Microsoft font. The four small
 # sibling fixtures embed no font program and are checked in normally.
 render_core/tests/fixtures/sample_justified_embedded.pdf
+
+# OCR models, fetched, hash-checked and converted by tools/ocr/fetch_ocr_models.py
+# (about 35 MB, all re-downloadable). The licence texts beside them are checked in.
+PdfEditorApp/Assets/Ocr/tessdata/
+PdfEditorApp/Assets/Ocr/*.onnx
+tools/ocr/__pycache__/

@@ -51,7 +51,7 @@
       still at the SDK default of 1.0.0 while the installer said 1.15.0, and
       the About dialog dutifully reported the wrong one.
     -->
-    <Version>3.45.34</Version>
+    <Version>3.46.0</Version>
 
     <!--
       The SDK otherwise appends "+<git sha>" to the informational version, which
@@ -115,6 +115,26 @@
     <Content Include="Assets\Dictionary\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+
+    <!--
+      OCR: Tesseract's English, Hindi and Myanmar models and the Myanmar line
+      model, fetched, hash-checked and converted by tools\ocr\fetch_ocr_models.py,
+      with the licence texts that have to travel with them. Read from beside the
+      exe at runtime, so copied rather than packaged.
+    -->
+    <Content Include="Assets\Ocr\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!--
+      The Visual C++ runtime Tesseract's native DLLs link against (MSVCP140,
+      VCRUNTIME140_1), app-local so OCR works on a machine that never installed
+      the redistributable. Microsoft's redistributable files, copied unchanged.
+    -->
+    <Content Include="Native\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>
@@ -164,6 +184,10 @@
       Assets\Cursors\cursors.rc; see tools\CursorGen for the art. Must sit
       beside the exe, since AppCursors loads it by name from the app folder.
     -->
+    <Content Include="$(NuGetPackageRoot)tesseract\5.2.0\x64\*.dll" Condition="Exists('$(NuGetPackageRoot)tesseract\5.2.0\x64')">
+      <Link>x64\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="Assets\Cursors\AyaanCursors.dll">
       <Link>AyaanCursors.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -221,6 +245,14 @@
       this draws nothing until the flag is turned on.
     -->
     <PackageReference Include="SkiaSharp.Views.WinUI" Version="3.119.1" />
+    <!--
+      OCR for English and Hindi, and the line finder for Myanmar (charlesw's
+      wrapper over Tesseract 5 and Leptonica, Apache 2.0). This version is the
+      one every number in the OCR benchmark was measured with, and it has a
+      layout-only pass the Myanmar reader needs. Its x64 natives are copied
+      explicitly below, since the package's own targets do not reach a publish.
+    -->
+    <PackageReference Include="Tesseract" Version="5.2.0" />
   </ItemGroup>
 
   <!--

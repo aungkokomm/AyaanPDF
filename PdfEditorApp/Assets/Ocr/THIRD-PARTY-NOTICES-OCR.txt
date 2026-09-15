@@ -1,0 +1,28 @@
+OCR components shipped with Ayaan PDF
+
+Tesseract OCR engine 5.2, through the Tesseract NuGet package
+(github.com/charlesw/tesseract).
+    Apache License 2.0. See LICENSE-tesseract.txt.
+
+Leptonica image library 1.82, which Tesseract uses.
+    See LICENSE-leptonica.txt.
+
+Microsoft Visual C++ runtime (msvcp140.dll, vcruntime140.dll,
+vcruntime140_1.dll), which Tesseract's native libraries need.
+    Microsoft redistributable files, shipped unchanged.
+
+Tesseract "fast" models for English, Hindi and Myanmar
+(github.com/tesseract-ocr/tessdata_fast).
+    Apache License 2.0. See LICENSE-tessdata_fast.txt.
+
+myanmar-crnn-ocr, the Myanmar line recognition model by Kaung Sithu
+(huggingface.co/ksithu/myanmar-crnn-ocr).
+    Apache License 2.0. See LICENSE-myanmar-crnn-ocr.txt and
+    MODEL-CARD-myanmar-crnn-ocr.md.
+    MODIFIED: its dynamically quantized convolutions (ConvInteger) were
+    rewritten as the equivalent float convolutions, so it runs quickly on
+    ONNX Runtime's CPU provider. Recognition output is unchanged.
+
+The Myanmar line decoding and image preparation follow mmpdfkit by Kaung Sithu
+(github.com/kaungsithu/mmpdfkit).
+    MIT License. See LICENSE-mmpdfkit.txt.

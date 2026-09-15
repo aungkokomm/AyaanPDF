@@ -427,6 +427,7 @@
                     <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
                 </MenuFlyoutSubItem>
                 <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
+                <MenuFlyoutItem Text="Recognize text..." Click="RecognizeText_Click" />
                 <MenuFlyoutSeparator />
                 <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
                 <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />

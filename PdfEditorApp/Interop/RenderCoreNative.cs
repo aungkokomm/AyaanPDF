@@ -951,6 +951,26 @@ internal static partial class RenderCoreNative
     public static extern int sync_text_layer(ulong docHandle, int[] pages, nuint pageCount);
 
     /// <summary>
+    /// Replaces the OCR text layer on one page: recognised words written as
+    /// invisible text over the picture of the page, so it can be searched,
+    /// selected and copied. Returns how many words were written, or a negative
+    /// status.
+    ///
+    /// Boxes are fractions of the page as rendered. The core maps them back
+    /// through PDFium, so the page's rotation and crop box are handled there.
+    /// <paramref name="fontPath"/> must cover the words' script, or be null for
+    /// Helvetica: the words are never drawn, but a reader extracts each one
+    /// through the font.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int add_ocr_words(
+        ulong docHandle,
+        int pageIndex,
+        OcrWordNative[] words,
+        nuint count,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? fontPath);
+
+    /// <summary>
     /// Replaces the document's outline, reading <paramref name="srcPath"/> and
     /// writing to <paramref name="dstPath"/>.
     ///

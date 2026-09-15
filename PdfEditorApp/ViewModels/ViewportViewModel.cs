@@ -1697,6 +1697,39 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Moves the page at <paramref name="from"/> to sit at <paramref name="to"/>.</summary>
     public bool MovePage(int from, int to) =>
         from != to && RebuildPages(PageReorder.Move(PageCount, from, to));
+    /// <summary>The open document, for recognising its pages off the UI thread.
+    /// Zero when nothing is open.</summary>
+    public ulong DocumentHandleForRecognition => _documentHandle;
+
+    /// <summary>A page's size in points, from the cached sizes; (0, 0) when unknown.</summary>
+    public (double Width, double Height) PageSizeForRecognition(int pageIndex) => PagePointsFor(pageIndex);
+
+    /// <summary>
+    /// One undo step for a whole recognition run, recorded before its first page
+    /// is written, so undo takes back every page's recognised text at once.
+    /// </summary>
+    public void BeginTextRecognition()
+    {
+        PushHistory(HistoryScope.Document, "Recognize text");
+    }
+
+    /// <summary>
+    /// A page has just had its OCR layer written. It renders exactly as before,
+    /// but its text changed, so what selection and the text regions know about
+    /// it is thrown away, and the document now needs saving.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ The text layers are cached for the document's lifetime and
+    /// InvalidateLoadedPage does not drop them: without ForgetTextLayers a page
+    /// read a moment ago would still select as the empty picture it was.
+    /// </remarks>
+    public void TextRecognizedOnPage(int pageIndex)
+    {
+        InvalidateLoadedPage(pageIndex);
+        ForgetTextLayers();
+        IsDirty = true;
+    }
+
 
     /// <summary>
     /// Inserts chosen pages of another open document at <paramref name="atIndex"/>.

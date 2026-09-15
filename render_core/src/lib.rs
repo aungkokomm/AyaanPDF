@@ -10500,6 +10500,13 @@ fn get_page_text_objects_inner(doc_handle: u64, page_index: i32) -> ByteBuffer {
             continue;
         }
 
+        // OURS AS WELL: the OCR layer, by its own mark. Recognised words are
+        // invisible and lie over a picture of the page, so offering one as an
+        // object would offer a hit on nothing.
+        if ocr::is_ocr_run(doc_guard.bindings(), t.object_handle()) {
+            continue;
+        }
+
         let Some(text_page) = text_page.as_ref() else { break };
         let text = text_page.for_object(t);
         if text.trim().is_empty() {
@@ -10733,7 +10740,11 @@ fn page_word_clusters(
         let PdfPageObject::Text(t) = &o else { continue };
         let handle = t.object_handle() as usize;
         index_of.insert(handle, i as usize);
-        if path_b_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
+        // The OCR layer this app writes is withheld the same way, by its own
+        // mark: a recognised word is invisible, so it is not an edit target.
+        if path_b_mark_id(doc_guard.bindings(), t.object_handle()).is_some()
+            || ocr::is_ocr_run(doc_guard.bindings(), t.object_handle())
+        {
             path_b_runs.insert(i as usize);
         }
 
@@ -13442,6 +13453,12 @@ fn page_block_inputs(
         let Ok(obj) = page_objects.get(index) else { continue };
         let PdfPageObject::Text(t) = &obj else { continue };
 
+        // The OCR layer is not the page's editable text: its words are
+        // invisible, drawn over a picture of the page. Left out entirely.
+        if ocr::is_ocr_run(doc_guard.bindings(), t.object_handle()) {
+            continue;
+        }
+
         let kind = if path_b_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
             block::ObjectKind::LogicalRun
         } else if search_mark_id(doc_guard.bindings(), t.object_handle()).is_some() {
@@ -14085,6 +14102,8 @@ fn emit_block(
 }
 
 /// A SPIKE, test-only and called by nothing. See the file for what it asks.
+mod ocr;
+
 #[cfg(test)]
 mod gradient_spike;
 

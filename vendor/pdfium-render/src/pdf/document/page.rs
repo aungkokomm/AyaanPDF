@@ -234,8 +234,12 @@ impl<'a> PdfPage<'a> {
     }
 
     /// Returns the internal `FPDF_PAGE` handle for this [PdfPage].
+    ///
+    /// Public in this fork so render_core can ask PDFium to convert rendered
+    /// (device) coordinates back to page space with `FPDF_DeviceToPage`, which
+    /// accounts for the page's rotation and crop box exactly as rendering does.
     #[inline]
-    pub(crate) fn page_handle(&self) -> FPDF_PAGE {
+    pub fn page_handle(&self) -> FPDF_PAGE {
         self.page_handle
     }
 

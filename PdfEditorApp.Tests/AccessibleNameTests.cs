@@ -37,6 +37,7 @@ public class AccessibleNameTests
     [InlineData("BookmarkWindow.xaml")]
     [InlineData("PagePickerWindow.xaml")]
     [InlineData("MergeFilesWindow.xaml")]
+    [InlineData("OcrWindow.xaml")]
     public void every_button_says_what_it_is_to_a_screen_reader(string file)
     {
         string xaml = Source("PdfEditorApp", file);

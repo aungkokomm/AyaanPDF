@@ -127,6 +127,27 @@ public sealed record AppSettings
     public bool DefineShowsHindi { get; init; } = true;
 
     /// <summary>
+    /// The languages Recognize text reads, as Tesseract's codes joined by '+'
+    /// ("eng", "hin+eng", "mya+eng"). English by default. Remembered because a
+    /// reader's scans tend to be in the same languages every time. Read through
+    /// <see cref="OcrPlan.ParseLanguages"/>, which drops anything it does not know.
+    /// </summary>
+    public string OcrLanguages { get; init; } = "eng";
+
+    /// <summary>
+    /// Fast recognition for English (Windows' built-in OCR) instead of Accurate
+    /// (Tesseract). Off by default: on this project's benchmark Fast was about
+    /// five times quicker, but it misread blurry phone scans Accurate got right.
+    /// </summary>
+    public bool OcrFast { get; init; }
+
+    /// <summary>
+    /// Leaves pages that already have text alone. On by default: a page with a
+    /// text layer has nothing for OCR to add, and reading it again costs time.
+    /// </summary>
+    public bool OcrSkipPagesWithText { get; init; } = true;
+
+    /// <summary>
     /// Renders pages dark for night reading.
     ///
     /// Off by default: it changes how every document looks, and a reader who

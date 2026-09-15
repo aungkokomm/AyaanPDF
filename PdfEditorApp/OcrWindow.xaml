@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Page > Recognize text: reads scanned pages and adds what they say as an
+    invisible layer of text over the words, so the pages can be searched,
+    selected and copied. The pages look exactly as they did.
+
+    A window rather than a dialog, like Merge files: a run over a long book
+    takes minutes, and the document stays usable behind it.
+-->
+<Window
+    x:Class="PdfEditorApp.OcrWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Recognize text">
+
+    <Grid x:Name="Root" KeyDown="Root_KeyDown"
+          Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <ScrollViewer>
+            <StackPanel Padding="24,20,24,20" Spacing="20">
+                <TextBlock TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Text="Reads the words on scanned pages so they can be searched, selected and copied. Each page keeps its look: the words are added as invisible text over the picture." />
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Pages" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <RadioButton x:Name="AllPages" GroupName="OcrPages" Content="All pages" />
+                    <RadioButton x:Name="CurrentPage" GroupName="OcrPages" Content="Current page" />
+                    <RadioButton x:Name="ChosenPages" GroupName="OcrPages" Content="Pages chosen in the thumbnails"
+                                 Visibility="Collapsed" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <RadioButton x:Name="PageRange" GroupName="OcrPages" Content="Pages" MinWidth="0" />
+                        <TextBox x:Name="PageRangeBox" Width="200" VerticalAlignment="Center"
+                                 AutomationProperties.Name="Pages to read"
+                                 GotFocus="PageRangeBox_GotFocus" />
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Languages on the pages" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <CheckBox x:Name="EnglishBox" Content="English" Click="Choice_Changed" />
+                    <CheckBox x:Name="HindiBox" Content="Hindi" Click="Choice_Changed" />
+                    <CheckBox x:Name="MyanmarBox" Content="Myanmar" Click="Choice_Changed" />
+                </StackPanel>
+
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Quality" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <RadioButton x:Name="AccurateChoice" GroupName="OcrQuality" Click="Choice_Changed"
+                                 AutomationProperties.Name="Accurate">
+                        <StackPanel>
+                            <TextBlock Text="Accurate" />
+                            <TextBlock Text="Best for scans and phone photos." TextWrapping="Wrap"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="FastChoice" GroupName="OcrQuality" Click="Choice_Changed"
+                                 AutomationProperties.Name="Fast">
+                        <StackPanel>
+                            <TextBlock Text="Fast" />
+                            <TextBlock Text="English only. Several times quicker, but makes more mistakes on blurry pages." TextWrapping="Wrap"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </RadioButton>
+                </StackPanel>
+
+                <CheckBox x:Name="SkipTextPages" Content="Skip pages that already have text" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <Grid Grid.Row="1" Padding="16,12,16,12" ColumnSpacing="10"
+              BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel VerticalAlignment="Center" Spacing="2">
+                <TextBlock x:Name="SummaryText" TextWrapping="Wrap" Visibility="Collapsed" />
+                <TextBlock x:Name="MessageText" TextWrapping="Wrap" Visibility="Collapsed"
+                           Foreground="{ThemeResource SystemFillColorCriticalBrush}" />
+            </StackPanel>
+
+            <StackPanel x:Name="ProgressPanel" Grid.Column="1" Orientation="Horizontal" Spacing="10" Visibility="Collapsed">
+                <TextBlock x:Name="ProgressText" VerticalAlignment="Center" />
+                <ProgressBar x:Name="RunProgress" Width="160" VerticalAlignment="Center" />
+                <Button Content="Stop" Click="Stop_Click" />
+            </StackPanel>
+
+            <Button x:Name="CloseButton" Grid.Column="2" Content="Close" Click="Close_Click" />
+            <Button x:Name="StartButton" Grid.Column="3" Content="Recognize"
+                    Style="{StaticResource AccentButtonStyle}" Click="Start_Click" />
+        </Grid>
+    </Grid>
+</Window>
