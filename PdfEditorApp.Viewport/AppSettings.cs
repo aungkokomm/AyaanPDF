@@ -109,6 +109,17 @@ public sealed record AppSettings
     public bool RememberReadingPosition { get; init; } = true;
 
     /// <summary>
+    /// Whether Define shows Myanmar meanings under the English definition.
+    ///
+    /// On by default: the meanings are bundled, and Ayaan's readers include
+    /// Myanmar speakers. A reader with no use for them switches them off in
+    /// Settings, and the Myanmar dictionary is then never even read. A file
+    /// written before this switch existed has no value for it and so reads as
+    /// on, which is what those readers were already seeing.
+    /// </summary>
+    public bool DefineShowsMyanmar { get; init; } = true;
+
+    /// <summary>
     /// Renders pages dark for night reading.
     ///
     /// Off by default: it changes how every document looks, and a reader who

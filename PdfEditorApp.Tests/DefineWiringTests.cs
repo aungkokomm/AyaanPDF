@@ -276,4 +276,32 @@ public class DefineWiringTests
         Assert.DoesNotContain("LineHeight", element.Value, StringComparison.Ordinal);
         Assert.True(File.Exists(PathTo("PdfEditorApp", "Assets", "Dictionary", "akk-en-my.tsv.gz")));
     }
+
+    [Fact]
+    public void a_form_of_a_word_shows_its_most_used_part_of_speech_first()
+    {
+        var says = Shipped.Value.Lookup("says")!;
+
+        Assert.Equal(("say", "verb"), (says.Senses[0].Headword, says.Senses[0].PartOfSpeech));
+    }
+
+    // ---------------- Settings ----------------
+
+    [Fact]
+    public void myanmar_meanings_are_on_by_default_even_for_a_settings_file_older_than_the_switch()
+    {
+        Assert.True(new AppSettings().DefineShowsMyanmar);
+        Assert.True(System.Text.Json.JsonSerializer.Deserialize<AppSettings>("{\"NightMode\": true}")!.DefineShowsMyanmar);
+    }
+
+    [Fact]
+    public void switched_off_myanmar_is_not_even_loaded_and_the_switch_lives_in_settings()
+    {
+        string show = MethodBody(PageCode(), "private async void ShowDefinition(");
+        Assert.True(IndexIn(show, "SettingsStore.Current.DefineShowsMyanmar") < IndexIn(show, "DefinitionDictionary.LoadMyanmarAsync()"));
+
+        Assert.Contains("BuildDefineSettings()", MethodBody(PageCode(), "private async void Settings_Click("), StringComparison.Ordinal);
+        Assert.Contains("s with { DefineShowsMyanmar = myanmar.IsOn }",
+            MethodBody(PageCode(), "private static UIElement BuildDefineSettings("), StringComparison.Ordinal);
+    }
 }

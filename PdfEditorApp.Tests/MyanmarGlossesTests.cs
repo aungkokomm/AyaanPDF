@@ -105,4 +105,31 @@ public class MyanmarGlossesTests
     {
         Assert.True(File.Exists(PathTo("PdfEditorApp", "Assets", "Dictionary", "LICENSE-AKK.txt")));
     }
+
+    [Theory]
+    [InlineData("say", "verb", "ပြောသည်")]            // "say sth (to sb)"
+    [InlineData("tell", "verb", "ပြောသည်")]           // "tell sth (to sb)"
+    [InlineData("new", "adjective", "အသစ်")]           // "new (-er,-est)"
+    [InlineData("important", "adjective", "အရေးကြီးသော")] // "important (to sb/sth)"
+    [InlineData("information", "noun", "အချက်အလက်")]   // "information (on/about sb/sth)"
+    public void words_the_akk_dictionary_files_as_patterns_are_found(string headword, string pos, string first)
+    {
+        Assert.Equal(first, Shipped.Value.For(headword, pos)[0]);
+    }
+
+    private static readonly string[] SpokenEndings = ["လဲ", "လား", "တယ်", "ဘူး", "မယ်", "။", "?"];
+
+    [Theory]
+    [InlineData("say", "verb")]
+    [InlineData("give", "verb")]
+    [InlineData("make", "noun")]
+    [InlineData("light", "noun")]
+    public void glosses_carry_no_sentences_stray_brackets_or_respaced_repeats(string headword, string pos)
+    {
+        var glosses = Shipped.Value.For(headword, pos);
+
+        Assert.All(glosses, g => Assert.DoesNotContain(SpokenEndings, g.EndsWith));
+        Assert.All(glosses, g => Assert.False(g.StartsWith(')') || g.EndsWith('('), g));
+        Assert.Equal(glosses.Count, glosses.Select(g => g.Replace(" ", "")).Distinct().Count());
+    }
 }

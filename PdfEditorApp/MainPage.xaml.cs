@@ -1147,7 +1147,10 @@ public sealed partial class MainPage : Page
         DefinitionWord.Text = anchor.Word;
 
         var english = DefinitionDictionary.LoadAsync();
-        var myanmar = DefinitionDictionary.LoadMyanmarAsync();
+        // Switched off in Settings, the Myanmar file is not even read.
+        var myanmar = SettingsStore.Current.DefineShowsMyanmar
+            ? DefinitionDictionary.LoadMyanmarAsync()
+            : Task.FromResult<MyanmarGlosses?>(null);
         if (!english.IsCompleted || !myanmar.IsCompleted)
         {
             DefinitionText.Text = "Looking up...";
@@ -1267,7 +1270,7 @@ public sealed partial class MainPage : Page
             DefinitionMyanmar.Visibility = Visibility.Visible;
         }
 
-        Diag.Log($"define: \"{word}\" found {found.Senses.Count} part(s) of speech, first {found.Senses[0].PartOfSpeech} \"{found.Senses[0].Headword}\", {myanmarLines} Myanmar line(s)");
+        Diag.Log($"define: \"{word}\" found {found.Senses.Count} part(s) of speech, first {found.Senses[0].PartOfSpeech} \"{found.Senses[0].Headword}\", {(glosses is null ? "Myanmar off or unavailable" : $"{myanmarLines} Myanmar line(s)")}");
     }
 
     /// <summary>Puts the popup away. Safe to call when it is not showing.</summary>
@@ -5462,9 +5465,46 @@ public sealed partial class MainPage : Page
         {
             XamlRoot = XamlRoot,
             Title = "Settings",
-            Content = new Grid { Width = 420, Height = 400, Children = { Scrollable(BuildViewSettings()) } },
+            Content = new Grid
+            {
+                Width = 420,
+                Height = 400,
+                Children = { Scrollable(new StackPanel { Children = { BuildViewSettings(), BuildDefineSettings() } }) },
+            },
             CloseButtonText = "Close",
         }.ShowAsync();
+    }
+
+    /// <summary>
+    /// Define's own section: which meanings a definition shows beside the
+    /// English. One switch per language, so each reader keeps only the ones
+    /// they read. Hindi joins Myanmar here once it is bundled.
+    /// </summary>
+    private static UIElement BuildDefineSettings()
+    {
+        var panel = new StackPanel { Spacing = 8, Margin = new Thickness(0, 24, 0, 0) };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Define",
+            FontSize = 16,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Meanings shown under the English definition when you define a word.",
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.8,
+        });
+
+        var myanmar = new ToggleSwitch
+        {
+            Header = "Myanmar meanings",
+            IsOn = SettingsStore.Current.DefineShowsMyanmar,
+        };
+        myanmar.Toggled += (_, _) => SettingsStore.Update(s => s with { DefineShowsMyanmar = myanmar.IsOn });
+        panel.Children.Add(myanmar);
+
+        return panel;
     }
 
     /// <summary>

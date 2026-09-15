@@ -133,7 +133,7 @@ public sealed class WordDefinitions
         var senses = new List<WordSense>();
         var seen = new HashSet<(string, string)>();
 
-        void Add(string headword, string? onlyPos)
+        void Add(string headword, Func<string, bool> wanted)
         {
             if (!_entries.TryGetValue(headword, out var blocks))
             {
@@ -142,22 +142,38 @@ public sealed class WordDefinitions
 
             foreach (var (pos, definitions, example) in blocks)
             {
-                if ((onlyPos is null || onlyPos == pos) && seen.Add((headword, pos)))
+                if (wanted(pos) && seen.Add((headword, pos)))
                 {
                     senses.Add(new WordSense(headword, NameOf(pos), definitions, example));
                 }
             }
         }
 
-        Add(form, null);
+        Add(form, _ => true);
+
+        // The base words the page's word may be a form of, each with the parts
+        // of speech an irregular form or a rule allows it, in first-found order.
+        var bases = new List<(string Headword, List<string> Parts)>();
+        void Candidate(string headword, string pos)
+        {
+            int at = bases.FindIndex(b => b.Headword == headword);
+            if (at < 0)
+            {
+                bases.Add((headword, [pos]));
+            }
+            else if (!bases[at].Parts.Contains(pos))
+            {
+                bases[at].Parts.Add(pos);
+            }
+        }
 
         foreach (var (pos, rules) in new[] { ("n", NounRules), ("v", VerbRules), ("a", AdjectiveRules), ("r", Array.Empty<(string, string)>()) })
         {
-            if (_irregular.TryGetValue((pos, form), out var bases))
+            if (_irregular.TryGetValue((pos, form), out var irregular))
             {
-                foreach (string b in bases)
+                foreach (string b in irregular)
                 {
-                    Add(b, pos);
+                    Candidate(b, pos);
                 }
             }
 
@@ -178,16 +194,25 @@ public sealed class WordDefinitions
                     continue;
                 }
 
-                Add(stem + ending, pos);
+                Candidate(stem + ending, pos);
 
                 // stopped, running, bigger: the rule leaves "stopp", "runn",
                 // "bigg", and the doubled letter has to go too.
                 if (ending.Length == 0 && pos is "v" or "a" && stem.Length >= 3
                     && stem[^1] == stem[^2] && !IsVowel(stem[^1]))
                 {
-                    Add(stem[..^1], pos);
+                    Candidate(stem[..^1], pos);
                 }
             }
+        }
+
+        // ⚠️ IN THE DICTIONARY'S ORDER, NOT THE RULES'. The rules are tried
+        // noun first, and adding senses as each rule matched put the noun "say"
+        // (the chance to speak) above the verb for "says". A base word's parts
+        // of speech go in the order the file lists them, most used first.
+        foreach (var (headword, parts) in bases)
+        {
+            Add(headword, parts.Contains);
         }
 
         if (senses.Count == 0)

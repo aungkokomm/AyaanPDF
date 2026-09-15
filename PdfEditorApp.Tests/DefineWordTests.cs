@@ -233,4 +233,15 @@ public class DefineWordTests
         Assert.Equal((0, firstWord), range);
         Assert.False(EnglishWord.TryNormalize(layer.Text.Substring(0, firstWord), out _));
     }
+
+    [Fact]
+    public void a_form_of_a_word_lists_its_parts_of_speech_most_used_first()
+    {
+        // The file lists "say" verb first. That the noun rule is tried before
+        // the verb rule is no reason to show the noun first.
+        var dictionary = WordDefinitions.Load(new StringReader(string.Join("\n",
+            "D\tsay\tv\texpress in words", "D\tsay\tn\tthe chance to speak")));
+
+        Assert.Equal(new[] { "verb", "noun" }, dictionary.Lookup("says")!.Senses.Select(s => s.PartOfSpeech));
+    }
 }
