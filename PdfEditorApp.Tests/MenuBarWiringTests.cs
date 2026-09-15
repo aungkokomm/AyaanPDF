@@ -173,6 +173,24 @@ public class MenuBarWiringTests
         Assert.Contains("RootGrid.Focus(FocusState.Programmatic);", body, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The same starvation as the menu titles: a quick button in the title
+    /// bar that takes focus on a click keeps every key from the page, so
+    /// Ctrl+Z straight after clicking Undo did nothing.
+    /// </summary>
+    [Theory]
+    [InlineData("QuickOpen")]
+    [InlineData("QuickSave")]
+    [InlineData("QuickUndo")]
+    [InlineData("QuickRedo")]
+    public void the_quick_buttons_leave_the_keyboard_with_the_page(string name)
+    {
+        string window = WindowXaml();
+        int at = window.IndexOf($"<Button x:Name=\"{name}\"", StringComparison.Ordinal);
+        Assert.True(at > 0, $"{name} is gone");
+        Assert.Contains("AllowFocusOnInteraction=\"False\"", window[at..window.IndexOf('>', at)], StringComparison.Ordinal);
+    }
+
     [Fact]
     public void the_menus_are_the_ones_people_look_for_in_order()
     {

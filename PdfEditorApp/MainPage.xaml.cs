@@ -5201,15 +5201,14 @@ public sealed partial class MainPage : Page
     /// </summary>
     private async void Settings_Click(object sender, RoutedEventArgs e)
     {
-        var tabs = new Pivot { Margin = new Thickness(0, 8, 0, 0) };
-        tabs.Items.Add(new PivotItem { Header = "View", Content = Scrollable(BuildViewSettings()) });
-        tabs.Items.Add(new PivotItem { Header = "About", Content = Scrollable(BuildAboutPane()) });
-
+        // No tab strip. About used to be a second tab here as well as its own
+        // dialog under Help; it is only under Help now, and one tab labelled
+        // "View" says nothing.
         await new ContentDialog
         {
             XamlRoot = XamlRoot,
             Title = "Settings",
-            Content = new Grid { Width = 420, Height = 400, Children = { tabs } },
+            Content = new Grid { Width = 420, Height = 400, Children = { Scrollable(BuildViewSettings()) } },
             CloseButtonText = "Close",
         }.ShowAsync();
     }
@@ -5719,43 +5718,6 @@ public sealed partial class MainPage : Page
         : UnitPicas.IsChecked ? "Picas"
         : "Inches";
 
-    private UIElement BuildAboutPane()
-    {
-        var panel = new StackPanel { Spacing = 10, Margin = new Thickness(0, 12, 0, 0) };
-
-        panel.Children.Add(new TextBlock
-        {
-            Text = AppInfo.Name,
-            Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"],
-        });
-        panel.Children.Add(new TextBlock { Text = $"Version {AppInfo.Version}" });
-
-        // The third-party notices are owed, not decorative: PDFium and the
-        // vendored pdfium-render both carry licences that require attribution.
-        panel.Children.Add(new TextBlock
-        {
-            Text = "Renders with PDFium. Text shaping by rustybuzz. "
-                   + "PDF access through a patched copy of pdfium-render.",
-            TextWrapping = TextWrapping.Wrap,
-            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
-        });
-
-        // The log is where every question we have had today was answered, so
-        // it is worth one click rather than a path to type.
-        var log = new HyperlinkButton { Content = "Open the diagnostic log" };
-        log.Click += (_, _) =>
-        {
-            string path = System.IO.Path.Combine(AppContext.BaseDirectory, "diag.log");
-            if (System.IO.File.Exists(path))
-            {
-                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-            }
-        };
-        panel.Children.Add(log);
-
-        return panel;
-    }
-
     // ---------------- Signatures ----------------
 
     /// <summary>
@@ -6004,6 +5966,9 @@ public sealed partial class MainPage : Page
     /// About dialog. Reports the app version and the render core's, since the
     /// two ship together but are built separately and a mismatched pair is
     /// exactly the sort of thing a bug report needs to state.
+    ///
+    /// The only About. Settings used to carry a second one as a tab, with the
+    /// credits and the log link this one lacked; both moved here.
     /// </summary>
     private async void About_Click(object sender, RoutedEventArgs e)
     {
@@ -6033,12 +5998,34 @@ public sealed partial class MainPage : Page
         body.Children.Add(new TextBlock { Text = AppInfo.Name, Style = (Style)Application.Current.Resources["SubtitleTextBlockStyle"] });
         body.Children.Add(new TextBlock { Text = $"Version {informational}" });
         body.Children.Add(new TextBlock { Text = $"Render core: {core}", Opacity = 0.75 });
+
+        // The third-party notices are owed, not decorative: PDFium and the
+        // vendored pdfium-render both carry licences that require attribution.
         body.Children.Add(new TextBlock
         {
-            Text = "PDF rendering by PDFium.",
+            Text = "Renders with PDFium. Text shaping by rustybuzz. "
+                   + "PDF access through a patched copy of pdfium-render.",
             Opacity = 0.75,
             TextWrapping = TextWrapping.Wrap,
         });
+
+        // The log is where most questions about a misbehaving build get
+        // answered, so it is worth one click rather than a path to type. No
+        // side padding, so the link lines up with the text above it.
+        var log = new HyperlinkButton
+        {
+            Content = "Open the diagnostic log",
+            Padding = new Thickness(0, 4, 0, 4),
+        };
+        log.Click += (_, _) =>
+        {
+            string path = System.IO.Path.Combine(AppContext.BaseDirectory, "diag.log");
+            if (System.IO.File.Exists(path))
+            {
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            }
+        };
+        body.Children.Add(log);
 
         await new ContentDialog
         {
