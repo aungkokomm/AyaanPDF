@@ -184,7 +184,7 @@ public class DefineWiringTests
         // a blank line between the word and its first sense.
         Assert.Contains("DefinitionText.Inlines.Clear();", fill, StringComparison.Ordinal);
         Assert.DoesNotContain("DefinitionText.Text = string.Empty", fill, StringComparison.Ordinal);
-        Assert.Contains("label + \": \"", fill, StringComparison.Ordinal);
+        Assert.Contains("LabelFor(sense) + \": \"", fill, StringComparison.Ordinal);
         Assert.Contains("FontWeights.SemiBold", fill, StringComparison.Ordinal);
     }
 
@@ -242,5 +242,38 @@ public class DefineWiringTests
 
         // And had one slipped through, the dictionary has nothing to say.
         Assert.Null(Shipped.Value.Lookup(selected));
+    }
+
+    // ---------------- The log, and the Myanmar meanings ----------------
+
+    [Fact]
+    public void every_define_says_in_the_log_what_it_found()
+    {
+        string fill = MethodBody(PageCode(), "private void FillDefinition(");
+
+        Assert.Contains("Diag.Log($\"define: no entry for", fill, StringComparison.Ordinal);
+        Assert.Contains("Diag.Log($\"define: \\\"{word}\\\" found", fill, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void myanmar_meanings_are_looked_up_by_the_english_headword_and_part_of_speech()
+    {
+        Assert.Contains("DefinitionDictionary.LoadMyanmarAsync()",
+            MethodBody(PageCode(), "private async void ShowDefinition("), StringComparison.Ordinal);
+
+        string fill = MethodBody(PageCode(), "private void FillDefinition(");
+        Assert.Contains("glosses?.For(sense.Headword, sense.PartOfSpeech)", fill, StringComparison.Ordinal);
+        Assert.Contains("\"Pyidaungsu, Myanmar Text\"", fill, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_myanmar_block_has_no_fixed_line_height_to_clip_its_marks()
+    {
+        string xaml = File.ReadAllText(PathTo("PdfEditorApp", "MainPage.xaml"));
+        var element = Regex.Match(xaml, @"<TextBlock\s+x:Name=""DefinitionMyanmar""[^>]*?>", RegexOptions.Singleline);
+
+        Assert.True(element.Success, "DefinitionMyanmar was not found in MainPage.xaml");
+        Assert.DoesNotContain("LineHeight", element.Value, StringComparison.Ordinal);
+        Assert.True(File.Exists(PathTo("PdfEditorApp", "Assets", "Dictionary", "akk-en-my.tsv.gz")));
     }
 }

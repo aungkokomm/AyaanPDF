@@ -1146,31 +1146,39 @@ public sealed partial class MainPage : Page
         _defineShown = anchor;
         DefinitionWord.Text = anchor.Word;
 
-        var loading = DefinitionDictionary.LoadAsync();
-        if (!loading.IsCompleted)
+        var english = DefinitionDictionary.LoadAsync();
+        var myanmar = DefinitionDictionary.LoadMyanmarAsync();
+        if (!english.IsCompleted || !myanmar.IsCompleted)
         {
             DefinitionText.Text = "Looking up...";
+            DefinitionMyanmarRule.Visibility = Visibility.Collapsed;
+            DefinitionMyanmar.Visibility = Visibility.Collapsed;
             PlaceDefinition();
         }
 
-        WordDefinitions? dictionary = await loading;
+        WordDefinitions? dictionary = await english;
+        MyanmarGlosses? glosses = await myanmar;
         if (request != _defineRequest)
         {
             return;
         }
 
-        FillDefinition(anchor.Word, dictionary);
+        FillDefinition(anchor.Word, dictionary, glosses);
         PlaceDefinition();
     }
 
     /// <summary>
-    /// A glance, not an entry: up to three parts of speech, two senses each.
-    /// When the word on the page is a form of another (running, went), the
-    /// dictionary word is named, so the definition is not read as being of the
-    /// word as written.
+    /// A glance, not an entry: up to three parts of speech, two senses each,
+    /// then their Myanmar meanings. When the word on the page is a form of
+    /// another (running, went), the dictionary word is named, so the
+    /// definition is not read as being of the word as written.
     /// </summary>
-    private void FillDefinition(string word, WordDefinitions? dictionary)
+    private void FillDefinition(string word, WordDefinitions? dictionary, MyanmarGlosses? glosses)
     {
+        DefinitionMyanmar.Inlines.Clear();
+        DefinitionMyanmarRule.Visibility = Visibility.Collapsed;
+        DefinitionMyanmar.Visibility = Visibility.Collapsed;
+
         if (dictionary is null)
         {
             DefinitionText.Text = "The dictionary could not be loaded.";
@@ -1184,6 +1192,11 @@ public sealed partial class MainPage : Page
             return;
         }
 
+        string LabelFor(WordSense sense) =>
+            string.Equals(sense.Headword, word, StringComparison.OrdinalIgnoreCase)
+                ? sense.PartOfSpeech
+                : $"{sense.PartOfSpeech}, {sense.Headword}";
+
         // Inlines.Clear, NOT Text = "": setting empty text leaves an empty Run
         // behind, which counted as a first line and pushed every sense down
         // under a blank one.
@@ -1195,16 +1208,13 @@ public sealed partial class MainPage : Page
                 DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
             }
 
-            string label = string.Equals(sense.Headword, word, StringComparison.OrdinalIgnoreCase)
-                ? sense.PartOfSpeech
-                : $"{sense.PartOfSpeech}, {sense.Headword}";
             string meaning = sense.Definitions.Count > 1
                 ? $"{sense.Definitions[0]}; {sense.Definitions[1]}"
                 : sense.Definitions[0];
 
             DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
             {
-                Text = label + ": ",
+                Text = LabelFor(sense) + ": ",
                 FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             });
             DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = meaning });
@@ -1221,6 +1231,43 @@ public sealed partial class MainPage : Page
                 });
             }
         }
+
+        // Myanmar under the English, one line for each part of speech shown,
+        // looked up by the headword and part of speech the English settled on,
+        // so each line translates the meaning above it rather than the word as
+        // written ("running" is glossed as the verb "run").
+        int myanmarLines = 0;
+        foreach (var sense in found.Senses)
+        {
+            if (glosses?.For(sense.Headword, sense.PartOfSpeech) is not { Count: > 0 } meanings)
+            {
+                continue;
+            }
+
+            if (myanmarLines++ > 0)
+            {
+                DefinitionMyanmar.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
+            }
+
+            DefinitionMyanmar.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = LabelFor(sense) + ": ",
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            });
+            DefinitionMyanmar.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = string.Join("၊ ", meanings),
+                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Pyidaungsu, Myanmar Text"),
+            });
+        }
+
+        if (myanmarLines > 0)
+        {
+            DefinitionMyanmarRule.Visibility = Visibility.Visible;
+            DefinitionMyanmar.Visibility = Visibility.Visible;
+        }
+
+        Diag.Log($"define: \"{word}\" found {found.Senses.Count} part(s) of speech, first {found.Senses[0].PartOfSpeech} \"{found.Senses[0].Headword}\", {myanmarLines} Myanmar line(s)");
     }
 
     /// <summary>Puts the popup away. Safe to call when it is not showing.</summary>
