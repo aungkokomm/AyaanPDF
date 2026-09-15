@@ -58,6 +58,61 @@ public static class PageReorder
         return order;
     }
 
+    /// <summary>
+    /// The order that inserts a copy of each chosen page right after it, as
+    /// <see cref="Duplicate"/> does for one.
+    /// </summary>
+    public static List<int> DuplicateSet(int count, IReadOnlyCollection<int> pages)
+    {
+        var chosen = new HashSet<int>(pages);
+        var order = new List<int>(count + chosen.Count);
+        for (int i = 0; i < count; i++)
+        {
+            order.Add(i);
+            if (chosen.Contains(i))
+            {
+                order.Add(i);
+            }
+        }
+
+        return order;
+    }
+
+    /// <summary>
+    /// The order after moving the chosen pages one place up
+    /// (<paramref name="delta"/> below zero) or down (above zero). Each chosen
+    /// page trades places with the unchosen page beside it, so neighbours move
+    /// as a block; a page already at the edge stays, and so do chosen pages
+    /// stacked against it.
+    /// </summary>
+    public static List<int> MoveSet(int count, IReadOnlyCollection<int> pages, int delta)
+    {
+        var order = Identity(count);
+        var chosen = new HashSet<int>(pages);
+        if (delta < 0)
+        {
+            for (int i = 1; i < count; i++)
+            {
+                if (chosen.Contains(order[i]) && !chosen.Contains(order[i - 1]))
+                {
+                    (order[i - 1], order[i]) = (order[i], order[i - 1]);
+                }
+            }
+        }
+        else if (delta > 0)
+        {
+            for (int i = count - 2; i >= 0; i--)
+            {
+                if (chosen.Contains(order[i]) && !chosen.Contains(order[i + 1]))
+                {
+                    (order[i + 1], order[i]) = (order[i], order[i + 1]);
+                }
+            }
+        }
+
+        return order;
+    }
+
     /// <summary>The order with page <paramref name="index"/> removed. Never empties the document.</summary>
     public static List<int> Delete(int count, int index)
     {

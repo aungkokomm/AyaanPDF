@@ -62,7 +62,6 @@ public class ThumbnailReorderWiringTests
     public void nothing_waits_for_a_move_the_list_never_raises()
     {
         Assert.DoesNotContain("NotifyCollectionChangedAction.Move", PageCode(), StringComparison.Ordinal);
-        Assert.DoesNotContain("Thumbnails.CollectionChanged +=", PageCode(), StringComparison.Ordinal);
     }
 
     [Fact]

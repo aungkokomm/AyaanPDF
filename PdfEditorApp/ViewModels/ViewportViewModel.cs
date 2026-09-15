@@ -1779,6 +1779,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Inserts a copy of a page right after it.</summary>
     public bool DuplicatePage(int index) => RebuildPages(PageReorder.Duplicate(PageCount, index));
 
+    /// <summary>Inserts a copy of each of several pages right after it, in one undo step.</summary>
+    public bool DuplicatePages(IReadOnlyCollection<int> indices) =>
+        indices.Count > 0 && RebuildPages(PageReorder.DuplicateSet(PageCount, indices));
+
+    /// <summary>
+    /// Moves several pages one place up (<paramref name="delta"/> below zero)
+    /// or down together, in one undo step. Nothing happens when none can move.
+    /// </summary>
+    public bool MovePages(IReadOnlyCollection<int> indices, int delta)
+    {
+        var order = PageReorder.MoveSet(PageCount, indices, delta);
+        return !order.SequenceEqual(PageReorder.Identity(PageCount)) && RebuildPages(order);
+    }
+
     /// <summary>Deletes a page by index. Refuses to remove the last remaining page.</summary>
     public bool DeletePage(int index) =>
         PageCount > 1 && RebuildPages(PageReorder.Delete(PageCount, index));

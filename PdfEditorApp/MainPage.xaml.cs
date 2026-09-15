@@ -148,6 +148,23 @@ public sealed partial class MainPage : Page
         // than asking the repeater for each of 39,881 items. See its Slots.
         PageCardLayout.Slots = ViewModel.PageSlots;
 
+        // The thumbnail list follows the page being read, as one chosen card,
+        // until several are chosen there. See SyncThumbnailSelection.
+        ViewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(ViewModel.CurrentPageIndex))
+            {
+                SyncThumbnailSelection();
+            }
+        };
+        ViewModel.Thumbnails.CollectionChanged += (_, args) =>
+        {
+            if (args.Action == NotifyCollectionChangedAction.Reset)
+            {
+                DispatcherQueue.TryEnqueue(SyncThumbnailSelection);
+            }
+        };
+
         // When the loaded selection changes to (or from) one of our text boxes,
         // the toolbar's font/fill/outline sections need to show up (or hide) even
         // though the active tool has not changed. Any tool + a selected text box
@@ -9954,19 +9971,62 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// Navigates to a clicked thumbnail.
-    ///
-    /// ItemClick, NOT SelectionChanged. SelectedIndex is bound to the current
-    /// page, and scrolling changes the current page, so SelectionChanged would
-    /// fire from scrolling and navigate back to the top of that page: the
-    /// viewport would fight every attempt to scroll freely. ItemClick fires
-    /// only for a real click, which breaks that loop at the source.
+    /// Set while the thumbnail list's selection is being matched to the page
+    /// being read, so that change is not taken for a click and navigated to.
     /// </summary>
-    private void ThumbnailList_ItemClick(object sender, ItemClickEventArgs e)
+    private bool _syncingThumbnailSelection;
+
+    /// <summary>
+    /// A plain click on a thumbnail goes to that page. Ctrl+click and
+    /// Shift+click choose several pages, for the page menu and for dragging,
+    /// and leave the reader where they are.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE LIST FOLLOWS THE CURRENT PAGE FROM CODE, NOT A BINDING. Its
+    /// SelectedIndex was bound to the current page, which in a list that lets
+    /// several pages be chosen throws the choice away on every scroll step. And
+    /// the selection made from code is marked, because a change taken for a
+    /// click would navigate back to the top of the page on every scroll step:
+    /// the viewport would fight every attempt to scroll freely.
+    /// </remarks>
+    private void ThumbnailList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (e.ClickedItem is PageThumbnail thumbnail)
+        if (_syncingThumbnailSelection
+            || ThumbnailList.SelectedItems.Count != 1
+            || ThumbnailList.SelectedItem is not PageThumbnail thumbnail)
         {
-            ViewModel.GoToPage(thumbnail.PageIndex);
+            return;
+        }
+
+        ViewModel.GoToPage(thumbnail.PageIndex);
+    }
+
+    /// <summary>
+    /// Chooses the page being read in the thumbnail list, unless several pages
+    /// are chosen there: scrolling must not throw that choice away.
+    /// </summary>
+    private void SyncThumbnailSelection()
+    {
+        if (ThumbnailList.SelectedItems.Count > 1)
+        {
+            return;
+        }
+
+        int page = ViewModel.CurrentPageIndex;
+        int index = page >= 0 && page < ViewModel.Thumbnails.Count ? page : -1;
+        if (ThumbnailList.SelectedIndex == index)
+        {
+            return;
+        }
+
+        _syncingThumbnailSelection = true;
+        try
+        {
+            ThumbnailList.SelectedIndex = index;
+        }
+        finally
+        {
+            _syncingThumbnailSelection = false;
         }
     }
 
@@ -10083,48 +10143,121 @@ public sealed partial class MainPage : Page
     private static int PageOf(object sender) =>
         (sender as FrameworkElement)?.DataContext is PageThumbnail t ? t.PageIndex : -1;
 
+    /// <summary>The pages a thumbnail menu command acts on. See <see cref="ChosenPagesWith"/>.</summary>
+    private List<int> PagesOf(object sender) => ChosenPagesWith(PageOf(sender));
+
+    /// <summary>
+    /// Every chosen page, in page order, when <paramref name="page"/> is one of
+    /// several chosen; otherwise just that page. Right-clicking a page outside
+    /// the choice acts on that page alone, as it did before several could be
+    /// chosen.
+    /// </summary>
+    private List<int> ChosenPagesWith(int page)
+    {
+        if (page < 0)
+        {
+            return new List<int>();
+        }
+
+        var chosen = ThumbnailList.SelectedItems.OfType<PageThumbnail>().Select(t => t.PageIndex).Order().ToList();
+        return chosen.Count > 1 && chosen.Contains(page) ? chosen : new List<int> { page };
+    }
+
+    /// <summary>
+    /// Names the page menu's commands for what they will act on: "Delete 3
+    /// pages" when the page right-clicked is one of three chosen.
+    /// </summary>
+    private void PageMenu_Opening(object sender, object e)
+    {
+        if (sender is not MenuFlyout menu)
+        {
+            return;
+        }
+
+        int page = (menu.Target as FrameworkElement)?.DataContext is PageThumbnail t ? t.PageIndex : -1;
+        int n = ChosenPagesWith(page).Count;
+
+        foreach (var item in menu.Items.OfType<MenuFlyoutItem>())
+        {
+            item.Text = (item.Tag as string, n > 1) switch
+            {
+                ("Rotate", false) => "Rotate 90°",
+                ("Rotate", true) => $"Rotate {n} pages 90°",
+                ("Duplicate", false) => "Duplicate",
+                ("Duplicate", true) => $"Duplicate {n} pages",
+                ("Extract", false) => "Extract page...",
+                ("Extract", true) => $"Extract {n} pages...",
+                ("MoveUp", false) => "Move up",
+                ("MoveUp", true) => $"Move {n} pages up",
+                ("MoveDown", false) => "Move down",
+                ("MoveDown", true) => $"Move {n} pages down",
+                ("Delete", false) => "Delete page",
+                ("Delete", true) => $"Delete {n} pages",
+                _ => item.Text,
+            };
+        }
+    }
+
     private void PageRotate_Click(object sender, RoutedEventArgs e)
     {
-        int p = PageOf(sender);
-        if (p >= 0)
+        var pages = PagesOf(sender);
+        if (pages.Count > 1)
         {
-            ViewModel.RotatePage(p, 90);
+            ViewModel.RotatePages(pages, 90);
+        }
+        else if (pages.Count == 1)
+        {
+            ViewModel.RotatePage(pages[0], 90);
         }
     }
 
     private void PageDuplicate_Click(object sender, RoutedEventArgs e)
     {
-        int p = PageOf(sender);
-        if (p >= 0)
+        var pages = PagesOf(sender);
+        if (pages.Count > 1)
         {
-            ViewModel.DuplicatePage(p);
+            ViewModel.DuplicatePages(pages);
+        }
+        else if (pages.Count == 1)
+        {
+            ViewModel.DuplicatePage(pages[0]);
         }
     }
 
     private void PageMoveUp_Click(object sender, RoutedEventArgs e)
     {
-        int p = PageOf(sender);
-        if (p > 0)
+        var pages = PagesOf(sender);
+        if (pages.Count > 0)
         {
-            ViewModel.MovePage(p, p - 1);
+            ViewModel.MovePages(pages, -1);
         }
     }
 
     private void PageMoveDown_Click(object sender, RoutedEventArgs e)
     {
-        int p = PageOf(sender);
-        if (p >= 0 && p < ViewModel.PageCount - 1)
+        var pages = PagesOf(sender);
+        if (pages.Count > 0)
         {
-            ViewModel.MovePage(p, p + 1);
+            ViewModel.MovePages(pages, 1);
         }
     }
 
     private void PageDelete_Click(object sender, RoutedEventArgs e)
     {
-        int p = PageOf(sender);
-        if (p >= 0)
+        var pages = PagesOf(sender);
+        if (pages.Count > 1)
         {
-            ViewModel.DeletePage(p);
+            if (pages.Count >= ViewModel.PageCount)
+            {
+                ViewModel.Status = "A document needs at least one page, so not every page can be deleted.";
+                return;
+            }
+
+            ViewModel.DeletePages(pages);
+        }
+        else if (pages.Count == 1)
+        {
+            ViewModel.DeletePage(pages[0]);
         }
     }
 
@@ -10260,8 +10393,40 @@ public sealed partial class MainPage : Page
     private async void ExtractPagesMenu_Click(object sender, RoutedEventArgs e) =>
         await ShowExtractDialog(null);
 
-    private async void PageExtract_Click(object sender, RoutedEventArgs e) =>
+    private async void PageExtract_Click(object sender, RoutedEventArgs e)
+    {
+        var pages = PagesOf(sender);
+        if (pages.Count > 1)
+        {
+            await ExtractChosenPages(pages);
+            return;
+        }
+
         await ShowExtractDialog(PageOf(sender));
+    }
+
+    /// <summary>
+    /// Several pages chosen in the thumbnails go straight to a new file: the
+    /// Extract dialog asks for one from-to range, which a choice like "2-4, 9"
+    /// is not.
+    /// </summary>
+    private async System.Threading.Tasks.Task ExtractChosenPages(IReadOnlyList<int> pages)
+    {
+        var savePicker = new Windows.Storage.Pickers.FileSavePicker();
+        WinRT.Interop.InitializeWithWindow.Initialize(savePicker, App.WindowHandle);
+        savePicker.SuggestedFileName = $"pages {PageSelection.Format(pages, ViewModel.PageCount)}";
+        savePicker.FileTypeChoices.Add("PDF", new System.Collections.Generic.List<string> { ".pdf" });
+
+        var file = await savePicker.PickSaveFileAsync();
+        if (file is null)
+        {
+            return;
+        }
+
+        ViewModel.Status = ViewModel.ExtractPagesToFile(pages, file.Path)
+            ? "Pages extracted."
+            : "Could not extract the pages.";
+    }
 
     private void PageInsertBlankAfter_Click(object sender, RoutedEventArgs e)
     {

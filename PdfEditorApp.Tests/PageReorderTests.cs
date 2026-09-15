@@ -39,6 +39,27 @@ public class PageReorderTests
     }
 
     [Fact]
+    public void duplicating_several_pages_puts_each_copy_right_after_its_page()
+    {
+        Assert.Equal(new[] { 0, 0, 1, 2, 2, 3 }, PageReorder.DuplicateSet(4, new[] { 2, 0 }));
+    }
+
+    [Fact]
+    public void several_pages_move_up_together_and_one_at_the_top_stays()
+    {
+        Assert.Equal(new[] { 0, 2, 3, 1, 4 }, PageReorder.MoveSet(5, new[] { 2, 3 }, -1));
+        Assert.Equal(new[] { 1, 0, 3, 2 }, PageReorder.MoveSet(4, new[] { 1, 3 }, -1));
+        Assert.Equal(new[] { 0, 1, 2 }, PageReorder.MoveSet(3, new[] { 0, 1 }, -1));
+    }
+
+    [Fact]
+    public void several_pages_move_down_together_and_one_at_the_bottom_stays()
+    {
+        Assert.Equal(new[] { 0, 3, 1, 2, 4 }, PageReorder.MoveSet(5, new[] { 1, 2 }, 1));
+        Assert.Equal(new[] { 0, 1, 2 }, PageReorder.MoveSet(3, new[] { 1, 2 }, 1));
+    }
+
+    [Fact]
     public void delete_omits_the_index()
     {
         Assert.Equal(new[] { 0, 2, 3 }, PageReorder.Delete(4, 1));

@@ -3013,12 +3013,11 @@
                 <ListView
                 Grid.Row="1"
                 x:Name="ThumbnailList"
+                SelectionMode="Extended"
+                SelectionChanged="ThumbnailList_SelectionChanged"
                 PointerWheelChanged="ThumbnailList_PointerWheelChanged"
                 Padding="8,0,8,8"
                 ItemsSource="{x:Bind ViewModel.Thumbnails}"
-                SelectedIndex="{x:Bind ViewModel.CurrentPageIndex, Mode=OneWay}"
-                IsItemClickEnabled="True"
-                ItemClick="ThumbnailList_ItemClick"
                 CanReorderItems="True"
                 CanDragItems="True"
                 AllowDrop="True"
@@ -3033,25 +3032,28 @@
                                 nudge up or down.
                             -->
                             <StackPanel.ContextFlyout>
-                                <MenuFlyout>
-                                    <MenuFlyoutItem Text="Rotate 90&#176;" Click="PageRotate_Click">
+                                <!-- Tagged commands act on every chosen page when the
+                                     page right-clicked is one of several chosen, and
+                                     PageMenu_Opening names them for how many. -->
+                                <MenuFlyout Opening="PageMenu_Opening">
+                                    <MenuFlyoutItem Text="Rotate 90&#176;" Tag="Rotate" Click="PageRotate_Click">
                                         <MenuFlyoutItem.Icon>
                                             <FontIcon Glyph="&#xE7AD;" />
                                         </MenuFlyoutItem.Icon>
                                     </MenuFlyoutItem>
                                     <MenuFlyoutItem Text="Rotate pages..." Click="PageRotateDialog_Click" />
-                                    <MenuFlyoutItem Text="Duplicate" Click="PageDuplicate_Click">
+                                    <MenuFlyoutItem Text="Duplicate" Tag="Duplicate" Click="PageDuplicate_Click">
                                         <MenuFlyoutItem.Icon>
                                             <FontIcon Glyph="&#xE8C8;" />
                                         </MenuFlyoutItem.Icon>
                                     </MenuFlyoutItem>
                                     <MenuFlyoutItem Text="Insert blank page after" Click="PageInsertBlankAfter_Click" />
-                                    <MenuFlyoutItem Text="Extract page..." Click="PageExtract_Click" />
+                                    <MenuFlyoutItem Text="Extract page..." Tag="Extract" Click="PageExtract_Click" />
                                     <MenuFlyoutSeparator />
-                                    <MenuFlyoutItem Text="Move up" Click="PageMoveUp_Click" />
-                                    <MenuFlyoutItem Text="Move down" Click="PageMoveDown_Click" />
+                                    <MenuFlyoutItem Text="Move up" Tag="MoveUp" Click="PageMoveUp_Click" />
+                                    <MenuFlyoutItem Text="Move down" Tag="MoveDown" Click="PageMoveDown_Click" />
                                     <MenuFlyoutSeparator />
-                                    <MenuFlyoutItem Text="Delete page" Click="PageDelete_Click">
+                                    <MenuFlyoutItem Text="Delete page" Tag="Delete" Click="PageDelete_Click">
                                         <MenuFlyoutItem.Icon>
                                             <FontIcon Glyph="&#xE74D;" />
                                         </MenuFlyoutItem.Icon>
