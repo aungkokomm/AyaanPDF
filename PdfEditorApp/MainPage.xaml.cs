@@ -911,6 +911,7 @@ public sealed partial class MainPage : Page
 
         // Anchored to a page position, so every scroll and zoom moves it.
         UpdateObjectToolbar();
+        PlaceDefinition();
 
         // A zoom that no longer matches fit-width means the user took over,
         // by pinch, Ctrl+wheel or a zoom command. Detecting it from the state
@@ -1106,6 +1107,189 @@ public sealed partial class MainPage : Page
 
         ObjectToolbar.Opacity = 1;
         ObjectToolbar.Visibility = Visibility.Visible;
+    }
+
+    // ---------------- Define ----------------
+
+    /// <summary>
+    /// The word a right-click found selected, its box on its page in slot-space
+    /// DIPs, and the document it belongs to. Kept rather than re-read, because
+    /// the right-click itself can re-pick what is selected.
+    /// </summary>
+    private sealed record DefineAnchor(
+        string Word, int Page, double Left, double Top, double Right, double Bottom, string? Document);
+
+    private DefineAnchor? _defineCandidate;
+    private DefineAnchor? _defineShown;
+    private int _defineRequest;
+
+    private bool IsDefinitionShowing => _defineShown is not null;
+
+    private void DefinitionPopup_SizeChanged(object sender, SizeChangedEventArgs e) => PlaceDefinition();
+
+    /// <summary>
+    /// Opens the yellow definition popup beside the word Define was offered for.
+    /// </summary>
+    /// <remarks>
+    /// The first use reads the dictionary off the UI thread, so the popup says
+    /// it is looking rather than holding the click. A lookup that finishes
+    /// after the popup was put away, or replaced by another word, is dropped.
+    /// </remarks>
+    private async void ShowDefinition()
+    {
+        if (_defineCandidate is not { } anchor)
+        {
+            return;
+        }
+
+        int request = ++_defineRequest;
+        _defineShown = anchor;
+        DefinitionWord.Text = anchor.Word;
+
+        var loading = DefinitionDictionary.LoadAsync();
+        if (!loading.IsCompleted)
+        {
+            DefinitionText.Text = "Looking up...";
+            PlaceDefinition();
+        }
+
+        WordDefinitions? dictionary = await loading;
+        if (request != _defineRequest)
+        {
+            return;
+        }
+
+        FillDefinition(anchor.Word, dictionary);
+        PlaceDefinition();
+    }
+
+    /// <summary>
+    /// A glance, not an entry: up to three parts of speech, two senses each.
+    /// When the word on the page is a form of another (running, went), the
+    /// dictionary word is named, so the definition is not read as being of the
+    /// word as written.
+    /// </summary>
+    private void FillDefinition(string word, WordDefinitions? dictionary)
+    {
+        if (dictionary is null)
+        {
+            DefinitionText.Text = "The dictionary could not be loaded.";
+            return;
+        }
+
+        if (dictionary.Lookup(word) is not { } found)
+        {
+            Diag.Log($"define: no entry for \"{word}\"");
+            DefinitionText.Text = $"No definition found for \"{word}\".";
+            return;
+        }
+
+        DefinitionText.Text = string.Empty;
+        foreach (var sense in found.Senses)
+        {
+            if (DefinitionText.Inlines.Count > 0)
+            {
+                DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
+            }
+
+            string label = string.Equals(sense.Headword, word, StringComparison.OrdinalIgnoreCase)
+                ? sense.PartOfSpeech
+                : $"{sense.PartOfSpeech}, {sense.Headword}";
+            string meaning = sense.Definitions.Count > 1
+                ? $"{sense.Definitions[0]}; {sense.Definitions[1]}"
+                : sense.Definitions[0];
+
+            DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = label + "  ",
+                FontStyle = Windows.UI.Text.FontStyle.Italic,
+            });
+            DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = meaning });
+        }
+    }
+
+    /// <summary>Puts the popup away. Safe to call when it is not showing.</summary>
+    private void HideDefinition()
+    {
+        if (_defineShown is null)
+        {
+            return;
+        }
+
+        _defineShown = null;
+        _defineRequest++;
+        DefinitionPopup.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Puts the popup beside its word the way the object toolbar sits beside a
+    /// selection: above it, below it when there is no room, inside the
+    /// viewport. Hidden rather than pinned to an edge while the word is
+    /// scrolled out of view, and put away for good once its page or document
+    /// is gone.
+    /// </summary>
+    private void PlaceDefinition()
+    {
+        if (_defineShown is not { } anchor || DefinitionPopup is null || ViewportHost is null || PageScroller is null)
+        {
+            return;
+        }
+
+        if (anchor.Page >= ViewModel.PageCount
+            || !string.Equals(anchor.Document, ViewModel.DocumentPath, StringComparison.OrdinalIgnoreCase))
+        {
+            HideDefinition();
+            return;
+        }
+
+        double padL = ViewportHost.Padding.Left;
+        double padT = ViewportHost.Padding.Top;
+        double slotTop = ViewModel.SlotTopOf(anchor.Page);
+
+        Windows.Foundation.Point tl, br;
+        try
+        {
+            var toViewport = ViewportHost.TransformToVisual(PageScroller);
+            tl = toViewport.TransformPoint(new Windows.Foundation.Point(padL + anchor.Left, padT + slotTop + anchor.Top));
+            br = toViewport.TransformPoint(new Windows.Foundation.Point(padL + anchor.Right, padT + slotTop + anchor.Bottom));
+        }
+        catch
+        {
+            // The tree is being rebuilt; the next ViewChanged places it.
+            return;
+        }
+
+        if (br.X < 0 || br.Y < 0 || tl.X > PageScroller.ViewportWidth || tl.Y > PageScroller.ViewportHeight)
+        {
+            DefinitionPopup.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        double popupW = DefinitionPopup.ActualWidth;
+        double popupH = DefinitionPopup.ActualHeight;
+        if (popupW <= 0 || popupH <= 0)
+        {
+            // Not measured yet: laid out invisibly, and SizeChanged comes back
+            // here with real numbers, as the object toolbar does.
+            DefinitionPopup.Opacity = 0;
+            DefinitionPopup.Visibility = Visibility.Visible;
+            return;
+        }
+
+        double topInset = PropertyBar.Visibility == Visibility.Visible
+            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
+            : 0;
+
+        var place = ObjectToolbarPlacement.Place(
+            tl.X, tl.Y, br.X, br.Y,
+            popupW, popupH,
+            PageScroller.ViewportWidth, PageScroller.ViewportHeight,
+            Math.Max(0, topInset));
+
+        DefinitionPopup.Translation = new System.Numerics.Vector3(
+            (float)place.Left, (float)place.Top, ObjectToolbarPlacement.Elevation);
+        DefinitionPopup.Opacity = 1;
+        DefinitionPopup.Visibility = Visibility.Visible;
     }
 
     private void RulersToggle_Click(object sender, RoutedEventArgs e)
@@ -1777,6 +1961,7 @@ public sealed partial class MainPage : Page
         // so its origin has to move with the scroller's or it lands 22px out
         // whenever the rulers are toggled.
         ObjectToolbar.Margin = PageScroller.Margin;
+        DefinitionPopup.Margin = PageScroller.Margin;
         // Same reason, same space: the Skia layer's origin is the viewport's
         // top-left too.
         SkiaShapeCanvas.Margin = PageScroller.Margin;
@@ -7607,6 +7792,16 @@ public sealed partial class MainPage : Page
                 return;
         }
 
+        // Escape puts a definition away and does nothing else: the reader
+        // pressed it to close the popup, not to drop their selection or leave
+        // a line they are editing.
+        if (e.Key == VirtualKey.Escape && IsDefinitionShowing)
+        {
+            HideDefinition();
+            e.Handled = true;
+            return;
+        }
+
         if (IsTextInputFocused)
         {
             // Escape leaves the field and hands the canvas back, which is the
@@ -8324,6 +8519,16 @@ public sealed partial class MainPage : Page
         double ny = content.Y / ViewModel.OverlayScale;
         _contextPoint = (content.Page, nx, ny);
 
+        // Define's word is read BEFORE anything below re-picks under the
+        // pointer: a pick on page text replaces the very selection the reader
+        // right-clicked to ask about. Only one English word qualifies, so a
+        // Hindi or Burmese selection, or a phrase, is offered no Define at all.
+        _defineCandidate = ViewModel.DefineCandidate() is { } candidate
+                           && EnglishWord.TryNormalize(candidate.Text, out string defineWord)
+            ? new DefineAnchor(defineWord, candidate.PageIndex, candidate.Left, candidate.Top,
+                               candidate.Right, candidate.Bottom, ViewModel.DocumentPath)
+            : null;
+
         // A right-click ON the selection leaves it alone; anywhere else re-picks
         // what is under the pointer. That is the convention every editor uses,
         // and the reason for the first half is Group: without it, right-clicking
@@ -8350,6 +8555,7 @@ public sealed partial class MainPage : Page
             IsTextBox = ViewModel.HasSelectedTextBox,
             ClipboardHasContent = ViewModel.HasClipboardContent,
             EditMode = ViewModel.IsEditMode,
+            DefineWord = _defineCandidate?.Word,
         });
 
         if (items.Count == 0)
@@ -8435,6 +8641,8 @@ public sealed partial class MainPage : Page
 
             case ContextCommand.SelectAllOnPage: ViewModel.SelectAllOnPage(); break;
             case ContextCommand.RotatePage: ViewModel.RotateCurrentPage(90); break;
+
+            case ContextCommand.Define: ShowDefinition(); break;
         }
 
         UpdateObjectToolbar();
@@ -8446,6 +8654,10 @@ public sealed partial class MainPage : Page
     private void ViewportHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
         using var uiStall = UiStall.Section("PointerPressed");
+        // Any press on the page puts a definition away, the press that starts
+        // selecting another word included.
+        HideDefinition();
+
         // A click on the page hands the keyboard back to the canvas.
         //
         // RootGrid_KeyDown drops every key while a text field has focus, which

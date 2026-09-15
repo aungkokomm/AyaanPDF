@@ -332,4 +332,47 @@ public class ContextMenuModelTests
     {
         Assert.Empty(ContextMenuModel.For(new ContextTarget { EditMode = false }));
     }
+
+    // ---------------- Define ----------------
+
+    [Fact]
+    public void a_reader_with_one_english_word_selected_is_offered_define_first()
+    {
+        var items = ContextMenuModel.For(new ContextTarget { DocumentOpen = true, EditMode = false, DefineWord = "serendipity" });
+
+        Assert.Equal(ContextCommand.Define, items[0].Command);
+        Assert.Equal("Define “serendipity”", items[0].Label);
+        Assert.True(items[0].Enabled);
+        Assert.True(items[1].IsSeparator);
+        Assert.Equal(ContextCommand.Copy, items[2].Command);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void define_is_offered_while_editing_too_without_displacing_the_editing_rows(bool onObject)
+    {
+        var target = new ContextTarget
+        {
+            DocumentOpen = true, OnObject = onObject, SelectionCount = onObject ? 1 : 0, EditMode = true, DefineWord = "word",
+        };
+        var without = ContextMenuModel.For(target with { DefineWord = null });
+        var with = ContextMenuModel.For(target);
+
+        Assert.Equal(ContextCommand.Define, with[0].Command);
+        Assert.True(with[1].IsSeparator);
+        Assert.Equal(without.Select(i => i.Command), with.Skip(2).Select(i => i.Command));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void no_word_to_define_means_no_define_row(bool editMode)
+    {
+        // The view leaves DefineWord null for Hindi, Burmese, phrases and no
+        // selection at all, so this is every one of those cases.
+        var items = ContextMenuModel.For(new ContextTarget { DocumentOpen = true, EditMode = editMode });
+
+        Assert.DoesNotContain(items, i => i.Command == ContextCommand.Define);
+    }
 }

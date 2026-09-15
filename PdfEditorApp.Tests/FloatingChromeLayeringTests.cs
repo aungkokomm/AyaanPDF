@@ -57,6 +57,7 @@ public class FloatingChromeLayeringTests
     [Theory]
     [InlineData("ObjectToolbar")]
     [InlineData("PropertyBar")]
+    [InlineData("DefinitionPopup")]
     public void chrome_that_floats_over_a_page_is_lifted_above_it(string elementName)
     {
         // A page card is elevated by its shadow. Anything meant to float over

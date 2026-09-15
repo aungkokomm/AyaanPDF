@@ -51,7 +51,7 @@
       still at the SDK default of 1.0.0 while the installer said 1.15.0, and
       the About dialog dutifully reported the wrong one.
     -->
-    <Version>3.45.20</Version>
+    <Version>3.45.21</Version>
 
     <!--
       The SDK otherwise appends "+<git sha>" to the informational version, which
@@ -104,6 +104,15 @@
       Tabler's notice to ship with the icon paths.
     -->
     <Content Include="Assets\Fonts\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!--
+      Define's offline English dictionary, built from Princeton WordNet 3.0 by
+      tools/build_dictionary.py, and the licence WordNet requires on every copy.
+      Read from beside the exe at runtime, so copied rather than packaged.
+    -->
+    <Content Include="Assets\Dictionary\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

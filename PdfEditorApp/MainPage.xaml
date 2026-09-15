@@ -1509,6 +1509,35 @@
         </Border>
 
         <!--
+            Define's popup: the English definition of the one word the reader
+            right-clicked and asked about. A reading aid, not a dialog, so it is
+            small, takes no focus and no clicks (a press anywhere, on it
+            included, lands on the page and puts it away), and Escape closes it.
+
+            Placed exactly like ObjectToolbar: in the scroller's viewport space,
+            with the same margin and the same lift over the page cards, by
+            ObjectToolbarPlacement, so above the word or below it when there is
+            no room. Pale yellow with dark text in every theme, like a sticky
+            note, because it floats over paper rather than over app chrome.
+        -->
+        <Border x:Name="DefinitionPopup" Grid.Column="2"
+                Margin="22,22,0,0"
+                HorizontalAlignment="Left" VerticalAlignment="Top"
+                Visibility="Collapsed" Canvas.ZIndex="20" Translation="0,0,32"
+                IsHitTestVisible="False" MaxWidth="340"
+                Background="#FFFFF4CE" BorderBrush="#FFE6C84F"
+                BorderThickness="1" CornerRadius="6" Padding="10,6,10,7"
+                AutomationProperties.Name="Definition"
+                SizeChanged="DefinitionPopup_SizeChanged">
+            <StackPanel Spacing="2">
+                <TextBlock x:Name="DefinitionWord" FontSize="13" FontWeight="SemiBold"
+                           Foreground="#FF3D3413" />
+                <TextBlock x:Name="DefinitionText" FontSize="12" TextWrapping="Wrap"
+                           Foreground="#FF4A4020" />
+            </StackPanel>
+        </Border>
+
+        <!--
             Empty state: what the app shows before anything is open.
 
             Now the FIRST thing anyone sees, because launching no longer

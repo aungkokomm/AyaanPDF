@@ -13287,6 +13287,56 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// What Define would look up, and where it sits: the text selected in the
+    /// line open for in-place editing, otherwise the reader's text selection.
+    /// The box is on the selection's first page, in that page's slot-space
+    /// DIPs, the space <see cref="TryGetSelectionBox"/> answers in. Null when
+    /// nothing is selected or the selection cannot be placed.
+    /// </summary>
+    /// <remarks>
+    /// The text comes back exactly as selected. Whether it is one English word
+    /// is the caller's question, so nothing here trims or interprets it.
+    /// </remarks>
+    public (string Text, int PageIndex, double Left, double Top, double Right, double Bottom)? DefineCandidate()
+    {
+        double w = SlotLayoutWidth;
+
+        // An open line owns the selection while it is open. A document
+        // selection left from before the edit is not what the reader is
+        // pointing at, so it is not consulted.
+        if (_lineEdit is not null)
+        {
+            return _lineEdit.HasSelection && InPlaceSelectionOnPage() is { } line
+                ? (_lineEdit.SelectedText, _lineEditPage, line.Left * w, line.Top * w, line.Right * w, line.Bottom * w)
+                : null;
+        }
+
+        if (_selection is not DocumentSelection selection || GetSelectedText() is not { } text)
+        {
+            return null;
+        }
+
+        var (page, _) = selection.PageRange;
+        var layer = TextLayerFor(page);
+        if (layer is null || selection.RangeForPage(page, layer.CharCount) is not (int start, int length))
+        {
+            return null;
+        }
+
+        double left = double.MaxValue, top = double.MaxValue, right = double.MinValue, bottom = double.MinValue;
+        foreach (var rect in layer.GetRangeRects(start, length))
+        {
+            var sr = ScaledRect.From(NormRect(rect), w);
+            left = Math.Min(left, sr.Left);
+            top = Math.Min(top, sr.Top);
+            right = Math.Max(right, sr.Left + sr.Width);
+            bottom = Math.Max(bottom, sr.Top + sr.Height);
+        }
+
+        return right >= left ? (text, page, left, top, right, bottom) : null;
+    }
+
+    /// <summary>
     /// Recomputes selection rectangles for every page the selection touches
     /// and hands each page's share to its own card.
     /// </summary>

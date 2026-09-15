@@ -27,6 +27,9 @@ public enum ContextCommand
 
     SelectAllOnPage,
     RotatePage,
+
+    /// <summary>Show the dictionary definition of the one English word selected.</summary>
+    Define,
 }
 
 /// <summary>
@@ -84,6 +87,14 @@ public readonly record struct ContextTarget
     /// door into editing that the mode was supposed to close.
     /// </summary>
     public bool EditMode { get; init; }
+
+    /// <summary>
+    /// The one English word selected where the user right-clicked, which Define
+    /// would look up, or null. The view fills it only through
+    /// <see cref="EnglishWord.TryNormalize"/>, so a Hindi or Burmese selection,
+    /// or a phrase, leaves it null and Define is not offered.
+    /// </summary>
+    public string? DefineWord { get; init; }
 }
 
 /// <summary>
@@ -116,12 +127,19 @@ public static class ContextMenuModel
 
         // A reader gets the one command that takes nothing away from them.
         // Nothing is pickable in View mode, so there is never an object menu.
-        if (!target.EditMode)
+        // Define changes nothing either, so a reader gets it too.
+        List<ContextMenuItem> items = !target.EditMode
+            ? [new(ContextCommand.Copy, "Copy", Accelerator: "Ctrl+C")]
+            : target.OnObject ? ObjectMenu(target) : PageMenu(target);
+
+        // First, when there is a word to define: a right-click on a selected
+        // word is most likely asking about that word.
+        if (target.DefineWord is { Length: > 0 } word)
         {
-            return [new(ContextCommand.Copy, "Copy", Accelerator: "Ctrl+C")];
+            items.InsertRange(0, [new(ContextCommand.Define, $"Define “{word}”"), Divider]);
         }
 
-        return target.OnObject ? ObjectMenu(target) : PageMenu(target);
+        return items;
     }
 
     /// <summary>
