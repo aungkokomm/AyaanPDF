@@ -13323,17 +13323,64 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return null;
         }
 
-        double left = double.MaxValue, top = double.MaxValue, right = double.MinValue, bottom = double.MinValue;
-        foreach (var rect in layer.GetRangeRects(start, length))
+        return UnionOfRange(layer, start, length) is { } box
+            ? (text, page, box.Left, box.Top, box.Right, box.Bottom)
+            : null;
+    }
+
+    /// <summary>
+    /// What Define would look up for a right-click at (x, y) on
+    /// <paramref name="pageIndex"/>, in that page's slot-space DIPs: the
+    /// selection when the click is on it; otherwise, when
+    /// <paramref name="wordUnderPointer"/> allows it, the word under the
+    /// pointer; otherwise the selection wherever it is.
+    /// </summary>
+    /// <remarks>
+    /// A reader should not have to select a word to ask what it means, so in
+    /// View mode the word clicked is enough. A click ON a selection still means
+    /// the selection, and a click on no word at all falls back to it, which
+    /// forgives a click that lands just beside the word selected. Edit mode,
+    /// and a line open for editing, keep to the selection: there a right-click
+    /// on text is about editing it.
+    /// </remarks>
+    public (string Text, int PageIndex, double Left, double Top, double Right, double Bottom)? DefineCandidateAt(
+        int pageIndex, double x, double y, bool wordUnderPointer)
+    {
+        var selected = DefineCandidate();
+        if (!wordUnderPointer || _lineEdit is not null)
         {
-            var sr = ScaledRect.From(NormRect(rect), w);
-            left = Math.Min(left, sr.Left);
-            top = Math.Min(top, sr.Top);
-            right = Math.Max(right, sr.Left + sr.Width);
-            bottom = Math.Max(bottom, sr.Top + sr.Height);
+            return selected;
         }
 
-        return right >= left ? (text, page, left, top, right, bottom) : null;
+        const double Slack = 3;
+        if (selected is { } s && s.PageIndex == pageIndex
+            && x >= s.Left - Slack && x <= s.Right + Slack && y >= s.Top - Slack && y <= s.Bottom + Slack)
+        {
+            return selected;
+        }
+
+        if (TextLayerFor(pageIndex) is { } layer
+            && layer.WordAt(x, y) is (int start, int length)
+            && UnionOfRange(layer, start, length) is { } box)
+        {
+            return (layer.Text.Substring(start, length), pageIndex, box.Left, box.Top, box.Right, box.Bottom);
+        }
+
+        return selected;
+    }
+
+    /// <summary>One box around a range of a page's text, in the layer's own space, which is slot-space DIPs.</summary>
+    private static TextRect? UnionOfRange(PageTextLayer layer, int start, int length)
+    {
+        TextRect? union = null;
+        foreach (var r in layer.GetRangeRects(start, length))
+        {
+            union = union is { } u
+                ? new TextRect(Math.Min(u.Left, r.Left), Math.Min(u.Top, r.Top), Math.Max(u.Right, r.Right), Math.Max(u.Bottom, r.Bottom))
+                : r;
+        }
+
+        return union;
     }
 
     /// <summary>

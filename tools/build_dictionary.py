@@ -11,12 +11,13 @@ Writes <output dir>/wordnet-en.tsv.gz and <output dir>/LICENSE-WordNet.txt.
 
 The file is UTF-8 text, gzip-compressed, one record per line:
 
-    D <tab> lemma <tab> pos <tab> definition [<unit separator> definition ...]
+    D <tab> lemma <tab> pos <tab> definition [<unit separator> definition ...] <tab> example
     X <tab> pos <tab> inflected form <tab> base form
 
 pos is n, v, a or r. A lemma's D lines are written most-used part of speech
 first (summed WordNet tag counts), and each carries its first MAX_SENSES
-senses in WordNet's own frequency order, definition only, without examples.
+senses in WordNet's own frequency order. example is the first quoted example
+of the first sense no longer than MAX_EXAMPLE characters, or empty.
 Multi-word lemmas are left out: Define looks up one selected word.
 """
 
@@ -33,6 +34,7 @@ POS_FILES = [("n", "noun"), ("v", "verb"), ("a", "adj"), ("r", "adv")]
 SS_TYPE = {"1": "n", "2": "v", "3": "a", "4": "r", "5": "a"}
 
 MAX_SENSES = 3
+MAX_EXAMPLE = 100
 UNIT_SEPARATOR = "\x1f"
 
 
@@ -52,6 +54,19 @@ def definition_of(record: str) -> str:
     return gloss.split('; "', 1)[0].strip().rstrip(";").strip()
 
 
+def example_of(record: str) -> str:
+    """The gloss's first quoted example short enough for a glance, or empty."""
+    gloss = record.split(" | ", 1)[1].strip()
+    parts = gloss.split('; "', 1)
+    if len(parts) < 2:
+        return ""
+    for example in re.findall(r'"([^"\t]+)"', '"' + parts[1]):
+        example = example.strip()
+        if 0 < len(example) <= MAX_EXAMPLE:
+            return example
+    return ""
+
+
 def main(dict_dir: Path, exc_dir: Path, out_dir: Path) -> None:
     tag_counts = collections.Counter()
     for line in (dict_dir / "index.sense").read_text(encoding="latin-1").splitlines():
@@ -59,7 +74,7 @@ def main(dict_dir: Path, exc_dir: Path, out_dir: Path) -> None:
         lemma, rest = key.split("%", 1)
         tag_counts[(lemma, SS_TYPE[rest[0]])] += int(tags)
 
-    blocks = collections.defaultdict(list)  # lemma -> [(tags, pos order, pos, definitions)]
+    blocks = collections.defaultdict(list)  # lemma -> [(tags, pos order, pos, definitions, example)]
     for order, (pos, name) in enumerate(POS_FILES):
         data = (dict_dir / f"data.{name}").read_bytes()
         for line in (dict_dir / f"index.{name}").read_text(encoding="latin-1").splitlines():
@@ -76,22 +91,27 @@ def main(dict_dir: Path, exc_dir: Path, out_dir: Path) -> None:
             offsets = fields[first_offset:first_offset + synset_count]
 
             definitions = []
+            example = ""
             for offset in offsets[:MAX_SENSES]:
                 at = int(offset)
                 record = data[at:data.index(b"\n", at)].decode("latin-1")
+                if not definitions:
+                    example = example_of(record)
                 definitions.append(definition_of(record))
 
-            blocks[lemma].append((tag_counts[(lemma, pos)], order, pos, definitions))
+            blocks[lemma].append((tag_counts[(lemma, pos)], order, pos, definitions, example))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / "wordnet-en.tsv.gz"
     written = 0
+    examples = 0
     with gzip.open(out, "wt", encoding="utf-8", compresslevel=9, newline="\n") as f:
         f.write("# English definitions from Princeton WordNet 3.0. See LICENSE-WordNet.txt.\n")
         for lemma in sorted(blocks):
-            for _tags, _order, pos, definitions in sorted(blocks[lemma], key=lambda b: (-b[0], b[1])):
-                f.write(f"D\t{lemma}\t{pos}\t{UNIT_SEPARATOR.join(definitions)}\n")
+            for _tags, _order, pos, definitions, example in sorted(blocks[lemma], key=lambda b: (-b[0], b[1])):
+                f.write(f"D\t{lemma}\t{pos}\t{UNIT_SEPARATOR.join(definitions)}\t{example}\n")
                 written += 1
+                examples += 1 if example else 0
 
         exceptions = 0
         for pos, name in POS_FILES:
@@ -105,7 +125,8 @@ def main(dict_dir: Path, exc_dir: Path, out_dir: Path) -> None:
                         exceptions += 1
 
     (out_dir / "LICENSE-WordNet.txt").write_text(licence_text(dict_dir / "data.noun"), encoding="utf-8", newline="\n")
-    print(f"{written} definition records for {len(blocks)} words, {exceptions} irregular forms, {out.stat().st_size} bytes")
+    print(f"{written} definition records for {len(blocks)} words, {examples} with an example, "
+          f"{exceptions} irregular forms, {out.stat().st_size} bytes")
 
 
 if __name__ == "__main__":

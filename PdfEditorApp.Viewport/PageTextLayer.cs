@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 
 namespace PdfEditorApp.Viewport;
@@ -128,6 +129,71 @@ public sealed class PageTextLayer
 
         return best;
     }
+
+    /// <summary>
+    /// The word under (x, y), as a range of <see cref="Text"/>, or null when
+    /// the point is not on a letter.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ON A LETTER, NOT THE NEAREST ONE. <see cref="HitTestNearest"/> always
+    /// answers, which is right for starting a drag and wrong here: a
+    /// right-click in a margin or between lines is not a question about
+    /// whichever word happens to be closest.
+    ///
+    /// A word is a run of letters, digits and combining marks, joined across an
+    /// apostrophe or hyphen that sits between two of them. Every script counts,
+    /// so a Devanagari or Myanmar word comes back whole, vowel signs included,
+    /// and the caller refuses it whole instead of being handed a fragment that
+    /// might happen to look like something else.
+    /// </remarks>
+    public (int Start, int Length)? WordAt(double x, double y)
+    {
+        int hit = -1;
+        for (int i = 0; i < _chars.Length; i++)
+        {
+            var c = _chars[i];
+            if (x >= c.Left && x <= c.Right && y >= c.Top && y <= c.Bottom)
+            {
+                hit = i;
+                break;
+            }
+        }
+
+        if (hit < 0 || !IsWordCharacter(Text[hit]))
+        {
+            return null;
+        }
+
+        int start = hit;
+        while (start > 0 && (IsWordCharacter(Text[start - 1]) || IsJoinerAt(start - 1)))
+        {
+            start--;
+        }
+
+        int end = hit + 1;
+        while (end < Text.Length && (IsWordCharacter(Text[end]) || IsJoinerAt(end)))
+        {
+            end++;
+        }
+
+        return (start, end - start);
+    }
+
+    private const char ZeroWidthNonJoiner = (char)0x200C;
+    private const char ZeroWidthJoiner = (char)0x200D;
+    private const char RightSingleQuote = (char)0x2019;
+
+    private static bool IsWordCharacter(char c) =>
+        char.IsLetterOrDigit(c)
+        || c is ZeroWidthNonJoiner or ZeroWidthJoiner
+        || char.GetUnicodeCategory(c) is UnicodeCategory.NonSpacingMark
+            or UnicodeCategory.SpacingCombiningMark
+            or UnicodeCategory.EnclosingMark;
+
+    private bool IsJoinerAt(int i) =>
+        Text[i] is '\'' or RightSingleQuote or '-'
+        && i > 0 && i < Text.Length - 1
+        && IsWordCharacter(Text[i - 1]) && IsWordCharacter(Text[i + 1]);
 
     /// <summary>
     /// Where the caret goes when a reader clicks at <paramref name="x"/> on the

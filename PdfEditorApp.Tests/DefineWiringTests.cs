@@ -60,9 +60,70 @@ public class DefineWiringTests
     {
         string handler = MethodBody(PageCode(), "private void ViewportHost_RightTapped(");
 
-        int read = IndexIn(handler, "ViewModel.DefineCandidate()");
+        int read = IndexIn(handler, "ViewModel.DefineCandidateAt(");
         Assert.True(read < IndexIn(handler, "TryShowLinkMenu("));
         Assert.True(read < IndexIn(handler, "ViewModel.SelectAnnotationAt("));
+    }
+
+    [Fact]
+    public void a_reader_can_define_the_word_under_the_pointer_without_selecting_it()
+    {
+        string handler = MethodBody(PageCode(), "private void ViewportHost_RightTapped(");
+
+        // Asked with the pointer in the page's layer space, the space a text
+        // selection starts in, and only outside Edit mode.
+        int call = IndexIn(handler, "ViewModel.DefineCandidateAt(");
+        Assert.True(call < IndexIn(handler, "content.Page, content.X, content.Y, wordUnderPointer: !ViewModel.IsEditMode"));
+    }
+
+    [Fact]
+    public void the_first_meaning_carries_one_italic_example()
+    {
+        string fill = MethodBody(PageCode(), "private void FillDefinition(");
+
+        Assert.Contains("ReferenceEquals(sense, found.Senses[0]) && sense.Example is { Length: > 0 } example", fill, StringComparison.Ordinal);
+        Assert.Contains("FontStyle = Windows.UI.Text.FontStyle.Italic", fill, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("I")]
+    [InlineData("me")]
+    [InlineData("he")]
+    [InlineData("it")]
+    [InlineData("its")]
+    [InlineData("his")]
+    [InlineData("us")]
+    [InlineData("at")]
+    [InlineData("or")]
+    [InlineData("is")]
+    [InlineData("was")]
+    [InlineData("who")]
+    [InlineData("May")]
+    public void grammar_words_say_no_definition_instead_of_an_abbreviation(string word)
+    {
+        Assert.Null(Shipped.Value.Lookup(word));
+    }
+
+    [Theory]
+    [InlineData("has", "have", "verb")]
+    [InlineData("goes", "go", "verb")]
+    [InlineData("being", "being", "noun")]
+    [InlineData("in", "in", "adverb")]
+    public void small_words_with_a_real_meaning_still_have_it(string word, string headword, string pos)
+    {
+        var found = Shipped.Value.Lookup(word);
+
+        Assert.NotNull(found);
+        Assert.Contains(found!.Senses, s => s.Headword == headword && s.PartOfSpeech == pos);
+    }
+
+    [Fact]
+    public void the_shipped_dictionary_carries_short_examples()
+    {
+        Assert.Equal("ordinary everyday objects", Shipped.Value.Lookup("ordinary")!.Senses[0].Example);
+        Assert.Null(Shipped.Value.Lookup("serendipity")!.Senses[0].Example);
+        Assert.All(Shipped.Value.Lookup("discipline")!.Senses, s => Assert.True((s.Example?.Length ?? 0) <= 100));
     }
 
     [Fact]

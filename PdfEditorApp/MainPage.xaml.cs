@@ -1208,6 +1208,18 @@ public sealed partial class MainPage : Page
                 FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             });
             DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = meaning });
+
+            // One example, under the first meaning only: enough to show the
+            // word in use without turning a glance into a dictionary entry.
+            if (ReferenceEquals(sense, found.Senses[0]) && sense.Example is { Length: > 0 } example)
+            {
+                DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
+                DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+                {
+                    Text = "“" + example + "”",
+                    FontStyle = Windows.UI.Text.FontStyle.Italic,
+                });
+            }
         }
     }
 
@@ -8524,9 +8536,12 @@ public sealed partial class MainPage : Page
 
         // Define's word is read BEFORE anything below re-picks under the
         // pointer: a pick on page text replaces the very selection the reader
-        // right-clicked to ask about. Only one English word qualifies, so a
-        // Hindi or Burmese selection, or a phrase, is offered no Define at all.
-        _defineCandidate = ViewModel.DefineCandidate() is { } candidate
+        // right-clicked to ask about. In View mode the word under the pointer
+        // is enough, with nothing selected first. Only one English word
+        // qualifies, so a Hindi or Burmese word, or a phrase, is offered no
+        // Define at all.
+        _defineCandidate = ViewModel.DefineCandidateAt(
+                               content.Page, content.X, content.Y, wordUnderPointer: !ViewModel.IsEditMode) is { } candidate
                            && EnglishWord.TryNormalize(candidate.Text, out string defineWord)
             ? new DefineAnchor(defineWord, candidate.PageIndex, candidate.Left, candidate.Top,
                                candidate.Right, candidate.Bottom, ViewModel.DocumentPath)

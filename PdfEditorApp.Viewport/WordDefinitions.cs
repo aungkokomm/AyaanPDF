@@ -4,8 +4,12 @@ using System.IO;
 
 namespace PdfEditorApp.Viewport;
 
-/// <summary>One part of speech of one dictionary word, with its definitions in order of use.</summary>
-public sealed record WordSense(string Headword, string PartOfSpeech, IReadOnlyList<string> Definitions);
+/// <summary>
+/// One part of speech of one dictionary word, with its definitions in order of
+/// use, and a short example of the first definition when WordNet gives one.
+/// </summary>
+public sealed record WordSense(
+    string Headword, string PartOfSpeech, IReadOnlyList<string> Definitions, string? Example = null);
 
 /// <summary>What Define shows for a looked-up word.</summary>
 public sealed record WordDefinition(string Word, IReadOnlyList<WordSense> Senses);
@@ -35,7 +39,28 @@ public sealed class WordDefinitions
     private static readonly (string Suffix, string Ending)[] AdjectiveRules =
         [("er", ""), ("est", ""), ("er", "e"), ("est", "e")];
 
-    private readonly Dictionary<string, List<(string Pos, string[] Definitions)>> _entries = new(StringComparer.Ordinal);
+    /// <summary>Words Define answers "no definition" for, whatever the file holds.</summary>
+    /// <remarks>
+    /// ⚠️ WORDNET HAS NO GRAMMAR WORDS. It holds nouns, verbs, adjectives and
+    /// adverbs only, so where an article, pronoun, preposition, conjunction or
+    /// form of "be" seems to be in it, what matched is an abbreviation or a
+    /// symbol spelt the same way: "a" is the angstrom, "I" iodine, "me" Maine,
+    /// "at" astatine, "who" the World Health Organization, "may" the month.
+    /// Every one of those is the wrong answer for a word read in a sentence.
+    /// Small words WordNet really defines as adverbs (in, up, so, but, by) are
+    /// deliberately not listed.
+    /// </remarks>
+    private static readonly HashSet<string> GrammarWords = new(StringComparer.Ordinal)
+    {
+        "a", "an", "the",
+        "i", "me", "my", "myself", "we", "us", "our", "ours", "you", "your", "yours",
+        "he", "him", "his", "she", "her", "hers", "it", "its", "they", "them", "their", "theirs",
+        "this", "that", "these", "those", "who", "whom", "whose", "which", "what",
+        "and", "or", "nor", "if", "of", "to", "at", "for", "from", "with", "as", "into", "onto", "upon", "than",
+        "am", "is", "are", "was", "were", "be", "been", "does", "may",
+    };
+
+    private readonly Dictionary<string, List<(string Pos, string[] Definitions, string? Example)>> _entries = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Pos, string Form), List<string>> _irregular = new();
 
     private WordDefinitions()
@@ -58,14 +83,14 @@ public sealed class WordDefinitions
             }
 
             string[] fields = line.Split('\t');
-            if (line[0] == 'D' && fields.Length == 4)
+            if (line[0] == 'D' && fields.Length is 4 or 5)
             {
                 if (!dictionary._entries.TryGetValue(fields[1], out var blocks))
                 {
-                    blocks = new List<(string, string[])>(1);
+                    blocks = new List<(string, string[], string?)>(1);
                     dictionary._entries[fields[1]] = blocks;
                 }
-                blocks.Add((fields[2], fields[3].Split('')));
+                blocks.Add((fields[2], fields[3].Split(''), fields.Length > 4 && fields[4].Length > 0 ? fields[4] : null));
             }
             else if (line[0] == 'X' && fields.Length == 4)
             {
@@ -100,6 +125,11 @@ public sealed class WordDefinitions
             form = form[..^2];
         }
 
+        if (GrammarWords.Contains(form))
+        {
+            return null;
+        }
+
         var senses = new List<WordSense>();
         var seen = new HashSet<(string, string)>();
 
@@ -110,11 +140,11 @@ public sealed class WordDefinitions
                 return;
             }
 
-            foreach (var (pos, definitions) in blocks)
+            foreach (var (pos, definitions, example) in blocks)
             {
                 if ((onlyPos is null || onlyPos == pos) && seen.Add((headword, pos)))
                 {
-                    senses.Add(new WordSense(headword, NameOf(pos), definitions));
+                    senses.Add(new WordSense(headword, NameOf(pos), definitions, example));
                 }
             }
         }
@@ -138,7 +168,16 @@ public sealed class WordDefinitions
                     continue;
                 }
 
+                // ⚠️ A NOUN OR ADJECTIVE RULE MUST LEAVE A REAL-SIZED WORD.
+                // Otherwise "has", "was" and "its" become "ha", "wa" and "it",
+                // which WordNet holds only as abbreviations. Verbs may keep two
+                // letters, for "goes".
                 string stem = form[..^suffix.Length];
+                if ((stem + ending).Length < (pos == "v" ? 2 : 3))
+                {
+                    continue;
+                }
+
                 Add(stem + ending, pos);
 
                 // stopped, running, bigger: the rule leaves "stopp", "runn",
