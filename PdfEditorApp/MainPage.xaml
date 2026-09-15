@@ -171,6 +171,16 @@
         </Grid.ColumnDefinitions>
 
         <!--
+            The document and its chrome above, the status bar below. Every
+            element that names no row is in the first, so only the status bar
+            says Grid.Row. While it is collapsed the Auto row takes nothing.
+        -->
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!--
             THE MENU BAR, declared here and shown in the window's title bar.
 
             Declared in the PAGE because every entry calls this page's own
@@ -326,12 +336,30 @@
                 <MenuFlyoutSubItem x:Name="SignatureMenu" Text="Signature" />
             </MenuBarItem>
 
+            <MenuBarItem Title="Page" Margin="2,3,2,3">
+                <MenuFlyoutSubItem Text="Insert">
+                    <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
+                    <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
+                </MenuFlyoutSubItem>
+                <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
+                <MenuFlyoutItem Text="Recognize text..." Click="RecognizeText_Click" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
+                <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
+                <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
+            </MenuBarItem>
+
             <MenuBarItem Title="View" Margin="2,3,2,3">
                 <!-- Text only: F4 and F6 are live in the page's key handler. -->
                 <MenuFlyoutItem Text="Pages panel" Click="ToggleThumbnails_Click"
                                 KeyboardAcceleratorTextOverride="F4" />
                 <MenuFlyoutItem Text="Bookmarks panel" Click="ToggleBookmarks_Click"
                                 KeyboardAcceleratorTextOverride="F6" />
+                <!-- Remembered (ShowStatusBar), and applied through
+                     UpdateStatusBarVisibility like everything else that decides
+                     whether the bar is on screen. -->
+                <ToggleMenuFlyoutItem x:Name="StatusBarToggle" Text="Status bar"
+                                      IsChecked="True" Click="StatusBarToggle_Click" />
                 <MenuFlyoutSeparator />
                 <!--
                     Zoom. These already existed as a flyout off the status bar's
@@ -419,19 +447,6 @@
                     <MenuFlyoutItem Text="Clear guides on this page" Click="ClearGuidesPage_Click" />
                     <MenuFlyoutItem Text="Clear all guides" Click="ClearGuidesAll_Click" />
                 </MenuFlyoutSubItem>
-            </MenuBarItem>
-
-            <MenuBarItem Title="Page" Margin="2,3,2,3">
-                <MenuFlyoutSubItem Text="Insert">
-                    <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
-                    <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
-                </MenuFlyoutSubItem>
-                <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
-                <MenuFlyoutItem Text="Recognize text..." Click="RecognizeText_Click" />
-                <MenuFlyoutSeparator />
-                <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
-                <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
-                <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
             </MenuBarItem>
 
             <MenuBarItem Title="Help" Margin="2,3,2,3">
@@ -3363,34 +3378,40 @@
         </ContentDialog>
 
         <!--
-            Status pill: page position, zoom, fit and find. Floats bottom
-            centre and stays out of the way, replacing a full-width status bar.
+            THE STATUS BAR: where you are in the document on the left, how you
+            are looking at it on the right. Docked along the bottom, across
+            every column, where Word and Acrobat keep theirs.
+
+            Until 3.46 this was a pill floating over the canvas, draggable to
+            six anchors, and a bar over the page covers the page. Docked, it has
+            its own row and nothing it shows can sit on a word.
+
+            ⚠️ IN FULL SCREEN IT FLOATS AGAIN. SetPresenting moves it into the
+            page's row, over the bottom of the document, where it comes back
+            when the pointer moves and fades after three seconds. A row that
+            came and went would resize the viewport every time it did.
+            VerticalAlignment="Bottom" is what places it there; in its own Auto
+            row it changes nothing.
+
+            View > Status bar hides it (ShowStatusBar). Full screen shows it
+            regardless, because there it is the only chrome there is.
         -->
-        <Border x:Name="StatusBar" Grid.Column="2"
-                HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
-                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
-                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                BorderThickness="1" CornerRadius="18" Padding="6,3"
+        <Border x:Name="StatusBar" Grid.Row="1" Grid.ColumnSpan="4"
+                VerticalAlignment="Bottom" MinHeight="32" Padding="8,2"
+                Background="{ThemeResource LayerFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="0,1,0,0"
                 PointerEntered="StatusBar_PointerEntered"
                 PointerExited="StatusBar_PointerExited">
-            <StackPanel x:Name="StatusContent" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                <!--
-                    Drag handle. Like the tool rail's, this DOCKS to the nearest
-                    corner or edge rather than leaving the bar anywhere: a bar
-                    dropped mid-canvas would cover the page, and a remembered
-                    free position would need re-checking against every window
-                    size. Six anchors cover what anyone actually wants.
-                -->
-                <Border x:Name="StatusGrip" Width="14" Background="Transparent"
-                        ToolTipService.ToolTip="Drag to move this bar"
-                        PointerPressed="StatusGrip_PointerPressed"
-                        PointerMoved="StatusGrip_PointerMoved"
-                        PointerReleased="StatusGrip_PointerReleased"
-                        PointerCaptureLost="StatusGrip_PointerReleased">
-                    <Rectangle Width="3" Height="16" RadiusX="2" RadiusY="2"
-                               HorizontalAlignment="Center" VerticalAlignment="Center"
-                               Fill="{ThemeResource TextFillColorTertiaryBrush}" />
-                </Border>
+            <Grid x:Name="StatusContent" ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Where you are. -->
+                <StackPanel x:Name="StatusLeft" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
                 <!--
                     The page readout is editable: type a number, press Enter.
                     It lives HERE, in the always-visible status bar, and not in
@@ -3482,13 +3503,68 @@
                             Background="Transparent" BorderThickness="0"
                             ToolTipService.ToolTip="Forward (Alt+Right)" />
                 </StackPanel>
+                <!-- Unsaved work, beside where you are. -->
+                <TextBlock Text="&#9679;" Foreground="{ThemeResource SystemFillColorCautionBrush}"
+                           VerticalAlignment="Center" Margin="4,0,0,0" FontSize="14"
+                           ToolTipService.ToolTip="Unsaved changes"
+                           Visibility="{x:Bind ViewModel.DirtyIndicatorVisibility, Mode=OneWay}" />
+                </StackPanel>
+
                 <!-- Says why text selection is unavailable, instead of the
-                     tool silently doing nothing on a scanned page. -->
-                <TextBlock Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
-                           VerticalAlignment="Center" Margin="0,0,6,0"
+                     tool silently doing nothing on a scanned page. In the
+                     stretching middle column and trimmed, so a long message
+                     gives way rather than pushing the controls off the bar. -->
+                <TextBlock Grid.Column="1" Text="{x:Bind ViewModel.TextAvailabilityLabel, Mode=OneWay}"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
                            Foreground="{ThemeResource SystemFillColorCautionBrush}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
-                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+
+                <!-- How you are looking at it. -->
+                <StackPanel x:Name="StatusRight" Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                <!--
+                    The modes the page is LOOKED at in: night, turned, how it
+                    scrolls, and full screen. Toggles rather than menu ticks,
+                    because night mode being on is a thing to SEE.
+
+                    Grouped, with its divider inside, because this is the first
+                    thing the bar gives up when the window is too narrow for all
+                    of it (see StatusBarOverflow), and a divider left behind by a
+                    hidden group divides one thing from nothing. Every item here
+                    is also named in the "..." menu, so nothing becomes
+                    unreachable.
+                -->
+                <StackPanel x:Name="ViewModesGroup" Orientation="Horizontal" Spacing="4"
+                            VerticalAlignment="Center">
+                    <ToggleButton x:Name="NightModeBarButton" AutomationProperties.Name="Night mode" Click="NightModeBar_Click"
+                                  Width="28" Height="26" Padding="0" BorderThickness="0"
+                                  Background="Transparent"
+                                  ToolTipService.ToolTip="Night mode">
+                        <FontIcon Glyph="&#xE708;" FontSize="14" />
+                    </ToggleButton>
+                    <ToggleButton x:Name="RotateBarButton" AutomationProperties.Name="Rotate view clockwise" Click="RotateBar_Click"
+                                  Width="28" Height="26" Padding="0" BorderThickness="0"
+                                  Background="Transparent"
+                                  ToolTipService.ToolTip="Rotate view clockwise (Ctrl+Shift++)">
+                        <FontIcon Glyph="&#xE7AD;" FontSize="14" />
+                    </ToggleButton>
+                    <!--
+                        Which way the document scrolls. A plain button, not a
+                        toggle: the glyph shows the mode you are IN, a stack of
+                        sheets while scrolling is continuous and a single sheet
+                        when it is not, and the tooltip says what pressing it will
+                        do.
+                    -->
+                    <Button x:Name="PageModeBarButton" AutomationProperties.Name="Page layout" Click="PageModeBar_Click"
+                            Width="28" Height="26" Padding="0" BorderThickness="0"
+                            Background="Transparent">
+                        <FontIcon x:Name="PageModeBarIcon" Glyph="&#xE81E;" FontSize="14" />
+                    </Button>
+                    <Button AutomationProperties.Name="Full screen" Content="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                            Click="FullScreen_Click" Width="28" Height="26" Padding="0"
+                            Background="Transparent" BorderThickness="0"
+                            ToolTipService.ToolTip="Full screen (F11)" />
+                    <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                </StackPanel>
                 <Button AutomationProperties.Name="Zoom out" Content="&#xE949;" FontFamily="Segoe MDL2 Assets" FontSize="11" Click="ZoomOut_Click"
                         Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Zoom out" />
@@ -3531,54 +3607,7 @@
                         Width="28" Height="26" Padding="0" Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Fit page or fit width (Ctrl+0, Ctrl+2)" />
 
-                <!--
-                    How the page is LOOKED at, as opposed to where you are in it
-                    or how big it is. All of this was reachable only through the
-                    rail's menu button, which is three interactions deep, and in
-                    full screen there is no menu at all.
-
-                    Toggles rather than menu ticks: night mode being on is a
-                    thing you want to SEE, not something to open a menu to
-                    check. Same for a view that is turned.
-
-                    Grouped because this is the first thing the bar gives up
-                    when the canvas is too narrow for all of it; see
-                    StatusBarOverflow. Every item here is also a named entry in
-                    the "..." menu next to it, so nothing becomes unreachable.
-                -->
-                <StackPanel x:Name="ViewModesGroup" Orientation="Horizontal" Spacing="4"
-                            VerticalAlignment="Center">
-                    <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
-                    <ToggleButton x:Name="NightModeBarButton" AutomationProperties.Name="Night mode" Click="NightModeBar_Click"
-                                  Width="28" Height="26" Padding="0" BorderThickness="0"
-                                  Background="Transparent"
-                                  ToolTipService.ToolTip="Night mode">
-                        <FontIcon Glyph="&#xE708;" FontSize="14" />
-                    </ToggleButton>
-                    <ToggleButton x:Name="RotateBarButton" AutomationProperties.Name="Rotate view clockwise" Click="RotateBar_Click"
-                                  Width="28" Height="26" Padding="0" BorderThickness="0"
-                                  Background="Transparent"
-                                  ToolTipService.ToolTip="Rotate view clockwise (Ctrl+Shift++)">
-                        <FontIcon Glyph="&#xE7AD;" FontSize="14" />
-                    </ToggleButton>
-                    <!--
-                        Which way the document scrolls. A plain button, not a
-                        toggle: it shows the mode you are IN rather than one you
-                        can switch on, so the glyph is a stack of sheets while
-                        scrolling is continuous and a single sheet when it is
-                        not. The tooltip says what pressing it will do, since an
-                        icon that reports state cannot also advertise an action.
-                    -->
-                    <Button x:Name="PageModeBarButton" AutomationProperties.Name="Page layout" Click="PageModeBar_Click"
-                            Width="28" Height="26" Padding="0" BorderThickness="0"
-                            Background="Transparent">
-                        <FontIcon x:Name="PageModeBarIcon" Glyph="&#xE81E;" FontSize="14" />
-                    </Button>
-                    <Button AutomationProperties.Name="Full screen" Content="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="12"
-                            Click="FullScreen_Click" Width="28" Height="26" Padding="0"
-                            Background="Transparent" BorderThickness="0"
-                            ToolTipService.ToolTip="Full screen (F11)" />
-                </StackPanel>
+                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
                 <!--
                     The rest of the View menu, one click from the page instead
                     of three from the rail. Text items rather than icons: these
@@ -3635,25 +3664,36 @@
                     </Button.Flyout>
                 </Button>
 
-                <Rectangle Width="1" Height="16" Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                </StackPanel>
+            </Grid>
+        </Border>
 
-                <!--
-                    Find, collapsed to a glass until it is wanted.
+        <!--
+            FIND, over the top right of the page while it is wanted.
 
-                    It held about 120 DIP of a bar that floats over the page, to
-                    do a thing done in bursts. That width is what the view
-                    controls above are made of.
-                -->
-                <Button x:Name="FindToggleButton" AutomationProperties.Name="Find" Content="&#xE721;"
-                        FontFamily="Segoe MDL2 Assets" FontSize="12"
-                        Click="FindToggle_Click" Width="28" Height="26" Padding="0"
-                        Background="Transparent" BorderThickness="0"
-                        ToolTipService.ToolTip="Find (Ctrl+F)" />
+            It lived on the floating bar. With the bar docked, and able to be
+            hidden from the View menu, find cannot live there: hiding the status
+            bar would take find with it. The title bar's glass (MainWindow's
+            QuickFind), Edit > Find and Ctrl+F all open it here.
 
-                <StackPanel x:Name="FindPanel" Orientation="Horizontal" Spacing="4"
-                            VerticalAlignment="Center" Visibility="Collapsed">
+            ⚠️ INSIDE THE PAGE, NOT IN THE TITLE BAR. A search box out there is
+            outside RootGrid, so while it held focus no key would reach
+            RootGrid_KeyDown, the trap the menu bar already hit. Here the keys
+            still bubble, and it is still there in full screen, where the title
+            bar is not.
+
+            Top RIGHT, below the ruler: the object toolbar owns the top left, and
+            the tool options and notices are centred.
+        -->
+        <StackPanel x:Name="FindPanel" Grid.Column="2" Visibility="Collapsed"
+                    HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,30,20,0"
+                    Orientation="Horizontal" Spacing="4" Padding="6,3"
+                    Canvas.ZIndex="25" Translation="0,0,32"
+                    Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                    BorderThickness="1" CornerRadius="6">
                 <TextBox x:Name="SearchBox" Text="{x:Bind ViewModel.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                         PlaceholderText="Find" Width="120" Height="26" Margin="2,0,0,0"
+                         PlaceholderText="Find" Width="200" Height="26" Margin="2,0,0,0"
                          VerticalAlignment="Center" VerticalContentAlignment="Center"
                          FontSize="12" BorderThickness="0" Background="Transparent"
                          KeyDown="SearchBox_KeyDown">
@@ -3718,13 +3758,6 @@
                         Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Close find (Esc)" />
                 </StackPanel>
-
-                <TextBlock Text="&#9679;" Foreground="{ThemeResource SystemFillColorCautionBrush}"
-                           VerticalAlignment="Center" Margin="0,0,10,0" FontSize="14"
-                           ToolTipService.ToolTip="Unsaved changes"
-                           Visibility="{x:Bind ViewModel.DirtyIndicatorVisibility, Mode=OneWay}" />
-            </StackPanel>
-        </Border>
 
         <!--
             WHAT THE APP IS DOING DURING THE TWENTY SECONDS IT USED TO SPEND IN

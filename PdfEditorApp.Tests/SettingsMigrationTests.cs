@@ -97,7 +97,6 @@ public class SettingsMigrationTests
         Assert.Equal(stored.ShowRulers, migrated.ShowRulers);
         Assert.Equal(stored.RulerUnit, migrated.RulerUnit);
         Assert.Equal(stored.RecentLimit, migrated.RecentLimit);
-        Assert.Equal(stored.StatusBarDock, migrated.StatusBarDock);
         Assert.Equal(stored.SearchMatchCase, migrated.SearchMatchCase);
         Assert.Equal(stored.SearchWholeWord, migrated.SearchWholeWord);
         Assert.Equal(stored.RememberReadingPosition, migrated.RememberReadingPosition);

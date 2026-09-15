@@ -375,15 +375,6 @@ public class StatusBarViewControlsTests
     }
 
     [Fact]
-    public void opening_find_rechecks_the_fit()
-    {
-        // Find is the widest thing on the bar by a distance, so opening it is
-        // the likeliest moment for the bar to stop fitting.
-        Assert.Contains("ApplyBarOverflow", MethodBody(Code(), "private void SetFindOpen"),
-                        StringComparison.Ordinal);
-    }
-
-    [Fact]
     public void the_shadowed_z_order_case_is_gone()
     {
         // Ctrl+Shift+] was handled in the key switch AND now resolves through

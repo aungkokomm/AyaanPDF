@@ -377,6 +377,8 @@ public sealed partial class MainWindow : Window
 
     private void QuickRedo_Click(object sender, RoutedEventArgs e) => ActivePage?.RunRedo();
 
+    private void QuickFind_Click(object sender, RoutedEventArgs e) => ActivePage?.ToggleFind();
+
     /// <summary>
     /// Greys the quick actions for the document in FRONT.
     ///
@@ -390,6 +392,7 @@ public sealed partial class MainWindow : Window
         QuickSave.IsEnabled = page?.CanSave ?? false;
         QuickUndo.IsEnabled = page?.CanUndo ?? false;
         QuickRedo.IsEnabled = page?.CanRedo ?? false;
+        QuickFind.IsEnabled = page?.CanFind ?? false;
     }
 
     /// <summary>

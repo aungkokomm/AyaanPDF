@@ -205,7 +205,8 @@ public sealed partial class MainPage : Page
             if (args.PropertyName is nameof(ViewModel.CanUndo)
                 or nameof(ViewModel.CanRedo)
                 or nameof(ViewModel.HasDocumentPath)
-                or nameof(ViewModel.IsDirty))
+                or nameof(ViewModel.IsDirty)
+                or nameof(ViewModel.PageCount))
             {
                 CommandStateChanged?.Invoke(this);
             }
@@ -992,8 +993,8 @@ public sealed partial class MainPage : Page
         PushVisibleWindow();
         RedrawRulers();
 
-        // The bar lives in this column, so its room is whatever the canvas has
-        // left after the panels either side of it.
+        // The status bar spans the window below this, so a resize that changes
+        // the canvas has changed the bar's room too.
         ApplyBarOverflow();
     }
 
@@ -1702,36 +1703,29 @@ public sealed partial class MainPage : Page
     private bool IsFindOpen => FindPanel.Visibility == Visibility.Visible;
 
     /// <summary>
-    /// Shows or hides the find controls on the bar.
+    /// Shows or hides the find strip over the top right of the page.
     ///
-    /// Collapsed by default: they held about 120 DIP of a bar that floats over
-    /// the page, for something done in bursts rather than continuously. The
-    /// query is left alone when it closes, so reopening resumes the same search
-    /// rather than starting from nothing.
+    /// The query is left alone when it closes, so reopening resumes the same
+    /// search rather than starting from nothing.
     /// </summary>
     private void SetFindOpen(bool open)
     {
         FindPanel.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
-        FindToggleButton.Visibility = open ? Visibility.Collapsed : Visibility.Visible;
 
         if (open)
         {
             SearchBox.Focus(FocusState.Programmatic);
             SearchBox.SelectAll();
         }
-
-        // Find is the single widest thing on the bar, so opening it is the
-        // likeliest moment for the bar to stop fitting. Queued, because the new
-        // widths are not known until this layout pass has run.
-        DispatcherQueue.TryEnqueue(ApplyBarOverflow);
     }
 
-    // ---------------- Fitting the bar into the canvas ----------------
+    // ---------------- Fitting the bar into the window ----------------
 
-    /// <summary>The bar's own StackPanel spacing, and the margin it keeps from
-    /// each edge of the canvas. Both are declared in the XAML.</summary>
+    /// <summary>The bar's own StackPanel spacing, and what its padding and the
+    /// gaps between its three columns take from its width. Both are declared in
+    /// the XAML.</summary>
     private const double BarSpacing = 4;
-    private const double BarSideMargins = 32;
+    private const double BarSideMargins = 40;
 
     /// <summary>
     /// Natural widths, each recorded while its group was on screen.
@@ -1740,16 +1734,16 @@ public sealed partial class MainPage : Page
     /// from that would find that the bar now fits, put the group back, find
     /// that it does not fit, and take it away again, forever.
     /// </summary>
-    private double _navGroupWidth, _viewGroupWidth, _findExtraWidth, _barCoreWidth;
+    private double _navGroupWidth, _viewGroupWidth, _barCoreWidth;
 
     /// <summary>
-    /// Drops as much of the bar as it takes to fit the canvas, and puts it back
+    /// Drops as much of the bar as it takes to fit the window, and puts it back
     /// when there is room again. See <see cref="StatusBarOverflow"/> for what
     /// goes first and why.
     /// </summary>
     private void ApplyBarOverflow()
     {
-        if (StatusContent.ActualWidth <= 0 || PageScroller.ActualWidth <= 0)
+        if (StatusLeft.ActualWidth <= 0 || StatusBar.ActualWidth <= 0)
         {
             return;
         }
@@ -1767,18 +1761,12 @@ public sealed partial class MainPage : Page
             _viewGroupWidth = ViewModesGroup.ActualWidth + BarSpacing;
         }
 
-        if (IsFindOpen && FindPanel.ActualWidth > 0)
+        // Everything on the two sides besides the droppable groups, recorded
+        // only when both are present so the subtraction is honest. The message
+        // in the middle is not counted: it trims instead.
+        if (navShown && viewShown)
         {
-            // What find COSTS, which is its own width less the glass it
-            // replaces, since the glass is already counted in the core.
-            _findExtraWidth = FindPanel.ActualWidth - FindToggleButton.Width;
-        }
-
-        // Everything the bar is made of besides the two droppable groups,
-        // recorded only when both are present so the subtraction is honest.
-        if (navShown && viewShown && !IsFindOpen)
-        {
-            _barCoreWidth = StatusContent.ActualWidth - _navGroupWidth - _viewGroupWidth;
+            _barCoreWidth = StatusLeft.ActualWidth + StatusRight.ActualWidth - _navGroupWidth - _viewGroupWidth;
         }
 
         if (_barCoreWidth <= 0)
@@ -1786,11 +1774,10 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        double natural = _barCoreWidth + _navGroupWidth + _viewGroupWidth
-                       + (IsFindOpen ? _findExtraWidth : 0);
+        double natural = _barCoreWidth + _navGroupWidth + _viewGroupWidth;
 
         var fit = StatusBarOverflow.Decide(
-            PageScroller.ActualWidth - BarSideMargins, natural, _viewGroupWidth, _navGroupWidth);
+            StatusBar.ActualWidth - BarSideMargins, natural, _viewGroupWidth, _navGroupWidth);
 
         ViewModesGroup.Visibility = fit.ViewModes ? Visibility.Visible : Visibility.Collapsed;
         NavHistoryGroup.Visibility = fit.NavHistory ? Visibility.Visible : Visibility.Collapsed;
@@ -1941,6 +1928,10 @@ public sealed partial class MainPage : Page
         // in the one mode with no menu to find them in. It comes back on the
         // first movement of the pointer, the way a video player's controls do.
         _barRevealed = presenting;
+
+        // Docked in its own row normally; over the bottom of the page in full
+        // screen, so showing and hiding it there never resizes the document.
+        Grid.SetRow(StatusBar, presenting ? 0 : 1);
         UpdateStatusBarVisibility();
 
         if (presenting)
@@ -2004,7 +1995,8 @@ public sealed partial class MainPage : Page
     private static readonly TimeSpan BarRevealFor = TimeSpan.FromSeconds(3);
 
     /// <summary>Whether the bar is currently being shown over a full screen
-    /// document. Meaningless outside full screen, where it is simply on.</summary>
+    /// document. Meaningless outside full screen, where View > Status bar
+    /// decides.</summary>
     private bool _barRevealed;
 
     private bool _pointerOverBar;
@@ -2018,6 +2010,7 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void UpdateStatusBarVisibility() =>
         StatusBar.Visibility = ViewModel.PageCount > 0 && (!IsPresenting || _barRevealed)
+                               && (IsPresenting || SettingsStore.Current.ShowStatusBar)
             ? Visibility.Visible
             : Visibility.Collapsed;
 
@@ -2073,8 +2066,7 @@ public sealed partial class MainPage : Page
 
     private bool AnyBarFlyoutOpen =>
         ZoomMenuButton.Flyout is { IsOpen: true }
-        || ViewOptionsButton.Flyout is { IsOpen: true }
-        || SearchOptionsButton.Flyout is { IsOpen: true };
+        || ViewOptionsButton.Flyout is { IsOpen: true };
 
     /// <summary>Any movement of the pointer brings the bar back in full screen.
     /// Does nothing at all otherwise, which is the common case.</summary>
@@ -5474,6 +5466,7 @@ public sealed partial class MainPage : Page
     public bool CanUndo => ViewModel.CanUndo;
     public bool CanRedo => ViewModel.CanRedo;
     public bool CanSave => ViewModel.HasDocumentPath || ViewModel.IsDirty;
+    public bool CanFind => ViewModel.PageCount > 0;
 
     // The title bar lives in the Window and these handlers live here, so the
     // window calls in rather than duplicating any of it.
@@ -5481,6 +5474,15 @@ public sealed partial class MainPage : Page
     public void RunSave() => Save_Click(this, null!);
     public void RunUndo() => ViewModel.Undo();
     public void RunRedo() => ViewModel.Redo();
+
+    /// <summary>The title bar's glass: opens the find strip, or closes it.</summary>
+    public void ToggleFind()
+    {
+        if (CanFind)
+        {
+            SetFindOpen(!IsFindOpen);
+        }
+    }
 
     /// <summary>
     /// This document's menu bar. The window shows it in its title bar while
@@ -5660,7 +5662,16 @@ public sealed partial class MainPage : Page
         LeftRuler.Background = chrome;
         RulerCorner.Background = chrome;
 
-        ApplyStatusBarDock(s.StatusBarDock);
+        // Guarded: assigning IsChecked raises Click, and that handler saves.
+        _applyingSettings = true;
+        try
+        {
+            StatusBarToggle.IsChecked = s.ShowStatusBar;
+        }
+        finally
+        {
+            _applyingSettings = false;
+        }
 
         if (RulersToggle.IsChecked != s.ShowRulers)
         {
@@ -5711,58 +5722,23 @@ public sealed partial class MainPage : Page
         RedrawRulers();
     }
 
-    // ---------------- Moving the status bar ----------------
-
-    private bool _draggingStatusBar;
-
-    private void StatusGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
-    {
-        _draggingStatusBar = true;
-        StatusGrip.CapturePointer(e.Pointer);
-        e.Handled = true;
-    }
+    // ---------------- The status bar ----------------
 
     /// <summary>
-    /// Re-anchors live while dragging, rather than moving the bar with the
-    /// pointer and snapping on release. The bar jumping to each anchor as you
-    /// cross into it SHOWS where it will land, so there is no guessing about
-    /// what letting go will do.
+    /// View > Status bar. Remembered like every view setting, and applied at
+    /// once through the one place that decides whether the bar is on screen.
     /// </summary>
-    private void StatusGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
+    private void StatusBarToggle_Click(object sender, RoutedEventArgs e)
     {
-        if (!_draggingStatusBar) { return; }
-
-        var p = e.GetCurrentPoint(RootGrid).Position;
-        var dock = AppSettings.NearestDock(p.X, p.Y, RootGrid.ActualWidth, RootGrid.ActualHeight);
-        if (dock != SettingsStore.Current.StatusBarDock)
+        // Assigning IsChecked while settings are applied raises Click.
+        if (_applyingSettings)
         {
-            SettingsStore.Update(s => s with { StatusBarDock = dock });
-            ApplyStatusBarDock(dock);
+            return;
         }
-        e.Handled = true;
-    }
 
-    private void StatusGrip_PointerReleased(object sender, PointerRoutedEventArgs e)
-    {
-        _draggingStatusBar = false;
-        StatusGrip.ReleasePointerCapture(e.Pointer);
-    }
-
-    private void ApplyStatusBarDock(BarDock dock)
-    {
-        StatusBar.HorizontalAlignment = dock switch
-        {
-            BarDock.BottomLeft or BarDock.TopLeft => HorizontalAlignment.Left,
-            BarDock.BottomRight or BarDock.TopRight => HorizontalAlignment.Right,
-            _ => HorizontalAlignment.Center,
-        };
-
-        bool top = dock is BarDock.TopCentre or BarDock.TopLeft or BarDock.TopRight;
-        StatusBar.VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom;
-
-        // Kept off the edge on whichever side it is now on, and clear of the
-        // rulers when it sits at the top.
-        StatusBar.Margin = new Thickness(16, top ? 16 : 0, 16, top ? 0 : 16);
+        bool on = StatusBarToggle.IsChecked;
+        SettingsStore.Update(s => s with { ShowStatusBar = on });
+        UpdateStatusBarVisibility();
     }
 
     // ---------------- Reading position ----------------

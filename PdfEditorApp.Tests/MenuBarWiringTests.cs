@@ -118,6 +118,11 @@ public class MenuBarWiringTests
         Assert.Contains("ShowMenuOf(ActivePage);", Body(code, "private async Task CloseTab("), StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The menu is in the title bar, so the page keeps no row for it. Since
+    /// 3.46.2 the page does have rows, but only the document and, below it,
+    /// the status bar: nothing sits above the document.
+    /// </summary>
     [Fact]
     public void the_page_keeps_no_row_for_it()
     {
@@ -125,7 +130,12 @@ public class MenuBarWiringTests
         int root = xaml.IndexOf("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal);
         int menu = xaml.IndexOf("<MenuBar x:Name=\"AppMenuBar\"", StringComparison.Ordinal);
         Assert.True(root > 0 && menu > root);
-        Assert.DoesNotContain("<Grid.RowDefinitions>", xaml[root..menu], StringComparison.Ordinal);
+
+        // The first row is the one that stretches, so no row is above the page.
+        int rows = xaml.IndexOf("<Grid.RowDefinitions>", root, StringComparison.Ordinal);
+        Assert.True(rows > 0 && rows < menu, "the page grid's rows are gone");
+        int first = xaml.IndexOf("<RowDefinition ", rows, StringComparison.Ordinal);
+        Assert.StartsWith("<RowDefinition Height=\"*\"", xaml[first..], StringComparison.Ordinal);
 
         string[] lines = xaml.Split('\n');
         int rootLine = Array.FindIndex(lines, l => l.Contains("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal));
@@ -134,9 +144,10 @@ public class MenuBarWiringTests
             .Skip(rootLine + 1)
             .Where(x => Regex.IsMatch(x.line, @"^        <[A-Za-z]"))
             .Where(x => x.line.Contains("Grid.Row=", StringComparison.Ordinal))
+            .Where(x => !x.line.Contains("x:Name=\"StatusBar\"", StringComparison.Ordinal))
             .Select(x => $"line {x.i + 1}: {x.line.Trim()}")
             .ToList();
-        Assert.True(rowed.Count == 0, "still placed in a row: " + string.Join("; ", rowed));
+        Assert.True(rowed.Count == 0, "placed in a row other than the status bar's: " + string.Join("; ", rowed));
 
         Assert.DoesNotContain("Grid.", MenuBarTag(), StringComparison.Ordinal);
     }
@@ -183,6 +194,7 @@ public class MenuBarWiringTests
     [InlineData("QuickSave")]
     [InlineData("QuickUndo")]
     [InlineData("QuickRedo")]
+    [InlineData("QuickFind")]
     public void the_quick_buttons_leave_the_keyboard_with_the_page(string name)
     {
         string window = WindowXaml();
@@ -198,7 +210,7 @@ public class MenuBarWiringTests
             .Select(m => m.Groups[1].Value)
             .ToArray();
 
-        Assert.Equal(new[] { "File", "Edit", "View", "Page", "Help" }, titles);
+        Assert.Equal(new[] { "File", "Edit", "Page", "View", "Help" }, titles);
     }
 
     [Fact]
@@ -267,8 +279,8 @@ public class MenuBarWiringTests
         Assert.True(at > 0, $"there is no {text} in the menu");
 
         int edit = bar.IndexOf("<MenuBarItem Title=\"Edit\"", StringComparison.Ordinal);
-        int view = bar.IndexOf("<MenuBarItem Title=\"View\"", StringComparison.Ordinal);
-        Assert.True(at > edit && at < view, $"{text} is not under Edit");
+        int next = bar.IndexOf("<MenuBarItem ", edit + 1, StringComparison.Ordinal);
+        Assert.True(at > edit && at < next, $"{text} is not under Edit");
 
         string item = bar[at..bar.IndexOf("</MenuFlyoutItem>", at, StringComparison.Ordinal)];
         Assert.Contains($"KeyboardAcceleratorTextOverride=\"{chord}\"", item, StringComparison.Ordinal);
@@ -306,9 +318,9 @@ public class MenuBarWiringTests
     {
         string bar = MenuBar();
         int view = bar.IndexOf("<MenuBarItem Title=\"View\"", StringComparison.Ordinal);
-        int page = bar.IndexOf("<MenuBarItem Title=\"Page\"", StringComparison.Ordinal);
+        int next = bar.IndexOf("<MenuBarItem ", view + 1, StringComparison.Ordinal);
         int guides = bar.IndexOf("<MenuFlyoutSubItem Text=\"Guides\">", StringComparison.Ordinal);
-        Assert.True(guides > view && guides < page, "there is no Guides submenu under View");
+        Assert.True(guides > view && guides < next, "there is no Guides submenu under View");
 
         string submenu = bar[guides..bar.IndexOf("</MenuFlyoutSubItem>", guides, StringComparison.Ordinal)];
         Assert.Contains($"Click=\"{handler}\"", submenu, StringComparison.Ordinal);

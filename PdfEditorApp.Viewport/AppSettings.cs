@@ -16,23 +16,6 @@ public enum AppTheme
     MidnightBlue,
 }
 
-/// <summary>
-/// Where the floating status bar sits.
-///
-/// A fixed set of anchors rather than a free position: a bar dropped in the
-/// middle of the canvas would cover the page, and a remembered pixel position
-/// would have to be re-validated against every window size and monitor change.
-/// </summary>
-public enum BarDock
-{
-    BottomCentre,
-    BottomLeft,
-    BottomRight,
-    TopCentre,
-    TopLeft,
-    TopRight,
-}
-
 /// <summary>What the view does when a document opens.</summary>
 public enum DefaultView
 {
@@ -81,7 +64,12 @@ public sealed record AppSettings
     /// <summary>Entries kept in the recent-files list.</summary>
     public int RecentLimit { get; init; } = 10;
 
-    public BarDock StatusBarDock { get; init; } = BarDock.BottomCentre;
+    /// <summary>
+    /// Whether the status bar is shown along the bottom of the window. On by
+    /// default; View > Status bar turns it off. Full screen shows it anyway,
+    /// over the page, because there it is the only chrome there is.
+    /// </summary>
+    public bool ShowStatusBar { get; init; } = true;
 
     /// <summary>
     /// Whether find distinguishes upper from lower case.
@@ -202,28 +190,6 @@ public sealed record AppSettings
     public Dictionary<string, ReadingPosition> ReadingPositions { get; init; } = new();
 
     /// <summary>
-    /// Which anchor a point in the viewport is nearest, for dropping the bar.
-    ///
-    /// Thirds horizontally and halves vertically: the middle third is wide
-    /// enough that "centre" is easy to hit deliberately, which is where the bar
-    /// belongs by default.
-    /// </summary>
-    public static BarDock NearestDock(double x, double y, double width, double height)
-    {
-        if (width <= 0 || height <= 0)
-        {
-            return BarDock.BottomCentre;
-        }
-
-        bool top = y < height / 2;
-        double third = width / 3;
-
-        if (x < third) { return top ? BarDock.TopLeft : BarDock.BottomLeft; }
-        if (x > third * 2) { return top ? BarDock.TopRight : BarDock.BottomRight; }
-        return top ? BarDock.TopCentre : BarDock.BottomCentre;
-    }
-
-    /// <summary>
     /// Which generation of this file's meaning the stored settings were
     /// written against.
     ///
@@ -290,7 +256,6 @@ public sealed record AppSettings
         ColorIntensity = Math.Clamp(ColorIntensity, MinIntensity, MaxIntensity),
         RulerUnit = IsKnownUnit(RulerUnit) ? RulerUnit : "Inches",
         RecentLimit = Math.Clamp(RecentLimit, 1, 50),
-        StatusBarDock = Enum.IsDefined(StatusBarDock) ? StatusBarDock : BarDock.BottomCentre,
         PageViewMode = Enum.IsDefined(PageViewMode) ? PageViewMode : PageViewMode.Continuous,
     };
 
