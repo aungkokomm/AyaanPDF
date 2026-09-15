@@ -169,6 +169,232 @@
             <ColumnDefinition Width="*" />
             <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!--
+            THE MENU BAR. Every command used to sit behind one "Menu" button at
+            the foot of the tool rail, opening sideways, which is not where
+            anyone looks for File or Edit. It is a row across the top of the
+            document now, below its tab, the way the new Notepad does it.
+
+            In the PAGE rather than the window's title bar on purpose: every
+            entry calls this page's own handler and binds to this page's view
+            model, and Recent files and Signature are filled from this page's
+            code, so a bar in the window would need all of that wired across for
+            whichever tab is in front.
+
+            ⚠️ THE ACCELERATORS DECLARED HERE HAVE TO MATCH KeyboardCommands,
+            not just look right in the menu. Once a flyout has been opened its
+            accelerators go live and fire BEFORE the page's key handler, so a
+            stale one silently steals the chord: Save As kept Ctrl+S after Save
+            was added and went on opening the picker. An entry whose chord lives
+            in the page's key handler carries the TEXT only, because a
+            MenuFlyoutItem's own accelerator is dead until its flyout has been
+            opened once.
+        -->
+        <MenuBar x:Name="AppMenuBar" Grid.Row="0" Grid.ColumnSpan="4"
+                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                 AutomationProperties.Name="Menu">
+            <MenuBarItem Title="File">
+                <MenuFlyoutItem Text="New" Click="New_Click">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="N" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutItem Text="Open..." Click="OpenFile_Click">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="O" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutSubItem x:Name="RecentMenu" Text="Recent files" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Save" Click="Save_Click"
+                                IsEnabled="{x:Bind ViewModel.HasDocumentPath, Mode=OneWay}">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon Glyph="&#xE74E;" />
+                    </MenuFlyoutItem.Icon>
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="S" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control,Shift" Key="S" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <!--
+                    Flattening used to be what an ordinary Save did, silently. It
+                    is its own command, confirmed first, because it is the one
+                    save whose result cannot be undone by reopening the file.
+                -->
+                <MenuFlyoutItem Text="Flatten and save a copy..." Click="FlattenSaveAs_Click" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Print..." Click="Print_Click">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon Glyph="&#xE749;" />
+                    </MenuFlyoutItem.Icon>
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="P" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Settings..." Click="Settings_Click">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon Glyph="&#xE713;" />
+                    </MenuFlyoutItem.Icon>
+                </MenuFlyoutItem>
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Close document" Click="CloseDocument_Click">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="W" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <!-- Text only. The chord itself is an accelerator on the
+                     window's root grid, so it fires wherever focus is; an
+                     accelerator declared here would be dead until this flyout
+                     had been opened once. -->
+                <MenuFlyoutItem Text="Exit" Click="Exit_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+Q" />
+            </MenuBarItem>
+
+            <MenuBarItem Title="Edit">
+                <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}" Click="Undo_Click"
+                                IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="Z" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutItem Text="{x:Bind ViewModel.RedoLabel, Mode=OneWay}" Click="Redo_Click"
+                                IsEnabled="{x:Bind ViewModel.CanRedo, Mode=OneWay}">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="Y" />
+                        <!-- Ctrl+Shift+Z as well: both are standard for redo on
+                             Windows and users arrive expecting whichever their
+                             previous editor used. -->
+                        <KeyboardAccelerator Modifiers="Control,Shift" Key="Z" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Find" Click="FindToggle_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+F">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon Glyph="&#xE721;" />
+                    </MenuFlyoutItem.Icon>
+                </MenuFlyoutItem>
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Group" Click="Group_Click">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="G" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutItem Text="Ungroup" Click="Ungroup_Click">
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control,Shift" Key="G" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
+                <MenuFlyoutSeparator />
+                <MenuFlyoutSubItem x:Name="SignatureMenu" Text="Signature" />
+            </MenuBarItem>
+
+            <MenuBarItem Title="View">
+                <!-- Text only: F4 and F6 are live in the page's key handler. -->
+                <MenuFlyoutItem Text="Pages panel" Click="ToggleThumbnails_Click"
+                                KeyboardAcceleratorTextOverride="F4" />
+                <MenuFlyoutItem Text="Bookmarks panel" Click="ToggleBookmarks_Click"
+                                KeyboardAcceleratorTextOverride="F6" />
+                <MenuFlyoutSeparator />
+                <!--
+                    Zoom. These already existed as a flyout off the status bar's
+                    percentage and as toolbar buttons, which is fine once you
+                    know where to look and invisible until then: the View menu
+                    is where anyone goes first. The chords are Acrobat's, live in
+                    the page's key handler, so the muscle memory transfers.
+                -->
+                <MenuFlyoutItem Text="Fit page" Click="ZoomFitPage_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+0" />
+                <MenuFlyoutItem Text="Fit width" Click="ZoomFitWidth_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+2" />
+                <MenuFlyoutItem Text="Actual size" Click="ZoomActualSize_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+1" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Full screen" Click="FullScreen_Click"
+                                KeyboardAcceleratorTextOverride="F11" />
+                <ToggleMenuFlyoutItem x:Name="NightModeToggle" Text="Night mode"
+                                      Click="NightModeToggle_Click" />
+                <MenuFlyoutSeparator />
+                <!--
+                    Turning the VIEW, which is not the same as the Rotate page
+                    commands under Page: this changes nothing in the file, needs
+                    no save, and is forgotten when the document closes. Worded as
+                    "view" for exactly that reason. The chords are live through
+                    KeyboardCommands.
+                -->
+                <MenuFlyoutItem Text="Rotate view clockwise" Click="RotateViewCw_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+Shift++" />
+                <MenuFlyoutItem Text="Rotate view anticlockwise" Click="RotateViewCcw_Click"
+                                KeyboardAcceleratorTextOverride="Ctrl+Shift+-" />
+                <MenuFlyoutItem x:Name="ResetViewRotationItem" Text="Reset view rotation"
+                                Click="ResetViewRotation_Click" IsEnabled="False" />
+                <MenuFlyoutSeparator />
+                <!--
+                    How many pages are on screen. A radio pair rather than a
+                    toggle, because "Single page" unchecked does not say what you
+                    get instead, and the two names together do.
+                -->
+                <RadioMenuFlyoutItem x:Name="ContinuousViewItem" Text="Continuous scrolling"
+                                     GroupName="pageViewMode" IsChecked="True"
+                                     Click="ContinuousView_Click" />
+                <RadioMenuFlyoutItem x:Name="SinglePageViewItem" Text="Single page"
+                                     GroupName="pageViewMode"
+                                     Click="SinglePageView_Click" />
+                <MenuFlyoutSeparator />
+                <ToggleMenuFlyoutItem x:Name="ShowLinksToggle" Text="Show links"
+                                      Click="ShowLinksToggle_Click" />
+                <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
+                                      IsChecked="True" Click="RulersToggle_Click">
+                    <ToggleMenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Control" Key="R" />
+                    </ToggleMenuFlyoutItem.KeyboardAccelerators>
+                </ToggleMenuFlyoutItem>
+                <MenuFlyoutSubItem Text="Ruler units">
+                    <RadioMenuFlyoutItem x:Name="UnitInches" Text="Inches"
+                                         GroupName="RulerUnit" IsChecked="True"
+                                         Click="RulerUnit_Click" Tag="Inches" />
+                    <RadioMenuFlyoutItem x:Name="UnitCentimeters" Text="Centimeters"
+                                         GroupName="RulerUnit"
+                                         Click="RulerUnit_Click" Tag="Centimeters" />
+                    <RadioMenuFlyoutItem x:Name="UnitMillimeters" Text="Millimeters"
+                                         GroupName="RulerUnit"
+                                         Click="RulerUnit_Click" Tag="Millimeters" />
+                    <RadioMenuFlyoutItem x:Name="UnitPoints" Text="Points"
+                                         GroupName="RulerUnit"
+                                         Click="RulerUnit_Click" Tag="Points" />
+                    <RadioMenuFlyoutItem x:Name="UnitPicas" Text="Picas"
+                                         GroupName="RulerUnit"
+                                         Click="RulerUnit_Click" Tag="Picas" />
+                </MenuFlyoutSubItem>
+            </MenuBarItem>
+
+            <MenuBarItem Title="Page">
+                <MenuFlyoutSubItem Text="Insert">
+                    <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
+                    <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
+                </MenuFlyoutSubItem>
+                <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
+                <MenuFlyoutSeparator />
+                <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
+                <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
+                <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
+            </MenuBarItem>
+
+            <MenuBarItem Title="Help">
+                <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
+            </MenuBarItem>
+        </MenuBar>
+
 
         <!--
             MaxZoomFactor is 8, i.e. 800%. This was briefly raised to 64 to
@@ -193,7 +419,7 @@
              column with a Margin on the ScrollView reserving room; toggled
              from View > Rulers. Corner covers the intersection so the two
              rulers don't butt into each other visually. -->
-        <Border x:Name="RulerCorner" Grid.Column="2"
+        <Border x:Name="RulerCorner" Grid.Row="1" Grid.Column="2"
                 Width="22" Height="22"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -206,7 +432,7 @@
              the page. Horizontal preview: full viewport width, 1 DIP tall,
              top of Margin = pointer Y. Vertical preview: 1 DIP wide, full
              height, left of Margin = pointer X. Collapsed until pressed. -->
-        <Rectangle x:Name="GuidePreviewLine" Grid.Column="2"
+        <Rectangle x:Name="GuidePreviewLine" Grid.Row="1" Grid.Column="2"
                    Fill="#FF00A0D8" Opacity="0.85"
                    HorizontalAlignment="Left" VerticalAlignment="Top"
                    IsHitTestVisible="False"
@@ -219,7 +445,7 @@
              in the active ruler unit, so precise placement is a matter of
              watching the number rather than counting ticks. Collapsed until
              a ruler drag starts. -->
-        <Border x:Name="GuideReadout" Grid.Column="2"
+        <Border x:Name="GuideReadout" Grid.Row="1" Grid.Column="2"
                 Background="{ThemeResource SystemControlBackgroundBaseLowBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="3"
@@ -231,7 +457,7 @@
             <TextBlock x:Name="GuideReadoutText" FontSize="10"
                        Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
         </Border>
-        <controls:CursorCanvas x:Name="TopRuler" Grid.Column="2"
+        <controls:CursorCanvas x:Name="TopRuler" Grid.Row="1" Grid.Column="2"
                 Height="22" Margin="22,0,0,0"
                 HorizontalAlignment="Stretch" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -264,7 +490,7 @@
                 </MenuFlyout>
             </Canvas.ContextFlyout>
         </controls:CursorCanvas>
-        <controls:CursorCanvas x:Name="LeftRuler" Grid.Column="2"
+        <controls:CursorCanvas x:Name="LeftRuler" Grid.Row="1" Grid.Column="2"
                 Width="22" Margin="0,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Stretch"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -278,7 +504,7 @@
                 RightTapped="Ruler_RightTapped"
                 SizeChanged="Rulers_SizeChanged" />
 
-        <ScrollView
+        <ScrollView Grid.Row="1"
             x:Name="PageScroller"
             Grid.Column="2"
             Margin="22,22,0,0"
@@ -1021,7 +1247,7 @@
             Margin mirrors PageScroller's so its origin is the viewport's
             top-left, and SetRulersVisible keeps the two in step.
         -->
-        <rendering:SkiaShapeLayer x:Name="SkiaShapeCanvas"
+        <rendering:SkiaShapeLayer x:Name="SkiaShapeCanvas" Grid.Row="1"
                                   Grid.Column="2"
                                   Margin="22,22,0,0"
                                   IsHitTestVisible="False"
@@ -1044,7 +1270,7 @@
             both go through Translation, set in code; a RenderTransform would
             drive the same composition visual and quietly win, Z included.
         -->
-        <Border x:Name="GradientPanelWindow" Grid.Column="2"
+        <Border x:Name="GradientPanelWindow" Grid.Row="1" Grid.Column="2"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Visibility="Collapsed" Canvas.ZIndex="30" Translation="0,0,40"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
@@ -1195,7 +1421,7 @@
             out; the X and Y stay zero because position is set by the
             TranslateTransform below, which is a separate mechanism.
         -->
-        <Border x:Name="ObjectToolbar" Grid.Column="2"
+        <Border x:Name="ObjectToolbar" Grid.Row="1" Grid.Column="2"
                 Margin="22,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Visibility="Collapsed" Canvas.ZIndex="20" Translation="0,0,32"
@@ -1248,7 +1474,7 @@
             Still double-tappable, which is the gesture people try on an empty
             canvas, and it is the same handler as the button.
         -->
-        <Border x:Name="EmptyState" Grid.Column="2" Background="Transparent"
+        <Border x:Name="EmptyState" Grid.Row="1" Grid.Column="2" Background="Transparent"
                 AllowDrop="True"
                 DragOver="EmptyState_DragOver"
                 Drop="EmptyState_Drop"
@@ -1385,7 +1611,7 @@
             window with nothing to align to; docked, the rail has an edge to sit
             against and the settings button has a bottom to sit at.
         -->
-        <Border x:Name="ToolRail" Grid.Column="0" VerticalAlignment="Stretch" Margin="0"
+        <Border x:Name="ToolRail" Grid.Row="1" Grid.Column="0" VerticalAlignment="Stretch" Margin="0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="0,0,1,0" CornerRadius="0" Padding="4,4,4,4">
@@ -1534,217 +1760,6 @@
                     <FontIcon Glyph="&#xE762;" FontSize="16" />
                 </ToggleButton>
 
-                <Button AutomationProperties.Name="Menu" ToolTipService.ToolTip="Menu"
-                        Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
-                    <FontIcon Glyph="&#xE712;" FontSize="16" />
-                    <Button.Flyout>
-                        <MenuFlyout Placement="Right">
-                            <MenuFlyoutItem Text="New" Click="New_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="N" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="Open..." Click="OpenFile_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="O" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutSubItem x:Name="RecentMenu" Text="Recent files" />
-                            <MenuFlyoutSeparator />
-                            <!--
-                                The accelerators here have to match
-                                KeyboardCommands, not just look right in the
-                                menu. Once a flyout has been opened its
-                                accelerators go live and fire BEFORE the page's
-                                key handler, so a stale one silently steals the
-                                chord: Save As kept Ctrl+S after Save was added
-                                and went on opening the picker.
-                            -->
-                            <MenuFlyoutItem Text="Save" Click="Save_Click"
-                                            IsEnabled="{x:Bind ViewModel.HasDocumentPath, Mode=OneWay}">
-                                <MenuFlyoutItem.Icon>
-                                    <FontIcon Glyph="&#xE74E;" />
-                                </MenuFlyoutItem.Icon>
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="S" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="Save As..." Click="SaveAs_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="S" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <!--
-                                Flattening used to be what an ordinary Save did,
-                                silently. It is now its own command, confirmed
-                                first, because it is the one save whose result
-                                cannot be undone by reopening the file.
-                            -->
-                            <MenuFlyoutItem Text="Flatten and save a copy..." Click="FlattenSaveAs_Click" />
-                            <MenuFlyoutItem Text="Print..." Click="Print_Click">
-                                <MenuFlyoutItem.Icon>
-                                    <FontIcon Glyph="&#xE749;" />
-                                </MenuFlyoutItem.Icon>
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="P" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="{x:Bind ViewModel.UndoLabel, Mode=OneWay}" Click="Undo_Click"
-                                            IsEnabled="{x:Bind ViewModel.CanUndo, Mode=OneWay}">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="Z" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="{x:Bind ViewModel.RedoLabel, Mode=OneWay}" Click="Redo_Click"
-                                            IsEnabled="{x:Bind ViewModel.CanRedo, Mode=OneWay}">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="Y" />
-                                    <!-- Ctrl+Shift+Z as well: both are standard for redo on
-                                         Windows and users arrive expecting whichever their
-                                         previous editor used. -->
-                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="Z" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutSeparator />
-                            <!--
-                                Everything below is grouped by what it acts on.
-                                These are the entries that made the menu thirty
-                                rows long, and they are also the ones reached
-                                least often, so they cost a hover and save the
-                                list.
-                            -->
-                            <MenuFlyoutSubItem Text="Pages">
-                                <MenuFlyoutSubItem Text="Insert">
-                                    <MenuFlyoutItem Text="From file..." Click="InsertFromFile_Click" />
-                                    <MenuFlyoutItem Text="A blank page" Click="InsertBlankPage_Click" />
-                                </MenuFlyoutSubItem>
-                                <MenuFlyoutItem Text="Extract pages..." Click="ExtractPagesMenu_Click" />
-                                <MenuFlyoutSeparator />
-                                <MenuFlyoutItem Text="Rotate page 90" Click="RotatePage_Click" />
-                                <MenuFlyoutItem Text="Rotate pages..." Click="RotatePagesMenu_Click" />
-                                <MenuFlyoutItem Text="Delete page" Click="DeletePage_Click" />
-                            </MenuFlyoutSubItem>
-                            <MenuFlyoutSubItem x:Name="SignatureMenu" Text="Signature" />
-                            <MenuFlyoutSubItem Text="Arrange">
-                                <MenuFlyoutItem Text="Group" Click="Group_Click">
-                                    <MenuFlyoutItem.KeyboardAccelerators>
-                                        <KeyboardAccelerator Modifiers="Control" Key="G" />
-                                    </MenuFlyoutItem.KeyboardAccelerators>
-                                </MenuFlyoutItem>
-                                <MenuFlyoutItem Text="Ungroup" Click="Ungroup_Click">
-                                    <MenuFlyoutItem.KeyboardAccelerators>
-                                        <KeyboardAccelerator Modifiers="Control,Shift" Key="G" />
-                                    </MenuFlyoutItem.KeyboardAccelerators>
-                                </MenuFlyoutItem>
-                            </MenuFlyoutSubItem>
-                            <MenuFlyoutSubItem Text="View">
-                                <!-- The chord is live in RootGrid_KeyDown, via
-                                     PresentationKeys. The text here only prints
-                                     it beside the entry; a MenuFlyoutItem's own
-                                     accelerator is dead until its flyout has
-                                     been opened, which is the trap this menu
-                                     documents at the top of the file. -->
-                                <!--
-                                    Zoom. These already existed as a flyout off
-                                    the status bar's percentage and as toolbar
-                                    buttons, which is fine once you know where
-                                    to look and invisible until then: the View
-                                    menu is where anyone goes first.
-
-                                    Accelerator TEXT only, no accelerator: a
-                                    MenuFlyoutItem's accelerator is dead until
-                                    its flyout has been opened. The chords are
-                                    live in the page's key handler and are
-                                    Acrobat's, so the muscle memory transfers.
-                                -->
-                                <MenuFlyoutItem Text="Fit page" Click="ZoomFitPage_Click"
-                                                KeyboardAcceleratorTextOverride="Ctrl+0" />
-                                <MenuFlyoutItem Text="Fit width" Click="ZoomFitWidth_Click"
-                                                KeyboardAcceleratorTextOverride="Ctrl+2" />
-                                <MenuFlyoutItem Text="Actual size" Click="ZoomActualSize_Click"
-                                                KeyboardAcceleratorTextOverride="Ctrl+1" />
-                                <MenuFlyoutSeparator />
-                                <MenuFlyoutItem Text="Full screen" Click="FullScreen_Click"
-                                                KeyboardAcceleratorTextOverride="F11" />
-                                <ToggleMenuFlyoutItem x:Name="NightModeToggle" Text="Night mode"
-                                                      Click="NightModeToggle_Click" />
-                                <MenuFlyoutSeparator />
-                                <!--
-                                    Turning the VIEW, which is not the same as
-                                    the Rotate page commands under Pages: this
-                                    changes nothing in the file, needs no save,
-                                    and is forgotten when the document closes.
-                                    Worded as "view" for exactly that reason.
-
-                                    Accelerator TEXT only, no accelerator: a
-                                    MenuFlyoutItem's accelerator is dead until
-                                    its flyout has been opened. The chords are
-                                    live through KeyboardCommands instead.
-                                -->
-                                <MenuFlyoutItem Text="Rotate view clockwise" Click="RotateViewCw_Click"
-                                                KeyboardAcceleratorTextOverride="Ctrl+Shift++" />
-                                <MenuFlyoutItem Text="Rotate view anticlockwise" Click="RotateViewCcw_Click"
-                                                KeyboardAcceleratorTextOverride="Ctrl+Shift+-" />
-                                <MenuFlyoutItem x:Name="ResetViewRotationItem" Text="Reset view rotation"
-                                                Click="ResetViewRotation_Click" IsEnabled="False" />
-                                <MenuFlyoutSeparator />
-                                <!--
-                                    How many pages are on screen. A radio pair
-                                    rather than a toggle, because "Single page"
-                                    unchecked does not say what you get
-                                    instead, and the two names together do.
-                                -->
-                                <RadioMenuFlyoutItem x:Name="ContinuousViewItem" Text="Continuous scrolling"
-                                                     GroupName="pageViewMode" IsChecked="True"
-                                                     Click="ContinuousView_Click" />
-                                <RadioMenuFlyoutItem x:Name="SinglePageViewItem" Text="Single page"
-                                                     GroupName="pageViewMode"
-                                                     Click="SinglePageView_Click" />
-                                <MenuFlyoutSeparator />
-                                <ToggleMenuFlyoutItem x:Name="ShowLinksToggle" Text="Show links"
-                                                      Click="ShowLinksToggle_Click" />
-                                <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
-                                                      IsChecked="True" Click="RulersToggle_Click">
-                                    <ToggleMenuFlyoutItem.KeyboardAccelerators>
-                                        <KeyboardAccelerator Modifiers="Control" Key="R" />
-                                    </ToggleMenuFlyoutItem.KeyboardAccelerators>
-                                </ToggleMenuFlyoutItem>
-                                <MenuFlyoutSubItem Text="Ruler units">
-                                <RadioMenuFlyoutItem x:Name="UnitInches" Text="Inches"
-                                                     GroupName="RulerUnit" IsChecked="True"
-                                                     Click="RulerUnit_Click" Tag="Inches" />
-                                <RadioMenuFlyoutItem x:Name="UnitCentimeters" Text="Centimeters"
-                                                     GroupName="RulerUnit"
-                                                     Click="RulerUnit_Click" Tag="Centimeters" />
-                                <RadioMenuFlyoutItem x:Name="UnitMillimeters" Text="Millimeters"
-                                                     GroupName="RulerUnit"
-                                                     Click="RulerUnit_Click" Tag="Millimeters" />
-                                <RadioMenuFlyoutItem x:Name="UnitPoints" Text="Points"
-                                                     GroupName="RulerUnit"
-                                                     Click="RulerUnit_Click" Tag="Points" />
-                                    <RadioMenuFlyoutItem x:Name="UnitPicas" Text="Picas"
-                                                         GroupName="RulerUnit"
-                                                         Click="RulerUnit_Click" Tag="Picas" />
-                                </MenuFlyoutSubItem>
-                            </MenuFlyoutSubItem>
-                            <MenuFlyoutSeparator />
-                            <MenuFlyoutItem Text="Close document" Click="CloseDocument_Click">
-                                <MenuFlyoutItem.KeyboardAccelerators>
-                                    <KeyboardAccelerator Modifiers="Control" Key="W" />
-                                </MenuFlyoutItem.KeyboardAccelerators>
-                            </MenuFlyoutItem>
-                            <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
-                            <!-- Text only. The chord itself is an accelerator on
-                                 the window's root grid, so it fires wherever
-                                 focus is; an accelerator declared here would be
-                                 dead until this flyout had been opened once. -->
-                            <MenuFlyoutItem Text="Exit" Click="Exit_Click"
-                                            KeyboardAcceleratorTextOverride="Ctrl+Q" />
-                        </MenuFlyout>
-                    </Button.Flyout>
-                </Button>
-
                 <Button AutomationProperties.Name="Settings" Click="Settings_Click" ToolTipService.ToolTip="Settings"
                         Width="36" Height="36" Padding="0" Background="Transparent" BorderThickness="0">
                     <FontIcon Glyph="&#xE713;" FontSize="16" />
@@ -1780,7 +1795,7 @@
              toolbar's 32, because ObjectToolbarPlacement reserves this bar's
              height on the standing assumption that it draws on top; equal
              values would leave that contract decided by declaration order. -->
-        <Border x:Name="PropertyBar" Grid.Column="2" Visibility="Collapsed"
+        <Border x:Name="PropertyBar" Grid.Row="1" Grid.Column="2" Visibility="Collapsed"
                 Canvas.ZIndex="30" Translation="0,0,48"
                 HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12,12,12,0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
@@ -2856,7 +2871,7 @@
             Pages panel as an OVERLAY, not a permanent column, so it never
             takes width away from the canvas. Hidden until asked for.
         -->
-        <Border x:Name="ThumbnailPanel" Visibility="Collapsed"
+        <Border x:Name="ThumbnailPanel" Grid.Row="1" Visibility="Collapsed"
                 Grid.Column="1" Margin="0,12,12,12"
                 Width="{x:Bind ViewModel.ThumbnailPaneWidth, Mode=OneWay}"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
@@ -2988,7 +3003,7 @@
             same document, only one is wanted at a time, and two side by side
             would leave the page itself squeezed into what is left.
         -->
-        <Border x:Name="BookmarkPanel" Visibility="Collapsed"
+        <Border x:Name="BookmarkPanel" Grid.Row="1" Visibility="Collapsed"
                 Grid.Column="1" Margin="0,12,12,12" Width="260"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
@@ -3054,7 +3069,7 @@
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            Style="{StaticResource CaptionTextBlockStyle}" />
 
-                <ListView Grid.Row="1" x:Name="BookmarkList"
+                <ListView x:Name="BookmarkList" Grid.Row="1"
                           Padding="4,0,4,8"
                           ItemsSource="{x:Bind ViewModel.Bookmarks}"
                           IsItemClickEnabled="True"
@@ -3108,7 +3123,7 @@
             Naming a bookmark. Used for renaming one, and for adding one where
             no text was selected to name it after.
         -->
-        <ContentDialog x:Name="BookmarkNameDialog" Title="Bookmark name"
+        <ContentDialog x:Name="BookmarkNameDialog" Grid.Row="1" Title="Bookmark name"
                        PrimaryButtonText="Save" CloseButtonText="Cancel"
                        DefaultButton="Primary">
             <StackPanel Spacing="8" Width="360">
@@ -3136,7 +3151,7 @@
             typed here is stored, remembered between documents, or written to
             the trace.
         -->
-        <ContentDialog x:Name="PasswordDialog" Title="Password required"
+        <ContentDialog x:Name="PasswordDialog" Grid.Row="1" Title="Password required"
                        PrimaryButtonText="Open" CloseButtonText="Cancel"
                        DefaultButton="Primary">
             <StackPanel Spacing="12" Width="320">
@@ -3159,7 +3174,7 @@
             "Not now" keeps the snapshot, because deleting somebody's only
             remaining copy of an afternoon's work must take a deliberate press.
         -->
-        <ContentDialog x:Name="RecoveryDialog" Title="Recover unsaved work"
+        <ContentDialog x:Name="RecoveryDialog" Grid.Row="1" Title="Recover unsaved work"
                        PrimaryButtonText="Recover" SecondaryButtonText="Discard"
                        CloseButtonText="Not now" DefaultButton="Primary">
             <StackPanel Spacing="12" Width="380">
@@ -3180,7 +3195,7 @@
             </StackPanel>
         </ContentDialog>
 
-        <ContentDialog x:Name="RotatePagesDialog" Title="Rotate pages"
+        <ContentDialog x:Name="RotatePagesDialog" Grid.Row="1" Title="Rotate pages"
                        PrimaryButtonText="Rotate" CloseButtonText="Cancel"
                        DefaultButton="Primary">
             <StackPanel Spacing="16" Width="300">
@@ -3229,7 +3244,7 @@
 
         <!-- Extract Pages dialog: a range out to a new file, optionally one
              file per page, optionally removing them from this document. -->
-        <ContentDialog x:Name="ExtractPagesDialog" Title="Extract pages"
+        <ContentDialog x:Name="ExtractPagesDialog" Grid.Row="1" Title="Extract pages"
                        PrimaryButtonText="Extract" CloseButtonText="Cancel"
                        DefaultButton="Primary">
             <StackPanel Spacing="16" Width="300">
@@ -3250,7 +3265,7 @@
             Status pill: page position, zoom, fit and find. Floats bottom
             centre and stays out of the way, replacing a full-width status bar.
         -->
-        <Border x:Name="StatusBar" Grid.Column="2"
+        <Border x:Name="StatusBar" Grid.Row="1" Grid.Column="2"
                 HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
@@ -3638,7 +3653,7 @@
             Below the 22px ruler, and centred rather than left so it clears the
             object toolbar in the corner.
         -->
-        <Border Grid.Column="2"
+        <Border Grid.Row="1" Grid.Column="2"
                 Visibility="{x:Bind ViewModel.IsPreparingText, Mode=OneWay}"
                 IsHitTestVisible="False"
                 HorizontalAlignment="Center" VerticalAlignment="Top"
@@ -3675,7 +3690,7 @@
             In the canvas column for the reason the card above gives, top centre
             below the ruler, and pushed under that card while it shows.
         -->
-        <InfoBar x:Name="NoticeBar" Grid.Column="2"
+        <InfoBar x:Name="NoticeBar" Grid.Row="1" Grid.Column="2"
                  HorizontalAlignment="Center" VerticalAlignment="Top" MaxWidth="560"
                  Margin="{x:Bind local:MainPage.NoticeMargin(ViewModel.IsPreparingText), Mode=OneWay}"
                  IsOpen="{x:Bind ViewModel.IsNoticeOpen, Mode=TwoWay}"

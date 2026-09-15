@@ -1589,6 +1589,7 @@ public sealed partial class MainPage : Page
 
         ToolRail.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
         PropertyBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
+        AppMenuBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
 
         // Shown on arrival, then left to fade. Full screen used to collapse the
         // bar outright, which took away the only chrome there was: night mode,
@@ -5249,6 +5250,7 @@ public sealed partial class MainPage : Page
         var chrome = Theming.ChromeBrush(s.Theme);
         ToolRail.Background = chrome;
         PropertyBar.Background = chrome;
+        AppMenuBar.Background = chrome;
         StatusBar.Background = chrome;
         ThumbnailPanel.Background = chrome;
         BookmarkPanel.Background = chrome;
