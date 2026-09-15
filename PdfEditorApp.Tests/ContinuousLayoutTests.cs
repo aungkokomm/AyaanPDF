@@ -82,6 +82,74 @@ public class ContinuousLayoutTests
         Assert.Equal((-1, -1), layout.VisibleRange(5000, 6000));
     }
 
+    /// <summary>
+    /// The visible range is found by binary search now, because the walk over
+    /// every slot ran several times per scroll step and was part of a hitch on
+    /// a 39881-page book. It must give exactly the walk's answers, at slot
+    /// edges, inside gaps and outside the stack.
+    /// </summary>
+    [Fact]
+    public void visible_range_agrees_with_walking_every_slot()
+    {
+        var random = new System.Random(7);
+        var sizes = Enumerable.Range(0, 400)
+            .Select(_ => new PageSizePoints(612, random.Next(300, 1200)))
+            .ToList();
+        var layout = new ContinuousLayout(pageGap: 16);
+        layout.Rebuild(sizes, layoutWidth: 800);
+
+        for (int trial = 0; trial < 2000; trial++)
+        {
+            double top = (random.NextDouble() * (layout.TotalHeight + 2000)) - 1000;
+            double bottom = top + (random.NextDouble() * 3000);
+
+            // Every tenth view sits exactly on a card's top or bottom edge.
+            if (trial % 10 == 0)
+            {
+                var slot = layout.Slots[trial % layout.PageCount];
+                top = trial % 20 == 0 ? slot.Top : slot.Top + slot.Height;
+                bottom = top + (trial % 3 == 0 ? 0 : 50);
+            }
+
+            Assert.Equal(WalkEverySlot(layout, top, bottom), layout.VisibleRange(top, bottom));
+        }
+    }
+
+    [Fact]
+    public void visible_range_far_down_a_long_book_finds_the_page_there()
+    {
+        var layout = new ContinuousLayout(pageGap: 16);
+        layout.Rebuild(Uniform(39881, 612, 756), layoutWidth: 800);
+
+        double top = layout.TopOf(39174);
+        Assert.Equal((39174, 39174), layout.VisibleRange(top + 1, top + 100));
+        Assert.Equal(39174, layout.DominantPage(top + 1, top + 100));
+    }
+
+    /// <summary>The walk VisibleRange used to be, kept as the reference answer.</summary>
+    private static (int, int) WalkEverySlot(ContinuousLayout layout, double viewTop, double viewBottom)
+    {
+        int first = -1;
+        int last = -1;
+        for (int i = 0; i < layout.Slots.Count; i++)
+        {
+            var slot = layout.Slots[i];
+            if (slot.Top + slot.Height >= viewTop && slot.Top <= viewBottom)
+            {
+                if (first < 0)
+                {
+                    first = i;
+                }
+                last = i;
+            }
+            else if (first >= 0)
+            {
+                break;
+            }
+        }
+        return (first, last);
+    }
+
     [Fact]
     public void dominant_page_is_the_one_filling_most_of_the_viewport()
     {

@@ -84,6 +84,7 @@ public sealed class PageStackLayout : VirtualizingLayout
             return built;
         }
 
+        using var uiStall = UiStall.Section("PageStack.Geometry");
         var geometry = new PageStackGeometry(Spacing);
         geometry.Rebuild(context.ItemCount, i =>
             context.GetItemAt(i) is PageSlot slot ? (slot.SlotWidth, slot.SlotHeight) : (0, 0));

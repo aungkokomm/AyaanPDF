@@ -116,25 +116,50 @@ public sealed class ContinuousLayout
     /// </summary>
     public (int First, int Last) VisibleRange(double viewTop, double viewBottom)
     {
-        int first = -1;
-        int last = -1;
+        // A BINARY SEARCH, because this runs several times on every scroll step
+        // and a book can hold tens of thousands of slots. The walk it replaces
+        // was part of a hitch on a 39881-page book. Slots are ordered by Top and
+        // their bottoms rise with them, so the intersecting slots are one run:
+        // from the first whose bottom reaches the view to the last whose top is
+        // not below it. The same test the walk made, found without walking.
+        int count = _slots.Count;
 
-        for (int i = 0; i < _slots.Count; i++)
+        int first = count;
+        int lo = 0;
+        int hi = count - 1;
+        while (lo <= hi)
         {
-            var slot = _slots[i];
-            double bottom = slot.Top + slot.Height;
-            if (bottom >= viewTop && slot.Top <= viewBottom)
+            int mid = lo + ((hi - lo) / 2);
+            if (_slots[mid].Top + _slots[mid].Height >= viewTop)
             {
-                if (first < 0)
-                {
-                    first = i;
-                }
-                last = i;
+                first = mid;
+                hi = mid - 1;
             }
-            else if (first >= 0)
+            else
             {
-                // Slots are ordered, so once past the viewport we are done.
-                break;
+                lo = mid + 1;
+            }
+        }
+
+        if (first == count || _slots[first].Top > viewBottom)
+        {
+            return (-1, -1);
+        }
+
+        int last = first;
+        lo = first;
+        hi = count - 1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            if (_slots[mid].Top <= viewBottom)
+            {
+                last = mid;
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
             }
         }
 

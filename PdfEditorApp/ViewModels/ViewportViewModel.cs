@@ -877,7 +877,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         foreach (var slot in PageSlots)
         {
-            slot.FormFieldOutlines.Clear();
+            if (slot.FormFieldOutlines.Count > 0) { slot.FormFieldOutlines.Clear(); }
         }
 
         if (!ShowFormFields)
@@ -1034,7 +1034,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // ⚠️ THE DOCUMENT IS A DIFFERENT ONE NOW, behind the same handle. Every
         // per-page cache describes the document that was replaced.
-        _textLayers.Clear();
+        ForgetTextLayers();
         ClearSelection();
         ClearLoadedAnnotations();
         LoadFormFields();
@@ -1234,7 +1234,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Layers are keyed by page index, so carrying them across a document
         // switch would hand the new document the old one's text. Any search in
         // flight is reading those same page indices, so it goes too.
-        _textLayers.Clear();
+        ForgetTextLayers();
         RestartSearch();
         ClearLoadedAnnotations();
 
@@ -1538,7 +1538,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // Every page after the deleted one shifted down, so layers cached by
         // index now describe the wrong pages, and so do a running search's
         // results.
-        _textLayers.Clear();
+        ForgetTextLayers();
         RestartSearch();
         ClearSelection();
 
@@ -1997,7 +1997,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private void ReloadAfterPageStructureChange()
     {
-        _textLayers.Clear();
+        ForgetTextLayers();
         RestartSearch();
         ClearLoadedAnnotations();
         _loadedGrip = LoadedAnnotationPicker.Grip.None;
@@ -3012,6 +3012,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public ObservableCollection<PageSlot> PageSlots { get; } = new();
 
+    /// <summary>
+    /// The slots given pixels since the stack was built, so releasing pixels
+    /// far from the viewport asks these rather than every page in the book. A
+    /// slot stays listed until a pass releases it; a render that lands after
+    /// that lists it again.
+    /// </summary>
+    private readonly HashSet<PageSlot> _slotsWithPixels = new();
+
+    /// <summary>
+    /// A slot's position in the stack: its page number in continuous view,
+    /// where the stack holds every page in order, and a search otherwise, where
+    /// single-page view holds one slot. -1 for a slot no longer in the stack.
+    /// </summary>
+    private int StackIndexOf(PageSlot slot) =>
+        PageSlots.Count == PageCount
+        && ReferenceEquals(SlotFor(slot.PageIndex), slot)
+            ? slot.PageIndex
+            : PageSlots.IndexOf(slot);
+
     /// <summary>Slot-space size of the whole stack, for the scroll content.</summary>
     public double ContentWidth => _layout.LayoutWidth;
 
@@ -3106,6 +3125,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void RebuildContinuousLayoutCore()
     {
         PageSlots.Clear();
+        _slotsWithPixels.Clear();
         _layout.Rebuild([], SlotLayoutWidth, ViewRotation);
 
         if (_documentHandle == 0)
@@ -3582,12 +3602,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _lastViewLeft = horizontalOffset / zoom;
         _lastViewRight = (horizontalOffset + viewportWidth) / zoom;
 
+        long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
         var (first, last) = _layout.VisibleRange(viewTop, viewBottom);
         if (first < 0)
         {
             return;
         }
 
+        long pageChangeAt = System.Diagnostics.Stopwatch.GetTimestamp();
         int page = _layout.DominantPage(viewTop, viewBottom);
         if (page != CurrentPageIndex)
         {
@@ -3595,22 +3617,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             OnCurrentPageChangedByScroll();
         }
 
+        long pixelsAt = System.Diagnostics.Stopwatch.GetTimestamp();
         var (renderFrom, renderTo) = RenderBudget.Widen(first, last, RenderAheadPages, PageSlots.Count);
         var (keepFrom, keepTo) = RenderBudget.Widen(first, last, ReleaseBeyondPages, PageSlots.Count);
 
-        for (int i = 0; i < PageSlots.Count; i++)
+        // Outside the keep window: drop pixels, keep the slot's size.
+        //
+        // ⚠️ ONLY THE SLOTS HOLDING PIXELS, not every slot in the stack. This
+        // walked all 39881 slots of a real book on every scroll step. Every
+        // path that gives a slot pixels lists it in _slotsWithPixels.
+        foreach (var held in _slotsWithPixels.ToArray())
         {
-            var slot = PageSlots[i];
-
-            if (i < keepFrom || i > keepTo)
+            int index = StackIndexOf(held);
+            if (index >= keepFrom && index <= keepTo)
             {
-                // Outside the keep window: drop pixels, keep the slot's size.
-                if (slot.Bitmap is not null || slot.BaseBitmap is not null)
-                {
-                    slot.ReleaseBitmap();
-                }
                 continue;
             }
+
+            if (held.Bitmap is not null || held.BaseBitmap is not null)
+            {
+                held.ReleaseBitmap();
+            }
+            _slotsWithPixels.Remove(held);
+        }
+
+        for (int i = keepFrom; i <= keepTo && i < PageSlots.Count; i++)
+        {
+            var slot = PageSlots[i];
 
             // Inside the keep window but outside the sharpening window: give
             // back the expensive bitmap and show the cached base render. This
@@ -3632,6 +3665,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // just burn the UI thread on bitmaps that are obsolete before they
         // finish. One pass once the view settles.
         ScheduleSharpenPass();
+
+        // Which part, when the whole is slow enough for UiStall to report it.
+        long endedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(startedAt, endedAt).TotalMilliseconds >= 100)
+        {
+            Diag.Log("slow: UpdateVisibleWindow parts: "
+                     + $"range {System.Diagnostics.Stopwatch.GetElapsedTime(startedAt, pageChangeAt).TotalMilliseconds:F0} ms, "
+                     + $"page change {System.Diagnostics.Stopwatch.GetElapsedTime(pageChangeAt, pixelsAt).TotalMilliseconds:F0} ms, "
+                     + $"pixels {System.Diagnostics.Stopwatch.GetElapsedTime(pixelsAt, endedAt).TotalMilliseconds:F0} ms");
+        }
     }
 
     /// <summary>
@@ -3693,6 +3736,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 using (UiStall.Section("SetBaseRender"))
                 {
                     slot.SetBaseRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                    _slotsWithPixels.Add(slot);
                 }
                 Diag.Log($"base {pageIndex}: {raw.Width}x{raw.Height} {raw.Outcome}");
             }
@@ -3861,6 +3905,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             slot.ContentWidth, slot.ContentHeight, level, pageLeft, pageTop, pageRight, pageBottom);
 
         var added = slot.SyncTiles(wanted, level);
+        _slotsWithPixels.Add(slot);
 
         // Reuse is the whole point of tiling, so it is the number worth
         // watching: after a pan, most of the wanted tiles should already be on
@@ -3946,6 +3991,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 using (UiStall.Section("SetSharpRender"))
                 {
                     slot.SetSharpRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                    _slotsWithPixels.Add(slot);
                 }
                 Diag.Log($"sharpened {pageIndex} to {raw.Width}x{raw.Height}");
             }
@@ -3967,13 +4013,17 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private void DistributeAnnotationsToSlots()
     {
         using var uiStall = UiStall.Section("DistributeAnnotations");
+        // ⚠️ CLEARED ONLY WHEN THERE IS SOMETHING TO CLEAR. This runs on every
+        // page change while scrolling, over every slot, and an empty collection
+        // still raises three change notifications when cleared: hundreds of
+        // thousands per page change on a 39881-page book, for nothing.
         foreach (var slot in PageSlots)
         {
-            slot.Highlights.Clear();
-            slot.InkStrokes.Clear();
-            slot.Shapes.Clear();
-            slot.Notes.Clear();
-            slot.SelectionRects.Clear();
+            if (slot.Highlights.Count > 0) { slot.Highlights.Clear(); }
+            if (slot.InkStrokes.Count > 0) { slot.InkStrokes.Clear(); }
+            if (slot.Shapes.Count > 0) { slot.Shapes.Clear(); }
+            if (slot.Notes.Count > 0) { slot.Notes.Clear(); }
+            if (slot.SelectionRects.Count > 0) { slot.SelectionRects.Clear(); }
 
             // NOT SearchMatchRects. Search owns its own highlight now and
             // refreshes it only when the selected match moves. This ran on
@@ -3992,7 +4042,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         foreach (var slot in PageSlots)
         {
-            slot.RebuildHighlightRects();
+            // A slot with no highlights and nothing drawn has nothing to rebuild.
+            if (slot.Highlights.Count > 0 || slot.HighlightRects.Count > 0)
+            {
+                slot.RebuildHighlightRects();
+            }
         }
 
         foreach (var sh in _allShapes)
@@ -4520,12 +4574,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         using var uiStall = UiStall.Section("RefreshSelectionOutline");
         foreach (var slot in PageSlots)
         {
-            slot.SelectionOutline.Clear();
-            slot.SelectionGrips.Clear();
-            slot.ExtraSelectionOutlines.Clear();
-            slot.PageTextOutline.Clear();
-            slot.PageTextHandles.Clear();
-            slot.PageTextNotice.Clear();
+            // Only what holds something: an empty clear still notifies, and this
+            // walks every slot in the book.
+            if (slot.SelectionOutline.Count > 0) { slot.SelectionOutline.Clear(); }
+            if (slot.SelectionGrips.Count > 0) { slot.SelectionGrips.Clear(); }
+            if (slot.ExtraSelectionOutlines.Count > 0) { slot.ExtraSelectionOutlines.Clear(); }
+            if (slot.PageTextOutline.Count > 0) { slot.PageTextOutline.Clear(); }
+            if (slot.PageTextHandles.Count > 0) { slot.PageTextHandles.Clear(); }
+            if (slot.PageTextNotice.Count > 0) { slot.PageTextNotice.Clear(); }
             slot.SelectionRotation = 0; // nothing turned unless a rotated box says so below
         }
 
@@ -10970,7 +11026,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public void RefreshTextRegions()
     {
         using var uiStall = UiStall.Section("RefreshTextRegions");
-        foreach (var slot in PageSlots) { slot.TextRegionOutlines.Clear(); }
+        foreach (var slot in PageSlots)
+        {
+            if (slot.TextRegionOutlines.Count > 0) { slot.TextRegionOutlines.Clear(); }
+        }
 
         if (!IsEditMode || _documentHandle == 0 || PageSlots.Count == 0)
         {
@@ -12875,10 +12934,30 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public bool PageHasText(int pageIndex) => (TextLayerFor(pageIndex)?.CharCount ?? 0) > 0;
 
     /// <summary>Shown in the status pill so "why can't I select?" answers itself.</summary>
-    public string TextAvailabilityLabel =>
-        PageCount == 0 ? string.Empty
-        : PageHasText(CurrentPageIndex) ? string.Empty
-        : "Scanned page – no text";
+    /// <remarks>
+    /// ⚠️ NEVER READS A PAGE ON THE UI THREAD. It is asked on every page change,
+    /// and reading a dense page's characters took up to 122 ms inside the
+    /// scroll handler, a hitch each time the reader scrolled onto a new page.
+    /// A page not read yet shows nothing until its layer lands from the pool.
+    /// </remarks>
+    public string TextAvailabilityLabel
+    {
+        get
+        {
+            if (PageCount == 0)
+            {
+                return string.Empty;
+            }
+
+            if (!_textLayers.TryGetValue(CurrentPageIndex, out var layer))
+            {
+                _ = LoadTextLayerInBackgroundAsync(CurrentPageIndex);
+                return string.Empty;
+            }
+
+            return (layer?.CharCount ?? 0) > 0 ? string.Empty : "Scanned page – no text";
+        }
+    }
 
     // ---------------- Marquee (geometric) selection ----------------
 
@@ -14767,7 +14846,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Diag.Log($"handover {_documentHandle}->{restored} ready {readyBefore}->{readyAfter}");
         CloseCurrentDocument();
         _documentHandle = restored;
-        _textLayers.Clear();
+        ForgetTextLayers();
         ClearSelection();
         ClearLoadedAnnotations();
         // The form goes with it. Undoing a form edit restores the document's
@@ -15079,7 +15158,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
                 // A document-scope undo can restore a different page count and
                 // ordering, so index-keyed layers are no longer trustworthy.
-                _textLayers.Clear();
+                ForgetTextLayers();
                 ClearSelection();
 
                 // The loaded-annotation cache describes the document we just
@@ -15123,25 +15202,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // the flat lists has to be fanned back out to the slots.
         DistributeAnnotationsToSlots();
 
-        Highlights.Clear();
+        // Not when already empty: clearing notifies, and the ink strokes'
+        // notification redraws the whole ink layer on every page change.
+        if (Highlights.Count > 0) { Highlights.Clear(); }
         foreach (var h in _allHighlights.Where(h => h.PageIndex == CurrentPageIndex))
         {
             Highlights.Add(h);
         }
 
-        Notes.Clear();
+        // Not when already empty: clearing notifies, and the ink strokes'
+        // notification redraws the whole ink layer on every page change.
+        if (Notes.Count > 0) { Notes.Clear(); }
         foreach (var n in _allNotes.Where(n => n.PageIndex == CurrentPageIndex))
         {
             Notes.Add(n);
         }
 
-        Shapes.Clear();
+        // Not when already empty: clearing notifies, and the ink strokes'
+        // notification redraws the whole ink layer on every page change.
+        if (Shapes.Count > 0) { Shapes.Clear(); }
         foreach (var sh in _allShapes.Where(sh => sh.PageIndex == CurrentPageIndex))
         {
             Shapes.Add(sh);
         }
 
-        InkStrokes.Clear();
+        // Not when already empty: clearing notifies, and the ink strokes'
+        // notification redraws the whole ink layer on every page change.
+        if (InkStrokes.Count > 0) { InkStrokes.Clear(); }
         foreach (var st in _allInkStrokes.Where(st => st.PageIndex == CurrentPageIndex))
         {
             InkStrokes.Add(st);
@@ -15497,6 +15584,66 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// evicted; opening another document clears the lot.
     /// </summary>
     private readonly Dictionary<int, PageTextLayer?> _textLayers = new();
+
+    /// <summary>
+    /// Bumped whenever the text layers are thrown away, so a load already in
+    /// flight cannot put back a layer describing the document as it was.
+    /// </summary>
+    private int _textLayerEpoch;
+
+    /// <summary>Pages whose layer is being read on the pool for the status label.</summary>
+    private readonly HashSet<int> _textLayersLoading = new();
+
+    /// <summary>Throws away every page's text layer. The only way they are dropped.</summary>
+    private void ForgetTextLayers()
+    {
+        _textLayers.Clear();
+        _textLayerEpoch++;
+    }
+
+    /// <summary>
+    /// Reads a page's text layer on the pool and hands it to the cache on the
+    /// UI thread, then raises the status label if that page is still current.
+    /// </summary>
+    private async Task LoadTextLayerInBackgroundAsync(int pageIndex)
+    {
+        if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount
+            || !_textLayersLoading.Add(pageIndex))
+        {
+            return;
+        }
+
+        ulong handle = _documentHandle;
+        int epoch = _textLayerEpoch;
+        int width = (int)SlotLayoutWidth;
+        PageTextLayer? layer;
+        try
+        {
+            layer = await Task.Run(() => TextLayerLoader.Load(handle, pageIndex, width));
+        }
+        catch (Exception ex)
+        {
+            _textLayersLoading.Remove(pageIndex);
+            Diag.Log($"text layer p{pageIndex} failed: {ex.Message}");
+            return;
+        }
+
+        _textLayersLoading.Remove(pageIndex);
+
+        // Stored only if nothing has been replaced, restructured or edited
+        // since, and a layer the UI thread read meanwhile is kept.
+        if (handle == _documentHandle && epoch == _textLayerEpoch)
+        {
+            _textLayers.TryAdd(pageIndex, layer);
+        }
+
+        // Raised either way: when the load was stale, asking again starts a
+        // fresh one for the document as it is now.
+        if (handle == _documentHandle && pageIndex == CurrentPageIndex)
+        {
+            OnPropertyChanged(nameof(TextAvailabilityLabel));
+        }
+    }
 
     /// <summary>
     /// The text layer for a page, extracted in SLOT space on first use.
