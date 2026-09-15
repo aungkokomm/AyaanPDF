@@ -37,11 +37,23 @@ public sealed class PageStackLayout : VirtualizingLayout
     /// <summary>Gap between cards. Must equal the view model's page gap.</summary>
     public double Spacing { get; set; } = 16;
 
+    /// <summary>
+    /// The slots the repeater shows, read directly when building the geometry.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ASKING THE CONTEXT IS A TRIP PER PAGE. <c>context.GetItemAt</c> goes
+    /// through the repeater's WinRT view of the list, and building the geometry
+    /// that way for a 39,881-page book took 250 to 300 ms of the UI thread on
+    /// every open. The same objects, read from the list itself, cost nothing.
+    /// Used only while its count matches the context's; the context is the
+    /// fallback, and the answer either way.
+    /// </remarks>
+    public IReadOnlyList<PageSlot>? Slots { get; set; }
+
     protected override void OnItemsChangedCore(
         VirtualizingLayoutContext context, object source, NotifyCollectionChangedEventArgs args)
     {
-        // Rebuilt once, at the next measure. The view model refills the stack
-        // with one Add per page, so rebuilding here would be once per page.
+        // Rebuilt once, at the next measure, however the stack was refilled.
         _geometry = null;
         base.OnItemsChangedCore(context, source, args);
     }
@@ -86,8 +98,15 @@ public sealed class PageStackLayout : VirtualizingLayout
 
         using var uiStall = UiStall.Section("PageStack.Geometry");
         var geometry = new PageStackGeometry(Spacing);
-        geometry.Rebuild(context.ItemCount, i =>
-            context.GetItemAt(i) is PageSlot slot ? (slot.SlotWidth, slot.SlotHeight) : (0, 0));
+        if (Slots is { } slots && slots.Count == context.ItemCount)
+        {
+            geometry.Rebuild(slots.Count, i => (slots[i].SlotWidth, slots[i].SlotHeight));
+        }
+        else
+        {
+            geometry.Rebuild(context.ItemCount, i =>
+                context.GetItemAt(i) is PageSlot slot ? (slot.SlotWidth, slot.SlotHeight) : (0, 0));
+        }
         _geometry = geometry;
         return geometry;
     }

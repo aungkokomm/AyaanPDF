@@ -147,6 +147,10 @@ public sealed partial class MainPage : Page
         // that is the signal to rebuild the document in the new order.
         ViewModel.Thumbnails.CollectionChanged += Thumbnails_CollectionChanged;
 
+        // The page stack's layout reads card sizes from the list itself rather
+        // than asking the repeater for each of 39,881 items. See its Slots.
+        PageCardLayout.Slots = ViewModel.PageSlots;
+
         // When the loaded selection changes to (or from) one of our text boxes,
         // the toolbar's font/fill/outline sections need to show up (or hide) even
         // though the active tool has not changed. Any tool + a selected text box
@@ -715,6 +719,12 @@ public sealed partial class MainPage : Page
             }
 
             PushVisibleWindow();
+
+            // The rulers wait for the layout's page sizes rather than reading
+            // them early, so they are drawn here, once there are sizes to draw.
+            // A restore that happens not to move the view raises no ViewChanged
+            // to do it.
+            RedrawRulers();
         });
     }
 

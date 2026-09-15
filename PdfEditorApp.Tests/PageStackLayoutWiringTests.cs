@@ -41,7 +41,7 @@ public class PageStackLayoutWiringTests
         // pages near 36000.
         string stack = PageStack();
 
-        Assert.Contains("<controls:PageStackLayout Spacing=\"16\" />", stack, StringComparison.Ordinal);
+        Assert.Contains("<controls:PageStackLayout x:Name=\"PageCardLayout\" Spacing=\"16\" />", stack, StringComparison.Ordinal);
         Assert.DoesNotContain("<StackLayout", stack, StringComparison.Ordinal);
     }
 

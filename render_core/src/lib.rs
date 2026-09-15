@@ -8936,14 +8936,6 @@ fn declares_no_form_fields(path: &str) -> bool {
 fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     use pdfium_render::prelude::*;
 
-    let _guard = call_guard();
-    let doc = lock(&core().documents).get(&doc_handle).cloned();
-    let Some(doc) = doc else {
-        return ByteBuffer::err(STATUS_INVALID_INPUT);
-    };
-
-    let doc_guard = lock(&doc);
-
     // Ask whether the document has a form AT ALL before walking it.
     //
     // The loop below iterates pages, and iterating pages LOADS them. On a
@@ -8953,8 +8945,14 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     //
     // FPDF_GetFormType reads the catalog and answers in constant time. Almost
     // every PDF that is not a form answers NONE here and never touches a page.
-    if doc_guard.form().is_none() {
-        return no_form_fields();
+    {
+        let _guard = call_guard();
+        let Some(doc) = lock(&core().documents).get(&doc_handle).cloned() else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        if lock(&doc).form().is_none() {
+            return no_form_fields();
+        }
     }
 
     // FPDF_GetFormType only says the /AcroForm dictionary EXISTS. A book can
@@ -8967,10 +8965,24 @@ fn get_form_fields_inner(doc_handle: u64) -> ByteBuffer {
     // fields. Anything else -- fields present, no /Fields at all, a file lopdf
     // will not parse, contents that are no longer the file's -- falls through
     // to the walk, which is the answer we had before.
+    //
+    // ⚠️ WITH NO CORE LOCK HELD. lopdf reads the file off disk and touches no
+    // PDFium state, and on that 39,881-page book it takes over a second. Held
+    // under CALL_LOCK, that second stopped every other core call, page renders
+    // in every tab included, so the app could be asked for its form fields in
+    // the background and still freeze the page the reader was looking at.
     let source = lock(&core().sources).get(&doc_handle).cloned();
     if source.is_some_and(|path| declares_no_form_fields(&path)) {
         return no_form_fields();
     }
+
+    let _guard = call_guard();
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    let doc_guard = lock(&doc);
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&0u32.to_le_bytes()); // count placeholder, backfilled below
@@ -15256,6 +15268,49 @@ mod tests {
         }
 
         free_page_size_array(array);
+        close_document(handle);
+    }
+
+    /// Times each native step the app runs on the UI thread while opening a
+    /// reader's own file, in the app's order and through the app's own open.
+    /// Ignored because the file lives on the reader's machine: AYAAN_OPEN_PDF
+    /// names it.
+    #[test]
+    #[ignore]
+    fn how_long_each_step_of_opening_a_real_file_takes() {
+        let path = std::env::var("AYAAN_OPEN_PDF").expect("set AYAAN_OPEN_PDF");
+        let c_path = std::ffi::CString::new(path).unwrap();
+        let ms = |since: std::time::Instant| since.elapsed().as_secs_f64() * 1000.0;
+
+        let clock = std::time::Instant::now();
+        let opened = open_document_protected(c_path.as_ptr(), std::ptr::null());
+        println!("open_document_protected: {:.0} ms (status {})", ms(clock), opened.status);
+        let handle = opened.handle;
+        assert_ne!(handle, 0);
+
+        let clock = std::time::Instant::now();
+        let count = get_page_count(handle);
+        println!("get_page_count ({count} pages): {:.0} ms", ms(clock));
+
+        let clock = std::time::Instant::now();
+        get_page_count(handle);
+        println!("get_page_count again: {:.0} ms", ms(clock));
+
+        let clock = std::time::Instant::now();
+        let sizes = get_page_sizes(handle);
+        println!("get_page_sizes ({} sizes): {:.0} ms", sizes.len, ms(clock));
+        free_page_size_array(sizes);
+
+        let clock = std::time::Instant::now();
+        let fields = get_form_fields(handle);
+        println!("get_form_fields (status {}, {} bytes): {:.0} ms", fields.status, fields.len, ms(clock));
+        free_byte_buffer(fields);
+
+        let source = lock(&core().sources).get(&handle).cloned().unwrap();
+        let clock = std::time::Instant::now();
+        let none = declares_no_form_fields(&source);
+        println!("declares_no_form_fields = {none}: {:.0} ms", ms(clock));
+
         close_document(handle);
     }
 

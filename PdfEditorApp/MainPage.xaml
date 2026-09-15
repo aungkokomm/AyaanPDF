@@ -622,7 +622,7 @@
                 -->
                 <ItemsRepeater ItemsSource="{x:Bind ViewModel.PageSlots}" HorizontalAlignment="Center">
                     <ItemsRepeater.Layout>
-                        <controls:PageStackLayout Spacing="16" />
+                        <controls:PageStackLayout x:Name="PageCardLayout" Spacing="16" />
                     </ItemsRepeater.Layout>
                     <ItemsRepeater.ItemTemplate>
                         <DataTemplate x:DataType="viewmodels:PageSlot">

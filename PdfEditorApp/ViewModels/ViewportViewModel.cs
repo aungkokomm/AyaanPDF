@@ -274,7 +274,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     public partial int PageCount { get; set; }
 
     /// <summary>Sidebar entries — one per page, rendered lazily as MainPage's virtualized ListView realizes each item's container.</summary>
-    public ObservableCollection<PageThumbnail> Thumbnails { get; } = new();
+    public BulkObservableCollection<PageThumbnail> Thumbnails { get; } = new();
 
     [ObservableProperty]
     public partial string SearchQuery { get; set; } = string.Empty;
@@ -831,6 +831,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Reads the document's form fields. Cheap; called on open and after page-structure changes.</summary>
     private void LoadFormFields()
     {
+        _formFieldsGeneration++;
         _formFields.Clear();
         HasFillableForm = false;
         if (_documentHandle == 0)
@@ -838,14 +839,82 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var buf = RenderCoreNative.get_form_fields(_documentHandle);
+        _formFields.AddRange(ReadFormFields(_documentHandle));
+        ApplyFormFieldsRead();
+    }
+
+    /// <summary>
+    /// <see cref="LoadFormFields"/> for a document just opened, with the native
+    /// read on the pool.
+    /// </summary>
+    /// <remarks>
+    /// Opening does not need the answer to draw a page: it decides whether the
+    /// Fill Form button shows. And the answer can be slow, over a second on a
+    /// 39,881-page book that declares an empty form, which was a second of the
+    /// UI thread held while the reader waited for the first page. A result
+    /// that arrives after the document was closed, or after something else
+    /// read the fields again, is dropped.
+    /// </remarks>
+    private async Task LoadFormFieldsInBackgroundAsync()
+    {
+        int generation = ++_formFieldsGeneration;
+        _formFields.Clear();
+        HasFillableForm = false;
+
+        ulong handle = _documentHandle;
+        if (handle == 0)
+        {
+            return;
+        }
+
+        List<FormField> fields;
+        try
+        {
+            fields = await Task.Run(() => ReadFormFields(handle));
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"form fields: background read failed: {ex.Message}");
+            return;
+        }
+
+        if (_documentHandle != handle || generation != _formFieldsGeneration)
+        {
+            return;
+        }
+
+        _formFields.AddRange(fields);
+        ApplyFormFieldsRead();
+        if (ShowFormFields)
+        {
+            DistributeFormOutlines();
+        }
+    }
+
+    /// <summary>Bumped by every read of the form fields, so a late one knows it was overtaken.</summary>
+    private int _formFieldsGeneration;
+
+    private void ApplyFormFieldsRead()
+    {
+        HasFillableForm = _formFields.Any(f => f.IsFillable);
+        if (!HasFillableForm)
+        {
+            ShowFormFields = false;
+        }
+    }
+
+    /// <summary>Every form field in a document, read through the core. Safe off the UI thread.</summary>
+    private static List<FormField> ReadFormFields(ulong handle)
+    {
+        var fields = new List<FormField>();
+        var buf = RenderCoreNative.get_form_fields(handle);
         try
         {
             if (buf.Status == (int)RenderStatus.OkPdfium && buf.Data != IntPtr.Zero && buf.Len > 0)
             {
                 byte[] bytes = new byte[(int)buf.Len];
                 Marshal.Copy(buf.Data, bytes, 0, bytes.Length);
-                _formFields.AddRange(FormFieldReader.Parse(bytes));
+                fields.AddRange(FormFieldReader.Parse(bytes));
             }
         }
         finally
@@ -853,12 +922,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RenderCoreNative.free_byte_buffer(buf);
         }
 
-        HasFillableForm = _formFields.Any(f => f.IsFillable);
-        if (!HasFillableForm)
-        {
-            ShowFormFields = false;
-        }
+        return fields;
     }
+
+    /// <summary>A placeholder thumbnail for every page, for one ReplaceAll.</summary>
+    private IEnumerable<PageThumbnail> ThumbnailPlaceholders() =>
+        Enumerable.Range(0, PageCount).Select(i => new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
 
     partial void OnShowFormFieldsChanged(bool value)
     {
@@ -1277,13 +1346,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return DocumentOpenOutcome.Failed;
         }
 
-        PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
-        Stage($"get_page_count ({PageCount} pages)");
+        int pageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
+        Stage($"get_page_count ({pageCount} pages)");
 
-        for (int i = 0; i < PageCount; i++)
-        {
-            Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
-        }
+        // Timed on its own. Setting it redraws the document's chrome, rulers
+        // included, and that cost used to hide inside the native call's line.
+        PageCount = pageCount;
+        Stage("PageCount (chrome and rulers)");
+
+        Thumbnails.ReplaceAll(ThumbnailPlaceholders());
         Stage($"{PageCount} thumbnail placeholders");
 
         CurrentPageIndex = 0;
@@ -1293,8 +1364,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Stage("RenderCurrentPage");
         ReportExistingAnnotations();
         Stage("ReportExistingAnnotations");
-        LoadFormFields();
-        Stage("LoadFormFields");
+        _ = LoadFormFieldsInBackgroundAsync();
+        Stage("LoadFormFields (started in the background)");
         LoadBookmarks();
         Stage("LoadBookmarks");
         LoadGuidesFromSidecar();
@@ -1544,11 +1615,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // Later pages all shifted down one, so cached thumbnails (rendered at
         // the old indices) are stale; rebuild and let virtualization re-render.
-        Thumbnails.Clear();
-        for (int i = 0; i < PageCount; i++)
-        {
-            Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
-        }
+        Thumbnails.ReplaceAll(ThumbnailPlaceholders());
 
         if (CurrentPageIndex >= PageCount)
         {
@@ -1700,6 +1767,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         // The rulers call this on every scroll step, so it reads the cache. See
         // PagePointsFor for what the fresh read cost on a large book.
+        //
+        // ⚠️ AND NEVER FILLS IT. Opening a document sets PageCount, which
+        // redraws the rulers, BEFORE the layout reads the page sizes. Answering
+        // from PagePointsFor then read every page's size for the rulers, and
+        // the layout threw that away and read them all again: two whole-book
+        // reads, about a second each on a 39,881-page book, on the UI thread.
+        // Until the layout has read them there is nothing to measure, and the
+        // next redraw after it has them draws the rulers.
+        if (_pageSizes is null) { return (0, 0); }
+
         var (w, h) = PagePointsFor(CurrentPageIndex);
         return w > 0 && h > 0 ? (w, h) : (612, 792); // US Letter
     }
@@ -2011,11 +2088,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         IsRebuildingPages = true;
         try
         {
-            Thumbnails.Clear();
-            for (int i = 0; i < PageCount; i++)
-            {
-                Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
-            }
+            Thumbnails.ReplaceAll(ThumbnailPlaceholders());
         }
         finally
         {
@@ -3010,7 +3083,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private double _lastViewLeft;
     private double _lastViewRight;
 
-    public ObservableCollection<PageSlot> PageSlots { get; } = new();
+    public BulkObservableCollection<PageSlot> PageSlots { get; } = new();
 
     /// <summary>
     /// The slots given pixels since the stack was built, so releasing pixels
@@ -3137,7 +3210,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        var layoutClock = System.Diagnostics.Stopwatch.StartNew();
         var sizes = PageSizes();
+        long sizesMs = layoutClock.ElapsedMilliseconds;
 
         // Single-page view lays out the page being read and nothing else, so
         // the scroll range is that page. The slots are therefore NOT one per
@@ -3146,14 +3221,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         int only = PageViewMode == PageViewMode.SinglePage ? CurrentPageIndex : -1;
 
         _layout.Rebuild(sizes, SlotLayoutWidth, ViewRotation, only);
-        foreach (var slot in _layout.Slots)
-        {
-            PageSlots.Add(new PageSlot(slot.PageIndex, slot.Transform));
-        }
+
+        // One notification for the whole stack, not one per page. See
+        // BulkObservableCollection.
+        PageSlots.ReplaceAll(_layout.Slots.Select(slot => new PageSlot(slot.PageIndex, slot.Transform)));
+        long slotsMs = layoutClock.ElapsedMilliseconds - sizesMs;
 
         Diag.Log($"layout: {PageSlots.Count} slots, content {ContentWidth:F0}x{ContentHeight:F0}" +
                  (ViewRotation != 0 ? $", view rotated {ViewRotation}" : string.Empty) +
-                 (only >= 0 ? $", single page {only}" : string.Empty));
+                 (only >= 0 ? $", single page {only}" : string.Empty) +
+                 $" (page sizes {sizesMs} ms, slots {slotsMs} ms)");
 
         DistributeAnnotationsToSlots();
 
@@ -14957,11 +15034,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // and an undone form edit was as invisible as the edit had been.
         InvalidateAllPageRasters();
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
-        Thumbnails.Clear();
-        for (int i = 0; i < PageCount; i++)
-        {
-            Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
-        }
+        Thumbnails.ReplaceAll(ThumbnailPlaceholders());
     }
 
     /// <summary>The tag and rectangle of one annotation right now, for
@@ -15267,11 +15340,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                 ClearLoadedAnnotations();
 
                 PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
-                Thumbnails.Clear();
-                for (int i = 0; i < PageCount; i++)
-                {
-                    Thumbnails.Add(new PageThumbnail(i) { CardWidth = ThumbnailDisplayWidth });
-                }
+                Thumbnails.ReplaceAll(ThumbnailPlaceholders());
             }
         }
 
@@ -15804,6 +15873,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             RenderCoreNative.close_document(_documentHandle);
             _documentHandle = 0;
         }
+
+        // The sizes belong to the document being closed. Kept, the next one's
+        // rulers would measure its first page by this one's.
+        _pageSizes = null;
     }
 
     /// <summary>
