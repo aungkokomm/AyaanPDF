@@ -97,6 +97,12 @@ public sealed partial class MainPage : Page
     {
         InitializeComponent();
 
+        // The menu bar is declared in this page, where its handlers and
+        // bindings are, and shown in the window's title bar, which puts the
+        // menu of the tab in front beside the app icon. It leaves this grid
+        // first, because an element can have only one parent.
+        RootGrid.Children.Remove(AppMenuBar);
+
         // DIAGNOSTIC (temporary): watch EVERY key that reaches RootGrid,
         // including ones an earlier handler already marked Handled. The normal
         // KeyDown handler below is skipped for those, so on its own it cannot
@@ -5133,6 +5139,12 @@ public sealed partial class MainPage : Page
     public void RunUndo() => ViewModel.Undo();
     public void RunRedo() => ViewModel.Redo();
 
+    /// <summary>
+    /// This document's menu bar. The window shows it in its title bar while
+    /// this tab is in front.
+    /// </summary>
+    public MenuBar Menu => AppMenuBar;
+
     private void PushWindowTitle() => DocumentTitleChanged?.Invoke(this);
 
     // ---------------- Go to page ----------------
@@ -5250,7 +5262,6 @@ public sealed partial class MainPage : Page
         var chrome = Theming.ChromeBrush(s.Theme);
         ToolRail.Background = chrome;
         PropertyBar.Background = chrome;
-        AppMenuBar.Background = chrome;
         StatusBar.Background = chrome;
         ThumbnailPanel.Background = chrome;
         BookmarkPanel.Background = chrome;
@@ -6524,6 +6535,50 @@ public sealed partial class MainPage : Page
     private void Undo_Click(object sender, RoutedEventArgs e) => ViewModel.Undo();
 
     private void Redo_Click(object sender, RoutedEventArgs e) => ViewModel.Redo();
+
+    // Edit > Cut, Copy and Paste do what Ctrl+X, Ctrl+C and Ctrl+V do on the
+    // page. The chords themselves stay in RootGrid_KeyDown.
+    private void Cut_Click(object sender, RoutedEventArgs e) => ViewModel.CutSelectedAnnotations();
+
+    private void Copy_Click(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.CopySelectedAnnotations()) { CopySelectedText(); }
+    }
+
+    private void Paste_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.IsEditingInPlace)
+        {
+            PasteIntoInPlaceEdit();
+        }
+        else
+        {
+            ViewModel.PasteAnnotations();
+        }
+    }
+
+    /// <summary>
+    /// Hands the keyboard back to the document after the menu has been used.
+    ///
+    /// The menu bar lives in the window's title bar, outside RootGrid, so while
+    /// a menu title holds focus no key reaches RootGrid_KeyDown: no shortcut
+    /// works and a line being edited takes no typing. A click focuses the title,
+    /// and closing its menu puts focus back on it. Queued, so it looks after
+    /// the menu has finished opening or closing; a title whose menu is open no
+    /// longer holds focus by then. Keyboard focus is left where it is, so the
+    /// bar can still be reached with Tab.
+    /// </summary>
+    private void AppMenuBar_GotFocus(object sender, RoutedEventArgs e)
+    {
+        DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+        {
+            if (XamlRoot is not null
+                && FocusManager.GetFocusedElement(XamlRoot) is MenuBarItem { FocusState: not FocusState.Keyboard })
+            {
+                RootGrid.Focus(FocusState.Programmatic);
+            }
+        });
+    }
 
     private void RotatePage_Click(object sender, RoutedEventArgs e) => ViewModel.RotateCurrentPage(90);
 

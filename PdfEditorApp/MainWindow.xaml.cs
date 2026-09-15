@@ -221,6 +221,7 @@ public sealed partial class MainWindow : Window
 
         Tabs.TabItems.Add(item);
         Tabs.SelectedItem = item;
+        ShowMenuOf(page);
         return page;
     }
 
@@ -252,6 +253,10 @@ public sealed partial class MainWindow : Window
         {
             AddDocumentTab(null);
         }
+
+        // Whatever is in front now. A closed document's menu must not stay in
+        // the title bar acting on a page that is gone.
+        ShowMenuOf(ActivePage);
     }
 
     private void Tabs_AddTabButtonClick(TabView sender, object args) => AddDocumentTab(null);
@@ -271,8 +276,19 @@ public sealed partial class MainWindow : Window
         {
             SetDocumentTitle(page.DocumentTitle);
         }
+        ShowMenuOf(ActivePage);
         RefreshQuickActions();
     }
+
+    /// <summary>
+    /// Shows the menu of the document in front in the title bar.
+    ///
+    /// Each page declares its own menu, because its entries call that page's
+    /// handlers and bind to its view model. An element has one parent, so
+    /// giving the host a new child takes the previous tab's menu out of the
+    /// tree, where its accelerators cannot answer a key.
+    /// </summary>
+    private void ShowMenuOf(MainPage? page) => MenuHost.Child = page?.Menu;
 
     /// <summary>
     /// Shows which file is open, and whether it has unsaved work.

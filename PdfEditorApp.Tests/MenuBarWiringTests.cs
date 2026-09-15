@@ -7,13 +7,15 @@ using Xunit;
 namespace PdfEditorApp.Tests;
 
 /// <summary>
-/// The menu bar across the top of a document.
+/// The menu bar, File to Help, in the window's title bar.
 /// </summary>
 /// <remarks>
 /// ⚠️ EVERY COMMAND USED TO SIT BEHIND ONE "Menu" BUTTON at the foot of the
 /// tool rail, opening sideways, which is not where anyone looks for File or
-/// Edit. These hold the move down: the bar is in its own row, nothing else is
-/// in that row, the old button is gone, and no command was lost on the way.
+/// Edit. It then spent one build as a row under the tab, which made the app's
+/// menu look like part of one document. These hold it in the title bar beside
+/// the icon: declared per page, shown by the window for the tab in front, and
+/// handing the keyboard back to the page once used.
 /// </remarks>
 public class MenuBarWiringTests
 {
@@ -34,6 +36,10 @@ public class MenuBarWiringTests
 
     private static string Code() => Source("PdfEditorApp", "MainPage.xaml.cs");
 
+    private static string WindowXaml() => Source("PdfEditorApp", "MainWindow.xaml");
+
+    private static string WindowCode() => Source("PdfEditorApp", "MainWindow.xaml.cs");
+
     private static string MenuBar()
     {
         string xaml = Xaml();
@@ -43,22 +49,128 @@ public class MenuBarWiringTests
         return xaml[at..end];
     }
 
+    private static string MenuBarTag()
+    {
+        string bar = MenuBar();
+        return bar[..bar.IndexOf('>')];
+    }
+
+    /// <summary>From a member's signature to the end of its body.</summary>
+    private static string Body(string code, string signature)
+    {
+        int at = code.IndexOf(signature, StringComparison.Ordinal);
+        Assert.True(at > 0, $"{signature} is gone");
+        int end = code.IndexOf("\n    }\n", at, StringComparison.Ordinal);
+        return code[at..end];
+    }
+
+    private static string Line(string code, string start)
+    {
+        int at = code.IndexOf(start, StringComparison.Ordinal);
+        Assert.True(at > 0, $"{start} is gone");
+        return code[at..code.IndexOf('\n', at)];
+    }
+
     [Fact]
-    public void the_bar_is_the_top_row_across_every_column()
+    public void the_menu_is_shown_in_the_title_bar_beside_the_icon()
+    {
+        string window = WindowXaml();
+        int bar = window.IndexOf("<Grid x:Name=\"AppTitleBar\"", StringComparison.Ordinal);
+        int icon = window.IndexOf("ms-appx:///Assets/AppIcon.ico", StringComparison.Ordinal);
+        int host = window.IndexOf("<Border x:Name=\"MenuHost\" Grid.Column=\"1\" />", StringComparison.Ordinal);
+        int quick = window.IndexOf("<Button x:Name=\"QuickOpen\"", StringComparison.Ordinal);
+        int drag = window.IndexOf("<Border x:Name=\"TitleDragArea\"", StringComparison.Ordinal);
+        int tabs = window.IndexOf("<TabView x:Name=\"Tabs\"", StringComparison.Ordinal);
+
+        Assert.True(bar > 0 && icon > bar && host > icon && quick > host && drag > quick && tabs > drag,
+            "the title bar should read icon, menu, quick actions, then the drag area, all above the tabs");
+
+        // ⚠️ Not inside the drag area: that region swallows clicks.
+        string dragArea = window[drag..window.IndexOf("</Border>", drag, StringComparison.Ordinal)];
+        Assert.DoesNotContain("MenuHost", dragArea, StringComparison.Ordinal);
+        Assert.Contains("SetTitleBar(TitleDragArea);", WindowCode(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void each_page_declares_its_menu_and_hands_it_to_the_window()
+    {
+        string code = Code();
+        int ctor = code.IndexOf("public MainPage()", StringComparison.Ordinal);
+        Assert.True(ctor > 0);
+        Assert.Contains("RootGrid.Children.Remove(AppMenuBar);", code[ctor..(ctor + 800)], StringComparison.Ordinal);
+        Assert.Contains("public MenuBar Menu => AppMenuBar;", code, StringComparison.Ordinal);
+
+        Assert.Contains("private void ShowMenuOf(MainPage? page) => MenuHost.Child = page?.Menu;",
+            WindowCode(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ A MENU LEFT BEHIND ACTS ON THE WRONG DOCUMENT. Every place the front
+    /// tab can change has to bring that tab's menu, and closing a tab must not
+    /// leave its menu in the title bar.
+    /// </summary>
+    [Fact]
+    public void whichever_tab_is_in_front_brings_its_own_menu()
+    {
+        string code = WindowCode();
+        Assert.Contains("ShowMenuOf(ActivePage);", Body(code, "private void Tabs_SelectionChanged("), StringComparison.Ordinal);
+        Assert.Contains("ShowMenuOf(page);", Body(code, "public MainPage AddDocumentTab("), StringComparison.Ordinal);
+        Assert.Contains("ShowMenuOf(ActivePage);", Body(code, "private async Task CloseTab("), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_page_keeps_no_row_for_it()
     {
         string xaml = Xaml();
-        string bar = MenuBar();
-
-        Assert.Contains("Grid.Row=\"0\"", bar[..bar.IndexOf('>')], StringComparison.Ordinal);
-        Assert.Contains("Grid.ColumnSpan=\"4\"", bar[..bar.IndexOf('>')], StringComparison.Ordinal);
-
         int root = xaml.IndexOf("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal);
-        int rows = xaml.IndexOf("<Grid.RowDefinitions>", root, StringComparison.Ordinal);
-        Assert.True(rows > root && rows < xaml.IndexOf("<MenuBar", StringComparison.Ordinal),
-            "the root grid has no rows for the bar to sit in");
-        string defs = xaml[rows..xaml.IndexOf("</Grid.RowDefinitions>", rows, StringComparison.Ordinal)];
-        Assert.Contains("<RowDefinition Height=\"Auto\" />", defs, StringComparison.Ordinal);
-        Assert.Contains("<RowDefinition Height=\"*\" />", defs, StringComparison.Ordinal);
+        int menu = xaml.IndexOf("<MenuBar x:Name=\"AppMenuBar\"", StringComparison.Ordinal);
+        Assert.True(root > 0 && menu > root);
+        Assert.DoesNotContain("<Grid.RowDefinitions>", xaml[root..menu], StringComparison.Ordinal);
+
+        string[] lines = xaml.Split('\n');
+        int rootLine = Array.FindIndex(lines, l => l.Contains("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal));
+        var rowed = lines
+            .Select((line, i) => (line, i))
+            .Skip(rootLine + 1)
+            .Where(x => Regex.IsMatch(x.line, @"^        <[A-Za-z]"))
+            .Where(x => x.line.Contains("Grid.Row=", StringComparison.Ordinal))
+            .Select(x => $"line {x.i + 1}: {x.line.Trim()}")
+            .ToList();
+        Assert.True(rowed.Count == 0, "still placed in a row: " + string.Join("; ", rowed));
+
+        Assert.DoesNotContain("Grid.", MenuBarTag(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The stock bar asks for 40 DIP and the title bar is 34, and its own
+    /// paint would sit as a block on the window's colour.
+    /// </summary>
+    [Fact]
+    public void the_bar_fits_the_title_bar_and_lets_the_window_colour_through()
+    {
+        string tag = MenuBarTag();
+        Assert.Contains("MinHeight=\"0\"", tag, StringComparison.Ordinal);
+        Assert.DoesNotContain("Background=", tag, StringComparison.Ordinal);
+        Assert.DoesNotContain("AppMenuBar.Background", Code(), StringComparison.Ordinal);
+
+        Assert.Equal(5, Regex.Matches(MenuBar(), "<MenuBarItem Title=\"[^\"]+\" Margin=\"2,3,2,3\">").Count);
+        Assert.Contains("private const double TitleBarHeight = 34;", WindowCode(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ OUTSIDE RootGrid, A FOCUSED MENU TITLE KEEPS EVERY KEY FROM THE PAGE.
+    /// Inside the page the keys bubbled up to RootGrid_KeyDown anyway; in the
+    /// title bar they do not, so after one click on File the shortcuts and
+    /// typing into a line being edited would go dead.
+    /// </summary>
+    [Fact]
+    public void using_the_menu_hands_the_keyboard_back_to_the_page()
+    {
+        Assert.Contains("GotFocus=\"AppMenuBar_GotFocus\"", MenuBarTag(), StringComparison.Ordinal);
+
+        string body = Body(Code(), "private void AppMenuBar_GotFocus(");
+        Assert.Contains("is MenuBarItem { FocusState: not FocusState.Keyboard }", body, StringComparison.Ordinal);
+        Assert.Contains("RootGrid.Focus(FocusState.Programmatic);", body, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -69,31 +181,6 @@ public class MenuBarWiringTests
             .ToArray();
 
         Assert.Equal(new[] { "File", "Edit", "View", "Page", "Help" }, titles);
-    }
-
-    /// <summary>
-    /// ⚠️ A GRID CHILD WITH NO ROW IS IN ROW ZERO, which is now the bar's.
-    /// The rail, the rulers, the page and the status bar would all have been
-    /// squeezed into a row the height of a menu.
-    /// </summary>
-    [Fact]
-    public void everything_else_on_the_page_is_in_the_content_row()
-    {
-        string[] lines = Xaml().Split('\n');
-        int root = Array.FindIndex(lines, l => l.Contains("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal));
-        Assert.True(root > 0);
-
-        var stray = lines
-            .Select((line, i) => (line, i))
-            .Skip(root + 1)
-            .Where(x => Regex.IsMatch(x.line, @"^        <[A-Za-z][A-Za-z0-9:]*(?=[\s>/]|$)"))
-            .Where(x => !Regex.IsMatch(x.line, @"^        <[A-Za-z][A-Za-z0-9:]*\."))
-            .Where(x => !x.line.Contains("<MenuBar ", StringComparison.Ordinal))
-            .Where(x => !x.line.Contains("Grid.Row=\"1\"", StringComparison.Ordinal))
-            .Select(x => $"line {x.i + 1}: {x.line.Trim()}")
-            .ToList();
-
-        Assert.True(stray.Count == 0, "not in the content row: " + string.Join("; ", stray));
     }
 
     [Fact]
@@ -115,6 +202,9 @@ public class MenuBarWiringTests
     [InlineData("Exit_Click")]
     [InlineData("Undo_Click")]
     [InlineData("Redo_Click")]
+    [InlineData("Cut_Click")]
+    [InlineData("Copy_Click")]
+    [InlineData("Paste_Click")]
     [InlineData("FindToggle_Click")]
     [InlineData("Group_Click")]
     [InlineData("Ungroup_Click")]
@@ -140,6 +230,46 @@ public class MenuBarWiringTests
         Assert.Contains($"Click=\"{handler}\"", MenuBar(), StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// ⚠️ TEXT ONLY. The chords are cases in the page's key handler; an
+    /// accelerator on the item would go live once Edit had been opened and
+    /// take Ctrl+C from every text field.
+    /// </summary>
+    [Theory]
+    [InlineData("Cut", "Ctrl+X")]
+    [InlineData("Copy", "Ctrl+C")]
+    [InlineData("Paste", "Ctrl+V")]
+    public void cut_copy_and_paste_are_in_edit_and_print_their_chord_without_taking_it(string text, string chord)
+    {
+        string bar = MenuBar();
+        int at = bar.IndexOf($"<MenuFlyoutItem Text=\"{text}\" ", StringComparison.Ordinal);
+        Assert.True(at > 0, $"there is no {text} in the menu");
+
+        int edit = bar.IndexOf("<MenuBarItem Title=\"Edit\"", StringComparison.Ordinal);
+        int view = bar.IndexOf("<MenuBarItem Title=\"View\"", StringComparison.Ordinal);
+        Assert.True(at > edit && at < view, $"{text} is not under Edit");
+
+        string item = bar[at..bar.IndexOf("</MenuFlyoutItem>", at, StringComparison.Ordinal)];
+        Assert.Contains($"KeyboardAcceleratorTextOverride=\"{chord}\"", item, StringComparison.Ordinal);
+        Assert.DoesNotContain("<KeyboardAccelerator ", item, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void cut_copy_and_paste_do_what_the_chords_do()
+    {
+        string code = Code();
+
+        Assert.Contains("ViewModel.CutSelectedAnnotations()", Line(code, "private void Cut_Click("), StringComparison.Ordinal);
+
+        Assert.Contains("if (!ViewModel.CopySelectedAnnotations()) { CopySelectedText(); }",
+            Body(code, "private void Copy_Click("), StringComparison.Ordinal);
+
+        string paste = Body(code, "private void Paste_Click(");
+        Assert.Contains("ViewModel.IsEditingInPlace", paste, StringComparison.Ordinal);
+        Assert.Contains("PasteIntoInPlaceEdit();", paste, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.PasteAnnotations();", paste, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void the_submenus_filled_from_code_are_still_there_once()
     {
@@ -151,7 +281,7 @@ public class MenuBarWiringTests
     }
 
     [Fact]
-    public void full_screen_takes_the_bar_away_and_the_theme_paints_it()
+    public void full_screen_takes_the_bar_away()
     {
         string code = Code();
 
@@ -160,6 +290,7 @@ public class MenuBarWiringTests
         Assert.Contains("AppMenuBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;",
             code[presenting..(presenting + 2000)], StringComparison.Ordinal);
 
-        Assert.Contains("AppMenuBar.Background = chrome;", code, StringComparison.Ordinal);
+        Assert.Contains("AppTitleBar.Visibility = full ? Visibility.Collapsed : Visibility.Visible;",
+            WindowCode(), StringComparison.Ordinal);
     }
 }

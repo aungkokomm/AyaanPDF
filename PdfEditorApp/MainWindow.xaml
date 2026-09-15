@@ -63,6 +63,7 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
 
@@ -71,7 +72,7 @@
                 page. ms-appx resolves to the app folder for an unpackaged app,
                 which is why the csproj had to start copying the .ico there.
             -->
-            <StackPanel Orientation="Horizontal" Spacing="8" Margin="12,0,14,0"
+            <StackPanel Orientation="Horizontal" Margin="12,0,6,0"
                         VerticalAlignment="Center">
                 <!-- Left as a plain .ico source on purpose. At 18 DIP the
                      decoder picks a small frame and renders it at close to its
@@ -79,11 +80,24 @@
                      forced a large frame to be squeezed into 27 real pixels and
                      made it visibly WORSE, so this one is better left alone. -->
                 <Image Source="ms-appx:///Assets/AppIcon.ico" Width="18" Height="18" />
-                <TextBlock x:Name="TitleText" Text="Ayaan PDF" VerticalAlignment="Center"
-                           Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="1" VerticalAlignment="Center">
+            <!--
+                THE MENU of the tab in front, File to Help, beside the icon where
+                every desktop app keeps it. The window only hosts it: each
+                MainPage declares its own, because the entries call that page's
+                handlers and bind to its view model, and ShowMenuOf swaps it in
+                when the front tab changes. One page's menu is in the tree at a
+                time, so a tab behind cannot act on keys meant for the one on
+                screen.
+
+                Its own column, NOT inside TitleDragArea, which swallows clicks.
+            -->
+            <Border x:Name="MenuHost" Grid.Column="1" />
+
+            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="1" VerticalAlignment="Center">
+                <Rectangle Width="1" Height="14" Margin="4,0,5,0"
+                           Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
                 <Button x:Name="QuickOpen" AutomationProperties.Name="Open" Click="QuickOpen_Click" Width="30" Height="28" Padding="0"
                         Background="Transparent" BorderThickness="0"
                         ToolTipService.ToolTip="Open (Ctrl+O)">
@@ -109,11 +123,17 @@
             </StackPanel>
 
             <!--
-                The draggable remainder, deliberately empty: the tabs below
-                already name every open document, and the taskbar gets the
-                document name through Window.Title.
+                The draggable remainder. It carries the app's name and build and
+                nothing that has to be clicked, because a drag region swallows
+                clicks. The tabs below already name every open document, and the
+                taskbar gets the document name through Window.Title.
             -->
-            <Border x:Name="TitleDragArea" Grid.Column="2" Background="Transparent" />
+            <Border x:Name="TitleDragArea" Grid.Column="3" Background="Transparent">
+                <TextBlock x:Name="TitleText" Text="Ayaan PDF" Margin="16,0,0,0"
+                           VerticalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+            </Border>
         </Grid>
 
         <!--
