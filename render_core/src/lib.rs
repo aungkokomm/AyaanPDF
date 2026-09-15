@@ -15201,6 +15201,27 @@ mod tests {
         close_document(handle);
     }
 
+    /// Prints the links on one page of a reader's own file, to see what a link
+    /// that "does nothing" actually is before touching the click path. Ignored
+    /// because the file lives on the reader's machine: AYAAN_LINKS_PDF names it
+    /// and AYAAN_LINKS_PAGE the page (default 0).
+    #[test]
+    #[ignore]
+    fn what_links_a_real_file_holds() {
+        let path = std::env::var("AYAAN_LINKS_PDF").expect("set AYAAN_LINKS_PDF");
+        let page: i32 = std::env::var("AYAAN_LINKS_PAGE")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let handle = open_fixture_named(&path);
+
+        for link in decode_links(handle, page) {
+            println!("{link:?}");
+        }
+
+        close_document(handle);
+    }
+
     #[test]
     fn an_internal_link_cannot_be_retargeted_as_a_url() {
         // PDFium has no destination setter, so writing a URI action over one

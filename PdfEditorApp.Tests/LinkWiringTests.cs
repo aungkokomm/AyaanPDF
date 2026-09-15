@@ -234,12 +234,15 @@ public class LinkWiringTests
     }
 
     [Fact]
-    public void a_click_follows_a_link_only_while_the_reader_has_asked_to_see_them()
+    public void in_edit_mode_a_click_follows_a_link_only_while_links_are_shown()
     {
-        // An ordinary click on a page still selects text the way it always has.
+        // In Edit mode an ordinary click on a page still selects and edits text
+        // the way it always has. In View mode a link is followed regardless:
+        // gating it there left a real book's table of contents dead.
         string code = Page();
 
-        Assert.Contains("ViewModel.ShowLinks\n                    && ViewModel.LinkAt(",
+        Assert.Contains("bool followsLinks = ViewModel.ShowLinks || !ViewModel.IsEditMode;\n"
+                        + "                if (followsLinks\n                    && ViewModel.LinkAt(",
                         code.Replace("\r\n", "\n"), StringComparison.Ordinal);
     }
 

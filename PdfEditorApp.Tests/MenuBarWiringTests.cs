@@ -294,8 +294,14 @@ public class MenuBarWiringTests
     /// Clearing guides was only on the ruler's right-click menu, which is out
     /// of reach while the rulers are hidden.
     /// </summary>
-    [Fact]
-    public void view_has_guides_with_both_ways_to_clear_them()
+    [Theory]
+    [InlineData("AddGuideAt_Click")]
+    [InlineData("AddMargins_Click")]
+    [InlineData("AddColumns_Click")]
+    [InlineData("LockGuidesToggle_Click")]
+    [InlineData("ClearGuidesPage_Click")]
+    [InlineData("ClearGuidesAll_Click")]
+    public void view_guides_has_every_guide_command_the_ruler_menu_has(string handler)
     {
         string bar = MenuBar();
         int view = bar.IndexOf("<MenuBarItem Title=\"View\"", StringComparison.Ordinal);
@@ -304,8 +310,28 @@ public class MenuBarWiringTests
         Assert.True(guides > view && guides < page, "there is no Guides submenu under View");
 
         string submenu = bar[guides..bar.IndexOf("</MenuFlyoutSubItem>", guides, StringComparison.Ordinal)];
-        Assert.Contains("Click=\"ClearGuidesPage_Click\"", submenu, StringComparison.Ordinal);
-        Assert.Contains("Click=\"ClearGuidesAll_Click\"", submenu, StringComparison.Ordinal);
+        Assert.Contains($"Click=\"{handler}\"", submenu, StringComparison.Ordinal);
+
+        // Still on the ruler's right-click menu as well.
+        string xaml = Xaml();
+        int ruler = xaml.IndexOf("<MenuFlyout x:Name=\"RulerFlyout\">", StringComparison.Ordinal);
+        Assert.True(ruler > 0, "the ruler menu is gone");
+        Assert.Contains($"Click=\"{handler}\"", xaml[ruler..xaml.IndexOf("</MenuFlyout>", ruler, StringComparison.Ordinal)],
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// ⚠️ TWO TOGGLES, ONE SETTING. Reading one fixed toggle in the handler
+    /// would lock or unlock by whichever was NOT clicked, and the two ticks
+    /// would disagree about whether guides are locked.
+    /// </summary>
+    [Fact]
+    public void both_lock_guides_toggles_follow_the_one_clicked()
+    {
+        string body = Body(Code(), "private void LockGuidesToggle_Click(");
+        Assert.Contains("ViewModel.AreGuidesLocked = ((ToggleMenuFlyoutItem)sender).IsChecked;", body, StringComparison.Ordinal);
+        Assert.Contains("LockGuidesToggle.IsChecked = ViewModel.AreGuidesLocked;", body, StringComparison.Ordinal);
+        Assert.Contains("LockGuidesMenuToggle.IsChecked = ViewModel.AreGuidesLocked;", body, StringComparison.Ordinal);
     }
 
     [Fact]

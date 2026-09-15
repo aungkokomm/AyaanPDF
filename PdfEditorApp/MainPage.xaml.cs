@@ -2232,7 +2232,11 @@ public sealed partial class MainPage : Page
 
     private void LockGuidesToggle_Click(object sender, RoutedEventArgs e)
     {
-        ViewModel.AreGuidesLocked = LockGuidesToggle.IsChecked;
+        // Two toggles for one setting, on the ruler's right-click menu and under
+        // View > Guides: the one clicked decides, and both then show it.
+        ViewModel.AreGuidesLocked = ((ToggleMenuFlyoutItem)sender).IsChecked;
+        LockGuidesToggle.IsChecked = ViewModel.AreGuidesLocked;
+        LockGuidesMenuToggle.IsChecked = ViewModel.AreGuidesLocked;
     }
 
     /// <summary>Adds four margin guides (top, bottom, left, right) at a
@@ -8039,8 +8043,11 @@ public sealed partial class MainPage : Page
         // cursor cannot disagree with either. After the grips, because a grip
         // belongs to something the reader has already selected and is drawn over
         // the page; before everything else, because a link owns its pointer.
+        //
+        // Behind the same gate as the click: in View mode always, in Edit mode
+        // only while Show Links is on.
         if (grip == LoadedAnnotationPicker.Grip.None
-            && ViewModel.ShowLinks
+            && (ViewModel.ShowLinks || !ViewModel.IsEditMode)
             && ViewModel.LinkAt(content.Page, nx, ny) is not null)
         {
             return InputSystemCursorShape.Hand;
@@ -8659,12 +8666,18 @@ public sealed partial class MainPage : Page
                     ViewModel.ClearTextUnitSelection();
                 }
 
-                // A LINK first, and only while Show Links is on. A link is the
-                // document's, not ours: the reader who has asked to see links
-                // and then clicks one is asking to follow it, not to select a
-                // rectangle. Gated on the toggle so an ordinary click on a page
-                // still selects text the way it always has.
-                if (ViewModel.ShowLinks
+                // A LINK first. A link is the document's, not ours: a reader
+                // who clicks one is asking to follow it, not to select a
+                // rectangle.
+                //
+                // ⚠️ IN VIEW MODE ALWAYS, whether or not the outlines are
+                // showing. Gating it on Show Links there made every link in a
+                // real book dead: a table of contents of buttons did nothing,
+                // because nobody reading a PDF goes to turn links on first. In
+                // Edit mode only while Show Links is on, so an ordinary click
+                // there still selects and edits text.
+                bool followsLinks = ViewModel.ShowLinks || !ViewModel.IsEditMode;
+                if (followsLinks
                     && ViewModel.LinkAt(content.Page, nx, ny) is { } clicked)
                 {
                     Diag.Log($"link press p{content.Page} kind={clicked.Kind} "
@@ -8677,14 +8690,15 @@ public sealed partial class MainPage : Page
                     break;
                 }
 
-                if (!ViewModel.ShowLinks
+                if (!followsLinks
                     && ViewModel.LinkAt(content.Page, nx, ny) is not null)
                 {
-                    // Not an error: with the overlay off a link is just page,
-                    // and a click on it selects text as it always has. Logged
-                    // because "I clicked the link and nothing happened" and
-                    // "Show Links is off" look identical from outside.
-                    Diag.Log($"link press p{content.Page} IGNORED, Show Links is off");
+                    // Not an error: in Edit mode with the overlay off a link is
+                    // just page, and a click on it selects text as it always
+                    // has. Logged because "I clicked the link and nothing
+                    // happened" and "Show Links is off" look identical from
+                    // outside.
+                    Diag.Log($"link press p{content.Page} IGNORED, Show Links is off in Edit mode");
                 }
 
                 // A FORM FIELD is operated, not selected.

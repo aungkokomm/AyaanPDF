@@ -126,16 +126,33 @@ public class LinkInteractionWiringTests
     }
 
     [Fact]
-    public void no_hand_appears_while_show_links_is_off()
+    public void the_hand_appears_exactly_where_a_click_follows_the_link()
     {
-        // The cursor has to say what a click will actually do, and with the
-        // overlay off a click on a link selects text as it always has.
+        // The cursor has to say what a click will actually do: a hand in View
+        // mode, and in Edit mode only while Show Links is on, because there a
+        // click on a link with the overlay off selects text as it always has.
         string body = Body(Page(), "private InputSystemCursorShape? HoverCursor(");
 
-        int gate = body.IndexOf("ViewModel.ShowLinks", StringComparison.Ordinal);
+        int gate = body.IndexOf("(ViewModel.ShowLinks || !ViewModel.IsEditMode)", StringComparison.Ordinal);
         int hand = body.IndexOf("return InputSystemCursorShape.Hand;", gate, StringComparison.Ordinal);
 
-        Assert.True(gate > 0 && hand > gate, "the hand is not behind the Show Links gate");
+        Assert.True(gate > 0 && hand > gate, "the hand is not behind the same gate as the click");
+    }
+
+    [Fact]
+    public void in_view_mode_a_link_is_followed_whether_or_not_links_are_shown()
+    {
+        // ⚠️ WRITTEN AFTER A REAL FAILURE. A book whose first page is a table
+        // of contents made of link buttons did nothing when they were clicked:
+        // the log said "IGNORED, Show Links is off" four times. A reader does
+        // not turn links on before following one.
+        string body = Body(Page(), "private void ViewportHost_PointerPressed(");
+
+        Assert.Contains("bool followsLinks = ViewModel.ShowLinks || !ViewModel.IsEditMode;", body, StringComparison.Ordinal);
+        Assert.Contains("if (followsLinks\n                    && ViewModel.LinkAt(content.Page, nx, ny) is { } clicked)",
+            body, StringComparison.Ordinal);
+        Assert.Contains("if (!followsLinks\n                    && ViewModel.LinkAt(content.Page, nx, ny) is not null)",
+            body, StringComparison.Ordinal);
     }
 
     [Fact]

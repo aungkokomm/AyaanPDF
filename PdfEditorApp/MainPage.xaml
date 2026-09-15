@@ -406,8 +406,15 @@
                     The guide commands were only on the ruler's right-click menu,
                     which nobody finds without being told and which is out of
                     reach while the rulers are hidden. Same handlers as that menu.
+                    Lock guides is a second toggle for the same setting, kept in
+                    step with the ruler menu's by LockGuidesToggle_Click.
                 -->
                 <MenuFlyoutSubItem Text="Guides">
+                    <MenuFlyoutItem Text="Add guide at exact position..." Click="AddGuideAt_Click" />
+                    <MenuFlyoutItem Text="Add margin guides..." Click="AddMargins_Click" />
+                    <MenuFlyoutItem Text="Add column guides..." Click="AddColumns_Click" />
+                    <ToggleMenuFlyoutItem x:Name="LockGuidesMenuToggle" Text="Lock guides" Click="LockGuidesToggle_Click" />
+                    <MenuFlyoutSeparator />
                     <MenuFlyoutItem Text="Clear guides on this page" Click="ClearGuidesPage_Click" />
                     <MenuFlyoutItem Text="Clear all guides" Click="ClearGuidesAll_Click" />
                 </MenuFlyoutSubItem>
