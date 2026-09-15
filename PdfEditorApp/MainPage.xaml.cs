@@ -1184,7 +1184,10 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        DefinitionText.Text = string.Empty;
+        // Inlines.Clear, NOT Text = "": setting empty text leaves an empty Run
+        // behind, which counted as a first line and pushed every sense down
+        // under a blank one.
+        DefinitionText.Inlines.Clear();
         foreach (var sense in found.Senses)
         {
             if (DefinitionText.Inlines.Count > 0)
@@ -1201,8 +1204,8 @@ public sealed partial class MainPage : Page
 
             DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
             {
-                Text = label + "  ",
-                FontStyle = Windows.UI.Text.FontStyle.Italic,
+                Text = label + ": ",
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             });
             DefinitionText.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = meaning });
         }

@@ -114,6 +114,19 @@ public class DefineWiringTests
         Assert.Contains(@"Background=""#FFFFF4CE""", element.Value, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void each_part_of_speech_is_a_bold_label_with_a_colon_and_no_blank_first_line()
+    {
+        string fill = MethodBody(PageCode(), "private void FillDefinition(");
+
+        // Text = "" leaves an empty Run that counts as a first line, which put
+        // a blank line between the word and its first sense.
+        Assert.Contains("DefinitionText.Inlines.Clear();", fill, StringComparison.Ordinal);
+        Assert.DoesNotContain("DefinitionText.Text = string.Empty", fill, StringComparison.Ordinal);
+        Assert.Contains("label + \": \"", fill, StringComparison.Ordinal);
+        Assert.Contains("FontWeights.SemiBold", fill, StringComparison.Ordinal);
+    }
+
     // ---------------- The dictionary the app ships ----------------
 
     [Fact]
