@@ -246,6 +246,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     public partial string Status { get; set; } = "Opening document...";
 
+    // ⚠️ SHOWN NOW. Written in 148 places and displayed in none, so a refusal
+    // that only set it was a click that did nothing and said nothing.
+    // StatusNotices decides what reaches the notice bar.
+    partial void OnStatusChanged(string value)
+    {
+        _notices.Status(value);
+        QueueNoticeFlush();
+    }
+
+    /// <summary>The sentence in the notice bar.</summary>
+    [ObservableProperty]
+    public partial string NoticeMessage { get; set; } = string.Empty;
+
+    /// <summary>Whether the notice bar is saying something did not happen.</summary>
+    [ObservableProperty]
+    public partial bool NoticeIsWarning { get; set; }
+
+    /// <summary>Whether the notice bar is showing.</summary>
+    [ObservableProperty]
+    public partial bool IsNoticeOpen { get; set; }
+
     [ObservableProperty]
     public partial int CurrentPageIndex { get; set; }
 
@@ -6532,6 +6553,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         _unitNotice = string.IsNullOrWhiteSpace(message) ? null : message;
 
+        // The label explains this click, so the notice bar does not say it too.
+        _notices.Label(message);
+        QueueNoticeFlush();
+
         _unitNoticeTimer?.Stop();
         if (_unitNotice is not null)
         {
@@ -6625,6 +6650,58 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// visibly, slow enough that it costs nothing.
     /// </summary>
     private const int PrepareTickMs = 250;
+
+    private readonly StatusNotices _notices = new();
+    private bool _noticeFlushQueued;
+    private DispatcherQueueTimer? _noticeTimer;
+
+    /// <summary>How long an instruction stays in the notice bar.</summary>
+    private const int NoticeSeconds = 5;
+
+    /// <summary>How long a refusal stays: longer, because it is read, not glanced at.</summary>
+    private const int NoticeWarningSeconds = 8;
+
+    /// <summary>
+    /// Decides what the notice bar says once the current turn has finished.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ AT THE END OF THE TURN, NOT NOW. One click can write the status and
+    /// then raise the label beside the text, or the other way round, and the bar
+    /// must know about both before it decides whether to speak.
+    /// </remarks>
+    private void QueueNoticeFlush()
+    {
+        if (_noticeFlushQueued || _dispatcherQueue is null) { return; }
+        _noticeFlushQueued = _dispatcherQueue.TryEnqueue(
+            Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, FlushNotice);
+    }
+
+    private void FlushNotice()
+    {
+        _noticeFlushQueued = false;
+        if (_notices.Flush() is not { } shown) { return; }
+
+        NoticeMessage = shown.Message;
+        NoticeIsWarning = shown.Kind == NoticeKind.Warning;
+        IsNoticeOpen = true;
+
+        if (_noticeTimer is null && _dispatcherQueue is not null)
+        {
+            _noticeTimer = _dispatcherQueue.CreateTimer();
+            _noticeTimer.IsRepeating = false;
+            _noticeTimer.Tick += (t, _) =>
+            {
+                t.Stop();
+                IsNoticeOpen = false;
+            };
+        }
+        if (_noticeTimer is null) { return; }
+
+        _noticeTimer.Stop();
+        _noticeTimer.Interval = TimeSpan.FromSeconds(
+            NoticeIsWarning ? NoticeWarningSeconds : NoticeSeconds);
+        _noticeTimer.Start();
+    }
 
     private DispatcherQueueTimer? CreateUnitNoticeTimer()
     {

@@ -538,6 +538,18 @@ public sealed partial class MainPage : Page
     public static Thickness ScaledOffset(double x, double y, double scale) =>
         new(x * scale, y * scale, 0, 0);
 
+    /// <summary>The notice bar's severity, for x:Bind.</summary>
+    public static Microsoft.UI.Xaml.Controls.InfoBarSeverity NoticeSeverity(bool warning) =>
+        warning
+            ? Microsoft.UI.Xaml.Controls.InfoBarSeverity.Warning
+            : Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational;
+
+    /// <summary>
+    /// Where the notice bar sits: under the preparing card while that shows, so
+    /// the two never lie on top of each other.
+    /// </summary>
+    public static Thickness NoticeMargin(bool preparing) => new(0, preparing ? 150 : 34, 0, 0);
+
     /// <summary>
     /// Turns a stored "#AARRGGBB" into a brush, for x:Bind in the annotation
     /// templates. Compiled like <see cref="Offset"/>, so a mistake is a build
