@@ -1663,31 +1663,24 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         from != to && RebuildPages(PageReorder.Move(PageCount, from, to));
 
     /// <summary>
-    /// Inserts every page of another PDF file at <paramref name="atIndex"/>. The
-    /// overlay marks on pages at or after the insertion point shift down by the
-    /// number of pages inserted.
+    /// Inserts chosen pages of another open document at <paramref name="atIndex"/>.
+    /// The overlay marks on pages at or after the insertion point shift down by
+    /// the number of pages inserted.
     /// </summary>
-    public bool InsertPagesFromFile(string path, int atIndex)
+    /// <remarks>
+    /// The source is a handle, not a path: the pages were picked from its
+    /// thumbnails, so it is already open and already unlocked.
+    /// </remarks>
+    public bool InsertPagesFromDocument(ulong sourceHandle, IReadOnlyList<int> indices, int atIndex)
     {
-        if (_documentHandle == 0)
+        if (_documentHandle == 0 || sourceHandle == 0 || indices.Count == 0)
         {
-            return false;
-        }
-
-        byte[] bytes;
-        try
-        {
-            bytes = System.IO.File.ReadAllBytes(path);
-        }
-        catch
-        {
-            Status = "Could not read that file.";
             return false;
         }
 
         PushHistory(HistoryScope.Document, "Insert pages");
-        int inserted = RenderCoreNative.insert_pages_from_bytes(
-            _documentHandle, bytes, (nuint)bytes.Length, atIndex);
+        int inserted = RenderCoreNative.insert_pages_from_document(
+            _documentHandle, sourceHandle, indices.ToArray(), (nuint)indices.Count, atIndex);
         if (inserted <= 0)
         {
             Status = "Could not insert those pages.";

@@ -1102,11 +1102,12 @@ internal static partial class RenderCoreNative
     public static extern int rebuild_page_order(ulong docHandle, [In] int[] indices, nuint count);
 
     /// <summary>
-    /// Inserts every page of another PDF (its bytes) at a position. Returns the
-    /// NUMBER of pages inserted, or a NEGATIVE value on error.
+    /// Copies chosen pages of another OPEN document in at a position. Returns
+    /// the NUMBER of pages inserted, or a NEGATIVE value on error.
     /// </summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int insert_pages_from_bytes(ulong docHandle, [In] byte[] data, nuint len, int atIndex);
+    public static extern int insert_pages_from_document(
+        ulong docHandle, ulong sourceHandle, [In] int[] indices, nuint count, int atIndex);
 
     /// <summary>Inserts one blank page, sized in points, at a position.</summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]

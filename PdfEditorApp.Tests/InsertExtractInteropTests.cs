@@ -42,6 +42,10 @@ public class InsertExtractInteropTests
     private static extern int insert_pages_from_bytes(ulong docHandle, [In] byte[] data, nuint len, int atIndex);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int insert_pages_from_document(
+        ulong docHandle, ulong sourceHandle, [In] int[] indices, nuint count, int atIndex);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     private static extern int insert_blank_page(ulong docHandle, int atIndex, float widthPts, float heightPts);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -92,6 +96,27 @@ public class InsertExtractInteropTests
         finally
         {
             close_document(handle);
+        }
+    }
+
+    [Fact]
+    public void chosen_pages_of_an_open_document_grow_the_count_by_that_many()
+    {
+        ulong source = OpenFixture();
+        ulong handle = OpenFixture();
+        try
+        {
+            var chosen = new[] { 0, 4, 5, 19 };
+            Assert.Equal(4, insert_pages_from_document(handle, source, chosen, (nuint)chosen.Length, 3));
+            Assert.Equal(24, get_page_count(handle));
+
+            // The file the pages came from is only read.
+            Assert.Equal(20, get_page_count(source));
+        }
+        finally
+        {
+            close_document(handle);
+            close_document(source);
         }
     }
 

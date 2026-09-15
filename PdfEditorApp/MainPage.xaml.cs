@@ -10193,10 +10193,26 @@ public sealed partial class MainPage : Page
 
     // ---------------- Insert / extract pages ----------------
 
+    private PagePickerWindow? _insertPagesWindow;
+
+    /// <summary>
+    /// Page > Insert > From file: picks a PDF, then shows its pages so which
+    /// ones go in, and where, is chosen before anything changes.
+    /// </summary>
+    /// <remarks>
+    /// It used to insert every page of the file after the current one, with no
+    /// preview and no choice, which is no use for a chapter out of a book.
+    /// </remarks>
     private async void InsertFromFile_Click(object sender, RoutedEventArgs e)
     {
         if (ViewModel.PageCount == 0)
         {
+            return;
+        }
+
+        if (_insertPagesWindow is not null)
+        {
+            _insertPagesWindow.Activate();
             return;
         }
 
@@ -10206,12 +10222,26 @@ public sealed partial class MainPage : Page
         picker.FileTypeFilter.Add(".pdf");
 
         var file = await picker.PickSingleFileAsync();
-        if (file is not null)
+        if (file is null)
         {
-            // After the current page, so the inserted content follows what is
-            // on screen.
-            ViewModel.InsertPagesFromFile(file.Path, ViewModel.CurrentPageIndex + 1);
+            return;
         }
+
+        var (source, failure) = await SourceDocument.OpenAsync(file.Path, XamlRoot);
+        if (source is null)
+        {
+            if (failure == SourceOpenFailure.Unreadable)
+            {
+                await ShowMessage("Couldn't open that file", $"“{file.Name}” couldn't be read as a PDF.");
+            }
+
+            return;
+        }
+
+        var window = PagePickerWindow.ForInsert(source, ViewModel);
+        window.Closed += (_, _) => _insertPagesWindow = null;
+        _insertPagesWindow = window;
+        window.Activate();
     }
 
     private void InsertBlankPage_Click(object sender, RoutedEventArgs e)

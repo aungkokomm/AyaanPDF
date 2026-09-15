@@ -892,6 +892,101 @@ fn insert_pages_from_bytes_inner(doc_handle: u64, data: *const u8, len: usize, a
     source_count
 }
 
+/// Copies chosen pages of one OPEN document into another at `at_index`.
+/// Returns the NUMBER of pages inserted, or a NEGATIVE value on error (-1
+/// invalid, -2 panic). The source is only read.
+///
+/// The source is a handle rather than a file because the pages were chosen
+/// from its thumbnails: it is already open, and already unlocked if it had a
+/// password, so reading it from disk again would ask for that password twice.
+/// `indices` are zero-based and inserted in the order given.
+#[unsafe(no_mangle)]
+pub extern "C" fn insert_pages_from_document(
+    doc_handle: u64,
+    source_handle: u64,
+    indices: *const i32,
+    count: usize,
+    at_index: i32,
+) -> i32 {
+    if doc_handle == 0
+        || source_handle == 0
+        || doc_handle == source_handle
+        || indices.is_null()
+        || count == 0
+        || at_index < 0
+    {
+        return -1;
+    }
+    panic::catch_unwind(|| insert_pages_from_document_inner(doc_handle, source_handle, indices, count, at_index))
+        .unwrap_or(-2)
+}
+
+fn insert_pages_from_document_inner(
+    doc_handle: u64,
+    source_handle: u64,
+    indices: *const i32,
+    count: usize,
+    at_index: i32,
+) -> i32 {
+    let chosen: &[i32] = unsafe { std::slice::from_raw_parts(indices, count) };
+
+    let _guard = call_guard();
+    let found = {
+        let documents = lock(&core().documents);
+        (documents.get(&doc_handle).cloned(), documents.get(&source_handle).cloned())
+    };
+    let (Some(doc), Some(source)) = found else {
+        return -1;
+    };
+
+    let source_guard = lock(&source);
+    let source_count = source_guard.pages().len() as i32;
+    if chosen.iter().any(|&i| i < 0 || i >= source_count) {
+        return -1;
+    }
+
+    let mut doc_guard = lock(&doc);
+    let dest_count = doc_guard.pages().len() as i32;
+    let at = at_index.min(dest_count).max(0) as u16;
+
+    if doc_guard
+        .pages_mut()
+        .copy_pages_from_document(&source_guard, &pdfium_page_list(chosen), at)
+        .is_err()
+    {
+        return -1;
+    }
+
+    drop(doc_guard);
+    drop(source_guard);
+    evict_all_cache_for_doc(doc_handle);
+    lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
+    count as i32
+}
+
+/// PDFium's 1-based page list for zero-based indices, in the order given:
+/// "1-4,7,9". Neighbours are written as a range, so every page of a large book
+/// is a few characters rather than one number per page.
+fn pdfium_page_list(indices: &[i32]) -> String {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < indices.len() {
+        let first = indices[i];
+        let mut last = first;
+        while i + 1 < indices.len() && indices[i + 1] == last + 1 {
+            i += 1;
+            last = indices[i];
+        }
+        parts.push(if first == last {
+            (first + 1).to_string()
+        } else {
+            format!("{}-{}", first + 1, last + 1)
+        });
+        i += 1;
+    }
+    parts.join(",")
+}
+
 /// Inserts one blank page at `at_index`, sized in points. Used for "insert a
 /// blank page"; the app passes the current page's size so it matches.
 #[unsafe(no_mangle)]
@@ -18444,6 +18539,52 @@ mod tests {
         assert_eq!(insert_pages_from_bytes(h, junk.as_ptr(), junk.len(), 0), -1);
         assert_eq!(get_page_count(h), 20);
         close_document(h);
+    }
+
+    #[test]
+    fn chosen_pages_of_an_open_document_go_in_at_the_right_spot_in_order() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let source = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+
+        let chosen = [0, 1, 2, 9];
+        assert_eq!(insert_pages_from_document(h, source, chosen.as_ptr(), chosen.len(), 5), 4);
+        assert_eq!(get_page_count(h), 24);
+
+        assert_eq!(page_text(h, 4), "Page 5 of 20");
+        assert_eq!(page_text(h, 5), "Page 1 of 20");
+        assert_eq!(page_text(h, 7), "Page 3 of 20");
+        assert_eq!(page_text(h, 8), "Page 10 of 20");
+        assert_eq!(page_text(h, 9), "Page 6 of 20");
+
+        // The source is only read.
+        assert_eq!(get_page_count(source), 20);
+        close_document(source);
+        close_document(h);
+    }
+
+    #[test]
+    fn inserting_from_an_open_document_rejects_bad_input() {
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let source = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let first = [0];
+        let past_the_end = [20];
+
+        assert_eq!(insert_pages_from_document(h, source, past_the_end.as_ptr(), 1, 0), -1);
+        assert_eq!(insert_pages_from_document(h, h, first.as_ptr(), 1, 0), -1);
+        assert_eq!(insert_pages_from_document(h, 0, first.as_ptr(), 1, 0), -1);
+        assert_eq!(insert_pages_from_document(h, 987_654, first.as_ptr(), 1, 0), -1);
+        assert_eq!(insert_pages_from_document(h, source, std::ptr::null(), 0, 0), -1);
+        assert_eq!(get_page_count(h), 20);
+
+        close_document(source);
+        close_document(h);
+    }
+
+    #[test]
+    fn a_page_list_writes_neighbours_as_ranges_in_the_order_given() {
+        assert_eq!(pdfium_page_list(&[0, 1, 2, 3, 6, 8]), "1-4,7,9");
+        assert_eq!(pdfium_page_list(&[4]), "5");
+        assert_eq!(pdfium_page_list(&[9, 0, 1]), "10,1-2");
     }
 
     #[test]
