@@ -120,6 +120,13 @@ public sealed record AppSettings
     public bool DefineShowsMyanmar { get; init; } = true;
 
     /// <summary>
+    /// Whether Define shows Hindi meanings, under the Myanmar ones. On by
+    /// default for the same reasons as <see cref="DefineShowsMyanmar"/>, and
+    /// switched off the same way.
+    /// </summary>
+    public bool DefineShowsHindi { get; init; } = true;
+
+    /// <summary>
     /// Renders pages dark for night reading.
     ///
     /// Off by default: it changes how every document looks, and a reader who

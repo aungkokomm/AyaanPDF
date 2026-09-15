@@ -1151,22 +1151,27 @@ public sealed partial class MainPage : Page
         var myanmar = SettingsStore.Current.DefineShowsMyanmar
             ? DefinitionDictionary.LoadMyanmarAsync()
             : Task.FromResult<MyanmarGlosses?>(null);
-        if (!english.IsCompleted || !myanmar.IsCompleted)
+        var hindi = SettingsStore.Current.DefineShowsHindi
+            ? DefinitionDictionary.LoadHindiAsync()
+            : Task.FromResult<HindiGlosses?>(null);
+        if (!english.IsCompleted || !myanmar.IsCompleted || !hindi.IsCompleted)
         {
             DefinitionText.Text = "Looking up...";
-            DefinitionMyanmarRule.Visibility = Visibility.Collapsed;
+            DefinitionTranslationsRule.Visibility = Visibility.Collapsed;
             DefinitionMyanmar.Visibility = Visibility.Collapsed;
+            DefinitionHindi.Visibility = Visibility.Collapsed;
             PlaceDefinition();
         }
 
         WordDefinitions? dictionary = await english;
         MyanmarGlosses? glosses = await myanmar;
+        HindiGlosses? hindiGlosses = await hindi;
         if (request != _defineRequest)
         {
             return;
         }
 
-        FillDefinition(anchor.Word, dictionary, glosses);
+        FillDefinition(anchor.Word, dictionary, glosses, hindiGlosses);
         PlaceDefinition();
     }
 
@@ -1176,11 +1181,13 @@ public sealed partial class MainPage : Page
     /// another (running, went), the dictionary word is named, so the
     /// definition is not read as being of the word as written.
     /// </summary>
-    private void FillDefinition(string word, WordDefinitions? dictionary, MyanmarGlosses? glosses)
+    private void FillDefinition(string word, WordDefinitions? dictionary, MyanmarGlosses? glosses, HindiGlosses? hindi)
     {
         DefinitionMyanmar.Inlines.Clear();
-        DefinitionMyanmarRule.Visibility = Visibility.Collapsed;
+        DefinitionHindi.Inlines.Clear();
+        DefinitionTranslationsRule.Visibility = Visibility.Collapsed;
         DefinitionMyanmar.Visibility = Visibility.Collapsed;
+        DefinitionHindi.Visibility = Visibility.Collapsed;
 
         if (dictionary is null)
         {
@@ -1264,13 +1271,54 @@ public sealed partial class MainPage : Page
             });
         }
 
+        // Hindi under that. The word list has no parts of speech, so it is one
+        // line for each dictionary word the English settled on: "running"
+        // shows the Hindi for "running" and, when it has one, for "run".
+        int hindiLines = 0;
+        var hindiHeadwords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var sense in found.Senses)
+        {
+            if (!hindiHeadwords.Add(sense.Headword)
+                || hindi?.For(sense.Headword) is not { Count: > 0 } hindiMeanings)
+            {
+                continue;
+            }
+
+            if (hindiLines++ > 0)
+            {
+                DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
+            }
+
+            DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = (string.Equals(sense.Headword, word, StringComparison.OrdinalIgnoreCase)
+                    ? "Hindi"
+                    : $"Hindi, {sense.Headword}") + ": ",
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            });
+            DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+            {
+                Text = string.Join(", ", hindiMeanings),
+                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Nirmala UI"),
+            });
+        }
+
+        if (myanmarLines + hindiLines > 0)
+        {
+            DefinitionTranslationsRule.Visibility = Visibility.Visible;
+        }
+
         if (myanmarLines > 0)
         {
-            DefinitionMyanmarRule.Visibility = Visibility.Visible;
             DefinitionMyanmar.Visibility = Visibility.Visible;
         }
 
-        Diag.Log($"define: \"{word}\" found {found.Senses.Count} part(s) of speech, first {found.Senses[0].PartOfSpeech} \"{found.Senses[0].Headword}\", {(glosses is null ? "Myanmar off or unavailable" : $"{myanmarLines} Myanmar line(s)")}");
+        if (hindiLines > 0)
+        {
+            DefinitionHindi.Visibility = Visibility.Visible;
+        }
+
+        Diag.Log($"define: \"{word}\" found {found.Senses.Count} part(s) of speech, first {found.Senses[0].PartOfSpeech} \"{found.Senses[0].Headword}\", {(glosses is null ? "Myanmar off or unavailable" : $"{myanmarLines} Myanmar line(s)")}, {(hindi is null ? "Hindi off or unavailable" : $"{hindiLines} Hindi line(s)")}");
     }
 
     /// <summary>Puts the popup away. Safe to call when it is not showing.</summary>
@@ -5478,7 +5526,7 @@ public sealed partial class MainPage : Page
     /// <summary>
     /// Define's own section: which meanings a definition shows beside the
     /// English. One switch per language, so each reader keeps only the ones
-    /// they read. Hindi joins Myanmar here once it is bundled.
+    /// they read.
     /// </summary>
     private static UIElement BuildDefineSettings()
     {
@@ -5503,6 +5551,14 @@ public sealed partial class MainPage : Page
         };
         myanmar.Toggled += (_, _) => SettingsStore.Update(s => s with { DefineShowsMyanmar = myanmar.IsOn });
         panel.Children.Add(myanmar);
+
+        var hindi = new ToggleSwitch
+        {
+            Header = "Hindi meanings",
+            IsOn = SettingsStore.Current.DefineShowsHindi,
+        };
+        hindi.Toggled += (_, _) => SettingsStore.Update(s => s with { DefineShowsHindi = hindi.IsOn });
+        panel.Children.Add(hindi);
 
         return panel;
     }

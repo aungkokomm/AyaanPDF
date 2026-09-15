@@ -1536,16 +1536,21 @@
                            TextWrapping="Wrap" Foreground="#FF4A4020" />
                 <!--
                     Myanmar meanings, from the AKK dictionary, one line per part
-                    of speech shown above. A TextBlock of its own with NO fixed
-                    LineHeight: Myanmar stacks marks above and below the letter,
-                    and the 21px lines above would clip them.
+                    of speech shown above, then Hindi meanings, one line per
+                    dictionary word. TextBlocks of their own with NO fixed
+                    LineHeight: both scripts stack marks above and below the
+                    letter, and the 21px lines above would clip them.
                 -->
-                <Rectangle x:Name="DefinitionMyanmarRule" Height="1" Margin="0,2"
+                <Rectangle x:Name="DefinitionTranslationsRule" Height="1" Margin="0,2"
                            Fill="#FFE6C84F" Visibility="Collapsed" />
                 <TextBlock x:Name="DefinitionMyanmar" FontSize="14"
                            TextWrapping="Wrap" Foreground="#FF4A4020"
                            Visibility="Collapsed"
                            AutomationProperties.Name="Myanmar meaning" />
+                <TextBlock x:Name="DefinitionHindi" FontSize="14"
+                           TextWrapping="Wrap" Foreground="#FF4A4020"
+                           Visibility="Collapsed"
+                           AutomationProperties.Name="Hindi meaning" />
             </StackPanel>
         </Border>
 

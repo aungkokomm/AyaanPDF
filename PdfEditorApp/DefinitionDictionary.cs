@@ -25,6 +25,14 @@ internal static class DefinitionDictionary
     public static readonly string MyanmarFilePath =
         Path.Combine(AppContext.BaseDirectory, "Assets", "Dictionary", "akk-en-my.tsv.gz");
 
+    public static readonly string HindiFilePath =
+        Path.Combine(AppContext.BaseDirectory, "Assets", "Dictionary", "hindi-en-hi.tsv.gz");
+
+    private static readonly Lazy<Task<HindiGlosses?>> LoadedHindi =
+        new(() => Task.Run(() => Read(HindiFilePath, HindiGlosses.Load, g => $"{g.Count} Hindi words")));
+
+    public static Task<HindiGlosses?> LoadHindiAsync() => LoadedHindi.Value;
+
     private static readonly Lazy<Task<WordDefinitions?>> Loaded =
         new(() => Task.Run(() => Read(FilePath, WordDefinitions.Load, d => $"{d.WordCount} words")));
 

@@ -304,4 +304,43 @@ public class DefineWiringTests
         Assert.Contains("s with { DefineShowsMyanmar = myanmar.IsOn }",
             MethodBody(PageCode(), "private static UIElement BuildDefineSettings("), StringComparison.Ordinal);
     }
+
+    // ---------------- Hindi ----------------
+
+    [Fact]
+    public void hindi_meanings_are_on_by_default_even_for_a_settings_file_older_than_the_switch()
+    {
+        Assert.True(new AppSettings().DefineShowsHindi);
+        Assert.True(System.Text.Json.JsonSerializer.Deserialize<AppSettings>("{\"DefineShowsMyanmar\": false}")!.DefineShowsHindi);
+    }
+
+    [Fact]
+    public void switched_off_hindi_is_not_even_loaded_and_the_switch_lives_in_settings()
+    {
+        string show = MethodBody(PageCode(), "private async void ShowDefinition(");
+        Assert.True(IndexIn(show, "SettingsStore.Current.DefineShowsHindi") < IndexIn(show, "DefinitionDictionary.LoadHindiAsync()"));
+
+        Assert.Contains("s with { DefineShowsHindi = hindi.IsOn }",
+            MethodBody(PageCode(), "private static UIElement BuildDefineSettings("), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void hindi_is_looked_up_by_the_english_headword_and_logged()
+    {
+        string fill = MethodBody(PageCode(), "private void FillDefinition(");
+
+        Assert.Contains("hindi?.For(sense.Headword)", fill, StringComparison.Ordinal);
+        Assert.Contains("\"Nirmala UI\"", fill, StringComparison.Ordinal);
+        Assert.Contains("Hindi line(s)", fill, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_hindi_block_has_no_fixed_line_height_to_clip_its_marks()
+    {
+        string xaml = File.ReadAllText(PathTo("PdfEditorApp", "MainPage.xaml"));
+        var element = Regex.Match(xaml, @"<TextBlock\s+x:Name=""DefinitionHindi""[^>]*?>", RegexOptions.Singleline);
+
+        Assert.True(element.Success, "DefinitionHindi was not found in MainPage.xaml");
+        Assert.DoesNotContain("LineHeight", element.Value, StringComparison.Ordinal);
+    }
 }
