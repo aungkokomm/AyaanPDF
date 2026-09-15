@@ -402,6 +402,15 @@
                                          GroupName="RulerUnit"
                                          Click="RulerUnit_Click" Tag="Picas" />
                 </MenuFlyoutSubItem>
+                <!--
+                    The guide commands were only on the ruler's right-click menu,
+                    which nobody finds without being told and which is out of
+                    reach while the rulers are hidden. Same handlers as that menu.
+                -->
+                <MenuFlyoutSubItem Text="Guides">
+                    <MenuFlyoutItem Text="Clear guides on this page" Click="ClearGuidesPage_Click" />
+                    <MenuFlyoutItem Text="Clear all guides" Click="ClearGuidesAll_Click" />
+                </MenuFlyoutSubItem>
             </MenuBarItem>
 
             <MenuBarItem Title="Page" Margin="2,3,2,3">

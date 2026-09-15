@@ -236,6 +236,8 @@ public class MenuBarWiringTests
     [InlineData("ContinuousView_Click")]
     [InlineData("RulersToggle_Click")]
     [InlineData("RulerUnit_Click")]
+    [InlineData("ClearGuidesPage_Click")]
+    [InlineData("ClearGuidesAll_Click")]
     [InlineData("InsertFromFile_Click")]
     [InlineData("InsertBlankPage_Click")]
     [InlineData("ExtractPagesMenu_Click")]
@@ -286,6 +288,24 @@ public class MenuBarWiringTests
         Assert.Contains("ViewModel.IsEditingInPlace", paste, StringComparison.Ordinal);
         Assert.Contains("PasteIntoInPlaceEdit();", paste, StringComparison.Ordinal);
         Assert.Contains("ViewModel.PasteAnnotations();", paste, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Clearing guides was only on the ruler's right-click menu, which is out
+    /// of reach while the rulers are hidden.
+    /// </summary>
+    [Fact]
+    public void view_has_guides_with_both_ways_to_clear_them()
+    {
+        string bar = MenuBar();
+        int view = bar.IndexOf("<MenuBarItem Title=\"View\"", StringComparison.Ordinal);
+        int page = bar.IndexOf("<MenuBarItem Title=\"Page\"", StringComparison.Ordinal);
+        int guides = bar.IndexOf("<MenuFlyoutSubItem Text=\"Guides\">", StringComparison.Ordinal);
+        Assert.True(guides > view && guides < page, "there is no Guides submenu under View");
+
+        string submenu = bar[guides..bar.IndexOf("</MenuFlyoutSubItem>", guides, StringComparison.Ordinal)];
+        Assert.Contains("Click=\"ClearGuidesPage_Click\"", submenu, StringComparison.Ordinal);
+        Assert.Contains("Click=\"ClearGuidesAll_Click\"", submenu, StringComparison.Ordinal);
     }
 
     [Fact]
