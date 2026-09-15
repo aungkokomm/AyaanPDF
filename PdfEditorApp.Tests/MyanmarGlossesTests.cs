@@ -112,6 +112,7 @@ public class MyanmarGlossesTests
     [InlineData("new", "adjective", "အသစ်")]           // "new (-er,-est)"
     [InlineData("important", "adjective", "အရေးကြီးသော")] // "important (to sb/sth)"
     [InlineData("information", "noun", "အချက်အလက်")]   // "information (on/about sb/sth)"
+    [InlineData("grateful", "adjective", "ကျေးဇူးတင်သော")] // "grateful (to sb) (for sth); grateful (to do sth); ..."
     public void words_the_akk_dictionary_files_as_patterns_are_found(string headword, string pos, string first)
     {
         Assert.Equal(first, Shipped.Value.For(headword, pos)[0]);

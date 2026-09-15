@@ -58,7 +58,23 @@ PLACEHOLDER = re.compile(r"\b(?:sth|sb|sb's|one's|oneself|somebody|something|etc
 
 
 def word_of(headword: str) -> tuple[str, int] | None:
-    """The single word a headword is for, and 0 for a bare word or 1 for a pattern; None for a phrase."""
+    """The single word a headword is for, and 0 for a bare word or 1 for a pattern; None for a phrase.
+
+    A headword listing alternatives separated by ";", such as
+    "grateful (to sb) (for sth); grateful (to do sth); grateful (that_)", is
+    for a word only when every alternative is for that same word.
+    """
+    alternatives = [one_word_of(part) for part in (headword or "").split(";") if part.strip()]
+    if not alternatives or not all(alternatives):
+        return None
+    words = {word for word, _tier in alternatives}
+    if len(words) != 1:
+        return None
+    return words.pop(), max(tier for _word, tier in alternatives)
+
+
+def one_word_of(headword: str) -> tuple[str, int] | None:
+    """word_of for a single alternative."""
     text = (headword or "").replace("\\/", "/").replace("\\'", "'").replace("\\-", "-").strip()
     if WORD.fullmatch(text):
         return text.lower(), 0
