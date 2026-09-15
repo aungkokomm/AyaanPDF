@@ -143,9 +143,6 @@ public sealed partial class MainPage : Page
             new PointerEventHandler(RootGrid_PointerMoved),
             handledEventsToo: true);
         ViewModel.ScrollToPageRequested += OnScrollToPageRequested;
-        // Drag-reorder in the thumbnail list moves an item in this collection;
-        // that is the signal to rebuild the document in the new order.
-        ViewModel.Thumbnails.CollectionChanged += Thumbnails_CollectionChanged;
 
         // The page stack's layout reads card sizes from the list itself rather
         // than asking the repeater for each of 39,881 items. See its Slots.
@@ -10055,22 +10052,30 @@ public sealed partial class MainPage : Page
     // ---------------- Page organising ----------------
 
     /// <summary>
-    /// A drag-reorder in the thumbnail list moved an item, so rebuild the
-    /// document to match the new sequence.
-    ///
-    /// Only a user MOVE is acted on; the app's own Clear/Add while rebuilding
-    /// the thumbnails raises Reset/Add, and would otherwise loop. The rebuild is
-    /// deferred to after this event, because clearing the collection the list is
-    /// mid-reorder on, from inside its own change notification, is not safe.
+    /// A thumbnail drag finished: rebuild the document in the order the
+    /// thumbnails now show.
     /// </summary>
-    private void Thumbnails_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    /// <remarks>
+    /// ⚠️ NOT FROM THE COLLECTION'S CHANGE EVENTS. A ListView reorders its items
+    /// as a Remove and then an Add, never as a Move, so the handler that waited
+    /// for a Move never ran: from v1.43.0 to 3.45.31 a dragged thumbnail stayed
+    /// where it was dropped while the document kept its old order, and saving
+    /// wrote the old order.
+    ///
+    /// The rebuild is deferred to after this event, because refilling the
+    /// collection the list has only just finished moving, from inside its own
+    /// drag notification, is not safe.
+    /// </remarks>
+    private void ThumbnailList_DragItemsCompleted(ListViewBase sender, DragItemsCompletedEventArgs args)
     {
-        if (e.Action != NotifyCollectionChangedAction.Move || ViewModel.IsRebuildingPages)
+        var order = ViewModel.Thumbnails.Select(t => t.PageIndex).ToList();
+        if (order.Count != ViewModel.PageCount || order.SequenceEqual(Enumerable.Range(0, order.Count)))
         {
+            // Dropped back where it started, or outside the list.
             return;
         }
 
-        var order = ViewModel.Thumbnails.Select(t => t.PageIndex).ToList();
+        Diag.Log($"pages: thumbnail drag, order now starts {string.Join(",", order.Take(12).Select(i => i + 1))}");
         DispatcherQueue.TryEnqueue(() => ViewModel.RebuildPages(order));
     }
 

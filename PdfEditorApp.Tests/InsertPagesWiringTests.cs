@@ -77,8 +77,29 @@ public class InsertPagesWiringTests
     public void the_picker_is_a_window_that_resizes_not_a_dialog_that_stops_at_548()
     {
         Assert.Contains("class PagePickerWindow : Window", WindowCode(), StringComparison.Ordinal);
-        Assert.Contains("AppWindow.Resize(", MethodBody(WindowCode(), "private PagePickerWindow("), StringComparison.Ordinal);
         Assert.DoesNotContain("<ContentDialog", WindowXaml(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_window_is_sized_to_the_screen_so_its_buttons_are_never_below_the_taskbar()
+    {
+        string ctor = MethodBody(WindowCode(), "private PagePickerWindow(");
+
+        Assert.True(IndexIn(ctor, "DisplayArea.GetFromWindowId(") < IndexIn(ctor, "AppWindow.MoveAndResize("));
+        Assert.Contains("WorkArea", ctor, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void where_the_pages_go_is_asked_at_the_top_beside_the_preview()
+    {
+        string xaml = WindowXaml();
+
+        // A dropdown in the bottom corner was not found in the first test.
+        Assert.Contains("<RadioButtons x:Name=\"PositionChoice\"", xaml, StringComparison.Ordinal);
+        Assert.True(IndexIn(xaml, "x:Name=\"PositionPanel\"") < IndexIn(xaml, "x:Name=\"PreviewImage\""));
+        Assert.DoesNotContain("<ComboBox", xaml, StringComparison.Ordinal);
+
+        Assert.Contains("PositionChoice.SelectedIndex switch", MethodBody(WindowCode(), "private void Confirm_Click("), StringComparison.Ordinal);
     }
 
     [Fact]

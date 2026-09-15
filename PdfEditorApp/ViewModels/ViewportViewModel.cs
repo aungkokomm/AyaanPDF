@@ -1652,6 +1652,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        Diag.Log($"pages: rebuilt as {order.Count} page(s)");
         MapOverlayPages(p => PageReorder.NewIndexOf(order, p));
         ReloadAfterPageStructureChange();
         IsDirty = true;
@@ -1687,6 +1688,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        Diag.Log($"pages: inserted {inserted} page(s) at index {atIndex}");
         MapOverlayPages(p => p < atIndex ? p : p + inserted);
         ReloadAfterPageStructureChange();
         IsDirty = true;
@@ -2058,13 +2060,6 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// The full reload after the page count or order changed: fresh thumbnails,
     /// a rebuilt slot stack, redistributed overlay, and a re-render.
     /// </summary>
-    /// <summary>
-    /// True while the thumbnail list is being rebuilt by a page operation, so
-    /// the view's drag-reorder handler can tell the app's own Clear/Add of the
-    /// Thumbnails collection apart from a user drag and not loop.
-    /// </summary>
-    public bool IsRebuildingPages { get; private set; }
-
     private void ReloadAfterPageStructureChange()
     {
         ForgetTextLayers();
@@ -2078,15 +2073,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         PageCount = Math.Max(0, RenderCoreNative.get_page_count(_documentHandle));
 
-        IsRebuildingPages = true;
-        try
-        {
-            Thumbnails.ReplaceAll(ThumbnailPlaceholders());
-        }
-        finally
-        {
-            IsRebuildingPages = false;
-        }
+        Thumbnails.ReplaceAll(ThumbnailPlaceholders());
 
         CurrentPageIndex = Math.Clamp(CurrentPageIndex, 0, Math.Max(0, PageCount - 1));
 

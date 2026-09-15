@@ -18398,6 +18398,30 @@ mod tests {
     }
 
     #[test]
+    fn a_reordered_document_saves_in_its_new_order() {
+        // The half of drag-to-reorder that the file keeps. The app's drag did
+        // not reach the core until 3.45.32; this pins the core's side of it.
+        let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let order = [2i32, 0, 1];
+        assert_eq!(rebuild_page_order(h, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+
+        let path = std::env::temp_dir().join(format!("ayaan_reorder_{}.pdf", std::process::id()));
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(h, c_path.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(h);
+
+        let reopened = open_document(c_path.as_ptr());
+        assert_ne!(reopened, 0);
+        assert_eq!(get_page_count(reopened), 3);
+        assert_eq!(page_text(reopened, 0), "Page 3 of 20");
+        assert_eq!(page_text(reopened, 1), "Page 1 of 20");
+        assert_eq!(page_text(reopened, 2), "Page 2 of 20");
+
+        close_document(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn reordering_carries_a_pages_annotations_with_it() {
         // THE question the whole feature hinges on: does importing a page bring
         // its annotations along? If not, reordering would silently drop every

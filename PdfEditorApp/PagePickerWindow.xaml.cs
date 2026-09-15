@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
@@ -25,6 +26,11 @@ namespace PdfEditorApp;
 /// </remarks>
 public sealed partial class PagePickerWindow : Window
 {
+    private const int AfterCurrentPage = 0;
+    private const int AtStart = 1;
+    private const int AtEnd = 2;
+    private const int AfterPageNumber = 3;
+
     private readonly SourceDocument _source;
     private readonly bool _ownsSource;
     private readonly ViewportViewModel? _insertInto;
@@ -51,7 +57,16 @@ public sealed partial class PagePickerWindow : Window
         _initial = initial;
 
         AppWindow.SetIcon("Assets/AppIcon.ico");
-        AppWindow.Resize(new Windows.Graphics.SizeInt32(1100, 760));
+
+        // Sized to the screen it opens on. A fixed 1100 by 760 is taller than a
+        // small laptop's work area once the taskbar is counted, which puts the
+        // bottom of the window, and its buttons, off the screen.
+        var work = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Nearest).WorkArea;
+        int width = Math.Min(1400, (int)(work.Width * 0.9));
+        int height = (int)(work.Height * 0.9);
+        AppWindow.MoveAndResize(new Windows.Graphics.RectInt32(
+            work.X + (work.Width - width) / 2, work.Y + (work.Height - height) / 2, width, height));
+
         Theming.Apply(this, SettingsStore.Current.Theme);
 
         Title = $"Insert pages from {source.Name}";
@@ -68,11 +83,11 @@ public sealed partial class PagePickerWindow : Window
             // The current page as it was when the window opened, so the label
             // and where the pages go can never disagree.
             _currentPageAtOpen = insertInto.CurrentPageIndex;
-            PositionBox.Items.Add($"After the current page ({_currentPageAtOpen + 1})");
-            PositionBox.Items.Add("At the start");
-            PositionBox.Items.Add("At the end");
-            PositionBox.Items.Add("After a page number");
-            PositionBox.SelectedIndex = 0;
+            PositionChoice.Items.Add($"After page {_currentPageAtOpen + 1}, the page you're on");
+            PositionChoice.Items.Add("At the start, before page 1");
+            PositionChoice.Items.Add($"At the end, after page {insertInto.PageCount}");
+            PositionChoice.Items.Add("After a page number");
+            PositionChoice.SelectedIndex = AfterCurrentPage;
             AfterPageBox.Maximum = insertInto.PageCount;
             AfterPageBox.Value = _currentPageAtOpen + 1;
         }
@@ -302,8 +317,8 @@ public sealed partial class PagePickerWindow : Window
 
     // ---------------- The answer ----------------
 
-    private void PositionBox_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
-        AfterPageBox.Visibility = PositionBox.SelectedIndex == 3 ? Visibility.Visible : Visibility.Collapsed;
+    private void PositionChoice_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        AfterPageBox.Visibility = PositionChoice.SelectedIndex == AfterPageNumber ? Visibility.Visible : Visibility.Collapsed;
 
     private void Confirm_Click(object sender, RoutedEventArgs e)
     {
@@ -322,14 +337,15 @@ public sealed partial class PagePickerWindow : Window
 
         if (_insertInto is { } into)
         {
-            int at = PositionBox.SelectedIndex switch
+            int at = PositionChoice.SelectedIndex switch
             {
-                1 => 0,
-                2 => into.PageCount,
-                3 when !double.IsNaN(AfterPageBox.Value) => (int)Math.Clamp(AfterPageBox.Value, 1, into.PageCount),
+                AtStart => 0,
+                AtEnd => into.PageCount,
+                AfterPageNumber when !double.IsNaN(AfterPageBox.Value) => (int)Math.Clamp(AfterPageBox.Value, 1, into.PageCount),
                 _ => _currentPageAtOpen + 1,
             };
 
+            Diag.Log($"insert pages: {indices.Count} of {_source.PageCount} from \"{_source.Name}\", choice {PositionChoice.SelectedIndex}, at index {at}");
             if (!into.InsertPagesFromDocument(_source.Handle, indices, at))
             {
                 ShowError("Couldn't insert those pages.");

@@ -59,7 +59,7 @@
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="3*" MinWidth="320" />
-                <ColumnDefinition Width="2*" MinWidth="240" />
+                <ColumnDefinition Width="2*" MinWidth="260" />
             </Grid.ColumnDefinitions>
 
             <!--
@@ -94,45 +94,50 @@
                 </GridView.ItemTemplate>
             </GridView>
 
-            <Grid x:Name="PreviewHost" Grid.Column="1" Padding="16" RowSpacing="8"
+            <Grid x:Name="PreviewHost" Grid.Column="1" Padding="16" RowSpacing="12"
                   Background="{ThemeResource LayerFillColorDefaultBrush}"
                   BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1,0,0,0">
                 <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <Image x:Name="PreviewImage" Stretch="Uniform"
+
+                <!--
+                    Where the chosen pages go, at the top beside the preview. It
+                    was a dropdown in the bottom corner, and in the first test it
+                    was not found at all.
+                -->
+                <StackPanel x:Name="PositionPanel" Spacing="4">
+                    <TextBlock Text="Where to put the pages" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <RadioButtons x:Name="PositionChoice" AutomationProperties.Name="Where to put the pages"
+                                  SelectionChanged="PositionChoice_SelectionChanged" />
+                    <NumberBox x:Name="AfterPageBox" Width="160" HorizontalAlignment="Left"
+                               Visibility="Collapsed" Minimum="1" SpinButtonPlacementMode="Inline"
+                               AutomationProperties.Name="After page number" />
+                </StackPanel>
+
+                <Image x:Name="PreviewImage" Grid.Row="1" Stretch="Uniform"
                        AutomationProperties.Name="Preview of the chosen page" />
-                <TextBlock x:Name="PreviewCaption" Grid.Row="1" HorizontalAlignment="Center"
+                <TextBlock x:Name="PreviewCaption" Grid.Row="2" HorizontalAlignment="Center"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
             </Grid>
         </Grid>
 
-        <!-- Where the pages go, how many there are, and the two answers. -->
+        <!-- How many pages are chosen, and the two answers. -->
         <Grid Grid.Row="2" Padding="16,12,16,12" ColumnSpacing="10"
               BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
-            <StackPanel x:Name="PositionPanel" Orientation="Horizontal" Spacing="8">
-                <TextBlock Text="Insert" VerticalAlignment="Center" />
-                <ComboBox x:Name="PositionBox" MinWidth="230"
-                          AutomationProperties.Name="Where to insert"
-                          SelectionChanged="PositionBox_SelectionChanged" />
-                <NumberBox x:Name="AfterPageBox" Width="120" Visibility="Collapsed"
-                           Minimum="1" SpinButtonPlacementMode="Compact"
-                           AutomationProperties.Name="After page number" />
-            </StackPanel>
-
-            <TextBlock x:Name="SelectedCount" Grid.Column="2" VerticalAlignment="Center"
+            <TextBlock x:Name="SelectedCount" Grid.Column="1" VerticalAlignment="Center"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-            <Button Grid.Column="3" Content="Cancel" Click="Cancel_Click" />
-            <Button x:Name="ConfirmButton" Grid.Column="4" Content="Insert pages"
+            <Button Grid.Column="2" Content="Cancel" Click="Cancel_Click" />
+            <Button x:Name="ConfirmButton" Grid.Column="3" Content="Insert pages"
                     Style="{StaticResource AccentButtonStyle}" Click="Confirm_Click" />
         </Grid>
     </Grid>

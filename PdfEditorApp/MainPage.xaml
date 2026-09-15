@@ -3022,6 +3022,7 @@
                 CanReorderItems="True"
                 CanDragItems="True"
                 AllowDrop="True"
+                DragItemsCompleted="ThumbnailList_DragItemsCompleted"
                 ContainerContentChanging="ThumbnailList_ContainerContentChanging">
                 <ListView.ItemTemplate>
                     <DataTemplate x:DataType="viewmodels:PageThumbnail">
