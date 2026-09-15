@@ -886,6 +886,7 @@ public sealed partial class MainPage : Page
 
     private void PageScroller_ViewChanged(ScrollView sender, object args)
     {
+        using var uiStall = UiStall.Section("ViewChanged");
         UpdateZoomReadout();
 
         // The Skia layer is outside the scroller, so nothing moves it for free:
@@ -949,6 +950,7 @@ public sealed partial class MainPage : Page
 
     private void PageScroller_SizeChanged(object sender, SizeChangedEventArgs e)
     {
+        using var uiStall = UiStall.Section("ScrollerSizeChanged");
         if (XamlRoot is not null)
         {
             ViewModel.RasterizationScale = XamlRoot.RasterizationScale;
@@ -1221,6 +1223,7 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void PageScroller_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
     {
+        using var uiStall = UiStall.Section("WheelChanged");
         if (!ViewModel.IsSinglePageView || ViewModel.PageCount == 0)
         {
             return;
@@ -7584,6 +7587,7 @@ public sealed partial class MainPage : Page
 
     private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)
     {
+        using var uiStall = UiStall.Section("KeyDown");
         // DIAGNOSTIC (temporary): does the REAL handler get this key at all?
         // The spy above sees everything; this line only fires for keys that
         // actually reach the switch, so the two together locate the loss.
@@ -7984,6 +7988,7 @@ public sealed partial class MainPage : Page
     /// </summary>
     private InputSystemCursorShape? HoverCursor(PointerRoutedEventArgs e)
     {
+        using var uiStall = UiStall.Section("HoverCursor");
         // The hand overrides everything - never override the pan cursor. This
         // covers the Hand TOOL as well as Space, because press routing below
         // does: with the hand armed a drag pans, so offering a resize or
@@ -8440,6 +8445,7 @@ public sealed partial class MainPage : Page
 
     private void ViewportHost_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
+        using var uiStall = UiStall.Section("PointerPressed");
         // A click on the page hands the keyboard back to the canvas.
         //
         // RootGrid_KeyDown drops every key while a text field has focus, which
@@ -8865,6 +8871,7 @@ public sealed partial class MainPage : Page
 
     private void ViewportHost_PointerMoved(object sender, PointerRoutedEventArgs e)
     {
+        using var uiStall = UiStall.Section("PointerMoved");
         // Cursor first, and BEFORE the drag guard below. That guard only lets
         // through the pointer that is mid-drag, and a hovering pointer has no
         // drag id, so putting the cursor update after it meant the resize
@@ -8989,6 +8996,7 @@ public sealed partial class MainPage : Page
 
     private void ViewportHost_PointerReleased(object sender, PointerRoutedEventArgs e)
     {
+        using var uiStall = UiStall.Section("PointerReleased");
         // Lifted BEFORE the pointer-id check. A press that never became a drag
         // still suppressed the toolbar, and bailing out below would leave it
         // hidden until the next selection change.

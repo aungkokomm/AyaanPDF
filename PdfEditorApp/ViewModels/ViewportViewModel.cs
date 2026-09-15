@@ -3586,6 +3586,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         double verticalOffset, double viewportHeight, double zoomFactor,
         double horizontalOffset = 0, double viewportWidth = 0)
     {
+        using var uiStall = UiStall.Section("UpdateVisibleWindow");
         if (_documentHandle == 0 || PageSlots.Count == 0)
         {
             return;
@@ -3709,7 +3710,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             if (raw.Bgra is not null)
             {
-                slot.SetBaseRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                using (UiStall.Section("SetBaseRender"))
+                {
+                    slot.SetBaseRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                }
                 Diag.Log($"base {pageIndex}: {raw.Width}x{raw.Height} {raw.Outcome}");
             }
         }
@@ -3774,6 +3778,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void SharpenVisiblePages()
     {
+        using var uiStall = UiStall.Section("SharpenVisiblePages");
         if (_documentHandle == 0 || PageSlots.Count == 0)
         {
             return;
@@ -3958,7 +3963,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
             if (raw.Bgra is not null)
             {
-                slot.SetSharpRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                using (UiStall.Section("SetSharpRender"))
+                {
+                    slot.SetSharpRender(PageRenderer.ToBitmap(raw).Bitmap, raw.Width);
+                }
                 Diag.Log($"sharpened {pageIndex} to {raw.Width}x{raw.Height}");
             }
         }
@@ -3978,6 +3986,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void DistributeAnnotationsToSlots()
     {
+        using var uiStall = UiStall.Section("DistributeAnnotations");
         foreach (var slot in PageSlots)
         {
             slot.Highlights.Clear();
@@ -4528,6 +4537,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private void RefreshSelectionOutlineCore()
     {
+        using var uiStall = UiStall.Section("RefreshSelectionOutline");
         foreach (var slot in PageSlots)
         {
             slot.SelectionOutline.Clear();
@@ -5256,6 +5266,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private PageTextContext ContextFor(int pageIndex)
     {
+        using var uiStall = UiStall.Section("ContextFor");
         if (_documentHandle == 0)
         {
             return PageTextContext.Plain(pageIndex, Array.Empty<LineSnapshot>());
@@ -10978,6 +10989,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </remarks>
     public void RefreshTextRegions()
     {
+        using var uiStall = UiStall.Section("RefreshTextRegions");
         foreach (var slot in PageSlots) { slot.TextRegionOutlines.Clear(); }
 
         if (!IsEditMode || _documentHandle == 0 || PageSlots.Count == 0)
@@ -12797,6 +12809,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void OnCurrentPageChangedByScroll()
     {
+        using var uiStall = UiStall.Section("PageChangedByScroll");
         RefreshAnnotationsForCurrentPage();
     }
 
@@ -13068,6 +13081,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public void BeginTextSelection(int pageIndex, double x, double y)
     {
+        using var uiStall = UiStall.Section("BeginTextSelection");
         ClearSelection();
 
         var layer = TextLayerFor(pageIndex);
@@ -13094,6 +13108,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public void UpdateTextSelection(int pageIndex, double x, double y)
     {
+        using var uiStall = UiStall.Section("UpdateTextSelection");
         if (!_isSelecting || _selection is not DocumentSelection current)
         {
             return;
@@ -13218,6 +13233,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void RefreshSelectionRects()
     {
+        using var uiStall = UiStall.Section("RefreshSelectionRects");
         foreach (var slot in PageSlots)
         {
             slot.SelectionRects.Clear();
@@ -15509,6 +15525,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private PageTextLayer? TextLayerFor(int pageIndex)
     {
+        using var uiStall = UiStall.Section("TextLayerFor");
         if (_documentHandle == 0 || pageIndex < 0 || pageIndex >= PageCount)
         {
             return null;

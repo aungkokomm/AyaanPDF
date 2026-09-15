@@ -48,6 +48,7 @@ public sealed class PageStackLayout : VirtualizingLayout
 
     protected override Size MeasureOverride(VirtualizingLayoutContext context, Size availableSize)
     {
+        using var uiStall = UiStall.Section("PageStack.Measure");
         var geometry = GeometryFor(context);
         var window = context.RealizationRect;
         double top = window.Y;
@@ -64,6 +65,7 @@ public sealed class PageStackLayout : VirtualizingLayout
 
     protected override Size ArrangeOverride(VirtualizingLayoutContext context, Size finalSize)
     {
+        using var uiStall = UiStall.Section("PageStack.Arrange");
         var geometry = GeometryFor(context);
         for (int i = _first; i >= 0 && i <= _last && i < geometry.Count; i++)
         {

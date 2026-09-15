@@ -27,6 +27,9 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
 
+        // Logs which code holds the UI thread whenever it freezes. See UiStall.
+        UiStall.Start(DispatcherQueue);
+
         ExtendsContentIntoTitleBar = true;
         // Only the empty remainder, NOT the whole bar: whatever is handed to
         // SetTitleBar becomes the drag region, and its children stop receiving
