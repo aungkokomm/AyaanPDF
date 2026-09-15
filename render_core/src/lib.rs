@@ -15232,7 +15232,9 @@ mod tests {
     fn how_page_shapes_vary_in_a_real_file() {
         let path = std::env::var("AYAAN_SIZES_PDF").expect("set AYAAN_SIZES_PDF");
         let handle = open_fixture_named(&path);
+        let clock = std::time::Instant::now();
         let array = get_page_sizes(handle);
+        println!("get_page_sizes took {:.1} ms", clock.elapsed().as_secs_f64() * 1000.0);
         println!("status {}", array.status);
         let sizes = unsafe { std::slice::from_raw_parts(array.sizes, array.len) };
         let n = sizes.len();

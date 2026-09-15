@@ -1698,26 +1698,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private (double W, double H) CurrentPageSizePoints()
     {
-        var array = RenderCoreNative.get_page_sizes(_documentHandle);
-        try
-        {
-            if (array.Status == RenderStatus.OkPdfium && array.Sizes != IntPtr.Zero
-                && CurrentPageIndex >= 0 && CurrentPageIndex < (int)array.Len)
-            {
-                int stride = Marshal.SizeOf<NativePageSize>();
-                var native = Marshal.PtrToStructure<NativePageSize>(array.Sizes + (CurrentPageIndex * stride));
-                if (native.Width > 0 && native.Height > 0)
-                {
-                    return (native.Width, native.Height);
-                }
-            }
-        }
-        finally
-        {
-            RenderCoreNative.free_page_size_array(array);
-        }
-
-        return (612, 792); // US Letter
+        // The rulers call this on every scroll step, so it reads the cache. See
+        // PagePointsFor for what the fresh read cost on a large book.
+        var (w, h) = PagePointsFor(CurrentPageIndex);
+        return w > 0 && h > 0 ? (w, h) : (612, 792); // US Letter
     }
 
     /// <summary>Inserts a copy of a page right after it.</summary>
@@ -3349,22 +3333,18 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// page + a letter page in the same PDF would want different margins).</summary>
     private (double W, double H) PagePointsFor(int pageIndex)
     {
-        var array = RenderCoreNative.get_page_sizes(_documentHandle);
-        try
-        {
-            if (array.Status == RenderStatus.OkPdfium && array.Sizes != IntPtr.Zero
-                && pageIndex >= 0 && pageIndex < (int)array.Len)
-            {
-                int stride = Marshal.SizeOf<NativePageSize>();
-                var native = Marshal.PtrToStructure<NativePageSize>(array.Sizes + (pageIndex * stride));
-                if (native.Width > 0 && native.Height > 0) { return (native.Width, native.Height); }
-            }
-        }
-        finally
-        {
-            RenderCoreNative.free_page_size_array(array);
-        }
-        return (0, 0);
+        // ⚠️ FROM THE CACHE, NEVER A FRESH get_page_sizes. That call reads EVERY
+        // page's size under the PDFium lock, and this used to make it to answer
+        // for one page. The rulers ask on every scroll step, so on a 39881-page
+        // book, where one call measured 1546 ms, scrolling one page froze the
+        // app for about 40 seconds and starved the page renders of the lock.
+        if (_documentHandle == 0) { return (0, 0); }
+
+        var sizes = PageSizes();
+        if (pageIndex < 0 || pageIndex >= sizes.Count) { return (0, 0); }
+
+        var size = sizes[pageIndex];
+        return size.Width > 0 && size.Height > 0 ? (size.Width, size.Height) : (0, 0);
     }
 
     /// <summary>The guide the user has picked (single-select). Delete removes
