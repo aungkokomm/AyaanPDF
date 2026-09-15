@@ -1,10 +1,14 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using PdfEditorApp.Interop;
+using PdfEditorApp.Viewport;
 
 namespace PdfEditorApp;
 
@@ -170,6 +174,32 @@ internal sealed class SourceDocument : IDisposable
             }
 
             error.Visibility = Visibility.Visible;
+        }
+    }
+
+    /// <summary>The file's own outline, read from its catalog without loading a page.</summary>
+    public IReadOnlyList<Bookmark> ReadBookmarks()
+    {
+        if (Handle == 0)
+        {
+            return Array.Empty<Bookmark>();
+        }
+
+        var buffer = RenderCoreNative.get_bookmarks(Handle);
+        try
+        {
+            if (buffer.Status != RenderStatus.OkPdfium || buffer.Data == IntPtr.Zero || buffer.Len == 0)
+            {
+                return Array.Empty<Bookmark>();
+            }
+
+            byte[] bytes = new byte[(int)buffer.Len];
+            Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+            return BookmarkReader.Parse(bytes).ToList();
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buffer);
         }
     }
 

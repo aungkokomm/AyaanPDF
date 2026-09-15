@@ -282,7 +282,9 @@ public class BookmarkEditingWiringTests
         // the handle first.
         string body = MethodBody(ViewModel(), "public bool SaveDocumentAs(string path, bool flatten)");
 
-        int flush = body.IndexOf("FlushPendingOutline();", StringComparison.Ordinal);
+        // Handed the outline taken before the save: reopening the file clears
+        // the pending one. See BookmarksSurvivePageChangesWiringTests.
+        int flush = body.IndexOf("FlushPendingOutline(outlineToWrite);", StringComparison.Ordinal);
         Assert.True(flush >= 0, "a save no longer writes pending bookmarks, so they would be lost");
 
         int save = body.IndexOf("RenderCoreNative.save_document(", StringComparison.Ordinal);

@@ -987,6 +987,265 @@ fn pdfium_page_list(indices: &[i32]) -> String {
     parts.join(",")
 }
 
+/// Makes a new, empty document in memory and returns its handle, or 0.
+///
+/// What a merged file is built in: pages are copied in with
+/// `insert_pages_from_document`, pictures added with `insert_image_page` and
+/// `insert_jpeg_page`, and the result written with `save_document`. It has no
+/// file behind it, so nothing is ever answered out of one.
+#[unsafe(no_mangle)]
+pub extern "C" fn create_document() -> u64 {
+    panic::catch_unwind(|| {
+        let document = {
+            let _guard = call_guard();
+            let Some(pdfium) = pdfium() else {
+                return 0;
+            };
+            match pdfium.create_new_pdf() {
+                Ok(document) => document,
+                Err(_) => return 0,
+            }
+        };
+
+        let core = core();
+        let id = core.next_doc_id.fetch_add(1, Ordering::Relaxed);
+        lock(&core.documents).insert(id, Arc::new(Mutex::new(document)));
+        id
+    })
+    .unwrap_or(0)
+}
+
+/// Where a picture of `width` x `height` pixels is drawn on a page: as large
+/// as fits, centred, keeping its shape. (x, y, drawn width, drawn height) in
+/// points, from the bottom-left corner.
+fn fit_image(width: f32, height: f32, page_width: f32, page_height: f32) -> (f32, f32, f32, f32) {
+    let scale = (page_width / width).min(page_height / height);
+    let (drawn_width, drawn_height) = (width * scale, height * scale);
+    (
+        (page_width - drawn_width) / 2.0,
+        (page_height - drawn_height) / 2.0,
+        drawn_width,
+        drawn_height,
+    )
+}
+
+/// Adds a page showing one picture at `at_index` (past the end appends).
+///
+/// `bgra` is `width` x `height` pixels, four bytes each, straight alpha. The
+/// page is `page_width` x `page_height` points and the picture is drawn as
+/// large as fits, centred. The pixels are stored losslessly, so a photograph
+/// that is already a JPEG file is better added with `insert_jpeg_page`.
+/// Returns STATUS_OK_PDFIUM, STATUS_INVALID_INPUT or STATUS_PANIC.
+#[unsafe(no_mangle)]
+pub extern "C" fn insert_image_page(
+    doc_handle: u64,
+    at_index: i32,
+    bgra: *const u8,
+    width: i32,
+    height: i32,
+    page_width: f32,
+    page_height: f32,
+) -> i32 {
+    if doc_handle == 0
+        || bgra.is_null()
+        || width <= 0
+        || height <= 0
+        || !(page_width > 0.0)
+        || !(page_height > 0.0)
+        || at_index < 0
+    {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        insert_image_page_inner(doc_handle, at_index, bgra, width, height, page_width, page_height)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn insert_image_page_inner(
+    doc_handle: u64,
+    at_index: i32,
+    bgra: *const u8,
+    width: i32,
+    height: i32,
+    page_width: f32,
+    page_height: f32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let Some(len) = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4)) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // PDFium's bitmap BORROWS the buffer it is given, so the pixels are copied
+    // into memory this function owns for as long as the bitmap lives.
+    let mut pixels = unsafe { std::slice::from_raw_parts(bgra, len) }.to_vec();
+
+    let _guard = call_guard();
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let doc_guard = lock(&doc);
+    let bindings = doc_guard.bindings();
+    let document = doc_guard.handle();
+
+    let at = at_index.min(bindings.FPDF_GetPageCount(document)).max(0);
+    let page = bindings.FPDFPage_New(document, at, page_width as f64, page_height as f64);
+    if page.is_null() {
+        return STATUS_INVALID_INPUT;
+    }
+
+    // FPDFBitmap_BGRA: four bytes a pixel, with alpha.
+    const BITMAP_BGRA: i32 = 4;
+    let image = bindings.FPDFPageObj_NewImageObj(document);
+    let bitmap = bindings.FPDFBitmap_CreateEx(
+        width,
+        height,
+        BITMAP_BGRA,
+        pixels.as_mut_ptr() as *mut std::ffi::c_void,
+        width * 4,
+    );
+    let set = !image.is_null()
+        && !bitmap.is_null()
+        && bindings.is_true(bindings.FPDFImageObj_SetBitmap(std::ptr::null_mut(), 0, image, bitmap));
+    // The image object has taken its own copy of the pixels by now.
+    if !bitmap.is_null() {
+        bindings.FPDFBitmap_Destroy(bitmap);
+    }
+
+    if !set {
+        if !image.is_null() {
+            bindings.FPDFPageObj_Destroy(image);
+        }
+        bindings.FPDF_ClosePage(page);
+        // No blank page left behind where the picture should have been.
+        bindings.FPDFPage_Delete(document, at);
+        return STATUS_INVALID_INPUT;
+    }
+
+    let (x, y, drawn_width, drawn_height) = fit_image(width as f32, height as f32, page_width, page_height);
+    bindings.FPDFImageObj_SetMatrix(
+        image,
+        drawn_width as f64,
+        0.0,
+        0.0,
+        drawn_height as f64,
+        x as f64,
+        y as f64,
+    );
+    bindings.FPDFPage_InsertObject(page, image);
+    let generated = bindings.is_true(bindings.FPDFPage_GenerateContent(page));
+    bindings.FPDF_ClosePage(page);
+
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
+    if generated { STATUS_OK_PDFIUM } else { STATUS_INVALID_INPUT }
+}
+
+/// Adds a page showing a JPEG file at `at_index`, keeping the file's own
+/// compressed bytes rather than decoding them, so a photograph costs what the
+/// file costs.
+///
+/// `pixel_width` and `pixel_height` are the picture's size, which the caller
+/// already knows from reading the file. The page is sized and the picture
+/// fitted as `insert_image_page` does. ⚠️ PDFium draws the bytes as stored, so
+/// a JPEG that its EXIF orientation turns upright has to go through
+/// `insert_image_page` as decoded pixels instead.
+#[unsafe(no_mangle)]
+pub extern "C" fn insert_jpeg_page(
+    doc_handle: u64,
+    at_index: i32,
+    path: *const c_char,
+    pixel_width: i32,
+    pixel_height: i32,
+    page_width: f32,
+    page_height: f32,
+) -> i32 {
+    if doc_handle == 0
+        || path.is_null()
+        || pixel_width <= 0
+        || pixel_height <= 0
+        || !(page_width > 0.0)
+        || !(page_height > 0.0)
+        || at_index < 0
+    {
+        return STATUS_INVALID_INPUT;
+    }
+    panic::catch_unwind(|| {
+        insert_jpeg_page_inner(doc_handle, at_index, path, pixel_width, pixel_height, page_width, page_height)
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+fn insert_jpeg_page_inner(
+    doc_handle: u64,
+    at_index: i32,
+    path: *const c_char,
+    pixel_width: i32,
+    pixel_height: i32,
+    page_width: f32,
+    page_height: f32,
+) -> i32 {
+    use pdfium_render::prelude::*;
+
+    let Ok(path_str) = (unsafe { CStr::from_ptr(path) }).to_str() else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    // ⚠️ PDFium TAKES ANY FILE HERE. The JPEG is only decoded when the page is
+    // drawn, so a file that is not one loads "successfully" and becomes a page
+    // with nothing on it. Measured: a PDF handed in came back OK. So a file
+    // that does not even begin with a JPEG's start-of-image marker is refused.
+    let starts_like_a_jpeg = std::fs::File::open(path_str)
+        .and_then(|mut file| {
+            let mut head = [0u8; 3];
+            std::io::Read::read_exact(&mut file, &mut head).map(|_| head)
+        })
+        .is_ok_and(|head| head == [0xFF, 0xD8, 0xFF]);
+    if !starts_like_a_jpeg {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let _guard = call_guard();
+    let doc = lock(&core().documents).get(&doc_handle).cloned();
+    let Some(doc) = doc else {
+        return STATUS_INVALID_INPUT;
+    };
+    let mut doc_guard = lock(&doc);
+
+    // Loaded BEFORE the page is made, so a file that is not a JPEG leaves no
+    // blank page behind.
+    let Ok(mut image) = PdfPageImageObject::new_from_jpeg_file(&doc_guard, path_str) else {
+        return STATUS_INVALID_INPUT;
+    };
+    let (x, y, drawn_width, drawn_height) =
+        fit_image(pixel_width as f32, pixel_height as f32, page_width, page_height);
+    if image.scale(drawn_width, drawn_height).is_err()
+        || image.translate(PdfPoints::new(x), PdfPoints::new(y)).is_err()
+    {
+        return STATUS_INVALID_INPUT;
+    }
+
+    let at = at_index.min(doc_guard.pages().len() as i32).max(0) as u16;
+    let size = PdfPagePaperSize::Custom(PdfPoints::new(page_width), PdfPoints::new(page_height));
+    let Ok(mut page) = doc_guard.pages_mut().create_page_at_index(size, at) else {
+        return STATUS_INVALID_INPUT;
+    };
+
+    if page.objects_mut().add_image_object(image).is_err() || page.regenerate_content().is_err() {
+        let _ = page.delete();
+        return STATUS_INVALID_INPUT;
+    }
+
+    drop(page);
+    drop(doc_guard);
+    evict_all_cache_for_doc(doc_handle);
+    lock(&core().generations).retain(|(d, _), _| *d != doc_handle);
+    STATUS_OK_PDFIUM
+}
+
 /// Inserts one blank page at `at_index`, sized in points. Used for "insert a
 /// blank page"; the app passes the current page's size so it matches.
 #[unsafe(no_mangle)]
@@ -18612,6 +18871,77 @@ mod tests {
     }
 
     #[test]
+    fn a_new_document_takes_chosen_pages_from_several_places_and_saves_them() {
+        let merged = create_document();
+        assert_ne!(merged, 0);
+        assert_eq!(get_page_count(merged), 0);
+
+        let source = open_fixture_named("tests/fixtures/sample_20pages.pdf");
+        let first = [4, 5];
+        let second = [0];
+        assert_eq!(insert_pages_from_document(merged, source, first.as_ptr(), first.len(), 0), 2);
+        assert_eq!(insert_pages_from_document(merged, source, second.as_ptr(), second.len(), 2), 1);
+        assert_eq!(get_page_count(merged), 3);
+
+        let path = std::env::temp_dir().join(format!("ayaan_merge_{}.pdf", std::process::id()));
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(save_document(merged, c_path.as_ptr()), STATUS_OK_PDFIUM);
+        close_document(merged);
+        close_document(source);
+
+        let reopened = open_document(c_path.as_ptr());
+        assert_ne!(reopened, 0);
+        assert_eq!(get_page_count(reopened), 3);
+        assert_eq!(page_text(reopened, 0), "Page 5 of 20");
+        assert_eq!(page_text(reopened, 1), "Page 6 of 20");
+        assert_eq!(page_text(reopened, 2), "Page 1 of 20");
+
+        close_document(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_picture_becomes_a_page_of_its_own_drawn_as_large_as_fits() {
+        let merged = create_document();
+
+        // Two pixels side by side, red then blue, as BGRA. On a page twice as
+        // wide as it is tall they fill it: red on the left, blue on the right.
+        let pixels = [0u8, 0, 255, 255, 255, 0, 0, 255];
+        assert_eq!(insert_image_page(merged, 0, pixels.as_ptr(), 2, 1, 200.0, 100.0), STATUS_OK_PDFIUM);
+        assert_eq!(get_page_count(merged), 1);
+
+        let rendered = render_low_res(merged, 0, 200);
+        assert_eq!(rendered.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(rendered.buffer, rendered.len) };
+        let at = |x: usize| {
+            let i = ((rendered.height as usize / 2) * rendered.width as usize + x) * 4;
+            (bytes[i + 2], bytes[i])
+        };
+        let (red, blue) = at(rendered.width as usize / 4);
+        assert!(red > 200 && blue < 60, "the left half is the red pixel, got r={red} b={blue}");
+        let (red, blue) = at(rendered.width as usize * 3 / 4);
+        assert!(blue > 200 && red < 60, "the right half is the blue pixel, got r={red} b={blue}");
+        free_render_result(rendered);
+
+        close_document(merged);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_jpeg_adds_no_page() {
+        let merged = create_document();
+        let path = std::ffi::CString::new("tests/fixtures/sample.pdf").unwrap();
+
+        assert_eq!(insert_jpeg_page(merged, 0, path.as_ptr(), 100, 100, 100.0, 100.0), STATUS_INVALID_INPUT);
+        assert_eq!(get_page_count(merged), 0);
+
+        let pixels = [0u8; 4];
+        assert_eq!(insert_image_page(merged, 0, pixels.as_ptr(), 0, 1, 100.0, 100.0), STATUS_INVALID_INPUT);
+        assert_eq!(get_page_count(merged), 0);
+
+        close_document(merged);
+    }
+
+    #[test]
     fn a_blank_page_is_inserted_and_is_actually_blank() {
         let h = open_fixture_named("tests/fixtures/sample_20pages.pdf");
         assert_eq!(insert_blank_page(h, 3, 612.0, 792.0), STATUS_OK_PDFIUM);
@@ -25378,6 +25708,27 @@ p={spread_px:.4},c={rgba:08X})"
                 ("Nowhere", 0, -1),
             ]
         );
+
+        close_document(handle);
+    }
+
+    #[test]
+    fn a_rebuilt_document_has_no_outline_so_the_app_carries_it() {
+        // Reordering, duplicating and deleting pages copy them into a NEW
+        // document, and a page copy brings no bookmarks. The app keeps the
+        // outline in memory and writes it on save; this pins why it must.
+        let handle = open_fixture_named("tests/fixtures/sample_outline.pdf");
+        let before = get_bookmarks(handle);
+        assert!(!parse_bookmarks(&before).is_empty());
+        free_byte_buffer(before);
+
+        let count = get_page_count(handle);
+        let order: Vec<i32> = (0..count).rev().collect();
+        assert_eq!(rebuild_page_order(handle, order.as_ptr(), order.len()), STATUS_OK_PDFIUM);
+
+        let after = get_bookmarks(handle);
+        assert!(after.len < 4 || parse_bookmarks(&after).is_empty(), "a rebuilt document is expected to have no outline");
+        free_byte_buffer(after);
 
         close_document(handle);
     }

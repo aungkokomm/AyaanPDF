@@ -10331,6 +10331,26 @@ public sealed partial class MainPage : Page
 
     // ---------------- Insert / extract pages ----------------
 
+    private MergeFilesWindow? _mergeFilesWindow;
+
+    /// <summary>
+    /// File > Merge files: PDFs and pictures into one new file, which opens in
+    /// a tab of its own. Needs no document open.
+    /// </summary>
+    private void MergeFiles_Click(object sender, RoutedEventArgs e)
+    {
+        if (_mergeFilesWindow is not null)
+        {
+            _mergeFilesWindow.Activate();
+            return;
+        }
+
+        var window = new MergeFilesWindow();
+        window.Closed += (_, _) => _mergeFilesWindow = null;
+        _mergeFilesWindow = window;
+        window.Activate();
+    }
+
     private PagePickerWindow? _insertPagesWindow;
 
     /// <summary>

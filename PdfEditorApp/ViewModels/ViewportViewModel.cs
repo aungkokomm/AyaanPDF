@@ -666,9 +666,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// the outline writer works on a CLOSED file, so it has to be the last
     /// thing that happens.
     /// </summary>
-    private void FlushPendingOutline()
+    /// <remarks>
+    /// ⚠️ HANDED THE OUTLINE AS IT WAS BEFORE THE SAVE. An ordinary Save reopens
+    /// the file it just wrote, and reopening re-reads the file's outline, which
+    /// clears the edits waiting here. Read at this point there was nothing left
+    /// to write, so bookmark edits did not survive a plain Save.
+    /// </remarks>
+    private void FlushPendingOutline(List<DetectedHeading>? outline)
     {
-        if (_pendingOutline is not { } outline)
+        if (outline is null)
         {
             return;
         }
@@ -684,6 +690,30 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Status = problem;
             Diag.Log($"outline flush failed: {problem}");
         }
+    }
+
+    /// <summary>
+    /// Puts an outline back after the pages changed, each bookmark following
+    /// its page, as edits the next save writes.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A REBUILT DOCUMENT HAS NO OUTLINE. Reordering, duplicating and
+    /// deleting pages copy them into a NEW document, and a page copy brings no
+    /// bookmarks: re-reading the outline afterwards found none, and the next
+    /// save wrote a file without them. PDFium cannot create a bookmark, so the
+    /// outline is carried here and written by the save like any bookmark edit.
+    /// </remarks>
+    private void CarryOutline(IReadOnlyList<Bookmark> outline, Func<int, int> newPageOf, int oldPageCount)
+    {
+        if (outline.Count == 0 || _currentDocumentPath is null)
+        {
+            return;
+        }
+
+        var carried = OutlineEdits.Remap(outline, newPageOf, oldPageCount);
+        _pendingOutline = [.. carried];
+        ShowOutline(carried);
+        OnPropertyChanged(nameof(HasUnsavedOutline));
     }
 
     /// <summary>
@@ -1643,6 +1673,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // Taken BEFORE the rebuild, which makes a new document with no outline.
+        var outline = Bookmarks.Select(b => b.Mark).ToList();
+        int oldPageCount = PageCount;
+
         PushHistory(HistoryScope.Document, "Reorganize pages");
 
         int[] arr = order.ToArray();
@@ -1655,6 +1689,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Diag.Log($"pages: rebuilt as {order.Count} page(s)");
         MapOverlayPages(p => PageReorder.NewIndexOf(order, p));
         ReloadAfterPageStructureChange();
+        CarryOutline(outline, p => PageReorder.NewIndexOf(order, p), oldPageCount);
         IsDirty = true;
         return true;
     }
@@ -1679,6 +1714,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        var unsavedOutline = HasUnsavedOutline ? Bookmarks.Select(b => b.Mark).ToList() : null;
+        int oldPageCount = PageCount;
+
         PushHistory(HistoryScope.Document, "Insert pages");
         int inserted = RenderCoreNative.insert_pages_from_document(
             _documentHandle, sourceHandle, indices.ToArray(), (nuint)indices.Count, atIndex);
@@ -1691,6 +1729,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Diag.Log($"pages: inserted {inserted} page(s) at index {atIndex}");
         MapOverlayPages(p => p < atIndex ? p : p + inserted);
         ReloadAfterPageStructureChange();
+        if (unsavedOutline is not null)
+        {
+            CarryOutline(unsavedOutline, p => p < atIndex ? p : p + inserted, oldPageCount);
+        }
         IsDirty = true;
         GoToPage(Math.Clamp(atIndex, 0, PageCount - 1));
         return true;
@@ -2187,6 +2229,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // Taken now, because an in-place save reopens the document below, and
+        // reopening re-reads the file's outline, which clears the edits waiting
+        // to be written. They are written from this copy at the end.
+        var outlineToWrite = _pendingOutline;
+
         bool burned = flatten ? BurnAllAnnotations() : WriteAnnotationObjects();
 
         // Groups live in memory while the app runs; this is where they become
@@ -2306,7 +2353,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             //
             // Safe against recursion: ApplyOutline saves first only when the
             // document is dirty, and IsDirty was cleared above.
-            FlushPendingOutline();
+            FlushPendingOutline(outlineToWrite);
         }
 
         return saved;

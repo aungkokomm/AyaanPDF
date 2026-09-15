@@ -133,6 +133,46 @@ public static class OutlineEdits
     }
 
     /// <summary>
+    /// The outline after its pages moved: each bookmark follows its page to
+    /// where <paramref name="newPageOf"/> puts it, which answers -1 for a page
+    /// that is gone.
+    /// </summary>
+    /// <remarks>
+    /// A bookmark whose page was deleted points at the next page that
+    /// survived, or failing that the last one before it, so a chapter mark
+    /// still lands where its chapter was. A bookmark with no target keeps none.
+    /// The order and nesting stay the author's.
+    /// </remarks>
+    public static IReadOnlyList<DetectedHeading> Remap(
+        IReadOnlyList<Bookmark> marks, Func<int, int> newPageOf, int oldPageCount)
+    {
+        var headings = ToHeadings(marks);
+        for (int i = 0; i < headings.Count; i++)
+        {
+            int old = headings[i].PageIndex;
+            if (old < 0)
+            {
+                continue;
+            }
+
+            int moved = newPageOf(old);
+            for (int later = old + 1; moved < 0 && later < oldPageCount; later++)
+            {
+                moved = newPageOf(later);
+            }
+
+            for (int earlier = old - 1; moved < 0 && earlier >= 0; earlier--)
+            {
+                moved = newPageOf(earlier);
+            }
+
+            headings[i] = headings[i] with { PageIndex = moved };
+        }
+
+        return headings;
+    }
+
+    /// <summary>
     /// Levels made expressible as a tree again, and consecutive duplicates
     /// left alone.
     ///
@@ -141,7 +181,7 @@ public static class OutlineEdits
     /// pulls it up. Its duplicate-dropping does not apply here, since a reader
     /// who deliberately made two bookmarks with the same name meant to.
     /// </summary>
-    private static IReadOnlyList<DetectedHeading> Repair(List<DetectedHeading> headings)
+    internal static IReadOnlyList<DetectedHeading> Repair(List<DetectedHeading> headings)
     {
         var fixedUp = new List<DetectedHeading>(headings.Count);
         int previous = 0;

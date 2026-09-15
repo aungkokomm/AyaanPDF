@@ -211,6 +211,7 @@
                     </MenuFlyoutItem.KeyboardAccelerators>
                 </MenuFlyoutItem>
                 <MenuFlyoutSubItem x:Name="RecentMenu" Text="Recent files" />
+                <MenuFlyoutItem Text="Merge files..." Click="MergeFiles_Click" />
                 <MenuFlyoutSeparator />
                 <MenuFlyoutItem Text="Save" Click="Save_Click"
                                 IsEnabled="{x:Bind ViewModel.HasDocumentPath, Mode=OneWay}">

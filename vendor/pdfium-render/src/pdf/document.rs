@@ -200,8 +200,12 @@ impl<'a> PdfDocument<'a> {
     }
 
     /// Returns the internal `FPDF_DOCUMENT` handle for this [PdfDocument].
+    ///
+    /// Public in this fork (Ayaan PDF): putting a raw BGRA bitmap on a new page
+    /// needs FPDFPageObj_NewImageObj, which takes the document handle, and the
+    /// crate's own route to it requires the `image` feature and its decoders.
     #[inline]
-    pub(crate) fn handle(&self) -> FPDF_DOCUMENT {
+    pub fn handle(&self) -> FPDF_DOCUMENT {
         self.handle
     }
 

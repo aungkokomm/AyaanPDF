@@ -34,6 +34,7 @@ public sealed partial class PagePickerWindow : Window
     private readonly SourceDocument _source;
     private readonly bool _ownsSource;
     private readonly ViewportViewModel? _insertInto;
+    private readonly Action<IReadOnlyList<int>>? _onChosen;
     private readonly int _currentPageAtOpen;
     private readonly IReadOnlyList<int> _initial;
     private readonly PickerPage[] _pages;
@@ -47,7 +48,9 @@ public sealed partial class PagePickerWindow : Window
     private bool _closed;
     private int _previewRequest;
 
-    private PagePickerWindow(SourceDocument source, bool ownsSource, ViewportViewModel? insertInto, IReadOnlyList<int> initial)
+    private PagePickerWindow(
+        SourceDocument source, bool ownsSource, ViewportViewModel? insertInto, IReadOnlyList<int> initial,
+        Action<IReadOnlyList<int>>? onChosen)
     {
         InitializeComponent();
 
@@ -55,6 +58,7 @@ public sealed partial class PagePickerWindow : Window
         _ownsSource = ownsSource;
         _insertInto = insertInto;
         _initial = initial;
+        _onChosen = onChosen;
 
         AppWindow.SetIcon("Assets/AppIcon.ico");
 
@@ -69,7 +73,8 @@ public sealed partial class PagePickerWindow : Window
 
         Theming.Apply(this, SettingsStore.Current.Theme);
 
-        Title = $"Insert pages from {source.Name}";
+        Title = insertInto is null ? $"Choose pages from {source.Name}" : $"Insert pages from {source.Name}";
+        ConfirmButton.Content = insertInto is null ? "Use these pages" : "Insert pages";
 
         _pages = Enumerable.Range(0, source.PageCount).Select(i => new PickerPage(i)).ToArray();
         PageGrid.ItemsSource = _pages;
@@ -109,7 +114,15 @@ public sealed partial class PagePickerWindow : Window
     /// inserting a file used to do; the window owns the file and closes it.
     /// </summary>
     internal static PagePickerWindow ForInsert(SourceDocument source, ViewportViewModel into) =>
-        new(source, ownsSource: true, into, Enumerable.Range(0, source.PageCount).ToArray());
+        new(source, ownsSource: true, into, Enumerable.Range(0, source.PageCount).ToArray(), onChosen: null);
+
+    /// <summary>
+    /// Merge files' "Choose pages": the same window, answering with the pages
+    /// chosen instead of inserting them. The file belongs to the merge, which
+    /// closes it.
+    /// </summary>
+    internal static PagePickerWindow ForChoosing(SourceDocument source, IReadOnlyList<int> chosen, Action<IReadOnlyList<int>> onChosen) =>
+        new(source, ownsSource: false, insertInto: null, chosen, onChosen);
 
     // ---------------- Thumbnails ----------------
 
@@ -351,6 +364,10 @@ public sealed partial class PagePickerWindow : Window
                 ShowError("Couldn't insert those pages.");
                 return;
             }
+        }
+        else
+        {
+            _onChosen?.Invoke(indices);
         }
 
         Close();

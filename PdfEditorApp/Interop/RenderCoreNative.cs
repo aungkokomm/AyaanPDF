@@ -1109,6 +1109,27 @@ internal static partial class RenderCoreNative
     public static extern int insert_pages_from_document(
         ulong docHandle, ulong sourceHandle, [In] int[] indices, nuint count, int atIndex);
 
+    /// <summary>A new, empty document in memory, to build a merged file in. Zero on failure.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong create_document();
+
+    /// <summary>
+    /// Adds a page showing a picture given as straight-alpha BGRA pixels, drawn
+    /// as large as fits, centred, on a page of the given size in points.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int insert_image_page(
+        ulong docHandle, int atIndex, [In] byte[] bgra, int width, int height, float pageWidth, float pageHeight);
+
+    /// <summary>
+    /// Adds a page showing a JPEG file, keeping the file's own compressed bytes.
+    /// Not for a JPEG its EXIF orientation turns upright: those go in as pixels.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int insert_jpeg_page(
+        ulong docHandle, int atIndex, [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int pixelWidth, int pixelHeight, float pageWidth, float pageHeight);
+
     /// <summary>Inserts one blank page, sized in points, at a position.</summary>
     [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int insert_blank_page(ulong docHandle, int atIndex, float widthPts, float heightPts);

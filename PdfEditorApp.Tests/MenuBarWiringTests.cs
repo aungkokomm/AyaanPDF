@@ -239,6 +239,7 @@ public class MenuBarWiringTests
     [InlineData("ClearGuidesPage_Click")]
     [InlineData("ClearGuidesAll_Click")]
     [InlineData("InsertFromFile_Click")]
+    [InlineData("MergeFiles_Click")]
     [InlineData("InsertBlankPage_Click")]
     [InlineData("ExtractPagesMenu_Click")]
     [InlineData("RotatePage_Click")]
