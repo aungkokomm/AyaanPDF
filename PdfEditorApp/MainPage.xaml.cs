@@ -1281,15 +1281,13 @@ public sealed partial class MainPage : Page
             });
         }
 
-        // Hindi under that. The word list has no parts of speech, so it is one
-        // line for each dictionary word the English settled on: "running"
-        // shows the Hindi for "running" and, when it has one, for "run".
+        // Hindi under that, in the same shape: one line for each part of
+        // speech shown, looked up by the headword and part of speech the
+        // English settled on.
         int hindiLines = 0;
-        var hindiHeadwords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var sense in found.Senses)
         {
-            if (!hindiHeadwords.Add(sense.Headword)
-                || hindi?.For(sense.Headword) is not { Count: > 0 } hindiMeanings)
+            if (hindi?.For(sense.Headword, sense.PartOfSpeech) is not { Count: > 0 } hindiMeanings)
             {
                 continue;
             }
@@ -1301,9 +1299,7 @@ public sealed partial class MainPage : Page
 
             DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
             {
-                Text = (string.Equals(sense.Headword, word, StringComparison.OrdinalIgnoreCase)
-                    ? "Hindi"
-                    : $"Hindi, {sense.Headword}") + ": ",
+                Text = LabelFor(sense) + ": ",
                 FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             });
             DefinitionHindi.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run

@@ -329,7 +329,7 @@ public class DefineWiringTests
     {
         string fill = MethodBody(PageCode(), "private void FillDefinition(");
 
-        Assert.Contains("hindi?.For(sense.Headword)", fill, StringComparison.Ordinal);
+        Assert.Contains("hindi?.For(sense.Headword, sense.PartOfSpeech)", fill, StringComparison.Ordinal);
         Assert.Contains("\"Nirmala UI\"", fill, StringComparison.Ordinal);
         Assert.Contains("Hindi line(s)", fill, StringComparison.Ordinal);
     }

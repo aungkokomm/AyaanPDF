@@ -1536,8 +1536,8 @@
                            TextWrapping="Wrap" Foreground="#FF4A4020" />
                 <!--
                     Myanmar meanings, from the AKK dictionary, one line per part
-                    of speech shown above, then Hindi meanings, one line per
-                    dictionary word. TextBlocks of their own with NO fixed
+                    of speech shown above, then Hindi meanings in the same
+                    shape. TextBlocks of their own with NO fixed
                     LineHeight: both scripts stack marks above and below the
                     letter, and the 21px lines above would clip them.
                 -->

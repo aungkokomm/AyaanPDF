@@ -1,14 +1,43 @@
-"""Builds the Hindi meanings Define shows, from an English-Hindi word list typed in Kruti Dev.
+"""Builds the Hindi meanings Define shows, from the user's own English-Hindi dictionary.
 
 Usage:
-    python tools/build_hindi_glosses.py <Real Hindi.xlsx> <output dir>
-    python tools/build_hindi_glosses.py <Real Hindi.xlsx> --check [sample size]
+    python tools/build_hindi_glosses.py <English-Hindi Dictionary.csv> <Real Hindi.xlsx> <output dir>
+    python tools/build_hindi_glosses.py --check-kruti <Real Hindi.xlsx> [sample size]
 
-The word list is a spreadsheet of English words (column A) and Hindi meanings
-(column B), comma-separated. Its Hindi is typed in Kruti Dev 010, a legacy
-font that draws Devanagari over ordinary ASCII codes, so what the file holds
-for पीछे is the text "ihNs". Unicode text has to be made from it:
+THE SOURCE is the CSV: columns eword, hword, egrammar, one meaning per row,
+already Unicode Devanagari. It is far more complete than the older
+spreadsheet (38,000 words against 22,000), and it has parts of speech, so
+each Hindi line sits under the English meaning it translates, like Myanmar.
 
+Its rows are not in order of importance ("book" lists ढेर and नियमावली before
+पुस्तक), so each word's meanings are RANKED: meanings the older spreadsheet
+also gives for that word come first, since the user checked that list, then
+the CSV's own order. The older spreadsheet is typed in Kruti Dev 010 and is
+converted to Unicode for that comparison; it contributes no meanings of its
+own.
+
+Cleaning:
+  - part-of-speech labels are mapped onto n, v, a, r (TransitiveVerb, a stray
+    lower-case "noun", "Adjective" with a quote after it); rows labelled
+    anything else, and rows whose English is not a single word, are left out;
+  - a meaning with Latin letters, a replacement character, or marks out of
+    Unicode order is dropped; whitespace and line breaks inside a meaning
+    collapse to single spaces;
+  - ट्र is corrected to त्र where the CSV holds an old conversion slip
+    (मिट्र, नियंट्रित): only when the त्र spelling of that same meaning occurs
+    elsewhere in either list, so a real ट्र (राष्ट्र, ट्रेन) is never touched;
+  - a meaning repeated with different spacing is kept once, and each word and
+    part of speech keeps at most MAX_MEANINGS.
+
+Writes <output dir>/hindi-en-hi.tsv.gz, one record per line:
+
+    H <tab> word <tab> pos <tab> meaning [<unit separator> meaning ...]
+
+--check-kruti checks the Kruti Dev conversion against known words and prints a
+sample, for when that spreadsheet changes.
+
+HOW KRUTI DEV BECOMES UNICODE. Kruti Dev draws Devanagari over ordinary ASCII
+codes, so what the spreadsheet holds for पीछे is "ihNs":
   1. Each Kruti Dev code, longest first, becomes the Unicode it draws.
   2. A half letter followed by the stroke that completes it becomes the full
      letter: Kruti Dev types many letters as a half form plus "k".
@@ -18,23 +47,15 @@ for पीछे is the text "ihNs". Unicode text has to be made from it:
      the consonant it sits over.
   5. Marks typed in drawing order are put in Unicode order: a nasal sign
      before a vowel sign (मंुह -> मुंह), a nukta after one (बढा़ -> बढ़ा).
-
-Two habits of THIS file, found by checking it, not guessed:
+Two habits of that spreadsheet, found by checking it, not guessed:
   - "W", Kruti Dev's ॅ, is how it types chandrabindu, often with an anusvara
-    as well (nkWar is दाँत); Hindi words have no use for a bare ॅ.
+    as well (nkWar is दाँत).
   - Excel turned the apostrophe into a curly one, so ’ stands for श where
     Kruti Dev would have ' (fu’kk is निशा).
-
---check converts everything, checks a set of known words, reports what did
-not convert cleanly and how often each known fault still occurs, and prints a
-random sample for a Hindi reader to judge.
-
-Writes <output dir>/hindi-en-hi.tsv.gz, one record per line:
-
-    H <tab> word <tab> meaning [<unit separator> meaning ...]
 """
 
 import collections
+import csv
 import gzip
 import random
 import re
@@ -43,9 +64,19 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-MAX_MEANINGS = 4
+MAX_MEANINGS = 3
 UNIT_SEPARATOR = "\x1f"
 WORD = re.compile(r"[A-Za-z][A-Za-z'\-]*")
+
+POS = {
+    "noun": "n",
+    "verb": "v", "transitiveverb": "v", "intransitiveverb": "v", "phrasalverb": "v",
+    "adjective": "a", 'adjective"': "a",
+    "adverb": "r",
+}
+
+TTA_RA = "ट्र"
+TA_RA = "त्र"
 
 I_SIGN = "\x01"   # stands in for ि until it is moved
 REPH = "\x02"     # stands in for र् until it is moved
@@ -93,10 +124,12 @@ LONGEST = max(len(k) for k, _ in KRUTI_DEV)
 TABLE = dict(KRUTI_DEV)
 
 DEVANAGARI = chr(0x0900) + "-" + chr(0x097F)
+JOINERS = chr(0x200C) + chr(0x200D)
 CONSONANT = "[क-हळ]"
 VOWEL_SIGNS = "ािीुूृॄेैोौॉ"
 SIGNS = VOWEL_SIGNS + "ंँः़"
-PLAIN = re.compile("[" + DEVANAGARI + r"\s,.;:()\-/?!{}=0-9]*")
+PLAIN_CHARACTERS = "[" + DEVANAGARI + JOINERS + r"\s,.;:()\[\]\-/?!{}=0-9]"
+PLAIN = re.compile(PLAIN_CHARACTERS + "*")
 
 
 def to_unicode(kruti: str) -> str:
@@ -145,7 +178,7 @@ FAULTS = [
 
 
 def clean(text: str) -> bool:
-    """Whether a converted meaning is plausible Devanagari rather than a conversion failure."""
+    """Whether a meaning is plausible Unicode Devanagari rather than a conversion failure."""
     return (bool(re.search("[क-ह]", text))
             and PLAIN.fullmatch(text) is not None
             and not re.match("[" + SIGNS + "्]", text)
@@ -200,7 +233,7 @@ KNOWN = [
 ]
 
 
-def check(xlsx: Path, sample: int) -> None:
+def check_kruti(xlsx: Path, sample: int) -> None:
     print("known words:")
     failures = 0
     for kruti, expected in KNOWN:
@@ -209,70 +242,87 @@ def check(xlsx: Path, sample: int) -> None:
         print(f"  {'ok  ' if got == expected else 'FAIL'} {kruti!r:24} -> {got}  (expected {expected})")
     print(f"  {len(KNOWN) - failures} of {len(KNOWN)} right")
 
-    rows = [(w, d) for w, d in read_rows(xlsx) if WORD.fullmatch(w) and d.strip()]
-    leftovers = collections.Counter()
-    examples = {}
-    kept_total = rejected_total = 0
     converted = []
-    everything = []
-    for word, kruti in rows:
-        everything.append(to_unicode(kruti))
-        kept, rejected = meanings_of(kruti)
-        kept_total += len(kept)
-        rejected_total += len(rejected)
-        for bad in rejected:
-            odd = set(re.sub("[" + DEVANAGARI + r"\s,.;:()\-/?!{}=0-9]", "", bad)) or {"(a known fault)"}
-            for ch in odd:
-                leftovers[ch] += 1
-                examples.setdefault(ch, (word, kruti, bad))
-        if kept:
-            converted.append((word, kruti, kept))
-
-    print(f"\n{len(rows)} single-word rows, {len(converted)} with a usable meaning; "
-          f"{kept_total} meanings kept, {rejected_total} rejected")
-    print("why meanings were rejected, most common first:")
-    for ch, n in leftovers.most_common(20):
-        word, kruti, bad = examples[ch]
-        print(f"  {ch!r:18} x{n:<5} e.g. {word}: {kruti!r} -> {bad}")
-
-    text = "\n".join(everything)
-    print("\nknown faults still in the converted text:")
-    for name, pattern in FAULTS:
-        hits = list(re.finditer(pattern, text))
-        shown = [text[max(0, h.start() - 6):h.end() + 3].replace("\n", " / ") for h in hits[:3]]
-        print(f"  {name:32} {len(hits):5}  {shown}")
-
-    print(f"\nrandom sample of {sample}:")
+    for word, kruti in read_rows(xlsx):
+        kept, _rejected = meanings_of(kruti)
+        if WORD.fullmatch(word) and kept:
+            converted.append((word, kept))
+    print(f"\n{len(converted)} words with a usable meaning; random sample of {sample}:")
     random.seed(11)
-    for word, kruti, kept in random.sample(converted, min(sample, len(converted))):
+    for word, kept in random.sample(converted, min(sample, len(converted))):
         print(f"  {word:18} {' | '.join(kept)}")
 
 
-def build(xlsx: Path, out_dir: Path) -> None:
-    meanings = collections.defaultdict(list)
+def build(csv_path: Path, xlsx: Path, out_dir: Path) -> None:
+    # What the user-checked spreadsheet says each word means, to rank by.
+    verified = collections.defaultdict(set)
     for word, kruti in read_rows(xlsx):
-        if not WORD.fullmatch(word):
-            continue
-        kept, _rejected = meanings_of(kruti)
-        bucket = meanings[word.lower()]
-        for meaning in kept:
-            if meaning not in bucket and len(bucket) < MAX_MEANINGS:
-                bucket.append(meaning)
+        if WORD.fullmatch(word):
+            verified[word.lower()].update(meanings_of(kruti)[0])
+
+    candidates = collections.defaultdict(list)  # (word, pos) -> [(row, meaning)]
+    dropped = collections.Counter()
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        rows = csv.reader(f)
+        next(rows)
+        for order, row in enumerate(rows):
+            if len(row) < 3:
+                dropped["short row"] += 1
+                continue
+            word = row[0].strip().lower()
+            pos = POS.get(row[2].strip().lower())
+            meaning = " ".join(row[1].split()).strip(" .;,:")
+            if not WORD.fullmatch(word):
+                dropped["not one English word"] += 1
+            elif pos is None:
+                dropped["another part of speech"] += 1
+            elif not meaning or not clean(meaning):
+                dropped["unusable meaning"] += 1
+            else:
+                candidates[(word, pos)].append((order, meaning))
+
+    spelled = {m for items in candidates.values() for _o, m in items}
+    spelled |= {m for meanings in verified.values() for m in meanings}
+    repaired = 0
+
+    def corrected(meaning: str) -> str:
+        nonlocal repaired
+        if TTA_RA in meaning and meaning.replace(TTA_RA, TA_RA) in spelled:
+            repaired += 1
+            return meaning.replace(TTA_RA, TA_RA)
+        return meaning
+
+    glosses = {}
+    for (word, pos), items in candidates.items():
+        good = verified.get(word, set())
+        fixed = [(order, corrected(meaning)) for order, meaning in items]
+        kept, spellings = [], set()
+        for _order, meaning in sorted(fixed, key=lambda item: (item[1] not in good, item[0])):
+            spelling = meaning.replace(" ", "")
+            if spelling in spellings:
+                continue
+            spellings.add(spelling)
+            kept.append(meaning)
+            if len(kept) == MAX_MEANINGS:
+                break
+        glosses[(word, pos)] = kept
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / "hindi-en-hi.tsv.gz"
     with gzip.open(out, "wt", encoding="utf-8", compresslevel=9, newline="\n") as f:
-        f.write("# Hindi meanings, converted from a Kruti Dev English-Hindi word list.\n")
-        for word in sorted(meanings):
-            if meanings[word]:
-                f.write(f"H\t{word}\t{UNIT_SEPARATOR.join(meanings[word])}\n")
-    print(f"{sum(1 for v in meanings.values() if v)} words, {out.stat().st_size} bytes")
+        f.write("# Hindi meanings from the user's own English-Hindi dictionary.\n")
+        for (word, pos) in sorted(glosses):
+            f.write(f"H\t{word}\t{pos}\t{UNIT_SEPARATOR.join(glosses[(word, pos)])}\n")
+
+    words = len({word for word, _pos in glosses})
+    print(f"{len(glosses)} word/part-of-speech records for {words} words, "
+          f"{repaired} ट्र slips corrected, dropped rows: {dict(dropped)}, {out.stat().st_size} bytes")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[2] == "--check":
-        check(Path(sys.argv[1]), int(sys.argv[3]) if len(sys.argv) > 3 else 40)
-    elif len(sys.argv) == 3:
-        build(Path(sys.argv[1]), Path(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--check-kruti":
+        check_kruti(Path(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 40)
+    elif len(sys.argv) == 4:
+        build(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
     else:
         sys.exit(__doc__)
