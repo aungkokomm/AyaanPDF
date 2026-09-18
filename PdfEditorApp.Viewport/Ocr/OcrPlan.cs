@@ -32,6 +32,13 @@ public sealed record OcrPlan(OcrEngineKind Engine, string TesseractLanguages)
         ("mya", "Myanmar"),
     };
 
+    /// <summary>Every language Recognize text knows, in the order they are offered: the shipped three, then the downloadable ones.</summary>
+    public static IEnumerable<string> Offered =>
+        Bundled.Select(b => b.Code).Concat(OcrLanguageList.All.Select(l => l.Code));
+
+    /// <summary>At most this many languages are read in one run. Each one makes Tesseract slower.</summary>
+    public const int MostLanguages = 3;
+
     /// <summary>
     /// The stored "hin+eng" form back into codes, in the order they are offered.
     /// Unknown codes are dropped; nothing known at all reads as English.
@@ -42,12 +49,12 @@ public sealed record OcrPlan(OcrEngineKind Engine, string TesseractLanguages)
             .Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(c => c.ToLowerInvariant())
             .ToHashSet();
-        var known = Bundled.Select(b => b.Code).Where(chosen.Contains).ToList();
+        var known = Offered.Where(chosen.Contains).ToList();
         return known.Count > 0 ? known : new[] { "eng" };
     }
 
     public static string StoreLanguages(IEnumerable<string> codes) =>
-        string.Join('+', Bundled.Select(b => b.Code).Where(codes.Contains));
+        string.Join('+', Offered.Where(codes.Contains));
 
     /// <summary>What stops a run with these choices, in words a window can show, or null.</summary>
     public static string? Problem(IReadOnlyCollection<string> codes, bool fast)
@@ -56,13 +63,19 @@ public sealed record OcrPlan(OcrEngineKind Engine, string TesseractLanguages)
         {
             return "Choose at least one language.";
         }
-        if (codes.Contains("mya") && codes.Contains("hin"))
+        // Myanmar has a reader of its own, which reads English letters too but
+        // nothing else.
+        if (codes.Contains("mya") && codes.FirstOrDefault(c => c is not "mya" and not "eng") is { } other)
         {
-            return "Myanmar and Hindi can't be recognised in one pass yet. Choose one of them.";
+            return $"Myanmar and {OcrLanguageCatalog.NameOf(other)} can't be recognised in one pass yet. Choose one of them.";
         }
         if (fast && !(codes.Count == 1 && codes.Contains("eng")))
         {
-            return "Fast works for English only. Choose Accurate for Hindi or Myanmar.";
+            return "Fast works for English only. Choose Accurate for other languages.";
+        }
+        if (codes.Count > MostLanguages)
+        {
+            return "Choose up to three languages at a time. Each one makes reading slower.";
         }
         return null;
     }
@@ -78,9 +91,14 @@ public sealed record OcrPlan(OcrEngineKind Engine, string TesseractLanguages)
         {
             return new OcrPlan(OcrEngineKind.Windows, "eng");
         }
-        // The main language first: Tesseract leans on the first one it is given.
-        return new OcrPlan(OcrEngineKind.Tesseract, codes.Contains("hin")
-            ? string.Join('+', new[] { "hin", "eng" }.Where(codes.Contains))
-            : "eng");
+        // The main languages first and English last: Tesseract leans on the
+        // first one it is given, and English is mostly the odd word in a page
+        // of something else.
+        var main = Offered.Where(c => c != "eng" && codes.Contains(c)).ToList();
+        if (codes.Contains("eng") || main.Count == 0)
+        {
+            main.Add("eng");
+        }
+        return new OcrPlan(OcrEngineKind.Tesseract, string.Join('+', main));
     }
 }

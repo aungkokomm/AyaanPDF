@@ -44,6 +44,10 @@
                     <CheckBox x:Name="EnglishBox" Content="English" Click="Choice_Changed" />
                     <CheckBox x:Name="HindiBox" Content="Hindi" Click="Choice_Changed" />
                     <CheckBox x:Name="MyanmarBox" Content="Myanmar" Click="Choice_Changed" />
+                    <!-- The languages downloaded in Recognition languages, one box each. -->
+                    <StackPanel x:Name="DownloadedLanguages" Spacing="4" />
+                    <HyperlinkButton x:Name="MoreLanguagesLink" Content="More languages..." Padding="0,4,0,4"
+                                     Click="MoreLanguages_Click" />
                 </StackPanel>
 
                 <StackPanel Spacing="4">

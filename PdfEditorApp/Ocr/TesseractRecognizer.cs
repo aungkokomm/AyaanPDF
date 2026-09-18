@@ -22,7 +22,7 @@ internal sealed class TesseractRecognizer : IDisposable
     /// <param name="languages">Tesseract's codes joined by '+', e.g. "hin+eng".</param>
     public TesseractRecognizer(string languages, int dpi)
     {
-        _engine = new TesseractEngine(OcrAssets.Tessdata, languages, EngineMode.LstmOnly);
+        _engine = new TesseractEngine(OcrAssets.TessdataFor(languages), languages, EngineMode.LstmOnly);
         _engine.SetVariable("user_defined_dpi", dpi.ToString(CultureInfo.InvariantCulture));
     }
 

@@ -45,6 +45,32 @@ public class OcrPlanTests
     }
 
     [Fact]
+    public void downloaded_languages_are_stored_and_read_after_the_shipped_ones()
+    {
+        Assert.Equal(new[] { "eng", "ben" }, OcrPlan.ParseLanguages("ben+eng"));
+        Assert.Equal("hin+ben", OcrPlan.StoreLanguages(new[] { "ben", "hin" }));
+    }
+
+    [Fact]
+    public void downloaded_languages_follow_the_same_rules()
+    {
+        Assert.Contains("Myanmar and Bengali", OcrPlan.Problem(new[] { "mya", "ben" }, fast: false));
+        Assert.Contains("Myanmar and Bengali", OcrPlan.Problem(new[] { "eng", "mya", "ben" }, fast: false));
+        Assert.Contains("English only", OcrPlan.Problem(new[] { "ben" }, fast: true));
+        Assert.Contains("up to three", OcrPlan.Problem(new[] { "eng", "hin", "ben", "tam" }, fast: false));
+
+        Assert.Null(OcrPlan.Problem(new[] { "eng", "hin", "ben" }, fast: false));
+        Assert.Null(OcrPlan.Problem(new[] { "tam" }, fast: false));
+    }
+
+    [Fact]
+    public void downloaded_languages_are_read_first_and_english_last()
+    {
+        Assert.Equal(new OcrPlan(OcrEngineKind.Tesseract, "hin+ben+eng"), OcrPlan.For(new[] { "eng", "ben", "hin" }, fast: false));
+        Assert.Equal(new OcrPlan(OcrEngineKind.Tesseract, "tam"), OcrPlan.For(new[] { "tam" }, fast: false));
+    }
+
+    [Fact]
     public void every_bundled_language_is_offered_by_name()
     {
         Assert.Equal(new[] { "English", "Hindi", "Myanmar" }, OcrPlan.Bundled.Select(b => b.Name));

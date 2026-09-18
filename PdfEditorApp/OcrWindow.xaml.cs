@@ -34,6 +34,12 @@ public sealed partial class OcrWindow : Window
     private readonly IReadOnlyList<int> _chosenPages;
     private CancellationTokenSource? _running;
 
+    /// <summary>One box per downloaded language, by code.</summary>
+    private readonly Dictionary<string, CheckBox> _downloadedBoxes = new();
+
+    /// <summary>The downloaded languages that are ticked, kept while the boxes are rebuilt.</summary>
+    private readonly HashSet<string> _downloadedChosen;
+
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr hwnd);
 
@@ -64,6 +70,7 @@ public sealed partial class OcrWindow : Window
         EnglishBox.IsChecked = languages.Contains("eng");
         HindiBox.IsChecked = languages.Contains("hin");
         MyanmarBox.IsChecked = languages.Contains("mya");
+        _downloadedChosen = languages.Where(c => OcrLanguageCatalog.Find(c) is not null).ToHashSet();
         FastChoice.IsChecked = settings.OcrFast;
         AccurateChoice.IsChecked = !settings.OcrFast;
         SkipTextPages.IsChecked = settings.OcrSkipPagesWithText;
@@ -73,6 +80,8 @@ public sealed partial class OcrWindow : Window
             EnglishBox.IsChecked = asked.Contains("eng");
             HindiBox.IsChecked = asked.Contains("hin");
             MyanmarBox.IsChecked = asked.Contains("mya");
+            _downloadedChosen.Clear();
+            _downloadedChosen.UnionWith(asked.Where(c => OcrLanguageCatalog.Find(c) is not null));
             FastChoice.IsChecked = false;
             AccurateChoice.IsChecked = true;
         }
@@ -100,6 +109,11 @@ public sealed partial class OcrWindow : Window
         {
             AllPages.IsChecked = true;
         }
+
+        // A language downloaded while this window is open is offered at once.
+        ShowDownloadedLanguages();
+        OcrLanguageStore.Changed += ShowDownloadedLanguages;
+        Closed += (_, _) => OcrLanguageStore.Changed -= ShowDownloadedLanguages;
 
         // The page being looked at can change while this window is open.
         Activated += (_, _) => CurrentPage.Content = $"Current page ({_viewModel.CurrentPageIndex + 1})";
@@ -130,8 +144,40 @@ public sealed partial class OcrWindow : Window
         if (EnglishBox.IsChecked == true) { codes.Add("eng"); }
         if (HindiBox.IsChecked == true) { codes.Add("hin"); }
         if (MyanmarBox.IsChecked == true) { codes.Add("mya"); }
+        codes.AddRange(_downloadedBoxes.Where(b => b.Value.IsChecked == true).Select(b => b.Key));
         return codes;
     }
+
+    /// <summary>A box for each downloaded language, ticked as it was.</summary>
+    private void ShowDownloadedLanguages()
+    {
+        foreach (var (code, box) in _downloadedBoxes)
+        {
+            if (box.IsChecked == true) { _downloadedChosen.Add(code); } else { _downloadedChosen.Remove(code); }
+        }
+
+        DownloadedLanguages.Children.Clear();
+        _downloadedBoxes.Clear();
+        foreach (var language in OcrLanguageStore.Installed)
+        {
+            var box = new CheckBox
+            {
+                Content = language.Native.Length > 0 ? $"{language.Name}  {language.Native}" : language.Name,
+                IsChecked = _downloadedChosen.Contains(language.Code),
+                IsEnabled = _running is null,
+            };
+            box.Click += Choice_Changed;
+            _downloadedBoxes[language.Code] = box;
+            DownloadedLanguages.Children.Add(box);
+        }
+        if (_running is null)
+        {
+            Validate();
+        }
+    }
+
+    private void MoreLanguages_Click(object sender, RoutedEventArgs e) =>
+        OcrLanguagesWindow.Open(_viewModel.DetectScriptAsync());
 
     /// <summary>Says what stops a run with the choices as they are, and allows Recognize only when nothing does.</summary>
     private void Validate()
@@ -144,6 +190,14 @@ public sealed partial class OcrWindow : Window
 
     private static string? MissingModel(IReadOnlyCollection<string> codes)
     {
+        foreach (string code in codes.Where(c => OcrLanguageCatalog.Find(c) is not null))
+        {
+            if (!OcrAssets.HasTesseractLanguage(code))
+            {
+                return $"{OcrLanguageCatalog.NameOf(code)} isn't downloaded any more. Download it again from More languages.";
+            }
+        }
+
         foreach (var (code, name) in OcrPlan.Bundled)
         {
             if (codes.Contains(code) && !OcrAssets.HasTesseractLanguage(code))
@@ -346,7 +400,8 @@ public sealed partial class OcrWindow : Window
                  {
                      AllPages, CurrentPage, ChosenPages, PageRange, PageRangeBox,
                      EnglishBox, HindiBox, MyanmarBox, AccurateChoice, FastChoice, SkipTextPages,
-                 })
+                     MoreLanguagesLink,
+                 }.Concat(_downloadedBoxes.Values))
         {
             choice.IsEnabled = !running;
         }

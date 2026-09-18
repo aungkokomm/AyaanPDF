@@ -5638,7 +5638,7 @@ public sealed partial class MainPage : Page
             {
                 Width = 420,
                 Height = 400,
-                Children = { Scrollable(new StackPanel { Children = { BuildViewSettings(), BuildDefineSettings() } }) },
+                Children = { Scrollable(new StackPanel { Children = { BuildViewSettings(), BuildDefineSettings(), BuildTextRecognitionSettings() } }) },
             },
             CloseButtonText = "Close",
         }.ShowAsync();
@@ -5680,6 +5680,35 @@ public sealed partial class MainPage : Page
         };
         hindi.Toggled += (_, _) => SettingsStore.Update(s => s with { DefineShowsHindi = hindi.IsOn });
         panel.Children.Add(hindi);
+
+        return panel;
+    }
+
+    /// <summary>
+    /// Text recognition's own section: the languages Recognize text can read,
+    /// and the way to download more. The list follows downloads finishing
+    /// while the dialog is open.
+    /// </summary>
+    private UIElement BuildTextRecognitionSettings()
+    {
+        var panel = new StackPanel { Spacing = 8, Margin = new Thickness(0, 24, 0, 0) };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Text recognition",
+            FontSize = 16,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        });
+        var installed = new TextBlock { TextWrapping = TextWrapping.Wrap, Opacity = 0.8 };
+        void ShowInstalled() => installed.Text = "Recognize text reads " + string.Join(", ",
+            OcrPlan.Bundled.Select(b => b.Name).Concat(PdfEditorApp.Ocr.OcrLanguageStore.Installed.Select(l => l.Name))) + ".";
+        ShowInstalled();
+        PdfEditorApp.Ocr.OcrLanguageStore.Changed += ShowInstalled;
+        panel.Unloaded += (_, _) => PdfEditorApp.Ocr.OcrLanguageStore.Changed -= ShowInstalled;
+        panel.Children.Add(installed);
+
+        var languages = new Button { Content = "Recognition languages..." };
+        languages.Click += (_, _) => OcrLanguagesWindow.Open(ViewModel.DetectScriptAsync());
+        panel.Children.Add(languages);
 
         return panel;
     }

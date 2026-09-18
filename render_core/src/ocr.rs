@@ -55,6 +55,12 @@ pub(crate) fn is_ocr_run(
     false
 }
 
+/// A letter of a right-to-left script: Hebrew, Arabic, Syriac, Thaana, N'Ko
+/// and their presentation forms.
+fn is_right_to_left(c: char) -> bool {
+    matches!(c, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}')
+}
+
 /// One recognised word, as the recogniser saw it.
 ///
 /// The box is a fraction of the page AS RENDERED: 0..1 across and down from
@@ -282,6 +288,18 @@ fn add_ocr_words_inner(doc_handle: u64, page_index: i32, words: &[Word], font_pa
         if height <= 0.0 || ux * ux + uy * uy <= 0.0 {
             continue;
         }
+
+        // A right-to-left word is stored the way it lies on the page, last
+        // letter first, as every PDF producer stores Arabic and Hebrew: a
+        // reader turns such a run round when it extracts it. Stored in reading
+        // order it came back reversed, and a search never matched it.
+        let visual: String;
+        let text = if text.chars().any(is_right_to_left) {
+            visual = text.chars().rev().collect();
+            visual.as_str()
+        } else {
+            text
+        };
 
         let Ok(mut obj) = PdfPageTextObject::new(&doc_guard, text, font, PdfPoints::new(height)) else {
             continue;
@@ -641,5 +659,104 @@ mod tests {
             );
             close_document(h);
         }
+    }
+
+    /// Words in one script written with one font, and read back the way
+    /// search and copy read them: the characters, in order, spaces aside.
+    fn reads_back(font: &str, words: &[&str]) -> Result<(), String> {
+        let path = format!(r"C:\Windows\Fonts\{font}");
+        if !std::path::Path::new(&path).exists() {
+            return Err(format!("{font} is not on this PC"));
+        }
+        let h = open(BLANK);
+        // One word a line, the lines as far apart as a page's lines are.
+        let boxes: Vec<(&str, [f32; 4])> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (*w, [0.1, 0.1 + i as f32 * 0.08, 0.6, 0.13 + i as f32 * 0.08]))
+            .collect();
+        let written = write(h, 0, &boxes, Some(&path));
+        let got = visible_text(h, 0);
+        close_document(h);
+        let want: String = words.concat().chars().filter(|c| !c.is_whitespace()).collect();
+        if written != words.len() as i32 {
+            Err(format!("wrote {written} of {}", words.len()))
+        } else if got != want {
+            Err(format!("read back {got:?}, wrote {want:?}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The font each downloadable language's recognised words are written
+    /// in, proved per script: the words come back as they went in. A font
+    /// that lacks a character maps it to nothing, and that word is then
+    /// unsearchable however well it was recognised. PdfEditorApp.Viewport's
+    /// OcrScripts holds the same table.
+    #[test]
+    fn every_script_reads_back_through_the_font_chosen_for_it() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("Bengali", "Nirmala.ttf", &["বাংলা", "ভাষা", "অসমীয়া"]),
+            ("Gurmukhi", "Nirmala.ttf", &["ਪੰਜਾਬੀ"]),
+            ("Gujarati", "Nirmala.ttf", &["ગુજરાતી"]),
+            ("Oriya", "Nirmala.ttf", &["ଓଡ଼ିଆ"]),
+            ("Tamil", "Nirmala.ttf", &["தமிழ்"]),
+            ("Telugu", "Nirmala.ttf", &["తెలుగు"]),
+            ("Kannada", "Nirmala.ttf", &["ಕನ್ನಡ"]),
+            ("Malayalam", "Nirmala.ttf", &["മലയാളം"]),
+            ("Sinhala", "Nirmala.ttf", &["සිංහල"]),
+            ("Devanagari", "Nirmala.ttf", &["मराठी", "नेपाली", "संस्कृतम्"]),
+            ("Thai", "LeelawUI.ttf", &["ภาษาไทย"]),
+            ("Lao", "LeelawUI.ttf", &["ພາສາລາວ"]),
+            ("Khmer", "LeelawUI.ttf", &["ភាសាខ្មែរ"]),
+            ("Tibetan", "himalaya.ttf", &["བོད་ཡིག", "རྫོང་ཁ"]),
+            ("Georgian", "sylfaen.ttf", &["ქართული"]),
+            ("Armenian", "sylfaen.ttf", &["Հայերեն"]),
+            ("Ethiopic", "ebrima.ttf", &["አማርኛ", "ትግርኛ"]),
+            ("Cherokee", "gadugi.ttf", &["ᏣᎳᎩ"]),
+            ("CanadianSyllabics", "gadugi.ttf", &["ᐃᓄᒃᑎᑐᑦ"]),
+            ("Thaana", "mvboli.ttf", &["ދިވެހި"]),
+            ("Syriac", "seguihis.ttf", &["ܣܘܪܝܝܐ"]),
+            ("Arabic", "arial.ttf", &["العربية", "اردو", "فارسی", "پښتو", "سنڌي", "ئۇيغۇرچە"]),
+            ("Hebrew", "arial.ttf", &["עברית", "ייִדיש"]),
+            ("Cyrillic", "arial.ttf", &["Русский", "Қазақ", "Тоҷикӣ", "Ўзбек"]),
+            ("Greek", "arial.ttf", &["Ελληνικά"]),
+            ("PolytonicGreek", "arial.ttf", &["Ἑλληνική"]),
+            ("Latin", "arial.ttf", &["Tiếng", "Việt", "Čeština", "Oʻzbek", "Yorùbá"]),
+        ];
+        let mut failed = Vec::new();
+        for (script, font, words) in cases {
+            match reads_back(font, words) {
+                Ok(()) => println!("{script:<18} {font:<14} ok"),
+                Err(e) => {
+                    println!("{script:<18} {font:<14} {e}");
+                    failed.push(*script);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "these do not read back: {failed:?}");
+    }
+
+    /// A right-to-left line of two words: the first word read sits on the
+    /// right. It must come back first, and each word the right way round.
+    #[test]
+    fn a_right_to_left_line_reads_back_in_reading_order() {
+        for (font, first, second) in [("arial.ttf", "اللغة", "العربية"), ("arial.ttf", "עברית", "ייִדיש")] {
+            let h = open(BLANK);
+            let boxes = [(first, [0.55f32, 0.2, 0.85, 0.24]), (second, [0.15f32, 0.2, 0.5, 0.24])];
+            assert_eq!(write(h, 0, &boxes, Some(&format!(r"C:\Windows\Fonts\{font}"))), 2);
+            let got = visible_text(h, 0);
+            close_document(h);
+            assert_eq!(got, format!("{first}{second}"));
+        }
+
+        // The control: a word stored in reading order, as the writer stored it
+        // before, comes back last letter first. Handing the writer the word
+        // already reversed makes it store reading order.
+        let h = open(BLANK);
+        let reversed: String = "עברית".chars().rev().collect();
+        assert_eq!(write(h, 0, &[(reversed.as_str(), [0.2f32, 0.2, 0.6, 0.24])], Some(r"C:\Windows\Fonts\arial.ttf")), 1);
+        assert_eq!(visible_text(h, 0), reversed, "stored in reading order, read back reversed");
+        close_document(h);
     }
 }

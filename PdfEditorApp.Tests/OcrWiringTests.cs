@@ -143,4 +143,70 @@ public class OcrWiringTests
         Assert.Contains("PdfEditorApp/Assets/Ocr/tessdata/", Read(".gitignore"), StringComparison.Ordinal);
         Assert.Contains("CONVERTED_SHA", Read("tools", "ocr", "fetch_ocr_models.py"), StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void more_languages_opens_the_languages_window_and_downloaded_ones_can_be_chosen()
+    {
+        string xaml = Read("PdfEditorApp", "OcrWindow.xaml");
+        Assert.Contains("x:Name=\"DownloadedLanguages\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"More languages...\"", xaml, StringComparison.Ordinal);
+
+        string code = Code();
+        Assert.Contains("OcrLanguagesWindow.Open(_viewModel.DetectScriptAsync())", MethodBody(code, "private void MoreLanguages_Click("), StringComparison.Ordinal);
+        Assert.Contains("_downloadedBoxes", MethodBody(code, "private List<string> ChosenLanguages("), StringComparison.Ordinal);
+        Assert.Contains("_downloadedBoxes.Values", MethodBody(code, "private void SetRunning("), StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageCatalog.Find(c)", MethodBody(code, "private static string? MissingModel("), StringComparison.Ordinal);
+
+        // A language that finishes downloading shows up at once, and the
+        // window stops listening when it closes.
+        string ctor = MethodBody(code, "public OcrWindow(");
+        Assert.Contains("OcrLanguageStore.Changed += ShowDownloadedLanguages;", ctor, StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageStore.Changed -= ShowDownloadedLanguages", ctor, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_languages_window_is_one_window_that_follows_the_downloads()
+    {
+        string code = Read("PdfEditorApp", "OcrLanguagesWindow.xaml.cs");
+        string open = MethodBody(code, "public static void Open(");
+        Assert.Contains("_open.Activate();", open, StringComparison.Ordinal);
+        Assert.Contains("window.Closed += (_, _) => _open = null;", open, StringComparison.Ordinal);
+
+        Assert.Contains("OcrLanguageStore.Changed += Rebuild;", code, StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageStore.Changed -= Rebuild;", code, StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageStore.Progress += ShowProgress;", code, StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageStore.Progress -= ShowProgress;", code, StringComparison.Ordinal);
+
+        // A language whose words this PC has no font for is not offered.
+        Assert.Contains("OcrAssets.HasFontFor(language.Script)", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void settings_has_a_text_recognition_section_that_opens_the_languages_window()
+    {
+        string page = Read("PdfEditorApp", "MainPage.xaml.cs");
+        Assert.Contains("BuildTextRecognitionSettings()", MethodBody(page, "private async void Settings_Click("), StringComparison.Ordinal);
+
+        string section = MethodBody(page, "private UIElement BuildTextRecognitionSettings(");
+        Assert.Contains("OcrLanguagesWindow.Open(ViewModel.DetectScriptAsync())", section, StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageStore.Changed += ShowInstalled;", section, StringComparison.Ordinal);
+        Assert.Contains("OcrLanguageStore.Changed -= ShowInstalled", section, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void downloaded_languages_live_in_the_users_folder_and_tesseract_reads_them_from_there()
+    {
+        string store = Read("PdfEditorApp", "Ocr", "OcrLanguageStore.cs");
+        Assert.Contains("Environment.SpecialFolder.LocalApplicationData), AppInfo.Name, \"OCR\", \"tessdata\"", store, StringComparison.Ordinal);
+        // Only a file the exact size the list names counts as installed.
+        Assert.Contains("file.Length == language.Size", store, StringComparison.Ordinal);
+
+        Assert.Contains("new TesseractEngine(OcrAssets.TessdataFor(languages), languages,", Read("PdfEditorApp", "Ocr", "TesseractRecognizer.cs"), StringComparison.Ordinal);
+
+        // Tesseract reads every language of a run from one folder, so a run
+        // mixing shipped and downloaded ones copies the shipped ones across.
+        string assets = MethodBody(Read("PdfEditorApp", "Ocr", "OcrAssets.cs"), "public static string TessdataFor(");
+        Assert.Contains("File.Copy(shipped.FullName, copy.FullName, overwrite: true);", assets, StringComparison.Ordinal);
+        Assert.Contains("return OcrLanguageStore.Folder;", assets, StringComparison.Ordinal);
+    }
 }
