@@ -12,6 +12,8 @@ Ayaan PDF opens, reads, marks up and edits PDF files. It can also change the wor
 - **Edit the text already in a PDF**, in place on the page. Hindi (Devanagari) and Myanmar text are shaped properly, so conjuncts, vowel signs and stacked consonants come out right. Burmese typing through KeyMagic works too.
 - **Make scanned pages searchable.** Recognize text reads English, Hindi and Myanmar out of the box, and more than 100 other languages can be downloaded from inside the app.
 - **Look up words without leaving the page.** Right-click an English word to see its meaning, with Myanmar and Hindi meanings under it, all offline.
+- **Text boxes in complex scripts.** Type Hindi, Myanmar or English in any font on your PC. The text is shaped properly and saved as real text that can be searched and copied.
+- **Shapes with real effects.** Gradient fills, soft drop shadows and outer glows are written into the PDF itself, so every PDF reader shows them, not just Ayaan PDF.
 - **Spot old fonts.** Pages typed in pre-Unicode Hindi or Burmese fonts are flagged, and those pages can be recognised into real text.
 
 ## Features
@@ -32,8 +34,17 @@ Ayaan PDF opens, reads, marks up and edits PDF files. It can also change the wor
 
 - Highlight, underline and strike out text
 - Freehand drawing
-- Shapes: rectangle, rounded rectangle, ellipse, line and arrow, with colours, gradient fills and shadows
-- Text boxes with your choice of font, colour, fill, outline, alignment, underline and strikethrough, and they can be rotated
+- Shapes: rectangle, rounded rectangle with adjustable corners, ellipse, line and arrow, with colour, line width, opacity and fill opacity
+- Effects for shapes, saved into the PDF so they look the same in any reader:
+  - gradient fills with start and end colours, angle and spread, written as a true vector gradient
+  - soft drop shadows with colour, light direction, distance, blur and opacity
+  - outer glows with colour, blur and opacity
+- Text boxes:
+  - Hindi (Devanagari) and Myanmar shaped properly, with conjuncts, vowel signs and stacked consonants in the right places
+  - any font installed on your PC, embedded in the PDF so the text looks the same everywhere
+  - saved as real text, so it can be searched, selected and copied
+  - colour, fill, outline, alignment, underline and strikethrough
+  - the words re-wrap when you resize the box, the box can be rotated, and a double-click opens it for editing again
 - Sticky notes
 - Stamps: APPROVED, NOT APPROVED, DRAFT, FINAL, CONFIDENTIAL, REVIEWED, RECEIVED, VOID, URGENT, COPY, PAID and SIGN HERE, marks such as a tick, a cross and a star, or your own pictures
 - Signatures: draw one once, save it, and place it on any document
@@ -174,7 +185,7 @@ After changing a dependency, regenerate the licence notices with `python tools/m
 
 - **The window** is WinUI 3 on the Windows App SDK, written in C# on .NET 10. It is unpackaged and self-contained, so it carries its own .NET runtime and needs nothing installed.
 - **The core**, `render_core.dll`, is written in Rust. It draws and edits pages through [PDFium](https://pdfium.googlesource.com/pdfium/), using a patched copy of [pdfium-render](https://github.com/ajrcarey/pdfium-render). It shapes Hindi and Myanmar text with [rustybuzz](https://github.com/harfbuzz/rustybuzz) and writes bookmarks with [lopdf](https://github.com/J-F-Liu/lopdf).
-- **Live previews** of shapes and effects are drawn with [SkiaSharp](https://github.com/mono/SkiaSharp). What is saved is always drawn by PDFium.
+- **Live previews** of shapes and effects are drawn with [SkiaSharp](https://github.com/mono/SkiaSharp), which also blurs the soft shadows and glows that are saved into the PDF. Gradients are saved as vector shading, drawn by PDFium.
 - **Text recognition** uses [Tesseract](https://github.com/tesseract-ocr/tesseract). For Myanmar, a line recognition model runs on ONNX Runtime.
 
 ### Project layout
