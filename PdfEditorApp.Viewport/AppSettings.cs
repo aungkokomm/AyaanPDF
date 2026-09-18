@@ -190,6 +190,14 @@ public sealed record AppSettings
     public Dictionary<string, ReadingPosition> ReadingPositions { get; init; } = new();
 
     /// <summary>
+    /// Documents whose tab shows the document's title instead of its file
+    /// name, by upper-cased full path, as <see cref="ReadingPositions"/> is.
+    /// Kept per file rather than as one switch because plenty of files carry a
+    /// title nobody chose, and the tab would read worse for showing it.
+    /// </summary>
+    public List<string> TitleInTabPaths { get; init; } = new();
+
+    /// <summary>
     /// Which generation of this file's meaning the stored settings were
     /// written against.
     ///

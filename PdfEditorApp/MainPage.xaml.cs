@@ -178,6 +178,12 @@ public sealed partial class MainPage : Page
                 UpdateToolRail();
             }
 
+            // Kept per file, so it follows the document a tab holds.
+            if (args.PropertyName == nameof(ViewModel.DocumentTitle))
+            {
+                SyncTitleInTab();
+            }
+
             if (args.PropertyName == nameof(ViewModel.WindowTitle))
             {
                 PushWindowTitle();
@@ -6383,6 +6389,267 @@ public sealed partial class MainPage : Page
     /// The only About. Settings used to carry a second one as a tab, with the
     /// credits and the log link this one lacked; both moved here.
     /// </summary>
+    // ---------------- Document properties ----------------
+
+    /// <summary>
+    /// File > Document properties: the title, author, subject and keywords to
+    /// edit, and what the file is, read-only, beneath them.
+    ///
+    /// The four fields are written on the next save, as a bookmark edit is,
+    /// into the Info dictionary and into the XMP copy most files also carry.
+    /// An encrypted file shows them read-only: its Info strings are encrypted
+    /// too, and they cannot be rewritten here.
+    /// </summary>
+    private async void DocumentProperties_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.ReadDocumentInfo() is not { } info)
+        {
+            return;
+        }
+
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        var secondary = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+        string? path = ViewModel.DocumentPath;
+        bool onDisk = path is not null && System.IO.File.Exists(path);
+        bool locked = info.IsEncrypted;
+
+        TextBox Field(string name, string value, string placeholder)
+        {
+            var box = new TextBox { Text = value, PlaceholderText = placeholder, IsReadOnly = locked };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(box, name);
+            return box;
+        }
+
+        TextBlock Text(string value, Brush? brush = null) => new()
+        {
+            Text = value,
+            TextWrapping = TextWrapping.Wrap,
+            IsTextSelectionEnabled = true,
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = brush ?? (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"],
+        };
+
+        void Row(Grid grid, string label, UIElement value)
+        {
+            int row = grid.RowDefinitions.Count;
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var name = new TextBlock { Text = label, Foreground = secondary, VerticalAlignment = VerticalAlignment.Center };
+            Grid.SetRow(name, row);
+            Grid.SetRow((FrameworkElement)value, row);
+            Grid.SetColumn((FrameworkElement)value, 1);
+            grid.Children.Add(name);
+            grid.Children.Add(value);
+        }
+
+        Grid TwoColumns(double rowSpacing) => new()
+        {
+            ColumnSpacing = 12,
+            RowSpacing = rowSpacing,
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(88) },
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+            },
+        };
+
+        // What can be changed.
+        var title = Field("Title", info.Title, string.Empty);
+        var author = Field("Author", info.Author, string.Empty);
+        var subject = Field("Subject", info.Subject, "What the document is about");
+        var keywords = Field("Keywords", info.Keywords, "Separate with commas");
+
+        // Titles in the wild are often empty or a leftover ("Microsoft Word -
+        // report.docx"); the file name is usually what was meant.
+        var useFileName = new HyperlinkButton
+        {
+            Content = "Use file name",
+            IsEnabled = path is not null && !locked,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        useFileName.Click += (_, _) => title.Text = System.IO.Path.GetFileNameWithoutExtension(path) ?? string.Empty;
+        var titleRow = new Grid
+        {
+            ColumnSpacing = 8,
+            ColumnDefinitions =
+            {
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                new ColumnDefinition { Width = GridLength.Auto },
+            },
+        };
+        Grid.SetColumn(useFileName, 1);
+        titleRow.Children.Add(title);
+        titleRow.Children.Add(useFileName);
+
+        var editable = TwoColumns(8);
+        Row(editable, "Title", titleRow);
+        Row(editable, "Author", author);
+        Row(editable, "Subject", subject);
+        Row(editable, "Keywords", keywords);
+
+        // What the file is.
+        var facts = TwoColumns(6);
+        if (path is not null)
+        {
+            var file = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+            file.Children.Add(Text(System.IO.Path.GetFileName(path)));
+            if (onDisk)
+            {
+                var show = new HyperlinkButton { Content = "Show in folder", Padding = new Thickness(4, 0, 4, 0) };
+                show.Click += (_, _) => ShowInFolder(path);
+                file.Children.Add(show);
+            }
+            Row(facts, "File", file);
+        }
+
+        string size = string.Join(", ", new[]
+        {
+            onDisk ? DocumentFacts.FileSize(new System.IO.FileInfo(path!).Length, culture) : string.Empty,
+            info.PageCount == 1 ? "1 page" : $"{info.PageCount} pages",
+            DocumentFacts.PageSize(info.PageWidth, info.PageHeight, culture),
+        }.Where(s => s.Length > 0));
+        Row(facts, "Size", Text(size));
+        if (info.Version.Length > 0)
+        {
+            Row(facts, "PDF version", Text(info.Version));
+        }
+        Row(facts, "Created", Text(DocumentFacts.Created(info.Created, info.Creator, culture)));
+        Row(facts, "Modified", Text(DocumentFacts.When(info.Modified, culture)));
+        if (info.Producer.Length > 0)
+        {
+            Row(facts, "Producer", Text(info.Producer));
+        }
+        Row(facts, "Security", Text(DocumentFacts.Security(info.SecurityRevision, info.Permissions)));
+
+        // On request: it parses the whole file, which on a big book takes a
+        // second or two, and most visits to this dialog are not about fonts.
+        var fonts = new StackPanel { Spacing = 4 };
+        var showFonts = new HyperlinkButton { Content = "Show fonts", Padding = new Thickness(0) };
+        showFonts.Click += async (_, _) =>
+        {
+            fonts.Children.Clear();
+            var reading = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+            reading.Children.Add(new ProgressRing { IsActive = true, Width = 16, Height = 16 });
+            reading.Children.Add(Text("Reading the fonts", secondary));
+            fonts.Children.Add(reading);
+
+            var found = await ViewModel.ListFontsAsync();
+            fonts.Children.Clear();
+            if (found is null)
+            {
+                fonts.Children.Add(Text("Couldn't read the fonts."));
+                return;
+            }
+
+            fonts.Children.Add(Text(DocumentFacts.FontsSummary(found)));
+            if (found.Count > 0)
+            {
+                var list = new StackPanel { Spacing = 2 };
+                foreach (var font in found)
+                {
+                    list.Children.Add(Text(font.Describe(), secondary));
+                }
+                fonts.Children.Add(new ScrollViewer { Content = list, MaxHeight = 160 });
+            }
+        };
+        fonts.Children.Add(showFonts);
+        Row(facts, "Fonts", fonts);
+
+        string other = info.Tagged ? "Tagged" : "Not tagged";
+        if (onDisk)
+        {
+            other += FileFacts.IsLinearized(ReadHead(path!)) ? ", fast web view on" : ", fast web view off";
+        }
+        Row(facts, "Other", Text(other));
+
+        var inTab = new CheckBox
+        {
+            Content = "Show the title in the tab instead of the file name",
+            IsChecked = TabTitles.IsOn(SettingsStore.Current.TitleInTabPaths, path),
+            IsEnabled = path is not null,
+        };
+
+        var panel = new StackPanel { Spacing = 16, MinWidth = 460 };
+        if (locked)
+        {
+            panel.Children.Add(Text("This file is encrypted, so its title, author, subject and keywords can't be changed.", secondary));
+        }
+        panel.Children.Add(editable);
+        panel.Children.Add(new Rectangle
+        {
+            Height = 1,
+            Fill = (Brush)Application.Current.Resources["DividerStrokeColorDefaultBrush"],
+        });
+        panel.Children.Add(facts);
+        panel.Children.Add(inTab);
+
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Document properties",
+            Content = new ScrollViewer { Content = panel, Padding = new Thickness(0, 0, 12, 0) },
+            PrimaryButtonText = "OK",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        dialog.Resources["ContentDialogMaxWidth"] = 640.0;
+
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            ViewModel.ApplyInfoEdits(InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text));
+
+            if (path is not null)
+            {
+                bool on = inTab.IsChecked == true;
+                SettingsStore.Update(s => s with { TitleInTabPaths = TabTitles.Set(s.TitleInTabPaths, path, on) });
+                SyncTitleInTab();
+            }
+        }
+
+        RootGrid.Focus(FocusState.Programmatic);
+    }
+
+    /// <summary>Puts this document's tab-title choice, kept per file in the settings, on the view model.</summary>
+    private void SyncTitleInTab() =>
+        ViewModel.TitleInTab = TabTitles.IsOn(SettingsStore.Current.TitleInTabPaths, ViewModel.DocumentPath);
+
+    /// <summary>The first kilobyte of a file, or nothing if it cannot be read.</summary>
+    private static byte[] ReadHead(string path)
+    {
+        try
+        {
+            using var stream = System.IO.File.OpenRead(path);
+            byte[] head = new byte[1024];
+            int read = stream.Read(head, 0, head.Length);
+            return head[..read];
+        }
+        catch (System.IO.IOException)
+        {
+            return [];
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>Opens the file's folder in File Explorer with the file selected.</summary>
+    private static void ShowInFolder(string path)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                Arguments = $"/select,\"{path}\"",
+                UseShellExecute = false,
+            });
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"show in folder failed: {ex.Message}");
+        }
+    }
+
     private async void About_Click(object sender, RoutedEventArgs e)
     {
         var asm = System.Reflection.Assembly.GetExecutingAssembly();
@@ -7391,6 +7658,8 @@ public sealed partial class MainPage : Page
             case EditorCommand.FindPrevious: ViewModel.StepSearchMatch(-1); break;
 
             case EditorCommand.GoToPage: FocusPageJumpBox(); break;
+
+            case EditorCommand.DocumentProperties: DocumentProperties_Click(this, null!); break;
 
             // Z-order and duplicate act on a selection and do nothing without
             // one, which the view model already guards. The object toolbar

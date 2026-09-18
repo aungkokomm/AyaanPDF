@@ -268,6 +268,17 @@
                         <KeyboardAccelerator Modifiers="Control" Key="P" />
                     </MenuFlyoutItem.KeyboardAccelerators>
                 </MenuFlyoutItem>
+                <!-- Alt+Enter, which is Properties across Windows: Ctrl+D, which
+                     Acrobat uses, is Duplicate here. -->
+                <MenuFlyoutItem x:Name="DocumentPropertiesItem" Text="Document properties..."
+                                Click="DocumentProperties_Click">
+                    <MenuFlyoutItem.Icon>
+                        <FontIcon Glyph="&#xE946;" />
+                    </MenuFlyoutItem.Icon>
+                    <MenuFlyoutItem.KeyboardAccelerators>
+                        <KeyboardAccelerator Modifiers="Menu" Key="Enter" />
+                    </MenuFlyoutItem.KeyboardAccelerators>
+                </MenuFlyoutItem>
                 <MenuFlyoutSeparator />
                 <MenuFlyoutItem Text="Settings..." Click="Settings_Click">
                     <MenuFlyoutItem.Icon>

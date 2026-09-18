@@ -46,6 +46,7 @@ mod retype;
 mod shift;
 mod shaped;
 pub mod outline;
+pub mod docinfo;
 
 use std::collections::HashMap;
 use std::ffi::CStr;

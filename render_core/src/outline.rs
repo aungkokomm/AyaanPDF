@@ -254,7 +254,7 @@ fn remove_existing_outline(doc: &mut Document) {
 /// else becomes UTF-16BE behind a byte-order mark, because PDFDocEncoding
 /// cannot represent Devanagari, Burmese, Arabic or CJK at all and a title
 /// written as raw bytes would come back as mojibake.
-fn pdf_text_string(title: &str) -> Object {
+pub(crate) fn pdf_text_string(title: &str) -> Object {
     if title.is_ascii() {
         return Object::String(title.as_bytes().to_vec(), StringFormat::Literal);
     }

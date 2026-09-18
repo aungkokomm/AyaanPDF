@@ -1358,6 +1358,11 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         IsDirty = false;
         NotifyHistoryChanged();
 
+        // Properties typed into Document properties belong to the document
+        // being closed. A save that reopens its file finds them in it.
+        _infoEdits = null;
+        _fileTitle = null;
+
         if (_documentHandle == 0)
         {
             PageCount = 0;
@@ -1400,6 +1405,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         Stage("LoadBookmarks");
         LoadGuidesFromSidecar();
         Stage("LoadGuidesFromSidecar");
+
+        // For a tab set to show the title rather than the file name.
+        _fileTitle = ReadDocumentInfo()?.Title;
+        NotifyDocumentTitleChanged();
 
         Diag.Log($"open: {System.IO.Path.GetFileName(path)} " +
             $"({PageCount} pages) opened in {openClock.ElapsedMilliseconds} ms");
@@ -1809,8 +1818,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        return RenderCoreNative.extract_pages_to_file(
+        bool written = RenderCoreNative.extract_pages_to_file(
             _documentHandle, indices.ToArray(), (nuint)indices.Count, path) == RenderStatus.OkPdfium;
+        if (written)
+        {
+            StampWrittenFile(path);
+        }
+        return written;
+    }
+
+    /// <summary>
+    /// The stamp a save gets, for a new file written some other way (extracted
+    /// pages, a merge): dated, with Ayaan PDF as producer and as creator where
+    /// PDFium named itself. The source document's own edits are not carried:
+    /// they describe that document, not this one.
+    /// </summary>
+    internal static void StampWrittenFile(string path)
+    {
+        byte[] data = DocumentInfoStamp.Pairs(null, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now);
+        int status = RenderCoreNative.write_document_info(path, data, (nuint)data.Length);
+        if (status != RenderStatus.OkPdfium)
+        {
+            Diag.Log($"write_document_info (new file): status {status}");
+        }
     }
 
     /// <summary>Deletes a set of pages at once, never emptying the document.</summary>
@@ -2316,6 +2346,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (saved)
         {
             WriteGradientFills(writePath);
+
+            // Last of the file-to-file passes, so the date it stamps is the
+            // moment the file was finished.
+            WriteDocumentInfo(writePath);
         }
 
         if (inPlace && saved)
@@ -2396,6 +2430,152 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
 
         return saved;
+    }
+
+    // ---------------- Document properties ----------------
+
+    /// <summary>
+    /// Title, author, subject and keywords as changed in Document properties,
+    /// waiting to be written, or null when the file's own are what is shown.
+    ///
+    /// Kept after a save that does not reopen the file, a Save As to a new
+    /// path: the open document still holds the old values in memory and every
+    /// later save writes them out again first, so the edits have to go on
+    /// being laid over them until the document is reopened.
+    /// </summary>
+    private InfoEdits? _infoEdits;
+
+    /// <summary>The title the file itself carries, read when it opened.</summary>
+    private string? _fileTitle;
+
+    /// <summary>
+    /// What the open document says about itself, with any edits waiting to be
+    /// written laid over it. Null with no document.
+    /// </summary>
+    public DocumentInfo? ReadDocumentInfo()
+    {
+        if (_documentHandle == 0)
+        {
+            return null;
+        }
+
+        var buffer = RenderCoreNative.get_document_properties(_documentHandle);
+        try
+        {
+            if (buffer.Status != RenderStatus.OkPdfium || buffer.Data == IntPtr.Zero)
+            {
+                return null;
+            }
+            byte[] bytes = new byte[(int)buffer.Len];
+            Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+            return DocumentInfo.FromPairs(NulFields.Pairs(bytes)).With(_infoEdits);
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buffer);
+        }
+    }
+
+    /// <summary>
+    /// Takes the dialog's changes. Nothing is written until the next save,
+    /// the same as a bookmark edit, so the dirty dot and the unsaved-changes
+    /// prompt cover it without learning about properties.
+    /// </summary>
+    public void ApplyInfoEdits(InfoEdits edits)
+    {
+        if (!edits.HasChanges)
+        {
+            return;
+        }
+        _infoEdits = _infoEdits is null ? edits : _infoEdits.Then(edits);
+        IsDirty = true;
+        NotifyDocumentTitleChanged();
+    }
+
+    /// <summary>
+    /// Stamps the file a save has just written: any properties edited in
+    /// Document properties, the modified date, and Ayaan PDF as producer, in
+    /// the Info dictionary and in its XMP copy. PDFium writes none of these,
+    /// so a saved file used to keep the date it was first made and name
+    /// whatever program made it, "PDFium" included.
+    ///
+    /// A failure never fails the save: the document is on disk either way.
+    /// It is only reported when there were edits the user will look for.
+    /// </summary>
+    private void WriteDocumentInfo(string path)
+    {
+        byte[] data = DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now);
+        int status = RenderCoreNative.write_document_info(path, data, (nuint)data.Length);
+        if (status == RenderStatus.OkPdfium)
+        {
+            return;
+        }
+
+        Diag.Log($"write_document_info: status {status}");
+        if (_infoEdits is { HasChanges: true })
+        {
+            Status = status == RenderStatus.Unsupported
+                ? "Saved, but the properties could not be written: the file is encrypted or could not be read."
+                : "Saved, but the properties could not be written.";
+        }
+    }
+
+    /// <summary>
+    /// The fonts the document uses, read off the file on disk when it matches
+    /// what is open, or off a copy written for the purpose when it does not.
+    /// Null when they could not be read.
+    /// </summary>
+    public async Task<List<FontFact>?> ListFontsAsync()
+    {
+        ulong handle = _documentHandle;
+        if (handle == 0)
+        {
+            return null;
+        }
+
+        string? source = !IsDirty && _currentDocumentPath is { } p && File.Exists(p) ? p : null;
+        string? temp = null;
+        if (source is null)
+        {
+            temp = Path.Combine(Path.GetTempPath(), $"ayaan-fonts-{Guid.NewGuid():N}.pdf");
+            if (await Task.Run(() => RenderCoreNative.save_document(handle, temp)) != RenderStatus.OkPdfium)
+            {
+                return null;
+            }
+            source = temp;
+        }
+
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var buffer = RenderCoreNative.list_document_fonts(source);
+                try
+                {
+                    if (buffer.Status != RenderStatus.OkPdfium)
+                    {
+                        return null;
+                    }
+                    byte[] bytes = new byte[(int)buffer.Len];
+                    if (bytes.Length > 0)
+                    {
+                        Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+                    }
+                    return DocumentFacts.Fonts(bytes);
+                }
+                finally
+                {
+                    RenderCoreNative.free_byte_buffer(buffer);
+                }
+            });
+        }
+        finally
+        {
+            if (temp is not null)
+            {
+                try { File.Delete(temp); } catch (IOException) { }
+            }
+        }
     }
 
     // ---------------- Crash recovery ----------------
@@ -2762,7 +2942,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // File > New still produces a real blank document and keeps "Untitled".
         PageCount == 0 && !HasDocumentPath
             ? "Welcome"
-            : $"{(IsDirty ? "• " : string.Empty)}{DocumentTitle}";
+            : $"{(IsDirty ? "• " : string.Empty)}{TabName}";
+
+    /// <summary>
+    /// The document's title when its tab is set to show it and it has one,
+    /// otherwise the file name. Per file, because many files carry a title
+    /// nobody chose ("Microsoft Word - ...") that reads worse than the name.
+    /// </summary>
+    private string TabName =>
+        TitleInTab && (_infoEdits?.Title ?? _fileTitle) is { Length: > 0 } title ? title : DocumentTitle;
+
+    private bool _titleInTab;
+
+    /// <summary>Whether this document's tab shows its title. Set by the page from the settings.</summary>
+    public bool TitleInTab
+    {
+        get => _titleInTab;
+        set
+        {
+            if (_titleInTab == value) { return; }
+            _titleInTab = value;
+            NotifyDocumentTitleChanged();
+        }
+    }
 
     private void NotifyDocumentTitleChanged()
     {

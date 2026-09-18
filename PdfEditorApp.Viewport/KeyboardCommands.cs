@@ -34,6 +34,8 @@ public enum EditorCommand
     NavigateForward,
     /// <summary>Bookmarks the current page, named after any selected text.</summary>
     AddBookmark,
+    /// <summary>File > Document properties. Alt+Enter, as for Properties in File Explorer.</summary>
+    DocumentProperties,
 }
 
 /// <summary>
@@ -73,6 +75,7 @@ public static class KeyboardCommands
     public const int KeyN = 0x4E;
     public const int KeyW = 0x57;
     public const int KeyTab = 0x09;
+    public const int KeyEnter = 0x0D;
     public const int KeyF3 = 0x72;
     public const int KeyD = 0x44;
 
@@ -119,6 +122,10 @@ public static class KeyboardCommands
             {
                 case KeyLeft: return EditorCommand.NavigateBack;
                 case KeyRight: return EditorCommand.NavigateForward;
+
+                // Alt+Enter is Properties across Windows. Not from a text field,
+                // which may want Enter for itself.
+                case KeyEnter when !textFocused: return EditorCommand.DocumentProperties;
             }
         }
 

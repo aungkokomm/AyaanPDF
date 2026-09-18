@@ -560,6 +560,9 @@ public sealed partial class MergeFilesWindow : Window
                 return "Couldn't write the new PDF.";
             }
 
+            // Before the bookmarks, whose writer keeps what it finds.
+            await Task.Run(() => ViewportViewModel.StampWrittenFile(written));
+
             RenderCoreNative.close_document(merged);
             merged = 0;
 

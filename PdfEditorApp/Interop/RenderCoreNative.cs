@@ -990,6 +990,37 @@ internal static partial class RenderCoreNative
         nuint len);
 
     /// <summary>
+    /// What the open document says about itself (render_core/src/docinfo.rs):
+    /// NUL-separated UTF-8 pairs, the Info fields that are present plus
+    /// Version, Pages, PageWidth, PageHeight, Tagged, Security and Permissions.
+    /// Nothing is loaded to answer it. Release with <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer get_document_properties(ulong docHandle);
+
+    /// <summary>
+    /// Appends Info fields, and the same fields in the file's XMP copy, to the
+    /// PDF at <paramref name="path"/> as an incremental update. For the file a
+    /// save has just written, which nothing has open. Pairs as built by
+    /// DocumentInfoStamp. Returns Ok, InvalidInput, Unsupported (unparseable
+    /// or encrypted; the file is left as it was), or Panic.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int write_document_info(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        byte[] data,
+        nuint len);
+
+    /// <summary>
+    /// The fonts in the PDF at <paramref name="path"/>, four NUL-separated
+    /// fields each: name, type, embedded, subset. Parses the whole file, so
+    /// call it off the UI thread. Release with <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer list_document_fonts(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>
     /// Writes every gradient-filled shape's paint into the file as a real PDF
     /// shading, which is the second thing PDFium cannot create.
     ///
