@@ -30,13 +30,12 @@
 Plenty of PDF apps can *show* Hindi and Burmese. Try to change a word, though, and the letters fall apart: vowel signs land on the wrong side, conjuncts split, stacked consonants come unstacked.
 
 **Ayaan PDF was built to get that right.** Click a line, type, and it stays real text: shaped correctly, searchable, and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
-<img width="960" height="511" alt="image" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
 
 ## Screenshots
 
 **Your documents, in tabs, with everything at hand**
 
-<!-- Paste screenshot 1 on the line below: the main window with a document open. -->
+<img width="960" height="511" alt="Ayaan PDF with a document open" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
 
 
 **Edit the words on the page, in Hindi and Myanmar too**
