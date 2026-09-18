@@ -3337,9 +3337,10 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>
     /// The zoom that makes a page span the viewport width. Pure function of
     /// the fixed layout width, so it is always correct, even before anything
-    /// has rendered.
+    /// has rendered. <paramref name="padding"/> is the canvas padding, which
+    /// zooms with the pages.
     /// </summary>
-    public double FitWidthZoom(double viewportWidth) => _layout.FitWidthZoom(viewportWidth);
+    public double FitWidthZoom(double viewportWidth, double padding) => _layout.FitWidthZoom(viewportWidth, padding);
 
     /// <summary>
     /// The zoom that shows the WHOLE first page with air around it.

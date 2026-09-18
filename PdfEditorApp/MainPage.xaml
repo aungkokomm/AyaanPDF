@@ -82,6 +82,14 @@
             E932 glyph on the other half so the two do not read as one heavy
             icon beside one light one.
         -->
+        <!--
+            Continuous scrolling, for the page layout button: the tail of one
+            page above a whole one. It replaces E81E, which is Fluent's "map
+            layers" and read as layers. Drawn at 10 by 14 with a wall of 1, the
+            size and weight of the single-page glyph (E7C3) it alternates with.
+        -->
+        <x:String x:Key="ContinuousPagesPath">F0 M0,0 L0,1.5 A1.5,1.5 0 0 0 1.5,3 L8.5,3 A1.5,1.5 0 0 0 10,1.5 L10,0 L9,0 L9,1.5 A0.5,0.5 0 0 1 8.5,2 L1.5,2 A0.5,0.5 0 0 1 1,1.5 L1,0 Z M1.5,5 L8.5,5 A1.5,1.5 0 0 1 10,6.5 L10,12.5 A1.5,1.5 0 0 1 8.5,14 L1.5,14 A1.5,1.5 0 0 1 0,12.5 L0,6.5 A1.5,1.5 0 0 1 1.5,5 Z M1.5,6 L8.5,6 A0.5,0.5 0 0 1 9,6.5 L9,12.5 A0.5,0.5 0 0 1 8.5,13 L1.5,13 A0.5,0.5 0 0 1 1,12.5 L1,6.5 A0.5,0.5 0 0 1 1.5,6 Z</x:String>
+
         <x:String x:Key="OpenBookPath">F0 M7.56,2.46 C5.54,0.88 2.9,0 0,0 L0,11.52 C2.9,11.52 5.54,12.4 7.56,13.98 Z M6.86,3.3 C5.1,2.15 2.9,1.36 0.97,1.05 L0.97,10.73 C2.99,11.03 5.1,11.82 6.86,12.97 Z M8.44,2.46 C10.46,0.88 13.1,0 16,0 L16,11.52 C13.1,11.52 10.46,12.4 8.44,13.98 Z M9.14,3.3 C10.9,2.15 13.1,1.36 15.03,1.05 L15.03,10.73 C13.01,11.03 10.9,11.82 9.14,12.97 Z</x:String>
 
         <!--
@@ -416,7 +424,7 @@
                 <MenuFlyoutSeparator />
                 <ToggleMenuFlyoutItem x:Name="ShowLinksToggle" Text="Show links"
                                       Click="ShowLinksToggle_Click" />
-                <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers"
+                <ToggleMenuFlyoutItem x:Name="RulersToggle" Text="Rulers in Edit mode"
                                       IsChecked="True" Click="RulersToggle_Click">
                     <ToggleMenuFlyoutItem.KeyboardAccelerators>
                         <KeyboardAccelerator Modifiers="Control" Key="R" />
@@ -1818,6 +1826,33 @@
                           ScrollViewer.HorizontalScrollMode="Disabled"
                           ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                           Padding="0" BorderThickness="0" Background="Transparent">
+                    <!--
+                        The chosen tool, tinted with the accent. The stock
+                        selection is a faint grey square and a 3px accent
+                        sliver, while Reading and Edit above are solid accent,
+                        so the mode looked more "on" than the tool in use. A
+                        tint rather than solid accent keeps the icons their own
+                        colour: the hand and the stamp are Paths, which cannot
+                        follow a selected foreground.
+                    -->
+                    <ListView.Resources>
+                        <ResourceDictionary>
+                            <ResourceDictionary.ThemeDictionaries>
+                                <ResourceDictionary x:Key="Light">
+                                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="{ThemeResource SystemAccentColorDark1}" Opacity="0.18" />
+                                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="{ThemeResource SystemAccentColorDark1}" Opacity="0.26" />
+                                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="{ThemeResource SystemAccentColorDark1}" Opacity="0.14" />
+                                </ResourceDictionary>
+                                <ResourceDictionary x:Key="Dark">
+                                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="{ThemeResource SystemAccentColorLight2}" Opacity="0.24" />
+                                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPointerOver" Color="{ThemeResource SystemAccentColorLight2}" Opacity="0.32" />
+                                    <SolidColorBrush x:Key="ListViewItemBackgroundSelectedPressed" Color="{ThemeResource SystemAccentColorLight2}" Opacity="0.18" />
+                                </ResourceDictionary>
+                                <!-- High contrast keeps the system highlight. -->
+                                <ResourceDictionary x:Key="HighContrast" />
+                            </ResourceDictionary.ThemeDictionaries>
+                        </ResourceDictionary>
+                    </ListView.Resources>
                     <ListView.ItemContainerStyle>
                         <Style TargetType="ListViewItem">
                             <Setter Property="MinWidth" Value="0" />
@@ -2499,13 +2534,15 @@
                      the right (visible only when the selected object HAS a
                      fill - a filled shape today, potentially a text box's
                      fill tomorrow). Two sliders means the labels stop being
-                     optional: "Stroke" and "Fill" precede each so a user
-                     doesn't have to guess which they are dragging. -->
+                     optional: "Opacity" and "Fill opacity" precede each so a
+                     user doesn't have to guess which they are dragging. The
+                     first said "Stroke", and beside the line widths it read
+                     as a thickness. -->
                 <StackPanel x:Name="OpacitySection" Orientation="Horizontal" Spacing="6"
                             VerticalAlignment="Center">
                     <Rectangle Width="1" Height="18" VerticalAlignment="Center"
                                Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
-                    <TextBlock Text="Stroke" VerticalAlignment="Center"
+                    <TextBlock Text="Opacity" VerticalAlignment="Center"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                Style="{StaticResource CaptionTextBlockStyle}" />
                     <!--
@@ -2524,8 +2561,8 @@
                     <Slider x:Name="OpacitySlider" Width="88" Maximum="100" Minimum="10"
                             StepFrequency="5" TickFrequency="10"
                             VerticalAlignment="Center"
-                            AutomationProperties.Name="Stroke opacity"
-                            ToolTipService.ToolTip="Stroke opacity"
+                            AutomationProperties.Name="Opacity"
+                            ToolTipService.ToolTip="Opacity"
                             ValueChanged="Opacity_ValueChanged" />
                     <TextBlock x:Name="OpacityReadout" VerticalAlignment="Center" MinWidth="34"
                                TextAlignment="Right"
@@ -2540,7 +2577,7 @@
                                 Visibility="Collapsed">
                         <Rectangle Width="1" Height="18" VerticalAlignment="Center"
                                    Fill="{ThemeResource ControlStrokeColorDefaultBrush}" />
-                        <TextBlock Text="Fill" VerticalAlignment="Center"
+                        <TextBlock Text="Fill opacity" VerticalAlignment="Center"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                    Style="{StaticResource CaptionTextBlockStyle}" />
                         <Slider x:Name="FillOpacitySlider" Width="88" Maximum="100" Minimum="10"
@@ -3543,15 +3580,21 @@
                     </ToggleButton>
                     <!--
                         Which way the document scrolls. A plain button, not a
-                        toggle: the glyph shows the mode you are IN, a stack of
-                        sheets while scrolling is continuous and a single sheet
-                        when it is not, and the tooltip says what pressing it will
-                        do.
+                        toggle: the icon shows the mode you are IN, one page
+                        running into the next while scrolling is continuous and
+                        a single sheet when it is not, and the tooltip says what
+                        pressing it will do.
                     -->
                     <Button x:Name="PageModeBarButton" AutomationProperties.Name="Page layout" Click="PageModeBar_Click"
                             Width="28" Height="26" Padding="0" BorderThickness="0"
                             Background="Transparent">
-                        <FontIcon x:Name="PageModeBarIcon" Glyph="&#xE81E;" FontSize="14" />
+                        <Grid>
+                            <FontIcon x:Name="PageModeBarIcon" Glyph="&#xE7C3;" FontSize="14"
+                                      Visibility="Collapsed" />
+                            <!-- Roomier than the path's 10x14, because the box clips. -->
+                            <PathIcon x:Name="ContinuousPagesIcon" Data="{StaticResource ContinuousPagesPath}"
+                                      Width="11" Height="15" />
+                        </Grid>
                     </Button>
                     <Button AutomationProperties.Name="Full screen" Content="&#xE740;" FontFamily="Segoe MDL2 Assets" FontSize="12"
                             Click="FullScreen_Click" Width="28" Height="26" Padding="0"
@@ -3644,7 +3687,7 @@
                             <MenuFlyoutItem x:Name="BarResetRotationItem" Text="Reset view rotation"
                                             Click="ResetViewRotation_Click" IsEnabled="False" />
                             <MenuFlyoutSeparator />
-                            <ToggleMenuFlyoutItem x:Name="BarRulersToggle" Text="Rulers"
+                            <ToggleMenuFlyoutItem x:Name="BarRulersToggle" Text="Rulers in Edit mode"
                                                   Click="RulersToggle_Click"
                                                   KeyboardAcceleratorTextOverride="Ctrl+R" />
                             <MenuFlyoutSubItem Text="Ruler units">

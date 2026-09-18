@@ -241,7 +241,11 @@ public sealed class ContinuousLayout
     /// The zoom factor that makes a page exactly fill the viewport width.
     /// Layout width is fixed, so fit-width is purely a zoom decision, which is
     /// why the layout never has to be rebuilt when the window resizes.
+    ///
+    /// <paramref name="padding"/> is space around the pages INSIDE the zoomed
+    /// content, which grows with the zoom as the pages do, so it is divided
+    /// by rather than subtracted from the viewport.
     /// </summary>
-    public double FitWidthZoom(double viewportWidth) =>
-        LayoutWidth > 0 ? viewportWidth / LayoutWidth : 1.0;
+    public double FitWidthZoom(double viewportWidth, double padding = 0) =>
+        LayoutWidth > 0 ? viewportWidth / (LayoutWidth + padding) : 1.0;
 }

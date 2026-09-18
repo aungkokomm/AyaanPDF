@@ -175,6 +175,25 @@ public class ContinuousLayoutTests
     }
 
     [Fact]
+    public void fit_width_counts_the_padding_that_zooms_with_the_pages()
+    {
+        // The canvas padding is inside the zoomed content, so at zoom z the
+        // content is (layout + padding) x z wide. Fitting the pages alone to
+        // the width less the padding overshot by padding x (z - 1), and above
+        // 100% that put a horizontal scroll bar under a page meant to fit.
+        var layout = new ContinuousLayout();
+        layout.Rebuild(Uniform(2), layoutWidth: 800);
+        const double viewport = 1900, padding = 48;
+
+        double zoom = layout.FitWidthZoom(viewport, padding);
+        Assert.Equal(viewport, (800 + padding) * zoom, 6);
+
+        // The control: the old sum overshoots the viewport by over 10 DIP.
+        double old = layout.FitWidthZoom(viewport - padding);
+        Assert.True((800 + padding) * old > viewport + 10);
+    }
+
+    [Fact]
     public void rebuilding_replaces_the_previous_stack()
     {
         var layout = new ContinuousLayout(pageGap: 0);

@@ -273,12 +273,14 @@ public class StatusBarViewControlsTests
         string xaml = Xaml();
         Assert.Contains("x:Name=\"PageModeBarButton\"", xaml, StringComparison.Ordinal);
 
-        // Both glyphs are checked against the font that actually renders them:
-        // E7C3 is a single sheet and E81E is a stack of them. A code that is
-        // not in the font renders as an empty box, silently.
+        // A single sheet (E7C3, checked against the font that renders it: a
+        // code not in the font is an empty box, silently) or a drawn icon for
+        // continuous scrolling. It was E81E, which is "map layers" and read as
+        // layers; ChromeClarityTests holds the drawn one.
+        Assert.Contains("<FontIcon x:Name=\"PageModeBarIcon\" Glyph=\"&#xE7C3;\"", xaml, StringComparison.Ordinal);
         string sync = MethodBody(Code(), "private void SyncBarViewState");
-        Assert.Contains("\\uE7C3", sync, StringComparison.Ordinal);
-        Assert.Contains("\\uE81E", sync, StringComparison.Ordinal);
+        Assert.Contains("PageModeBarIcon.Visibility =", sync, StringComparison.Ordinal);
+        Assert.Contains("ContinuousPagesIcon.Visibility =", sync, StringComparison.Ordinal);
 
         // An icon that reports the current mode cannot also advertise what
         // pressing it does, so the tooltip has to, and it has to change with

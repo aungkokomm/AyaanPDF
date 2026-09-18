@@ -202,6 +202,13 @@ public sealed partial class MainPage : Page
                 UpdateChromeForDocument();
             }
 
+            // Rulers belong to Edit. Heard here rather than in SetMode, because
+            // opening a document puts the app back in View without passing it.
+            if (args.PropertyName == nameof(ViewModel.IsEditMode))
+            {
+                ApplyRulerVisibility();
+            }
+
             if (args.PropertyName is nameof(ViewModel.CanUndo)
                 or nameof(ViewModel.CanRedo)
                 or nameof(ViewModel.HasDocumentPath)
@@ -657,19 +664,13 @@ public sealed partial class MainPage : Page
     /// </summary>
     private void FitToWidth(bool animate = false)
     {
-        double available = AvailableContentWidth;
-        double availableHeight = PageScroller.ViewportHeight - ViewportHost.Padding.Top - ViewportHost.Padding.Bottom;
-        if (available <= 0)
+        if (AvailableContentWidth <= 0)
         {
             return;
         }
 
-        double target = _fitMode == FitMode.Width
-            ? ViewModel.FitWidthZoom(available)
-            : ViewModel.FitPageZoom(available, availableHeight);
-
         float zoom = (float)Math.Clamp(
-            target,
+            FitZoom(),
             PageScroller.MinZoomFactor,
             PageScroller.MaxZoomFactor);
 
@@ -678,6 +679,25 @@ public sealed partial class MainPage : Page
             null,
             new ScrollingZoomOptions(animate ? ScrollingAnimationMode.Enabled : ScrollingAnimationMode.Disabled,
                                      ScrollingSnapPointsMode.Ignore));
+    }
+
+    /// <summary>
+    /// The zoom the current fit mode asks for. One place, because the fit and
+    /// the check that notices the user zooming away from it must agree.
+    ///
+    /// Fit-width divides by the pages PLUS the canvas padding: the padding is
+    /// inside the zoomed content, so fitting the pages alone to the width less
+    /// the padding overshot by padding x (zoom - 1), and above 100% that put a
+    /// horizontal scroll bar under a page meant to fit. Half a DIP is held back
+    /// so rounding the zoom to a float cannot tip the page past the edge.
+    /// </summary>
+    private double FitZoom()
+    {
+        double availableHeight = PageScroller.ViewportHeight - ViewportHost.Padding.Top - ViewportHost.Padding.Bottom;
+        return _fitMode == FitMode.Width
+            ? ViewModel.FitWidthZoom(PageScroller.ViewportWidth - 0.5,
+                                     ViewportHost.Padding.Left + ViewportHost.Padding.Right)
+            : ViewModel.FitPageZoom(AvailableContentWidth, availableHeight);
     }
 
     /// <summary>
@@ -943,12 +963,7 @@ public sealed partial class MainPage : Page
         // rather than from each input path means no gesture can be forgotten.
         if (_autoFit && AvailableContentWidth > 0)
         {
-            double availableHeight = PageScroller.ViewportHeight - ViewportHost.Padding.Top - ViewportHost.Padding.Bottom;
-            double fit = _fitMode == FitMode.Width
-                ? ViewModel.FitWidthZoom(AvailableContentWidth)
-                : ViewModel.FitPageZoom(AvailableContentWidth, availableHeight);
-
-            if (Math.Abs(PageScroller.ZoomFactor - fit) > 0.005)
+            if (Math.Abs(PageScroller.ZoomFactor - FitZoom()) > 0.005)
             {
                 _autoFit = false;
             }
@@ -1459,13 +1474,6 @@ public sealed partial class MainPage : Page
         ApplyRulerVisibility();
     }
 
-    /// <summary>
-    /// Rulers show when they are switched on AND there is something to measure.
-    ///
-    /// Two conditions, one place. The toggle is the user's preference and
-    /// survives a document being closed; whether a ruler is on screen right now
-    /// also depends on whether a page exists to rule.
-    /// </summary>
     // ---------------- Full screen ----------------
 
     /// <summary>
@@ -1793,10 +1801,11 @@ public sealed partial class MainPage : Page
             BarContinuousItem.IsChecked = !ViewModel.IsSinglePageView;
             BarRulersToggle.IsChecked = RulersToggle.IsChecked;
 
-            // A stack of sheets while the document scrolls through, one sheet
-            // when it turns a page at a time. The tooltip names the OTHER mode,
-            // because that is what pressing it gets you.
-            PageModeBarIcon.Glyph = ViewModel.IsSinglePageView ? "\uE7C3" : "\uE81E";
+            // One page running into the next while the document scrolls
+            // through, one sheet when it turns a page at a time. The tooltip
+            // names the OTHER mode, because that is what pressing it gets you.
+            PageModeBarIcon.Visibility = ViewModel.IsSinglePageView ? Visibility.Visible : Visibility.Collapsed;
+            ContinuousPagesIcon.Visibility = ViewModel.IsSinglePageView ? Visibility.Collapsed : Visibility.Visible;
             ToolTipService.SetToolTip(
                 PageModeBarButton,
                 ViewModel.IsSinglePageView
@@ -1945,8 +1954,16 @@ public sealed partial class MainPage : Page
         }
     }
 
+    /// <summary>
+    /// Rulers show when they are switched on, there is something to measure,
+    /// and the app is in Edit mode.
+    ///
+    /// Three conditions, one place. The toggle is the user's preference and
+    /// survives a document being closed or a switch to reading. Reading has
+    /// nothing to place, so it gets the two strips back for the page.
+    /// </summary>
     private void ApplyRulerVisibility() =>
-        SetRulersVisible(RulersToggle.IsChecked && ViewModel.PageCount > 0);
+        SetRulersVisible(RulersToggle.IsChecked && ViewModel.PageCount > 0 && ViewModel.IsEditMode);
 
     /// <summary>
     /// Shows or hides the chrome that only means something with a document
@@ -6071,7 +6088,7 @@ public sealed partial class MainPage : Page
 
         var rulers = new ToggleSwitch
         {
-            Header = "Rulers",
+            Header = "Rulers in Edit mode",
             IsOn = RulersToggle.IsChecked == true,
         };
         // Driven through the existing command rather than setting state here,
