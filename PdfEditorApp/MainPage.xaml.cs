@@ -1103,18 +1103,12 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        // The property bar sits at the top of this same column and draws ABOVE
-        // this toolbar, so anything placed under it is unreachable. Reserve its
-        // height, measured rather than assumed, since it is one or two rows.
-        double topInset = PropertyBar.Visibility == Visibility.Visible
-            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
-            : 0;
-
+        // Nothing to reserve at the top: the property bar has its own row above
+        // the viewport, so it can no longer cover this toolbar.
         var place = ObjectToolbarPlacement.Place(
             tl.X, tl.Y, br.X, br.Y,
             barW, barH,
-            PageScroller.ViewportWidth, PageScroller.ViewportHeight,
-            Math.Max(0, topInset));
+            PageScroller.ViewportWidth, PageScroller.ViewportHeight);
 
         // Position AND elevation through the one property.
         //
@@ -1428,15 +1422,10 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        double topInset = PropertyBar.Visibility == Visibility.Visible
-            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
-            : 0;
-
         var place = ObjectToolbarPlacement.Place(
             tl.X, tl.Y, br.X, br.Y,
             popupW, popupH,
-            PageScroller.ViewportWidth, PageScroller.ViewportHeight,
-            Math.Max(0, topInset));
+            PageScroller.ViewportWidth, PageScroller.ViewportHeight);
 
         DefinitionPopup.Translation = new System.Numerics.Vector3(
             (float)place.Left, (float)place.Top, ObjectToolbarPlacement.Elevation);
@@ -1919,7 +1908,7 @@ public sealed partial class MainPage : Page
         }
 
         ToolRail.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
-        PropertyBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
+        UpdatePropertyBarVisibility();
         AppMenuBar.Visibility = presenting ? Visibility.Collapsed : Visibility.Visible;
 
         // Shown on arrival, then left to fade. Full screen used to collapse the
@@ -1931,7 +1920,7 @@ public sealed partial class MainPage : Page
 
         // Docked in its own row normally; over the bottom of the page in full
         // screen, so showing and hiding it there never resizes the document.
-        Grid.SetRow(StatusBar, presenting ? 0 : 1);
+        Grid.SetRow(StatusBar, presenting ? 1 : 2);
         UpdateStatusBarVisibility();
 
         if (presenting)
@@ -1981,6 +1970,7 @@ public sealed partial class MainPage : Page
         }
 
         UpdateStatusBarVisibility();
+        UpdatePropertyBarVisibility();
 
         // The rail's own menu and settings button stay live: they are how you
         // open a file from here. Only the TOOLS go dim.
@@ -2013,6 +2003,40 @@ public sealed partial class MainPage : Page
                                && (IsPresenting || SettingsStore.Current.ShowStatusBar)
             ? Visibility.Visible
             : Visibility.Collapsed;
+
+    /// <summary>
+    /// The one place that decides whether the tool options row is on screen.
+    /// It stays up for every tool while a document is open, even a tool with
+    /// no options, so choosing a tool never moves the page.
+    /// </summary>
+    private void UpdatePropertyBarVisibility() =>
+        PropertyBar.Visibility = ViewModel.PageCount > 0 && !IsPresenting
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+    private void PropertyBar_SizeChanged(object sender, SizeChangedEventArgs e) => FitPropertyBar();
+
+    /// <summary>
+    /// Puts the property bar's two rows side by side when they fit, and stacks
+    /// them when they do not, so a narrow window never cuts off the last
+    /// controls. Each row is measured at its natural width, which does not
+    /// depend on the orientation chosen here, so the choice cannot flip back
+    /// and forth.
+    /// </summary>
+    private void FitPropertyBar()
+    {
+        var natural = new Size(double.PositiveInfinity, double.PositiveInfinity);
+        PropertyBarRow1.Measure(natural);
+        PropertyBarRow2.Measure(natural);
+
+        double oneRow = PropertyBarRow1.DesiredSize.Width + PropertyBarRows.Spacing
+                        + PropertyBarRow2.DesiredSize.Width;
+        double room = PropertyBar.ActualWidth - PropertyBar.Padding.Left - PropertyBar.Padding.Right;
+
+        PropertyBarRows.Orientation = room <= 0 || oneRow <= room
+            ? Orientation.Horizontal
+            : Orientation.Vertical;
+    }
 
     /// <summary>Brings the bar back during full screen and starts its clock again.</summary>
     private void RevealStatusBar()
@@ -2151,6 +2175,12 @@ public sealed partial class MainPage : Page
 
     private void Rulers_SizeChanged(object sender, SizeChangedEventArgs e)
     {
+        // A Canvas does not clip its children. The left ruler's last tick and
+        // label were drawn past its bottom edge and over the status bar.
+        ((UIElement)sender).Clip = new RectangleGeometry
+        {
+            Rect = new Rect(0, 0, e.NewSize.Width, e.NewSize.Height),
+        };
         RedrawRulers();
     }
 
@@ -4466,17 +4496,13 @@ public sealed partial class MainPage : Page
         double h = GradientPanelWindow.ActualHeight;
         if (w <= 0 || h <= 0) { return; }
 
-        double topInset = PropertyBar is { Visibility: Visibility.Visible }
-            ? PropertyBar.ActualHeight + PropertyBar.Margin.Top - PageScroller.Margin.Top
-            : 0;
-
         var at = _gradientPanelAt is { } placed
             ? FloatingPanelPlacement.Clamp(
                 placed.Left, placed.Top, w, h,
-                PageScroller.ViewportWidth, PageScroller.ViewportHeight, Math.Max(0, topInset))
+                PageScroller.ViewportWidth, PageScroller.ViewportHeight)
             : FloatingPanelPlacement.Opening(
                 w, h,
-                PageScroller.ViewportWidth, PageScroller.ViewportHeight, Math.Max(0, topInset));
+                PageScroller.ViewportWidth, PageScroller.ViewportHeight);
 
         _gradientPanelAt = at;
 
@@ -5106,7 +5132,8 @@ public sealed partial class MainPage : Page
         EffectsSection.Visibility = Show(sections.Effects);
         if (sections.Effects) { SyncDropShadow(); SyncGlow(); }
         PropertyBarRow2.Visibility = Show(sections.Row2);
-        PropertyBar.Visibility = Show(sections.Bar);
+        UpdatePropertyBarVisibility();
+        FitPropertyBar();
 
         bool color = sections.Color;
         if (sections.CornerRadius) { SyncCornerRadius(); }
@@ -6524,7 +6551,10 @@ public sealed partial class MainPage : Page
         // The pages panel belongs beside the rail, not stranded on the far
         // side of the document from it.
         Grid.SetColumn(ThumbnailPanel, right ? 3 : 1);
-        ThumbnailPanel.Margin = right ? new Thickness(12, 12, 0, 12) : new Thickness(0, 12, 12, 12);
+
+        // Flush against the rail either way, with the divider on the edge that
+        // faces the document.
+        ThumbnailPanel.BorderThickness = right ? new Thickness(1, 0, 0, 0) : new Thickness(0, 0, 1, 0);
 
         // Keep the resize grip on the edge that faces the document, and flip the
         // drag direction to match, so dragging inward always widens.

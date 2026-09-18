@@ -56,7 +56,6 @@ public class FloatingChromeLayeringTests
 
     [Theory]
     [InlineData("ObjectToolbar")]
-    [InlineData("PropertyBar")]
     [InlineData("DefinitionPopup")]
     public void chrome_that_floats_over_a_page_is_lifted_above_it(string elementName)
     {
@@ -68,24 +67,6 @@ public class FloatingChromeLayeringTests
             $"{elementName} declares no Translation, so it will be drawn behind the page cards. "
             + "Canvas.ZIndex does not help here: the cards are raised by their ThemeShadow.");
         Assert.True(z > 0, $"{elementName} declares Translation Z {z}, which lifts it above nothing.");
-    }
-
-    [Fact]
-    public void the_property_bar_stays_above_the_object_toolbar()
-    {
-        // ObjectToolbarPlacement reserves the property bar's height because the
-        // property bar draws on top of the object toolbar. If that ever
-        // inverted, the reservation would be protecting the wrong control and
-        // the toolbar would be pushed away from a bar it now covers.
-        string xaml = MainPageXaml();
-
-        double? toolbar = TranslationZOf(xaml, "ObjectToolbar");
-        double? propertyBar = TranslationZOf(xaml, "PropertyBar");
-
-        Assert.NotNull(toolbar);
-        Assert.NotNull(propertyBar);
-        Assert.True(propertyBar > toolbar,
-            $"the property bar (Z {propertyBar}) must sit above the object toolbar (Z {toolbar})");
     }
 
     [Fact]

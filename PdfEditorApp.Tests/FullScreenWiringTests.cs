@@ -131,7 +131,8 @@ public class FullScreenWiringTests
         string body = MethodBody(PageCode(), "public void SetPresenting");
 
         Assert.Contains("ToolRail.Visibility", body, StringComparison.Ordinal);
-        Assert.Contains("PropertyBar.Visibility", body, StringComparison.Ordinal);
+        Assert.Contains("UpdatePropertyBarVisibility();", body, StringComparison.Ordinal);
+        Assert.Contains("!IsPresenting", PageCode()[PageCode().IndexOf("private void UpdatePropertyBarVisibility()", StringComparison.Ordinal)..], StringComparison.Ordinal);
     }
 
     [Fact]

@@ -71,7 +71,7 @@ public class StatusBarDockTests
         Assert.Contains("<RowDefinition Height=\"Auto\" />", definitions, StringComparison.Ordinal);
 
         string tag = Tag(StatusBarBlock(), 0);
-        Assert.Contains("Grid.Row=\"1\"", tag, StringComparison.Ordinal);
+        Assert.Contains("Grid.Row=\"2\"", tag, StringComparison.Ordinal);
         Assert.Contains("Grid.ColumnSpan=\"4\"", tag, StringComparison.Ordinal);
         Assert.DoesNotContain("CornerRadius", tag, StringComparison.Ordinal);
     }
@@ -112,7 +112,7 @@ public class StatusBarDockTests
     {
         // A row that came and went with every reveal would resize the viewport
         // each time the pointer moved.
-        Assert.Contains("Grid.SetRow(StatusBar, presenting ? 0 : 1);",
+        Assert.Contains("Grid.SetRow(StatusBar, presenting ? 1 : 2);",
             Body(Code(), "public void SetPresenting("), StringComparison.Ordinal);
         Assert.Contains("VerticalAlignment=\"Bottom\"", Tag(StatusBarBlock(), 0), StringComparison.Ordinal);
     }

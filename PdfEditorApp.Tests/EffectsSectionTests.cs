@@ -96,7 +96,6 @@ public class EffectsSectionTests
         var nothing = PropertyBarLayout.For(State());
 
         Assert.False(nothing.Effects);
-        Assert.False(nothing.Bar);
     }
 
     // ---------------- where it lives ----------------

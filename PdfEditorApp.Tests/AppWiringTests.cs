@@ -200,13 +200,13 @@ public class AppWiringTests
     }
 
     [Fact]
-    public void a_bar_with_nothing_to_show_is_hidden_rather_than_left_empty()
+    public void a_tool_with_nothing_to_offer_shows_no_sections()
     {
-        // An empty pill floating over the page is worse than no bar.
+        // The docked bar stays up and shows only the tool's name.
         var nothing = PropertyBarLayout.For(new PropertyBarState(
             ToolOptions.None, ShapeKind.Rectangle, false, false, false, false, false, false));
 
-        Assert.False(nothing.Bar);
+        Assert.False(nothing.Color);
         Assert.False(nothing.Row2);
     }
 

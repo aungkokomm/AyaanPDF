@@ -119,9 +119,9 @@ public class MenuBarWiringTests
     }
 
     /// <summary>
-    /// The menu is in the title bar, so the page keeps no row for it. Since
-    /// 3.46.2 the page does have rows, but only the document and, below it,
-    /// the status bar: nothing sits above the document.
+    /// The menu is in the title bar, so the page keeps no row for it. The row
+    /// above the document belongs to the tool options bar (see
+    /// DockedChromeTests); the menu bar names no row or column at all.
     /// </summary>
     [Fact]
     public void the_page_keeps_no_row_for_it()
@@ -130,24 +130,6 @@ public class MenuBarWiringTests
         int root = xaml.IndexOf("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal);
         int menu = xaml.IndexOf("<MenuBar x:Name=\"AppMenuBar\"", StringComparison.Ordinal);
         Assert.True(root > 0 && menu > root);
-
-        // The first row is the one that stretches, so no row is above the page.
-        int rows = xaml.IndexOf("<Grid.RowDefinitions>", root, StringComparison.Ordinal);
-        Assert.True(rows > 0 && rows < menu, "the page grid's rows are gone");
-        int first = xaml.IndexOf("<RowDefinition ", rows, StringComparison.Ordinal);
-        Assert.StartsWith("<RowDefinition Height=\"*\"", xaml[first..], StringComparison.Ordinal);
-
-        string[] lines = xaml.Split('\n');
-        int rootLine = Array.FindIndex(lines, l => l.Contains("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal));
-        var rowed = lines
-            .Select((line, i) => (line, i))
-            .Skip(rootLine + 1)
-            .Where(x => Regex.IsMatch(x.line, @"^        <[A-Za-z]"))
-            .Where(x => x.line.Contains("Grid.Row=", StringComparison.Ordinal))
-            .Where(x => !x.line.Contains("x:Name=\"StatusBar\"", StringComparison.Ordinal))
-            .Select(x => $"line {x.i + 1}: {x.line.Trim()}")
-            .ToList();
-        Assert.True(rowed.Count == 0, "placed in a row other than the status bar's: " + string.Join("; ", rowed));
 
         Assert.DoesNotContain("Grid.", MenuBarTag(), StringComparison.Ordinal);
     }

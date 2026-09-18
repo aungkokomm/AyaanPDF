@@ -171,11 +171,13 @@
         </Grid.ColumnDefinitions>
 
         <!--
-            The document and its chrome above, the status bar below. Every
-            element that names no row is in the first, so only the status bar
-            says Grid.Row. While it is collapsed the Auto row takes nothing.
+            The tool options bar, the document, the status bar. The canvas
+            column's elements say Grid.Row="1"; the rail and the side panels
+            span the first two rows so they run from the top of the page to the
+            status bar. A collapsed bar leaves its Auto row empty.
         -->
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
@@ -478,7 +480,7 @@
              column with a Margin on the ScrollView reserving room; toggled
              from View > Rulers. Corner covers the intersection so the two
              rulers don't butt into each other visually. -->
-        <Border x:Name="RulerCorner" Grid.Column="2"
+        <Border x:Name="RulerCorner" Grid.Column="2" Grid.Row="1"
                 Width="22" Height="22"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -491,7 +493,7 @@
              the page. Horizontal preview: full viewport width, 1 DIP tall,
              top of Margin = pointer Y. Vertical preview: 1 DIP wide, full
              height, left of Margin = pointer X. Collapsed until pressed. -->
-        <Rectangle x:Name="GuidePreviewLine" Grid.Column="2"
+        <Rectangle x:Name="GuidePreviewLine" Grid.Column="2" Grid.Row="1"
                    Fill="#FF00A0D8" Opacity="0.85"
                    HorizontalAlignment="Left" VerticalAlignment="Top"
                    IsHitTestVisible="False"
@@ -504,7 +506,7 @@
              in the active ruler unit, so precise placement is a matter of
              watching the number rather than counting ticks. Collapsed until
              a ruler drag starts. -->
-        <Border x:Name="GuideReadout" Grid.Column="2"
+        <Border x:Name="GuideReadout" Grid.Column="2" Grid.Row="1"
                 Background="{ThemeResource SystemControlBackgroundBaseLowBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="1" CornerRadius="3"
@@ -516,7 +518,7 @@
             <TextBlock x:Name="GuideReadoutText" FontSize="10"
                        Foreground="{ThemeResource TextFillColorPrimaryBrush}" />
         </Border>
-        <controls:CursorCanvas x:Name="TopRuler" Grid.Column="2"
+        <controls:CursorCanvas x:Name="TopRuler" Grid.Column="2" Grid.Row="1"
                 Height="22" Margin="22,0,0,0"
                 HorizontalAlignment="Stretch" VerticalAlignment="Top"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -549,7 +551,7 @@
                 </MenuFlyout>
             </Canvas.ContextFlyout>
         </controls:CursorCanvas>
-        <controls:CursorCanvas x:Name="LeftRuler" Grid.Column="2"
+        <controls:CursorCanvas x:Name="LeftRuler" Grid.Column="2" Grid.Row="1"
                 Width="22" Margin="0,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Stretch"
                 Background="{ThemeResource LayerFillColorAltBrush}"
@@ -566,6 +568,7 @@
         <ScrollView
             x:Name="PageScroller"
             Grid.Column="2"
+            Grid.Row="1"
             Margin="22,22,0,0"
             ZoomMode="Enabled"
             HorizontalScrollBarVisibility="Auto"
@@ -1316,6 +1319,7 @@
         -->
         <rendering:SkiaShapeLayer x:Name="SkiaShapeCanvas"
                                   Grid.Column="2"
+                                  Grid.Row="1"
                                   Margin="22,22,0,0"
                                   IsHitTestVisible="False"
                                   Visibility="Collapsed" />
@@ -1337,7 +1341,7 @@
             both go through Translation, set in code; a RenderTransform would
             drive the same composition visual and quietly win, Z included.
         -->
-        <Border x:Name="GradientPanelWindow" Grid.Column="2"
+        <Border x:Name="GradientPanelWindow" Grid.Column="2" Grid.Row="1"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Visibility="Collapsed" Canvas.ZIndex="30" Translation="0,0,40"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
@@ -1488,7 +1492,7 @@
             out; the X and Y stay zero because position is set by the
             TranslateTransform below, which is a separate mechanism.
         -->
-        <Border x:Name="ObjectToolbar" Grid.Column="2"
+        <Border x:Name="ObjectToolbar" Grid.Column="2" Grid.Row="1"
                 Margin="22,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Visibility="Collapsed" Canvas.ZIndex="20" Translation="0,0,32"
@@ -1537,7 +1541,7 @@
             no room. Pale yellow with dark text in every theme, like a sticky
             note, because it floats over paper rather than over app chrome.
         -->
-        <Border x:Name="DefinitionPopup" Grid.Column="2"
+        <Border x:Name="DefinitionPopup" Grid.Column="2" Grid.Row="1"
                 Margin="22,22,0,0"
                 HorizontalAlignment="Left" VerticalAlignment="Top"
                 Visibility="Collapsed" Canvas.ZIndex="20" Translation="0,0,32"
@@ -1587,7 +1591,7 @@
             Still double-tappable, which is the gesture people try on an empty
             canvas, and it is the same handler as the button.
         -->
-        <Border x:Name="EmptyState" Grid.Column="2" Background="Transparent"
+        <Border x:Name="EmptyState" Grid.Column="2" Grid.Row="1" Background="Transparent"
                 AllowDrop="True"
                 DragOver="EmptyState_DragOver"
                 Drop="EmptyState_Drop"
@@ -1724,7 +1728,7 @@
             window with nothing to align to; docked, the rail has an edge to sit
             against and the settings button has a bottom to sit at.
         -->
-        <Border x:Name="ToolRail" Grid.Column="0" VerticalAlignment="Stretch" Margin="0"
+        <Border x:Name="ToolRail" Grid.Column="0" Grid.RowSpan="2" VerticalAlignment="Stretch" Margin="0"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
                 BorderThickness="0,0,1,0" CornerRadius="0" Padding="4,4,4,4">
@@ -1893,47 +1897,31 @@
 
             Which sections appear is decided by the tool's ToolOptions, so a
             tool declares what it offers in one record rather than here.
-            Collapsed entirely for tools that offer nothing, so the canvas is
-            uncluttered whenever the bar has nothing to say.
-        -->
-        <!-- ZIndex 30: ABOVE the floating object toolbar (20). Both are
-             top-aligned in this column and the object toolbar clamps to a few
-             pixels from the top of the viewport, so a selection near the top of
-             a page put it straight over this bar and hid whatever was under it.
-             The property bar is the app's chrome and wins.
 
-             Translation Z for the same reason the object toolbar has one: the
-             page cards are elevated by their ThemeShadow and would otherwise
-             composite over this bar wherever a page reaches it. HIGHER than the
-             toolbar's 32, because ObjectToolbarPlacement reserves this bar's
-             height on the standing assumption that it draws on top; equal
-             values would leave that contract decided by declaration order. -->
+            Docked in its own row above the rulers. It floated over the top of
+            the page, covering what was there, and it appeared and vanished as
+            tools changed. Now it stays up for every tool while a document is
+            open, one showing only the tool's name, at a fixed height, so
+            choosing a tool never moves the page.
+        -->
         <Border x:Name="PropertyBar" Grid.Column="2" Visibility="Collapsed"
-                Canvas.ZIndex="30" Translation="0,0,48"
-                HorizontalAlignment="Center" VerticalAlignment="Top" Margin="12,12,12,0"
+                MinHeight="44" Padding="8,4"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                BorderThickness="1" CornerRadius="18" Padding="10,4"
+                BorderThickness="0,0,0,1"
+                SizeChanged="PropertyBar_SizeChanged"
                 AutomationProperties.Name="Tool options">
             <!--
-                Scrollable, so the bar CANNOT clip. A horizontal StackPanel does
-                not compress: the drawing tool's sections come to roughly 500
-                DIP, which fits any normal window and silently loses its last
-                control on a narrow one. The ScrollViewer caps the bar at the
-                column width and lets what does not fit be reached instead of
-                cut off, and it costs nothing at the sizes that do fit.
+                One row whenever it fits. Row 1 carries the general sections
+                (colour, width, shape, size), row 2 the rest (font, text style,
+                opacity, stamps). On a window too narrow for both side by side,
+                FitPropertyBar stacks them rather than let the last controls
+                fall off the edge.
             -->
-            <!--
-                Two rows, not one scrolling row: a bar you have to scroll hides
-                controls. Row 1 carries the general sections (colour, width,
-                shape, size); row 2 the rest (font, text style, opacity,
-                stamps). Sections still show or hide per tool, and row 2 is
-                collapsed whenever none of its sections apply, so a simple tool
-                stays a single row.
-            -->
-            <StackPanel Orientation="Vertical" Spacing="4">
+            <StackPanel x:Name="PropertyBarRows" Orientation="Horizontal" Spacing="8"
+                        HorizontalAlignment="Left" VerticalAlignment="Center">
             <StackPanel x:Name="PropertyBarRow1" Orientation="Horizontal" Spacing="8"
-                        VerticalAlignment="Center" HorizontalAlignment="Center">
+                        VerticalAlignment="Center" HorizontalAlignment="Left">
 
                 <TextBlock x:Name="PropertyBarToolName" VerticalAlignment="Center"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -2295,7 +2283,7 @@
             </StackPanel>
             <!-- Row 2: font, text style, opacity, stamps. -->
             <StackPanel x:Name="PropertyBarRow2" Orientation="Horizontal" Spacing="8"
-                        VerticalAlignment="Center" HorizontalAlignment="Center">
+                        VerticalAlignment="Center" HorizontalAlignment="Left">
 
                 <!-- Font family + bold/italic/underline/strikethrough. Unicode:
                      pick any installed font (including a local-language one). -->
@@ -2985,11 +2973,11 @@
             takes width away from the canvas. Hidden until asked for.
         -->
         <Border x:Name="ThumbnailPanel" Visibility="Collapsed"
-                Grid.Column="1" Margin="0,12,12,12"
+                Grid.Column="1" Grid.RowSpan="2"
                 Width="{x:Bind ViewModel.ThumbnailPaneWidth, Mode=OneWay}"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                BorderThickness="1" CornerRadius="10">
+                BorderThickness="0,0,1,0">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
@@ -3120,10 +3108,10 @@
             would leave the page itself squeezed into what is left.
         -->
         <Border x:Name="BookmarkPanel" Visibility="Collapsed"
-                Grid.Column="1" Margin="0,12,12,12" Width="260"
+                Grid.Column="1" Grid.RowSpan="2" Width="260"
                 Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
-                BorderThickness="1" CornerRadius="10">
+                BorderThickness="0,0,1,0">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
@@ -3396,7 +3384,7 @@
             View > Status bar hides it (ShowStatusBar). Full screen shows it
             regardless, because there it is the only chrome there is.
         -->
-        <Border x:Name="StatusBar" Grid.Row="1" Grid.ColumnSpan="4"
+        <Border x:Name="StatusBar" Grid.Row="2" Grid.ColumnSpan="4"
                 VerticalAlignment="Bottom" MinHeight="32" Padding="8,2"
                 Background="{ThemeResource LayerFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
@@ -3685,7 +3673,7 @@
             Top RIGHT, below the ruler: the object toolbar owns the top left, and
             the tool options and notices are centred.
         -->
-        <StackPanel x:Name="FindPanel" Grid.Column="2" Visibility="Collapsed"
+        <StackPanel x:Name="FindPanel" Grid.Column="2" Grid.Row="1" Visibility="Collapsed"
                     HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,30,20,0"
                     Orientation="Horizontal" Spacing="4" Padding="6,3"
                     Canvas.ZIndex="25" Translation="0,0,32"
@@ -3787,7 +3775,7 @@
             Below the 22px ruler, and centred rather than left so it clears the
             object toolbar in the corner.
         -->
-        <Border Grid.Column="2"
+        <Border Grid.Column="2" Grid.Row="1"
                 Visibility="{x:Bind ViewModel.IsPreparingText, Mode=OneWay}"
                 IsHitTestVisible="False"
                 HorizontalAlignment="Center" VerticalAlignment="Top"
@@ -3824,7 +3812,7 @@
             In the canvas column for the reason the card above gives, top centre
             below the ruler, and pushed under that card while it shows.
         -->
-        <InfoBar x:Name="NoticeBar" Grid.Column="2"
+        <InfoBar x:Name="NoticeBar" Grid.Column="2" Grid.Row="1"
                  HorizontalAlignment="Center" VerticalAlignment="Top" MaxWidth="560"
                  Margin="{x:Bind local:MainPage.NoticeMargin(ViewModel.IsPreparingText), Mode=OneWay}"
                  IsOpen="{x:Bind ViewModel.IsNoticeOpen, Mode=TwoWay}"

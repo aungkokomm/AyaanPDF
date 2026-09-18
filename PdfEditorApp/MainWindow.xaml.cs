@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 
@@ -174,6 +175,26 @@ public sealed partial class MainWindow : Window
         Close();
     }
 
+    /// <summary>The widest a tab's title may grow before it is cut with an ellipsis.</summary>
+    private const double TabTitleMaxWidth = 220;
+
+    /// <summary>
+    /// Titles a tab, capped with an ellipsis. The strip sizes tabs to their
+    /// content, so one long file name took a third of the window. The whole
+    /// name is in the tooltip and is what a screen reader hears.
+    /// </summary>
+    private static void SetTabTitle(TabViewItem item, string title)
+    {
+        item.Header = new TextBlock
+        {
+            Text = title,
+            MaxWidth = TabTitleMaxWidth,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+        };
+        ToolTipService.SetToolTip(item, title);
+        AutomationProperties.SetName(item, title);
+    }
+
     /// <summary>
     /// Opens a document in a new tab.
     ///
@@ -192,10 +213,11 @@ public sealed partial class MainWindow : Window
         var item = new TabViewItem
         {
             Content = page,
-            // A tab with no document is the welcome screen, and says so.
-            Header = System.IO.Path.GetFileName(path) ?? "Welcome",
             IconSource = new SymbolIconSource { Symbol = Symbol.Document },
         };
+
+        // A tab with no document is the welcome screen, and says so.
+        SetTabTitle(item, System.IO.Path.GetFileName(path) ?? "Welcome");
 
         // The page tells us its title; we decide where it belongs. A background
         // document must be able to retitle its own tab without touching the
@@ -205,7 +227,7 @@ public sealed partial class MainWindow : Window
             // The TAB gets the file name; the WINDOW gets the full title. They
             // used to share one string, so every tab read "name - Ayaan PDF"
             // inside a window already called Ayaan PDF.
-            item.Header = p.TabTitle;
+            SetTabTitle(item, p.TabTitle);
             if (ReferenceEquals(ActivePage, p))
             {
                 SetDocumentTitle(p.DocumentTitle);
