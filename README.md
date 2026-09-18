@@ -1,25 +1,101 @@
-# Ayaan PDF
+<p align="center">
+  <img src="docs/logo.png" width="112" alt="Ayaan PDF logo">
+</p>
 
-A free PDF reader and editor for Windows, made with English, Hindi and Myanmar (Burmese) documents in mind.
+<h1 align="center">Ayaan PDF</h1>
 
-Ayaan PDF opens, reads, marks up and edits PDF files. It can also change the words already in a PDF, including Hindi and Myanmar text, and it can turn scanned pages into searchable text. Everything runs on your own computer, with no account and no internet connection needed.
+<p align="center">
+  <b>The PDF editor that speaks Hindi and Myanmar.</b><br>
+  Read, mark up, sign and truly edit PDFs on Windows. Free, open source, and it works offline.
+</p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Platform: Windows 10 and 11, x64](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20x64-blue.svg)
+<p align="center">
+  <a href="../../releases/latest"><b>Download for Windows</b></a>
+  &nbsp;·&nbsp;
+  <a href="#what-it-can-do">What it can do</a>
+  &nbsp;·&nbsp;
+  <a href="#build-it-yourself">Build it yourself</a>
+</p>
 
-## Highlights
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4.svg" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/languages-English%20%7C%20%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80%20%7C%20%E1%80%99%E1%80%BC%E1%80%94%E1%80%BA%E1%80%99%E1%80%AC-orange.svg" alt="English, Hindi, Myanmar">
+</p>
 
-- **Edit the text already in a PDF**, in place on the page. Hindi (Devanagari) and Myanmar text are shaped properly, so conjuncts, vowel signs and stacked consonants come out right. Burmese typing through KeyMagic works too.
-- **Make scanned pages searchable.** Recognize text reads English, Hindi and Myanmar out of the box, and more than 100 other languages can be downloaded from inside the app.
-- **Look up words without leaving the page.** Right-click an English word to see its meaning, with Myanmar and Hindi meanings under it, all offline.
-- **Text boxes in complex scripts.** Type Hindi, Myanmar or English in any font on your PC. The text is shaped properly and saved as real text that can be searched and copied.
-- **Shapes with real effects.** Gradient fills, soft drop shadows and outer glows are written into the PDF itself, so every PDF reader shows them, not just Ayaan PDF.
-- **Spot old fonts.** Pages typed in pre-Unicode Hindi or Burmese fonts are flagged, and those pages can be recognised into real text.
+---
 
-## Features
+Plenty of PDF apps can *show* Hindi and Burmese. Try to change a word, though, and the letters fall apart: vowel signs land on the wrong side, conjuncts split, stacked consonants come unstacked.
+
+**Ayaan PDF was built to get that right.** Click a line, type, and it stays real text: shaped correctly, searchable, and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
+
+## What it can do
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### ✍️ Edit the words on the page
+Click a line and type. English, Hindi and Myanmar are reshaped as you go, paragraphs reflow, and the result is real text you can search. Burmese typing through KeyMagic works too.
+
+</td>
+<td width="50%" valign="top">
+
+### 🔍 Turn scans into text
+Recognize text reads English, Hindi and Myanmar, and 112 more languages are one download away. The page looks exactly the same, but now you can search it, select it and copy from it.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 📖 Look up any word
+Right-click an English word for its meaning, with the Myanmar and Hindi translations right underneath. No internet needed.
+
+</td>
+<td valign="top">
+
+### 🔤 Text boxes in your language
+Write Hindi, Myanmar or English in the font you like. It is shaped properly and the font goes inside the PDF, so it looks right wherever the file goes.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### ✨ Effects that travel
+Give shapes gradient fills, soft shadows and glows. They are saved into the PDF itself, so every PDF reader shows them, not just this one.
+
+</td>
+<td valign="top">
+
+### 🕰️ Rescue old documents
+Pages typed in old fonts like Kruti Dev, Zawgyi or Win Innwa are spotted for you, and can be recognised into proper, searchable Unicode text.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 🖊️ Mark up and sign
+Highlight, draw, add notes and stamps, and save your signature once to place it on any document.
+
+</td>
+<td valign="top">
+
+### 🗂️ Pages your way
+Drag pages to reorder them. Insert, extract, rotate or delete them, or merge PDFs and pictures into one new file.
+
+</td>
+</tr>
+</table>
+
+**Also in the box:** tabs, find, links with Back and Forward, night mode and a dark theme, full screen, rulers and guides, forms, password-protected files, bookmarks built from a document's headings, document properties and attachments, printing, saving in the background, and your unsaved work offered back if anything ever goes wrong.
+
+<details>
+<summary><b>See the full feature list</b></summary>
 
 ### Reading
-
 - Several documents at once, each in its own tab
 - Continuous scrolling or one page at a time
 - Fit page, fit width, actual size, and zoom up to 800%
@@ -28,10 +104,9 @@ Ayaan PDF opens, reads, marks up and edits PDF files. It can also change the wor
 - Links you can follow, with Back and Forward (Alt+Left and Alt+Right)
 - Page thumbnails and a bookmarks panel
 - Full screen, night mode, and light or dark themes
-- Recent files, and double-clicking a PDF in File Explorer opens it as a new tab in the open window
+- Recent files, and double-clicking a PDF in File Explorer opens it as a new tab in the window already open
 
 ### Marking up
-
 - Highlight, underline and strike out text
 - Freehand drawing
 - Shapes: rectangle, rounded rectangle with adjustable corners, ellipse, line and arrow, with colour, line width, opacity and fill opacity
@@ -53,34 +128,29 @@ Ayaan PDF opens, reads, marks up and edits PDF files. It can also change the wor
 - Rulers and guides, including margin and column guides
 
 ### Editing text
-
 - In Edit mode, click a line of text to change it right on the page
 - English, Hindi and Myanmar are shaped and written back as real, searchable text
 - Paragraphs reflow as you type
 - For Myanmar, editing works on text set in Myanmar Text or Pyidaungsu
 
 ### Pages
-
 - Reorder pages by dragging their thumbnails, and act on several at once
 - Insert pages from another file, or a blank page
 - Extract, rotate and delete pages
 - Merge PDFs and pictures into a new document
 
-### Recognize text (OCR)
-
+### Recognize text
 - English, Hindi and Myanmar are included
-- More than 100 other languages can be downloaded in Recognition languages. Each download is checked before it is kept. Chinese, Japanese and Korean are not available yet.
+- 112 more languages can be downloaded in Recognition languages, and each download is checked before it is kept. Chinese, Japanese and Korean are not available yet.
 - The recognised words are written as an invisible layer, so the page looks the same but can be searched, selected and copied
 - A Fast option uses the recognition built into Windows, for English
 
 ### Define
-
 - Right-click an English word for its definition, from WordNet
 - Myanmar and Hindi meanings are shown under it, and each can be turned off in Settings
 - Works entirely offline
 
 ### Document
-
 - Document properties (Alt+Enter): title, author, subject, keywords and language
 - Choose how the file opens: page, zoom, panel and layout
 - Remove personal information when saving
@@ -92,56 +162,46 @@ Ayaan PDF opens, reads, marks up and edits PDF files. It can also change the wor
 - Print, and save a flattened copy
 
 ### Your work is safe
-
 - Saving happens in the background, so the app stays usable
 - If Ayaan PDF closes unexpectedly, your unsaved work is offered back the next time it starts
 - Undo and redo for your changes
 
-## Install
+</details>
 
-1. Download `AyaanPDF-Setup-<version>.exe` from the [Releases](../../releases) page.
-2. Run it. It installs for your Windows account only, so it doesn't need administrator rights.
-3. Leave "Offer Ayaan PDF for PDF files" ticked if you want it in Open with. To make it your default PDF app, choose it in Settings > Apps > Default apps.
+## Get it
 
-The installer isn't code-signed, so Windows SmartScreen may warn that it doesn't recognise the app. Choose **More info**, then **Run anyway**.
+1. Download `AyaanPDF-Setup-<version>.exe` from the [latest release](../../releases/latest).
+2. Run it. It installs just for you, so no administrator rights are needed.
+3. Keep **Offer Ayaan PDF for PDF files** ticked to see it under Open with. To make it your default PDF app, pick it in Settings > Apps > Default apps.
 
-### Requirements
+> [!NOTE]
+> This free project isn't code-signed, so Windows SmartScreen may say it doesn't recognise the app. Click **More info**, then **Run anyway**.
 
-- Windows 10 version 1809 or later, or Windows 11
-- A 64-bit (x64) PC
-- For Myanmar, the Myanmar Text font, which comes with Windows, or Pyidaungsu
+Ayaan PDF runs on **Windows 10 (version 1809 or later) and Windows 11**, on 64-bit PCs. For Myanmar it uses the Myanmar Text font that comes with Windows, or Pyidaungsu.
 
-## Privacy
+## Your files stay on your PC
 
-Ayaan PDF works offline. It connects to the internet only when you ask it to:
+No account, no tracking, no automatic updates phoning home. Ayaan PDF goes online only when you ask it to: to download a recognition language, or to open a web link you clicked.
 
-- when you download a recognition language, from the Tesseract project on GitHub
-- when you click a web link in a document, which opens in your browser
+## Handy keys
 
-There is no account, no telemetry and no automatic update check.
+Press **F1** in the app to see every shortcut. A few favourites:
 
-## Keyboard shortcuts
-
-Press **F1** in the app to see all of them. The most used are:
-
-| Keys | What they do |
+| | |
 |---|---|
-| Ctrl+O | Open |
-| Ctrl+S / Ctrl+Shift+S | Save / Save as |
-| Ctrl+P | Print |
-| Ctrl+F, F3 | Find, next match |
-| Ctrl+Z / Ctrl+Y | Undo / Redo |
-| Ctrl+0 / Ctrl+1 / Ctrl+2 | Fit page / Actual size / Fit width |
-| Ctrl+Tab | Next tab |
-| F4 / F6 | Pages panel / Bookmarks panel |
-| F11 | Full screen |
-| Alt+Enter | Document properties |
-| H, V, U, D, R, T, N, S, L | Hand, Select, Highlight, Draw, Shape, Text, Note, Stamp, Link |
+| **Ctrl+F**, then **F3** | Find, and jump to the next match |
+| **Ctrl+0 / 1 / 2** | Fit page, actual size, fit width |
+| **F4** / **F6** | Pages panel / bookmarks panel |
+| **F11** | Full screen |
+| **Alt+Enter** | Document properties |
+| **H V U D R T N S L** | Hand, Select, Highlight, Draw, Shape, Text, Note, Stamp, Link |
 
-## Building from source
+## Build it yourself
+
+<details>
+<summary><b>What you need, and the steps</b></summary>
 
 ### What you need
-
 - Windows 10 or 11, x64
 - [Visual Studio 2026](https://visualstudio.microsoft.com/) with the **.NET desktop development** workload. Build with Visual Studio's MSBuild: the `dotnet` command line lacks a WinUI step the app needs.
 - The [.NET 10 SDK](https://dotnet.microsoft.com/)
@@ -181,14 +241,14 @@ Press **F1** in the app to see all of them. The most used are:
 
 After changing a dependency, regenerate the licence notices with `python tools/make_third_party_notices.py`.
 
-## How it is built
+</details>
 
-- **The window** is WinUI 3 on the Windows App SDK, written in C# on .NET 10. It is unpackaged and self-contained, so it carries its own .NET runtime and needs nothing installed.
-- **The core**, `render_core.dll`, is written in Rust. It draws and edits pages through [PDFium](https://pdfium.googlesource.com/pdfium/), using a patched copy of [pdfium-render](https://github.com/ajrcarey/pdfium-render). It shapes Hindi and Myanmar text with [rustybuzz](https://github.com/harfbuzz/rustybuzz) and writes bookmarks with [lopdf](https://github.com/J-F-Liu/lopdf).
-- **Live previews** of shapes and effects are drawn with [SkiaSharp](https://github.com/mono/SkiaSharp), which also blurs the soft shadows and glows that are saved into the PDF. Gradients are saved as vector shading, drawn by PDFium.
-- **Text recognition** uses [Tesseract](https://github.com/tesseract-ocr/tesseract). For Myanmar, a line recognition model runs on ONNX Runtime.
+## Under the hood
 
-### Project layout
+The window is **WinUI 3** in C# on .NET 10, and it carries its own runtime, so there's nothing else to install. The pages are drawn and edited by a **Rust** core built on **PDFium**, which shapes Hindi and Myanmar with **rustybuzz** so the letters land where they belong. **SkiaSharp** draws the live previews and blurs the shadows and glows before they are saved. Text recognition runs on **Tesseract**, with a dedicated model for Myanmar.
+
+<details>
+<summary><b>Where things are</b></summary>
 
 | Folder | What is in it |
 |---|---|
@@ -197,20 +257,17 @@ After changing a dependency, regenerate the licence notices with `python tools/m
 | `PdfEditorApp.Rendering.Skia/` | The live previews |
 | `PdfEditorApp.Tests/` | The C# tests (xUnit) |
 | `render_core/` | The Rust core and its tests |
-| `vendor/pdfium-render/` | The patched copy of pdfium-render |
+| `vendor/pdfium-render/` | A patched copy of pdfium-render |
 | `installer/` | The Inno Setup script |
 | `tools/` | Build, dictionary, OCR and licence scripts |
 
+</details>
+
 ## Licence
 
-Ayaan PDF is released under the [MIT License](LICENSE), and so are its Hindi and Myanmar dictionaries.
+Ayaan PDF is free and open source under the [MIT License](LICENSE), and so are its Hindi and Myanmar dictionaries.
 
-It is built on the work of others, each under its own licence:
-
-- [THIRD-PARTY-NOTICES.txt](PdfEditorApp/THIRD-PARTY-NOTICES.txt): PDFium and the libraries built into it, the Rust libraries, the .NET libraries and the .NET runtime
-- [Assets/Ocr/THIRD-PARTY-NOTICES-OCR.txt](PdfEditorApp/Assets/Ocr/THIRD-PARTY-NOTICES-OCR.txt): Tesseract, Leptonica and the recognition models
-- [Assets/Fonts/THIRD-PARTY-NOTICES.txt](PdfEditorApp/Assets/Fonts/THIRD-PARTY-NOTICES.txt): the Oswald font and the stamp icons
-- [Assets/Dictionary/](PdfEditorApp/Assets/Dictionary/): WordNet's licence and the dictionaries' own
+It stands on the work of many others, each under its own licence. See [THIRD-PARTY-NOTICES.txt](PdfEditorApp/THIRD-PARTY-NOTICES.txt), and the notices in [Assets/Ocr](PdfEditorApp/Assets/Ocr/THIRD-PARTY-NOTICES-OCR.txt), [Assets/Fonts](PdfEditorApp/Assets/Fonts/THIRD-PARTY-NOTICES.txt) and [Assets/Dictionary](PdfEditorApp/Assets/Dictionary/).
 
 ## Thanks
 
