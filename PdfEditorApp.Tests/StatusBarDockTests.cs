@@ -72,7 +72,7 @@ public class StatusBarDockTests
 
         string tag = Tag(StatusBarBlock(), 0);
         Assert.Contains("Grid.Row=\"2\"", tag, StringComparison.Ordinal);
-        Assert.Contains("Grid.ColumnSpan=\"4\"", tag, StringComparison.Ordinal);
+        Assert.Contains("Grid.ColumnSpan=\"5\"", tag, StringComparison.Ordinal);
         Assert.DoesNotContain("CornerRadius", tag, StringComparison.Ordinal);
     }
 

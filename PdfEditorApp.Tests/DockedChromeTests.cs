@@ -149,15 +149,22 @@ public class DockedChromeTests
     }
 
     [Fact]
-    public void the_bar_stays_up_for_every_tool_while_a_document_is_open()
+    public void the_bar_takes_its_row_only_when_it_has_something_to_show()
     {
-        // Appearing and vanishing with the tool moved the page each time.
+        // 3.46.3 kept it up for every tool, and for Select that was a row
+        // holding one word. The user: space should be taken only when a
+        // toolbar comes.
         string code = Code();
         string decide = Statement(code, "private void UpdatePropertyBarVisibility() =>");
-        Assert.Contains("ViewModel.PageCount > 0 && !IsPresenting", decide, StringComparison.Ordinal);
+        Assert.Contains("_propertyBarWanted && ViewModel.PageCount > 0 && !IsPresenting", decide, StringComparison.Ordinal);
 
         Assert.Single(Regex.Matches(code, @"PropertyBar\.Visibility\s*="));
-        Assert.Contains("UpdatePropertyBarVisibility();", Body(code, "private void UpdateToolRail()"), StringComparison.Ordinal);
+        string rail = Body(code, "private void UpdateToolRail()");
+        Assert.Contains("_propertyBarWanted = sections.Bar;", rail, StringComparison.Ordinal);
+        Assert.True(
+            rail.IndexOf("_propertyBarWanted = sections.Bar;", StringComparison.Ordinal)
+                < rail.IndexOf("UpdatePropertyBarVisibility();", StringComparison.Ordinal),
+            "the bar is decided before what it has to show is known");
         Assert.Contains("UpdatePropertyBarVisibility();", Body(code, "public void SetPresenting("), StringComparison.Ordinal);
         Assert.Contains("UpdatePropertyBarVisibility();", Body(code, "private void UpdateChromeForDocument()"), StringComparison.Ordinal);
     }
@@ -199,11 +206,33 @@ public class DockedChromeTests
             Assert.Contains("BorderThickness=\"0,0,1,0\"", tag, StringComparison.Ordinal);
         }
 
-        // Docked on the right, the pages panel's divider moves to its left edge.
+        // Docked on the right, every divider moves to the edge facing the document.
         string dock = Body(Code(), "private void DockRail(");
-        Assert.Contains("ThumbnailPanel.BorderThickness = right ? new Thickness(1, 0, 0, 0) : new Thickness(0, 0, 1, 0);",
+        Assert.Contains("var divider = right ? new Thickness(1, 0, 0, 0) : new Thickness(0, 0, 1, 0);",
             dock, StringComparison.Ordinal);
+        foreach (string name in new[] { "ToolRail", "ThumbnailPanel", "BookmarkPanel" })
+        {
+            Assert.Contains($"{name}.BorderThickness = divider;", dock, StringComparison.Ordinal);
+        }
         Assert.DoesNotContain("ThumbnailPanel.Margin", dock, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_rail_docked_right_does_not_share_a_column_with_the_panels()
+    {
+        // It used to: the rail and the pages panel both went to column 3, and
+        // the panel was drawn over the rail.
+        string xaml = Xaml();
+        int columns = xaml.IndexOf("<Grid.ColumnDefinitions>", xaml.IndexOf("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal), StringComparison.Ordinal);
+        string definitions = xaml[columns..xaml.IndexOf("</Grid.ColumnDefinitions>", columns, StringComparison.Ordinal)];
+        Assert.Equal(
+            new[] { "Auto", "Auto", "*", "Auto", "Auto" },
+            Regex.Matches(definitions, @"<ColumnDefinition (?:x:Name=""\w+"" )?Width=""([^""]+)"" />").Select(m => m.Groups[1].Value));
+
+        string dock = Body(Code(), "private void DockRail(");
+        Assert.Contains("Grid.SetColumn(ToolRail, right ? 4 : 0);", dock, StringComparison.Ordinal);
+        Assert.Contains("Grid.SetColumn(ThumbnailPanel, right ? 3 : 1);", dock, StringComparison.Ordinal);
+        Assert.Contains("Grid.SetColumn(BookmarkPanel, right ? 3 : 1);", dock, StringComparison.Ordinal);
     }
 
     [Fact]

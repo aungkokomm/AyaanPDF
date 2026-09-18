@@ -25,6 +25,7 @@ public readonly record struct PropertyBarState(
 /// setting it does not compile.
 /// </summary>
 public readonly record struct PropertyBarSections(
+    bool Bar,
     bool Row2,
     bool Color,
     bool Width,
@@ -106,7 +107,13 @@ public static class PropertyBarLayout
         bool row2 = s.ToolOptions.HasFlag(ToolOptions.FontSize) || s.HasSelectedTextBox
                  || textStyle || opacity || stamp || align || effects;
 
+        // A bar with everything collapsed is an empty row taking the page's
+        // space, so the whole thing goes when the tool offers nothing and no
+        // selection-driven section is showing.
+        bool bar = s.ToolOptions != ToolOptions.None || s.HasMultiSelection;
+
         return new PropertyBarSections(
+            Bar: bar,
             Row2: row2,
             Color: color,
             Width: width,

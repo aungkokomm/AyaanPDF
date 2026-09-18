@@ -163,10 +163,16 @@
             layout engine already knows will eventually disagree with it.
             Giving the panel a column means overlap is not expressible.
         -->
+        <!--
+            Rail | panels | document | panels | rail. The rail and the side
+            panels sit on the left or, dragged across, on the right, and each
+            side has a column for both so they never share one.
+        -->
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto" />
             <ColumnDefinition x:Name="ThumbnailColumn" Width="Auto" />
             <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
             <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
@@ -1898,11 +1904,11 @@
             Which sections appear is decided by the tool's ToolOptions, so a
             tool declares what it offers in one record rather than here.
 
-            Docked in its own row above the rulers. It floated over the top of
-            the page, covering what was there, and it appeared and vanished as
-            tools changed. Now it stays up for every tool while a document is
-            open, one showing only the tool's name, at a fixed height, so
-            choosing a tool never moves the page.
+            Docked in its own row above the rulers; it used to float over the
+            top of the page and cover what was there. The row is taken only
+            while the bar has something to show, at one fixed height for every
+            tool. For a tool with no options it is collapsed and the page gets
+            the space.
         -->
         <Border x:Name="PropertyBar" Grid.Column="2" Visibility="Collapsed"
                 MinHeight="44" Padding="8,4"
@@ -3384,7 +3390,7 @@
             View > Status bar hides it (ShowStatusBar). Full screen shows it
             regardless, because there it is the only chrome there is.
         -->
-        <Border x:Name="StatusBar" Grid.Row="2" Grid.ColumnSpan="4"
+        <Border x:Name="StatusBar" Grid.Row="2" Grid.ColumnSpan="5"
                 VerticalAlignment="Bottom" MinHeight="32" Padding="8,2"
                 Background="{ThemeResource LayerFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"

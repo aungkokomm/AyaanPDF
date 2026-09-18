@@ -2004,13 +2004,17 @@ public sealed partial class MainPage : Page
             ? Visibility.Visible
             : Visibility.Collapsed;
 
+    /// <summary>Whether the armed tool or the selection has anything for the
+    /// property bar to show. Set by UpdateToolRail.</summary>
+    private bool _propertyBarWanted;
+
     /// <summary>
     /// The one place that decides whether the tool options row is on screen.
-    /// It stays up for every tool while a document is open, even a tool with
-    /// no options, so choosing a tool never moves the page.
+    /// Only while it has something to show: an empty row with just the tool's
+    /// name took the page's space for nothing.
     /// </summary>
     private void UpdatePropertyBarVisibility() =>
-        PropertyBar.Visibility = ViewModel.PageCount > 0 && !IsPresenting
+        PropertyBar.Visibility = _propertyBarWanted && ViewModel.PageCount > 0 && !IsPresenting
             ? Visibility.Visible
             : Visibility.Collapsed;
 
@@ -5132,6 +5136,7 @@ public sealed partial class MainPage : Page
         EffectsSection.Visibility = Show(sections.Effects);
         if (sections.Effects) { SyncDropShadow(); SyncGlow(); }
         PropertyBarRow2.Visibility = Show(sections.Row2);
+        _propertyBarWanted = sections.Bar;
         UpdatePropertyBarVisibility();
         FitPropertyBar();
 
@@ -6543,18 +6548,24 @@ public sealed partial class MainPage : Page
         e.Handled = true;
     }
 
-    /// <summary>Moves the rail to the left (column 0) or right (column 3) edge.</summary>
+    /// <summary>Moves the rail to the left (column 0) or right (column 4) edge.</summary>
     private void DockRail(bool right)
     {
-        Grid.SetColumn(ToolRail, right ? 3 : 0);
+        Grid.SetColumn(ToolRail, right ? 4 : 0);
 
-        // The pages panel belongs beside the rail, not stranded on the far
-        // side of the document from it.
+        // The panels belong beside the rail, not stranded on the far side of
+        // the document from it. Each side has its own panel column between
+        // the rail and the document: sharing the rail's column put the pages
+        // panel on top of the rail.
         Grid.SetColumn(ThumbnailPanel, right ? 3 : 1);
+        Grid.SetColumn(BookmarkPanel, right ? 3 : 1);
 
-        // Flush against the rail either way, with the divider on the edge that
-        // faces the document.
-        ThumbnailPanel.BorderThickness = right ? new Thickness(1, 0, 0, 0) : new Thickness(0, 0, 1, 0);
+        // Flush against each other either way, with the divider on the edge
+        // that faces the document.
+        var divider = right ? new Thickness(1, 0, 0, 0) : new Thickness(0, 0, 1, 0);
+        ToolRail.BorderThickness = divider;
+        ThumbnailPanel.BorderThickness = divider;
+        BookmarkPanel.BorderThickness = divider;
 
         // Keep the resize grip on the edge that faces the document, and flip the
         // drag direction to match, so dragging inward always widens.
