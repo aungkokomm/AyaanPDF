@@ -133,6 +133,94 @@ public class DocumentPropertiesTests
         Assert.False(pairs.ContainsKey("Keywords"));
     }
 
+    // ---------------- Removing personal info ----------------
+
+    [Fact]
+    public void removal_is_asked_for_only_when_chosen()
+    {
+        var off = NulFields.Pairs(DocumentInfoStamp.Pairs(null, "p", "c", DateTimeOffset.Now));
+        Assert.False(off.ContainsKey("RemovePersonal"));
+
+        var on = NulFields.Pairs(DocumentInfoStamp.Pairs(null, "p", "c", DateTimeOffset.Now, removePersonal: true));
+        Assert.Equal("1", on["RemovePersonal"]);
+        Assert.Equal("p", on["Producer"]);
+    }
+
+    private static PersonalInfo Found(params string[] fields) => PersonalInfo.FromBuffer(NulFields.Join(fields));
+
+    [Fact]
+    public void what_a_file_carries_is_listed_in_plain_words()
+    {
+        var found = Found(
+            "Author", "Aung Ko Ko", "Creator", "Microsoft Word for Microsoft 365",
+            "Custom", "Company: Acme", "XmpAuthor", "Aung Ko Ko", "XmpTool", "Microsoft Word for Microsoft 365",
+            "History", "12", "FilePath", @"C:\Users\aung\report.docx",
+            "CommentAuthor", "Steve", "CommentAuthor", "Aung", "Comments", "5", "ObjectMetadata", "3");
+
+        Assert.Equal(
+            new[]
+            {
+                "Author: Aung Ko Ko",
+                "Made with: Microsoft Word for Microsoft 365",
+                "Company: Acme (custom property)",
+                "Editing history: 12 steps",
+                @"Original file: C:\Users\aung\report.docx",
+                "Comment authors: Steve, Aung (5 comments)",
+                "Hidden details on 3 pages or pictures",
+            },
+            found.Lines("An Unlikely Prisoner"));
+    }
+
+    [Fact]
+    public void a_clean_file_lists_nothing_and_a_title_that_names_a_file_is_mentioned()
+    {
+        Assert.Empty(Found().Lines("Kept title"));
+
+        var lines = Found().Lines("Microsoft Word - BGO0508_01 Invoice.docx");
+        Assert.Single(lines);
+        Assert.StartsWith("The title names the original file:", lines[0], StringComparison.Ordinal);
+
+        Assert.True(PersonalInfo.TitleNamesAFile("salaries.xlsx"));
+        Assert.False(PersonalInfo.TitleNamesAFile("An Unlikely Prisoner"));
+    }
+
+    [Fact]
+    public void removal_waits_for_a_save_and_is_forgotten_with_the_document()
+    {
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+
+        string set = Body(vm, "public void SetRemovePersonalInfo(bool on)");
+        Assert.Contains("IsDirty = true;", set, StringComparison.Ordinal);
+        Assert.DoesNotContain("write_document_info", set, StringComparison.Ordinal);
+
+        string open = vm[vm.IndexOf("public DocumentOpenOutcome OpenDocument(", StringComparison.Ordinal)..];
+        open = open[..open.IndexOf("return DocumentOpenOutcome.Opened;", StringComparison.Ordinal)];
+        Assert.Contains("_removePersonal = false;", open, StringComparison.Ordinal);
+
+        // A failed removal is said loudly: a file believed clean gets shared.
+        string write = Body(vm, "private void WriteDocumentInfo(string path)");
+        Assert.Contains("personal info could NOT be removed", write, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_dialog_offers_removal_with_what_it_found_and_clears_the_author()
+    {
+        string code = Read("PdfEditorApp", "MainPage.xaml.cs");
+        string dialog = Body(code, "private async void DocumentProperties_Click(");
+
+        Assert.Contains("Content = \"Remove personal info when saving\"", dialog, StringComparison.Ordinal);
+        Assert.Contains("IsChecked = ViewModel.WillRemovePersonalInfo", dialog, StringComparison.Ordinal);
+        Assert.Contains("IsEnabled = !locked", dialog, StringComparison.Ordinal);
+        Assert.Contains("personalCheck ??= ViewModel.FindPersonalInfoAsync();", dialog, StringComparison.Ordinal);
+        Assert.Contains("author.IsEnabled = !on;", dialog, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.SetRemovePersonalInfo(removePersonal.IsChecked == true);", dialog, StringComparison.Ordinal);
+
+        string interop = Read("PdfEditorApp", "Interop", "RenderCoreNative.cs");
+        Assert.Contains("public static extern ByteBuffer find_personal_info(", interop, StringComparison.Ordinal);
+        Assert.Contains("pub unsafe extern \"C\" fn find_personal_info(path: *const c_char) -> ByteBuffer",
+            Read("render_core", "src", "docinfo.rs"), StringComparison.Ordinal);
+    }
+
     [Fact]
     public void a_nul_inside_a_value_cannot_shift_the_fields_after_it()
     {
@@ -322,7 +410,7 @@ public class DocumentPropertiesTests
             $"gradients {gradients}, stamp {stamp}, swap {swap}");
 
         string write = Body(vm, "private void WriteDocumentInfo(string path)");
-        Assert.Contains("DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now)", write, StringComparison.Ordinal);
+        Assert.Contains("DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now, _removePersonal)", write, StringComparison.Ordinal);
         Assert.Contains("RenderCoreNative.write_document_info(path, data, (nuint)data.Length)", write, StringComparison.Ordinal);
     }
 

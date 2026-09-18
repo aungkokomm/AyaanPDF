@@ -99,7 +99,7 @@ public static class DocumentInfoStamp
     /// Info and the XMP form, and the creator a document PDFium made should
     /// carry instead of "PDFium".
     /// </summary>
-    public static byte[] Pairs(InfoEdits? edits, string producer, string creator, DateTimeOffset now)
+    public static byte[] Pairs(InfoEdits? edits, string producer, string creator, DateTimeOffset now, bool removePersonal = false)
     {
         var fields = new List<string>();
         void Add(string key, string? value)
@@ -109,6 +109,13 @@ public static class DocumentInfoStamp
                 fields.Add(key);
                 fields.Add(value);
             }
+        }
+
+        // Makes the core rewrite the file whole rather than append to it, so
+        // what is removed is not left behind in the earlier bytes.
+        if (removePersonal)
+        {
+            Add("RemovePersonal", "1");
         }
 
         Add("Title", edits?.Title);
@@ -343,6 +350,109 @@ public static class DocumentFacts
             _ when missing == fonts.Count => fonts.Count == 1 ? $"{count}, not embedded" : $"{count}, none embedded",
             _ => $"{count}, {missing} not embedded",
         };
+    }
+}
+
+/// <summary>
+/// The personal info a file carries, as <c>find_personal_info</c> reports it:
+/// key/value pairs in order, a key repeating once per value.
+/// </summary>
+public sealed record PersonalInfo(IReadOnlyList<(string Key, string Value)> Found)
+{
+    public static PersonalInfo FromBuffer(byte[] buffer)
+    {
+        var fields = NulFields.Parse(buffer);
+        var found = new List<(string, string)>();
+        for (int i = 0; i + 1 < fields.Count; i += 2)
+        {
+            found.Add((fields[i], fields[i + 1]));
+        }
+        return new PersonalInfo(found);
+    }
+
+    private IEnumerable<string> All(string key) =>
+        Found.Where(f => f.Key == key).Select(f => f.Value.Trim()).Where(v => v.Length > 0);
+
+    private int Count(string key) =>
+        int.TryParse(All(key).FirstOrDefault(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? n : 0;
+
+    /// <summary>
+    /// What the dialog lists under "Remove personal info", one line each, or
+    /// nothing when the file is clean. <paramref name="title"/> is checked too:
+    /// it is kept, being the document's own, but a title like "Microsoft Word -
+    /// salaries.docx" gives the source file away and deserves a mention.
+    /// </summary>
+    public List<string> Lines(string title)
+    {
+        var lines = new List<string>();
+
+        var authors = All("Author").Concat(All("XmpAuthor")).Distinct(StringComparer.Ordinal).ToList();
+        if (authors.Count > 0)
+        {
+            lines.Add($"Author: {string.Join(", ", authors)}");
+        }
+
+        var tools = All("Creator").Concat(All("XmpTool")).Distinct(StringComparer.Ordinal).ToList();
+        if (tools.Count > 0)
+        {
+            lines.Add($"Made with: {string.Join("; ", tools)}");
+        }
+
+        foreach (var custom in All("Custom").Distinct(StringComparer.Ordinal).Take(6))
+        {
+            int colon = custom.IndexOf(": ", StringComparison.Ordinal);
+            lines.Add(colon > 0
+                ? $"{custom[..colon]}: {custom[(colon + 2)..]} (custom property)"
+                : $"{custom} (custom property)");
+        }
+
+        int steps = Count("History");
+        if (steps > 0)
+        {
+            lines.Add(steps == 1 ? "Editing history: 1 step" : $"Editing history: {steps} steps");
+        }
+
+        foreach (var path in All("FilePath").Distinct(StringComparer.OrdinalIgnoreCase).Take(3))
+        {
+            lines.Add($"Original file: {path}");
+        }
+
+        var commenters = All("CommentAuthor").ToList();
+        int comments = Count("Comments");
+        if (commenters.Count > 0)
+        {
+            string count = comments == 1 ? "1 comment" : $"{comments} comments";
+            lines.Add($"Comment authors: {string.Join(", ", commenters.Take(5))}{(commenters.Count > 5 ? " and others" : string.Empty)} ({count})");
+        }
+
+        int attached = Count("ObjectMetadata");
+        if (attached > 0)
+        {
+            lines.Add(attached == 1
+                ? "Hidden details on 1 page or picture"
+                : $"Hidden details on {attached} pages or pictures");
+        }
+
+        if (TitleNamesAFile(title))
+        {
+            lines.Add($"The title names the original file: “{title.Trim()}”. It is kept; change it above if you'd rather it didn't.");
+        }
+
+        return lines;
+    }
+
+    private static readonly string[] ProgramPrefixes =
+        ["Microsoft Word - ", "Microsoft Excel - ", "Microsoft PowerPoint - "];
+
+    private static readonly string[] DocumentExtensions =
+        [".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp", ".rtf", ".txt", ".pages"];
+
+    /// <summary>A title a program made from the source file's name.</summary>
+    public static bool TitleNamesAFile(string title)
+    {
+        string t = title.Trim();
+        return ProgramPrefixes.Any(p => t.StartsWith(p, StringComparison.OrdinalIgnoreCase))
+            || DocumentExtensions.Any(e => t.EndsWith(e, StringComparison.OrdinalIgnoreCase));
     }
 }
 

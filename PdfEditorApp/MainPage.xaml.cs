@@ -6568,12 +6568,115 @@ public sealed partial class MainPage : Page
             IsEnabled = path is not null,
         };
 
+        // Remove personal info. Waits for the save like every other change
+        // here, and says what it found in THIS file, so ticking it is a
+        // decision about something visible rather than a leap of faith.
+        var removePersonal = new CheckBox
+        {
+            Content = "Remove personal info when saving",
+            IsChecked = ViewModel.WillRemovePersonalInfo,
+            IsEnabled = !locked,
+        };
+        var personalDetails = new StackPanel { Spacing = 2, Margin = new Thickness(28, 0, 0, 0), Visibility = Visibility.Collapsed };
+        string authorBefore = author.Text;
+
+        // One check per visit, however often the box is ticked, and only the
+        // latest tick draws its result.
+        Task<PersonalInfo?>? personalCheck = null;
+        int personalShown = 0;
+
+        async Task ShowPersonalAsync()
+        {
+            int mine = ++personalShown;
+            personalDetails.Visibility = Visibility.Visible;
+            personalDetails.Children.Clear();
+            personalDetails.Children.Add(Text(
+                "The file is rewritten whole, so earlier versions saved inside it go too. "
+                + "The title, subject, keywords and dates stay.", secondary));
+
+            personalCheck ??= ViewModel.FindPersonalInfoAsync();
+            StackPanel? checking = null;
+            if (!personalCheck.IsCompleted)
+            {
+                checking = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+                checking.Children.Add(new ProgressRing { IsActive = true, Width = 16, Height = 16 });
+                checking.Children.Add(Text("Checking the file", secondary));
+                personalDetails.Children.Add(checking);
+            }
+
+            var personalFound = await personalCheck;
+            if (mine != personalShown || removePersonal.IsChecked != true)
+            {
+                return;
+            }
+            if (checking is not null)
+            {
+                personalDetails.Children.Remove(checking);
+            }
+
+            var lines = personalFound?.Lines(title.Text) ?? [];
+            if (personalFound is null)
+            {
+                personalDetails.Children.Add(Text("Couldn't check the file. Anything personal will still be removed."));
+            }
+            else if (lines.Count == 0)
+            {
+                personalDetails.Children.Add(Text("Nothing personal was found in this file."));
+            }
+            else
+            {
+                personalDetails.Children.Add(Text("Found and to be removed:"));
+                foreach (string line in lines)
+                {
+                    personalDetails.Children.Add(Text("• " + line));
+                }
+            }
+        }
+
+        void ApplyPersonalChoice()
+        {
+            bool on = removePersonal.IsChecked == true;
+
+            // The author is the first thing that goes, so the field shows it gone.
+            if (on)
+            {
+                authorBefore = author.Text;
+                author.Text = string.Empty;
+            }
+            else
+            {
+                author.Text = authorBefore;
+            }
+            author.IsEnabled = !on;
+
+            if (on)
+            {
+                _ = ShowPersonalAsync();
+            }
+            else
+            {
+                personalDetails.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        removePersonal.Checked += (_, _) => ApplyPersonalChoice();
+        removePersonal.Unchecked += (_, _) => ApplyPersonalChoice();
+        if (removePersonal.IsChecked == true)
+        {
+            ApplyPersonalChoice();
+        }
+
+        var personal = new StackPanel { Spacing = 4 };
+        personal.Children.Add(removePersonal);
+        personal.Children.Add(personalDetails);
+
         var panel = new StackPanel { Spacing = 16, MinWidth = 460 };
         if (locked)
         {
             panel.Children.Add(Text("This file is encrypted, so its title, author, subject and keywords can't be changed.", secondary));
         }
         panel.Children.Add(editable);
+        panel.Children.Add(personal);
         panel.Children.Add(new Rectangle
         {
             Height = 1,
@@ -6596,6 +6699,7 @@ public sealed partial class MainPage : Page
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
             ViewModel.ApplyInfoEdits(InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text));
+            ViewModel.SetRemovePersonalInfo(removePersonal.IsChecked == true);
 
             if (path is not null)
             {

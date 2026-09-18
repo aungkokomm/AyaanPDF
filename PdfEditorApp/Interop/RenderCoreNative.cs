@@ -1021,6 +1021,16 @@ internal static partial class RenderCoreNative
         [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
     /// <summary>
+    /// What personal info the PDF at <paramref name="path"/> carries, as
+    /// NUL-separated pairs whose keys can repeat (see PersonalInfo). Parses
+    /// the whole file, so call it off the UI thread. Unsupported for an
+    /// encrypted file. Release with <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer find_personal_info(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>
     /// Writes every gradient-filled shape's paint into the file as a real PDF
     /// shading, which is the second thing PDFium cannot create.
     ///

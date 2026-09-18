@@ -1362,6 +1362,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // being closed. A save that reopens its file finds them in it.
         _infoEdits = null;
         _fileTitle = null;
+        _removePersonal = false;
 
         if (_documentHandle == 0)
         {
@@ -2449,6 +2450,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     private string? _fileTitle;
 
     /// <summary>
+    /// Whether the next save removes personal info. Kept, like
+    /// <see cref="_infoEdits"/>, until the document is reopened: after a Save
+    /// As that does not reopen, the open document still holds the author, and
+    /// every later save would write it out again.
+    /// </summary>
+    private bool _removePersonal;
+
+    public bool WillRemovePersonalInfo => _removePersonal;
+
+    /// <summary>
+    /// Asks the next save to remove personal info, or withdraws the request.
+    /// Like any other edit it waits for a save and marks the document dirty.
+    /// </summary>
+    public void SetRemovePersonalInfo(bool on)
+    {
+        if (_removePersonal == on || _documentHandle == 0)
+        {
+            return;
+        }
+        _removePersonal = on;
+        if (on)
+        {
+            IsDirty = true;
+        }
+    }
+
+    /// <summary>
     /// What the open document says about itself, with any edits waiting to be
     /// written laid over it. Null with no document.
     /// </summary>
@@ -2504,15 +2532,26 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private void WriteDocumentInfo(string path)
     {
-        byte[] data = DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now);
+        byte[] data = DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now, _removePersonal);
         int status = RenderCoreNative.write_document_info(path, data, (nuint)data.Length);
         if (status == RenderStatus.OkPdfium)
         {
+            if (_removePersonal)
+            {
+                Status = "Saved. Personal info removed.";
+            }
             return;
         }
 
         Diag.Log($"write_document_info: status {status}");
-        if (_infoEdits is { HasChanges: true })
+
+        // Said plainly when removal was asked for: a file believed clean and
+        // shared is the one failure here that matters.
+        if (_removePersonal)
+        {
+            Status = "Saved, but personal info could NOT be removed: the file is encrypted or could not be read.";
+        }
+        else if (_infoEdits is { HasChanges: true })
         {
             Status = status == RenderStatus.Unsupported
                 ? "Saved, but the properties could not be written: the file is encrypted or could not be read."
@@ -2520,12 +2559,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>The fonts the document uses. Null when they could not be read.</summary>
+    public Task<List<FontFact>?> ListFontsAsync() =>
+        ReadSavedFileAsync(RenderCoreNative.list_document_fonts, DocumentFacts.Fonts);
+
+    /// <summary>What personal info the document carries. Null when it could not be read.</summary>
+    public Task<PersonalInfo?> FindPersonalInfoAsync() =>
+        ReadSavedFileAsync(RenderCoreNative.find_personal_info, PersonalInfo.FromBuffer);
+
     /// <summary>
-    /// The fonts the document uses, read off the file on disk when it matches
-    /// what is open, or off a copy written for the purpose when it does not.
-    /// Null when they could not be read.
+    /// Asks the core a question about the document as a FILE: the file on disk
+    /// when it matches what is open, or a copy written for the purpose when it
+    /// does not. Off the UI thread, because the answer parses the whole file.
     /// </summary>
-    public async Task<List<FontFact>?> ListFontsAsync()
+    private async Task<T?> ReadSavedFileAsync<T>(Func<string, ByteBuffer> ask, Func<byte[], T> parse) where T : class
     {
         ulong handle = _documentHandle;
         if (handle == 0)
@@ -2549,7 +2596,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             return await Task.Run(() =>
             {
-                var buffer = RenderCoreNative.list_document_fonts(source);
+                var buffer = ask(source);
                 try
                 {
                     if (buffer.Status != RenderStatus.OkPdfium)
@@ -2561,7 +2608,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
                     {
                         Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
                     }
-                    return DocumentFacts.Fonts(bytes);
+                    return parse(bytes);
                 }
                 finally
                 {
