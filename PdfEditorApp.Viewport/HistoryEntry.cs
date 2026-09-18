@@ -40,6 +40,14 @@ public enum HistoryScope
     /// does not hold, so that stays a <see cref="Document"/> snapshot.
     /// </summary>
     AnnotationBounds,
+
+    /// <summary>
+    /// A change made in Document properties: what a save will write into the
+    /// file's properties, language and opening settings. Carries the pending
+    /// state before and after, so like <see cref="Records"/> it describes its
+    /// own reversal and costs a few strings rather than a document.
+    /// </summary>
+    Properties,
 }
 
 /// <summary>
@@ -102,6 +110,12 @@ public sealed class HistoryEntry
     /// undo as ONE step, not as one step per object.
     /// </summary>
     public IReadOnlyList<EditRecord> Records { get; init; } = [];
+
+    /// <summary>Set for <see cref="HistoryScope.Properties"/>: the pending properties before the change.</summary>
+    public DocumentPropertiesState? PropertiesBefore { get; init; }
+
+    /// <summary>Set for <see cref="HistoryScope.Properties"/>: the pending properties after the change.</summary>
+    public DocumentPropertiesState? PropertiesAfter { get; init; }
 
     /// <summary>
     /// A document snapshot paired with records, for actions that include a

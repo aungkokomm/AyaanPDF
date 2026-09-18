@@ -189,17 +189,19 @@ public class DocumentPropertiesTests
     {
         string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
 
-        string set = Body(vm, "public void SetRemovePersonalInfo(bool on)");
-        Assert.Contains("IsDirty = true;", set, StringComparison.Ordinal);
+        string set = Body(vm, "private void SetPendingProperties(DocumentPropertiesState state)");
+        Assert.Contains("_removePersonal = state.RemovePersonal;", set, StringComparison.Ordinal);
+        Assert.Contains("_removeDates = state.RemoveDates;", set, StringComparison.Ordinal);
         Assert.DoesNotContain("write_document_info", set, StringComparison.Ordinal);
 
         string open = vm[vm.IndexOf("public DocumentOpenOutcome OpenDocument(", StringComparison.Ordinal)..];
         open = open[..open.IndexOf("return DocumentOpenOutcome.Opened;", StringComparison.Ordinal)];
         Assert.Contains("_removePersonal = false;", open, StringComparison.Ordinal);
+        Assert.Contains("_removeDates = false;", open, StringComparison.Ordinal);
 
         // A failed removal is said loudly: a file believed clean gets shared.
-        string write = Body(vm, "private void WriteDocumentInfo(string path)");
-        Assert.Contains("personal info could NOT be removed", write, StringComparison.Ordinal);
+        string report = Body(vm, "private void ReportDocumentInfo(SavePlan plan)");
+        Assert.Contains("personal info could NOT be removed", report, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -213,7 +215,12 @@ public class DocumentPropertiesTests
         Assert.Contains("IsEnabled = !locked", dialog, StringComparison.Ordinal);
         Assert.Contains("personalCheck ??= ViewModel.FindPersonalInfoAsync();", dialog, StringComparison.Ordinal);
         Assert.Contains("author.IsEnabled = !on;", dialog, StringComparison.Ordinal);
-        Assert.Contains("ViewModel.SetRemovePersonalInfo(removePersonal.IsChecked == true);", dialog, StringComparison.Ordinal);
+        Assert.Contains("removePersonal.IsChecked == true,", dialog, StringComparison.Ordinal);
+
+        // The dates are a second choice under it, shown only with it.
+        Assert.Contains("Content = \"Also remove the created and modified dates\"", dialog, StringComparison.Ordinal);
+        Assert.Contains("IsChecked = ViewModel.WillRemoveDates", dialog, StringComparison.Ordinal);
+        Assert.Contains("removeDates.Visibility = on ? Visibility.Visible : Visibility.Collapsed;", dialog, StringComparison.Ordinal);
 
         string interop = Read("PdfEditorApp", "Interop", "RenderCoreNative.cs");
         Assert.Contains("public static extern ByteBuffer find_personal_info(", interop, StringComparison.Ordinal);
@@ -401,17 +408,20 @@ public class DocumentPropertiesTests
         // On the temporary copy, so an in-place save replaces the original
         // once, with everything already in it.
         string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
-        string save = Body(vm, "public bool SaveDocumentAs(string path, bool flatten)");
+        string write = Body(vm, "private static void WriteSave(SavePlan plan, IProgress<string>? progress)");
 
-        int gradients = save.IndexOf("WriteGradientFills(writePath);", StringComparison.Ordinal);
-        int stamp = save.IndexOf("WriteDocumentInfo(writePath);", StringComparison.Ordinal);
-        int swap = save.IndexOf("File.Move(writePath, path, overwrite: true);", StringComparison.Ordinal);
-        Assert.True(gradients > 0 && stamp > gradients && swap > stamp,
-            $"gradients {gradients}, stamp {stamp}, swap {swap}");
+        int saved = write.IndexOf("RenderCoreNative.save_document(plan.Handle, plan.WritePath)", StringComparison.Ordinal);
+        int gradients = write.IndexOf("WriteGradientFills(plan.WritePath);", StringComparison.Ordinal);
+        int stamp = write.IndexOf("RenderCoreNative.write_document_info(plan.WritePath, plan.InfoPairs, (nuint)plan.InfoPairs.Length)", StringComparison.Ordinal);
+        Assert.True(saved > 0 && gradients > saved && stamp > gradients, $"save {saved}, gradients {gradients}, stamp {stamp}");
 
-        string write = Body(vm, "private void WriteDocumentInfo(string path)");
-        Assert.Contains("DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now, _removePersonal)", write, StringComparison.Ordinal);
-        Assert.Contains("RenderCoreNative.write_document_info(path, data, (nuint)data.Length)", write, StringComparison.Ordinal);
+        // The original is replaced only after, back on the UI thread.
+        Assert.Contains("File.Move(writePath, path, overwrite: true);", Body(vm, "private bool FinishSave(SavePlan plan)"), StringComparison.Ordinal);
+
+        // What the stamp says is taken before the write, with everything pending.
+        string begin = Body(vm, "private SavePlan? BeginSave(string path, bool flatten)");
+        Assert.Contains("_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now,", begin, StringComparison.Ordinal);
+        Assert.Contains("_removePersonal, _removeDates, _catalogEdits)", begin, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -432,14 +442,16 @@ public class DocumentPropertiesTests
     {
         string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
 
-        string apply = Body(vm, "public void ApplyInfoEdits(InfoEdits edits)");
+        string apply = Body(vm, "public void ApplyDocumentProperties(InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates)");
         Assert.Contains("IsDirty = true;", apply, StringComparison.Ordinal);
         Assert.DoesNotContain("write_document_info", apply, StringComparison.Ordinal);
 
         string open = vm[vm.IndexOf("public DocumentOpenOutcome OpenDocument(", StringComparison.Ordinal)..];
         open = open[..open.IndexOf("return DocumentOpenOutcome.Opened;", StringComparison.Ordinal)];
         Assert.Contains("_infoEdits = null;", open, StringComparison.Ordinal);
+        Assert.Contains("_catalogEdits = null;", open, StringComparison.Ordinal);
         Assert.Contains("_fileTitle = ReadDocumentInfo()?.Title;", open, StringComparison.Ordinal);
+        Assert.Contains("_catalogRead = LoadCatalogAsync(path, ++_catalogGeneration);", open, StringComparison.Ordinal);
 
         Assert.Contains(".With(_infoEdits)", Body(vm, "public DocumentInfo? ReadDocumentInfo()"), StringComparison.Ordinal);
     }
@@ -452,17 +464,31 @@ public class DocumentPropertiesTests
 
         Assert.Contains("bool locked = info.IsEncrypted;", dialog, StringComparison.Ordinal);
         Assert.Contains("IsReadOnly = locked", dialog, StringComparison.Ordinal);
-        Assert.Contains("ViewModel.ApplyInfoEdits(InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text));", dialog, StringComparison.Ordinal);
+        Assert.Contains("ViewModel.ApplyDocumentProperties(", dialog, StringComparison.Ordinal);
+        Assert.Contains("InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text),", dialog, StringComparison.Ordinal);
         Assert.DoesNotContain("write_document_info", dialog, StringComparison.Ordinal);
-        Assert.Contains("TabTitles.Set(s.TitleInTabPaths, path, on)", dialog, StringComparison.Ordinal);
+        Assert.Contains("TabTitles.Set(s.TitleInTabPaths, path, keepHere)", dialog, StringComparison.Ordinal);
         Assert.Contains("ViewModel.ListFontsAsync()", dialog, StringComparison.Ordinal);
+
+        // The catalog of an encrypted file cannot be written either.
+        Assert.Contains("var box = new ComboBox { IsEnabled = !locked, MinWidth = 240 };", dialog, StringComparison.Ordinal);
+        Assert.Contains("if (!locked)", dialog, StringComparison.Ordinal);
     }
 
     [Fact]
     public void the_tab_shows_the_title_only_where_asked_and_only_when_there_is_one()
     {
         string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
-        Assert.Contains("TitleInTab && (_infoEdits?.Title ?? _fileTitle) is { Length: > 0 } title ? title : DocumentTitle;", vm, StringComparison.Ordinal);
+        string tab = Body(vm, "private string TabName");
+        Assert.Contains("string? title = (_infoEdits?.Title ?? _fileTitle)?.Trim();", tab, StringComparison.Ordinal);
+        Assert.Contains("if (TitleInTab)", tab, StringComparison.Ordinal);
+
+        // The file's own /DisplayDocTitle, but not for a program's leftover.
+        Assert.Contains("bool fileAsks = Catalog?.ShowTitle ?? false;", tab, StringComparison.Ordinal);
+        Assert.Contains("return fileAsks && !PersonalInfo.TitleNamesAFile(title) ? title : DocumentTitle;", tab, StringComparison.Ordinal);
+
+        // The window says what the tab says.
+        Assert.Contains("{TabName} - Ayaan PDF", vm, StringComparison.Ordinal);
 
         string code = Read("PdfEditorApp", "MainPage.xaml.cs");
         Assert.Contains("ViewModel.TitleInTab = TabTitles.IsOn(SettingsStore.Current.TitleInTabPaths, ViewModel.DocumentPath);", code, StringComparison.Ordinal);
@@ -480,5 +506,250 @@ public class DocumentPropertiesTests
         Assert.Contains("pub extern \"C\" fn get_document_properties(doc_handle: u64) -> ByteBuffer", core, StringComparison.Ordinal);
         Assert.Contains("pub unsafe extern \"C\" fn write_document_info(path: *const c_char, data: *const u8, len: usize) -> i32", core, StringComparison.Ordinal);
         Assert.Contains("pub unsafe extern \"C\" fn list_document_fonts(path: *const c_char) -> ByteBuffer", core, StringComparison.Ordinal);
+
+        Assert.Contains("public static extern ByteBuffer read_catalog_settings(", interop, StringComparison.Ordinal);
+        Assert.Contains("public static extern int dominant_text_script(ulong docHandle);", interop, StringComparison.Ordinal);
+        Assert.Contains("pub unsafe extern \"C\" fn read_catalog_settings(path: *const c_char) -> ByteBuffer", core, StringComparison.Ordinal);
+        Assert.Contains("pub extern \"C\" fn dominant_text_script(doc_handle: u64) -> i32", core, StringComparison.Ordinal);
+    }
+
+    // ---------------- Language and opening settings ----------------
+
+    private static Dictionary<string, string> Pairs(params string[] fields) => NulFields.Pairs(NulFields.Join(fields));
+
+    [Fact]
+    public void a_catalog_is_read_from_the_cores_pairs()
+    {
+        var catalog = CatalogSettings.FromPairs(Pairs(
+            "Lang", "en-US", "PageMode", "UseOutlines", "PageLayout", "OneColumn",
+            "DisplayDocTitle", "1", "OpenPage", "0", "OpenZoom", "page"));
+        Assert.Equal("en-US", catalog.Language);
+        Assert.Equal("UseOutlines", catalog.PageMode);
+        Assert.Equal("OneColumn", catalog.PageLayout);
+        Assert.True(catalog.ShowTitle);
+        Assert.Equal(new OpenView(0, "page"), catalog.Open);
+        Assert.False(catalog.OpenActionOther);
+
+        // A script run on opening is not a page to go to.
+        var scripted = CatalogSettings.FromPairs(Pairs("OpenActionOther", "1"));
+        Assert.Null(scripted.Open);
+        Assert.True(scripted.OpenActionOther);
+        Assert.Equal(CatalogSettings.Empty, CatalogSettings.FromPairs(Pairs()));
+    }
+
+    [Fact]
+    public void catalog_edits_name_only_what_changed_and_a_script_stays_unless_the_page_is_chosen()
+    {
+        var file = new CatalogSettings("en", "UseNone", "", false, null, true);
+
+        var language = CatalogEdits.Between(file, file with { Language = "my" });
+        Assert.Equal("my", language.Language);
+        Assert.Null(language.PageMode);
+        Assert.Null(language.ShowTitle);
+        Assert.False(language.OpenChanged);
+        Assert.True(file.With(language).OpenActionOther, "a language change must not replace the file's script");
+
+        var page = CatalogEdits.Between(file, file with { Open = new OpenView(4, "width") });
+        Assert.True(page.OpenChanged);
+        Assert.False(file.With(page).OpenActionOther);
+
+        Assert.False(CatalogEdits.Between(file, file).HasChanges);
+    }
+
+    [Fact]
+    public void a_second_round_of_catalog_edits_keeps_the_first_where_it_says_nothing()
+    {
+        var first = new CatalogEdits("hi", null, "SinglePage", null, true, new OpenView(2, ""));
+        var second = new CatalogEdits(null, "UseThumbs", null, true, false, null);
+        Assert.Equal(new CatalogEdits("hi", "UseThumbs", "SinglePage", true, true, new OpenView(2, "")), first.Then(second));
+
+        var removed = first.Then(new CatalogEdits(null, null, null, null, true, null));
+        Assert.True(removed.OpenChanged);
+        Assert.Null(removed.Open);
+    }
+
+    [Fact]
+    public void removing_the_dates_stamps_none_and_the_catalog_goes_with_the_save()
+    {
+        var catalog = new CatalogEdits("my", "", null, false, true, null);
+        var pairs = NulFields.Pairs(DocumentInfoStamp.Pairs(
+            null, "p", "c", DateTimeOffset.Now, removePersonal: true, removeDates: true, catalog: catalog));
+
+        Assert.Equal("1", pairs["RemoveDates"]);
+        Assert.False(pairs.ContainsKey("ModDate"));
+        Assert.False(pairs.ContainsKey("XmpDate"));
+        Assert.Equal("my", pairs["Lang"]);
+        Assert.Equal(string.Empty, pairs["PageMode"]);
+        Assert.False(pairs.ContainsKey("PageLayout"));
+        Assert.Equal("0", pairs["DisplayDocTitle"]);
+        Assert.Equal("-1", pairs["OpenPage"]);
+
+        var kept = NulFields.Pairs(DocumentInfoStamp.Pairs(null, "p", "c", DateTimeOffset.Now, removePersonal: true));
+        Assert.True(kept.ContainsKey("ModDate"), "the dates stay unless asked");
+        Assert.False(kept.ContainsKey("Lang"));
+    }
+
+    [Fact]
+    public void the_language_list_keeps_the_files_own_and_names_it()
+    {
+        var choices = DocumentLanguages.Choices("en-US");
+        Assert.Equal((string.Empty, "Not set"), choices[0]);
+        Assert.Equal("en-US", choices[1].Tag);
+        Assert.Equal("English (United States) (en-US)", choices[1].Label);
+        Assert.Contains(choices, c => c.Tag == "my" && c.Label == "Burmese (my)");
+
+        Assert.DoesNotContain(DocumentLanguages.Choices("EN"), c => c.Tag == "EN");
+        Assert.Equal("Not set", DocumentLanguages.Describe(" "));
+        Assert.Equal("Hindi (hi)", DocumentLanguages.Describe("hi"));
+    }
+
+    [Fact]
+    public void a_language_suits_text_in_the_script_it_is_written_in()
+    {
+        // The Myanmar and Pyidaungsu files say "en" and "en-US".
+        Assert.Equal("my", DocumentLanguages.ForScript(2));
+        Assert.False(DocumentLanguages.Fits("en", 2));
+        Assert.False(DocumentLanguages.Fits("en-US", 2));
+        Assert.False(DocumentLanguages.Fits(string.Empty, 2));
+        Assert.True(DocumentLanguages.Fits("my-MM", 2));
+
+        // Marathi is written in Devanagari too, so it is not a mismatch.
+        Assert.True(DocumentLanguages.Fits("mr", 1));
+        Assert.False(DocumentLanguages.Fits("en", 1));
+
+        // Latin or unclear text suggests nothing: Kruti Dev Hindi looks Latin.
+        Assert.Null(DocumentLanguages.ForScript(0));
+        Assert.True(DocumentLanguages.Fits("en", 0));
+        Assert.True(DocumentLanguages.Fits("hi", 0));
+    }
+
+    [Fact]
+    public void opening_choices_read_as_ayaan_honours_them()
+    {
+        Assert.Equal("Bookmarks", OpenSettingsText.PanelToShow("UseOutlines"));
+        Assert.Equal("Pages", OpenSettingsText.PanelToShow("UseThumbs"));
+        Assert.Equal(string.Empty, OpenSettingsText.PanelToShow("UseNone"));
+        Assert.Equal(PageViewMode.SinglePage, OpenSettingsText.LayoutToShow("TwoPageLeft"));
+        Assert.Equal(PageViewMode.Continuous, OpenSettingsText.LayoutToShow("OneColumn"));
+        Assert.Null(OpenSettingsText.LayoutToShow(string.Empty));
+
+        Assert.Equal(1.5, OpenSettingsText.ZoomFactor("percent:150"));
+        Assert.Equal(1.0, OpenSettingsText.ZoomFactor("actual"));
+        Assert.Null(OpenSettingsText.ZoomFactor("page"));
+        Assert.Null(OpenSettingsText.ZoomFactor(string.Empty));
+
+        var zooms = OpenSettingsText.WithCurrent(OpenSettingsText.Zooms, "percent:133");
+        Assert.Equal(("percent:133", "133%"), zooms[^1]);
+        Assert.Equal(OpenSettingsText.Zooms.Length, OpenSettingsText.WithCurrent(OpenSettingsText.Zooms, "page").Count);
+    }
+
+    [Fact]
+    public void copied_details_are_one_line_each_and_leave_out_empty_values()
+    {
+        string text = DocumentFacts.AsText(new List<(string, string)>
+        {
+            ("Title", "गीता दर्शन"), ("Author", string.Empty), ("Fonts", "2 fonts, all embedded"),
+            (string.Empty, "Mangal, TrueType, embedded"),
+        });
+        Assert.Equal(
+            string.Join(Environment.NewLine, "Title: गीता दर्शन", "Fonts: 2 fonts, all embedded", "  Mangal, TrueType, embedded"),
+            text);
+    }
+
+    // ---------------- Saving in the background ----------------
+
+    [Fact]
+    public void a_save_writes_the_file_off_the_ui_thread_and_takes_no_input_meanwhile()
+    {
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        string saveAsync = Body(vm, "public async Task<bool> SaveDocumentAsAsync(string path, bool flatten)");
+        Assert.Contains("if (IsSaving || BeginSave(path, flatten) is not { } plan)", saveAsync, StringComparison.Ordinal);
+        Assert.Contains("await Task.Run(() => WriteSave(plan, progress));", saveAsync, StringComparison.Ordinal);
+        Assert.Contains("return FinishSave(plan);", saveAsync, StringComparison.Ordinal);
+
+        // The write touches no view state: it is static and works from the plan.
+        Assert.Contains("private static void WriteSave(SavePlan plan, IProgress<string>? progress)", vm, StringComparison.Ordinal);
+
+        // A snapshot must not read the handle a save is about to close.
+        Assert.Contains("if (_documentHandle == 0 || _snapshotInFlight || IsSaving)", Body(vm, "public async System.Threading.Tasks.Task<bool> SnapshotIfDueAsync()"), StringComparison.Ordinal);
+
+        string code = Read("PdfEditorApp", "MainPage.xaml.cs");
+        Assert.Contains("bool saved = await ViewModel.SaveDocumentAsync();", Body(code, "private async Task<bool> SaveAsync()"), StringComparison.Ordinal);
+        Assert.Contains("bool saved = await ViewModel.SaveDocumentAsAsync(file.Path, flatten);", Body(code, "private async Task<bool> SaveAsAsync(bool flatten)"), StringComparison.Ordinal);
+
+        string keys = Body(code, "private void RootGrid_KeyDown(object sender, KeyRoutedEventArgs e)");
+        int modifiers = keys.IndexOf("_isCtrlDown = true;", StringComparison.Ordinal);
+        int blocked = keys.IndexOf("if (ViewModel.IsSaving)", StringComparison.Ordinal);
+        Assert.True(modifiers > 0 && blocked > modifiers, "keys are refused while saving, after the modifiers are tracked");
+
+        Assert.Contains("if (ViewModel.IsSaving)", Body(code, "public async Task<bool> ConfirmCloseAsync()"), StringComparison.Ordinal);
+        Assert.Contains("AppMenuBar.IsEnabled = !saving;", Body(code, "private void ShowSaving(bool saving)"), StringComparison.Ordinal);
+
+        string xaml = Read("PdfEditorApp", "MainPage.xaml");
+        int at = xaml.IndexOf("<Grid x:Name=\"SavingOverlay\"", StringComparison.Ordinal);
+        Assert.True(at > 0, "the saving overlay is gone");
+        string overlay = xaml[at..xaml.IndexOf('>', at)];
+        Assert.Contains("Grid.RowSpan=\"3\" Grid.ColumnSpan=\"5\"", overlay, StringComparison.Ordinal);
+        Assert.Contains("Background=\"Transparent\"", overlay, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{x:Bind ViewModel.SavingStep, Mode=OneWay}\"", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void a_properties_change_is_one_undo_step()
+    {
+        string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
+        string apply = Body(vm, "public void ApplyDocumentProperties(InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates)");
+        Assert.Contains("Scope = HistoryScope.Properties,", apply, StringComparison.Ordinal);
+        Assert.Contains("PropertiesBefore = before,", apply, StringComparison.Ordinal);
+        Assert.Contains("PropertiesAfter = after,", apply, StringComparison.Ordinal);
+
+        string undo = Body(vm, "private void ApplyHistoryEntryCore(HistoryEntry entry, bool backwards)");
+        Assert.Contains("SetPendingProperties((backwards ? entry.PropertiesBefore : entry.PropertiesAfter) ?? DocumentPropertiesState.None);", undo, StringComparison.Ordinal);
+        Assert.Contains("IsDirty = backwards ? entry.WasDirty : true;", undo, StringComparison.Ordinal);
+        Assert.Contains("target.Scope is HistoryScope.Records or HistoryScope.Properties", vm, StringComparison.Ordinal);
+    }
+
+    // ---------------- Opening the way the file asks ----------------
+
+    [Fact]
+    public void the_file_opens_the_way_it_asks_without_changing_the_readers_settings()
+    {
+        string code = Read("PdfEditorApp", "MainPage.xaml.cs");
+        string rebuilt = Body(code, "private void OnLayoutRebuilt()");
+        int restore = rebuilt.IndexOf("bool restored = firstForThisFile && RestoreReadingPosition();", StringComparison.Ordinal);
+        int opening = rebuilt.IndexOf("ApplyOpeningSettings();", StringComparison.Ordinal);
+        Assert.True(restore > 0 && opening > restore, $"restore {restore}, opening {opening}");
+        Assert.Contains("_openingRestored = restored;", rebuilt, StringComparison.Ordinal);
+
+        string apply = Body(code, "private void ApplyOpeningSettings()");
+        Assert.Contains("ViewModel.SetPageViewMode(layout);", apply, StringComparison.Ordinal);
+        Assert.DoesNotContain("SettingsStore.Update", apply, StringComparison.Ordinal);
+        Assert.DoesNotContain("ApplyPageViewMode(", apply, StringComparison.Ordinal);
+        Assert.Contains("if (_openingRestored || late || catalog.Open is not { } open)", apply, StringComparison.Ordinal);
+        Assert.Contains("case \"Bookmarks\" when ViewModel.Bookmarks.Count > 0", apply, StringComparison.Ordinal);
+
+        // A catalog still being read is applied when it arrives.
+        Assert.Contains("ViewModel.FileCatalogLoaded += OnFileCatalogLoaded;", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void the_dialog_offers_the_language_the_opening_and_its_details()
+    {
+        string code = Read("PdfEditorApp", "MainPage.xaml.cs");
+        string dialog = Body(code, "private async void DocumentProperties_Click(");
+
+        Assert.Contains("var catalog = await ViewModel.ReadCatalogAsync();", dialog, StringComparison.Ordinal);
+        Assert.Contains("script = await ViewModel.DetectScriptAsync();", dialog, StringComparison.Ordinal);
+        Assert.Contains("DocumentLanguages.Fits(chosen, script)", dialog, StringComparison.Ordinal);
+        Assert.Contains("Heading(\"When this file opens\")", dialog, StringComparison.Ordinal);
+        Assert.Contains("Fact(\"Accessibility\", info.Tagged ? \"Tagged\" : \"Not tagged\");", dialog, StringComparison.Ordinal);
+        Assert.Contains("Fact(\"Fast web view\",", dialog, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"Other\"", dialog, StringComparison.Ordinal);
+        Assert.Contains("Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);", dialog, StringComparison.Ordinal);
+
+        string window = Read("PdfEditorApp", "MainWindow.xaml.cs");
+        Assert.Contains("Text = \"Properties\"", window, StringComparison.Ordinal);
+        Assert.Contains("page.ShowDocumentProperties();", window, StringComparison.Ordinal);
+        Assert.Contains("properties.IsEnabled = page.CanShowProperties;", window, StringComparison.Ordinal);
     }
 }

@@ -164,7 +164,7 @@ public class CrashRecoveryWiringTests
         // The work is in the user's file now. Leaving the snapshot would offer
         // it back on the next launch as though something had gone wrong.
         Assert.Contains("RecoveryStore.Discard(",
-                        MethodBody(ViewModel(), "public bool SaveDocumentAs(string path, bool flatten)"),
+                        MethodBody(ViewModel(), "private bool FinishSave(SavePlan plan)"),
                         StringComparison.Ordinal);
     }
 

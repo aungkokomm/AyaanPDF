@@ -70,7 +70,11 @@ public class BookmarksSurvivePageChangesWiringTests
     [Fact]
     public void a_save_writes_the_outline_it_had_before_reopening_the_file()
     {
-        string save = MethodBody(ViewModelCode(), "public bool SaveDocumentAs(string path, bool flatten)");
+        // Prepared, written off the UI thread, then finished, in that order.
+        string vm = ViewModelCode();
+        string save = MethodBody(vm, "private SavePlan? BeginSave(")
+            + MethodBody(vm, "private static void WriteSave(")
+            + MethodBody(vm, "private bool FinishSave(");
 
         Assert.True(IndexIn(save, "var outlineToWrite = _pendingOutline;") < IndexIn(save, "RenderCoreNative.save_document("));
         Assert.True(IndexIn(save, "OpenDocument(path, preserveAnnotations: false);") < IndexIn(save, "FlushPendingOutline(outlineToWrite);"));

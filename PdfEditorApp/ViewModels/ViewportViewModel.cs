@@ -1360,9 +1360,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         // Properties typed into Document properties belong to the document
         // being closed. A save that reopens its file finds them in it.
+        // The catalog just written is kept until the fresh read arrives, so a
+        // save's reopen does not flicker the tab from title to file name.
+        _fileCatalog = _fileCatalog is not null && _fileCatalogPath is { } catalogPath && SamePath(catalogPath, path)
+            ? _fileCatalog.With(_catalogEdits)
+            : null;
         _infoEdits = null;
         _fileTitle = null;
         _removePersonal = false;
+        _removeDates = false;
+        _catalogEdits = null;
 
         if (_documentHandle == 0)
         {
@@ -1410,6 +1417,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // For a tab set to show the title rather than the file name.
         _fileTitle = ReadDocumentInfo()?.Title;
         NotifyDocumentTitleChanged();
+        _catalogRead = LoadCatalogAsync(path, ++_catalogGeneration);
 
         Diag.Log($"open: {System.IO.Path.GetFileName(path)} " +
             $"({PageCount} pages) opened in {openClock.ElapsedMilliseconds} ms");
@@ -2294,9 +2302,111 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     public bool SaveDocumentAs(string path, bool flatten)
     {
-        if (_documentHandle == 0)
+        if (BeginSave(path, flatten) is not { } plan)
         {
             return false;
+        }
+        WriteSave(plan, progress: null);
+        return FinishSave(plan);
+    }
+
+    /// <summary>Saves back over the document's own file, writing it off the UI thread.</summary>
+    public Task<bool> SaveDocumentAsync() =>
+        _documentHandle == 0 || _currentDocumentPath is not { } path
+            ? Task.FromResult(false)
+            : SaveDocumentAsAsync(path, flatten: false);
+
+    /// <summary>
+    /// The save the menu, Ctrl+S and the close prompt use. The slow middle, the
+    /// file being written and rewritten, runs off the UI thread while the page
+    /// shows its progress and takes no input: an edit arriving half way would
+    /// be lost, or reach a document PDFium is writing out. Preparing the
+    /// document before and swapping the file in after stay on the UI thread,
+    /// because they change what the page shows.
+    /// </summary>
+    public async Task<bool> SaveDocumentAsAsync(string path, bool flatten)
+    {
+        if (IsSaving || BeginSave(path, flatten) is not { } plan)
+        {
+            return false;
+        }
+
+        IsSaving = true;
+        try
+        {
+            var progress = new Progress<string>(step => SavingStep = step);
+            await Task.Run(() => WriteSave(plan, progress));
+            if (plan.Saved && (plan.InPlace || plan.Burned))
+            {
+                SavingStep = "Opening the saved file";
+
+                // One frame for the words to reach the screen before the
+                // reopen holds the UI thread.
+                await Task.Delay(16);
+            }
+            return FinishSave(plan);
+        }
+        finally
+        {
+            IsSaving = false;
+            SavingStep = string.Empty;
+        }
+    }
+
+    private bool _isSaving;
+
+    /// <summary>True while a save is writing the file. The page takes no input meanwhile.</summary>
+    public bool IsSaving
+    {
+        get => _isSaving;
+        private set
+        {
+            if (_isSaving == value) { return; }
+            _isSaving = value;
+            OnPropertyChanged();
+        }
+    }
+
+    private string _savingStep = string.Empty;
+
+    /// <summary>What the save is doing, in words, for the progress card.</summary>
+    public string SavingStep
+    {
+        get => _savingStep;
+        private set
+        {
+            if (_savingStep == value) { return; }
+            _savingStep = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>What one save does, carried from the part that prepares it to the parts that write and finish it.</summary>
+    private sealed class SavePlan
+    {
+        public required string Path { get; init; }
+        public required string WritePath { get; init; }
+        public required bool InPlace { get; init; }
+        public required bool Burned { get; init; }
+        public required ulong Handle { get; init; }
+        public required byte[] InfoPairs { get; init; }
+        public List<DetectedHeading>? Outline { get; init; }
+        public bool RemovingPersonal { get; init; }
+        public bool HasPropertyEdits { get; init; }
+        public bool Saved { get; set; }
+        public int InfoStatus { get; set; } = -1;
+    }
+
+    /// <summary>
+    /// Everything that must happen on the UI thread before the file is
+    /// written: the marks go into the document, and what the write will need
+    /// is taken now, while nothing else can change it.
+    /// </summary>
+    private SavePlan? BeginSave(string path, bool flatten)
+    {
+        if (_documentHandle == 0)
+        {
+            return null;
         }
 
         // Taken now, because an in-place save reopens the document below, and
@@ -2333,7 +2443,35 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         bool inPlace = _currentDocumentPath is { } current && SamePath(current, path);
         string writePath = inPlace ? path + ".ayaan-saving" : path;
 
-        bool saved = RenderCoreNative.save_document(_documentHandle, writePath) == RenderStatus.OkPdfium;
+        return new SavePlan
+        {
+            Path = path,
+            WritePath = writePath,
+            InPlace = inPlace,
+            Burned = burned,
+            Handle = _documentHandle,
+            Outline = outlineToWrite,
+            InfoPairs = DocumentInfoStamp.Pairs(
+                _infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now,
+                _removePersonal, _removeDates, _catalogEdits),
+            RemovingPersonal = _removePersonal,
+            HasPropertyEdits = _infoEdits is { HasChanges: true } || _catalogEdits is { HasChanges: true },
+        };
+    }
+
+    /// <summary>
+    /// Writes the file: PDFium saves the document, then the passes PDFium
+    /// cannot do work on the file it wrote. Touches no view state, so it can
+    /// run off the UI thread; the core serialises PDFium calls itself.
+    /// </summary>
+    private static void WriteSave(SavePlan plan, IProgress<string>? progress)
+    {
+        progress?.Report("Writing the file");
+        plan.Saved = RenderCoreNative.save_document(plan.Handle, plan.WritePath) == RenderStatus.OkPdfium;
+        if (!plan.Saved)
+        {
+            return;
+        }
 
         // A gradient becomes real PDF paint HERE, on the file PDFium has just
         // written, because PDFium cannot create a shading and so cannot put one
@@ -2344,14 +2482,23 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         //
         // AFTER the save and BEFORE the swap, so an in-place save rewrites the
         // temporary copy and the original is only replaced once.
-        if (saved)
-        {
-            WriteGradientFills(writePath);
+        WriteGradientFills(plan.WritePath);
 
-            // Last of the file-to-file passes, so the date it stamps is the
-            // moment the file was finished.
-            WriteDocumentInfo(writePath);
-        }
+        // Last of the file-to-file passes, so the date it stamps is the
+        // moment the file was finished.
+        progress?.Report(plan.RemovingPersonal ? "Removing personal info" : "Writing the properties");
+        plan.InfoStatus = RenderCoreNative.write_document_info(plan.WritePath, plan.InfoPairs, (nuint)plan.InfoPairs.Length);
+    }
+
+    /// <summary>Swaps the written file in and brings the page up to date with it, on the UI thread.</summary>
+    private bool FinishSave(SavePlan plan)
+    {
+        string path = plan.Path;
+        string writePath = plan.WritePath;
+        bool inPlace = plan.InPlace;
+        bool burned = plan.Burned;
+        bool saved = plan.Saved;
+        var outlineToWrite = plan.Outline;
 
         if (inPlace && saved)
         {
@@ -2421,6 +2568,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             }
             _lastSnapshotUtc = DateTime.UtcNow;
 
+            ReportDocumentInfo(plan);
+
             // Last, because the outline writer works on a CLOSED file and
             // closes and reopens the document to do it. Everything above has to
             // have finished with the handle first.
@@ -2457,23 +2606,129 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// </summary>
     private bool _removePersonal;
 
+    /// <summary>Whether the next save also removes the created and modified dates. Only with <see cref="_removePersonal"/>.</summary>
+    private bool _removeDates;
+
+    /// <summary>Language and opening settings changed in Document properties, waiting to be written.</summary>
+    private CatalogEdits? _catalogEdits;
+
     public bool WillRemovePersonalInfo => _removePersonal;
 
+    public bool WillRemoveDates => _removeDates;
+
+    /// <summary>Everything Document properties has changed and a save has yet to write.</summary>
+    public DocumentPropertiesState PendingProperties => new(_infoEdits, _catalogEdits, _removePersonal, _removeDates);
+
     /// <summary>
-    /// Asks the next save to remove personal info, or withdraws the request.
-    /// Like any other edit it waits for a save and marks the document dirty.
+    /// Takes the dialog's changes, as ONE undo step. Nothing is written until
+    /// the next save, the same as a bookmark edit, so the dirty dot and the
+    /// unsaved-changes prompt cover it without learning about properties.
     /// </summary>
-    public void SetRemovePersonalInfo(bool on)
+    public void ApplyDocumentProperties(InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates)
     {
-        if (_removePersonal == on || _documentHandle == 0)
+        var before = PendingProperties;
+        var after = new DocumentPropertiesState(
+            info.HasChanges ? before.Info?.Then(info) ?? info : before.Info,
+            catalog.HasChanges ? before.Catalog?.Then(catalog) ?? catalog : before.Catalog,
+            removePersonal,
+            removePersonal && removeDates);
+        if (after == before || _documentHandle == 0)
         {
             return;
         }
-        _removePersonal = on;
-        if (on)
+
+        _history.Push(new HistoryEntry
         {
-            IsDirty = true;
+            Scope = HistoryScope.Properties,
+            Label = "Change document properties",
+            WasDirty = IsDirty,
+            PageIndex = CurrentPageIndex,
+            PropertiesBefore = before,
+            PropertiesAfter = after,
+        });
+        SetPendingProperties(after);
+        IsDirty = true;
+        NotifyHistoryChanged();
+    }
+
+    private void SetPendingProperties(DocumentPropertiesState state)
+    {
+        _infoEdits = state.Info;
+        _catalogEdits = state.Catalog;
+        _removePersonal = state.RemovePersonal;
+        _removeDates = state.RemoveDates;
+        NotifyDocumentTitleChanged();
+    }
+
+    // The file's catalog: language and how it opens. PDFium cannot read it,
+    // so it is read from the file off the UI thread when the document opens.
+
+    private CatalogSettings? _fileCatalog;
+    private string? _fileCatalogPath;
+    private Task<CatalogSettings?>? _catalogRead;
+    private int _catalogGeneration;
+
+    /// <summary>Raised on the UI thread once the file's catalog has been read.</summary>
+    public event Action? FileCatalogLoaded;
+
+    /// <summary>The file's language and opening settings with pending edits over them; null until read.</summary>
+    public CatalogSettings? Catalog => _fileCatalog?.With(_catalogEdits);
+
+    /// <summary>The same, waiting for the read if it is still going.</summary>
+    public async Task<CatalogSettings> ReadCatalogAsync()
+    {
+        if (_catalogRead is { } reading)
+        {
+            await reading;
         }
+        return (_fileCatalog ?? CatalogSettings.Empty).With(_catalogEdits);
+    }
+
+    private async Task<CatalogSettings?> LoadCatalogAsync(string path, int generation)
+    {
+        var found = await Task.Run(() =>
+        {
+            var buffer = RenderCoreNative.read_catalog_settings(path);
+            try
+            {
+                if (buffer.Status != RenderStatus.OkPdfium)
+                {
+                    return null;
+                }
+                byte[] bytes = new byte[(int)buffer.Len];
+                if (bytes.Length > 0)
+                {
+                    Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+                }
+                return CatalogSettings.FromPairs(NulFields.Pairs(bytes));
+            }
+            finally
+            {
+                RenderCoreNative.free_byte_buffer(buffer);
+            }
+        });
+
+        // A newer document took over this page while the file was read.
+        if (generation != _catalogGeneration)
+        {
+            return null;
+        }
+
+        _fileCatalog = found ?? CatalogSettings.Empty;
+        _fileCatalogPath = path;
+        NotifyDocumentTitleChanged();
+        FileCatalogLoaded?.Invoke();
+        return _fileCatalog;
+    }
+
+    /// <summary>
+    /// Which script most of the first pages are written in (see the core's
+    /// dominant_text_script), for suggesting a language. 0 when unclear.
+    /// </summary>
+    public Task<int> DetectScriptAsync()
+    {
+        ulong handle = _documentHandle;
+        return handle == 0 ? Task.FromResult(0) : Task.Run(() => RenderCoreNative.dominant_text_script(handle));
     }
 
     /// <summary>
@@ -2509,51 +2764,33 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// the same as a bookmark edit, so the dirty dot and the unsaved-changes
     /// prompt cover it without learning about properties.
     /// </summary>
-    public void ApplyInfoEdits(InfoEdits edits)
-    {
-        if (!edits.HasChanges)
-        {
-            return;
-        }
-        _infoEdits = _infoEdits is null ? edits : _infoEdits.Then(edits);
-        IsDirty = true;
-        NotifyDocumentTitleChanged();
-    }
-
     /// <summary>
-    /// Stamps the file a save has just written: any properties edited in
-    /// Document properties, the modified date, and Ayaan PDF as producer, in
-    /// the Info dictionary and in its XMP copy. PDFium writes none of these,
-    /// so a saved file used to keep the date it was first made and name
-    /// whatever program made it, "PDFium" included.
+    /// Says what happened to the properties a save wrote. The write itself
+    /// happens in <see cref="WriteSave"/>, off the UI thread.
     ///
-    /// A failure never fails the save: the document is on disk either way.
-    /// It is only reported when there were edits the user will look for.
+    /// A failure never fails the save: the document is on disk either way. It
+    /// is reported when there were changes the user will look for, and loudly
+    /// when removal was asked for, because a file believed clean gets shared.
     /// </summary>
-    private void WriteDocumentInfo(string path)
+    private void ReportDocumentInfo(SavePlan plan)
     {
-        byte[] data = DocumentInfoStamp.Pairs(_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now, _removePersonal);
-        int status = RenderCoreNative.write_document_info(path, data, (nuint)data.Length);
-        if (status == RenderStatus.OkPdfium)
+        if (plan.InfoStatus == RenderStatus.OkPdfium)
         {
-            if (_removePersonal)
+            if (plan.RemovingPersonal)
             {
                 Status = "Saved. Personal info removed.";
             }
             return;
         }
 
-        Diag.Log($"write_document_info: status {status}");
-
-        // Said plainly when removal was asked for: a file believed clean and
-        // shared is the one failure here that matters.
-        if (_removePersonal)
+        Diag.Log($"write_document_info: status {plan.InfoStatus}");
+        if (plan.RemovingPersonal)
         {
             Status = "Saved, but personal info could NOT be removed: the file is encrypted or could not be read.";
         }
-        else if (_infoEdits is { HasChanges: true })
+        else if (plan.HasPropertyEdits)
         {
-            Status = status == RenderStatus.Unsupported
+            Status = plan.InfoStatus == RenderStatus.Unsupported
                 ? "Saved, but the properties could not be written: the file is encrypted or could not be read."
                 : "Saved, but the properties could not be written.";
         }
@@ -2665,7 +2902,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     {
         var now = DateTime.UtcNow;
 
-        if (_documentHandle == 0 || _snapshotInFlight)
+        // Not while a save is writing: the save's reopen closes the handle the
+        // snapshot would be reading, and the file is about to be safe anyway.
+        if (_documentHandle == 0 || _snapshotInFlight || IsSaving)
         {
             return false;
         }
@@ -2972,7 +3211,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// work that would be lost.
     /// </summary>
     public string WindowTitle =>
-        $"{(IsDirty ? "• " : string.Empty)}{DocumentTitle} - Ayaan PDF";
+        $"{(IsDirty ? "• " : string.Empty)}{TabName} - Ayaan PDF";
 
     /// <summary>
     /// What a TAB says: the file name, and a dot if it has unsaved work.
@@ -2996,8 +3235,29 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// otherwise the file name. Per file, because many files carry a title
     /// nobody chose ("Microsoft Word - ...") that reads worse than the name.
     /// </summary>
-    private string TabName =>
-        TitleInTab && (_infoEdits?.Title ?? _fileTitle) is { Length: > 0 } title ? title : DocumentTitle;
+    private string TabName
+    {
+        get
+        {
+            string? title = (_infoEdits?.Title ?? _fileTitle)?.Trim();
+            if (string.IsNullOrEmpty(title))
+            {
+                return DocumentTitle;
+            }
+
+            // The reader asked for it for this file in an earlier version.
+            if (TitleInTab)
+            {
+                return title;
+            }
+
+            // The file asks for it (/DisplayDocTitle), as Word does by default.
+            // Not when the title is a program's leftover like "Microsoft Word -
+            // report.docx", which reads worse than the file name.
+            bool fileAsks = Catalog?.ShowTitle ?? false;
+            return fileAsks && !PersonalInfo.TitleNamesAFile(title) ? title : DocumentTitle;
+        }
+    }
 
     private bool _titleInTab;
 
@@ -15425,7 +15685,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// to build their inverse.
     /// </summary>
     private HistoryEntry Capture(HistoryEntry target) =>
-        target.Scope == HistoryScope.Records
+        target.Scope is HistoryScope.Records or HistoryScope.Properties
             ? target
             : Capture(target.Scope, target.Label, target.Bounds);
 
@@ -15559,6 +15819,16 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private void ApplyHistoryEntryCore(HistoryEntry entry, bool backwards)
     {
+        // A properties change holds both sides, like a Records entry, and
+        // touches nothing but what the next save will write.
+        if (entry.Scope == HistoryScope.Properties)
+        {
+            SetPendingProperties((backwards ? entry.PropertiesBefore : entry.PropertiesAfter) ?? DocumentPropertiesState.None);
+            IsDirty = backwards ? entry.WasDirty : true;
+            NotifyHistoryChanged();
+            return;
+        }
+
         // Record entries describe their own reversal, so they take the shared
         // walker rather than any of the snapshot restores below.
         if (entry.Scope == HistoryScope.Records)

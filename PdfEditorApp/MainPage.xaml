@@ -3879,5 +3879,41 @@
                  Severity="{x:Bind local:MainPage.NoticeSeverity(ViewModel.NoticeIsWarning), Mode=OneWay}"
                  Message="{x:Bind ViewModel.NoticeMessage, Mode=OneWay}"
                  AutomationProperties.Name="Notice" />
+
+        <!--
+            SAVING. The file is written off the UI thread, so the window keeps
+            painting instead of freezing for the 11 s a large book takes to
+            clean. The page takes no input meanwhile: an edit arriving half way
+            would be lost, or reach a document PDFium is writing out. So this
+            covers the whole page, transparent but hit-testable, from the first
+            moment; the card only appears if the save is still going after
+            400 ms, so a quick save shows nothing at all.
+
+            Over everything, the paper included, which sits in a raised layer
+            of its own (see GradientPanelWindow).
+        -->
+        <Grid x:Name="SavingOverlay" Grid.Row="0" Grid.RowSpan="3" Grid.ColumnSpan="5"
+              Visibility="Collapsed" Canvas.ZIndex="50" Translation="0,0,64"
+              Background="Transparent">
+            <Border x:Name="SavingCard"
+                    AutomationProperties.Name="Saving"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Padding="20,16" CornerRadius="8" MinWidth="320"
+                    Visibility="Collapsed"
+                    Background="{ThemeResource AcrylicInAppFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1">
+                <Border.Shadow>
+                    <ThemeShadow />
+                </Border.Shadow>
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Saving" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                    <ProgressBar IsIndeterminate="True" />
+                    <TextBlock Text="{x:Bind ViewModel.SavingStep, Mode=OneWay}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Style="{StaticResource CaptionTextBlockStyle}" />
+                </StackPanel>
+            </Border>
+        </Grid>
     </Grid>
 </Page>

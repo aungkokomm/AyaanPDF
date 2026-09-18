@@ -212,6 +212,19 @@ public sealed partial class MainWindow : Window
         // A tab with no document is the welcome screen, and says so.
         SetTabTitle(item, System.IO.Path.GetFileName(path) ?? "Welcome");
 
+        // Right-click a tab for its document's properties, as Explorer offers
+        // a file's. The tab comes to the front first, so the dialog is over the
+        // document it describes.
+        var properties = new MenuFlyoutItem { Text = "Properties", Icon = new FontIcon { Glyph = "" } };
+        properties.Click += (_, _) =>
+        {
+            Tabs.SelectedItem = item;
+            page.ShowDocumentProperties();
+        };
+        var tabMenu = new MenuFlyout { Items = { properties } };
+        tabMenu.Opening += (_, _) => properties.IsEnabled = page.CanShowProperties;
+        item.ContextFlyout = tabMenu;
+
         // The page tells us its title; we decide where it belongs. A background
         // document must be able to retitle its own tab without touching the
         // window.

@@ -96,12 +96,71 @@ fn get_document_properties_inner(doc_handle: u64) -> ByteBuffer {
         }
     }
 
+    // PDFium's reading of /PageMode: -1 unknown, 0 none, 1 outlines,
+    // 2 thumbnails, 3 full screen, 4 layers, 5 attachments.
+    pairs.push(("PageModeCode", bindings.FPDFDoc_GetPageMode(handle).to_string()));
+
     let tagged = bindings.FPDFCatalog_IsTagged(handle) != 0;
     pairs.push(("Tagged", if tagged { "1" } else { "0" }.to_owned()));
     pairs.push(("Security", bindings.FPDF_GetSecurityHandlerRevision(handle).to_string()));
     pairs.push(("Permissions", (bindings.FPDF_GetDocPermissions(handle) as u32).to_string()));
 
     buffer_of(&pairs)
+}
+
+/// The script most of the first pages' text is written in, for suggesting a
+/// document language: 0 when there is too little text or it is mostly Latin
+/// (which is also what a legacy Hindi font such as Kruti Dev reads as, so
+/// Latin is never taken as evidence of English), 1 Devanagari, 2 Myanmar,
+/// 3 Bengali, 4 Tamil, 5 Thai, 6 Arabic. Loads up to three pages' text, so
+/// call it off the UI thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn dominant_text_script(doc_handle: u64) -> i32 {
+    if doc_handle == 0 {
+        return 0;
+    }
+    panic::catch_unwind(|| {
+        let _guard = crate::call_guard();
+        let Some(doc) = crate::lock(&crate::core().documents).get(&doc_handle).cloned() else {
+            return 0;
+        };
+        let doc_guard = crate::lock(&doc);
+        let pages = doc_guard.pages();
+        let mut text = String::new();
+        for index in 0..pages.len().min(3) {
+            if let Ok(page) = pages.get(index) {
+                if let Ok(t) = page.text() {
+                    text.push_str(&t.all());
+                }
+            }
+        }
+        script_of(&text)
+    })
+    .unwrap_or(0)
+}
+
+pub(crate) fn script_of(text: &str) -> i32 {
+    const SCRIPTS: &[(i32, u32, u32)] = &[
+        (1, 0x0900, 0x097F),
+        (2, 0x1000, 0x109F),
+        (3, 0x0980, 0x09FF),
+        (4, 0x0B80, 0x0BFF),
+        (5, 0x0E00, 0x0E7F),
+        (6, 0x0600, 0x06FF),
+    ];
+    let mut counts = [0usize; 7];
+    let mut letters = 0usize;
+    for c in text.chars() {
+        if c.is_alphabetic() || ('\u{0900}'..='\u{109F}').contains(&c) {
+            letters += 1;
+        }
+        let u = c as u32;
+        if let Some((code, _, _)) = SCRIPTS.iter().find(|(_, lo, hi)| (*lo..=*hi).contains(&u)) {
+            counts[*code as usize] += 1;
+        }
+    }
+    let (best, count) = counts.iter().enumerate().skip(1).max_by_key(|(_, n)| **n).map(|(i, n)| (i, *n)).unwrap_or((0, 0));
+    if count >= 20 && count * 10 >= letters * 3 { best as i32 } else { 0 }
 }
 
 /// Appends the given properties to the file at `path`, in place.
@@ -170,7 +229,7 @@ fn write_document_info_inner(path: &str, data: &[u8]) -> i32 {
 /// The file's bytes with the properties appended, or None when lopdf cannot
 /// parse it or it is encrypted.
 pub(crate) fn with_document_info(file: Vec<u8>, pairs: &[(String, String)]) -> Option<Vec<u8>> {
-    if value(pairs, REMOVE_PERSONAL) == Some("1") {
+    if value(pairs, REMOVE_PERSONAL) == Some("1") || value(pairs, REMOVE_DATES) == Some("1") {
         return without_personal_info(file, pairs);
     }
 
@@ -192,6 +251,22 @@ pub(crate) fn with_document_info(file: Vec<u8>, pairs: &[(String, String)]) -> O
         _ => None,
     };
     let metadata = metadata_stream(&prev);
+
+    // The catalog, and the viewer preferences it may hold by reference, are
+    // copied into the update only when this write changes one of them, so an
+    // ordinary save stays the few hundred bytes it was.
+    let catalog = if touches_catalog(pairs) {
+        let root = prev.trailer.get(b"Root").ok()?.as_reference().ok()?;
+        let prefs = prev
+            .get_object(root)
+            .ok()
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|c| c.get(b"ViewerPreferences").ok())
+            .and_then(|v| v.as_reference().ok());
+        Some((root, prefs, prev.get_pages()))
+    } else {
+        None
+    };
 
     let mut inc = IncrementalDocument::create_from(file, prev);
 
@@ -225,6 +300,14 @@ pub(crate) fn with_document_info(file: Vec<u8>, pairs: &[(String, String)]) -> O
         }
     }
 
+    if let Some((root, prefs, pages)) = catalog {
+        inc.opt_clone_object_to_new_document(root).ok()?;
+        if let Some(prefs) = prefs {
+            inc.opt_clone_object_to_new_document(prefs).ok()?;
+        }
+        apply_to_catalog(&mut inc.new_document, root, &pages, pairs)?;
+    }
+
     let mut out = Vec::new();
     inc.save_to(&mut out).ok()?;
     Some(out)
@@ -252,6 +335,10 @@ fn apply_to_info(info: &mut Dictionary, pairs: &[(String, String)]) {
         for key in doomed {
             info.remove(&key);
         }
+    }
+    if get(REMOVE_DATES) == Some("1") {
+        info.remove(b"CreationDate");
+        info.remove(b"ModDate");
     }
 
     for key in ["Title", "Author", "Subject", "Keywords"] {
@@ -317,7 +404,10 @@ fn edited_metadata(stream: &Stream, pairs: &[(String, String)]) -> Option<Stream
         changes.push((XmpProperty::ModifyDate, date));
         changes.push((XmpProperty::MetadataDate, date));
     }
-    let removals = if get(REMOVE_PERSONAL) == Some("1") { personal_xmp_names(&xml) } else { Vec::new() };
+    let mut removals = if get(REMOVE_PERSONAL) == Some("1") { personal_xmp_names(&xml) } else { Vec::new() };
+    if get(REMOVE_DATES) == Some("1") {
+        removals.extend(XMP_DATES.iter().map(|s| (*s).to_owned()));
+    }
     if changes.is_empty() && removals.is_empty() {
         return None;
     }
@@ -565,7 +655,15 @@ fn without_personal_info(file: Vec<u8>, pairs: &[(String, String)]) -> Option<Ve
         }
     }
 
-    strip_personal_objects(&mut doc);
+    if touches_catalog(pairs) {
+        let root = doc.trailer.get(b"Root").ok()?.as_reference().ok()?;
+        let pages = doc.get_pages();
+        apply_to_catalog(&mut doc, root, &pages, pairs)?;
+    }
+
+    if value(pairs, REMOVE_PERSONAL) == Some("1") {
+        strip_personal_objects(&mut doc);
+    }
 
     // The old Info and XMP, and anything else nothing refers to any more.
     doc.prune_objects();
@@ -620,7 +718,7 @@ pub unsafe extern "C" fn find_personal_info(path: *const c_char) -> ByteBuffer {
     };
 
     panic::catch_unwind(move || {
-        let Ok(doc) = Document::load(&path) else {
+        let Ok(doc) = load_structure(&path) else {
             return ByteBuffer::err(STATUS_UNSUPPORTED);
         };
         if doc.is_encrypted() || doc.encryption_state.is_some() {
@@ -847,6 +945,295 @@ fn li_values(block: &str) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Dates, language and how the file opens
+// ---------------------------------------------------------------------------
+
+/// The pair that removes the created and modified dates. Only sent together
+/// with personal-info removal, and like it, done by a whole rewrite.
+const REMOVE_DATES: &str = "RemoveDates";
+
+const XMP_DATES: &[&str] = &["xmp:CreateDate", "xmp:ModifyDate", "xmp:MetadataDate"];
+
+/// The pairs that change the catalog. Each is applied only when present.
+///
+/// * Lang: a BCP 47 tag ("hi", "my", "en-GB"); empty removes it.
+/// * PageMode, PageLayout: the PDF name; empty removes it.
+/// * DisplayDocTitle: "1" sets it, "0" removes it.
+/// * OpenPage: a 0-based page, with OpenZoom ("", "page", "width",
+///   "actual" or "percent:NNN"); "-1" removes the open action.
+const CATALOG_KEYS: &[&str] = &["Lang", "PageMode", "PageLayout", "DisplayDocTitle", "OpenPage"];
+
+fn touches_catalog(pairs: &[(String, String)]) -> bool {
+    CATALOG_KEYS.iter().any(|k| value(pairs, k).is_some())
+}
+
+fn apply_to_catalog(
+    doc: &mut Document,
+    root: lopdf::ObjectId,
+    pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
+    pairs: &[(String, String)],
+) -> Option<()> {
+    let get = |key: &str| value(pairs, key);
+
+    if let Some(show) = get("DisplayDocTitle") {
+        let on = show == "1";
+        let prefs = doc.get_object(root).ok()?.as_dict().ok()?.get(b"ViewerPreferences").ok().cloned();
+        match prefs {
+            Some(Object::Reference(id)) => {
+                let d = doc.get_object_mut(id).ok()?.as_dict_mut().ok()?;
+                set_flag(d, b"DisplayDocTitle", on);
+            }
+            Some(Object::Dictionary(mut d)) => {
+                set_flag(&mut d, b"DisplayDocTitle", on);
+                doc.get_object_mut(root).ok()?.as_dict_mut().ok()?.set("ViewerPreferences", d);
+            }
+            _ if on => {
+                let mut d = Dictionary::new();
+                d.set("DisplayDocTitle", Object::Boolean(true));
+                doc.get_object_mut(root).ok()?.as_dict_mut().ok()?.set("ViewerPreferences", d);
+            }
+            _ => {}
+        }
+    }
+
+    let catalog = doc.get_object_mut(root).ok()?.as_dict_mut().ok()?;
+
+    match get("Lang") {
+        Some("") => {
+            catalog.remove(b"Lang");
+        }
+        Some(tag) => catalog.set("Lang", pdf_text_string(tag)),
+        None => {}
+    }
+
+    for key in ["PageMode", "PageLayout"] {
+        match get(key) {
+            Some("") => {
+                catalog.remove(key.as_bytes());
+            }
+            Some(name) => catalog.set(key, Object::Name(name.as_bytes().to_vec())),
+            None => {}
+        }
+    }
+
+    if let Some(page) = get("OpenPage") {
+        match page.parse::<i64>() {
+            Ok(index) if index >= 0 => {
+                let count = pages.len() as i64;
+                let number = (index.min(count - 1) + 1).max(1) as u32;
+                let page_id = *pages.get(&number)?;
+                let mut dest = vec![Object::Reference(page_id)];
+                dest.extend(zoom_to_dest(get("OpenZoom").unwrap_or("")));
+                catalog.set("OpenAction", Object::Array(dest));
+            }
+            _ => {
+                catalog.remove(b"OpenAction");
+            }
+        }
+    }
+
+    Some(())
+}
+
+fn set_flag(dict: &mut Dictionary, key: &[u8], on: bool) {
+    if on {
+        dict.set(key.to_vec(), Object::Boolean(true));
+    } else {
+        dict.remove(key);
+    }
+}
+
+/// The rest of a destination array after the page, for a zoom token.
+fn zoom_to_dest(zoom: &str) -> Vec<Object> {
+    let null = || Object::Null;
+    match zoom {
+        "page" => vec![Object::Name(b"Fit".to_vec())],
+        "width" => vec![Object::Name(b"FitH".to_vec()), null()],
+        "actual" => vec![Object::Name(b"XYZ".to_vec()), null(), null(), Object::Integer(1)],
+        z if z.starts_with("percent:") => {
+            let percent: f32 = z["percent:".len()..].parse().unwrap_or(100.0);
+            vec![Object::Name(b"XYZ".to_vec()), null(), null(), Object::Real(percent / 100.0)]
+        }
+        // Where the reader's own zoom stays as it is.
+        _ => vec![Object::Name(b"XYZ".to_vec()), null(), null(), null()],
+    }
+}
+
+/// How the file asks to be opened, as NUL-separated pairs: Lang, PageMode,
+/// PageLayout, DisplayDocTitle ("1"), OpenPage (0-based) and OpenZoom (a
+/// token as above), and OpenActionOther ("1") when the file has an open
+/// action that is not a plain go-to-page, such as a script.
+///
+/// PDFium can WRITE the language and cannot read it, and reads none of the
+/// rest, so the catalog is read from the file by lopdf. Parses the whole
+/// file: call it off the UI thread.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn read_catalog_settings(path: *const c_char) -> ByteBuffer {
+    if path.is_null() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let Ok(path) = unsafe { CStr::from_ptr(path) }.to_str().map(str::to_owned) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    panic::catch_unwind(move || {
+        let Ok(doc) = load_structure(&path) else {
+            return ByteBuffer::err(STATUS_UNSUPPORTED);
+        };
+        let found = catalog_settings_of(&doc);
+        bytes_buffer(join_nul(found.iter().flat_map(|(k, v)| [*k, v.as_str()])))
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+pub(crate) fn catalog_settings_of(doc: &Document) -> Vec<(&'static str, String)> {
+    let mut found: Vec<(&'static str, String)> = Vec::new();
+    let Some(catalog) = doc
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|r| resolve(doc, r))
+        .and_then(|c| c.as_dict().ok())
+    else {
+        return found;
+    };
+
+    if let Some(lang) = catalog.get(b"Lang").ok().map(|l| object_text(doc, l)) {
+        if !lang.trim().is_empty() {
+            found.push(("Lang", lang.trim().to_owned()));
+        }
+    }
+    for (key, name) in [("PageMode", b"PageMode".as_slice()), ("PageLayout", b"PageLayout")] {
+        if let Some(n) = catalog.get(name).ok().and_then(|o| resolve(doc, o)).and_then(|o| o.as_name().ok()) {
+            found.push((key, String::from_utf8_lossy(n).into_owned()));
+        }
+    }
+    let shows_title = catalog
+        .get(b"ViewerPreferences")
+        .ok()
+        .and_then(|v| resolve(doc, v))
+        .and_then(|v| v.as_dict().ok())
+        .and_then(|v| v.get(b"DisplayDocTitle").ok())
+        .and_then(|v| resolve(doc, v))
+        .and_then(|v| v.as_bool().ok())
+        .unwrap_or(false);
+    if shows_title {
+        found.push(("DisplayDocTitle", "1".to_owned()));
+    }
+
+    if let Some(action) = catalog.get(b"OpenAction").ok().and_then(|a| resolve(doc, a)) {
+        match open_view_of(doc, action) {
+            Some((page, zoom)) => {
+                found.push(("OpenPage", page.to_string()));
+                found.push(("OpenZoom", zoom));
+            }
+            None => found.push(("OpenActionOther", "1".to_owned())),
+        }
+    }
+
+    found
+}
+
+/// The page and zoom an open action goes to, when it is a destination or a
+/// go-to action (directly or through a named destination).
+fn open_view_of(doc: &Document, action: &Object) -> Option<(usize, String)> {
+    let dest = match action {
+        Object::Array(_) => action.clone(),
+        Object::Dictionary(d) => {
+            if d.get(b"S").and_then(Object::as_name).ok() != Some(b"GoTo".as_slice()) {
+                return None;
+            }
+            let target = resolve(doc, d.get(b"D").ok()?)?;
+            match target {
+                Object::Array(_) => target.clone(),
+                Object::Name(n) | Object::String(n, _) => named_destination(doc, n)?,
+                _ => return None,
+            }
+        }
+        Object::Name(n) | Object::String(n, _) => named_destination(doc, n)?,
+        _ => return None,
+    };
+
+    let items = dest.as_array().ok()?;
+    let page_index = match items.first()? {
+        Object::Reference(id) => {
+            let pages = doc.get_pages();
+            pages.iter().find(|(_, pid)| **pid == *id).map(|(n, _)| (*n - 1) as usize)?
+        }
+        Object::Integer(i) if *i >= 0 => *i as usize,
+        _ => return None,
+    };
+
+    let kind = items.get(1).and_then(|k| k.as_name().ok()).unwrap_or(b"XYZ");
+    let zoom = match kind {
+        b"Fit" | b"FitB" | b"FitV" | b"FitBV" => "page".to_owned(),
+        b"FitH" | b"FitBH" => "width".to_owned(),
+        b"XYZ" => match items.get(4) {
+            Some(Object::Integer(z)) if *z > 0 => zoom_token(*z as f32),
+            Some(Object::Real(z)) if *z > 0.0 => zoom_token(*z),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    Some((page_index, zoom))
+}
+
+fn zoom_token(z: f32) -> String {
+    if (z - 1.0).abs() < 0.001 {
+        "actual".to_owned()
+    } else {
+        format!("percent:{}", (z * 100.0).round() as i64)
+    }
+}
+
+/// A named destination's array, from the catalog's /Dests dictionary or the
+/// /Names /Dests name tree.
+fn named_destination(doc: &Document, name: &[u8]) -> Option<Object> {
+    let catalog = resolve(doc, doc.trailer.get(b"Root").ok()?)?.as_dict().ok()?;
+
+    let found = catalog
+        .get(b"Dests")
+        .ok()
+        .and_then(|d| resolve(doc, d))
+        .and_then(|d| d.as_dict().ok())
+        .and_then(|d| d.get(name).ok())
+        .cloned()
+        .or_else(|| {
+            let names = resolve(doc, catalog.get(b"Names").ok()?)?.as_dict().ok()?;
+            let tree = resolve(doc, names.get(b"Dests").ok()?)?.as_dict().ok()?;
+            name_tree_lookup(doc, tree, name, 0)
+        })?;
+
+    match resolve(doc, &found)? {
+        Object::Array(a) => Some(Object::Array(a.clone())),
+        Object::Dictionary(d) => resolve(doc, d.get(b"D").ok()?).cloned(),
+        _ => None,
+    }
+}
+
+fn name_tree_lookup(doc: &Document, node: &Dictionary, key: &[u8], depth: usize) -> Option<Object> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(names) = node.get(b"Names").ok().and_then(|n| resolve(doc, n)).and_then(|n| n.as_array().ok()) {
+        for pair in names.chunks(2) {
+            if let [Object::String(k, _), v] = pair {
+                if k.as_slice() == key {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+    let kids = node.get(b"Kids").ok().and_then(|k| resolve(doc, k)).and_then(|k| k.as_array().ok())?;
+    kids.iter()
+        .filter_map(|kid| resolve(doc, kid).and_then(|k| k.as_dict().ok()))
+        .find_map(|kid| name_tree_lookup(doc, kid, key, depth + 1))
+}
+
 fn xml_unescape(value: &str) -> String {
     value
         .replace("&lt;", "<")
@@ -893,7 +1280,7 @@ pub unsafe extern "C" fn list_document_fonts(path: *const c_char) -> ByteBuffer 
     };
 
     panic::catch_unwind(move || {
-        let Ok(doc) = Document::load(&path) else {
+        let Ok(doc) = load_structure(&path) else {
             return ByteBuffer::err(STATUS_UNSUPPORTED);
         };
         let mut fields: Vec<String> = Vec::new();
@@ -906,6 +1293,23 @@ pub unsafe extern "C" fn list_document_fonts(path: *const c_char) -> ByteBuffer 
         bytes_buffer(join_nul(fields.iter().map(String::as_str)))
     })
     .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+/// The file's structure without the bulk: every dictionary kept, and every
+/// stream's bytes dropped except object streams (which hold dictionaries) and
+/// XMP metadata. What the read-only questions here need, for a fraction of the
+/// memory: a 211 MB book otherwise holds its images and page contents twice
+/// over while one question is answered.
+fn load_structure(path: &str) -> lopdf::Result<Document> {
+    fn keep_structure(id: (u32, u16), object: &mut Object) -> Option<((u32, u16), Object)> {
+        if let Object::Stream(stream) = object {
+            if !stream.dict.has_type(b"ObjStm") && !stream.dict.has_type(b"Metadata") {
+                stream.content = Vec::new();
+            }
+        }
+        Some((id, object.clone()))
+    }
+    Document::load_filtered(path, keep_structure)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1549,6 +1953,259 @@ mod tests {
         assert!(xml.contains("Kept title"), "{xml}");
         assert!(!xml.contains("pdfx:Company"), "{xml}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------- Language and how the file opens ----------------
+
+    fn catalog_of(path: &std::path::Path) -> HashMap<String, String> {
+        catalog_settings_of(&Document::load(path).unwrap())
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect()
+    }
+
+    #[test]
+    fn language_and_opening_settings_are_appended_and_read_back() {
+        let original = fixture("sample_20pages.pdf");
+        let path = temp_copy(&original, "catalog");
+        assert!(catalog_of(&path).is_empty(), "the control: {:?}", catalog_of(&path));
+        assert_eq!(read(&path)["PageModeCode"], "0", "the control: no page mode");
+
+        assert_eq!(
+            write(
+                &path,
+                &[
+                    ("Lang", "hi"),
+                    ("PageMode", "UseOutlines"),
+                    ("PageLayout", "SinglePage"),
+                    ("DisplayDocTitle", "1"),
+                    ("OpenPage", "4"),
+                    ("OpenZoom", "width"),
+                ]
+            ),
+            STATUS_OK_PDFIUM
+        );
+
+        let written = std::fs::read(&path).unwrap();
+        assert!(written.starts_with(&original), "appended, not rewritten");
+
+        let catalog = catalog_of(&path);
+        assert_eq!(catalog["Lang"], "hi");
+        assert_eq!(catalog["PageMode"], "UseOutlines");
+        assert_eq!(catalog["PageLayout"], "SinglePage");
+        assert_eq!(catalog["DisplayDocTitle"], "1");
+        assert_eq!(catalog["OpenPage"], "4");
+        assert_eq!(catalog["OpenZoom"], "width");
+
+        // PDFium, the other reader, agrees on what it can see.
+        let after = read(&path);
+        assert_eq!(after["PageModeCode"], "1");
+        assert_eq!(after["Pages"], "20");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn opening_settings_can_be_changed_again_and_removed() {
+        let path = temp_copy(&fixture("sample_20pages.pdf"), "catalog_again");
+        assert_eq!(write(&path, &[("Lang", "my"), ("OpenPage", "2"), ("OpenZoom", "percent:150"), ("DisplayDocTitle", "1")]), STATUS_OK_PDFIUM);
+        assert_eq!(catalog_of(&path)["OpenZoom"], "percent:150");
+
+        assert_eq!(write(&path, &[("OpenPage", "0"), ("OpenZoom", "actual")]), STATUS_OK_PDFIUM);
+        let second = catalog_of(&path);
+        assert_eq!((second["OpenPage"].as_str(), second["OpenZoom"].as_str()), ("0", "actual"));
+        assert_eq!(second["Lang"], "my", "a key this write did not name is left alone");
+
+        assert_eq!(write(&path, &[("Lang", ""), ("OpenPage", "-1"), ("DisplayDocTitle", "0")]), STATUS_OK_PDFIUM);
+        let gone = catalog_of(&path);
+        assert!(!gone.contains_key("Lang") && !gone.contains_key("OpenPage") && !gone.contains_key("DisplayDocTitle"), "{gone:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_open_action_through_a_named_destination_is_followed_and_a_script_is_not_guessed_at() {
+        let mut doc = Document::load_mem(&fixture("sample_20pages.pdf")).unwrap();
+        let page7 = *doc.get_pages().get(&7).unwrap();
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+
+        let mut leaf = Dictionary::new();
+        leaf.set(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"chap2".to_vec(), StringFormat::Literal),
+                Object::Array(vec![Object::Reference(page7), Object::Name(b"Fit".to_vec())]),
+            ]),
+        );
+        let leaf_id = doc.add_object(leaf);
+        let mut tree = Dictionary::new();
+        tree.set("Kids", Object::Array(vec![Object::Reference(leaf_id)]));
+        let mut names = Dictionary::new();
+        names.set("Dests", tree);
+        let mut go = Dictionary::new();
+        go.set("S", Object::Name(b"GoTo".to_vec()));
+        go.set("D", Object::String(b"chap2".to_vec(), StringFormat::Literal));
+        {
+            let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+            catalog.set("Names", names);
+            catalog.set("OpenAction", go);
+        }
+        let found: HashMap<_, _> = catalog_settings_of(&doc).into_iter().collect();
+        assert_eq!(found["OpenPage"], "6");
+        assert_eq!(found["OpenZoom"], "page");
+
+        let mut script = Dictionary::new();
+        script.set("S", Object::Name(b"JavaScript".to_vec()));
+        doc.get_object_mut(root).unwrap().as_dict_mut().unwrap().set("OpenAction", script);
+        let found: HashMap<_, _> = catalog_settings_of(&doc).into_iter().collect();
+        assert_eq!(found.get("OpenActionOther").map(String::as_str), Some("1"));
+        assert!(!found.contains_key("OpenPage"));
+    }
+
+    #[test]
+    fn the_script_of_the_text_is_named_only_when_it_is_clearly_not_latin() {
+        assert_eq!(script_of("अध्याय पहला: गीता का सार और उसका अर्थ समझना बहुत आवश्यक है"), 1);
+        assert_eq!(script_of("မြန်မာနိုင်ငံ၏ အစိုးရ ရုံးတော်မှ ထုတ်ပြန်သော စာ ဖြစ်သည်"), 2);
+        // Kruti Dev Hindi reads as Latin letters; it must not look like anything.
+        assert_eq!(script_of("vè;k; igyk % xhrk dk lkj vkSj mldk vFkZ le>uk cgqr vko';d gS"), 0);
+        assert_eq!(script_of("An ordinary English page with a few words on it."), 0);
+        assert_eq!(script_of("गीता"), 0, "too little to go on");
+    }
+
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_script_real_files_are_written_in() {
+        let dir = std::path::Path::new(r"D:\Ayaan PDF Test file");
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+            .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with("ayaan-"))
+            .collect();
+        files.sort();
+        for file in files {
+            let c = CString::new(file.to_str().unwrap()).unwrap();
+            let handle = crate::open_document(c.as_ptr());
+            if handle == 0 {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let script = dominant_text_script(handle);
+            println!("{:<46} script {} in {} ms", file.file_name().unwrap().to_string_lossy(), script, started.elapsed().as_millis());
+            crate::close_document(handle);
+        }
+    }
+
+    #[test]
+    fn the_light_load_answers_exactly_what_the_full_load_does() {
+        let path = temp_copy(&with_personal_info(), "light");
+        assert_eq!(write(&path, &[("Lang", "hi"), ("OpenPage", "3"), ("OpenZoom", "page")]), STATUS_OK_PDFIUM);
+        let full = Document::load(&path).unwrap();
+        let light = load_structure(path.to_str().unwrap()).unwrap();
+        assert_eq!(personal_info_of(&full), personal_info_of(&light));
+        assert_eq!(catalog_settings_of(&full), catalog_settings_of(&light));
+        assert_eq!(fonts_of(&full), fonts_of(&light));
+        assert!(!personal_info_of(&light).is_empty() && !catalog_settings_of(&light).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn the_light_load_agrees_on_real_files() {
+        let dir = std::path::Path::new(r"D:\Ayaan PDF Test file");
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+            .collect();
+        files.sort();
+        let mut bad = Vec::new();
+        for file in files {
+            let Ok(full) = Document::load(&file) else { continue };
+            let started = std::time::Instant::now();
+            let light = load_structure(file.to_str().unwrap()).unwrap();
+            let ms = started.elapsed().as_millis();
+            let same = personal_info_of(&full) == personal_info_of(&light)
+                && catalog_settings_of(&full) == catalog_settings_of(&light)
+                && fonts_of(&full) == fonts_of(&light);
+            println!("{:<46} light load {:>5} ms  {}", file.file_name().unwrap().to_string_lossy(), ms, if same { "same" } else { "DIFFERENT" });
+            if !same {
+                bad.push(file.display().to_string());
+            }
+        }
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    #[test]
+    fn removing_dates_leaves_them_nowhere_in_the_file() {
+        let path = temp_copy(&with_personal_info(), "dates");
+        assert!(read(&path).contains_key("CreationDate"), "the control");
+
+        assert_eq!(write(&path, &[("RemovePersonal", "1"), ("RemoveDates", "1"), ("Producer", "Ayaan PDF 9.9.9")]), STATUS_OK_PDFIUM);
+        let after = read(&path);
+        assert!(!after.contains_key("CreationDate") && !after.contains_key("ModDate"), "{after:?}");
+        assert!(!contains(&std::fs::read(&path).unwrap(), "D:20250101000000Z"));
+        assert_eq!(after["Title"], "Kept title");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_real_files_ask_for_when_they_open_and_a_write_of_it() {
+        let dir = std::path::Path::new(r"D:\Ayaan PDF Test file");
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+            .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with("ayaan-"))
+            .collect();
+        files.sort();
+
+        let mut bad = Vec::new();
+        for file in files {
+            let started = std::time::Instant::now();
+            let Ok(doc) = Document::load(&file) else { continue };
+            let found = catalog_settings_of(&doc);
+            let read_ms = started.elapsed().as_millis();
+
+            let c_src = CString::new(file.to_str().unwrap()).unwrap();
+            let handle = crate::open_document(c_src.as_ptr());
+            if handle == 0 {
+                continue;
+            }
+            let saved = std::env::temp_dir().join(format!("ayaan_docinfo_cat_{}.pdf", std::process::id()));
+            let c_saved = CString::new(saved.to_str().unwrap()).unwrap();
+            let status = crate::save_document(handle, c_saved.as_ptr());
+            crate::close_document(handle);
+            if status != STATUS_OK_PDFIUM {
+                continue;
+            }
+            let pages: i32 = read(&saved)["Pages"].parse().unwrap();
+            let checked = pages.min(3);
+            let before: Vec<Vec<u8>> = (0..checked).map(|p| text_of(&saved, p)).collect();
+
+            let stamp = write(
+                &saved,
+                &[("Lang", "my"), ("PageMode", "UseOutlines"), ("OpenPage", &(pages - 1).to_string()), ("OpenZoom", "width"), ("DisplayDocTitle", "1")],
+            );
+            let after: Vec<Vec<u8>> = (0..checked).map(|p| text_of(&saved, p)).collect();
+            let catalog = catalog_of(&saved);
+            let ok = stamp == STATUS_OK_PDFIUM
+                && before == after
+                && read(&saved)["PageModeCode"] == "1"
+                && catalog.get("OpenPage") == Some(&(pages - 1).to_string())
+                && catalog.get("Lang").map(String::as_str) == Some("my");
+            println!(
+                "{:<44} read {:>5} ms  {:?}  write {}",
+                file.file_name().unwrap().to_string_lossy().chars().take(44).collect::<String>(),
+                read_ms,
+                found,
+                if ok { "ok" } else { "FAILED" }
+            );
+            if !ok {
+                bad.push(file.display().to_string());
+            }
+            let _ = std::fs::remove_file(&saved);
+        }
+        assert!(bad.is_empty(), "{bad:?}");
     }
 
     #[test]

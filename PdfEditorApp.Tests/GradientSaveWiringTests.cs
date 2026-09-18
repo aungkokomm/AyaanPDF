@@ -51,10 +51,10 @@ public class GradientSaveWiringTests
         string code = ViewModel();
 
         int save = code.IndexOf(
-            "bool saved = RenderCoreNative.save_document(", StringComparison.Ordinal);
+            "plan.Saved = RenderCoreNative.save_document(", StringComparison.Ordinal);
         Assert.True(save > 0, "the save call has moved; this test needs updating");
 
-        int call = code.IndexOf("WriteGradientFills(writePath);", save, StringComparison.Ordinal);
+        int call = code.IndexOf("WriteGradientFills(plan.WritePath);", save, StringComparison.Ordinal);
         Assert.True(call > save, "the gradient writer is not called after the save");
 
         // BEFORE the swap. An in-place save writes to a temporary copy and only

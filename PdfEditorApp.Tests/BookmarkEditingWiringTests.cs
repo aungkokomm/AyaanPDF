@@ -280,7 +280,12 @@ public class BookmarkEditingWiringTests
         // The writer works on a CLOSED file and closes and reopens the document
         // to do it, so everything else in the save has to have finished with
         // the handle first.
-        string body = MethodBody(ViewModel(), "public bool SaveDocumentAs(string path, bool flatten)");
+        // A save is prepared, written off the UI thread, then finished, in
+        // three methods run in that order.
+        string vm = ViewModel();
+        string body = MethodBody(vm, "private SavePlan? BeginSave(")
+            + MethodBody(vm, "private static void WriteSave(")
+            + MethodBody(vm, "private bool FinishSave(");
 
         // Handed the outline taken before the save: reopening the file clears
         // the pending one. See BookmarksSurvivePageChangesWiringTests.

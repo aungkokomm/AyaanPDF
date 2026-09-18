@@ -95,7 +95,8 @@ public class KeyboardFocusWiringTests
         // The tempting shortcut is to delete this guard. It exists because
         // Backspace in the find box used to delete the selected annotation and
         // mark the event handled, so it did not even edit the text.
-        string body = Body("private void RootGrid_KeyDown(", limit: 1600);
+        // 1900: the refusal while saving sits just above it.
+        string body = Body("private void RootGrid_KeyDown(", limit: 1900);
 
         Assert.Contains("if (IsTextInputFocused)", body, StringComparison.Ordinal);
     }

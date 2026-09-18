@@ -339,10 +339,12 @@ public class GradientOverlayTests
     {
         // The saved file's gradient comes from the tag through the lopdf
         // writer, whatever the live surface is doing.
-        string body = MethodBody("public bool SaveDocumentAs(string path, bool flatten)");
+        string body = MethodBody("private SavePlan? BeginSave(")
+            + MethodBody("private static void WriteSave(")
+            + MethodBody("private bool FinishSave(");
 
         Assert.DoesNotContain("GradientOverlay", body, StringComparison.Ordinal);
-        Assert.Contains("WriteGradientFills(writePath);", body, StringComparison.Ordinal);
+        Assert.Contains("WriteGradientFills(plan.WritePath);", body, StringComparison.Ordinal);
     }
 
     private static string MethodBody(string signature)

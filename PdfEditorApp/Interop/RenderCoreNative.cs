@@ -1031,6 +1031,23 @@ internal static partial class RenderCoreNative
         [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
     /// <summary>
+    /// The file's language and how it asks to open (panel, layout, title in
+    /// the title bar, first page and zoom), read from the file's catalog as
+    /// NUL-separated pairs; PDFium has no getter for most of it. Release with
+    /// <see cref="free_byte_buffer"/>.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer read_catalog_settings(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>
+    /// The script most of the first pages' text is written in: 0 none or
+    /// Latin, 1 Devanagari, 2 Myanmar, 3 Bengali, 4 Tamil, 5 Thai, 6 Arabic.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int dominant_text_script(ulong docHandle);
+
+    /// <summary>
     /// Writes every gradient-filled shape's paint into the file as a real PDF
     /// shading, which is the second thing PDFium cannot create.
     ///

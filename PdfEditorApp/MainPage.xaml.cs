@@ -215,15 +215,24 @@ public sealed partial class MainPage : Page
                 ApplyRulerVisibility();
             }
 
+            if (args.PropertyName == nameof(ViewModel.IsSaving))
+            {
+                ShowSaving(ViewModel.IsSaving);
+            }
+
             if (args.PropertyName is nameof(ViewModel.CanUndo)
                 or nameof(ViewModel.CanRedo)
                 or nameof(ViewModel.HasDocumentPath)
                 or nameof(ViewModel.IsDirty)
-                or nameof(ViewModel.PageCount))
+                or nameof(ViewModel.PageCount)
+                or nameof(ViewModel.IsSaving))
             {
                 CommandStateChanged?.Invoke(this);
             }
         };
+
+        // Where the file asks to open, once the file has been read for it.
+        ViewModel.FileCatalogLoaded += OnFileCatalogLoaded;
         Loaded += (_, _) =>
         {
             RootGrid.Focus(FocusState.Programmatic);
@@ -754,9 +763,21 @@ public sealed partial class MainPage : Page
             // so Fit page and Actual size were only ever applied at the moment
             // they were chosen in the settings dialog and never on opening a
             // document.
-            if (!firstForThisFile || !RestoreReadingPosition())
+            bool restored = firstForThisFile && RestoreReadingPosition();
+            if (!restored)
             {
                 ApplyDefaultView();
+            }
+
+            // Then what the file itself asks for. Its catalog is read off the
+            // UI thread, so for a big file it may still be on its way; it is
+            // applied when it arrives.
+            if (firstForThisFile)
+            {
+                _openingFor = ViewModel.DocumentPath;
+                _openingRestored = restored;
+                _openingAtUtc = DateTime.UtcNow;
+                ApplyOpeningSettings();
             }
 
             PushVisibleWindow();
@@ -5518,10 +5539,15 @@ public sealed partial class MainPage : Page
     /// </summary>
     public event Action<MainPage>? CommandStateChanged;
 
-    public bool CanUndo => ViewModel.CanUndo;
-    public bool CanRedo => ViewModel.CanRedo;
-    public bool CanSave => ViewModel.HasDocumentPath || ViewModel.IsDirty;
-    public bool CanFind => ViewModel.PageCount > 0;
+    public bool CanUndo => ViewModel.CanUndo && !ViewModel.IsSaving;
+    public bool CanRedo => ViewModel.CanRedo && !ViewModel.IsSaving;
+    public bool CanSave => (ViewModel.HasDocumentPath || ViewModel.IsDirty) && !ViewModel.IsSaving;
+    public bool CanFind => ViewModel.PageCount > 0 && !ViewModel.IsSaving;
+
+    /// <summary>True while this document's save is writing the file.</summary>
+    public bool IsSaving => ViewModel.IsSaving;
+
+    public bool CanShowProperties => ViewModel.PageCount > 0 && !ViewModel.IsSaving;
 
     // The title bar lives in the Window and these handlers live here, so the
     // window calls in rather than duplicating any of it.
@@ -5980,6 +6006,103 @@ public sealed partial class MainPage : Page
         return true;
     }
 
+    /// <summary>The file whose opening settings are waiting for its catalog, or null.</summary>
+    private string? _openingFor;
+
+    /// <summary>Whether a remembered reading position was restored for it, which wins over the file's page and zoom.</summary>
+    private bool _openingRestored;
+
+    private DateTime _openingAtUtc;
+
+    private void OnFileCatalogLoaded()
+    {
+        if (_openingFor is not null)
+        {
+            ApplyOpeningSettings();
+        }
+    }
+
+    /// <summary>
+    /// Honours what the file asks for when it opens: a layout, a panel (or
+    /// full screen), and a page and zoom. Once per file, on its first layout.
+    ///
+    /// The layout is this document's only: the app-wide setting is left as it
+    /// is, or one file asking for single pages would change every file after
+    /// it. The page and zoom give way to a remembered reading position, which
+    /// is the reader's own. "Page only" is not honoured by closing panels,
+    /// because most files say it by default.
+    /// </summary>
+    private void ApplyOpeningSettings()
+    {
+        if (_openingFor is not { } path
+            || !string.Equals(path, ViewModel.DocumentPath, StringComparison.OrdinalIgnoreCase))
+        {
+            _openingFor = null;
+            return;
+        }
+
+        if (ViewModel.Catalog is not { } catalog)
+        {
+            return;
+        }
+        _openingFor = null;
+
+        if (OpenSettingsText.LayoutToShow(catalog.PageLayout) is { } layout
+            && layout != ViewModel.PageViewMode)
+        {
+            ViewModel.SetPageViewMode(layout);
+            SyncBarViewState();
+        }
+
+        switch (OpenSettingsText.PanelToShow(catalog.PageMode))
+        {
+            case "Bookmarks" when ViewModel.Bookmarks.Count > 0 && BookmarkPanel.Visibility != Visibility.Visible:
+                ToggleBookmarks();
+                break;
+            case "Pages" when ThumbnailPanel.Visibility != Visibility.Visible:
+                ToggleThumbnails();
+                break;
+            case "FullScreen" when App.Window is MainWindow window && ReferenceEquals(window.ActivePage, this):
+                window.SetFullScreen(true);
+                break;
+        }
+
+        // A catalog arriving late moves the view only while the reader can
+        // not yet have started reading; after that it would be a jump.
+        bool late = DateTime.UtcNow - _openingAtUtc > TimeSpan.FromSeconds(3);
+        if (_openingRestored || late || catalog.Open is not { } open)
+        {
+            return;
+        }
+
+        Diag.Log($"opening settings: page {open.Page} zoom '{open.Zoom}' layout '{catalog.PageLayout}' mode '{catalog.PageMode}'");
+
+        // Queued, so it lands after the relayout a layout change has just
+        // queued, which would otherwise put the default zoom back over it.
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            switch (open.Zoom)
+            {
+                case "page": ZoomFitPage_Click(this, null!); break;
+                case "width": ZoomFitWidth_Click(this, null!); break;
+                default:
+                    if (OpenSettingsText.ZoomFactor(open.Zoom) is { } factor)
+                    {
+                        ZoomPreset_Click(new MenuFlyoutItem
+                        {
+                            Tag = factor.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        }, null!);
+                    }
+                    break;
+            }
+
+            if (open.Page > 0 && open.Page < ViewModel.PageCount)
+            {
+                ViewModel.GoToPage(open.Page, animate: false);
+            }
+        });
+    }
+
     /// <summary>The saved default view, applied once a document has pages to fit.</summary>
     private void ApplyDefaultView()
     {
@@ -6299,11 +6422,49 @@ public sealed partial class MainPage : Page
             return await SaveAsAsync();
         }
 
-        bool saved = ViewModel.SaveDocument();
+        bool saved = await ViewModel.SaveDocumentAsync();
         if (saved) { ViewModel.SaveGuidesToSidecar(); }
         Debug.WriteLine($"[MainPage] Save -> {(saved ? "ok" : "failed")}");
         return saved;
     }
+
+    /// <summary>
+    /// Covers the page while a save writes the file, and shows what it is
+    /// doing if it takes long enough to wonder about.
+    /// </summary>
+    private void ShowSaving(bool saving)
+    {
+        SavingOverlay.Visibility = saving ? Visibility.Visible : Visibility.Collapsed;
+        SavingCard.Visibility = Visibility.Collapsed;
+
+        // The menu lives in the title bar, outside the overlay, and its
+        // shortcuts go with it while it is disabled.
+        AppMenuBar.IsEnabled = !saving;
+
+        _savingCardTimer?.Stop();
+        if (!saving)
+        {
+            RootGrid.Focus(FocusState.Programmatic);
+            return;
+        }
+
+        if (_savingCardTimer is null)
+        {
+            _savingCardTimer = DispatcherQueue.CreateTimer();
+            _savingCardTimer.Interval = TimeSpan.FromMilliseconds(400);
+            _savingCardTimer.IsRepeating = false;
+            _savingCardTimer.Tick += (_, _) =>
+            {
+                if (ViewModel.IsSaving)
+                {
+                    SavingCard.Visibility = Visibility.Visible;
+                }
+            };
+        }
+        _savingCardTimer.Start();
+    }
+
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _savingCardTimer;
 
     private async void SaveAs_Click(object sender, RoutedEventArgs e) => await SaveAsAsync();
 
@@ -6316,6 +6477,11 @@ public sealed partial class MainPage : Page
 
     private async Task<bool> SaveAsAsync(bool flatten)
     {
+        if (ViewModel.IsSaving)
+        {
+            return false;
+        }
+
         var picker = new Windows.Storage.Pickers.FileSavePicker();
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
@@ -6328,7 +6494,7 @@ public sealed partial class MainPage : Page
             return false;
         }
 
-        bool saved = ViewModel.SaveDocumentAs(file.Path, flatten);
+        bool saved = await ViewModel.SaveDocumentAsAsync(file.Path, flatten);
         // Ruler guides live in a sidecar next to the PDF; write it whenever
         // the PDF itself is saved so a reopen from the new location shows the
         // same guides. Non-fatal if it fails.
@@ -6402,7 +6568,7 @@ public sealed partial class MainPage : Page
     /// </summary>
     private async void DocumentProperties_Click(object sender, RoutedEventArgs e)
     {
-        if (ViewModel.ReadDocumentInfo() is not { } info)
+        if (ViewModel.IsSaving || ViewModel.ReadDocumentInfo() is not { } info)
         {
             return;
         }
@@ -6412,6 +6578,9 @@ public sealed partial class MainPage : Page
         string? path = ViewModel.DocumentPath;
         bool onDisk = path is not null && System.IO.File.Exists(path);
         bool locked = info.IsEncrypted;
+
+        // Read when the file opened, so this is normally already here.
+        var catalog = await ViewModel.ReadCatalogAsync();
 
         TextBox Field(string name, string value, string placeholder)
         {
@@ -6452,6 +6621,30 @@ public sealed partial class MainPage : Page
             },
         };
 
+        // A drop-down over (value, label) pairs, on the file's own value.
+        ComboBox Choice(string name, List<(string Value, string Label)> choices, string current)
+        {
+            var box = new ComboBox { IsEnabled = !locked, MinWidth = 240 };
+            foreach (var choice in choices)
+            {
+                box.Items.Add(choice.Label);
+            }
+            box.SelectedIndex = Math.Max(0, choices.FindIndex(c => string.Equals(c.Value, current, StringComparison.OrdinalIgnoreCase)));
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(box, name);
+            return box;
+        }
+
+        string Chosen(ComboBox box, List<(string Value, string Label)> choices) =>
+            box.SelectedIndex >= 0 && box.SelectedIndex < choices.Count ? choices[box.SelectedIndex].Value : string.Empty;
+
+        TextBlock Heading(string text) => new() { Text = text, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"] };
+
+        Rectangle Divider() => new()
+        {
+            Height = 1,
+            Fill = (Brush)Application.Current.Resources["DividerStrokeColorDefaultBrush"],
+        };
+
         // What can be changed.
         var title = Field("Title", info.Title, string.Empty);
         var author = Field("Author", info.Author, string.Empty);
@@ -6480,14 +6673,123 @@ public sealed partial class MainPage : Page
         titleRow.Children.Add(title);
         titleRow.Children.Add(useFileName);
 
+        // The language screen readers read the text in, and what search and
+        // copying assume. Word writes its own default whatever the text is, so
+        // Burmese and Hindi files often say English: the script the pages are
+        // actually written in is checked, and a mismatch offered a fix.
+        var languageChoices = DocumentLanguages.Choices(catalog.Language);
+        var language = Choice("Language", languageChoices, catalog.Language);
+        var languageHint = new StackPanel { Spacing = 0, Visibility = Visibility.Collapsed };
+        var languageHintText = Text(string.Empty, secondary);
+        var useSuggested = new HyperlinkButton { Padding = new Thickness(0, 2, 0, 2), IsEnabled = !locked };
+        languageHint.Children.Add(languageHintText);
+        languageHint.Children.Add(useSuggested);
+        var languageCell = new StackPanel { Spacing = 4 };
+        languageCell.Children.Add(language);
+        languageCell.Children.Add(languageHint);
+
+        int script = 0;
+        void UpdateLanguageHint()
+        {
+            string chosen = Chosen(language, languageChoices);
+            if (DocumentLanguages.ForScript(script) is not { } suggested || DocumentLanguages.Fits(chosen, script))
+            {
+                languageHint.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            string name = DocumentLanguages.NameOf(suggested);
+            languageHintText.Text = chosen.Length == 0
+                ? $"The text looks like {name}, and no language is set."
+                : $"The text looks like {name}, but the language says {DocumentLanguages.Describe(chosen)}.";
+            useSuggested.Content = $"Use {name}";
+            languageHint.Visibility = Visibility.Visible;
+        }
+
+        useSuggested.Click += (_, _) =>
+        {
+            if (DocumentLanguages.ForScript(script) is { } suggested)
+            {
+                language.SelectedIndex = Math.Max(0, languageChoices.FindIndex(c => c.Tag == suggested));
+            }
+        };
+        language.SelectionChanged += (_, _) => UpdateLanguageHint();
+
+        async Task DetectScriptAsync()
+        {
+            script = await ViewModel.DetectScriptAsync();
+            UpdateLanguageHint();
+        }
+        _ = DetectScriptAsync();
+
         var editable = TwoColumns(8);
         Row(editable, "Title", titleRow);
         Row(editable, "Author", author);
         Row(editable, "Subject", subject);
         Row(editable, "Keywords", keywords);
+        Row(editable, "Language", languageCell);
 
-        // What the file is.
+        // When this file opens. Written into the file, so any reader honours
+        // it, Ayaan included. "Reader's choice" leaves it to the reader.
+        var opening = TwoColumns(8);
+        var openPage = new NumberBox
+        {
+            Minimum = 1,
+            Maximum = Math.Max(1, info.PageCount),
+            PlaceholderText = "Reader's choice",
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact,
+            Value = catalog.Open is { } open ? open.Page + 1 : double.NaN,
+            Width = 160,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            IsEnabled = !locked,
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(openPage, "Open at page");
+        var zoomChoices = OpenSettingsText.WithCurrent(OpenSettingsText.Zooms, catalog.Open?.Zoom ?? string.Empty);
+        var openZoom = Choice("Open at zoom", zoomChoices, catalog.Open?.Zoom ?? string.Empty);
+        var panelChoices = OpenSettingsText.WithCurrent(OpenSettingsText.Panels, catalog.PageMode);
+        var openPanel = Choice("Show when opening", panelChoices, catalog.PageMode);
+        var layoutChoices = OpenSettingsText.WithCurrent(OpenSettingsText.Layouts, catalog.PageLayout);
+        var openLayout = Choice("Page layout", layoutChoices, catalog.PageLayout);
+        Row(opening, "Page", openPage);
+        Row(opening, "Zoom", openZoom);
+        Row(opening, "Show", openPanel);
+        Row(opening, "Layout", openLayout);
+
+        // The file's own /DisplayDocTitle. An encrypted file cannot be
+        // rewritten, so for one the choice is kept on this computer, as every
+        // file's was before 3.48.
+        bool legacyTitle = TabTitles.IsOn(SettingsStore.Current.TitleInTabPaths, path);
+        bool showTitleWas = locked ? legacyTitle : catalog.ShowTitle || legacyTitle;
+        var showTitle = new CheckBox
+        {
+            Content = "Show the title instead of the file name",
+            IsChecked = showTitleWas,
+            IsEnabled = path is not null,
+        };
+        var openingSection = new StackPanel { Spacing = 8 };
+        openingSection.Children.Add(Heading("When this file opens"));
+        if (catalog.OpenActionOther)
+        {
+            openingSection.Children.Add(Text(
+                "This file runs its own action when it opens, such as a script. Choosing a page or zoom replaces it.", secondary));
+        }
+        openingSection.Children.Add(opening);
+        openingSection.Children.Add(showTitle);
+        openingSection.Children.Add(Text(
+            locked
+                ? "The file is encrypted, so these can't be saved in it. The title choice is kept on this computer."
+                : "Saved in the file, so other PDF readers open it the same way.",
+            secondary));
+
+        // What the file is. Each line is also kept as text for Copy details.
         var facts = TwoColumns(6);
+        var details = new List<(string Label, string Value)>();
+        void Fact(string label, string value)
+        {
+            Row(facts, label, Text(value));
+            details.Add((label, value));
+        }
+
         if (path is not null)
         {
             var file = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
@@ -6499,6 +6801,7 @@ public sealed partial class MainPage : Page
                 file.Children.Add(show);
             }
             Row(facts, "File", file);
+            details.Add(("File", path));
         }
 
         string size = string.Join(", ", new[]
@@ -6507,21 +6810,22 @@ public sealed partial class MainPage : Page
             info.PageCount == 1 ? "1 page" : $"{info.PageCount} pages",
             DocumentFacts.PageSize(info.PageWidth, info.PageHeight, culture),
         }.Where(s => s.Length > 0));
-        Row(facts, "Size", Text(size));
+        Fact("Size", size);
         if (info.Version.Length > 0)
         {
-            Row(facts, "PDF version", Text(info.Version));
+            Fact("PDF version", info.Version);
         }
-        Row(facts, "Created", Text(DocumentFacts.Created(info.Created, info.Creator, culture)));
-        Row(facts, "Modified", Text(DocumentFacts.When(info.Modified, culture)));
+        Fact("Created", DocumentFacts.Created(info.Created, info.Creator, culture));
+        Fact("Modified", DocumentFacts.When(info.Modified, culture));
         if (info.Producer.Length > 0)
         {
-            Row(facts, "Producer", Text(info.Producer));
+            Fact("Producer", info.Producer);
         }
-        Row(facts, "Security", Text(DocumentFacts.Security(info.SecurityRevision, info.Permissions)));
+        Fact("Security", DocumentFacts.Security(info.SecurityRevision, info.Permissions));
 
         // On request: it parses the whole file, which on a big book takes a
         // second or two, and most visits to this dialog are not about fonts.
+        List<FontFact>? fontsFound = null;
         var fonts = new StackPanel { Spacing = 4 };
         var showFonts = new HyperlinkButton { Content = "Show fonts", Padding = new Thickness(0) };
         showFonts.Click += async (_, _) =>
@@ -6540,6 +6844,7 @@ public sealed partial class MainPage : Page
                 return;
             }
 
+            fontsFound = found;
             fonts.Children.Add(Text(DocumentFacts.FontsSummary(found)));
             if (found.Count > 0)
             {
@@ -6554,18 +6859,33 @@ public sealed partial class MainPage : Page
         fonts.Children.Add(showFonts);
         Row(facts, "Fonts", fonts);
 
-        string other = info.Tagged ? "Tagged" : "Not tagged";
+        Fact("Accessibility", info.Tagged ? "Tagged" : "Not tagged");
         if (onDisk)
         {
-            other += FileFacts.IsLinearized(ReadHead(path!)) ? ", fast web view on" : ", fast web view off";
+            Fact("Fast web view", FileFacts.IsLinearized(ReadHead(path!)) ? "On" : "Off");
         }
-        Row(facts, "Other", Text(other));
 
-        var inTab = new CheckBox
+        // Everything above as plain text, for a bug report, an email or a
+        // catalogue. The fields as they stand in the dialog, fonts if shown.
+        var copyDetails = new HyperlinkButton { Content = "Copy details", Padding = new Thickness(0, 4, 0, 4) };
+        copyDetails.Click += (_, _) =>
         {
-            Content = "Show the title in the tab instead of the file name",
-            IsChecked = TabTitles.IsOn(SettingsStore.Current.TitleInTabPaths, path),
-            IsEnabled = path is not null,
+            var lines = new List<(string Label, string Value)>
+            {
+                ("Title", title.Text), ("Author", author.Text), ("Subject", subject.Text), ("Keywords", keywords.Text),
+                ("Language", DocumentLanguages.Describe(Chosen(language, languageChoices))),
+            };
+            lines.AddRange(details);
+            if (fontsFound is not null)
+            {
+                lines.Add(("Fonts", DocumentFacts.FontsSummary(fontsFound)));
+                lines.AddRange(fontsFound.Select(f => (string.Empty, f.Describe())));
+            }
+
+            var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
+            package.SetText(DocumentFacts.AsText(lines));
+            Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+            copyDetails.Content = "Copied";
         };
 
         // Remove personal info. Waits for the save like every other change
@@ -6578,6 +6898,16 @@ public sealed partial class MainPage : Page
             IsEnabled = !locked,
         };
         var personalDetails = new StackPanel { Spacing = 2, Margin = new Thickness(28, 0, 0, 0), Visibility = Visibility.Collapsed };
+
+        // The dates say when the work was done, which can matter as much as
+        // who did it. Off by default: most people want them kept.
+        var removeDates = new CheckBox
+        {
+            Content = "Also remove the created and modified dates",
+            IsChecked = ViewModel.WillRemoveDates,
+            Margin = new Thickness(28, 0, 0, 0),
+            Visibility = Visibility.Collapsed,
+        };
         string authorBefore = author.Text;
 
         // One check per visit, however often the box is ticked, and only the
@@ -6592,7 +6922,7 @@ public sealed partial class MainPage : Page
             personalDetails.Children.Clear();
             personalDetails.Children.Add(Text(
                 "The file is rewritten whole, so earlier versions saved inside it go too. "
-                + "The title, subject, keywords and dates stay.", secondary));
+                + "The title, subject and keywords stay.", secondary));
 
             personalCheck ??= ViewModel.FindPersonalInfoAsync();
             StackPanel? checking = null;
@@ -6648,6 +6978,7 @@ public sealed partial class MainPage : Page
                 author.Text = authorBefore;
             }
             author.IsEnabled = !on;
+            removeDates.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
 
             if (on)
             {
@@ -6669,6 +7000,7 @@ public sealed partial class MainPage : Page
         var personal = new StackPanel { Spacing = 4 };
         personal.Children.Add(removePersonal);
         personal.Children.Add(personalDetails);
+        personal.Children.Add(removeDates);
 
         var panel = new StackPanel { Spacing = 16, MinWidth = 460 };
         if (locked)
@@ -6677,13 +7009,11 @@ public sealed partial class MainPage : Page
         }
         panel.Children.Add(editable);
         panel.Children.Add(personal);
-        panel.Children.Add(new Rectangle
-        {
-            Height = 1,
-            Fill = (Brush)Application.Current.Resources["DividerStrokeColorDefaultBrush"],
-        });
+        panel.Children.Add(Divider());
+        panel.Children.Add(openingSection);
+        panel.Children.Add(Divider());
         panel.Children.Add(facts);
-        panel.Children.Add(inTab);
+        panel.Children.Add(copyDetails);
 
         var dialog = new ContentDialog
         {
@@ -6698,19 +7028,54 @@ public sealed partial class MainPage : Page
 
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
-            ViewModel.ApplyInfoEdits(InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text));
-            ViewModel.SetRemovePersonalInfo(removePersonal.IsChecked == true);
-
-            if (path is not null)
+            bool titleChosen = showTitle.IsChecked == true;
+            var catalogEdits = new CatalogEdits(null, null, null, null, false, null);
+            if (!locked)
             {
-                bool on = inTab.IsChecked == true;
-                SettingsStore.Update(s => s with { TitleInTabPaths = TabTitles.Set(s.TitleInTabPaths, path, on) });
+                // Case alone is not a change: "EN" is the "en" in the list.
+                string lang = Chosen(language, languageChoices);
+                if (string.Equals(lang, catalog.Language, StringComparison.OrdinalIgnoreCase))
+                {
+                    lang = catalog.Language;
+                }
+
+                string zoom = Chosen(openZoom, zoomChoices);
+                OpenView? openAt = double.IsNaN(openPage.Value) && zoom.Length == 0
+                    ? null
+                    : new OpenView(double.IsNaN(openPage.Value) ? 0 : Math.Clamp((int)openPage.Value - 1, 0, Math.Max(0, info.PageCount - 1)), zoom);
+
+                catalogEdits = CatalogEdits.Between(catalog, catalog with
+                {
+                    Language = lang,
+                    PageMode = Chosen(openPanel, panelChoices),
+                    PageLayout = Chosen(openLayout, layoutChoices),
+                    ShowTitle = titleChosen == showTitleWas ? catalog.ShowTitle : titleChosen,
+                    Open = openAt,
+                });
+            }
+
+            ViewModel.ApplyDocumentProperties(
+                InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text),
+                catalogEdits,
+                removePersonal.IsChecked == true,
+                removeDates.IsChecked == true);
+
+            // The title choice now lives in the file. The old per-computer one
+            // is only for a file that cannot be written, and is dropped for a
+            // file once its own choice is made.
+            if (path is not null && titleChosen != showTitleWas)
+            {
+                bool keepHere = locked && titleChosen;
+                SettingsStore.Update(s => s with { TitleInTabPaths = TabTitles.Set(s.TitleInTabPaths, path, keepHere) });
                 SyncTitleInTab();
             }
         }
 
         RootGrid.Focus(FocusState.Programmatic);
     }
+
+    /// <summary>Opens Document properties for this document, from its tab's menu.</summary>
+    public void ShowDocumentProperties() => DocumentProperties_Click(this, null!);
 
     /// <summary>Puts this document's tab-title choice, kept per file in the settings, on the view model.</summary>
     private void SyncTitleInTab() =>
@@ -6830,6 +7195,14 @@ public sealed partial class MainPage : Page
     /// </summary>
     public async Task<bool> ConfirmCloseAsync()
     {
+        // The file is half written; closing now would leave the temp copy and
+        // the original to sort out by hand. The save takes seconds.
+        if (ViewModel.IsSaving)
+        {
+            ViewModel.Status = "Cannot close while the file is still saving.";
+            return false;
+        }
+
         // Written now rather than left to the debounce, which will not fire if
         // the window is closing. Closing a book is exactly when where you got
         // to matters most.
@@ -8362,7 +8735,7 @@ public sealed partial class MainPage : Page
     /// </remarks>
     private void RootGrid_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
     {
-        if (!ViewModel.IsEditingInPlace || _isCtrlDown || IsAltDown()) { return; }
+        if (!ViewModel.IsEditingInPlace || _isCtrlDown || IsAltDown() || ViewModel.IsSaving) { return; }
         if (_textInput is { IsActive: true }) { return; }
 
         // Enter, Escape, Backspace and Tab arrive here too. They are keys, not
@@ -8393,6 +8766,14 @@ public sealed partial class MainPage : Page
             case VirtualKey.RightControl:
                 _isCtrlDown = true;
                 return;
+        }
+
+        // Nothing reaches the document while a save is writing it. Modifier
+        // presses are still tracked above, so Ctrl is known when it ends.
+        if (ViewModel.IsSaving)
+        {
+            e.Handled = true;
+            return;
         }
 
         // Escape puts a definition away and does nothing else: the reader
