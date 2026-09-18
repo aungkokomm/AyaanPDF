@@ -101,7 +101,8 @@ public static class DocumentInfoStamp
     /// </summary>
     public static byte[] Pairs(
         InfoEdits? edits, string producer, string creator, DateTimeOffset now,
-        bool removePersonal = false, bool removeDates = false, CatalogEdits? catalog = null)
+        bool removePersonal = false, bool removeDates = false, CatalogEdits? catalog = null,
+        bool removeAttachments = false)
     {
         var fields = new List<string>();
         void Add(string key, string? value)
@@ -118,6 +119,10 @@ public static class DocumentInfoStamp
         if (removePersonal)
         {
             Add("RemovePersonal", "1");
+            if (removeAttachments)
+            {
+                Add("RemoveAttachments", "1");
+            }
         }
 
         Add("Title", edits?.Title);
@@ -240,7 +245,7 @@ public sealed record CatalogEdits(
 /// One value, so undo can put all of it back in one step.
 /// </summary>
 public sealed record DocumentPropertiesState(
-    InfoEdits? Info, CatalogEdits? Catalog, bool RemovePersonal, bool RemoveDates)
+    InfoEdits? Info, CatalogEdits? Catalog, bool RemovePersonal, bool RemoveDates, bool RemoveAttachments = false)
 {
     public static readonly DocumentPropertiesState None = new(null, null, false, false);
 }

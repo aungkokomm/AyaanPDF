@@ -1048,6 +1048,31 @@ internal static partial class RenderCoreNative
     public static extern int dominant_text_script(ulong docHandle);
 
     /// <summary>
+    /// What each page of a range is made of: per page its index, whether it
+    /// has text, whether this app recognised it, and the fonts it is set in,
+    /// as NUL-separated fields. Loads the pages; off the UI thread.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer survey_pages(ulong docHandle, int first, int count);
+
+    /// <summary>
+    /// Counts of what the file holds besides its pages (Bookmarks, Comments,
+    /// Links, FormFields, Signatures, Attachments) as NUL-separated pairs.
+    /// </summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer document_contents(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>The open document's attached files: name, then size in bytes, per file.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ByteBuffer list_attachments(ulong docHandle);
+
+    /// <summary>Writes one attached file, by its place in <see cref="list_attachments"/>, to a path.</summary>
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int save_attachment(
+        ulong docHandle, int index, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    /// <summary>
     /// Writes every gradient-filled shape's paint into the file as a real PDF
     /// shading, which is the second thing PDFium cannot create.
     ///

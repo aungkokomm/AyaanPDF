@@ -1369,6 +1369,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _fileTitle = null;
         _removePersonal = false;
         _removeDates = false;
+        _removeAttachments = false;
         _catalogEdits = null;
 
         if (_documentHandle == 0)
@@ -2453,7 +2454,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             Outline = outlineToWrite,
             InfoPairs = DocumentInfoStamp.Pairs(
                 _infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now,
-                _removePersonal, _removeDates, _catalogEdits),
+                _removePersonal, _removeDates, _catalogEdits, _removeAttachments),
             RemovingPersonal = _removePersonal,
             HasPropertyEdits = _infoEdits is { HasChanges: true } || _catalogEdits is { HasChanges: true },
         };
@@ -2609,6 +2610,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>Whether the next save also removes the created and modified dates. Only with <see cref="_removePersonal"/>.</summary>
     private bool _removeDates;
 
+    /// <summary>Whether the next save also removes the attached files. Only with <see cref="_removePersonal"/>.</summary>
+    private bool _removeAttachments;
+
     /// <summary>Language and opening settings changed in Document properties, waiting to be written.</summary>
     private CatalogEdits? _catalogEdits;
 
@@ -2616,22 +2620,27 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     public bool WillRemoveDates => _removeDates;
 
+    public bool WillRemoveAttachments => _removeAttachments;
+
     /// <summary>Everything Document properties has changed and a save has yet to write.</summary>
-    public DocumentPropertiesState PendingProperties => new(_infoEdits, _catalogEdits, _removePersonal, _removeDates);
+    public DocumentPropertiesState PendingProperties =>
+        new(_infoEdits, _catalogEdits, _removePersonal, _removeDates, _removeAttachments);
 
     /// <summary>
     /// Takes the dialog's changes, as ONE undo step. Nothing is written until
     /// the next save, the same as a bookmark edit, so the dirty dot and the
     /// unsaved-changes prompt cover it without learning about properties.
     /// </summary>
-    public void ApplyDocumentProperties(InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates)
+    public void ApplyDocumentProperties(
+        InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates, bool removeAttachments)
     {
         var before = PendingProperties;
         var after = new DocumentPropertiesState(
             info.HasChanges ? before.Info?.Then(info) ?? info : before.Info,
             catalog.HasChanges ? before.Catalog?.Then(catalog) ?? catalog : before.Catalog,
             removePersonal,
-            removePersonal && removeDates);
+            removePersonal && removeDates,
+            removePersonal && removeAttachments);
         if (after == before || _documentHandle == 0)
         {
             return;
@@ -2657,6 +2666,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _catalogEdits = state.Catalog;
         _removePersonal = state.RemovePersonal;
         _removeDates = state.RemoveDates;
+        _removeAttachments = state.RemoveAttachments;
         NotifyDocumentTitleChanged();
     }
 
@@ -2803,6 +2813,100 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
     /// <summary>What personal info the document carries. Null when it could not be read.</summary>
     public Task<PersonalInfo?> FindPersonalInfoAsync() =>
         ReadSavedFileAsync(RenderCoreNative.find_personal_info, PersonalInfo.FromBuffer);
+
+    /// <summary>
+    /// The fonts in the file as last saved, without writing a copy first when
+    /// there are unsaved changes: for spotting an old Hindi or Burmese font,
+    /// which comes with the file, never from an edit. Null with no file on disk.
+    /// </summary>
+    public Task<List<FontFact>?> ListFileFontsAsync() =>
+        ReadFileOnDiskAsync(RenderCoreNative.list_document_fonts, DocumentFacts.Fonts);
+
+    /// <summary>What the file as last saved holds besides its pages. Null with no file on disk.</summary>
+    public Task<DocumentContents?> ReadContentsAsync() =>
+        ReadFileOnDiskAsync(RenderCoreNative.document_contents, bytes => DocumentContents.FromPairs(NulFields.Pairs(bytes)));
+
+    /// <summary>The open document's attached files, as it stands now.</summary>
+    public Task<List<AttachedFile>> ListAttachmentsAsync()
+    {
+        ulong handle = _documentHandle;
+        if (handle == 0)
+        {
+            return Task.FromResult(new List<AttachedFile>());
+        }
+        return Task.Run(() => AttachedFile.FromBuffer(TakeBytes(RenderCoreNative.list_attachments(handle)) ?? []));
+    }
+
+    /// <summary>Writes one attached file out to <paramref name="path"/>.</summary>
+    public Task<bool> SaveAttachmentAsync(int index, string path)
+    {
+        ulong handle = _documentHandle;
+        return handle == 0
+            ? Task.FromResult(false)
+            : Task.Run(() => RenderCoreNative.save_attachment(handle, index, path) == RenderStatus.OkPdfium);
+    }
+
+    /// <summary>
+    /// Looks at every page: whether it has text, whether it was recognised,
+    /// and the fonts it is set in. A few pages per core call, so the lock is
+    /// let go between them and a large book can be stopped part way. Null when
+    /// stopped, or when the document changed underneath.
+    /// </summary>
+    public async Task<List<PageFacts>?> SurveyPagesAsync(IProgress<int>? progress, System.Threading.CancellationToken token)
+    {
+        const int PagesPerStep = 16;
+        ulong handle = _documentHandle;
+        int count = PageCount;
+        var found = new List<PageFacts>(count);
+        for (int first = 0; first < count; first += PagesPerStep)
+        {
+            if (token.IsCancellationRequested || handle != _documentHandle)
+            {
+                return null;
+            }
+            int from = first;
+            var step = await Task.Run(() => TakeBytes(RenderCoreNative.survey_pages(handle, from, PagesPerStep)));
+            if (step is null)
+            {
+                return null;
+            }
+            found.AddRange(PageSurvey.Parse(step));
+            progress?.Report(Math.Min(count, first + PagesPerStep));
+        }
+        return handle == _documentHandle ? found : null;
+    }
+
+    /// <summary>A core answer's bytes, the buffer released; null when the core refused.</summary>
+    private static byte[]? TakeBytes(ByteBuffer buffer)
+    {
+        try
+        {
+            if (buffer.Status != RenderStatus.OkPdfium)
+            {
+                return null;
+            }
+            byte[] bytes = new byte[(int)buffer.Len];
+            if (bytes.Length > 0)
+            {
+                Marshal.Copy(buffer.Data, bytes, 0, bytes.Length);
+            }
+            return bytes;
+        }
+        finally
+        {
+            RenderCoreNative.free_byte_buffer(buffer);
+        }
+    }
+
+    /// <summary>Asks the core about the file on disk as it is, off the UI thread. Null with no file.</summary>
+    private Task<T?> ReadFileOnDiskAsync<T>(Func<string, ByteBuffer> ask, Func<byte[], T> parse) where T : class
+    {
+        if (_documentHandle == 0 || _currentDocumentPath is not { } path || !File.Exists(path))
+        {
+            return Task.FromResult<T?>(null);
+        }
+        return Task.Run(() => TakeBytes(ask(path)) is { } bytes ? parse(bytes) : null);
+    }
 
     /// <summary>
     /// Asks the core a question about the document as a FILE: the file on disk

@@ -421,7 +421,7 @@ public class DocumentPropertiesTests
         // What the stamp says is taken before the write, with everything pending.
         string begin = Body(vm, "private SavePlan? BeginSave(string path, bool flatten)");
         Assert.Contains("_infoEdits, AppInfo.Producer, AppInfo.Name, DateTimeOffset.Now,", begin, StringComparison.Ordinal);
-        Assert.Contains("_removePersonal, _removeDates, _catalogEdits)", begin, StringComparison.Ordinal);
+        Assert.Contains("_removePersonal, _removeDates, _catalogEdits, _removeAttachments)", begin, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -442,7 +442,7 @@ public class DocumentPropertiesTests
     {
         string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
 
-        string apply = Body(vm, "public void ApplyDocumentProperties(InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates)");
+        string apply = Body(vm, "public void ApplyDocumentProperties(");
         Assert.Contains("IsDirty = true;", apply, StringComparison.Ordinal);
         Assert.DoesNotContain("write_document_info", apply, StringComparison.Ordinal);
 
@@ -698,7 +698,7 @@ public class DocumentPropertiesTests
     public void a_properties_change_is_one_undo_step()
     {
         string vm = Read("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
-        string apply = Body(vm, "public void ApplyDocumentProperties(InfoEdits info, CatalogEdits catalog, bool removePersonal, bool removeDates)");
+        string apply = Body(vm, "public void ApplyDocumentProperties(");
         Assert.Contains("Scope = HistoryScope.Properties,", apply, StringComparison.Ordinal);
         Assert.Contains("PropertiesBefore = before,", apply, StringComparison.Ordinal);
         Assert.Contains("PropertiesAfter = after,", apply, StringComparison.Ordinal);

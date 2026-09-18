@@ -6574,13 +6574,26 @@ public sealed partial class MainPage : Page
         }
 
         var culture = System.Globalization.CultureInfo.CurrentCulture;
+        var primary = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
         var secondary = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"];
         string? path = ViewModel.DocumentPath;
         bool onDisk = path is not null && System.IO.File.Exists(path);
         bool locked = info.IsEncrypted;
+        int pageCount = ViewModel.PageCount;
 
         // Read when the file opened, so this is normally already here.
         var catalog = await ViewModel.ReadCatalogAsync();
+
+        // Started now and shown as each arrives, so the dialog opens at once.
+        var fileFonts = ViewModel.ListFileFontsAsync();
+        var contentsRead = ViewModel.ReadContentsAsync();
+        var attachmentsRead = ViewModel.ListAttachmentsAsync();
+
+        // A page check stops when the dialog closes. Recognize text, asked for
+        // from inside the dialog, closes it and opens once it has gone.
+        using var closing = new System.Threading.CancellationTokenSource();
+        OcrRequest? recognize = null;
+        ContentDialog? dialog = null;
 
         TextBox Field(string name, string value, string placeholder)
         {
@@ -6595,10 +6608,10 @@ public sealed partial class MainPage : Page
             TextWrapping = TextWrapping.Wrap,
             IsTextSelectionEnabled = true,
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = brush ?? (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"],
+            Foreground = brush ?? primary,
         };
 
-        void Row(Grid grid, string label, UIElement value)
+        TextBlock Row(Grid grid, string label, UIElement value)
         {
             int row = grid.RowDefinitions.Count;
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -6608,6 +6621,7 @@ public sealed partial class MainPage : Page
             Grid.SetColumn((FrameworkElement)value, 1);
             grid.Children.Add(name);
             grid.Children.Add(value);
+            return name;
         }
 
         Grid TwoColumns(double rowSpacing) => new()
@@ -6639,13 +6653,46 @@ public sealed partial class MainPage : Page
 
         TextBlock Heading(string text) => new() { Text = text, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"] };
 
-        Rectangle Divider() => new()
+        StackPanel Busy(TextBlock label)
         {
-            Height = 1,
-            Fill = (Brush)Application.Current.Resources["DividerStrokeColorDefaultBrush"],
-        };
+            var busy = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+            busy.Children.Add(new ProgressRing { IsActive = true, Width = 16, Height = 16 });
+            busy.Children.Add(label);
+            return busy;
+        }
 
-        // What can be changed.
+        HyperlinkButton Link(string text) => new() { Content = text, Padding = new Thickness(0, 2, 0, 2) };
+
+        // The page check: once per visit however many places ask for it, each
+        // showing its own progress while it waits.
+        Task<List<PageFacts>?>? survey = null;
+        var surveyWatchers = new List<Action<int>>();
+
+        async Task<PageFindings?> FindingsAsync(TextBlock progress)
+        {
+            void Show(int done) => progress.Text = $"Checked {done} of {pageCount} pages";
+            surveyWatchers.Add(Show);
+            try
+            {
+                survey ??= ViewModel.SurveyPagesAsync(
+                    new Progress<int>(done => surveyWatchers.ForEach(watch => watch(done))), closing.Token);
+                var pages = await survey;
+                return pages is null ? null : PageSurvey.Summarise(pages, pageCount);
+            }
+            finally
+            {
+                surveyWatchers.Remove(Show);
+            }
+        }
+
+        void Recognize(OcrRequest request)
+        {
+            recognize = request;
+            dialog?.Hide();
+        }
+
+        // ================ Description ================
+
         var title = Field("Title", info.Title, string.Empty);
         var author = Field("Author", info.Author, string.Empty);
         var subject = Field("Subject", info.Subject, "What the document is about");
@@ -6679,7 +6726,7 @@ public sealed partial class MainPage : Page
         // actually written in is checked, and a mismatch offered a fix.
         var languageChoices = DocumentLanguages.Choices(catalog.Language);
         var language = Choice("Language", languageChoices, catalog.Language);
-        var languageHint = new StackPanel { Spacing = 0, Visibility = Visibility.Collapsed };
+        var languageHint = new StackPanel { Visibility = Visibility.Collapsed };
         var languageHintText = Text(string.Empty, secondary);
         var useSuggested = new HyperlinkButton { Padding = new Thickness(0, 2, 0, 2), IsEnabled = !locked };
         languageHint.Children.Add(languageHintText);
@@ -6722,12 +6769,204 @@ public sealed partial class MainPage : Page
         }
         _ = DetectScriptAsync();
 
+        // An old Hindi or Burmese font, known by name among the file's fonts.
+        // The page looks right and its text is something else, which no
+        // language setting can mend; recognising the pages can.
+        var legacyNote = new StackPanel { Spacing = 2, Visibility = Visibility.Collapsed };
+        languageCell.Children.Add(legacyNote);
+
+        async Task ShowLegacyAsync()
+        {
+            var fonts = await fileFonts;
+            var legacy = fonts is null ? [] : LegacyFonts.In(fonts.Select(f => f.Name));
+            if (legacy.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var font in legacy)
+            {
+                legacyNote.Children.Add(Text(font.Warning, secondary));
+            }
+
+            var read = Link("Recognize text...");
+            var status = Text(string.Empty, secondary);
+            status.Visibility = Visibility.Collapsed;
+            read.Click += async (_, _) =>
+            {
+                read.IsEnabled = false;
+                status.Text = "Finding the pages";
+                status.Visibility = Visibility.Visible;
+
+                var findings = await FindingsAsync(status);
+                if (findings is null)
+                {
+                    status.Text = "The pages couldn't be checked.";
+                    read.IsEnabled = true;
+                    return;
+                }
+                if (findings.LegacyRequest() is not { } request)
+                {
+                    status.Text = "Every page in these fonts already has recognised text, so search finds its words.";
+                    return;
+                }
+                Recognize(request);
+            };
+            legacyNote.Children.Add(read);
+            legacyNote.Children.Add(status);
+            legacyNote.Children.Add(Text(
+                "Recognize text reads those pages and adds a Unicode copy of their words, so search finds them. The old letters stay as they are.",
+                secondary));
+            legacyNote.Visibility = Visibility.Visible;
+        }
+        _ = ShowLegacyAsync();
+
         var editable = TwoColumns(8);
         Row(editable, "Title", titleRow);
         Row(editable, "Author", author);
         Row(editable, "Subject", subject);
         Row(editable, "Keywords", keywords);
         Row(editable, "Language", languageCell);
+
+        // Remove personal info. Waits for the save like every other change
+        // here, and says what it found in THIS file, so ticking it is a
+        // decision about something visible rather than a leap of faith.
+        var removePersonal = new CheckBox
+        {
+            Content = "Remove personal info when saving",
+            IsChecked = ViewModel.WillRemovePersonalInfo,
+            IsEnabled = !locked,
+        };
+        var personalDetails = new StackPanel { Spacing = 2, Margin = new Thickness(28, 0, 0, 0), Visibility = Visibility.Collapsed };
+
+        // The dates say when the work was done, which can matter as much as
+        // who did it. Off by default: most people want them kept.
+        var removeDates = new CheckBox
+        {
+            Content = "Also remove the created and modified dates",
+            IsChecked = ViewModel.WillRemoveDates,
+            Margin = new Thickness(28, 0, 0, 0),
+            Visibility = Visibility.Collapsed,
+        };
+
+        // Attached files can be anything, a spreadsheet of salaries included.
+        // Offered only when the document has some.
+        var removeAttachments = new CheckBox
+        {
+            Content = "Also remove the attached files",
+            IsChecked = ViewModel.WillRemoveAttachments,
+            Margin = new Thickness(28, 0, 0, 0),
+            Visibility = Visibility.Collapsed,
+        };
+        int attachedCount = 0;
+        string authorBefore = author.Text;
+
+        // One check per visit, however often the box is ticked, and only the
+        // latest tick draws its result.
+        Task<PersonalInfo?>? personalCheck = null;
+        int personalShown = 0;
+
+        async Task ShowPersonalAsync()
+        {
+            int mine = ++personalShown;
+            personalDetails.Visibility = Visibility.Visible;
+            personalDetails.Children.Clear();
+            personalDetails.Children.Add(Text(
+                "The file is rewritten whole, so earlier versions saved inside it go too. "
+                + "The title, subject and keywords stay.", secondary));
+
+            personalCheck ??= ViewModel.FindPersonalInfoAsync();
+            StackPanel? checking = null;
+            if (!personalCheck.IsCompleted)
+            {
+                checking = Busy(Text("Checking the file", secondary));
+                personalDetails.Children.Add(checking);
+            }
+
+            var personalFound = await personalCheck;
+            if (mine != personalShown || removePersonal.IsChecked != true)
+            {
+                return;
+            }
+            if (checking is not null)
+            {
+                personalDetails.Children.Remove(checking);
+            }
+
+            var lines = personalFound?.Lines(title.Text) ?? [];
+            if (personalFound is null)
+            {
+                personalDetails.Children.Add(Text("Couldn't check the file. Anything personal will still be removed."));
+            }
+            else if (lines.Count == 0)
+            {
+                personalDetails.Children.Add(Text("Nothing personal was found in this file."));
+            }
+            else
+            {
+                personalDetails.Children.Add(Text("Found and to be removed:"));
+                foreach (string line in lines)
+                {
+                    personalDetails.Children.Add(Text("• " + line));
+                }
+            }
+        }
+
+        void ShowAttachmentChoice() =>
+            removeAttachments.Visibility = removePersonal.IsChecked == true && attachedCount > 0
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+        void ApplyPersonalChoice()
+        {
+            bool on = removePersonal.IsChecked == true;
+
+            // The author is the first thing that goes, so the field shows it gone.
+            if (on)
+            {
+                authorBefore = author.Text;
+                author.Text = string.Empty;
+            }
+            else
+            {
+                author.Text = authorBefore;
+            }
+            author.IsEnabled = !on;
+            removeDates.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+            ShowAttachmentChoice();
+
+            if (on)
+            {
+                _ = ShowPersonalAsync();
+            }
+            else
+            {
+                personalDetails.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        removePersonal.Checked += (_, _) => ApplyPersonalChoice();
+        removePersonal.Unchecked += (_, _) => ApplyPersonalChoice();
+        if (removePersonal.IsChecked == true)
+        {
+            ApplyPersonalChoice();
+        }
+
+        var personal = new StackPanel { Spacing = 4 };
+        personal.Children.Add(removePersonal);
+        personal.Children.Add(personalDetails);
+        personal.Children.Add(removeDates);
+        personal.Children.Add(removeAttachments);
+
+        var descriptionTab = new StackPanel { Spacing = 16 };
+        if (locked)
+        {
+            descriptionTab.Children.Add(Text("This file is encrypted, so its title, author, subject and keywords can't be changed.", secondary));
+        }
+        descriptionTab.Children.Add(editable);
+        descriptionTab.Children.Add(personal);
+
+        // ================ Opening ================
 
         // When this file opens. Written into the file, so any reader honours
         // it, Ayaan included. "Reader's choice" leaves it to the reader.
@@ -6766,20 +7005,22 @@ public sealed partial class MainPage : Page
             IsChecked = showTitleWas,
             IsEnabled = path is not null,
         };
-        var openingSection = new StackPanel { Spacing = 8 };
-        openingSection.Children.Add(Heading("When this file opens"));
+        var openingTab = new StackPanel { Spacing = 8 };
+        openingTab.Children.Add(Heading("When this file opens"));
         if (catalog.OpenActionOther)
         {
-            openingSection.Children.Add(Text(
+            openingTab.Children.Add(Text(
                 "This file runs its own action when it opens, such as a script. Choosing a page or zoom replaces it.", secondary));
         }
-        openingSection.Children.Add(opening);
-        openingSection.Children.Add(showTitle);
-        openingSection.Children.Add(Text(
+        openingTab.Children.Add(opening);
+        openingTab.Children.Add(showTitle);
+        openingTab.Children.Add(Text(
             locked
                 ? "The file is encrypted, so these can't be saved in it. The title choice is kept on this computer."
                 : "Saved in the file, so other PDF readers open it the same way.",
             secondary));
+
+        // ================ File ================
 
         // What the file is. Each line is also kept as text for Copy details.
         var facts = TwoColumns(6);
@@ -6825,18 +7066,17 @@ public sealed partial class MainPage : Page
 
         // On request: it parses the whole file, which on a big book takes a
         // second or two, and most visits to this dialog are not about fonts.
+        // The file as saved has usually been read already, for the old-font
+        // check; unsaved changes can add fonts, so they are read afresh.
         List<FontFact>? fontsFound = null;
         var fonts = new StackPanel { Spacing = 4 };
         var showFonts = new HyperlinkButton { Content = "Show fonts", Padding = new Thickness(0) };
         showFonts.Click += async (_, _) =>
         {
             fonts.Children.Clear();
-            var reading = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
-            reading.Children.Add(new ProgressRing { IsActive = true, Width = 16, Height = 16 });
-            reading.Children.Add(Text("Reading the fonts", secondary));
-            fonts.Children.Add(reading);
+            fonts.Children.Add(Busy(Text("Reading the fonts", secondary)));
 
-            var found = await ViewModel.ListFontsAsync();
+            var found = ViewModel.IsDirty ? await ViewModel.ListFontsAsync() : await fileFonts;
             fonts.Children.Clear();
             if (found is null)
             {
@@ -6851,7 +7091,10 @@ public sealed partial class MainPage : Page
                 var list = new StackPanel { Spacing = 2 };
                 foreach (var font in found)
                 {
-                    list.Children.Add(Text(font.Describe(), secondary));
+                    string old = LegacyFonts.Recognise(font.Name) is { } legacy
+                        ? $", old {legacy.Language} font, not Unicode"
+                        : string.Empty;
+                    list.Children.Add(Text(font.Describe() + old, secondary));
                 }
                 fonts.Children.Add(new ScrollViewer { Content = list, MaxHeight = 160 });
             }
@@ -6864,6 +7107,133 @@ public sealed partial class MainPage : Page
         {
             Fact("Fast web view", FileFacts.IsLinearized(ReadHead(path!)) ? "On" : "Off");
         }
+
+        // What the file holds besides its pages, counted from the file itself.
+        if (onDisk)
+        {
+            var contentsText = Text("Counting", secondary);
+            Row(facts, "Contents", contentsText);
+
+            async Task ShowContentsAsync()
+            {
+                var contents = await contentsRead;
+                string said = contents?.Describe() ?? "Couldn't be counted.";
+                if (contents is not null && ViewModel.IsDirty)
+                {
+                    said += " (as last saved)";
+                }
+                contentsText.Text = said;
+                contentsText.Foreground = primary;
+                details.Add(("Contents", said));
+            }
+            _ = ShowContentsAsync();
+        }
+
+        // The attached files, each one to save out. From the open document, so
+        // it is what the document holds now.
+        var attachedCell = new StackPanel { Spacing = 2, Visibility = Visibility.Collapsed };
+        var attachedLabel = Row(facts, "Attached files", attachedCell);
+        attachedLabel.Visibility = Visibility.Collapsed;
+
+        async Task SaveAttachedFileAsync(AttachedFile attached, HyperlinkButton button)
+        {
+            var picker = new Windows.Storage.Pickers.FileSavePicker();
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
+            string extension = System.IO.Path.GetExtension(attached.Name);
+            picker.SuggestedFileName = System.IO.Path.GetFileNameWithoutExtension(attached.Name);
+            picker.FileTypeChoices.Add("Attached file", new List<string> { extension.Length > 1 ? extension : ".bin" });
+            var target = await picker.PickSaveFileAsync();
+            if (target is null)
+            {
+                return;
+            }
+            button.Content = await ViewModel.SaveAttachmentAsync(attached.Index, target.Path) ? "Saved" : "Couldn't save";
+        }
+
+        async Task ShowAttachmentsAsync()
+        {
+            var attached = await attachmentsRead;
+            attachedCount = attached.Count;
+            removeAttachments.Content = attachedCount == 1
+                ? "Also remove the attached file"
+                : $"Also remove the {attachedCount} attached files";
+            ShowAttachmentChoice();
+            if (attached.Count == 0)
+            {
+                return;
+            }
+
+            var list = new StackPanel { Spacing = 2 };
+            foreach (var one in attached)
+            {
+                var line = new Grid
+                {
+                    ColumnSpacing = 8,
+                    ColumnDefinitions =
+                    {
+                        new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                        new ColumnDefinition { Width = GridLength.Auto },
+                    },
+                };
+                line.Children.Add(Text($"{one.Name} ({DocumentFacts.FileSize(one.Size, culture)})"));
+                var save = new HyperlinkButton { Content = "Save", Padding = new Thickness(4, 0, 4, 0) };
+                save.Click += async (_, _) => await SaveAttachedFileAsync(one, save);
+                Grid.SetColumn(save, 1);
+                line.Children.Add(save);
+                list.Children.Add(line);
+            }
+            attachedCell.Children.Add(new ScrollViewer { Content = list, MaxHeight = 140 });
+            attachedCell.Visibility = Visibility.Visible;
+            attachedLabel.Visibility = Visibility.Visible;
+            details.Add(("Attached files", string.Join(", ", attached.Select(a => a.Name))));
+        }
+        _ = ShowAttachmentsAsync();
+
+        // Which pages have text, and which are set in an old font. Every page
+        // is looked at, so only on request, with its progress, and stopped if
+        // the dialog closes first.
+        var textCell = new StackPanel { Spacing = 2 };
+        var checkPages = new HyperlinkButton { Content = "Check pages", Padding = new Thickness(0) };
+        textCell.Children.Add(checkPages);
+        Row(facts, "Text", textCell);
+        checkPages.Click += async (_, _) =>
+        {
+            textCell.Children.Clear();
+            var progress = Text(pageCount == 1 ? "Checking the page" : $"Checking {pageCount} pages", secondary);
+            textCell.Children.Add(Busy(progress));
+
+            var findings = await FindingsAsync(progress);
+            textCell.Children.Clear();
+            if (findings is null)
+            {
+                textCell.Children.Add(Text("The pages couldn't be checked."));
+                return;
+            }
+
+            var said = new List<string> { findings.TextLine };
+            textCell.Children.Add(Text(findings.TextLine));
+            if (findings.WithoutText.Count > 0)
+            {
+                var read = Link("Recognize text on these pages");
+                read.Click += (_, _) => Recognize(OcrRequest.ForPagesWithoutText(findings.WithoutText));
+                textCell.Children.Add(read);
+            }
+            foreach (var group in findings.Legacy)
+            {
+                string line = PageFindings.LegacyLine(group);
+                said.Add(line);
+                textCell.Children.Add(Text(line));
+            }
+            if (findings.LegacyRequest() is { } legacyRequest)
+            {
+                // "Pages in Kruti Dev" reads on as "the pages in Kruti Dev".
+                string which = char.ToLowerInvariant(legacyRequest.What[0]) + legacyRequest.What[1..];
+                var read = Link($"Recognize text on the {which}");
+                read.Click += (_, _) => Recognize(legacyRequest);
+                textCell.Children.Add(read);
+            }
+            details.Add(("Text", string.Join(" ", said)));
+        };
 
         // Everything above as plain text, for a bug report, an email or a
         // catalogue. The fields as they stand in the dialog, fonts if shown.
@@ -6888,145 +7258,77 @@ public sealed partial class MainPage : Page
             copyDetails.Content = "Copied";
         };
 
-        // Remove personal info. Waits for the save like every other change
-        // here, and says what it found in THIS file, so ticking it is a
-        // decision about something visible rather than a leap of faith.
-        var removePersonal = new CheckBox
+        var fileTab = new StackPanel { Spacing = 8 };
+        fileTab.Children.Add(facts);
+        fileTab.Children.Add(copyDetails);
+
+        // ================ The tabs ================
+
+        // Three tabs rather than one long scroll. All three are laid out once,
+        // the unseen ones invisible, so the dialog takes the height of the
+        // tallest and does not jump when the tab changes.
+        var tabs = new SelectorBar();
+        var tabPages = new (SelectorBarItem Item, FrameworkElement Page)[]
         {
-            Content = "Remove personal info when saving",
-            IsChecked = ViewModel.WillRemovePersonalInfo,
-            IsEnabled = !locked,
+            (new SelectorBarItem { Text = "Description", IsSelected = true }, descriptionTab),
+            (new SelectorBarItem { Text = "Opening" }, openingTab),
+            (new SelectorBarItem { Text = "File" }, fileTab),
         };
-        var personalDetails = new StackPanel { Spacing = 2, Margin = new Thickness(28, 0, 0, 0), Visibility = Visibility.Collapsed };
-
-        // The dates say when the work was done, which can matter as much as
-        // who did it. Off by default: most people want them kept.
-        var removeDates = new CheckBox
+        var host = new Grid { MinWidth = 480, Margin = new Thickness(0, 12, 0, 0) };
+        foreach (var (item, page) in tabPages)
         {
-            Content = "Also remove the created and modified dates",
-            IsChecked = ViewModel.WillRemoveDates,
-            Margin = new Thickness(28, 0, 0, 0),
-            Visibility = Visibility.Collapsed,
+            tabs.Items.Add(item);
+            page.Opacity = item.IsSelected ? 1 : 0;
+            page.IsHitTestVisible = item.IsSelected;
+            host.Children.Add(page);
+        }
+
+        void ShowTab()
+        {
+            foreach (var (item, page) in tabPages)
+            {
+                page.Visibility = item.IsSelected ? Visibility.Visible : Visibility.Collapsed;
+                page.Opacity = 1;
+                page.IsHitTestVisible = true;
+            }
+        }
+        tabs.SelectionChanged += (_, _) => ShowTab();
+        host.Loaded += (_, _) =>
+        {
+            host.MinHeight = host.ActualHeight;
+            ShowTab();
         };
-        string authorBefore = author.Text;
 
-        // One check per visit, however often the box is ticked, and only the
-        // latest tick draws its result.
-        Task<PersonalInfo?>? personalCheck = null;
-        int personalShown = 0;
-
-        async Task ShowPersonalAsync()
+        var body = new Grid
         {
-            int mine = ++personalShown;
-            personalDetails.Visibility = Visibility.Visible;
-            personalDetails.Children.Clear();
-            personalDetails.Children.Add(Text(
-                "The file is rewritten whole, so earlier versions saved inside it go too. "
-                + "The title, subject and keywords stay.", secondary));
-
-            personalCheck ??= ViewModel.FindPersonalInfoAsync();
-            StackPanel? checking = null;
-            if (!personalCheck.IsCompleted)
+            RowDefinitions =
             {
-                checking = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
-                checking.Children.Add(new ProgressRing { IsActive = true, Width = 16, Height = 16 });
-                checking.Children.Add(Text("Checking the file", secondary));
-                personalDetails.Children.Add(checking);
-            }
+                new RowDefinition { Height = GridLength.Auto },
+                new RowDefinition { Height = new GridLength(1, GridUnitType.Star) },
+            },
+        };
+        var scroller = new ScrollViewer { Content = host, Padding = new Thickness(0, 0, 12, 0) };
+        Grid.SetRow(scroller, 1);
+        body.Children.Add(tabs);
+        body.Children.Add(scroller);
 
-            var personalFound = await personalCheck;
-            if (mine != personalShown || removePersonal.IsChecked != true)
-            {
-                return;
-            }
-            if (checking is not null)
-            {
-                personalDetails.Children.Remove(checking);
-            }
-
-            var lines = personalFound?.Lines(title.Text) ?? [];
-            if (personalFound is null)
-            {
-                personalDetails.Children.Add(Text("Couldn't check the file. Anything personal will still be removed."));
-            }
-            else if (lines.Count == 0)
-            {
-                personalDetails.Children.Add(Text("Nothing personal was found in this file."));
-            }
-            else
-            {
-                personalDetails.Children.Add(Text("Found and to be removed:"));
-                foreach (string line in lines)
-                {
-                    personalDetails.Children.Add(Text("• " + line));
-                }
-            }
-        }
-
-        void ApplyPersonalChoice()
-        {
-            bool on = removePersonal.IsChecked == true;
-
-            // The author is the first thing that goes, so the field shows it gone.
-            if (on)
-            {
-                authorBefore = author.Text;
-                author.Text = string.Empty;
-            }
-            else
-            {
-                author.Text = authorBefore;
-            }
-            author.IsEnabled = !on;
-            removeDates.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
-
-            if (on)
-            {
-                _ = ShowPersonalAsync();
-            }
-            else
-            {
-                personalDetails.Visibility = Visibility.Collapsed;
-            }
-        }
-
-        removePersonal.Checked += (_, _) => ApplyPersonalChoice();
-        removePersonal.Unchecked += (_, _) => ApplyPersonalChoice();
-        if (removePersonal.IsChecked == true)
-        {
-            ApplyPersonalChoice();
-        }
-
-        var personal = new StackPanel { Spacing = 4 };
-        personal.Children.Add(removePersonal);
-        personal.Children.Add(personalDetails);
-        personal.Children.Add(removeDates);
-
-        var panel = new StackPanel { Spacing = 16, MinWidth = 460 };
-        if (locked)
-        {
-            panel.Children.Add(Text("This file is encrypted, so its title, author, subject and keywords can't be changed.", secondary));
-        }
-        panel.Children.Add(editable);
-        panel.Children.Add(personal);
-        panel.Children.Add(Divider());
-        panel.Children.Add(openingSection);
-        panel.Children.Add(Divider());
-        panel.Children.Add(facts);
-        panel.Children.Add(copyDetails);
-
-        var dialog = new ContentDialog
+        dialog = new ContentDialog
         {
             XamlRoot = XamlRoot,
             Title = "Document properties",
-            Content = new ScrollViewer { Content = panel, Padding = new Thickness(0, 0, 12, 0) },
+            Content = body,
             PrimaryButtonText = "OK",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,
         };
         dialog.Resources["ContentDialogMaxWidth"] = 640.0;
 
-        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        var result = await dialog.ShowAsync();
+        closing.Cancel();
+
+        // Recognize text closes the dialog the way OK does, keeping what was
+        // changed: the reader moved on to the next step, they did not cancel.
+        if (result == ContentDialogResult.Primary || recognize is not null)
         {
             bool titleChosen = showTitle.IsChecked == true;
             var catalogEdits = new CatalogEdits(null, null, null, null, false, null);
@@ -7058,7 +7360,8 @@ public sealed partial class MainPage : Page
                 InfoEdits.Between(info, title.Text, author.Text, subject.Text, keywords.Text),
                 catalogEdits,
                 removePersonal.IsChecked == true,
-                removeDates.IsChecked == true);
+                removeDates.IsChecked == true,
+                removeAttachments.IsChecked == true && attachedCount > 0);
 
             // The title choice now lives in the file. The old per-computer one
             // is only for a file that cannot be written, and is dropped for a
@@ -7072,6 +7375,11 @@ public sealed partial class MainPage : Page
         }
 
         RootGrid.Focus(FocusState.Programmatic);
+
+        if (recognize is not null)
+        {
+            RecognizeText(recognize);
+        }
     }
 
     /// <summary>Opens Document properties for this document, from its tab's menu.</summary>
@@ -11161,6 +11469,30 @@ public sealed partial class MainPage : Page
 
         var chosen = ThumbnailList.SelectedItems.OfType<PageThumbnail>().Select(t => t.PageIndex).Order().ToList();
         var window = new OcrWindow(ViewModel, chosen);
+        window.Closed += (_, _) => _ocrWindow = null;
+        _ocrWindow = window;
+        window.Activate();
+    }
+
+    /// <summary>
+    /// Recognize text on the pages Document properties found: pages with no
+    /// text, or pages in an old Hindi or Burmese font. A window already open
+    /// is brought forward instead, since it may be part way through a run.
+    /// </summary>
+    private void RecognizeText(OcrRequest request)
+    {
+        if (ViewModel.PageCount == 0 || request.Pages.Count == 0)
+        {
+            return;
+        }
+
+        if (_ocrWindow is not null)
+        {
+            _ocrWindow.Activate();
+            return;
+        }
+
+        var window = new OcrWindow(ViewModel, request.Pages, request);
         window.Closed += (_, _) => _ocrWindow = null;
         _ocrWindow = window;
         window.Activate();

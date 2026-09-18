@@ -37,11 +37,15 @@ public sealed partial class OcrWindow : Window
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr hwnd);
 
-    public OcrWindow(ViewportViewModel viewModel, IReadOnlyList<int> chosenPages)
+    /// <param name="request">
+    /// Pages Document properties found and wants read, with the language and
+    /// the "skip" choice their reason decides. Null for Page > Recognize text.
+    /// </param>
+    public OcrWindow(ViewportViewModel viewModel, IReadOnlyList<int> chosenPages, OcrRequest? request = null)
     {
         InitializeComponent();
         _viewModel = viewModel;
-        _chosenPages = chosenPages;
+        _chosenPages = request?.Pages ?? chosenPages;
 
         AppWindow.SetIcon("Assets/AppIcon.ico");
 
@@ -64,10 +68,29 @@ public sealed partial class OcrWindow : Window
         AccurateChoice.IsChecked = !settings.OcrFast;
         SkipTextPages.IsChecked = settings.OcrSkipPagesWithText;
 
+        if (request?.Languages is { } asked)
+        {
+            EnglishBox.IsChecked = asked.Contains("eng");
+            HindiBox.IsChecked = asked.Contains("hin");
+            MyanmarBox.IsChecked = asked.Contains("mya");
+            FastChoice.IsChecked = false;
+            AccurateChoice.IsChecked = true;
+        }
+        if (request is { ReadPagesWithText: true })
+        {
+            SkipTextPages.IsChecked = false;
+        }
+
         int pageCount = viewModel.PageCount;
         AllPages.Content = pageCount == 1 ? "All pages (1)" : $"All pages ({pageCount})";
         PageRangeBox.PlaceholderText = "For example 1-3, 8";
-        if (chosenPages.Count > 1)
+        if (request is not null)
+        {
+            ChosenPages.Content = $"{request.What} ({PageSurvey.ShortList(request.Pages, pageCount)})";
+            ChosenPages.Visibility = Visibility.Visible;
+            ChosenPages.IsChecked = true;
+        }
+        else if (chosenPages.Count > 1)
         {
             ChosenPages.Content = $"Pages chosen in the thumbnails ({PageSelection.Format(chosenPages, pageCount)})";
             ChosenPages.Visibility = Visibility.Visible;

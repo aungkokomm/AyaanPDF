@@ -663,6 +663,9 @@ fn without_personal_info(file: Vec<u8>, pairs: &[(String, String)]) -> Option<Ve
 
     if value(pairs, REMOVE_PERSONAL) == Some("1") {
         strip_personal_objects(&mut doc);
+        if value(pairs, REMOVE_ATTACHMENTS) == Some("1") {
+            strip_attachments(&mut doc);
+        }
     }
 
     // The old Info and XMP, and anything else nothing refers to any more.
@@ -1293,6 +1296,404 @@ pub unsafe extern "C" fn list_document_fonts(path: *const c_char) -> ByteBuffer 
         bytes_buffer(join_nul(fields.iter().map(String::as_str)))
     })
     .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+// ---------------------------------------------------------------------------
+// What is in the document, page by page and as a whole
+// ---------------------------------------------------------------------------
+
+/// What each page of a range is made of, for Document properties' page check,
+/// as NUL-separated UTF-8 fields. Per page: its 0-based index; "1" when it has
+/// any text at all (the same rule as Recognize text's "pages that already have
+/// text", so the OCR layer counts); "1" when this app has recognised its text;
+/// how many fonts follow; then the name of each font its text is set in,
+/// subset prefix removed. The OCR layer's own font is not listed.
+///
+/// A range rather than the document, so the caller walks a large book in
+/// steps, letting go of the lock between them and able to stop. Loads every
+/// page it is asked about: call it off the UI thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn survey_pages(doc_handle: u64, first: i32, count: i32) -> ByteBuffer {
+    if doc_handle == 0 || first < 0 || count <= 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| survey_pages_inner(doc_handle, first, count))
+        .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+fn survey_pages_inner(doc_handle: u64, first: i32, count: i32) -> ByteBuffer {
+    use pdfium_render::prelude::*;
+
+    let _guard = crate::call_guard();
+    let Some(doc) = crate::lock(&crate::core().documents).get(&doc_handle).cloned() else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+    let doc_guard = crate::lock(&doc);
+    let bindings = doc_guard.bindings();
+    let pages = doc_guard.pages();
+    let end = (i64::from(first) + i64::from(count)).min(i64::from(pages.len())) as i32;
+
+    let mut fields: Vec<String> = Vec::new();
+    for index in first..end {
+        let Ok(page) = pages.get(index as u16) else {
+            continue;
+        };
+        let has_text = page.text().is_ok_and(|t| t.all().chars().any(|c| c > ' '));
+
+        let mut fonts = BTreeSet::new();
+        let mut recognised = false;
+        let mut note = |object: &PdfPageObject| {
+            let PdfPageObject::Text(t) = object else {
+                return;
+            };
+            if crate::ocr::is_ocr_run(bindings, t.object_handle()) {
+                recognised = true;
+            } else {
+                let (name, _) = strip_subset_prefix(&t.font().name());
+                if !name.is_empty() {
+                    fonts.insert(name);
+                }
+            }
+        };
+        let objects = page.objects();
+        for i in 0..objects.len() {
+            let Ok(object) = objects.get(i) else {
+                continue;
+            };
+            // Text can sit inside a form XObject and still be the page's text.
+            if let PdfPageObject::XObjectForm(form) = &object {
+                for j in 0..form.len() {
+                    if let Ok(inner) = form.get(j) {
+                        note(&inner);
+                    }
+                }
+            } else {
+                note(&object);
+            }
+        }
+
+        fields.push(index.to_string());
+        fields.push(if has_text { "1" } else { "0" }.to_owned());
+        fields.push(if recognised { "1" } else { "0" }.to_owned());
+        fields.push(fonts.len().to_string());
+        fields.extend(fonts);
+    }
+    bytes_buffer(join_nul(fields.iter().map(String::as_str)))
+}
+
+/// What the PDF at `path` holds besides its pages, as NUL-separated pairs of
+/// counts: Bookmarks, Comments (markup annotations, file attachments among
+/// them), Links, FormFields, Signatures (signature fields) and Attachments
+/// (the document's attached files). Parses the file: off the UI thread.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn document_contents(path: *const c_char) -> ByteBuffer {
+    if path.is_null() {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    let Ok(path) = unsafe { CStr::from_ptr(path) }.to_str().map(str::to_owned) else {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    };
+
+    panic::catch_unwind(move || {
+        let Ok(doc) = load_structure(&path) else {
+            return ByteBuffer::err(STATUS_UNSUPPORTED);
+        };
+        let found: Vec<(&str, String)> = contents_of(&doc)
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect();
+        bytes_buffer(join_nul(found.iter().flat_map(|(k, v)| [*k, v.as_str()])))
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+pub(crate) fn contents_of(doc: &Document) -> Vec<(&'static str, usize)> {
+    let catalog = doc
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|r| resolve(doc, r))
+        .and_then(|c| c.as_dict().ok());
+
+    // Bookmarks: every item of the outline tree, children included.
+    let mut bookmarks = 0;
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<&Object> = catalog
+        .and_then(|c| c.get(b"Outlines").ok())
+        .and_then(|o| resolve(doc, o))
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|o| o.get(b"First").ok())
+        .into_iter()
+        .collect();
+    while let Some(item) = stack.pop() {
+        if let Object::Reference(id) = item {
+            if !seen.insert(*id) {
+                continue;
+            }
+        }
+        let Some(dict) = resolve(doc, item).and_then(|o| o.as_dict().ok()) else {
+            continue;
+        };
+        bookmarks += 1;
+        for key in [b"First".as_slice(), b"Next"] {
+            if let Ok(next) = dict.get(key) {
+                stack.push(next);
+            }
+        }
+    }
+
+    // Annotations, page by page.
+    let (mut comments, mut links) = (0, 0);
+    for page_id in doc.get_pages().into_values() {
+        let annots = doc
+            .get_object(page_id)
+            .ok()
+            .and_then(|p| p.as_dict().ok())
+            .and_then(|p| p.get(b"Annots").ok())
+            .and_then(|a| resolve(doc, a))
+            .and_then(|a| a.as_array().ok());
+        for annot in annots.into_iter().flatten() {
+            let subtype = resolve(doc, annot)
+                .and_then(|a| a.as_dict().ok())
+                .and_then(|a| a.get(b"Subtype").and_then(Object::as_name).ok());
+            match subtype {
+                Some(b"Link") => links += 1,
+                Some(s) if COMMENT_SUBTYPES.contains(&s) => comments += 1,
+                _ => {}
+            }
+        }
+    }
+
+    // Form fields: the terminal ones, which are what a reader fills in. A
+    // field's type can be inherited from its parent.
+    let (mut fields, mut signatures) = (0, 0);
+    let mut field_stack: Vec<(&Object, Option<&[u8]>)> = catalog
+        .and_then(|c| c.get(b"AcroForm").ok())
+        .and_then(|f| resolve(doc, f))
+        .and_then(|f| f.as_dict().ok())
+        .and_then(|f| f.get(b"Fields").ok())
+        .and_then(|f| resolve(doc, f))
+        .and_then(|f| f.as_array().ok())
+        .map(|a| a.iter().map(|f| (f, None)).collect())
+        .unwrap_or_default();
+    let mut seen_fields = BTreeSet::new();
+    while let Some((node, inherited)) = field_stack.pop() {
+        if let Object::Reference(id) = node {
+            if !seen_fields.insert(*id) {
+                continue;
+            }
+        }
+        let Some(dict) = resolve(doc, node).and_then(|o| o.as_dict().ok()) else {
+            continue;
+        };
+        let kind = dict.get(b"FT").and_then(Object::as_name).ok().or(inherited);
+        let kids: Vec<&Object> = dict
+            .get(b"Kids")
+            .ok()
+            .and_then(|k| resolve(doc, k))
+            .and_then(|k| k.as_array().ok())
+            .map(|k| k.iter().collect())
+            .unwrap_or_default();
+        // Kids that are fields in their own right have names; a terminal
+        // field's kids are only its widgets.
+        let child_fields: Vec<&Object> = kids
+            .into_iter()
+            .filter(|k| resolve(doc, k).and_then(|o| o.as_dict().ok()).is_some_and(|d| d.has(b"T")))
+            .collect();
+        if child_fields.is_empty() {
+            fields += 1;
+            if kind == Some(b"Sig".as_slice()) {
+                signatures += 1;
+            }
+        } else {
+            field_stack.extend(child_fields.into_iter().map(|k| (k, kind)));
+        }
+    }
+
+    // Attached files: the leaves of the EmbeddedFiles name tree.
+    let mut attachments = 0;
+    let mut tree: Vec<&Object> = catalog
+        .and_then(|c| c.get(b"Names").ok())
+        .and_then(|n| resolve(doc, n))
+        .and_then(|n| n.as_dict().ok())
+        .and_then(|n| n.get(b"EmbeddedFiles").ok())
+        .into_iter()
+        .collect();
+    let mut seen_nodes = BTreeSet::new();
+    while let Some(node) = tree.pop() {
+        if let Object::Reference(id) = node {
+            if !seen_nodes.insert(*id) {
+                continue;
+            }
+        }
+        let Some(dict) = resolve(doc, node).and_then(|o| o.as_dict().ok()) else {
+            continue;
+        };
+        if let Some(names) = dict.get(b"Names").ok().and_then(|n| resolve(doc, n)).and_then(|n| n.as_array().ok()) {
+            attachments += names.len() / 2;
+        }
+        if let Some(kids) = dict.get(b"Kids").ok().and_then(|k| resolve(doc, k)).and_then(|k| k.as_array().ok()) {
+            tree.extend(kids.iter());
+        }
+    }
+
+    vec![
+        ("Bookmarks", bookmarks),
+        ("Comments", comments),
+        ("Links", links),
+        ("FormFields", fields),
+        ("Signatures", signatures),
+        ("Attachments", attachments),
+    ]
+}
+
+/// The open document's attached files, as NUL-separated pairs: each file's
+/// name, then its size in bytes. From PDFium, so it is the document as it
+/// stands, pending changes and all.
+#[unsafe(no_mangle)]
+pub extern "C" fn list_attachments(doc_handle: u64) -> ByteBuffer {
+    if doc_handle == 0 {
+        return ByteBuffer::err(STATUS_INVALID_INPUT);
+    }
+    panic::catch_unwind(|| {
+        let _guard = crate::call_guard();
+        let Some(doc) = crate::lock(&crate::core().documents).get(&doc_handle).cloned() else {
+            return ByteBuffer::err(STATUS_INVALID_INPUT);
+        };
+        let doc_guard = crate::lock(&doc);
+        let mut fields: Vec<String> = Vec::new();
+        for attachment in doc_guard.attachments().iter() {
+            fields.push(attachment.name());
+            fields.push(attachment.len().to_string());
+        }
+        bytes_buffer(join_nul(fields.iter().map(String::as_str)))
+    })
+    .unwrap_or_else(|_| ByteBuffer::err(STATUS_PANIC))
+}
+
+/// Writes the open document's attached file at `index` (in the order
+/// [`list_attachments`] gives) to `path`.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn save_attachment(doc_handle: u64, index: i32, path: *const c_char) -> i32 {
+    if doc_handle == 0 || index < 0 || path.is_null() {
+        return STATUS_INVALID_INPUT;
+    }
+    let Ok(path) = unsafe { CStr::from_ptr(path) }.to_str().map(str::to_owned) else {
+        return STATUS_INVALID_INPUT;
+    };
+    panic::catch_unwind(move || {
+        let bytes = {
+            let _guard = crate::call_guard();
+            let Some(doc) = crate::lock(&crate::core().documents).get(&doc_handle).cloned() else {
+                return STATUS_INVALID_INPUT;
+            };
+            let doc_guard = crate::lock(&doc);
+            let attachments = doc_guard.attachments();
+            let Ok(attachment) = attachments.get(index as u16) else {
+                return STATUS_INVALID_INPUT;
+            };
+            match attachment.save_to_bytes() {
+                Ok(bytes) => bytes,
+                Err(_) => return STATUS_UNSUPPORTED,
+            }
+        };
+        // Written outside the lock: the file may be large and the disk slow.
+        match std::fs::write(&path, bytes) {
+            Ok(()) => STATUS_OK_PDFIUM,
+            Err(_) => STATUS_UNSUPPORTED,
+        }
+    })
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// The pair that removes the document's attached files. Only sent together
+/// with personal-info removal, so it rides the same whole rewrite.
+const REMOVE_ATTACHMENTS: &str = "RemoveAttachments";
+
+/// Every file carried inside the document. A file specification's /EF is
+/// what holds an attachment's bytes, wherever the specification is used from
+/// (the EmbeddedFiles tree, a paperclip comment, a PDF/A-3 associated file),
+/// so taking /EF off every one leaves the bytes unreferenced for the prune.
+/// The tree itself, the paperclip comments and the portfolio layout go too,
+/// so no empty entry or icon is left pointing at nothing.
+fn strip_attachments(doc: &mut Document) {
+    for object in doc.objects.values_mut() {
+        let dict = match object {
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &mut s.dict,
+            _ => continue,
+        };
+        dict.remove(b"EF");
+        dict.remove(b"AF");
+    }
+
+    let Ok(root) = doc.trailer.get(b"Root").and_then(Object::as_reference) else {
+        return;
+    };
+    let names_ref = doc
+        .get_object(root)
+        .ok()
+        .and_then(|c| c.as_dict().ok())
+        .and_then(|c| c.get(b"Names").ok())
+        .and_then(|n| n.as_reference().ok());
+    if let Some(id) = names_ref {
+        if let Ok(names) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+            names.remove(b"EmbeddedFiles");
+        }
+    }
+    if let Ok(catalog) = doc.get_object_mut(root).and_then(Object::as_dict_mut) {
+        if let Ok(Object::Dictionary(names)) = catalog.get_mut(b"Names") {
+            names.remove(b"EmbeddedFiles");
+        }
+        catalog.remove(b"Collection");
+    }
+
+    // The paperclip comments, and the pop-ups that belong to them.
+    let is_attachment = |o: &Object| {
+        o.as_dict().is_ok_and(|d| d.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"FileAttachment".as_slice()))
+    };
+    let clips: BTreeSet<lopdf::ObjectId> =
+        doc.objects.iter().filter(|(_, o)| is_attachment(o)).map(|(id, _)| *id).collect();
+    let goes = |doc: &Document, item: &Object| -> bool {
+        let Some(annot) = resolve(doc, item) else { return false };
+        if is_attachment(annot) {
+            return true;
+        }
+        annot
+            .as_dict()
+            .ok()
+            .and_then(|d| d.get(b"Parent").ok())
+            .and_then(|p| p.as_reference().ok())
+            .is_some_and(|p| clips.contains(&p))
+    };
+    for page_id in doc.get_pages().into_values() {
+        let annots = doc.get_object(page_id).ok().and_then(|p| p.as_dict().ok()).and_then(|p| p.get(b"Annots").ok()).cloned();
+        match annots {
+            Some(Object::Array(items)) => {
+                let kept: Vec<Object> = items.into_iter().filter(|i| !goes(doc, i)).collect();
+                if let Ok(page) = doc.get_object_mut(page_id).and_then(Object::as_dict_mut) {
+                    page.set("Annots", Object::Array(kept));
+                }
+            }
+            Some(Object::Reference(id)) => {
+                let kept: Option<Vec<Object>> = doc
+                    .get_object(id)
+                    .ok()
+                    .and_then(|a| a.as_array().ok())
+                    .map(|items| items.iter().filter(|i| !goes(doc, i)).cloned().collect());
+                if let Some(kept) = kept {
+                    doc.objects.insert(id, Object::Array(kept));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The file's structure without the bulk: every dictionary kept, and every
@@ -2306,5 +2707,399 @@ mod tests {
         let mut names: Vec<_> = fonts.iter().map(|f| (&f.name, f.embedded)).collect();
         names.dedup();
         assert_eq!(names.len(), fonts.len(), "{fonts:?}");
+    }
+
+    /// Every font name in the book folders, with how many files use it, to
+    /// find what the old Hindi and Burmese fonts are really called in PDFs.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_fonts_real_books_use() {
+        fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && depth > 0 {
+                    walk(&path, depth - 1, out);
+                } else if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")) {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(std::path::Path::new(r"D:\Ayaan PDF Test file"), 0, &mut files);
+        walk(std::path::Path::new(r"E:\BOOKS"), 2, &mut files);
+        let mut uses: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        for file in &files {
+            if std::fs::metadata(file).map(|m| m.len()).unwrap_or(0) > 400_000_000 {
+                continue;
+            }
+            let Ok(doc) = load_structure(file.to_str().unwrap_or_default()) else { continue };
+            for font in fonts_of(&doc) {
+                uses.entry(font.name).or_default().push(file.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        println!("{} files, {} font names", files.len(), uses.len());
+        for (name, in_files) in &uses {
+            println!("FONT {name} | {} | {}", in_files.len(), in_files.iter().take(3).cloned().collect::<Vec<_>>().join(" ; "));
+        }
+    }
+
+    // ---------------- The page check ----------------
+
+    struct Surveyed {
+        page: i32,
+        has_text: bool,
+        recognised: bool,
+        fonts: Vec<String>,
+    }
+
+    fn survey(handle: u64, first: i32, count: i32) -> Vec<Surveyed> {
+        let buffer = survey_pages(handle, first, count);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM);
+        let bytes = if buffer.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec()
+        };
+        crate::free_byte_buffer(buffer);
+
+        let fields: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .map(|f| String::from_utf8_lossy(f).into_owned())
+            .collect();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 4 <= fields.len() && !fields[at].is_empty() {
+            let n: usize = fields[at + 3].parse().unwrap();
+            out.push(Surveyed {
+                page: fields[at].parse().unwrap(),
+                has_text: fields[at + 1] == "1",
+                recognised: fields[at + 2] == "1",
+                fonts: fields[at + 4..at + 4 + n].to_vec(),
+            });
+            at += 4 + n;
+        }
+        out
+    }
+
+    fn open(path: &str) -> u64 {
+        let c = CString::new(path).unwrap();
+        let handle = crate::open_document(c.as_ptr());
+        assert_ne!(handle, 0, "expected {path} to open");
+        handle
+    }
+
+    #[test]
+    fn every_page_says_whether_it_has_text_and_what_fonts_it_is_set_in() {
+        let h = open("tests/fixtures/sample_20pages.pdf");
+        let pages = survey(h, 0, 20);
+        assert_eq!(pages.len(), 20);
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(page.page, i as i32);
+            assert!(page.has_text, "page {i}");
+            assert!(!page.recognised, "page {i}");
+            assert!(!page.fonts.is_empty(), "page {i}");
+            assert!(page.fonts.iter().all(|f| !f.contains('+')), "subset prefix stripped: {:?}", page.fonts);
+        }
+        crate::close_document(h);
+
+        // The control: a page with nothing on it.
+        let blank = open("tests/fixtures/blank.pdf");
+        let pages = survey(blank, 0, 1);
+        assert_eq!(pages.len(), 1);
+        assert!(!pages[0].has_text);
+        assert!(pages[0].fonts.is_empty());
+        crate::close_document(blank);
+    }
+
+    #[test]
+    fn a_page_recognised_here_has_text_and_its_layer_font_is_not_one_of_the_pages() {
+        let h = open("tests/fixtures/blank.pdf");
+        let text = "Recognised";
+        let word = crate::ocr::OcrWord {
+            left: 0.1,
+            top: 0.2,
+            right: 0.4,
+            bottom: 0.24,
+            text: text.as_ptr(),
+            text_len: text.len(),
+        };
+        assert_eq!(unsafe { crate::ocr::add_ocr_words(h, 0, &word, 1, std::ptr::null()) }, 1);
+
+        let pages = survey(h, 0, 1);
+        assert!(pages[0].has_text, "the recognised words are text now");
+        assert!(pages[0].recognised);
+        assert!(pages[0].fonts.is_empty(), "{:?}", pages[0].fonts);
+        crate::close_document(h);
+    }
+
+    #[test]
+    fn a_step_past_the_last_page_stops_there() {
+        let h = open("tests/fixtures/sample_20pages.pdf");
+        let tail = survey(h, 18, 16);
+        assert_eq!(tail.iter().map(|p| p.page).collect::<Vec<_>>(), vec![18, 19]);
+        assert!(survey(h, 25, 16).is_empty());
+        crate::close_document(h);
+    }
+
+    // ---------------- What the file holds ----------------
+
+    fn literal(text: &str) -> Object {
+        Object::String(text.as_bytes().to_vec(), StringFormat::Literal)
+    }
+
+    /// A file spec carrying `bytes` as its embedded file.
+    fn file_spec(doc: &mut Document, name: &str, bytes: &[u8]) -> lopdf::ObjectId {
+        let mut stream_dict = Dictionary::new();
+        stream_dict.set("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        let stream = doc.add_object(Stream::new(stream_dict, bytes.to_vec()));
+        let mut ef = Dictionary::new();
+        ef.set("F", Object::Reference(stream));
+        let mut spec = Dictionary::new();
+        spec.set("Type", Object::Name(b"Filespec".to_vec()));
+        spec.set("F", literal(name));
+        spec.set("UF", literal(name));
+        spec.set("EF", ef);
+        doc.add_object(spec)
+    }
+
+    /// sample_20pages with one file attached to the document, one paperclip
+    /// comment carrying a second file with its pop-up, three bookmarks (one a
+    /// child), a link, and a form of four fields, one of them for a signature
+    /// and two of them the kids of a parent that is not itself filled in.
+    fn with_contents() -> Vec<u8> {
+        let mut doc = Document::load_mem(&fixture("sample_20pages.pdf")).unwrap();
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+
+        let attached = file_spec(&mut doc, "salaries.xlsx", b"AttachedSecretBytes 12345");
+        let mut tree = Dictionary::new();
+        tree.set("Names", Object::Array(vec![literal("salaries.xlsx"), Object::Reference(attached)]));
+        let tree = doc.add_object(tree);
+        let mut names = Dictionary::new();
+        names.set("EmbeddedFiles", Object::Reference(tree));
+
+        let clip_file = file_spec(&mut doc, "notes.txt", b"ClipSecretBytes 67890");
+        let clip = doc.add_object(Dictionary::from_iter(vec![
+            ("Type", Object::Name(b"Annot".to_vec())),
+            ("Subtype", Object::Name(b"FileAttachment".to_vec())),
+            ("Rect", Object::Array(vec![10.into(), 10.into(), 30.into(), 30.into()])),
+            ("FS", Object::Reference(clip_file)),
+        ]));
+        let popup = doc.add_object(Dictionary::from_iter(vec![
+            ("Type", Object::Name(b"Annot".to_vec())),
+            ("Subtype", Object::Name(b"Popup".to_vec())),
+            ("Rect", Object::Array(vec![40.into(), 40.into(), 90.into(), 90.into()])),
+            ("Parent", Object::Reference(clip)),
+        ]));
+        let link = doc.add_object(Dictionary::from_iter(vec![
+            ("Type", Object::Name(b"Annot".to_vec())),
+            ("Subtype", Object::Name(b"Link".to_vec())),
+            ("Rect", Object::Array(vec![100.into(), 100.into(), 200.into(), 120.into()])),
+        ]));
+
+        let child = doc.add_object(Dictionary::from_iter(vec![("Title", literal("Child"))]));
+        let second = doc.add_object(Dictionary::from_iter(vec![("Title", literal("Two")), ("First", Object::Reference(child))]));
+        let first = doc.add_object(Dictionary::from_iter(vec![("Title", literal("One")), ("Next", Object::Reference(second))]));
+        let outlines = doc.add_object(Dictionary::from_iter(vec![
+            ("Type", Object::Name(b"Outlines".to_vec())),
+            ("First", Object::Reference(first)),
+        ]));
+
+        let field = |doc: &mut Document, name: &str, kind: Option<&[u8]>| {
+            let mut d = Dictionary::new();
+            d.set("T", literal(name));
+            if let Some(kind) = kind {
+                d.set("FT", Object::Name(kind.to_vec()));
+            }
+            doc.add_object(d)
+        };
+        let text_field = field(&mut doc, "Name", Some(b"Tx"));
+        let kid_a = field(&mut doc, "a", None);
+        let kid_b = field(&mut doc, "b", None);
+        let parent = field(&mut doc, "Choice", Some(b"Btn"));
+        doc.get_object_mut(parent).unwrap().as_dict_mut().unwrap()
+            .set("Kids", Object::Array(vec![Object::Reference(kid_a), Object::Reference(kid_b)]));
+        let signature = field(&mut doc, "Signed", Some(b"Sig"));
+        let form = Dictionary::from_iter(vec![(
+            "Fields",
+            Object::Array(vec![Object::Reference(text_field), Object::Reference(parent), Object::Reference(signature)]),
+        )]);
+
+        let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+        catalog.set("Names", names);
+        catalog.set("Outlines", Object::Reference(outlines));
+        catalog.set("AcroForm", form);
+
+        let pages = doc.get_pages();
+        let page_one = *pages.get(&1).unwrap();
+        doc.get_object_mut(page_one).unwrap().as_dict_mut().unwrap()
+            .set("Annots", Object::Array(vec![Object::Reference(clip), Object::Reference(popup)]));
+        let page_two = *pages.get(&2).unwrap();
+        doc.get_object_mut(page_two).unwrap().as_dict_mut().unwrap()
+            .set("Annots", Object::Array(vec![Object::Reference(link)]));
+
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn what_a_file_holds_is_counted() {
+        let doc = Document::load_mem(&with_contents()).unwrap();
+        let counts: HashMap<&str, usize> = contents_of(&doc).into_iter().collect();
+        assert_eq!(counts["Bookmarks"], 3, "a child bookmark counts");
+        assert_eq!(counts["Comments"], 1, "the paperclip, not its pop-up");
+        assert_eq!(counts["Links"], 1);
+        assert_eq!(counts["FormFields"], 4, "the parent is not a field anyone fills in");
+        assert_eq!(counts["Signatures"], 1);
+        assert_eq!(counts["Attachments"], 1);
+
+        // The control: the plain file holds only pages.
+        let plain = Document::load_mem(&fixture("sample_20pages.pdf")).unwrap();
+        assert!(contents_of(&plain).iter().all(|(_, n)| *n == 0), "{:?}", contents_of(&plain));
+
+        // And the light load the app uses counts the same.
+        let path = temp_copy(&with_contents(), "contents");
+        let light = load_structure(path.to_str().unwrap()).unwrap();
+        assert_eq!(contents_of(&light), contents_of(&doc));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_attached_file_is_listed_and_saved_out_as_it_is() {
+        let path = temp_copy(&with_contents(), "attached");
+        let h = open(path.to_str().unwrap());
+
+        let buffer = list_attachments(h);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM);
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec();
+        crate::free_byte_buffer(buffer);
+        let fields = parse_pairs(&bytes).unwrap();
+        assert_eq!(fields, vec![("salaries.xlsx".to_owned(), "25".to_owned())]);
+
+        let out = std::env::temp_dir().join(format!("ayaan_attached_{}.xlsx", std::process::id()));
+        let c_out = CString::new(out.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { save_attachment(h, 0, c_out.as_ptr()) }, STATUS_OK_PDFIUM);
+        assert_eq!(std::fs::read(&out).unwrap(), b"AttachedSecretBytes 12345");
+        assert_eq!(unsafe { save_attachment(h, 1, c_out.as_ptr()) }, STATUS_INVALID_INPUT, "there is only one");
+
+        crate::close_document(h);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn removing_attached_files_leaves_none_of_their_bytes_and_keeps_the_rest() {
+        let original = with_contents();
+
+        // The control: removing personal info alone keeps the files.
+        let kept = temp_copy(&original, "attach_kept");
+        assert_eq!(write(&kept, &[("RemovePersonal", "1")]), STATUS_OK_PDFIUM);
+        let kept_bytes = std::fs::read(&kept).unwrap();
+        assert!(contains(&kept_bytes, "AttachedSecretBytes") && contains(&kept_bytes, "ClipSecretBytes"));
+
+        let path = temp_copy(&original, "attach_gone");
+        assert_eq!(write(&path, &[("RemovePersonal", "1"), ("RemoveAttachments", "1")]), STATUS_OK_PDFIUM);
+        let bytes = std::fs::read(&path).unwrap();
+        for secret in ["AttachedSecretBytes", "ClipSecretBytes"] {
+            assert!(!contains(&bytes, secret), "{secret} is still in the file");
+        }
+
+        let doc = Document::load_mem(&bytes).unwrap();
+        let counts: HashMap<&str, usize> = contents_of(&doc).into_iter().collect();
+        assert_eq!(counts["Attachments"], 0);
+        assert_eq!(counts["Comments"], 0, "the paperclip went with its file");
+        assert_eq!(counts["Bookmarks"], 3);
+        assert_eq!(counts["Links"], 1);
+        assert_eq!(counts["FormFields"], 4);
+        let page_one = *doc.get_pages().get(&1).unwrap();
+        let annots = doc.get_object(page_one).unwrap().as_dict().unwrap().get(b"Annots").unwrap().as_array().unwrap();
+        assert!(annots.is_empty(), "the pop-up went with its paperclip: {annots:?}");
+
+        // PDFium agrees, and every page still reads as it did.
+        let h = open(path.to_str().unwrap());
+        let buffer = list_attachments(h);
+        assert_eq!(buffer.len, 0);
+        crate::free_byte_buffer(buffer);
+        assert_eq!(survey(h, 0, 20).iter().filter(|p| p.has_text).count(), 20);
+        crate::close_document(h);
+
+        let _ = std::fs::remove_file(&kept);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What the page check and the counts find in real files, and how long a
+    /// page takes: the old-font books, the Burmese ones and a scanned book.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs that are not in this repository"]
+    fn what_the_page_check_finds_in_real_files() {
+        let mut files: Vec<std::path::PathBuf> = [
+            r"D:\Ayaan PDF Test file\003_Agyat_Ki_Aur.pdf",
+            r"D:\Ayaan PDF Test file\1234.pdf",
+            r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file 2.pdf",
+            r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf",
+            r"D:\Ayaan PDF Test file\Geeta Darshan Complete 18 Chapters.pdf",
+            r"D:\Ayaan PDF Test file\OoPdfFormExample_2.pdf",
+            r"E:\BOOKS\2015.263767.Samarthya-Aur.pdf",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+        // One book of each old Burmese font the census found.
+        if let Ok(entries) = std::fs::read_dir(r"E:\BOOKS") {
+            let mut burmese: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            burmese.sort();
+            for want in ["WinInnwa", "Zawgyi", "Wwin_Burmese", "WinResearcher"] {
+                if let Some(found) = burmese.iter().find(|p| {
+                    p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf"))
+                        && std::fs::metadata(p).map(|m| m.len() < 60_000_000).unwrap_or(false)
+                        && load_structure(p.to_str().unwrap_or_default())
+                            .map(|d| fonts_of(&d).iter().any(|f| f.name.starts_with(want)))
+                            .unwrap_or(false)
+                }) {
+                    files.push(found.clone());
+                }
+            }
+        }
+
+        for file in files.iter().filter(|f| f.exists()) {
+            let name = file.file_name().unwrap().to_string_lossy();
+            let light = load_structure(file.to_str().unwrap()).unwrap();
+            println!("\n== {name}\n   contents {:?}", contents_of(&light));
+            let h = open(file.to_str().unwrap());
+            let count = {
+                let _guard = crate::call_guard();
+                let doc = crate::lock(&crate::core().documents).get(&h).cloned().unwrap();
+                let g = crate::lock(&doc);
+                g.pages().len() as i32
+            };
+            let started = std::time::Instant::now();
+            let mut all = Vec::new();
+            let mut first = 0;
+            while first < count {
+                all.extend(survey(h, first, 16));
+                first += 16;
+            }
+            let took = started.elapsed();
+            let without: Vec<i32> = all.iter().filter(|p| !p.has_text).map(|p| p.page + 1).collect();
+            let recognised = all.iter().filter(|p| p.recognised).count();
+            let mut fonts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for page in &all {
+                for f in &page.fonts {
+                    *fonts.entry(f.as_str()).or_default() += 1;
+                }
+            }
+            println!(
+                "   {} pages in {} ms ({:.1} ms a page); {} without text {:?}; {} recognised",
+                all.len(),
+                took.as_millis(),
+                took.as_secs_f64() * 1000.0 / all.len().max(1) as f64,
+                without.len(),
+                &without[..without.len().min(12)],
+                recognised
+            );
+            println!("   fonts by pages: {fonts:?}");
+            crate::close_document(h);
+        }
     }
 }
