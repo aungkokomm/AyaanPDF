@@ -43,6 +43,9 @@ PdfEditorApp/Assets/Ocr/tessdata/
 PdfEditorApp/Assets/Ocr/*.onnx
 tools/ocr/__pycache__/
 
-# Private planning notes, kept on this PC only.
+# Kept on this PC only, not published.
 PROJECT_SPEC.md
 hand-paper.svg
+prototypes/ShadowLab/out/
+tools/CursorGen/README.md
+vendor/PATCHES.md

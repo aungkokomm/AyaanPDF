@@ -10,8 +10,9 @@ using System.Drawing.Imaging;
 // in the repo so the art stays editable: the .cur files are otherwise opaque
 // binaries nobody could adjust.
 //
-// Run it from this folder:  dotnet run
-// Then rebuild the resource DLL, see tools/CursorGen/README.md.
+// Run it from this folder:  dotnet run -- ..\..\PdfEditorApp\Assets\Cursors
+// It rewrites the .cur files there, then rebuilds AyaanCursors.dll from them
+// with rc.exe and link.exe.
 
 const float Design = 64f;      // everything below is in a 64x64 design box
 const float Outline = 2f;      // black rim thickness, per side
