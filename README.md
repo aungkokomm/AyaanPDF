@@ -12,6 +12,8 @@
 <p align="center">
   <a href="../../releases/latest"><b>Download for Windows</b></a>
   &nbsp;·&nbsp;
+  <a href="#screenshots">Screenshots</a>
+  &nbsp;·&nbsp;
   <a href="#what-it-can-do">What it can do</a>
   &nbsp;·&nbsp;
   <a href="#build-it-yourself">Build it yourself</a>
@@ -29,6 +31,29 @@ Plenty of PDF apps can *show* Hindi and Burmese. Try to change a word, though, a
 
 **Ayaan PDF was built to get that right.** Click a line, type, and it stays real text: shaped correctly, searchable, and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
 <img width="960" height="511" alt="image" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
+
+## Screenshots
+
+**Your documents, in tabs, with everything at hand**
+
+<!-- Paste screenshot 1 on the line below: the main window with a document open. -->
+
+
+**Edit the words on the page, in Hindi and Myanmar too**
+
+<!-- Paste screenshot 2 on the line below: editing Hindi or Myanmar text. -->
+
+
+**Gradients, shadows and glows that are saved into the PDF**
+
+<!-- Paste screenshot 3 on the line below: shapes with effects. -->
+
+
+**Turn scans into searchable text**
+
+<!-- Paste screenshot 4 on the line below: Recognize text. -->
+
+
 
 ## What it can do
 
