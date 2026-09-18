@@ -66,6 +66,15 @@ public class ThirdPartyNoticesTests
     }
 
     [Fact]
+    public void ayaan_pdfs_own_mit_licence_ships_and_so_does_the_hindi_dictionarys()
+    {
+        Assert.Contains("<Content Include=\"..\\LICENSE\">\n      <Link>LICENSE.txt</Link>", Read("PdfEditorApp", "PdfEditorApp.csproj"), StringComparison.Ordinal);
+        Assert.StartsWith("MIT License\n\nCopyright (c) 2026 Aung Ko Ko\n", Read("LICENSE"), StringComparison.Ordinal);
+        Assert.Contains("MIT License", Read("PdfEditorApp", "Assets", "Dictionary", "LICENSE-Hindi.txt"), StringComparison.Ordinal);
+        Assert.Contains("MIT License", Read("PdfEditorApp", "Assets", "Dictionary", "LICENSE-AKK.txt"), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void pdfiums_licences_are_kept_with_the_vendored_dll()
     {
         // From the pdfium-binaries chromium/7961 release, whose pdfium.dll is
