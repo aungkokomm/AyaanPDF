@@ -367,22 +367,110 @@ public class RotatedShapeResizeInteropTests
         }
     }
 
-    // ---------------- A KNOWN GAP, pinned deliberately ----------------
+    // ---------------- Undoing and redoing the resize ----------------
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PageSizeArray
+    {
+        public IntPtr Sizes;
+        public nuint Len;
+        public int Status;
+    }
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern PageSizeArray get_page_sizes(ulong docHandle);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern void free_page_size_array(PageSizeArray array);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int shape_upright_bounds(
+        int captureWidth, float pageWidthPts, [In] byte[] tagUtf8, nuint tagLen,
+        float left, float top, float right, float bottom,
+        out float uprightLeft, out float uprightTop, out float uprightRight, out float uprightBottom);
+
+    private static float PageWidth(ulong handle, int page)
+    {
+        var sizes = get_page_sizes(handle);
+        try
+        {
+            Assert.Equal(OkPdfium, sizes.Status);
+            return Marshal.PtrToStructure<float>(sizes.Sizes + (page * 2 * sizeof(float)));
+        }
+        finally
+        {
+            free_page_size_array(sizes);
+        }
+    }
+
+    /// <summary>
+    /// One side of a resize put back the way ViewportViewModel.ApplyBoundsRecord
+    /// now does it for a turned shape: the upright box that side's TAG gives at
+    /// that side's /Rect, written with resize_shape_annotation.
+    /// </summary>
+    private static int PutBack(ulong handle, int index, string tag, TextRect rect)
+    {
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(tag);
+        Assert.Equal(OkPdfium, shape_upright_bounds(
+            Cap, PageWidth(handle, 0), utf8, (nuint)utf8.Length,
+            (float)(rect.Left * Cap), (float)(rect.Top * Cap), (float)(rect.Right * Cap), (float)(rect.Bottom * Cap),
+            out float l, out float t, out float r, out float b));
+        Assert.Equal(OkPdfium, resize_shape_annotation(handle, 0, index, Cap, l, t, r, b, out int newIndex));
+        return newIndex;
+    }
+
+    [Theory]
+    [InlineData(30f)]
+    [InlineData(45f)]
+    [InlineData(135f)]
+    public void undoing_a_turned_shapes_resize_restores_its_size_and_place_and_redo_resizes_it_again(float rotation)
+    {
+        ulong handle = OpenFixture();
+        try
+        {
+            Assert.Equal(OkPdfium, add_shape_annotations(handle, Cap, [Spec(ShapeKind.Rectangle, rotation)], 1));
+            string beforeTag = Tag(handle, 0, 0)!;
+            var before = TagOf(handle, 0, 0);
+            var beforeRect = RectOf(handle, 0, 0);
+
+            Assert.Equal(OkPdfium, resize_shape_annotation(
+                handle, 0, 0, Cap, 200, 300, 600, 500, out int resized));
+            string afterTag = Tag(handle, 0, resized)!;
+            var after = TagOf(handle, 0, resized);
+            var afterRect = RectOf(handle, 0, resized);
+            Assert.Equal(before.BoxWidthPts * 2, after.BoxWidthPts, 1);
+
+            // Undo.
+            int undone = PutBack(handle, resized, beforeTag, beforeRect);
+            var restored = TagOf(handle, 0, undone);
+            Assert.Equal(before.BoxWidthPts, restored.BoxWidthPts, 2);
+            Assert.Equal(before.BoxHeightPts, restored.BoxHeightPts, 2);
+            Assert.Equal(rotation, restored.RotationDeg, 2);
+            var restoredRect = RectOf(handle, 0, undone);
+            Assert.Equal(beforeRect.Left, restoredRect.Left, 3);
+            Assert.Equal(beforeRect.Top, restoredRect.Top, 3);
+            Assert.Equal(beforeRect.Right, restoredRect.Right, 3);
+            Assert.Equal(beforeRect.Bottom, restoredRect.Bottom, 3);
+
+            // Redo.
+            int redone = PutBack(handle, undone, afterTag, afterRect);
+            var again = TagOf(handle, 0, redone);
+            Assert.Equal(after.BoxWidthPts, again.BoxWidthPts, 2);
+            Assert.Equal(after.BoxHeightPts, again.BoxHeightPts, 2);
+            Assert.Equal(afterRect.Left, RectOf(handle, 0, redone).Left, 3);
+        }
+        finally
+        {
+            close_document(handle);
+        }
+    }
 
     [Fact]
-    public void undoing_a_turned_shapes_resize_does_NOT_yet_restore_its_size()
+    public void control_moving_a_turned_shape_back_to_its_old_rectangle_does_not_restore_its_size()
     {
-        // CHARACTERISATION, not an endorsement. This asserts what the app
-        // currently does so the gap cannot be forgotten; it is expected to be
-        // deleted by whoever closes it.
-        //
-        // Undo replays a move to the pre-gesture rectangle, and a move rebuilds
-        // a turned shape from the size on its tag, which the resize has already
-        // overwritten. So the shape returns to the right PLACE at the wrong
-        // SIZE. Closing this needs the undo record to carry the shape's tag as
-        // well as its rectangle, and TagRecord holds a single Rect, so it
-        // cannot express a resize's before and after. That is a change to the
-        // undo data model rather than to this path.
+        // What undo used to do, and why it had to change: a move rebuilds a
+        // turned shape from the size on its tag, which the resize has already
+        // overwritten. The shape came back to the right place at the wrong size.
         ulong handle = OpenFixture();
         try
         {
@@ -390,25 +478,16 @@ public class RotatedShapeResizeInteropTests
             var original = TagOf(handle, 0, 0);
             var originalRect = RectOf(handle, 0, 0);
 
-            // Resize, the way the fixed app now does.
             Assert.Equal(OkPdfium, resize_shape_annotation(
                 handle, 0, 0, Cap, 200, 300, 600, 500, out int resized));
-            Assert.Equal(original.BoxWidthPts * 2, TagOf(handle, 0, resized).BoxWidthPts, 1);
 
-            // Undo, the way ApplyBoundsRecord does: move back to the old /Rect.
             Assert.Equal(OkPdfium, move_shape_annotation(
                 handle, 0, resized, Cap,
                 (float)(originalRect.Left * Cap), (float)(originalRect.Top * Cap),
                 (float)(originalRect.Right * Cap), (float)(originalRect.Bottom * Cap),
-                out int undone));
+                out int moved));
 
-            var after = TagOf(handle, 0, undone);
-
-            // The size did NOT come back. When this assertion starts failing,
-            // the gap has been closed and this test should be replaced by one
-            // asserting equality with `original`.
-            Assert.NotEqual(original.BoxWidthPts, after.BoxWidthPts, 1);
-            Assert.Equal(original.BoxWidthPts * 2, after.BoxWidthPts, 1);
+            Assert.Equal(original.BoxWidthPts * 2, TagOf(handle, 0, moved).BoxWidthPts, 1);
         }
         finally
         {

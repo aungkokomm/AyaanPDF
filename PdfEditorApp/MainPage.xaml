@@ -477,6 +477,8 @@
             </MenuBarItem>
 
             <MenuBarItem Title="Help" Margin="2,3,2,3">
+                <MenuFlyoutItem Text="Keyboard shortcuts" Click="KeyboardShortcuts_Click" KeyboardAcceleratorTextOverride="F1" />
+                <MenuFlyoutSeparator />
                 <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
             </MenuBarItem>
         </MenuBar>

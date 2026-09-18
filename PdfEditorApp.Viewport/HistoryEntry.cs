@@ -61,7 +61,7 @@ public enum HistoryScope
 /// Id is what actually resolves the target.
 /// </param>
 public sealed record AnnotationBoundsState(
-    int PageIndex, int Index, double Left, double Top, double Right, double Bottom, Guid Id);
+    int PageIndex, int Index, double Left, double Top, double Right, double Bottom, Guid Id, string? Tag = null);
 
 /// <summary>
 /// A note's restorable state. Notes are the only mutable annotation (their

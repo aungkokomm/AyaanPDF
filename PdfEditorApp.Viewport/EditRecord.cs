@@ -24,7 +24,14 @@ public readonly record struct EditRect(double Left, double Top, double Right, do
 public abstract record EditRecord(Guid Id, int PageIndex);
 
 /// <summary>An annotation moved or resized. Covers drag, nudge, align, distribute.</summary>
-public sealed record BoundsRecord(Guid Id, int PageIndex, EditRect Before, EditRect After)
+/// <param name="BeforeTag">
+/// For the resize of a TURNED shape only, its tag before and after. Its size
+/// lives on the tag, not in its rectangle (a turned /Rect is the box around the
+/// rotated shape), so putting the rectangle back alone brought the shape back
+/// to the right place at the resized size. Null for everything else.
+/// </param>
+public sealed record BoundsRecord(
+    Guid Id, int PageIndex, EditRect Before, EditRect After, string? BeforeTag = null, string? AfterTag = null)
     : EditRecord(Id, PageIndex);
 
 /// <summary>

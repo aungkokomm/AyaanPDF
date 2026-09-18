@@ -1,3 +1,4 @@
+using System.Linq;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Data;
@@ -39,6 +40,24 @@ public partial class App : Application
     /// <summary>
     /// Initializes the singleton application object.
     /// </summary>
+    /// <summary>Held for the life of the process: it is what makes this the one window.</summary>
+    private static PdfEditorApp.Viewport.SingleInstance? _instance;
+
+    private const int AnyProcess = -1;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(int processId);
+
+    /// <summary>Another launch's files, opened as tabs here. Called off the UI thread.</summary>
+    private static void FilesFromAnotherLaunch(System.Collections.Generic.IReadOnlyList<string> files)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            Diag.Log($"launch: another launch sent {files.Count} file(s)");
+            (Window as MainWindow)?.OpenLaunchedFiles(files);
+        });
+    }
+
     public App()
     {
         InitializeComponent();
@@ -57,8 +76,33 @@ public partial class App : Application
         // which says nothing about which line failed.
         try
         {
-            Window = new MainWindow();
             DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+
+            // The PDFs Explorer asked for, by double-click or Open with.
+            var files = PdfEditorApp.Viewport.LaunchFiles.From(
+                System.Environment.GetCommandLineArgs().Skip(1), System.Environment.CurrentDirectory);
+
+            // One window: a launch while Ayaan PDF is already open hands its
+            // files to that window and quits. If that window does not answer,
+            // it is closing or stuck, and this launch carries on as the one.
+            string name = PdfEditorApp.Viewport.SingleInstance.NameFor(AppInfo.Name, System.AppContext.BaseDirectory);
+            _instance = PdfEditorApp.Viewport.SingleInstance.TryClaim(name, FilesFromAnotherLaunch);
+            if (_instance is null)
+            {
+                // Lets the running window come to the front, which Windows
+                // refuses to a process the user did not just start.
+                AllowSetForegroundWindow(AnyProcess);
+                if (PdfEditorApp.Viewport.SingleInstance.TrySend(name, files, System.TimeSpan.FromSeconds(5)))
+                {
+                    Diag.Log($"launch: handed {files.Count} file(s) to the running window");
+                    System.Environment.Exit(0);
+                    return;
+                }
+                Diag.Log("launch: the running window did not answer, opening a window of our own");
+                _instance = PdfEditorApp.Viewport.SingleInstance.TryClaim(name, FilesFromAnotherLaunch);
+            }
+
+            Window = new MainWindow(files);
             Window.Activate();
         }
         catch (System.Exception ex)

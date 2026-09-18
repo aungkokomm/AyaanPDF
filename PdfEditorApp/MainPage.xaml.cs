@@ -332,6 +332,15 @@ public sealed partial class MainPage : Page
             // untitled document in front of a user who wanted to open a file,
             // and meant the empty state below could never be seen.
 
+            // Recovered work took this tab, so a file the app was launched to
+            // open goes in a tab of its own rather than being dropped.
+            if (recovered && InitialDocumentPath is { } launched && System.IO.File.Exists(launched)
+                && App.Window is MainWindow owner)
+            {
+                owner.AddDocumentTab(launched);
+            }
+            _startupDone = true;
+
             // Places a stamp straight after opening, so the decode-and-place
             // path can be checked without a mouse. Done inline rather than on
             // a timer: a previous harness here scheduled one that never fired,
@@ -5505,6 +5514,15 @@ public sealed partial class MainPage : Page
     /// </summary>
     public string? InitialDocumentPath { get; set; }
 
+    private bool _startupDone;
+
+    /// <summary>
+    /// A welcome tab nobody has used: past its startup (and any recovery
+    /// question), with no document and nothing unsaved. A file opened from
+    /// Explorer takes its place rather than opening behind it.
+    /// </summary>
+    public bool IsIdleWelcome => _startupDone && ViewModel.PageCount == 0 && !ViewModel.IsDirty;
+
     /// <summary>
     /// Whether this page should make a blank document for itself on load.
     ///
@@ -7456,6 +7474,121 @@ public sealed partial class MainPage : Page
         }
     }
 
+    /// <summary>
+    /// Help > Keyboard shortcuts (F1): every key the app answers to, grouped,
+    /// with a box that narrows the list as the reader types. The list itself
+    /// is <see cref="KeyboardShortcutList"/>, which the tests hold to the key
+    /// handling.
+    /// </summary>
+    private async void KeyboardShortcuts_Click(object sender, RoutedEventArgs e)
+    {
+        var rows = new StackPanel();
+        var search = new TextBox
+        {
+            PlaceholderText = "Search, for example save or zoom",
+            Margin = new Thickness(0, 0, 0, 12),
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(search, "Search shortcuts");
+
+        void Show()
+        {
+            rows.Children.Clear();
+            string query = search.Text.Trim();
+            foreach (var group in KeyboardShortcutList.Groups)
+            {
+                var shown = group.Shortcuts
+                    .Where(s => query.Length == 0
+                        || s.What.Contains(query, StringComparison.CurrentCultureIgnoreCase)
+                        || string.Join(" ", s.Keys).Contains(query, StringComparison.CurrentCultureIgnoreCase)
+                        || group.Title.Contains(query, StringComparison.CurrentCultureIgnoreCase))
+                    .ToList();
+                if (shown.Count == 0)
+                {
+                    continue;
+                }
+
+                rows.Children.Add(new TextBlock
+                {
+                    Text = group.Title,
+                    Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+                    Margin = new Thickness(0, rows.Children.Count == 0 ? 0 : 16, 0, 4),
+                });
+                foreach (var shortcut in shown)
+                {
+                    var keys = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+                    foreach (string key in shortcut.Keys)
+                    {
+                        keys.Children.Add(new Border
+                        {
+                            Child = new TextBlock { Text = key, Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"] },
+                            Padding = new Thickness(8, 2, 8, 3),
+                            MinWidth = 28,
+                            CornerRadius = (CornerRadius)Application.Current.Resources["ControlCornerRadius"],
+                            BorderThickness = new Thickness(1, 1, 1, 2),
+                            BorderBrush = (Brush)Application.Current.Resources["ControlStrokeColorDefaultBrush"],
+                            Background = (Brush)Application.Current.Resources["ControlFillColorDefaultBrush"],
+                        });
+                    }
+
+                    var line = new Grid
+                    {
+                        ColumnSpacing = 16,
+                        Padding = new Thickness(0, 4, 0, 4),
+                        ColumnDefinitions =
+                        {
+                            new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) },
+                            new ColumnDefinition { Width = GridLength.Auto },
+                        },
+                    };
+                    line.Children.Add(new TextBlock { Text = shortcut.What, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center });
+                    Grid.SetColumn(keys, 1);
+                    line.Children.Add(keys);
+                    Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(line, $"{shortcut.What}: {string.Join(" ", shortcut.Keys)}");
+                    rows.Children.Add(line);
+                }
+            }
+            if (rows.Children.Count == 0)
+            {
+                rows.Children.Add(new TextBlock { Text = $"No shortcut matches \"{query}\".", Opacity = 0.75 });
+            }
+        }
+
+        search.TextChanged += (_, _) => Show();
+        Show();
+
+        var content = new Grid
+        {
+            Width = 480,
+            Height = 520,
+            RowDefinitions =
+            {
+                new RowDefinition { Height = GridLength.Auto },
+                new RowDefinition { Height = new GridLength(1, GridUnitType.Star) },
+            },
+        };
+        var list = Scrollable(rows);
+        Grid.SetRow(list, 1);
+        content.Children.Add(search);
+        content.Children.Add(list);
+
+        try
+        {
+            await new ContentDialog
+            {
+                XamlRoot = XamlRoot,
+                Title = "Keyboard shortcuts",
+                Content = content,
+                CloseButtonText = "Close",
+                DefaultButton = ContentDialogButton.Close,
+            }.ShowAsync();
+        }
+        catch (Exception ex)
+        {
+            // Another dialog is already open on this window; F1 then does nothing.
+            Diag.Log($"keyboard shortcuts could not be shown: {ex.GetType().Name}");
+        }
+    }
+
     private async void About_Click(object sender, RoutedEventArgs e)
     {
         var asm = System.Reflection.Assembly.GetExecutingAssembly();
@@ -7494,6 +7627,39 @@ public sealed partial class MainPage : Page
             Opacity = 0.75,
             TextWrapping = TextWrapping.Wrap,
         });
+
+        // The licences themselves, beside the exe. Opened in Notepad by its full
+        // path: a self-contained app cannot count on the .txt association.
+        var notices = new HyperlinkButton
+        {
+            Content = "Third-party notices",
+            Padding = new Thickness(0, 4, 0, 4),
+        };
+        notices.Click += (_, _) =>
+        {
+            string path = System.IO.Path.Combine(AppContext.BaseDirectory, "THIRD-PARTY-NOTICES.txt");
+            if (!System.IO.File.Exists(path))
+            {
+                return;
+            }
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    // The classic Notepad in System32. The Store one, reached by
+                    // the bare name, fails to start beside this app's own
+                    // Windows App SDK files.
+                    FileName = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "notepad.exe"),
+                    Arguments = $"\"{path}\"",
+                    UseShellExecute = false,
+                });
+            }
+            catch (Exception ex)
+            {
+                Diag.Log($"third-party notices could not be opened: {ex.Message}");
+            }
+        };
+        body.Children.Add(notices);
 
         // The log is where most questions about a misbehaving build get
         // answered, so it is worth one click rather than a path to type. No
@@ -8490,6 +8656,8 @@ public sealed partial class MainPage : Page
             // Not awaited: this switch is called from a key handler, and the
             // handler has to return so the key is marked handled.
             case EditorCommand.AddBookmark: _ = AddBookmarkHere(); break;
+
+            case EditorCommand.KeyboardShortcuts: KeyboardShortcuts_Click(this, null!); break;
         }
     }
 
@@ -9137,9 +9305,9 @@ public sealed partial class MainPage : Page
             // F3 is the exception to this early return, and the find box is
             // exactly where it will be pressed: the reader has just typed a
             // query and wants the next hit without leaving the field. It types
-            // no character, so nothing is taken away from the box.
+            // no character, so nothing is taken away from the box. F1 likewise.
             var inField = KeyboardCommands.Resolve((int)e.Key, _isCtrlDown, IsShiftDown(), textFocused: false);
-            if (inField is EditorCommand.FindNext or EditorCommand.FindPrevious)
+            if (inField is EditorCommand.FindNext or EditorCommand.FindPrevious or EditorCommand.KeyboardShortcuts)
             {
                 Run(inField);
                 e.Handled = true;

@@ -66,12 +66,39 @@ DisableDirPage=no
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Tells Explorer to re-read file types, so Open with lists the app at once.
+ChangesAssociations=WizardIsTaskSelected('pdffiles')
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
+; On by default. A portable install to a test folder should leave it off, or
+; PDFs would open in that copy instead of the main one.
+Name: "pdffiles"; Description: "Offer {#AppName} for &PDF files (Open with, and Default apps in Settings)"; GroupDescription: "PDF files:"
+
+[Registry]
+; Per user (HKCU), like the rest of this install. It OFFERS the app for PDFs
+; and never takes over the default: Windows lets only the user choose that,
+; in Open with or in Settings > Default apps. Everything here is removed on
+; uninstall.
+;
+; The document type the app opens PDFs as.
+Root: HKA; Subkey: "Software\Classes\AyaanPDF.Document"; ValueType: string; ValueName: ""; ValueData: "PDF Document"; Flags: uninsdeletekey; Tasks: pdffiles
+Root: HKA; Subkey: "Software\Classes\AyaanPDF.Document\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"; Tasks: pdffiles
+Root: HKA; Subkey: "Software\Classes\AyaanPDF.Document\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: pdffiles
+; Listed under Open with for .pdf.
+Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "AyaanPDF.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: pdffiles
+Root: HKA; Subkey: "Software\Classes\Applications\{#ExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"; Flags: uninsdeletekey; Tasks: pdffiles
+Root: HKA; Subkey: "Software\Classes\Applications\{#ExeName}\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""; Tasks: pdffiles
+Root: HKA; Subkey: "Software\Classes\Applications\{#ExeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: pdffiles
+; Listed in Settings > Default apps, where the user can make it the default.
+Root: HKA; Subkey: "Software\{#AppName}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#AppName}"; Flags: uninsdeletekey; Tasks: pdffiles
+Root: HKA; Subkey: "Software\{#AppName}\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "View, edit, sign and recognise text in PDF files."; Tasks: pdffiles
+Root: HKA; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "AyaanPDF.Document"; Tasks: pdffiles
+Root: HKA; Subkey: "Software\{#AppName}"; Flags: uninsdeletekeyifempty; Tasks: pdffiles
+Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#AppName}"; ValueData: "Software\{#AppName}\Capabilities"; Flags: uninsdeletevalue; Tasks: pdffiles
 
 [Files]
 ; The entire self-contained publish output (exe + WinUI runtime + render_core.dll +

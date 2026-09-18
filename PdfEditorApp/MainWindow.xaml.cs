@@ -24,7 +24,11 @@ public sealed partial class MainWindow : Window
     // re-issued Close() sails through instead of prompting again.
     private bool _closeConfirmed;
 
-    public MainWindow()
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hwnd);
+
+    /// <param name="files">The PDFs the app was launched to open, each in its own tab; none shows the welcome tab.</param>
+    public MainWindow(System.Collections.Generic.IReadOnlyList<string> files)
     {
         InitializeComponent();
 
@@ -50,7 +54,53 @@ public sealed partial class MainWindow : Window
             presenter.Maximize();
         }
 
-        AddDocumentTab(null);
+        if (files.Count == 0)
+        {
+            AddDocumentTab(null);
+        }
+        foreach (string file in files)
+        {
+            AddDocumentTab(file);
+        }
+    }
+
+    /// <summary>
+    /// Opens files another launch handed over, as Explorer's double-click or
+    /// Open with would, and brings the window to the front. A file already
+    /// open shows its tab instead of opening twice, and an untouched welcome
+    /// tab gives way to the first file rather than staying behind it.
+    /// </summary>
+    public void OpenLaunchedFiles(System.Collections.Generic.IReadOnlyList<string> files)
+    {
+        foreach (string file in files)
+        {
+            var open = Tabs.TabItems.OfType<TabViewItem>().FirstOrDefault(t =>
+                t.Content is MainPage p && string.Equals(p.ViewModel.DocumentPath, file, StringComparison.OrdinalIgnoreCase));
+            if (open is not null)
+            {
+                Tabs.SelectedItem = open;
+                continue;
+            }
+
+            var welcome = Tabs.SelectedItem as TabViewItem;
+            bool replace = welcome?.Content is MainPage { IsIdleWelcome: true };
+            AddDocumentTab(file);
+            if (replace)
+            {
+                Tabs.TabItems.Remove(welcome);
+            }
+        }
+        BringToFront();
+    }
+
+    private void BringToFront()
+    {
+        if (AppWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Minimized } presenter)
+        {
+            presenter.Restore();
+        }
+        Activate();
+        SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
     }
 
     /// <summary>The document the user is looking at, or null before the first tab exists.</summary>

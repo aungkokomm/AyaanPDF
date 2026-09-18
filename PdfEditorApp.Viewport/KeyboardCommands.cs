@@ -36,6 +36,8 @@ public enum EditorCommand
     AddBookmark,
     /// <summary>File > Document properties. Alt+Enter, as for Properties in File Explorer.</summary>
     DocumentProperties,
+    /// <summary>Help > Keyboard shortcuts. F1, the help key.</summary>
+    KeyboardShortcuts,
 }
 
 /// <summary>
@@ -78,6 +80,7 @@ public static class KeyboardCommands
     public const int KeyEnter = 0x0D;
     public const int KeyF3 = 0x72;
     public const int KeyD = 0x44;
+    public const int KeyF1 = 0x70;
 
     // The bracket keys, as Windows names them: OEM_4 is '[' and OEM_6 is ']'
     // on a US layout. Layout-dependent, and deliberately so: these are
@@ -152,6 +155,13 @@ public static class KeyboardCommands
         if (keyCode == KeyF3)
         {
             return shift ? EditorCommand.FindPrevious : EditorCommand.FindNext;
+        }
+
+        // F1 for the same reason: it types nothing, so it answers from a text
+        // field too. Plain F1 only.
+        if (keyCode == KeyF1)
+        {
+            return ctrl || shift ? EditorCommand.None : EditorCommand.KeyboardShortcuts;
         }
 
         if (!ctrl || textFocused) { return EditorCommand.None; }

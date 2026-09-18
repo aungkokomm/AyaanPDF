@@ -85,11 +85,15 @@ public class StartupAndEmptyStateWiringTests
     public void the_window_opens_its_first_tab_with_no_document()
     {
         // AddDocumentTab(null) and nothing else: passing startBlank here would
-        // put the old behaviour back one layer down.
-        string ctor = MethodBody(MainWindowCode(), "public MainWindow()");
+        // put the old behaviour back one layer down. Launched to open files,
+        // it opens those instead, one tab each.
+        string ctor = MethodBody(MainWindowCode(), "public MainWindow(");
 
-        Assert.Contains("AddDocumentTab(null)", ctor, StringComparison.Ordinal);
-        Assert.DoesNotContain("AddDocumentTab(null, startBlank", ctor, StringComparison.Ordinal);
+        int none = ctor.IndexOf("if (files.Count == 0)", StringComparison.Ordinal);
+        Assert.True(none >= 0);
+        Assert.True(ctor.IndexOf("AddDocumentTab(null);", none, StringComparison.Ordinal) > none);
+        Assert.Contains("AddDocumentTab(file);", ctor, StringComparison.Ordinal);
+        Assert.DoesNotContain("startBlank", ctor, StringComparison.Ordinal);
     }
 
     [Fact]

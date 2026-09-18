@@ -9513,15 +9513,22 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         // the rest where they had been dragged. The extras' pre-drag rectangles
         // come from _extraDragOrigin, which is the snapshot taken when the drag
         // began; _extraSelected already holds their moved positions by now.
+        // A turned shape being resized also keeps its tag, which is where its
+        // size lives; see BoundsRecord.
         var undoTargets = new List<AnnotationBoundsState>
         {
-            new(start.PageIndex, start.Index, start.Left, start.Top, start.Right, start.Bottom, start.Id),
+            new(start.PageIndex, start.Index, start.Left, start.Top, start.Right, start.Bottom, start.Id,
+                resizing ? TurnedShapeTagAt(start.PageIndex, start.Index) : null),
         };
         var origins = _extraDragOrigin.Count == _extraSelected.Count ? _extraDragOrigin : _extraSelected;
         foreach (var e in origins)
         {
+            // An extra carries its reported bounds; a turned text box's undo
+            // needs its own box, as the anchor's already is.
+            var (el, et, er, eb) = TextBoxUprightAt(e.PageIndex, e.Index, e.Left, e.Top, e.Right, e.Bottom);
             undoTargets.Add(new AnnotationBoundsState(
-                e.PageIndex, e.Index, e.Left, e.Top, e.Right, e.Bottom, e.Id));
+                e.PageIndex, e.Index, el, et, er, eb, e.Id,
+                resizing ? TurnedShapeTagAt(e.PageIndex, e.Index) : null));
         }
 
         // ONE entry for the whole gesture, however many objects it moved and
@@ -9811,9 +9818,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
                 if (extIsText)
                 {
+                    // The extra's rectangle is its reported bounds moved by
+                    // the drag; a turned box is re-laid-out at its own box.
+                    var (tl, tt, tr, tb) = TextBoxUprightAt(
+                        target.PageIndex, target.Index, target.Left, target.Top, target.Right, target.Bottom);
                     extStatus = RenderCoreNative.resize_text_box_annotation(
                         _documentHandle, target.PageIndex, target.Index, CaptureWidth,
-                        exl, ext, exr, exb, out extNewIndex);
+                        (float)(tl * CaptureWidth), (float)(tt * CaptureWidth),
+                        (float)(tr * CaptureWidth), (float)(tb * CaptureWidth), out extNewIndex);
                 }
                 if (extStatus != RenderStatus.OkPdfium && extIsShape)
                 {
@@ -10116,7 +10128,12 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         jobs.Add((oldAnchor, newAnchor, 0));
         for (int i = 0; i < _extraSelected.Count && i < newExtras.Count; i++)
         {
-            jobs.Add((_extraSelected[i], newExtras[i], i + 1));
+            // Extras carry their reported bounds; a turned text box among them
+            // is written at its own box, centred where its bounds were put.
+            var old = _extraSelected[i];
+            var (tl, tt, tr, tb) = TextBoxUprightAt(
+                old.PageIndex, old.Index, newExtras[i].Left, newExtras[i].Top, newExtras[i].Right, newExtras[i].Bottom);
+            jobs.Add((old, newExtras[i] with { Left = tl, Top = tt, Right = tr, Bottom = tb }, i + 1));
         }
         jobs.Sort((a, b) =>
         {
@@ -15402,7 +15419,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             switch (entry.Records[i])
             {
                 case BoundsRecord b:
-                    ApplyBoundsRecord(b, backwards ? b.Before : b.After);
+                    ApplyBoundsRecord(b, backwards ? b.Before : b.After, backwards ? b.BeforeTag : b.AfterTag);
                     touched.Add(b.PageIndex);
                     break;
 
@@ -15568,7 +15585,8 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     /// <summary>Puts one annotation back to a rectangle, by Id, through the
     /// same per-kind dispatch the move path uses.</summary>
-    private void ApplyBoundsRecord(BoundsRecord record, EditRect target)
+    /// <param name="tag">A turned shape's tag on that side of a resize, or null for a plain move.</param>
+    private void ApplyBoundsRecord(BoundsRecord record, EditRect target, string? tag)
     {
         if (FindLoadedById(record.Id, record.PageIndex) is not (int page, int index))
         {
@@ -15576,7 +15594,14 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
         var sel = new LoadedSelection(page, index, target.Left, target.Top, target.Right, target.Bottom, record.Id);
-        int newIndex = WriteMovedAnnotation(sel, sel, 1000);
+
+        // A turned shape's resize is put back the way it was written: as a
+        // resize to the upright box that side's tag describes at that
+        // rectangle. The move path would read the size off the CURRENT tag,
+        // which is the other side's.
+        int newIndex = tag is not null
+            ? ResizeTurnedShape(page, index, tag, sel)
+            : WriteMovedAnnotation(sel, sel, 1000);
         if (newIndex >= 0)
         {
             InvalidateLoadedPage(page);
@@ -15584,6 +15609,52 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             InvalidateLoadedPage(page);
         }
     }
+
+    /// <summary>
+    /// Resizes a turned shape to the upright box <paramref name="tag"/> gives
+    /// it at <paramref name="sel"/>'s rectangle. The new index, or -1.
+    /// </summary>
+    private int ResizeTurnedShape(int page, int index, string tag, LoadedSelection sel)
+    {
+        const int Cap = 1000;
+        var (l, t, r, b) = UprightBounds(tag, sel, Cap, PagePointsFor(page).W);
+        return RenderCoreNative.resize_shape_annotation(
+                   _documentHandle, page, index, Cap,
+                   (float)(l * Cap), (float)(t * Cap), (float)(r * Cap), (float)(b * Cap),
+                   out int newIndex) == RenderStatus.OkPdfium
+            ? newIndex
+            : -1;
+    }
+
+    /// <summary>
+    /// For a TURNED text box, its own upright box centred where the given
+    /// rectangle is; anything else gets the rectangle back unchanged. Needed
+    /// wherever a text box's rectangle came from its reported bounds, which for
+    /// a turned box is the larger box around it: a multi-selection's extras and
+    /// the rectangles read back after a write. Handed to the text box's
+    /// re-layout as it was, that larger box became the box, and it grew with
+    /// every move. The anchor never needed this: its rectangle is set from the
+    /// tag when it is selected. Read while the tag is current, which a move
+    /// leaves the same size.
+    /// </summary>
+    private (double Left, double Top, double Right, double Bottom) TextBoxUprightAt(
+        int page, int index, double left, double top, double right, double bottom)
+    {
+        if (!TextBoxTagReader.TryParse(ReadAnnotationContents(page, index), out var tag)
+            || tag.RotationDeg == 0 || !tag.HasBoxRect)
+        {
+            return (left, top, right, bottom);
+        }
+        return TurnedBox.Recentre((tag.BoxLeft, tag.BoxTop, tag.BoxRight, tag.BoxBottom), (left, top, right, bottom));
+    }
+
+    /// <summary>A shape's tag if it is turned, for a resize's undo record; otherwise null.</summary>
+    private string? TurnedShapeTagAt(int page, int index) =>
+        ReadAnnotationContents(page, index) is { } tag
+        && tag.StartsWith("AyaanShape:", StringComparison.Ordinal)
+        && AngleFromTag(tag) != 0
+            ? tag
+            : null;
 
     /// <summary>Rewrites one annotation from a stored tag: remove it, then
     /// re-create it from the tag's own description.</summary>
@@ -15766,10 +15837,15 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             foreach (var a in LoadedFor(page))
             {
                 if (a.Index != index) { continue; }
+                // Where it landed, as a turned text box's own box rather than
+                // the larger bounds it reports, so redo does not grow it.
+                var (al, at, ar, ab) = TextBoxUprightAt(page, index, a.Left, a.Top, a.Right, a.Bottom);
                 RecordEdit(new BoundsRecord(
                     b.Id, page,
                     new EditRect(b.Left, b.Top, b.Right, b.Bottom),
-                    new EditRect(a.Left, a.Top, a.Right, a.Bottom)));
+                    new EditRect(al, at, ar, ab),
+                    b.Tag,
+                    b.Tag is null ? null : ReadAnnotationContents(page, index)));
                 break;
             }
         }
