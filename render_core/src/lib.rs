@@ -32129,6 +32129,19 @@ p={spread_px:.4},c={rgba:08X})"
         close_document(handle);
     }
 
+    /// Where the manual surveys look for real PDFs: the test folder, and the
+    /// Downloads folder (with Telegram's inside it), found from Windows rather
+    /// than written in.
+    fn survey_roots() -> Vec<std::path::PathBuf> {
+        let mut roots = vec![std::path::PathBuf::from(r"D:\Ayaan PDF Test file")];
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let downloads = std::path::Path::new(&home).join("Downloads");
+            roots.push(downloads.join("Telegram Desktop"));
+            roots.push(downloads);
+        }
+        roots
+    }
+
     /// STEP D SURVEY. What would reflow actually have to work with?
     ///
     /// Read-only, `#[ignore]`d, run with
@@ -32146,11 +32159,7 @@ p={spread_px:.4},c={rgba:08X})"
         use lopdf::Object;
         use std::collections::BTreeMap;
 
-        let roots = [
-            r"D:\Ayaan PDF Test file",
-            r"%USERPROFILE%\Downloads",
-            r"%USERPROFILE%\Downloads\Telegram Desktop",
-        ];
+        let roots = survey_roots();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for root in roots {
             let Ok(entries) = std::fs::read_dir(root) else { continue };
@@ -32648,11 +32657,7 @@ p={spread_px:.4},c={rgba:08X})"
         use lopdf::content::Content;
         use std::collections::BTreeMap;
 
-        let roots = [
-            r"D:\Ayaan PDF Test file",
-            r"%USERPROFILE%\Downloads",
-            r"%USERPROFILE%\Downloads\Telegram Desktop",
-        ];
+        let roots = survey_roots();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for root in roots {
             let Ok(entries) = std::fs::read_dir(root) else { continue };
@@ -33561,11 +33566,7 @@ p={spread_px:.4},c={rgba:08X})"
         use lopdf::content::Content;
         use std::collections::BTreeMap;
 
-        let roots = [
-            r"D:\Ayaan PDF Test file",
-            r"%USERPROFILE%\Downloads",
-            r"%USERPROFILE%\Downloads\Telegram Desktop",
-        ];
+        let roots = survey_roots();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for root in roots {
             let Ok(entries) = std::fs::read_dir(root) else { continue };
@@ -33965,11 +33966,7 @@ p={spread_px:.4},c={rgba:08X})"
         use lopdf::Object;
         use std::collections::BTreeMap;
 
-        let roots = [
-            r"D:\Ayaan PDF Test file",
-            r"%USERPROFILE%\Downloads",
-            r"%USERPROFILE%\Downloads\Telegram Desktop",
-        ];
+        let roots = survey_roots();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for root in roots {
             let Ok(entries) = std::fs::read_dir(root) else { continue };
@@ -34274,11 +34271,7 @@ p={spread_px:.4},c={rgba:08X})"
     fn step_d_where_is_the_text() {
         use lopdf::content::Content;
         use std::collections::BTreeMap;
-        let roots = [
-            r"D:\Ayaan PDF Test file",
-            r"%USERPROFILE%\Downloads",
-            r"%USERPROFILE%\Downloads\Telegram Desktop",
-        ];
+        let roots = survey_roots();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for root in roots {
             let Ok(entries) = std::fs::read_dir(root) else { continue };
@@ -34354,11 +34347,7 @@ p={spread_px:.4},c={rgba:08X})"
     #[ignore]
     fn block_corpus() {
         use std::collections::BTreeMap;
-        let roots = [
-            r"D:\Ayaan PDF Test file",
-            r"%USERPROFILE%\Downloads",
-            r"%USERPROFILE%\Downloads\Telegram Desktop",
-        ];
+        let roots = survey_roots();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for root in roots {
             let Ok(entries) = std::fs::read_dir(root) else { continue };

@@ -395,10 +395,13 @@ mod tests {
     use super::*;
 
     const MYANMAR_TEXT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
-    const PYIDAUNGSU: [&str; 2] = [
-        r"%USERPROFILE%\AppData\Local\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf",
-        r"C:\Windows\Fonts\Pyidaungsu.ttf",
-    ];
+    /// Pyidaungsu installed for this user only, else for everyone.
+    fn pyidaungsu() -> Option<Vec<u8>> {
+        let own = std::env::var("LOCALAPPDATA")
+            .map(|d| format!(r"{d}\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf"))
+            .unwrap_or_default();
+        first_present(&[&own, r"C:\Windows\Fonts\Pyidaungsu.ttf"])
+    }
 
     /// An index can be filled by whoever enumerated the clusters, and the walk
     /// above it does not care who that was.
@@ -485,7 +488,7 @@ mod tests {
 
     #[test]
     fn pyidaungsu_reads_back_the_burmese_it_drew() {
-        let Some(bytes) = first_present(&PYIDAUNGSU) else { return };
+        let Some(bytes) = pyidaungsu() else { return };
         round_trips(&bytes, "Pyidaungsu");
     }
 
