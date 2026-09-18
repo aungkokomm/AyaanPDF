@@ -32,29 +32,9 @@ Plenty of PDF apps can *show* Hindi and Burmese. Try to change a word, though, a
 **Ayaan PDF was built to get that right.** Click a line, type, and it stays real text: shaped correctly, searchable, and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
 
 ## Screenshots
-
-**Your documents, in tabs, with everything at hand**
-
 <img width="960" height="511" alt="Ayaan PDF with a document open" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
 <img width="960" height="337" alt="image" src="https://github.com/user-attachments/assets/e7e5c9c7-40f8-4580-9a6f-36232761bd53" />
 <img width="591" height="380" alt="image" src="https://github.com/user-attachments/assets/8389f7e1-875e-4dfb-a207-f86ca6eb471f" />
-
-
-**Edit the words on the page, in Hindi and Myanmar too**
-
-<!-- Paste screenshot 2 on the line below: editing Hindi or Myanmar text. -->
-
-
-**Gradients, shadows and glows that are saved into the PDF**
-
-<!-- Paste screenshot 3 on the line below: shapes with effects. -->
-
-
-**Turn scans into searchable text**
-
-<!-- Paste screenshot 4 on the line below: Recognize text. -->
-
-
 
 ## What it can do
 
