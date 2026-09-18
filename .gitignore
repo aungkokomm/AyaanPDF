@@ -42,3 +42,6 @@ render_core/tests/fixtures/sample_justified_embedded.pdf
 PdfEditorApp/Assets/Ocr/tessdata/
 PdfEditorApp/Assets/Ocr/*.onnx
 tools/ocr/__pycache__/
+
+# Private planning notes, kept on this PC only.
+PROJECT_SPEC.md
