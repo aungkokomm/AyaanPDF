@@ -36,6 +36,8 @@ Plenty of PDF apps can *show* Hindi and Burmese. Try to change a word, though, a
 <img width="960" height="511" alt="Ayaan PDF with a document open" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
 <img width="960" height="337" alt="image" src="https://github.com/user-attachments/assets/e7e5c9c7-40f8-4580-9a6f-36232761bd53" />
 <img width="591" height="380" alt="image" src="https://github.com/user-attachments/assets/8389f7e1-875e-4dfb-a207-f86ca6eb471f" />
+<img width="960" height="399" alt="image" src="https://github.com/user-attachments/assets/142e3702-7717-4524-8aff-9d8047971cad" />
+<img width="687" height="456" alt="image" src="https://github.com/user-attachments/assets/478e92e1-aa7a-4d8b-9abe-a8f17d5ded91" />
 
 ## What it can do
 
