@@ -1,0 +1,42 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.5.11709.299 stable
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PdfEditorApp", "PdfEditorApp\PdfEditorApp.csproj", "{0A2A29D0-09BD-4753-A75B-81276EF8BAD6}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PdfEditorApp.Viewport", "PdfEditorApp.Viewport\PdfEditorApp.Viewport.csproj", "{C6EEABD9-AA26-4CF2-8BAB-D0251D3B57D6}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PdfEditorApp.Rendering.Skia", "PdfEditorApp.Rendering.Skia\PdfEditorApp.Rendering.Skia.csproj", "{4CC73926-2033-45DE-B935-87A701EAE654}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PdfEditorApp.Tests", "PdfEditorApp.Tests\PdfEditorApp.Tests.csproj", "{28752CD5-36E3-425C-B1D5-4997F24C11D4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0A2A29D0-09BD-4753-A75B-81276EF8BAD6}.Debug|x64.ActiveCfg = Debug|x64
+		{0A2A29D0-09BD-4753-A75B-81276EF8BAD6}.Debug|x64.Build.0 = Debug|x64
+		{0A2A29D0-09BD-4753-A75B-81276EF8BAD6}.Release|x64.ActiveCfg = Release|x64
+		{0A2A29D0-09BD-4753-A75B-81276EF8BAD6}.Release|x64.Build.0 = Release|x64
+		{C6EEABD9-AA26-4CF2-8BAB-D0251D3B57D6}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{C6EEABD9-AA26-4CF2-8BAB-D0251D3B57D6}.Debug|x64.Build.0 = Debug|Any CPU
+		{C6EEABD9-AA26-4CF2-8BAB-D0251D3B57D6}.Release|x64.ActiveCfg = Release|Any CPU
+		{C6EEABD9-AA26-4CF2-8BAB-D0251D3B57D6}.Release|x64.Build.0 = Release|Any CPU
+		{4CC73926-2033-45DE-B935-87A701EAE654}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{4CC73926-2033-45DE-B935-87A701EAE654}.Debug|x64.Build.0 = Debug|Any CPU
+		{4CC73926-2033-45DE-B935-87A701EAE654}.Release|x64.ActiveCfg = Release|Any CPU
+		{4CC73926-2033-45DE-B935-87A701EAE654}.Release|x64.Build.0 = Release|Any CPU
+		{28752CD5-36E3-425C-B1D5-4997F24C11D4}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{28752CD5-36E3-425C-B1D5-4997F24C11D4}.Debug|x64.Build.0 = Debug|Any CPU
+		{28752CD5-36E3-425C-B1D5-4997F24C11D4}.Release|x64.ActiveCfg = Release|Any CPU
+		{28752CD5-36E3-425C-B1D5-4997F24C11D4}.Release|x64.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {7FB357D5-823B-4971-B35B-56C39AEA3237}
+	EndGlobalSection
+EndGlobal

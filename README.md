@@ -229,7 +229,9 @@ Press **F1** in the app to see every shortcut. A few favourites:
    python tools/ocr/fetch_ocr_models.py
    ```
 
-3. **Build the app** from a Developer PowerShell for Visual Studio. The Rust core, `render_core.dll`, is built by `cargo` as part of this step.
+3. **Build and run.** Open `AyaanPDF.sln` in Visual Studio and press F5. The Rust core, `render_core.dll`, is built by `cargo` as part of the build, so the first one takes a few minutes.
+
+   Or build from a Developer PowerShell for Visual Studio:
 
    ```
    MSBuild PdfEditorApp\PdfEditorApp.csproj -t:Build -restore -p:Configuration=Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:WindowsPackageType=None -p:WindowsAppSDKSelfContained=true -p:SelfContained=true
