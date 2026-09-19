@@ -23,6 +23,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4.svg" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/languages-English%20%7C%20%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80%20%7C%20%E1%80%99%E1%80%BC%E1%80%94%E1%80%BA%E1%80%99%E1%80%AC-orange.svg" alt="English, Hindi, Myanmar">
+  <a href="../../releases"><img src="https://img.shields.io/github/downloads/aungkokomm/AyaanPDF/total.svg" alt="Downloads"></a>
 </p>
 
 ---
