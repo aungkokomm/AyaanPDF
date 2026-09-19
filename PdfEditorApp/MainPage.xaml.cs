@@ -7628,6 +7628,26 @@ public sealed partial class MainPage : Page
             TextWrapping = TextWrapping.Wrap,
         });
 
+        // The project's page. Launcher, like a web link in a document: the
+        // user's own browser, never a program.
+        var website = new HyperlinkButton
+        {
+            Content = "aungkokomm.github.io/ayaanpdf",
+            Padding = new Thickness(0, 4, 0, 4),
+        };
+        website.Click += async (_, _) =>
+        {
+            try
+            {
+                await Windows.System.Launcher.LaunchUriAsync(new Uri("https://aungkokomm.github.io/ayaanpdf/"));
+            }
+            catch (Exception ex)
+            {
+                Diag.Log($"website could not be opened: {ex.Message}");
+            }
+        };
+        body.Children.Add(website);
+
         // The licences themselves, beside the exe. Opened in Notepad by its full
         // path: a self-contained app cannot count on the .txt association.
         var notices = new HyperlinkButton

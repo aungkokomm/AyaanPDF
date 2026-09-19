@@ -60,6 +60,15 @@ public class AboutDialogWiringTests
     }
 
     [Fact]
+    public void about_links_to_the_website_through_the_launcher()
+    {
+        string about = Body(Code(), "private async void About_Click(");
+
+        Assert.Contains("Content = \"aungkokomm.github.io/ayaanpdf\"", about, StringComparison.Ordinal);
+        Assert.Contains("Launcher.LaunchUriAsync(new Uri(\"https://aungkokomm.github.io/ayaanpdf/\"))", about, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void the_log_link_is_offered_once()
     {
         Assert.Single(Regex.Matches(Code(), "Open the diagnostic log"));
