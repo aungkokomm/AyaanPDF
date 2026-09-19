@@ -170,9 +170,15 @@
     Rust edit silently would not reach the running app. cargo is incremental,
     so this costs well under a second once warm.
   -->
+  <!--
+    cargo's warnings go to the build output as plain text, not into Visual
+    Studio's Error List. A Rust error still fails the build (MSB3073); its
+    details are in the output.
+  -->
   <Target Name="BuildRenderCore" BeforeTargets="BeforeBuild">
     <Exec Command="cargo build --release"
           WorkingDirectory="$(MSBuildProjectDirectory)\..\render_core"
+          IgnoreStandardErrorWarningFormat="true"
           ContinueOnError="false" />
   </Target>
 
