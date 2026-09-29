@@ -66,6 +66,18 @@ fn winansi_encode(c: char) -> Option<u8> {
     }
 }
 
+/// One WinAnsi character code to the character it stands for, or nothing for a
+/// code WinAnsi leaves undefined. The inverse of `winansi_encode`.
+pub(crate) fn winansi_decode(code: u8) -> Option<char> {
+    match code {
+        0x80..=0x9F => match WINANSI_HIGH[(code - 0x80) as usize] {
+            0 => None,
+            u => char::from_u32(u32::from(u)),
+        },
+        _ => Some(char::from(code)),
+    }
+}
+
 /// Every character of `text` as a character code, or nothing if any of them
 /// has no WinAnsi code at all.
 fn to_codes(text: &str) -> Option<Vec<u8>> {

@@ -9737,7 +9737,9 @@ public sealed partial class MainPage : Page
         // anything. It is deliberately not offered once there is a caret in
         // the line: there a drag selects through the text, and the Select
         // tool's own I-beam is the truth.
-        if (ViewModel.CanMoveTextUnitAt(content.Page, nx, ny))
+        //
+        // ⚠️ ONLY WITH ALT HELD, because only then does the press move it.
+        if (IsAltDown() && ViewModel.CanMoveTextUnitAt(content.Page, nx, ny))
         {
             return InputSystemCursorShape.SizeAll;
         }
@@ -10347,8 +10349,16 @@ public sealed partial class MainPage : Page
                             // selection, and the selection is the very thing
                             // the move is committed against. It moved nothing,
                             // silently, every time.
-                            _textMoveArmed =
-                                ViewModel.BeginTextUnitMove(content.Page, nx, ny);
+                            //
+                            // ⚠️ AND ONLY ALT PICKS THE TEXT UP (the reader's
+                            // choice, 2026-09-29). A plain drag used to move it
+                            // too, and dragging to select words on a line the
+                            // app would not edit cut that line in half. Without
+                            // Alt the press is never a move, so it can act at
+                            // once: the caret goes in and a drag selects, just
+                            // as it does once typing.
+                            _textMoveArmed = IsAltDown()
+                                && ViewModel.BeginTextUnitMove(content.Page, nx, ny);
                             if (_textMoveArmed)
                             {
                                 _dragPointerId = e.Pointer.PointerId;
@@ -10360,6 +10370,10 @@ public sealed partial class MainPage : Page
                                 // TextBox, so the keys have to be sent somewhere
                                 // that will hand them to RootGrid_KeyDown.
                                 RootGrid.Focus(FocusState.Programmatic);
+
+                                _inPlaceDragging = true;
+                                _dragPointerId = e.Pointer.PointerId;
+                                ViewportHost.CapturePointer(e.Pointer);
                             }
                         }
 
@@ -10752,14 +10766,10 @@ public sealed partial class MainPage : Page
         {
             _textMoveArmed = false;
 
-            // ⚠️ ALT HELD MOVES THE ONE LINE. Without it the whole paragraph
-            // goes, which is what a reader dragging a block of text means; Alt
-            // is the one modifier not already spoken for here, since Shift
-            // extends a selection and Ctrl is the zoom.
-            //
-            // A press that never travelled is still the click it was, and the
-            // caret goes in here rather than on the way down. See
-            // ViewportViewModel.ReleaseTextUnitPress for why it has to.
+            // Only an Alt press arms a move (see the press). One that travelled
+            // puts the text down where it was carried; one that never travelled
+            // is an Alt click, which narrows the selection to the one line. See
+            // ViewportViewModel.ReleaseTextUnitPress.
             if (ViewModel.ReleaseTextUnitPress(IsAltDown()))
             {
                 RootGrid.Focus(FocusState.Programmatic);

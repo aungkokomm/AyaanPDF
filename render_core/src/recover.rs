@@ -103,6 +103,173 @@ fn installed(base_font: &str) -> Option<&'static str> {
     Some(if std::path::Path::new(heavy).exists() { heavy } else { regular })
 }
 
+/// Every Pyidaungsu file installed on this machine, for everyone and for this
+/// user, found once. See `face_for`.
+fn pyidaungsu_files() -> &'static [&'static str] {
+    static FILES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    FILES.get_or_init(|| {
+        let mut dirs = vec![std::path::PathBuf::from(r"C:\Windows\Fonts")];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            dirs.push(std::path::Path::new(&local).join(r"Microsoft\Windows\Fonts"));
+        }
+        let mut out: Vec<&'static str> = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut found: Vec<String> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        let n = n.to_ascii_lowercase();
+                        n.contains("pyidaungsu") && (n.ends_with(".ttf") || n.ends_with(".otf"))
+                    })
+                })
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            found.sort();
+            // Leaked once, like the fixed paths beside them: a handful of short
+            // strings for the life of the process.
+            out.extend(found.into_iter().map(|s| &*Box::leak(s.into_boxed_str())));
+        }
+        out
+    })
+}
+
+/// How many of the page's glyphs a font file draws at the width the page
+/// declares for them, as a fraction.
+fn agreement(path: &str, glyphs: &BTreeSet<u16>, widths: &crate::shaped::CidWidths) -> Option<f64> {
+    let bytes = std::fs::read(path).ok()?;
+    let face = rustybuzz::ttf_parser::Face::parse(&bytes, 0).ok()?;
+    let upem = f64::from(face.units_per_em());
+    if glyphs.is_empty() || upem <= 0.0 {
+        return None;
+    }
+    let agree = glyphs
+        .iter()
+        .filter(|&&g| {
+            face.glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(g))
+                .is_some_and(|adv| (f64::from(adv) * 1000.0 / upem - widths.of(g)).abs() <= 1.0)
+        })
+        .count();
+    Some(agree as f64 / glyphs.len() as f64)
+}
+
+/// The same question asked of the JOINED forms alone: the glyphs no character
+/// maps to, which only shaping produces.
+///
+/// ⚠️ THAT IS WHERE BUILDS DIFFER. Every build puts the plain letters at the
+/// same numbers (က is 134 in all of them), so counting them lifts a wrong
+/// build's score towards the right one's; it is the joined forms that each
+/// build numbers its own way.
+fn joined_agreement(path: &str, glyphs: &BTreeSet<u16>, widths: &crate::shaped::CidWidths) -> Option<f64> {
+    let bytes = std::fs::read(path).ok()?;
+    let face = rustybuzz::ttf_parser::Face::parse(&bytes, 0).ok()?;
+    let mut mapped: BTreeSet<u16> = BTreeSet::new();
+    if let Some(cmap) = face.tables().cmap {
+        for sub in cmap.subtables {
+            sub.codepoints(|cp| {
+                if let Some(g) = sub.glyph_index(cp) {
+                    mapped.insert(g.0);
+                }
+            });
+        }
+    }
+    let joined: BTreeSet<u16> = glyphs.iter().copied().filter(|g| !mapped.contains(g)).collect();
+    agreement(path, &joined, widths)
+}
+
+/// How much of a page's glyphs have to agree before a file is believed to be
+/// the one the page was made with.
+const AGREES: f64 = 0.9;
+
+/// Which installed file to read a font with.
+///
+/// ⚠️ THE ONE WHOSE WIDTHS THE PAGE AGREES WITH, not the one its name
+/// suggests. Pyidaungsu is published in builds that number their joined forms
+/// differently, and read with the wrong build a line is not merely refused, it
+/// can be MISREAD: measured on a reader's Word document made with 2.5.3 Bold,
+/// the old system Pyidaungsu.ttf "proved" လုပ်ငန်းအမည် as လပေဿငနဿွအမညဿ,
+/// because a different string shapes to the same glyph numbers in a different
+/// build. The page itself says which build it was: `/W` gives every glyph's
+/// width, and only the right file draws the same glyph at the same width.
+///
+/// ⚠️ AND NONE AT ALL WHEN NOTHING AGREES. A refusal costs the reader nothing
+/// they had; a misreading costs them their text.
+fn face_for(
+    base_font: &str,
+    glyphs: &BTreeSet<u16>,
+    widths: Option<&crate::shaped::CidWidths>,
+) -> Option<&'static str> {
+    let default = installed(base_font)?;
+    let family = family_of(base_font);
+    let family = family.split(|c| c == '-' || c == ',').next().unwrap_or(family);
+    let (Some(widths), "Pyidaungsu") = (widths, family) else {
+        return Some(default);
+    };
+
+    // ⚠️ THE BUILD FIRST, BY ITS JOINED FORMS, AND THE WEIGHT SECOND, BY
+    // EVERY GLYPH. Measured across the test files: a bold page read with the
+    // regular file of its own build agrees on every joined form (1.000) but on
+    // only 0.896 of all its glyphs, while a wrong build agrees on 0.000 to
+    // 0.500 of the joined forms however close its overall figure comes (the old
+    // file on that 2.5.3 Bold document: 0.773). Ranked this way the right build always
+    // wins, and within it the right weight.
+    //
+    // Asked again for the same font whenever a page is checked for being
+    // prepared, so the answer is kept: the key is the name with every glyph
+    // and the width the page gives it, which is exactly what it depends on.
+    type Key = (String, Vec<(u16, u64)>);
+    static ANSWERS: std::sync::Mutex<BTreeMap<Key, Option<&'static str>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let key: Key = (
+        base_font.to_string(),
+        glyphs.iter().map(|&g| (g, widths.of(g).to_bits())).collect(),
+    );
+    if let Some(&known) = ANSWERS.lock().unwrap_or_else(|held| held.into_inner()).get(&key) {
+        return known;
+    }
+
+    let mut best: Option<(&'static str, (f64, f64))> = None;
+    for path in std::iter::once(default).chain(pyidaungsu_files().iter().copied()) {
+        let Some(all) = agreement(path, glyphs, widths) else { continue };
+        let joined = joined_agreement(path, glyphs, widths).unwrap_or(all);
+        let score = (joined, all);
+        if best.is_none_or(|(_, had)| score > had) {
+            best = Some((path, score));
+        }
+    }
+    let chosen = best.filter(|(_, (joined, _))| *joined >= AGREES).map(|(path, _)| path);
+    ANSWERS.lock().unwrap_or_else(|held| held.into_inner()).insert(key, chosen);
+    chosen
+}
+
+/// Adds one font's widths to those of every other font of the same name. See
+/// `CidWidths::absorb`.
+fn pool(
+    widths: &mut BTreeMap<String, crate::shaped::CidWidths>,
+    base_font: String,
+    w: crate::shaped::CidWidths,
+) {
+    match widths.entry(base_font) {
+        std::collections::btree_map::Entry::Occupied(mut had) => had.get_mut().absorb(w),
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(w);
+        }
+    }
+}
+
+/// Which installed file reads this font, by its name where the name says, and
+/// by its glyphs where it does not. See `face_for` and `devanagari::face_of`.
+fn resolve(
+    base_font: &str,
+    glyphs: &BTreeSet<u16>,
+    widths: Option<&crate::shaped::CidWidths>,
+) -> Option<&'static str> {
+    match installed(base_font) {
+        Some(_) => face_for(base_font, glyphs, widths),
+        None => crate::devanagari::face_of(glyphs),
+    }
+}
+
 /// A 3x2 PDF matrix, as its six written numbers.
 #[derive(Clone, Copy, Debug)]
 struct Matrix([f64; 6]);
@@ -255,9 +422,57 @@ pub(crate) struct Line {
     /// several separately placed runs, so replacing its text means knowing
     /// every operation that contributed a glyph, not just where the line sits.
     pub(crate) drawn_by: Vec<usize>,
+    /// The glyphs that are English, digits or brackets drawn in a ONE-BYTE font
+    /// of a Burmese family, by their index in `glyphs`. That is how Word draws
+    /// them beside the Burmese: a TrueType subset with /WinAnsiEncoding, named
+    /// like the Type0 font it sits next to (`BCDEEE+Pyidaungsu-Bold` beside
+    /// `BCDGEE+Pyidaungsu-Bold`).
+    ///
+    /// ⚠️ THEIR CODES ARE CHARACTERS, NOT GLYPH IDS, so `glyphs` holds the byte
+    /// and nothing may read it as Burmese: byte 0x86 is also the glyph
+    /// Pyidaungsu draws က with. Read two bytes at a time, an English code in
+    /// brackets became three meaningless glyphs and refused every Burmese line
+    /// of a reader's Word document, and a lone "(" was dropped, so a retype
+    /// stepped over its brackets and left them behind as "( )". They say what
+    /// WinAnsi says they say, and they are as wide as their own font declares.
+    pub(crate) latin: BTreeMap<usize, Latin>,
+}
+
+/// One character drawn in a one-byte font inside a line. See `Line::latin`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Latin {
+    /// What it says, or None for a code WinAnsi leaves undefined.
+    pub(crate) character: Option<char>,
+    /// How far it moves the pen, in glyph space, from its own font's `/Widths`.
+    pub(crate) width: f64,
 }
 
 impl Line {
+    /// How far the glyph at `i` moves the pen, in glyph space: its own font's
+    /// width for a one-byte character, the line's font's for anything else.
+    pub(crate) fn width_at(&self, i: usize, widths: &crate::shaped::CidWidths) -> f64 {
+        match self.latin.get(&i) {
+            Some(one) => one.width,
+            None => widths.of(self.glyphs[i]),
+        }
+    }
+
+    /// Whether everything this line draws is one-byte English. Such a line is
+    /// PDFium's to read, which it does perfectly well.
+    pub(crate) fn only_latin(&self) -> bool {
+        !self.latin.is_empty() && self.latin.len() == self.glyphs.len()
+    }
+
+    /// The glyphs drawn in the line's own font, which are the ones an index
+    /// has to cover.
+    pub(crate) fn font_glyphs(&self) -> impl Iterator<Item = u16> + '_ {
+        self.glyphs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.latin.contains_key(i))
+            .map(|(_, g)| *g)
+    }
+
     /// Where the line STARTS on the page, in PDF user space.
     ///
     /// ⚠️ NOT [`Line::x`], WHICH IS THE STREAM'S OWN FRAME. Two lines drawn
@@ -470,6 +685,7 @@ fn devanagari_fonts_of(doc: &Document, page: ObjectId) -> BTreeSet<String> {
 #[allow(unused_assignments)]
 pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     let names = fonts_of(doc, page);
+    let latin_fonts = latin_fonts_of(doc, page);
     let Ok(content) = lopdf::content::Content::decode(&doc.get_page_content(page)) else {
         return Vec::new();
     };
@@ -495,9 +711,17 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     let mut adjust = 0.0f64;
     let mut nudges: Vec<(usize, f64)> = Vec::new();
     let mut drawn_by: Vec<usize> = Vec::new();
+    let mut latin: BTreeMap<usize, Latin> = BTreeMap::new();
+    // The last font other than a one-byte one that drew into this placement.
+    // See `Line::latin`: a line is named for the font that draws its Burmese.
+    let mut drawn_in: Option<Vec<u8>> = None;
 
     macro_rules! finish {
-        () => {
+        () => {{
+            let own = match drawn_in.take() {
+                Some(own) if latin_fonts.contains_key(&resource) => own,
+                _ => resource.clone(),
+            };
             if !glyphs.is_empty() {
                 let on_page = line_matrix.then(ctm);
                 out.push(Line {
@@ -506,11 +730,11 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     page_y: on_page.y(),
                     ctm,
                     on_page,
-                    resource: resource.clone(),
                     base_font: names
-                        .get(&resource)
+                        .get(&own)
                         .map(|(b, _)| b.clone())
                         .unwrap_or_default(),
+                    resource: own,
                     size,
                     glyphs: std::mem::take(&mut glyphs),
                     adjust: std::mem::replace(&mut adjust, 0.0),
@@ -518,13 +742,15 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     breaks: Vec::new(),
                     tracked: false,
                     drawn_by: std::mem::take(&mut drawn_by),
+                    latin: std::mem::take(&mut latin),
                 });
             } else {
                 adjust = 0.0;
                 nudges.clear();
                 drawn_by.clear();
+                latin.clear();
             }
-        };
+        }};
     }
 
     for (index, op) in content.operations.iter().enumerate() {
@@ -606,13 +832,40 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
                     Some(o @ Object::String(..)) => vec![o.clone()],
                     _ => continue,
                 };
+
+                // ⚠️ ENGLISH IN A ONE-BYTE FONT IS READ AS THE CHARACTERS IT IS.
+                // See `Line::latin`. A run of nothing but spaces is left as it
+                // always was: that is the word space Word draws between two
+                // Burmese words, and it is the gap it leaves, not a glyph, that
+                // the reading has always made its space from.
+                let one_byte = latin_fonts.get(&resource);
+                let blank = items
+                    .iter()
+                    .filter_map(|o| o.as_str().ok())
+                    .flatten()
+                    .all(|b| b.is_ascii_whitespace());
+
                 drawn_by.push(index);
                 for item in items {
                     match item {
                         Object::String(bytes, _) => {
+                            if let Some(one_byte) = one_byte {
+                                if blank {
+                                    continue;
+                                }
+                                for b in bytes {
+                                    latin.insert(glyphs.len(), Latin {
+                                        character: crate::justified::winansi_decode(b),
+                                        width: one_byte.width(b),
+                                    });
+                                    glyphs.push(u16::from(b));
+                                }
+                                continue;
+                            }
                             for pair in bytes.chunks(2) {
                                 if pair.len() == 2 {
                                     glyphs.push(u16::from_be_bytes([pair[0], pair[1]]));
+                                    drawn_in = Some(resource.clone());
                                 }
                             }
                         }
@@ -632,6 +885,79 @@ pub(crate) fn lines_of(doc: &Document, page: ObjectId) -> Vec<Line> {
     }
     finish!();
     merge_placements(out, &names)
+}
+
+/// The page's one-byte fonts of a Burmese family, by resource name: every font
+/// named MyanmarText or Pyidaungsu that is not a Type0 and says it is WinAnsi,
+/// with the widths it declares. See `Line::latin`.
+///
+/// ⚠️ BURMESE FAMILIES ONLY. A Hindi page's Latin runs go through the same
+/// reader, and Hindi editing is confirmed working as it is; nothing about how
+/// its lines are put together changes here.
+///
+/// ⚠️ AND WINANSI ONLY, because that is what makes a code a character. A font
+/// with an encoding of its own is left exactly as it was.
+fn latin_fonts_of(doc: &Document, page: ObjectId) -> BTreeMap<Vec<u8>, OneByte> {
+    let mut out = BTreeMap::new();
+    let Some(page) = doc.get_dictionary(page).ok() else { return out };
+    let Some(resources) = page.get(b"Resources").ok().and_then(|o| dictionary(doc, o)) else {
+        return out;
+    };
+    let Some(fonts) = resources.get(b"Font").ok().and_then(|o| dictionary(doc, o)) else {
+        return out;
+    };
+    for (name, obj) in fonts.iter() {
+        let Some(font) = dictionary(doc, obj) else { continue };
+        let Ok(base) = font.get(b"BaseFont").and_then(|o| o.as_name()) else { continue };
+        let family = family_of(std::str::from_utf8(base).unwrap_or_default());
+        let family = family.split(|c| c == '-' || c == ',').next().unwrap_or(family);
+        let winansi =
+            matches!(font.get(b"Encoding"), Ok(Object::Name(n)) if n == b"WinAnsiEncoding");
+        let simple = font
+            .get(b"Subtype")
+            .and_then(|o| o.as_name())
+            .is_ok_and(|s| s == b"TrueType" || s == b"Type1");
+        if !(simple && winansi && matches!(family, "MyanmarText" | "Pyidaungsu")) {
+            continue;
+        }
+        let first = font.get(b"FirstChar").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
+        let widths = font
+            .get(b"Widths")
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_array().ok())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| doc.dereference(w).ok().and_then(|(_, w)| number(w)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let missing = font
+            .get(b"FontDescriptor")
+            .ok()
+            .and_then(|o| dictionary(doc, o))
+            .and_then(|d| d.get(b"MissingWidth").ok().and_then(number))
+            .unwrap_or(0.0);
+        out.insert(name.to_vec(), OneByte { first, widths, missing });
+    }
+    out
+}
+
+/// What a one-byte font declares its characters' widths to be.
+struct OneByte {
+    first: i64,
+    widths: Vec<f64>,
+    missing: f64,
+}
+
+impl OneByte {
+    /// The width of a character code, in glyph space.
+    fn width(&self, code: u8) -> f64 {
+        usize::try_from(i64::from(code) - self.first)
+            .ok()
+            .and_then(|i| self.widths.get(i).copied())
+            .unwrap_or(self.missing)
+    }
 }
 
 /// Whether two font names are the same FACE, for the purpose of joining two
@@ -684,6 +1010,11 @@ fn merge_placements(
     // this admits and what it could ever reach.
     const A_MARK: f64 = 0.5;
 
+    // How far behind where the line has got to a run may be placed and still
+    // be taken as simply following it, as a fraction of the type size. The
+    // brackets this is for were placed 15 and 48 points back at 13 point type.
+    const A_BACK: f64 = 0.3;
+
     // Where a run ENDS: where it was placed, plus everything it advanced by.
     //
     // ⚠️ INCLUDING THE GAPS IT HAS ALREADY BEEN GIVEN. This is asked about a
@@ -691,9 +1022,17 @@ fn merge_placements(
     // pen just as surely as a glyph does. Leaving them out made every gap after
     // the first come out inflated by the sum of the ones before it: one real
     // line reported three gaps worth 405 points across 496 points of text.
+    //
+    // ⚠️ A ONE-BYTE CHARACTER IS AS WIDE AS ITS OWN FONT SAYS, whatever the
+    // line's font would say about the same number. See `Line::latin`.
     let ends_at = |line: &Line| -> Option<f64> {
-        let widths = fonts.get(&line.resource).and_then(|(_, w)| w.as_ref())?;
-        let drawn: f64 = line.glyphs.iter().map(|g| widths.of(*g)).sum();
+        let widths = fonts.get(&line.resource).and_then(|(_, w)| w.as_ref());
+        let drawn: f64 = (0..line.glyphs.len())
+            .map(|i| match line.latin.get(&i) {
+                Some(one) => Some(one.width),
+                None => widths.map(|w| w.of(line.glyphs[i])),
+            })
+            .sum::<Option<f64>>()?;
         let gaps: f64 = line.breaks.iter().map(|b| b.points).sum();
         Some(line.x + (drawn + line.adjust) / 1000.0 * line.size + gaps)
     };
@@ -710,7 +1049,9 @@ fn merge_placements(
         let Some(widths) = fonts.get(&line.resource).and_then(|(_, w)| w.as_ref()) else {
             return false;
         };
-        !line.glyphs.is_empty() && line.glyphs.iter().all(|g| widths.of(*g) == 0.0)
+        !line.glyphs.is_empty()
+            && line.latin.is_empty()
+            && line.glyphs.iter().all(|g| widths.of(*g) == 0.0)
     };
 
     // How many times each line in `out` has been joined to another, so a line
@@ -754,8 +1095,23 @@ fn merge_placements(
             joins.push(0);
             continue;
         }
-        *joins.last_mut().unwrap() += 1;
         let as_it_was = ends_at(out.last().unwrap()).map(|end| line.x - end);
+
+        // ⚠️ ENGLISH DRAWN BACK INSIDE THE LINE GOES WHERE IT IS DRAWN, NOT
+        // AFTER IT. Measured on the reader's Pyidaungsu- text 3 Pages 2.pdf, as
+        // an earlier retype left it: the Burmese is one run with a gap in it,
+        // and the "(" and ")" that belong in that gap are drawn after the whole
+        // run. Taken in the order the stream draws them, the line read
+        // "...မြို့ပြ()", which is not what the page shows.
+        if line.only_latin() && as_it_was.is_some_and(|g| g < -A_BACK * line.size) {
+            let prev = out.last_mut().unwrap();
+            if let Some(widths) = fonts.get(&prev.resource).and_then(|(_, w)| w.as_ref()) {
+                if place_inside(prev, &line, widths) {
+                    continue;
+                }
+            }
+        }
+        *joins.last_mut().unwrap() += 1;
         let run_by_run = ends.last().copied().flatten().map(|end| line.x - end);
         let gap = match as_it_was {
             Some(g) if g >= A_SPACE * line.size => Some(g),
@@ -773,6 +1129,14 @@ fn merge_placements(
         if let Some(points) = gap.filter(|g| *g >= A_SPACE * line.size) {
             prev.breaks.push(Break { at, points });
         }
+        // ⚠️ A LINE THAT OPENS IN ENGLISH IS STILL THE BURMESE FONT'S LINE.
+        // Its name is what finds the index that reads it and the file the app
+        // writes it back with, and a one-byte font answers for neither.
+        if prev.only_latin() && !line.only_latin() {
+            prev.resource = line.resource.clone();
+            prev.base_font = line.base_font.clone();
+        }
+        prev.latin.extend(line.latin.iter().map(|(i, one)| (i + at, *one)));
         prev.glyphs.extend(&line.glyphs);
         prev.breaks.extend(line.breaks.iter().map(|b| Break { at: b.at + at, ..*b }));
         prev.adjust += line.adjust;
@@ -784,6 +1148,95 @@ fn merge_placements(
         line.tracked = is_letter_spaced(line, joins);
     }
     out
+}
+
+/// Puts a run of one-byte characters into `line` before the first glyph that
+/// starts at or after the run's own `x`, and says whether it could.
+///
+/// ⚠️ AND WHERE EVERYTHING IS DRAWN STAYS WHERE IT WAS. The run sits in a
+/// space the line left for it, usually a `TJ` number, so that number is split
+/// in two around it: one that takes the pen to where the run starts, and one
+/// that takes it from where the run ends to where the next glyph always
+/// started. The reading changes order; the geometry does not move.
+fn place_inside(line: &mut Line, run: &Line, widths: &crate::shaped::CidWidths) -> bool {
+    let scale = line.size / 1000.0;
+    if scale <= 0.0 || run.glyphs.is_empty() {
+        return false;
+    }
+    let skip = |line: &Line, i: usize| -> f64 {
+        line.breaks.iter().filter(|b| b.at == i).map(|b| b.points).sum()
+    };
+    let nudge = |line: &Line, i: usize| -> f64 {
+        line.nudges.iter().filter(|(at, _)| *at == i).map(|(_, v)| *v).sum()
+    };
+
+    // Where the pen arrives in front of each glyph, and where that glyph
+    // starts once the skip and the numbers in front of it have moved it.
+    let n = line.glyphs.len();
+    let mut pen = line.x;
+    let mut found = None;
+    for i in 0..=n {
+        let starts = pen + skip(line, i) - nudge(line, i) * scale;
+        if starts >= run.x - 0.01 * line.size {
+            found = Some((i, pen, starts));
+            break;
+        }
+        if i < n {
+            pen = starts + line.width_at(i, widths) * scale;
+        }
+    }
+    let Some((k, arrives, starts)) = found else { return false };
+
+    let m = run.glyphs.len();
+    let drawn: f64 = run.latin.values().map(|one| one.width).sum();
+    let own: f64 = run.nudges.iter().map(|(_, v)| *v).sum();
+    let advance = (drawn - own) * scale;
+    let to_run = run.x - (arrives + skip(line, k));
+    let after_run = starts - (run.x + advance);
+
+    // ⚠️ AND ONLY INTO A SPACE THE LINE LEFT FOR IT. A run drawn over the
+    // letters is not part of what the line says: measured on the reader's
+    // Pyidaungsu- text 3 Pages 4.pdf, the "(" and ")" an earlier retype left
+    // behind sit on top of the word it had rewritten, and read into the text
+    // they cut a syllable in half and refused the line. Such a run is kept as
+    // one of the line's operations, so an edit of the line clears it away and a
+    // move carries it, and it is not read.
+    let tolerance = 0.1 * line.size;
+    if to_run < -tolerance || (k < n && after_run < -tolerance) {
+        line.drawn_by.extend(&run.drawn_by);
+        return true;
+    }
+
+    let shift = |i: usize| if i >= k { i + m } else { i };
+    let mut nudges: Vec<(usize, f64)> = line
+        .nudges
+        .iter()
+        .filter(|(at, _)| *at != k)
+        .map(|(at, v)| (shift(*at), *v))
+        .collect();
+    nudges.push((k, -to_run / scale));
+    nudges.extend(run.nudges.iter().map(|(at, v)| (k + at, *v)));
+    nudges.push((k + m, -after_run / scale));
+    nudges.sort_by_key(|(at, _)| *at);
+
+    // A skip in front of glyph `k` stays in front of the run: it is the space
+    // before whatever now comes first there.
+    for b in &mut line.breaks {
+        if b.at > k {
+            b.at += m;
+        }
+    }
+    line.latin = line
+        .latin
+        .iter()
+        .map(|(at, one)| (shift(*at), *one))
+        .chain(run.latin.iter().map(|(at, one)| (k + at, *one)))
+        .collect();
+    line.glyphs.splice(k..k, run.glyphs.iter().copied());
+    line.adjust = -nudges.iter().map(|(_, v)| *v).sum::<f64>();
+    line.nudges = nudges;
+    line.drawn_by.extend(&run.drawn_by);
+    true
 }
 
 /// Whether a line's gaps are letter spacing rather than word spaces.
@@ -883,22 +1336,122 @@ pub(crate) fn said_by(pieces: &[Piece]) -> String {
 pub(crate) fn pieces_of(index: &crate::reshape::Index, face: &rustybuzz::Face, line: &Line)
     -> Option<Vec<Piece>>
 {
+    if line.latin.is_empty() {
+        return burmese_pieces(index, face, &line.glyphs, &line.breaks, line.tracked);
+    }
+    // ⚠️ A LINE OF NOTHING BUT ONE-BYTE ENGLISH IS LEFT TO PDFIUM, which reads
+    // it perfectly well and has always been the one to edit it.
+    if line.only_latin() {
+        return None;
+    }
+
+    // ⚠️ ENGLISH IS NEVER PROVEN AS BURMESE. Its codes are characters, and
+    // some of them are also the numbers of Burmese glyphs, so "proving" one
+    // could only misread. The line is taken a stretch at a time: each run of
+    // one-byte characters says what WinAnsi says, and each run of the line's
+    // own glyphs is proven exactly as a line of nothing else would be.
+    let mut out: Vec<Piece> = Vec::new();
+    let mut from = 0usize;
+    while from < line.glyphs.len() {
+        let english = line.latin.contains_key(&from);
+        let mut to = from + 1;
+        while to < line.glyphs.len() && line.latin.contains_key(&to) == english {
+            to += 1;
+        }
+        let inside: Vec<Break> = line
+            .breaks
+            .iter()
+            .filter(|b| b.at > from && b.at < to)
+            .map(|b| Break { at: b.at - from, ..*b })
+            .collect();
+        let stretch = if english {
+            english_pieces(line, from, to, &inside)?
+        } else {
+            burmese_pieces(index, face, &line.glyphs[from..to], &inside, line.tracked)?
+        };
+
+        // The page's own skip where this stretch begins, read the way
+        // `split_at_the_spaces` reads one between two pieces.
+        let gap_before = line.breaks.iter().find(|b| b.at == from).map(|b| b.points).unwrap_or(0.0);
+        for (n, mut piece) in stretch.into_iter().enumerate() {
+            piece.glyphs = piece.glyphs.start + from..piece.glyphs.end + from;
+            if n == 0 {
+                let ends_open = out.last().is_some_and(|p: &Piece| p.text.ends_with(' '));
+                piece.space_before = !out.is_empty()
+                    && !line.tracked
+                    && !ends_open
+                    && !piece.text.starts_with(' ')
+                    && gap_before > 0.0;
+            }
+            out.push(piece);
+        }
+        from = to;
+    }
+    Some(out)
+}
+
+/// A stretch of one-byte English, as the pieces its skips cut it into.
+///
+/// ⚠️ A CODE WINANSI DOES NOT DEFINE, OR A CONTROL CODE, REFUSES THE LINE.
+/// There is nothing it could be read as, and guessing would be writing a guess
+/// back into the page on the next edit.
+fn english_pieces(line: &Line, start: usize, end: usize, breaks: &[Break]) -> Option<Vec<Piece>> {
+    let cuts = breaks.iter().map(|b| b.at).chain(std::iter::once(end - start));
+    let mut out: Vec<Piece> = Vec::new();
+    let mut from = 0usize;
+    for cut in cuts {
+        if cut <= from {
+            continue;
+        }
+        let text: String = (from..cut)
+            .map(|i| {
+                line.latin
+                    .get(&(start + i))
+                    .and_then(|one| one.character)
+                    .filter(|c| !c.is_control())
+            })
+            .collect::<Option<String>>()?;
+        let gap_before = breaks.iter().find(|b| b.at == from).map(|b| b.points).unwrap_or(0.0);
+        let ends_open = out.last().is_some_and(|p: &Piece| p.text.ends_with(' '));
+        let space_before = !out.is_empty()
+            && !line.tracked
+            && !ends_open
+            && !text.starts_with(' ')
+            && gap_before > 0.0;
+        out.push(Piece { glyphs: from..cut, text, space_before });
+        from = cut;
+    }
+    Some(out)
+}
+
+/// Glyphs of the line's own font, as the pieces that could each be proven.
+fn burmese_pieces(
+    index: &crate::reshape::Index,
+    face: &rustybuzz::Face,
+    glyphs: &[u16],
+    breaks: &[Break],
+    tracked: bool,
+) -> Option<Vec<Piece>> {
     // ⚠️ AND IF NO SPLIT WORKS, THE LINE IS READ WHOLE. Losing a space is
     // worth far less than losing the line, and a reading with a word space
     // missing is still the author's text.
-    split_at_the_spaces(index, face, line).or_else(|| {
+    split_at_the_spaces(index, face, glyphs, breaks, tracked).or_else(|| {
         Some(vec![Piece {
-            glyphs: 0..line.glyphs.len(),
-            text: crate::reshape::prove(face, index, &line.glyphs)?,
+            glyphs: 0..glyphs.len(),
+            text: crate::reshape::prove(face, index, glyphs)?,
             space_before: false,
         }])
     })
 }
 
-fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, line: &Line)
-    -> Option<Vec<Piece>>
-{
-    if line.breaks.is_empty() {
+fn split_at_the_spaces(
+    index: &crate::reshape::Index,
+    face: &rustybuzz::Face,
+    glyphs: &[u16],
+    breaks: &[Break],
+    tracked: bool,
+) -> Option<Vec<Piece>> {
+    if breaks.is_empty() {
         return None;
     }
     // ⚠️ A BREAK IS HONOURED ONLY IF WHAT IT CUTS OFF CAN BE PROVEN. A producer
@@ -906,25 +1459,24 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
     // file it does: splitting there leaves two halves of a cluster that nothing
     // spells. Rather than lose the line, the failed break is passed over and
     // folded into the next piece, which costs one space instead.
-    let cuts: Vec<usize> = line
-        .breaks
+    let cuts: Vec<usize> = breaks
         .iter()
         .map(|b| b.at)
-        .chain(std::iter::once(line.glyphs.len()))
+        .chain(std::iter::once(glyphs.len()))
         .collect();
 
     let mut out: Vec<Piece> = Vec::new();
     let mut from = 0usize;
     let mut next = 0usize;
-    while from < line.glyphs.len() {
+    while from < glyphs.len() {
         let mut taken = None;
         while next < cuts.len() {
             let cut = cuts[next];
             next += 1;
-            if cut <= from || cut > line.glyphs.len() {
+            if cut <= from || cut > glyphs.len() {
                 continue;
             }
-            if let Some(text) = crate::reshape::prove(face, index, &line.glyphs[from..cut]) {
+            if let Some(text) = crate::reshape::prove(face, index, &glyphs[from..cut]) {
                 taken = Some((cut, text));
                 break;
             }
@@ -932,8 +1484,7 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
         let (cut, text) = taken?;
 
         // The page's own skip before this piece, whatever it means.
-        let gap_before = line
-            .breaks
+        let gap_before = breaks
             .iter()
             .find(|b| b.at == from)
             .map(|b| b.points)
@@ -948,7 +1499,7 @@ fn split_at_the_spaces(index: &crate::reshape::Index, face: &rustybuzz::Face, li
         // `Line::tracked`: every join of such a line carries the same small
         // gap, and none of them is a space the author typed.
         let space_before = !out.is_empty()
-            && !line.tracked
+            && !tracked
             && !ends_open
             && !text.starts_with(' ')
             && gap_before > 0.0;
@@ -1013,7 +1564,7 @@ pub(crate) struct Cluster {
 /// [`Line::along_baseline`] before moving anything by it.
 pub(crate) fn advance_of(line: &Line, widths: &crate::shaped::CidWidths) -> f64 {
     let scale = line.size / 1000.0;
-    let glyphs: f64 = line.glyphs.iter().map(|g| widths.of(*g)).sum();
+    let glyphs: f64 = (0..line.glyphs.len()).map(|i| line.width_at(i, widths)).sum();
     // A positive number moves the pen LEFT, so it takes width away.
     let nudges: f64 = line.nudges.iter().map(|(_, v)| *v).sum();
     let skips: f64 = line.breaks.iter().map(|b| b.points).sum();
@@ -1053,9 +1604,32 @@ pub(crate) fn clusters_of(
             x += gap;
         }
 
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
-        buffer.push_str(&piece.text);
-        let shaped = rustybuzz::shape(face, &[], buffer);
+        // ⚠️ ONE-BYTE ENGLISH IS ONE CHARACTER PER GLYPH, AS WIDE AS ITS OWN
+        // FONT SAYS. Shaping it through the line's face would ask the widths of
+        // glyphs the page never drew. See `Line::latin`.
+        if line.latin.contains_key(&piece.glyphs.start) {
+            for (i, (offset, c)) in piece.text.char_indices().enumerate() {
+                let g = piece.glyphs.start + i;
+                let left = x;
+                if i > 0 {
+                    x += skip_at(g);
+                }
+                for (_, v) in line.nudges.iter().filter(|(at, _)| *at == g) {
+                    x -= v * scale;
+                }
+                x += line.latin.get(&g).map(|one| one.width).unwrap_or(0.0) * scale;
+                out.push(Cluster {
+                    from: at + offset,
+                    to: at + offset + c.len_utf8(),
+                    left,
+                    right: x,
+                });
+            }
+            at += piece.text.len();
+            continue;
+        }
+
+        let shaped = rustybuzz::shape(face, &[], crate::reshape::buffer_for(&piece.text));
         let infos = shaped.glyph_infos();
 
         let mut i = 0usize;
@@ -1170,7 +1744,9 @@ fn without_phantoms(
     widths: Option<&crate::shaped::CidWidths>,
 ) -> Option<Line> {
     let glyphs = face.number_of_glyphs();
-    if !line.glyphs.iter().any(|g| *g >= glyphs) {
+    // A one-byte character is not a glyph of this face at all. See `Line::latin`.
+    let phantom = |i: usize, g: u16| g >= glyphs && !line.latin.contains_key(&i);
+    if !line.glyphs.iter().enumerate().any(|(i, g)| phantom(i, *g)) {
         return None;
     }
     let scale = line.size / 1000.0;
@@ -1183,9 +1759,9 @@ fn without_phantoms(
     let mut moved_to = Vec::with_capacity(line.glyphs.len() + 1);
     let mut kept: Vec<u16> = Vec::with_capacity(line.glyphs.len());
     let mut skipped: Vec<Break> = Vec::new();
-    for g in &line.glyphs {
+    for (i, g) in line.glyphs.iter().enumerate() {
         moved_to.push(kept.len());
-        if *g < glyphs {
+        if !phantom(i, *g) {
             kept.push(*g);
         } else {
             let points = widths.map(|w| w.of(*g) * scale).unwrap_or(0.0);
@@ -1211,6 +1787,7 @@ fn without_phantoms(
         resource: line.resource.clone(),
         base_font: line.base_font.clone(),
         drawn_by: line.drawn_by.clone(),
+        latin: line.latin.iter().map(|(i, one)| (at(*i), *one)).collect(),
         ..*line
     })
 }
@@ -1341,7 +1918,11 @@ impl Indexes {
                     }
                     asked.entry(path).or_default().extend(glyphs.iter().copied());
                 }
-                None if installed(base_font).is_some() => return false,
+                None if installed(base_font).is_some()
+                    && face_for(base_font, glyphs, wanted.widths.get(base_font)).is_some() =>
+                {
+                    return false
+                }
                 None => {}
             }
         }
@@ -1391,7 +1972,7 @@ impl Indexes {
                 continue;
             }
             let path = match installed(base_font) {
-                Some(path) => Some(path),
+                Some(_) => face_for(base_font, glyphs, wanted.widths.get(base_font)),
                 None => match crate::devanagari::face_of(glyphs) {
                     Some(path) => Some(path),
                     // The targeted widen, and only here.
@@ -1514,11 +2095,13 @@ pub(crate) fn tests_only_at_generation(generation: u64) -> Indexes {
 /// can need.
 pub(crate) fn wanted_for_page(doc: &Document, page: ObjectId) -> Wanted {
     let mut by_font: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
-    for (_, (base_font, widths)) in fonts_of(doc, page) {
-        if let Some(w) = widths {
+    let mut widths: BTreeMap<String, crate::shaped::CidWidths> = BTreeMap::new();
+    for (_, (base_font, declared)) in fonts_of(doc, page) {
+        if let Some(w) = declared {
             if declares_usage(&base_font) {
-                by_font.entry(base_font).or_default().extend(w.declared());
+                by_font.entry(base_font.clone()).or_default().extend(w.declared());
             }
+            pool(&mut widths, base_font, w);
         }
     }
 
@@ -1534,12 +2117,13 @@ pub(crate) fn wanted_for_page(doc: &Document, page: ObjectId) -> Wanted {
         .collect();
     if !undeclared.is_empty() {
         for line in lines_of(doc, page) {
-            if undeclared.contains(&line.base_font) {
-                by_font.entry(line.base_font).or_default().extend(line.glyphs);
+            if !line.only_latin() && undeclared.contains(&line.base_font) {
+                let glyphs: Vec<u16> = line.font_glyphs().collect();
+                by_font.entry(line.base_font).or_default().extend(glyphs);
             }
         }
     }
-    Wanted { by_font, unbounded: undeclared.into_iter().collect() }
+    Wanted { by_font, unbounded: undeclared.into_iter().collect(), widths }
 }
 
 /// What one page needs, and how far the page can be trusted to know it.
@@ -1557,6 +2141,10 @@ pub(crate) struct Wanted {
     /// next page will exceed, and a Burmese index rebuilt per page is twenty
     /// seconds per page. Naming them is what lets the build widen just those.
     unbounded: BTreeSet<String>,
+
+    /// The width each font declares for its glyphs, which says which build of
+    /// a family the page was made with. See `face_for`.
+    widths: BTreeMap<String, crate::shaped::CidWidths>,
 }
 
 /// Every glyph ONE font declares, or is seen to draw, anywhere in the document.
@@ -1580,7 +2168,7 @@ fn wanted_for_font(doc: &Document, base_font: &str) -> BTreeSet<u16> {
                 _ => {
                     for line in lines_of(doc, page) {
                         if line.base_font == base_font {
-                            glyphs.extend(line.glyphs.iter().copied());
+                            glyphs.extend(line.font_glyphs());
                         }
                     }
                 }
@@ -1600,10 +2188,17 @@ fn wanted_for_font(doc: &Document, base_font: &str) -> BTreeSet<u16> {
 /// fail to read something; it cannot read it wrongly.
 pub(crate) fn indexes_for(doc: &Document, page: ObjectId) -> Indexes {
     let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
-    for line in lines_of(doc, page) {
-        wanted.entry(line.base_font).or_default().extend(line.glyphs);
+    for line in lines_of(doc, page).into_iter().filter(|l| !l.only_latin()) {
+        let glyphs: Vec<u16> = line.font_glyphs().collect();
+        wanted.entry(line.base_font).or_default().extend(glyphs);
     }
-    build_indexes(&wanted)
+    let mut widths = BTreeMap::new();
+    for (base_font, w) in fonts_of(doc, page).into_values() {
+        if let Some(w) = w {
+            pool(&mut widths, base_font, w);
+        }
+    }
+    build_indexes(&wanted, &widths)
 }
 
 /// The same, for the WHOLE DOCUMENT, so every page shares one index.
@@ -1629,12 +2224,14 @@ pub(crate) fn indexes_for_document(doc: &Document) -> Indexes {
     let mut wanted: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
     let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
 
+    let mut widths: BTreeMap<String, crate::shaped::CidWidths> = BTreeMap::new();
     for &page in &pages {
-        for (_, (base_font, widths)) in fonts_of(doc, page) {
-            if let Some(w) = widths {
+        for (_, (base_font, declared)) in fonts_of(doc, page) {
+            if let Some(w) = declared {
                 if declares_usage(&base_font) {
-                    wanted.entry(base_font).or_default().extend(w.declared());
+                    wanted.entry(base_font.clone()).or_default().extend(w.declared());
                 }
+                pool(&mut widths, base_font, w);
             }
         }
     }
@@ -1653,14 +2250,15 @@ pub(crate) fn indexes_for_document(doc: &Document) -> Indexes {
     if !undeclared.is_empty() {
         for &page in &pages {
             for line in lines_of(doc, page) {
-                if undeclared.contains(&line.base_font) {
-                    wanted.entry(line.base_font).or_default().extend(line.glyphs);
+                if !line.only_latin() && undeclared.contains(&line.base_font) {
+                    let glyphs: Vec<u16> = line.font_glyphs().collect();
+                    wanted.entry(line.base_font).or_default().extend(glyphs);
                 }
             }
         }
     }
 
-    build_indexes(&wanted)
+    build_indexes(&wanted, &widths)
 }
 
 /// The smallest document that opens: one blank page.
@@ -1751,7 +2349,10 @@ pub(crate) mod progress {
 }
 
 /// Builds one index per font, over the glyphs each is scoped to.
-fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
+fn build_indexes(
+    wanted: &BTreeMap<String, BTreeSet<u16>>,
+    widths: &BTreeMap<String, crate::shaped::CidWidths>,
+) -> Indexes {
     // ⚠️ ONE INDEX PER FACE, NOT PER NAME. A producer splits a document across
     // several subsets of one font, and a page names each of them separately:
     // `BCDEEE+MyanmarText` and `BCDGEE+MyanmarText` are one face, and so are
@@ -1773,8 +2374,7 @@ fn build_indexes(wanted: &BTreeMap<String, BTreeSet<u16>>) -> Indexes {
         // write one. A real Hindi book names all seven of its fonts
         // `CIDFont+F1`..`CIDFont+F7`, so every line on every page was refused
         // here before the reading even began.
-        let Some(path) = installed(base_font).or_else(|| crate::devanagari::face_of(glyphs))
-        else {
+        let Some(path) = resolve(base_font, glyphs, widths.get(base_font)) else {
             continue;
         };
         // ⚠️ FROM THE FACE, NOT FROM WHICHEVER ROUTE FOUND IT. Our own
@@ -1889,7 +2489,7 @@ pub(crate) fn can_read(base_font: &str) -> bool {
 /// says whether building an index for it is worth 17 seconds.
 pub(crate) fn worth_reading(doc: &Document, page: ObjectId) -> bool {
     let lines = lines_of(doc, page);
-    if lines.iter().any(|l| can_read(&l.base_font)) {
+    if lines.iter().any(|l| !l.only_latin() && can_read(&l.base_font)) {
         return true;
     }
 
@@ -2284,6 +2884,7 @@ mod tests {
             tracked: false,
             breaks,
             drawn_by: Vec::new(),
+            latin: BTreeMap::new(),
         };
 
         assert_eq!(read_line(&index, &face, &line, None).as_deref(),
@@ -2393,6 +2994,7 @@ mod tests {
             tracked: false,
             breaks: vec![Break { at: left.len(), points: 3.0 }],
             drawn_by: Vec::new(),
+            latin: BTreeMap::new(),
         };
         assert_eq!(read_line(&index, &face, &line, None).as_deref(),
             Some(format!("{LEFT} {RIGHT}").as_str()));
@@ -2429,6 +3031,7 @@ mod tests {
             // Straight through the middle of the first cluster.
             breaks: vec![Break { at: 1, points: 3.0 }],
             drawn_by: Vec::new(),
+            latin: BTreeMap::new(),
         };
         assert_eq!(read_line(&index, &face, &line, None).as_deref(), Some(WORD),
             "an impossible break took the line down with it");
@@ -6162,20 +6765,24 @@ mod tests {
             })
             .collect();
         files.sort();
+        // And any others through AYAAN_EXTRA_PDFS, separated by ';'.
+        files.extend(
+            std::env::var("AYAAN_EXTRA_PDFS").unwrap_or_default()
+                .split(';').filter(|p| !p.is_empty()).map(std::path::PathBuf::from));
         for file in &files {
             let Ok(doc) = Document::load(file) else { continue };
             let name = file.file_name().unwrap().to_string_lossy().to_string();
+            let indexes = indexes_for_document(&doc);
             for (n, (_, &page)) in doc.get_pages().iter().enumerate() {
                 let lines = lines_of(&doc, page);
-                let indexes = indexes_for(&doc, page);
                 let read = read_page_with(&doc, page, &indexes);
-                for line in &lines {
-                    let says = read
-                        .iter()
-                        .find(|r| (r.y - line.y).abs() < 1e-9)
-                        .and_then(|r| r.text.clone())
-                        .unwrap_or_else(|| "-".into());
-                    println!("READING\t{name}\t{n}\t{:.2}\t{:.2}\t{says}", line.y, line.x);
+                // ⚠️ PAIRED BY POSITION, which is exact: the reader reads the
+                // same lines in the same order. Pairing by height gave every run
+                // on a shared baseline the first run's reading.
+                for (line, r) in lines.iter().zip(&read) {
+                    let says = r.text.clone().unwrap_or_else(|| "-".into());
+                    println!("READING\t{name}\t{n}\t{:.2}\t{:.2}\t{}\t{says}",
+                        line.y, line.x, line.base_font);
                 }
             }
         }
@@ -6481,18 +7088,260 @@ mod tests {
     /// The question this answers is whether resolving fonts through the
     /// registry is worth building, or whether the file already on the system
     /// path reads the page just as well.
+    /// How well each installed Pyidaungsu file's widths agree with each
+    /// Pyidaungsu font in the test files, and which one `face_for` takes.
+    #[test]
+    #[ignore = "diagnostic, and needs PDFs and fonts that are not in this repository"]
+    fn which_build_each_pyidaungsu_font_agrees_with() {
+        let mut files: Vec<String> = std::fs::read_dir(r"D:\Ayaan PDF Test file")
+            .map(|d| d.filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned())
+                .filter(|p| p.to_lowercase().contains("pyidaungsu") && p.to_lowercase().ends_with(".pdf"))
+                .collect())
+            .unwrap_or_default();
+        files.sort();
+        files.extend(std::env::var("AYAAN_EXTRA_PDFS").unwrap_or_default()
+            .split(';').filter(|p| !p.is_empty()).map(String::from));
+        println!("installed: {:?}", pyidaungsu_files());
+        for file in files {
+            let Ok(doc) = Document::load(&file) else { continue };
+            let mut fonts: BTreeMap<String, crate::shaped::CidWidths> = BTreeMap::new();
+            for &page in doc.get_pages().values() {
+                for (_, (name, w)) in fonts_of(&doc, page) {
+                    if let Some(w) = w { fonts.entry(name).or_insert(w); }
+                }
+            }
+            println!("\n{file}");
+            for (name, w) in &fonts {
+                if !name.contains("Pyidaungsu") { continue; }
+                let glyphs: BTreeSet<u16> = w.declared().collect();
+                let scores: Vec<String> = std::iter::once(installed(name).unwrap_or_default())
+                    .chain(pyidaungsu_files().iter().copied())
+                    .map(|p| format!("{}={:.3}/{:.3}",
+                        std::path::Path::new(p).file_name().unwrap_or_default().to_string_lossy(),
+                        agreement(p, &glyphs, w).unwrap_or(-1.0),
+                        joined_agreement(p, &glyphs, w).unwrap_or(-1.0)))
+                    .collect();
+                println!("  {name} ({} glyphs) -> {:?}\n     {}", glyphs.len(),
+                    face_for(name, &glyphs, Some(w)), scores.join("  "));
+            }
+        }
+    }
+
+    /// How each font on a page is defined, for a file whose glyph numbers run
+    /// past anything the named face has (a reader's Word document: 31008
+    /// against a face of 610). File through AYAAN_PYIDAUNGSU_FILE.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn how_the_pages_fonts_are_defined() {
+        let Ok(file) = std::env::var("AYAAN_PYIDAUNGSU_FILE") else { return; };
+        let doc = Document::load(&file).unwrap();
+        let resolve = |o: &Object| -> Object {
+            match o {
+                Object::Reference(id) => doc.get_object(*id).cloned().unwrap_or(Object::Null),
+                other => other.clone(),
+            }
+        };
+        let short = |o: &Object| -> String {
+            match o {
+                Object::Name(n) => format!("/{}", String::from_utf8_lossy(n)),
+                Object::Stream(s) => format!("stream({} bytes)", s.content.len()),
+                Object::Dictionary(_) => "dict".to_string(),
+                Object::Array(a) => format!("array[{}]", a.len()),
+                Object::Reference(id) => format!("ref {id:?}"),
+                other => format!("{other:?}").chars().take(60).collect(),
+            }
+        };
+        for (number, page) in doc.get_pages() {
+            println!("page {number}");
+            let Ok(fonts) = doc.get_page_fonts(page) else { continue; };
+            for (name, font) in fonts {
+                let get = |k: &[u8]| font.get(k).map(|o| short(&resolve(o))).unwrap_or("-".into());
+                println!("  /{} {} base={} encoding={} tounicode={}",
+                    String::from_utf8_lossy(&name), get(b"Subtype"),
+                    get(b"BaseFont"), get(b"Encoding"), get(b"ToUnicode"));
+                if let Ok(Object::Array(kids)) = font.get(b"DescendantFonts").map(|o| resolve(o)) {
+                    for kid in kids {
+                        if let Object::Dictionary(d) = resolve(&kid) {
+                            let g = |k: &[u8]| d.get(k).map(|o| short(&resolve(o))).unwrap_or("-".into());
+                            let file2 = d.get(b"FontDescriptor").ok()
+                                .map(|o| resolve(o))
+                                .and_then(|fd| fd.as_dict().ok().and_then(|fd| fd.get(b"FontFile2").ok().map(|o| short(&resolve(o)))))
+                                .unwrap_or("-".into());
+                            println!("     descendant {} cidtogid={} W={} fontfile2={}",
+                                g(b"Subtype"), g(b"CIDToGIDMap"), g(b"W"), file2);
+                        }
+                    }
+                }
+            }
+
+            // A few of each font's shown strings, raw, and as Latin-1 for the
+            // simple fonts.
+            let content = lopdf::content::Content::decode(&doc.get_page_content(page)).unwrap();
+            let mut font = String::new();
+            let mut shown: BTreeMap<String, usize> = BTreeMap::new();
+            for op in &content.operations {
+                if op.operator == "Tf" {
+                    if let Some(Object::Name(n)) = op.operands.first() { font = String::from_utf8_lossy(n).into(); }
+                }
+                let strings: Vec<Vec<u8>> = match op.operator.as_str() {
+                    "Tj" | "'" => op.operands.iter().filter_map(|o| o.as_str().ok().map(|s| s.to_vec())).collect(),
+                    "TJ" => op.operands.first().and_then(|o| o.as_array().ok())
+                        .map(|a| a.iter().filter_map(|o| o.as_str().ok().map(|s| s.to_vec())).collect())
+                        .unwrap_or_default(),
+                    _ => continue,
+                };
+                let n = shown.entry(font.clone()).or_default();
+                *n += 1;
+                if *n > 4 { continue; }
+                let bytes: Vec<u8> = strings.concat();
+                let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                let latin: String = bytes.iter().map(|&b| b as char).collect();
+                println!("  {font} {} {hex}  |{latin}|", op.operator);
+            }
+            for (f, n) in shown { println!("  {f}: {n} showing operations"); }
+        }
+    }
+
+    /// What some text shapes to in one font file, glyph by glyph.
+    #[test]
+    #[ignore = "diagnostic, and needs a font that is not in this repository"]
+    fn what_a_text_shapes_to() {
+        let (Ok(font), Ok(text)) = (std::env::var("AYAAN_FONT"), std::env::var("AYAAN_TEXT")) else { return; };
+        let bytes = std::fs::read(&font).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        if let Ok(wanted) = std::env::var("AYAAN_GLYPHS") {
+            let wanted: Vec<u16> = wanted.split(',').filter_map(|g| g.trim().parse().ok()).collect();
+            if let Some(cmap) = face.tables().cmap {
+                for sub in cmap.subtables {
+                    sub.codepoints(|cp| {
+                        if let Some(g) = sub.glyph_index(cp) {
+                            if wanted.contains(&g.0) {
+                                println!("glyph {} <- U+{cp:04X}", g.0);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        for word in text.split('|') {
+            let glyphs = crate::reshape::draws(&face, word);
+            let points: Vec<String> = word.chars().map(|c| format!("{:04X}", c as u32)).collect();
+            println!("{word} [{}] -> {glyphs:?}", points.join(" "));
+        }
+    }
+
+    /// One line taken apart: its glyphs, which are one-byte, its breaks, and
+    /// what each stretch of it proves to.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn why_one_line_is_refused() {
+        let Ok(file) = std::env::var("AYAAN_PYIDAUNGSU_FILE") else { return; };
+        let y: f64 = std::env::var("AYAAN_Y").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let at: usize = std::env::var("AYAAN_PAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let doc = Document::load(&file).unwrap();
+        let page = *doc.get_pages().values().nth(at).unwrap();
+        let indexes = indexes_for_document(&doc);
+        let fonts = fonts_of(&doc, page);
+        for line in lines_of(&doc, page).iter().filter(|l| (l.y - y).abs() < 0.3) {
+            println!("line x={:.2} font={} resource={} path={:?} glyphs={} tracked={}",
+                line.x, line.base_font, String::from_utf8_lossy(&line.resource),
+                indexes.path_for(&line.base_font), line.glyphs.len(), line.tracked);
+            let shown: Vec<String> = line.glyphs.iter().enumerate().map(|(i, g)| match line.latin.get(&i) {
+                Some(one) => format!("'{}'", one.character.unwrap_or('?')),
+                None => g.to_string(),
+            }).collect();
+            println!("  glyphs: {}", shown.join(" "));
+            println!("  breaks: {:?}", line.breaks.iter().map(|b| (b.at, (b.points * 100.0).round() / 100.0)).collect::<Vec<_>>());
+            let Some(index) = indexes.index_for(&line.base_font) else { println!("  no index"); continue };
+            let path = indexes.path_for(&line.base_font).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+            let mine = fonts.get(&line.resource).and_then(|(_, w)| w.as_ref());
+            println!("  reads: {:?}", read_line(index, &face, line, mine));
+            let mut from = 0;
+            while from < line.glyphs.len() {
+                let english = line.latin.contains_key(&from);
+                let mut to = from + 1;
+                while to < line.glyphs.len() && line.latin.contains_key(&to) == english { to += 1; }
+                if !english {
+                    let whole = crate::reshape::prove(&face, index, &line.glyphs[from..to]);
+                    println!("  burmese {from}..{to}: {whole:?}");
+                    if whole.is_none() {
+                        let mut best = 0;
+                        for cut in 1..=(to - from) {
+                            if crate::reshape::prove(&face, index, &line.glyphs[from..from + cut]).is_some() { best = cut; }
+                        }
+                        println!("    longest provable prefix {best} of {}", to - from);
+                    }
+                }
+                from = to;
+            }
+        }
+    }
+
+    /// The text operations of a page in order, to see how a producer places a
+    /// line that mixes one-byte English with Burmese.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn the_text_operations_in_order() {
+        let Ok(file) = std::env::var("AYAAN_PYIDAUNGSU_FILE") else { return; };
+        let limit: usize = std::env::var("AYAAN_OPS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+        let at: usize = std::env::var("AYAAN_PAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let doc = Document::load(&file).unwrap();
+        let page = *doc.get_pages().values().nth(at).unwrap();
+        let content = lopdf::content::Content::decode(&doc.get_page_content(page)).unwrap();
+        let mut shown = 0usize;
+        for (i, op) in content.operations.iter().enumerate() {
+            let say = |o: &Object| -> String {
+                match o {
+                    Object::String(b, _) if b.iter().all(|c| (0x20..0x7F).contains(c)) => {
+                        format!("({})", String::from_utf8_lossy(b))
+                    }
+                    Object::String(b, _) => format!("<{}>", b.iter().map(|c| format!("{c:02X}")).collect::<String>()),
+                    Object::Array(a) => format!("[{}]", a.iter().map(|o| match o {
+                        Object::String(b, _) if b.iter().all(|c| (0x20..0x7F).contains(c)) => format!("({})", String::from_utf8_lossy(b)),
+                        Object::String(b, _) => format!("<{}>", b.iter().map(|c| format!("{c:02X}")).collect::<String>()),
+                        other => number(other).map(|v| format!("{v}")).unwrap_or_default(),
+                    }).collect::<Vec<_>>().join(" ")),
+                    Object::Name(n) => format!("/{}", String::from_utf8_lossy(n)),
+                    other => number(other).map(|v| format!("{v:.2}")).unwrap_or_else(|| format!("{other:?}")),
+                }
+            };
+            if matches!(op.operator.as_str(), "BT" | "ET" | "Tf" | "Tm" | "Td" | "TD" | "T*" | "TJ" | "Tj" | "Tc" | "Tw" | "Tz") {
+                let args: Vec<String> = op.operands.iter().map(say).collect();
+                println!("{i:5} {} {}", args.join(" "), op.operator);
+                shown += 1;
+                if shown >= limit { break; }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "diagnostic, and needs fonts and a PDF that are not in this repository"]
     fn which_pyidaungsu_reads_the_users_page() {
-        const FILE: &str = r"D:\Ayaan PDF Test file\Pyidaungsu- text test pdf.pdf";
-        if !std::path::Path::new(FILE).exists() {
+        // Any other file through AYAAN_PYIDAUNGSU_FILE, such as a reader's
+        // Word document set in Pyidaungsu-Bold.
+        let file = std::env::var("AYAAN_PYIDAUNGSU_FILE")
+            .unwrap_or_else(|_| r"D:\Ayaan PDF Test file\Pyidaungsu- text test pdf.pdf".to_string());
+        let file = file.as_str();
+        if !std::path::Path::new(file).exists() {
             println!("no Pyidaungsu file here");
             return;
         }
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
         const SUPPLIED: &str = r"D:\Ayaan PDF Test file";
-        let candidates: Vec<(&str, String)> = vec![
+        // And any font files listed in AYAAN_EXTRA_FONTS, separated by ';'.
+        let extra = std::env::var("AYAAN_EXTRA_FONTS").unwrap_or_default();
+        let mut candidates: Vec<(&str, String)> = extra
+            .split(';')
+            .filter(|p| !p.is_empty())
+            .map(|p| ("extra", p.to_string()))
+            .collect();
+        candidates.extend([
             ("system Pyidaungsu.ttf", r"C:\Windows\Fonts\Pyidaungsu.ttf".to_string()),
+            ("system 2.5.3 Regular", r"C:\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf".to_string()),
+            ("system 2.5.3 Bold", r"C:\Windows\Fonts\Pyidaungsu-2.5.3_Bold.ttf".to_string()),
             ("per-user 2.5.3 Regular",
              format!(r"{local}\Microsoft\Windows\Fonts\Pyidaungsu-2.5.3_Regular.ttf")),
             ("per-user 2.5.3 Bold",
@@ -6501,9 +7350,9 @@ mod tests {
              format!(r"{SUPPLIED}\Pyidaungsu-2.5.3_Numbers.ttf")),
             ("BMSTU pyidaungsu-1.2",
              r"C:\Program Files (x86)\BMSTU\MMUDictionary\pyidaungsu-1.2.ttf".to_string()),
-        ];
+        ]);
 
-        let doc = Document::load(FILE).unwrap();
+        let doc = Document::load(file).unwrap();
         let pages = doc.get_pages();
         let (_, &page) = pages.iter().next().unwrap();
         let lines = lines_of(&doc, page);
@@ -6583,6 +7432,33 @@ mod tests {
                 let proven = mine.iter().filter(|r| r.text.is_some()).count();
                 println!("   {font}: read {proven} of {} in {:.1?}",
                     mine.len(), started.elapsed());
+                if *label == "extra" {
+                    for r in &mine {
+                        let glyphs = lines.iter()
+                            .find(|l| &l.base_font == font && (l.page_y - r.y).abs() < 0.5)
+                            .map(|l| l.glyphs.len()).unwrap_or(0);
+                        println!("      y={:.1} x={:.1} glyphs={glyphs} text={:?}", r.y, r.x, r.text);
+                        if r.text.is_some() { continue; }
+                        // Which piece fails, and what the file says it is.
+                        let Some(line) = lines.iter()
+                            .find(|l| &l.base_font == font && (l.page_y - r.y).abs() < 0.5) else { continue; };
+                        let (fbytes, index) = indexes.by_font[font].as_ref();
+                        let face = rustybuzz::Face::from_slice(fbytes, 0).unwrap();
+                        let claims = claims_of(&doc, page);
+                        let said = claims.get(&line.resource);
+                        let mut from = 0;
+                        for cut in line.breaks.iter().map(|b| b.at).chain(std::iter::once(line.glyphs.len())) {
+                            if cut <= from { continue; }
+                            let part = &line.glyphs[from..cut];
+                            let proven = crate::reshape::prove(&face, index, part);
+                            let claimed: String = part.iter()
+                                .map(|g| said.and_then(|m| m.get(g)).cloned().unwrap_or("?".into()))
+                                .collect();
+                            println!("        [{from}..{cut}] {:?} proven={:?} file says {:?}", part, proven, claimed);
+                            from = cut;
+                        }
+                    }
+                }
             }
         }
     }
@@ -6903,7 +7779,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let built = build_indexes(&wanted);
+        let built = build_indexes(&wanted, &BTreeMap::new());
         let one = built.by_font.get("BCDEEE+MyanmarText").expect("no index");
         let two = built.by_font.get("BCDGEE+MyanmarText").expect("no index");
         assert!(Arc::ptr_eq(one, two), "two subsets of one face were indexed apart");
@@ -7559,5 +8435,130 @@ mod tests {
         let along = Matrix::translation(40.0, 0.0).then(placed);
         assert!((along.y() - 700.0).abs() < 0.001);
         assert!((along.x() - 112.0).abs() < 0.001);
+    }
+
+    /// The readings of one page of a file, or nothing when the file is not on
+    /// this machine.
+    fn readings_in(file: &str, page: usize) -> Option<(Vec<u8>, Indexes, Vec<Reading>)> {
+        let bytes = std::fs::read(file).ok()?;
+        let doc = Document::load_mem(&bytes).ok()?;
+        let id = *doc.get_pages().values().nth(page)?;
+        let indexes = indexes_for_document(&doc);
+        let read = read_page_with(&doc, id, &indexes);
+        Some((bytes, indexes, read))
+    }
+
+    fn said(read: &[Reading]) -> Vec<String> {
+        read.iter().filter_map(|r| r.text.clone()).collect()
+    }
+
+    /// ⚠️ ENGLISH, DIGITS AND BRACKETS IN A ONE-BYTE FONT ARE READ WHERE WORD
+    /// DREW THEM. Word draws them in a WinAnsi subset beside the Burmese, and
+    /// they were read two bytes at a time as Burmese glyphs, or dropped when a
+    /// run was one byte long: "(က)" read as "က", "( Emergency Preparedness
+    /// Plan)" was missing altogether.
+    #[test]
+    fn one_byte_english_is_read_where_it_is_drawn() {
+        let Some((_, _, read)) =
+            readings_in(r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf", 0)
+        else {
+            return;
+        };
+        let said = said(&read);
+        assert!(said.iter().any(|s| s.starts_with("(\u{1000}) ")), "{said:#?}");
+        assert!(said.iter().any(|s| s.contains(
+            "\u{1012}\u{102F}\u{1010}\u{102D}\u{101A}\u{100A}\u{103D}\u{103E}\u{1014}\u{103A}\u{1000}\u{103C}\u{102C}\u{1038}\u{101B}\u{1031}\u{1038}\u{1019}\u{103E}\u{1030}\u{1038}(\u{1019}\u{103C}\u{102D}\u{102F}\u{1037}\u{1015}\u{103C})")),
+            "{said:#?}");
+    }
+
+    /// ⚠️ AND THE BRACKETS AN EARLIER RETYPE LEFT BEHIND ARE READ IN THEIR
+    /// PLACE OR NOT AT ALL. Drawn into the gap the rewritten run left for them
+    /// (Pages 2), they are where the text has them; drawn over a word (Pages 4),
+    /// they are debris, and read into the text they split a syllable.
+    #[test]
+    fn brackets_an_old_retype_left_behind_do_not_scramble_the_line() {
+        let myo_pya = "(\u{1019}\u{103C}\u{102D}\u{102F}\u{1037}\u{1015}\u{103C})";
+        if let Some((_, _, read)) =
+            readings_in(r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages 2.pdf", 0)
+        {
+            let said = said(&read);
+            assert!(said.iter().any(|s| s.ends_with(&format!(" {myo_pya}"))), "{said:#?}");
+            assert!(!said.iter().any(|s| s.ends_with("()")), "{said:#?}");
+        }
+        if let Some((_, _, read)) =
+            readings_in(r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages 4.pdf", 2)
+        {
+            let said = said(&read);
+            assert!(said.iter().any(|s| s.contains(&format!(" {myo_pya} "))), "{said:#?}");
+        }
+    }
+
+    /// ⚠️ THE REPORTED FAILURE, END TO END: retyping a line with brackets in
+    /// it left them drawn empty, "( )", and the line could not be edited again.
+    /// The brackets are part of the line now, so the retype takes them with it
+    /// and writes them back, and the result reads and retypes like any line.
+    #[test]
+    fn a_bracketed_line_retyped_keeps_its_brackets_and_retypes_again() {
+        let Some((bytes, indexes, read)) =
+            readings_in(r"D:\Ayaan PDF Test file\Pyidaungsu- text 3 Pages.pdf", 0)
+        else {
+            return;
+        };
+        let myo_pya = "(\u{1019}\u{103C}\u{102D}\u{102F}\u{1037}\u{1015}\u{103C})";
+        let line = read
+            .iter()
+            .find(|r| r.text.as_deref().is_some_and(|t| t.ends_with(myo_pya)))
+            .expect("no bracketed line");
+        let was = line.text.clone().unwrap();
+        let now = format!("\u{1015}\u{1011}\u{1019}{myo_pya}");
+        let font = indexes.path_for(&line.font).expect("no file for the line");
+
+        let written = crate::retype::retype(&bytes, 0, line.y, &was, &now, font, Some(&indexes))
+            .expect("the retype was refused");
+        // Left behind for a person to look at: that it reads is not that it looks right.
+        let _ = std::fs::write(std::env::temp_dir().join("ayaan_brackets_retyped.pdf"), &written);
+        let doc = Document::load_mem(&written).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let again = indexes_for_document(&doc);
+        let after = read_page_with(&doc, page, &again);
+        let on_it: Vec<&Reading> =
+            after.iter().filter(|r| (r.y - line.y).abs() < 0.5).collect();
+        assert_eq!(on_it.len(), 1, "something else is still drawn on the line");
+        assert_eq!(on_it[0].text.as_deref(), Some(now.as_str()));
+
+        let font = again.path_for(&on_it[0].font).expect("no file for the new line");
+        let twice = format!("{now}\u{1000}");
+        assert!(crate::retype::retype(&written, 0, line.y, &now, &twice, font, Some(&again)).is_ok(),
+            "the retyped line could not be retyped again");
+    }
+
+    /// ⚠️ A READER'S WORD DOCUMENT, whose heading mixes Burmese with English
+    /// words and a code in brackets and was refused whole. Read with the file
+    /// it was made with, and retyped, it reads back as written. The document is
+    /// the reader's own and is kept out of the repository: name it through
+    /// AYAAN_MIXED_PDF.
+    #[test]
+    fn a_heading_mixing_burmese_and_english_reads_and_retypes() {
+        let Ok(file) = std::env::var("AYAAN_MIXED_PDF") else { return };
+        let Some((bytes, indexes, read)) = readings_in(&file, 0) else { return };
+        let mixed = |t: &str| {
+            t.chars().any(|c| c.is_ascii_alphabetic())
+                && t.chars().any(|c| ('\u{1000}'..='\u{109F}').contains(&c))
+        };
+        let Some(line) = read.iter().find(|r| r.text.as_deref().is_some_and(mixed)) else {
+            panic!("no line mixing the two was read: {:#?}", said(&read));
+        };
+        let was = line.text.clone().unwrap();
+        let now = format!("{was}Ayaan");
+        let font = indexes.path_for(&line.font).expect("no file for the heading");
+
+        let written = crate::retype::retype(&bytes, 0, line.y, &was, &now, font, Some(&indexes))
+            .expect("the retype was refused");
+        let _ = std::fs::write(std::env::temp_dir().join("ayaan_heading_retyped.pdf"), &written);
+        let doc = Document::load_mem(&written).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let after = read_page_with(&doc, page, &indexes_for_document(&doc));
+        assert!(after.iter().any(|r| r.text.as_deref() == Some(now.as_str())),
+            "the heading did not read back: {:#?}", said(&after));
     }
 }

@@ -110,6 +110,19 @@ const TAILS: [&str; 10] = [
     "\u{1036}\u{1037}", "\u{103A}\u{1038}",
 ];
 
+/// What a shaper draws under a sign that has no letter to sit on.
+const DOTTED_CIRCLE: char = '◌';
+
+/// The Burmese signs that sit on a letter: the vowels, the tone marks, the
+/// asat, the virama and the medials.
+const SIGNS: std::ops::RangeInclusive<u32> = 0x102B..=0x103E;
+
+/// Whether a spelling is one Burmese sign on its own, with no letter under it.
+fn is_lone_sign(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if SIGNS.contains(&(c as u32)))
+}
+
 /// Burmese syllables, as text.
 ///
 /// The shape of a syllable is fixed by the script, so this is an ENUMERATION
@@ -195,6 +208,22 @@ fn syllables(only: Option<&BTreeSet<char>>, scope: Option<&Scope>) -> Vec<String
         emit(base, "", medials);
     }
 
+    // ⚠️ AND A SIGN WITH NOTHING TO SIT ON, which is what a Burmese page
+    // typed in the order it LOOKS draws. Measured on a reader's Word
+    // document: "ေ" typed before the "ရွှ" it belongs to, which Word
+    // drew as the sign, a dotted circle, and then the letters, exactly as the
+    // text says. Kept only where the shaper supplies that dotted circle (see
+    // `Index::build_reporting`), so it can match nothing on a page typed
+    // correctly.
+    for u in SIGNS {
+        if let Some(c) = char::from_u32(u) {
+            let s = c.to_string();
+            if wanted(&s) {
+                out.push(s);
+            }
+        }
+    }
+
     // Whatever else a line of this text can hold.
     for u in 0x20u32..0x7F {
         if let Some(c) = char::from_u32(u) {
@@ -212,10 +241,29 @@ fn syllables(only: Option<&BTreeSet<char>>, scope: Option<&Scope>) -> Vec<String
 /// ⚠️ THE FACE IS BUILT BY THE CALLER AND REUSED. Rebuilding it per call is
 /// affordable once and ruinous a million times.
 pub(crate) fn draws(face: &rustybuzz::Face, text: &str) -> Vec<u16> {
+    let shaped = rustybuzz::shape(face, &[], buffer_for(text));
+    shaped.glyph_infos().iter().map(|i| i.glyph_id as u16).collect()
+}
+
+/// A zero-width space: what a Burmese typist puts between words, and what the
+/// reader puts in front of a sign Word drew on a dotted circle. See
+/// `Index::read`.
+pub(crate) const ZWSP: char = '\u{200B}';
+
+/// `text` in a buffer, ready to shape.
+///
+/// ⚠️ A ZERO-WIDTH SPACE DRAWS NOTHING, which is how Word draws it. HarfBuzz
+/// puts the face's space glyph in its place with no advance instead, which is
+/// a glyph the page does not have: read back, it said " ", and the next edit
+/// wrote a real space. Only a text that has one is shaped this way, so every
+/// other text shapes exactly as it always has.
+pub(crate) fn buffer_for(text: &str) -> rustybuzz::UnicodeBuffer {
     let mut buffer = rustybuzz::UnicodeBuffer::new();
     buffer.push_str(text);
-    let shaped = rustybuzz::shape(face, &[], buffer);
-    shaped.glyph_infos().iter().map(|i| i.glyph_id as u16).collect()
+    if text.contains(ZWSP) {
+        buffer.set_flags(rustybuzz::BufferFlags::REMOVE_DEFAULT_IGNORABLES);
+    }
+    buffer
 }
 
 impl Index {
@@ -272,6 +320,7 @@ impl Index {
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         let all = syllables(chars, scope_of(&face, glyphs).as_ref());
         let total = all.len();
+        let dotted = face.glyph_index(DOTTED_CIRCLE).map(|g| g.0);
 
         // ⚠️ NOT ON EVERY ONE OF THEM. There are hundreds of thousands, and a
         // caller that took a lock or woke a UI thread each time would cost more
@@ -294,6 +343,11 @@ impl Index {
             // A syllable the font cannot spell draws `.notdef`, and no page
             // contains one, so it can only add noise.
             if drawn.is_empty() || drawn.contains(&0) {
+                continue;
+            }
+            // A lone sign counts only as the dotted circle the shaper gives it.
+            // See `syllables`.
+            if is_lone_sign(&text) && !dotted.is_some_and(|d| drawn.contains(&d)) {
                 continue;
             }
             if let Some(allowed) = glyphs {
@@ -367,6 +421,16 @@ impl Index {
         let mut at = 0usize;
         while at < n {
             let (len, text) = step[at]?;
+            // ⚠️ A SIGN ON A DOTTED CIRCLE AFTER A CHARACTER IS KEPT APART
+            // FROM IT. Measured on a reader's Word document: "၊" then
+            // "ေ" on a dotted circle, which Word draws in that order and which
+            // HarfBuzz, given the two together, draws with the "ေ" in front of
+            // the "၊". Nothing is drawn between them, so what stood there was
+            // invisible, and a zero-width space is both what reproduces the
+            // page and what a Burmese typist uses there.
+            if is_lone_sign(text) && out.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                out.push(ZWSP);
+            }
             out.push_str(text);
             at += len;
         }
@@ -556,5 +620,46 @@ mod tests {
         assert_eq!(prove(&face, &by_chars, &drawn), prove(&face, &by_both, &drawn),
             "the glyph scope changed the reading");
         assert_eq!(prove(&face, &by_both, &drawn).as_deref(), Some(LINES[0]));
+    }
+
+    /// ⚠️ A SIGN TYPED BEFORE ITS LETTER IS READ AS THE PAGE DRAWS IT. A
+    /// reader's Word document has "ေ" typed ahead of "ရွှ" after a "၊",
+    /// which Word draws as the sign on a dotted circle, and no line holding it
+    /// could be read at all.
+    #[test]
+    fn a_sign_on_a_dotted_circle_reads_as_it_is_drawn() {
+        let Some(bytes) = pyidaungsu() else { return };
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let Some(dotted) = face.glyph_index(DOTTED_CIRCLE).map(|g| g.0) else { return };
+
+        let typed = format!("\u{104A}{ZWSP}\u{1031}\u{101B}");
+        let drawn = draws(&face, &typed);
+        assert!(drawn.contains(&dotted), "the sign was not drawn on a dotted circle: {drawn:?}");
+        let index = Index::build(&bytes, None, Some(&drawn.iter().copied().collect())).unwrap();
+        assert_eq!(prove(&face, &index, &drawn), Some(typed));
+    }
+
+    /// And a page typed correctly never reads through one: without a dotted
+    /// circle on the page, no lone sign is in the index to be matched.
+    #[test]
+    fn a_page_with_no_dotted_circle_has_no_lone_signs_to_read() {
+        let Some(bytes) = pyidaungsu() else { return };
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let drawn = draws(&face, "\u{101B}\u{1031}\u{1038}");
+        let index = Index::build(&bytes, None, Some(&drawn.iter().copied().collect())).unwrap();
+        assert!(index.says.values().all(|text| !is_lone_sign(text)),
+            "a lone sign was indexed for a page that draws no dotted circle");
+        assert_eq!(prove(&face, &index, &drawn).as_deref(), Some("\u{101B}\u{1031}\u{1038}"));
+    }
+
+    /// ⚠️ A ZERO-WIDTH SPACE DRAWS NOTHING, the way Word draws it. HarfBuzz
+    /// draws the space glyph there, which a page does not have and which read
+    /// back as a real space.
+    #[test]
+    fn a_zero_width_space_draws_no_glyph() {
+        let Some(bytes) = pyidaungsu() else { return };
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let apart = draws(&face, &format!("\u{1000}{ZWSP}\u{1001}"));
+        assert_eq!(apart, draws(&face, "\u{1000}\u{1001}"));
     }
 }

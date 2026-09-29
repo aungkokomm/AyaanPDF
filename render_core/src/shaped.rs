@@ -64,6 +64,18 @@ impl CidWidths {
     pub(crate) fn declared(&self) -> impl Iterator<Item = u16> + use<'_> {
         self.by_cid.keys().copied()
     }
+
+    /// Takes in what another subset of the SAME font declares.
+    ///
+    /// ⚠️ A PRODUCER NAMES SEVERAL SUBSETS ALIKE. Word wrote two Type0 fonts
+    /// called `ABCDEE+Pyidaungsu` on one page, each declaring its own glyphs,
+    /// and asking one of them the widths of the other's glyphs answered `/DW`
+    /// for all of them.
+    pub(crate) fn absorb(&mut self, other: CidWidths) {
+        for (cid, width) in other.by_cid {
+            self.by_cid.entry(cid).or_insert(width);
+        }
+    }
 }
 
 fn number(o: &Object) -> Option<f64> {

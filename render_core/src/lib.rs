@@ -4668,9 +4668,7 @@ fn shape_run(font_bytes: &[u8], text: &str, size_pts: f32) -> Option<Vec<ShapedG
     }
     let scale = size_pts / upem;
 
-    let mut buffer = rustybuzz::UnicodeBuffer::new();
-    buffer.push_str(text);
-    let shaped = rustybuzz::shape(&face, &[], buffer);
+    let shaped = rustybuzz::shape(&face, &[], crate::reshape::buffer_for(text));
 
     let infos = shaped.glyph_infos();
     let positions = shaped.glyph_positions();
@@ -18000,6 +17998,23 @@ mod tests {
     /// the claim written beside the repair, that every Devanagari line already
     /// refuses as complex script, is a claim about the text AFTER the repair
     /// and has to be checked against the code that decides.
+    /// Every line PDFium makes of a page, with where it is and why it is
+    /// refused, for comparing against what recovery reads on the same baselines.
+    #[test]
+    #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
+    fn what_pdfium_makes_of_each_line() {
+        let Ok(file) = std::env::var("AYAAN_PYIDAUNGSU_FILE") else { return };
+        let page: i32 = std::env::var("AYAAN_PAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let handle = open_fixture_named(&file);
+        let lines = decode_lines(handle, page);
+        close_document(handle);
+        for l in &lines {
+            println!("{:.4} {:.4}..{:.4} refusal={:2} objs={}..{} {} |{}|",
+                l.baseline, l.left, l.right, l.refusal, l.first_object, l.last_object,
+                l.font, l.text);
+        }
+    }
+
     #[test]
     #[ignore = "diagnostic, and needs a PDF that is not in this repository"]
     fn what_refusal_a_repaired_hindi_line_carries() {

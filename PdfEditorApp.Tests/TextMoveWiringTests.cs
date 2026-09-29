@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Linq;
 using Xunit;
 
 namespace PdfEditorApp.Tests;
@@ -17,6 +18,43 @@ public class TextMoveWiringTests
     private static string Vm() => Source("PdfEditorApp", "ViewModels", "ViewportViewModel.cs");
 
     private static string Page() => Source("PdfEditorApp", "MainPage.xaml.cs");
+
+    /// <summary>The code alone, comment lines dropped and spacing collapsed.</summary>
+    private static string CodeOnly(string source) =>
+        System.Text.RegularExpressions.Regex.Replace(
+            string.Join(" ", source.Split('\n')
+                .Where(l => !l.TrimStart().StartsWith("//", StringComparison.Ordinal))),
+            @"\s+", " ");
+
+    /// <summary>
+    /// ⚠️ ONLY ALT PICKS THE TEXT UP, the reader's choice (2026-09-29) after a
+    /// plain drag meant to select words on a line the app would not edit cut
+    /// that line in half. The press and the pointer ask the same question, so
+    /// a four-way arrow never promises a move a press would not make.
+    /// </summary>
+    [Fact]
+    public void only_alt_picks_the_text_up_and_the_pointer_says_so()
+    {
+        string page = CodeOnly(Page());
+
+        Assert.Contains("_textMoveArmed = IsAltDown() && ViewModel.BeginTextUnitMove(content.Page, nx, ny);",
+            page, StringComparison.Ordinal);
+        Assert.Contains("if (IsAltDown() && ViewModel.CanMoveTextUnitAt(content.Page, nx, ny))",
+            CodeOnly(Method(Page(), "InputSystemCursorShape? HoverCursor(", 3000)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And without Alt a press is never a move, so it acts at once: the caret
+    /// goes in and a drag selects, the same as a press once typing.
+    /// </summary>
+    [Fact]
+    public void a_plain_press_in_the_frame_types_and_drags_to_select()
+    {
+        string page = CodeOnly(Page());
+
+        Assert.Contains("else if (ViewModel.BeginInPlaceEdit(content.Page, nx, ny)) { RootGrid.Focus(FocusState.Programmatic); _inPlaceDragging = true;",
+            page, StringComparison.Ordinal);
+    }
 
     // ---------------- the gesture ----------------
 
