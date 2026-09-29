@@ -5,7 +5,7 @@
 <h1 align="center">Ayaan PDF</h1>
 
 <p align="center">
-  <b>The PDF editor that speaks Hindi and Myanmar.</b><br>
+  <b>The PDF editor that edits the words on the page.</b><br>
   Read, mark up, sign and truly edit PDFs on Windows. Free, open source, and it works offline.
 </p>
 
@@ -28,9 +28,9 @@
 
 ---
 
-Plenty of PDF apps can *show* Hindi and Burmese. Try to change a word, though, and the letters fall apart: vowel signs land on the wrong side, conjuncts split, stacked consonants come unstacked.
+Most PDF apps let you add notes on top of a page. **Ayaan PDF lets you change the page itself.** Click a line and type, and your edit stays real text: searchable and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
 
-**Ayaan PDF was built to get that right.** Click a line, type, and it stays real text: shaped correctly, searchable, and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
+It also handles scripts that other editors get wrong. Hindi and Myanmar (Burmese) are shaped correctly as you type, so vowel signs, conjuncts and stacked consonants stay where they belong.
 
 ## Screenshots
 <img width="960" height="511" alt="Ayaan PDF with a document open" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
