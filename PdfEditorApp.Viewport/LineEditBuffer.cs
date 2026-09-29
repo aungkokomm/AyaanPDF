@@ -24,12 +24,13 @@ namespace PdfEditorApp.Viewport;
 /// </remarks>
 public sealed class LineEditBuffer
 {
-    public LineEditBuffer(string original, int caret)
+    public LineEditBuffer(string original, int caret, Func<long>? clockMs = null)
     {
         Original = original ?? string.Empty;
         Text = Original;
         Caret = Clamp(caret);
         Anchor = Caret;
+        _clockMs = clockMs ?? (() => Environment.TickCount64);
     }
 
     /// <summary>
@@ -112,12 +113,80 @@ public sealed class LineEditBuffer
         }
     }
 
+    // ---------------- taking typing back ----------------
+
+    /// <summary>
+    /// How long a pause ends one undo step and starts the next, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONE STEP PER BURST, NOT PER CHARACTER. KeyMagic corrects a Burmese
+    /// letter by sending backspaces and the corrected letters a few milliseconds
+    /// apart (diag.log: four of them inside 7 ms). Undone one code point at a
+    /// time, Ctrl+Z would walk back through spellings the reader never saw.
+    /// Everything typed without a pause this long, and without moving the caret
+    /// in between, comes back as one step.
+    /// </remarks>
+    public const int UndoPauseMs = 1000;
+
+    private readonly record struct State(string Text, int Caret, int Anchor);
+
+    private readonly List<State> _undo = [];
+    private readonly List<State> _redo = [];
+    private readonly Func<long> _clockMs;
+    private long _lastEditAt;
+    private bool _runOpen;
+
+    public bool CanUndo => _undo.Count > 0;
+
+    public bool CanRedo => _redo.Count > 0;
+
+    /// <summary>Puts the line back as it was before the last step of typing.</summary>
+    public bool Undo() => Step(_undo, _redo);
+
+    /// <summary>Puts back the step of typing the last <see cref="Undo"/> took away.</summary>
+    public bool Redo() => Step(_redo, _undo);
+
+    private bool Step(List<State> from, List<State> to)
+    {
+        if (from.Count == 0) { return false; }
+
+        to.Add(new State(Text, Caret, Anchor));
+        var state = from[^1];
+        from.RemoveAt(from.Count - 1);
+        (Text, Caret, Anchor) = (state.Text, state.Caret, state.Anchor);
+        _runOpen = false;
+        return true;
+    }
+
+    /// <summary>
+    /// Runs one keystroke's change, recording the line as it was unless the
+    /// keystroke continues the step already open.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONLY A CHANGE TO THE TEXT IS A STEP. A backspace at the start of the
+    /// line, or an input method rewriting a range with what it already said,
+    /// changes nothing, and a Ctrl+Z that then does nothing reads as undo being
+    /// broken. It is also what makes "nothing to undo" mean "nothing typed".
+    /// </remarks>
+    private void Edit(Action change)
+    {
+        var before = new State(Text, Caret, Anchor);
+        change();
+        if (string.Equals(Text, before.Text, StringComparison.Ordinal)) { return; }
+
+        long now = _clockMs();
+        if (!_runOpen || now - _lastEditAt > UndoPauseMs) { _undo.Add(before); }
+        _runOpen = true;
+        _lastEditAt = now;
+        _redo.Clear();
+    }
+
     // ---------------- what a keystroke means ----------------
 
     /// <summary>
     /// Types text in, replacing the selection when there is one.
     /// </summary>
-    public void Insert(string s)
+    public void Insert(string s) => Edit(() =>
     {
         if (string.IsNullOrEmpty(s)) { return; }
 
@@ -125,7 +194,7 @@ public sealed class LineEditBuffer
         Text = Text[..Caret] + s + Text[Caret..];
         Caret += s.Length;
         Anchor = Caret;
-    }
+    });
 
     /// <summary>
     /// Replaces the characters from <paramref name="start"/> to
@@ -144,7 +213,7 @@ public sealed class LineEditBuffer
     /// trusted. A composition that is interrupted can name a range that no
     /// longer exists.
     /// </remarks>
-    public void ReplaceRange(int start, int end, string text)
+    public void ReplaceRange(int start, int end, string text) => Edit(() =>
     {
         start = Clamp(start);
         end = Clamp(end);
@@ -153,7 +222,7 @@ public sealed class LineEditBuffer
         Text = Text[..start] + text + Text[end..];
         Caret = start + (text?.Length ?? 0);
         Anchor = Caret;
-    }
+    });
 
     /// <summary>
     /// Backspace: removes the selection, or the character before the caret.
@@ -165,7 +234,7 @@ public sealed class LineEditBuffer
     /// This user is writing Devanagari and Burmese, where that is the ordinary
     /// case rather than an edge one.
     /// </remarks>
-    public void Backspace()
+    public void Backspace() => Edit(() =>
     {
         if (DeleteSelection()) { return; }
         if (Caret <= 0) { return; }
@@ -174,7 +243,7 @@ public sealed class LineEditBuffer
         Text = Text[..start] + Text[Caret..];
         Caret = start;
         Anchor = Caret;
-    }
+    });
 
     /// <summary>
     /// Backspace that removes exactly one character (one code point), the way a
@@ -189,7 +258,7 @@ public sealed class LineEditBuffer
     /// "မှောင်မိုက်နေသည် သို့သော်" after "ညတာသည်" and the page got
     /// "ညတာသှောင်နေသည်သော်".
     /// </remarks>
-    public void BackspaceOneCodePoint()
+    public void BackspaceOneCodePoint() => Edit(() =>
     {
         if (DeleteSelection()) { return; }
         if (Caret <= 0) { return; }
@@ -202,7 +271,7 @@ public sealed class LineEditBuffer
         Text = Text[..start] + Text[Caret..];
         Caret = start;
         Anchor = Caret;
-    }
+    });
 
     /// <summary>
     /// Pasted text, reduced to something a LINE can hold.
@@ -239,7 +308,7 @@ public sealed class LineEditBuffer
     }
 
     /// <summary>Delete: removes the selection, or the character after the caret.</summary>
-    public void Delete()
+    public void Delete() => Edit(() =>
     {
         if (DeleteSelection()) { return; }
         if (Caret >= Text.Length) { return; }
@@ -247,7 +316,7 @@ public sealed class LineEditBuffer
         int end = NextBoundary(Caret);
         Text = Text[..Caret] + Text[end..];
         Anchor = Caret;
-    }
+    });
 
     /// <summary>
     /// Removes the selection if there is one, and says whether it did.
@@ -270,9 +339,13 @@ public sealed class LineEditBuffer
     // released shift brings the anchor along. An arrow key pressed with a
     // selection up collapses it to the side it moved towards, which is what
     // every text editor does and what a reader will expect without thinking.
+    //
+    // ⚠️ AND EVERY MOVE ENDS THE UNDO STEP BEING TYPED. What is typed after it
+    // went somewhere else in the line, so Ctrl+Z takes it back on its own.
 
     public void MoveLeft(bool extend = false)
     {
+        _runOpen = false;
         if (!extend && HasSelection) { Collapse(SelectionStart); return; }
 
         Caret = Caret <= 0 ? 0 : PreviousBoundary(Caret);
@@ -281,6 +354,7 @@ public sealed class LineEditBuffer
 
     public void MoveRight(bool extend = false)
     {
+        _runOpen = false;
         if (!extend && HasSelection) { Collapse(SelectionEnd); return; }
 
         Caret = Caret >= Text.Length ? Text.Length : NextBoundary(Caret);
@@ -289,12 +363,14 @@ public sealed class LineEditBuffer
 
     public void MoveHome(bool extend = false)
     {
+        _runOpen = false;
         Caret = 0;
         if (!extend) { Anchor = Caret; }
     }
 
     public void MoveEnd(bool extend = false)
     {
+        _runOpen = false;
         Caret = Text.Length;
         if (!extend) { Anchor = Caret; }
     }
@@ -315,6 +391,11 @@ public sealed class LineEditBuffer
     /// </param>
     public void PlaceCaret(int offset, bool extend = false)
     {
+        // ⚠️ ONLY A REAL MOVE ENDS THE STEP. An input method confirms the caret
+        // where its own last rewrite left it, many times per word, and each of
+        // those splitting the step would make Ctrl+Z walk back through the
+        // composition a letter at a time.
+        if (Clamp(offset) != Caret) { _runOpen = false; }
         Caret = Clamp(offset);
         if (!extend) { Anchor = Caret; }
     }
@@ -322,6 +403,7 @@ public sealed class LineEditBuffer
     /// <summary>Selects the whole line.</summary>
     public void SelectAll()
     {
+        _runOpen = false;
         Anchor = 0;
         Caret = Text.Length;
     }
@@ -336,6 +418,7 @@ public sealed class LineEditBuffer
     /// </remarks>
     public void SelectWordAt(int offset)
     {
+        _runOpen = false;
         if (Text.Length == 0) { Collapse(0); return; }
 
         int at = Math.Clamp(offset, 0, Text.Length - 1);

@@ -12800,6 +12800,9 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
         act();
         InPlaceEditChanged?.Invoke();
+
+        // The Edit menu's Undo and Redo follow the typing.
+        NotifyHistoryChanged();
     }
 
     // ---------------- finishing ----------------
@@ -12851,6 +12854,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         _caretDesiredX = null;
         ForgetCaretStops();
         InPlaceEditChanged?.Invoke();
+        NotifyHistoryChanged();
     }
 
     // ---------------- what gets drawn ----------------
@@ -15241,13 +15245,20 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
 
     private readonly DocumentHistory _history = new();
 
-    public bool CanUndo => _history.CanUndo;
-    public bool CanRedo => _history.CanRedo;
+    // ⚠️ THE OPEN LINE COUNTS. The Edit menu's Undo is enabled by this, and a
+    // disabled menu item swallows its Ctrl+Z, so typing into a line of a file
+    // with no history yet could never be taken back.
+    public bool CanUndo => _lineEdit is { CanUndo: true } || _history.CanUndo;
+    public bool CanRedo => _lineEdit is { } edit
+        ? edit.CanRedo || (!edit.IsChanged && _history.CanRedo)
+        : _history.CanRedo;
 
     /// <summary>Menu text, e.g. "Undo Delete page". Falls back to plain "Undo".</summary>
-    public string UndoLabel => _history.NextUndoLabel is { } l ? $"Undo {l}" : "Undo";
+    public string UndoLabel => _lineEdit is { CanUndo: true } ? "Undo typing"
+        : _history.NextUndoLabel is { } l ? $"Undo {l}" : "Undo";
 
-    public string RedoLabel => _history.NextRedoLabel is { } l ? $"Redo {l}" : "Redo";
+    public string RedoLabel => _lineEdit is { CanRedo: true } ? "Redo typing"
+        : _history.NextRedoLabel is { } l ? $"Redo {l}" : "Redo";
 
     /// <summary>True when there are edits not yet written to disk.</summary>
     [ObservableProperty]
@@ -15961,6 +15972,25 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // ⚠️ WHILE A LINE IS OPEN, CTRL+Z MEANS WHAT WAS TYPED INTO IT. It used
+        // to reach past the open line to the last change to the DOCUMENT, swap
+        // the file for the one before it, and leave the line open over a
+        // document it no longer described, where Enter would then write it.
+        if (_lineEdit is { } edit)
+        {
+            if (edit.CanUndo)
+            {
+                Changed(() => edit.Undo());
+                Diag.Log($"undo: typing in the open line, canUndo={edit.CanUndo}");
+                return;
+            }
+
+            // Nothing typed, so the line is exactly what the page draws and
+            // closing it loses nothing. The reader's Ctrl+Z goes on to the last
+            // change to the document, which is what they meant by it.
+            CancelInPlaceEdit();
+        }
+
         var target = _history.Undo(Capture);
         Diag.Log($"undo: {(target is null ? "NOTHING to undo" : "applying")} canUndo={_history.CanUndo} canRedo={_history.CanRedo}");
         if (target is not null)
@@ -15975,6 +16005,21 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         {
             Status = "Still saving the last change.";
             return;
+        }
+
+        if (_lineEdit is { } edit)
+        {
+            if (edit.CanRedo)
+            {
+                Changed(() => edit.Redo());
+                Diag.Log($"redo: typing in the open line, canRedo={edit.CanRedo}");
+                return;
+            }
+
+            // Typing not yet committed would be lost under a document redo, so
+            // the line keeps it and the redo waits for the line to close.
+            if (edit.IsChanged) { return; }
+            CancelInPlaceEdit();
         }
 
         var target = _history.Redo(Capture);
