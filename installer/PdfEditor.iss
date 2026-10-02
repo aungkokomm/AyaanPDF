@@ -77,6 +77,10 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; On by default. A portable install to a test folder should leave it off, or
 ; PDFs would open in that copy instead of the main one.
 Name: "pdffiles"; Description: "Offer {#AppName} for &PDF files (Open with, and Default apps in Settings)"; GroupDescription: "PDF files:"
+; Its own line in a PDF's right-click menu. Open with shows at most 16 apps
+; (measured on a PC with 18 PDF apps: two were left out, and which two varied),
+; so on a well-stocked machine this is the only place the app reliably appears.
+Name: "pdfmenu"; Description: "Add ""Open in {#AppName}"" to the &right-click menu of PDF files"; GroupDescription: "PDF files:"
 
 [Registry]
 ; Per user (HKCU), like the rest of this install. It OFFERS the app for PDFs
@@ -99,6 +103,11 @@ Root: HKA; Subkey: "Software\{#AppName}\Capabilities"; ValueType: string; ValueN
 Root: HKA; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "AyaanPDF.Document"; Tasks: pdffiles
 Root: HKA; Subkey: "Software\{#AppName}"; Flags: uninsdeletekeyifempty; Tasks: pdffiles
 Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#AppName}"; ValueData: "Software\{#AppName}\Capabilities"; Flags: uninsdeletevalue; Tasks: pdffiles
+; "Open in Ayaan PDF" on every PDF, whichever app is the default for them:
+; SystemFileAssociations applies to the file type, not to the default's ProgId.
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\AyaanPDF.Open"; ValueType: string; ValueName: "MUIVerb"; ValueData: "Open in {#AppName}"; Flags: uninsdeletekey; Tasks: pdfmenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\AyaanPDF.Open"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#ExeName},0"; Tasks: pdfmenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\AyaanPDF.Open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: pdfmenu
 
 [Files]
 ; The entire self-contained publish output (exe + WinUI runtime + render_core.dll +
