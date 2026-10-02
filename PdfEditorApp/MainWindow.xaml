@@ -202,5 +202,39 @@
                 <Thickness x:Key="TabViewHeaderPadding">0</Thickness>
             </TabView.Resources>
         </TabView>
+
+        <!--
+            A newer release is out. The window's, not a page's: the check runs
+            once per start, whichever tab is in front. Bottom right, above the
+            page's status bar (32 tall) and clear of its scroll bar, and it stays
+            until the reader answers it. Download opens the release page; the
+            cross means "not this version", which is then not offered again.
+        -->
+        <Border x:Name="UpdateBubble" Grid.Row="1" Visibility="Collapsed"
+                HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,24,44"
+                Padding="16,8,8,8" Translation="0,0,32"
+                Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource ControlStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="{StaticResource OverlayCornerRadius}">
+            <Border.Shadow>
+                <ThemeShadow />
+            </Border.Shadow>
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <FontIcon Glyph="&#xE896;" FontSize="16" VerticalAlignment="Center"
+                          Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+                <TextBlock x:Name="UpdateText" VerticalAlignment="Center" />
+                <Button x:Name="UpdateDownload" AutomationProperties.AutomationId="UpdateDownload"
+                        Content="Download" Style="{StaticResource AccentButtonStyle}"
+                        Click="UpdateDownload_Click" />
+                <Button x:Name="UpdateSkip" AutomationProperties.AutomationId="UpdateSkip"
+                        AutomationProperties.Name="Skip this version"
+                        ToolTipService.ToolTip="Skip this version"
+                        Width="28" Height="28" Padding="0"
+                        Background="Transparent" BorderThickness="0"
+                        Click="UpdateSkip_Click">
+                    <FontIcon Glyph="&#xE711;" FontSize="12" />
+                </Button>
+            </StackPanel>
+        </Border>
     </Grid>
 </Window>

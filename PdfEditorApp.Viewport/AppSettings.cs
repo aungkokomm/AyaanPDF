@@ -198,6 +198,13 @@ public sealed record AppSettings
     public List<string> TitleInTabPaths { get; init; } = new();
 
     /// <summary>
+    /// The newer version the reader dismissed the update bubble for, so it is
+    /// not offered again. A later release is offered as usual. Empty until the
+    /// first dismissal.
+    /// </summary>
+    public string SkippedUpdateVersion { get; init; } = "";
+
+    /// <summary>
     /// Which generation of this file's meaning the stored settings were
     /// written against.
     ///

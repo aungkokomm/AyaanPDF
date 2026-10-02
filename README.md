@@ -191,7 +191,7 @@ Ayaan PDF runs on **Windows 10 (version 1809 or later) and Windows 11**, on 64-b
 
 ## Your files stay on your PC
 
-No account, no tracking, no automatic updates phoning home. Ayaan PDF goes online only when you ask it to: to download a recognition language, or to open a web link you clicked.
+No account, no tracking, and nothing about you or your files ever leaves your PC. When it starts, Ayaan PDF asks GitHub whether a newer version is out and, if one is, offers it in a small bubble you can dismiss; it never downloads or installs anything by itself. Otherwise it goes online only when you ask it to: to download a recognition language, or to open a web link you clicked.
 
 ## Handy keys
 

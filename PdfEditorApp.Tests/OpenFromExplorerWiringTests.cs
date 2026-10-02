@@ -86,13 +86,19 @@ public class OpenFromExplorerWiringTests
         Assert.Contains("Subkey: \"Software\\Classes\\.pdf\\OpenWithProgids\"; ValueType: string; ValueName: \"AyaanPDF.Document\"; ValueData: \"\"; Flags: uninsdeletevalue", iss, StringComparison.Ordinal);
         Assert.Contains("Subkey: \"Software\\RegisteredApplications\"; ValueType: string; ValueName: \"{#AppName}\"; ValueData: \"Software\\{#AppName}\\Capabilities\"; Flags: uninsdeletevalue", iss, StringComparison.Ordinal);
 
+        // Its own line in a PDF's right-click menu, since Open with shows at
+        // most 16 apps. An option of its own, and removed on uninstall.
+        Assert.Contains("Name: \"pdfmenu\";", iss, StringComparison.Ordinal);
+        Assert.Contains("Subkey: \"Software\\Classes\\SystemFileAssociations\\.pdf\\shell\\AyaanPDF.Open\"; ValueType: string; ValueName: \"MUIVerb\"; ValueData: \"Open in {#AppName}\"; Flags: uninsdeletekey; Tasks: pdfmenu", iss, StringComparison.Ordinal);
+        Assert.Contains("Subkey: \"Software\\Classes\\SystemFileAssociations\\.pdf\\shell\\AyaanPDF.Open\\command\"; ValueType: string; ValueName: \"\"; ValueData: \"\"\"{app}\\{#ExeName}\"\" \"\"%1\"\"\"; Tasks: pdfmenu", iss, StringComparison.Ordinal);
+
         // Per user, like the install, and never taking over .pdf's default.
         foreach (string line in iss.Split('\n'))
         {
             if (line.StartsWith("Root:", StringComparison.Ordinal))
             {
                 Assert.StartsWith("Root: HKA;", line);
-                Assert.EndsWith("Tasks: pdffiles", line.TrimEnd());
+                Assert.Matches("Tasks: (pdffiles|pdfmenu)$", line.TrimEnd());
                 Assert.DoesNotContain("Subkey: \"Software\\Classes\\.pdf\"; ValueType", line, StringComparison.Ordinal);
             }
         }

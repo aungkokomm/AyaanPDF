@@ -62,6 +62,58 @@ public sealed partial class MainWindow : Window
         {
             AddDocumentTab(file);
         }
+
+        // Once per start, and never in the way: see UpdateChecker.
+        _ = CheckForUpdateAsync();
+    }
+
+    /// <summary>The newer release the bubble is offering, until it is answered.</summary>
+    private UpdateInfo? _update;
+
+    private async Task CheckForUpdateAsync()
+    {
+        UpdateInfo? update = await UpdateChecker.CheckAsync(SettingsStore.Current.SkippedUpdateVersion);
+        if (update is null)
+        {
+            return;
+        }
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            _update = update;
+            UpdateText.Text = $"{AppInfo.Name} {update.Version} is available";
+            UpdateBubble.Visibility = IsFullScreen ? Visibility.Collapsed : Visibility.Visible;
+        });
+    }
+
+    private async void UpdateDownload_Click(object sender, RoutedEventArgs e)
+    {
+        if (_update is { } update)
+        {
+            try
+            {
+                await Windows.System.Launcher.LaunchUriAsync(new Uri(update.ReleaseUrl));
+            }
+            catch (Exception ex)
+            {
+                Diag.Log($"update: could not open the release page ({ex.GetType().Name})");
+            }
+        }
+        // Not remembered as skipped: until it is installed, the next start
+        // offers it again, which is what a reader who chose Download wants.
+        _update = null;
+        UpdateBubble.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>The cross: not this version. A later release is offered as usual.</summary>
+    private void UpdateSkip_Click(object sender, RoutedEventArgs e)
+    {
+        if (_update is { } update)
+        {
+            SettingsStore.Update(s => s with { SkippedUpdateVersion = update.Version });
+            Diag.Log($"update: the reader skipped {update.Version}");
+        }
+        _update = null;
+        UpdateBubble.Visibility = Visibility.Collapsed;
     }
 
     /// <summary>
@@ -157,6 +209,9 @@ public sealed partial class MainWindow : Window
         }
 
         Tabs.IsAddTabButtonVisible = !full;
+
+        // Not over a presentation. It comes back on the way out, still unanswered.
+        UpdateBubble.Visibility = !full && _update is not null ? Visibility.Visible : Visibility.Collapsed;
 
         ActivePage?.SetPresenting(full);
 
