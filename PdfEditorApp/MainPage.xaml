@@ -1325,8 +1325,14 @@
 
                     NOT HIT-TESTABLE: a click has to reach the page so it can
                     move the caret, exactly as clicking in text does anywhere.
+
+                    ⚠️ MARGIN 1,1 IS THE PAGE CARD'S BORDER. The page is drawn
+                    inside the card's 1-DIP border, and this layer used to start
+                    at the card's outer edge, so everything on it sat one DIP up
+                    and left of the page: at 145% the typed text rode high and
+                    the bottoms of the old descenders showed under the cover.
                 -->
-                <Canvas x:Name="InPlaceLayer" IsHitTestVisible="False" />
+                <Canvas x:Name="InPlaceLayer" IsHitTestVisible="False" Margin="1,1,0,0" />
 
             </controls:CursorGrid>
         </ScrollView>

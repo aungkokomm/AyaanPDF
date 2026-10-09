@@ -994,6 +994,12 @@ public sealed partial class MainPage : Page
         UpdateObjectToolbar();
         PlaceDefinition();
 
+        // A line being edited is drawn for the zoom, so a new zoom redraws it.
+        if (ViewModel.IsEditingInPlace)
+        {
+            DrawInPlaceLayerAtTheZoom();
+        }
+
         // A zoom that no longer matches fit-width means the user took over,
         // by pinch, Ctrl+wheel or a zoom command. Detecting it from the state
         // rather than from each input path means no gesture can be forgotten.
@@ -8952,6 +8958,34 @@ public sealed partial class MainPage : Page
         return PageTextInput.OnScreen(InPlaceLayer, local);
     }
 
+    /// <summary>
+    /// Draws the edit overlay at the size the reader sees it, not at the size
+    /// it is laid out.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE OVERLAY IS INSIDE THE ZOOM. The ScrollView magnifies its content
+    /// after it has been drawn, and nothing tells the overlay, so text typed
+    /// at 145% was drawn at 100% and stretched: soft, grey and heavier than the
+    /// page beside it. The page itself never shows this because it is a bitmap
+    /// rendered for the zoom. Telling the layer the scale it ends up at makes
+    /// its text be drawn at that scale in the first place.
+    ///
+    /// Capped, because at 800% on a high-DPI screen one line would ask for a
+    /// surface wider than the graphics card allows.
+    /// </remarks>
+    private void DrawInPlaceLayerAtTheZoom()
+    {
+        double device = XamlRoot?.RasterizationScale ?? 1.0;
+        double wanted = Math.Min(MaxInPlaceRasterScale, device * Math.Max(1.0, PageScroller.ZoomFactor));
+        if (Math.Abs(InPlaceLayer.RasterizationScale - wanted) > 0.01)
+        {
+            InPlaceLayer.RasterizationScale = wanted;
+        }
+    }
+
+    /// <summary>Pixels per DIP the edit overlay is never drawn finer than.</summary>
+    private const double MaxInPlaceRasterScale = 8.0;
+
     private void RenderInPlaceEdit()
     {
         InPlaceLayer.Children.Clear();
@@ -8960,6 +8994,8 @@ public sealed partial class MainPage : Page
 
         int page = ViewModel.InPlacePage;
         if (page < 0) { return; }
+
+        DrawInPlaceLayerAtTheZoom();
 
         // ⚠️ TWO DIFFERENT SCALES, the same trap the old editor documented. The
         // geometry is normalized across the page and converts with OverlayScale;
@@ -9047,14 +9083,21 @@ public sealed partial class MainPage : Page
         bool sliding = Math.Abs(delta) >= 0.5;
         double coverTo = sliding ? Math.Max(nowRight, scale) : Math.Max(wasRight, nowRight);
 
+        // ⚠️ A LITTLE TALLER THAN THE LINE. The line's box is the outline of
+        //    its glyphs, tight to the ink, and the page smooths every edge a
+        //    fraction of a pixel past that, so a cover exactly the box's height
+        //    left a hairline of each old ascender and descender showing. A
+        //    twentieth of the type size clears it and still falls well short of
+        //    the lines above and below.
+        double bleed = fontDip * 0.05;
         var cover = new Rectangle
         {
             Width = Math.Max(0, coverTo - left),
-            Height = height,
+            Height = height + (2 * bleed),
             Fill = HexBrush(tail.CoverColorHex),
         };
         Canvas.SetLeft(cover, left);
-        Canvas.SetTop(cover, top);
+        Canvas.SetTop(cover, top - bleed);
         InPlaceLayer.Children.Add(cover);
 
         if (sliding)
