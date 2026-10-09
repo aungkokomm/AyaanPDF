@@ -7,6 +7,7 @@ using Windows.Foundation;
 using Windows.UI.Text.Core;
 
 using PdfEditorApp.ViewModels;
+using PdfEditorApp.Viewport;
 
 namespace PdfEditorApp;
 
@@ -96,6 +97,12 @@ public sealed class PageTextInput : IDisposable
     /// </summary>
     public bool IsActive { get; private set; }
 
+    /// <summary>
+    /// Whether Text Services is delivering at all. Shared by every tab, because
+    /// what it decides is about this run of the app, not about one document.
+    /// </summary>
+    private static readonly TypingWatch s_watch = new();
+
     /// <summary>The line, as Text Services is entitled to see it.</summary>
     private string Line => _model.InPlaceText ?? string.Empty;
 
@@ -114,12 +121,32 @@ public sealed class PageTextInput : IDisposable
     /// <summary>The reader has started editing a line: input belongs here now.</summary>
     public void Enter()
     {
-        if (_context is null || IsActive) { return; }
+        if (_context is null || IsActive || s_watch.Silent) { return; }
 
+        s_watch.EditStarted();
         IsActive = true;
         _known = Line.Length;
         _context.NotifyFocusEnter();
         _context.NotifyLayoutChanged();
+    }
+
+    /// <summary>
+    /// A character that reached the window while this was active. Null leaves
+    /// it to Text Services. Text means Text Services has stayed silent: it is
+    /// let go for the rest of the run, and the caller inserts the text, which
+    /// carries the characters held while that was being decided.
+    /// </summary>
+    public string? Unclaimed(char c)
+    {
+        if (!IsActive) { return null; }
+
+        string? held = s_watch.Received(c);
+        if (held is not null)
+        {
+            Diag.Log($"text services: silent for {held.Length} characters, so typing goes by characters for the rest of this run");
+            Leave();
+        }
+        return held;
     }
 
     /// <summary>The edit is over.</summary>
@@ -183,6 +210,7 @@ public sealed class PageTextInput : IDisposable
             return;
         }
 
+        s_watch.Delivered();
         _applying = true;
         try
         {

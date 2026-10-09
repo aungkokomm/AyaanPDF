@@ -9329,11 +9329,22 @@ public sealed partial class MainPage : Page
     private void RootGrid_CharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
     {
         if (!ViewModel.IsEditingInPlace || _isCtrlDown || IsAltDown() || ViewModel.IsSaving) { return; }
-        if (_textInput is { IsActive: true }) { return; }
 
         // Enter, Escape, Backspace and Tab arrive here too. They are keys, not
         // text, and RootGrid_KeyDown has already dealt with them.
         if (char.IsControl(args.Character)) { return; }
+
+        // Text Services has the line, so it types this character itself,
+        // unless it turns out to be delivering nothing at all: then what it
+        // swallowed comes back here, held characters and all.
+        if (_textInput is { IsActive: true } input)
+        {
+            if (input.Unclaimed(args.Character) is not { } held) { return; }
+
+            ViewModel.InPlaceInsert(held);
+            args.Handled = true;
+            return;
+        }
 
         ViewModel.InPlaceInsert(args.Character.ToString());
         args.Handled = true;

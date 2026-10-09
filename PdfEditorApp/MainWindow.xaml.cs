@@ -32,6 +32,12 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
 
+        // A second way for files dragged from Explorer to get in: see FileDrops.
+        // On first activation, when the windows WinUI makes inside this one
+        // exist. Subscribed first thing: the window is activated before this
+        // constructor ends, and a subscription at the end never heard it.
+        Activated += AcceptFileDropsOnce;
+
         // Logs which code holds the UI thread whenever it freezes. See UiStall.
         UiStall.Start(DispatcherQueue);
 
@@ -65,6 +71,20 @@ public sealed partial class MainWindow : Window
 
         // Once per start, and never in the way: see UpdateChecker.
         _ = CheckForUpdateAsync();
+    }
+
+    private void AcceptFileDropsOnce(object sender, WindowActivatedEventArgs args)
+    {
+        Activated -= AcceptFileDropsOnce;
+        try
+        {
+            FileDrops.Accept(WinRT.Interop.WindowNative.GetWindowHandle(this), OpenLaunchedFiles);
+        }
+        catch (Exception ex)
+        {
+            // A second way in that failed leaves the first as it was.
+            Diag.Log($"drop: classic file drop not taken, {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     /// <summary>The newer release the bubble is offering, until it is answered.</summary>

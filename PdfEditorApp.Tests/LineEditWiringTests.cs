@@ -589,10 +589,12 @@ public class LineEditWiringTests
                               StringComparison.Ordinal);
         Assert.True(at > 0, "nothing receives typed characters");
 
-        string body = page[at..Math.Min(page.Length, at + 700)];
+        string body = page[at..Math.Min(page.Length, at + 1400)];
         Assert.Contains("_textInput is { IsActive: true }", body, StringComparison.Ordinal);
 
-        // The guard has to come BEFORE anything is inserted.
+        // The guard has to come BEFORE anything is inserted. Inside it, only
+        // what TypingWatch hands back from a SILENT Text Services is typed:
+        // see TypingWatchTests.
         int guard = body.IndexOf("_textInput is { IsActive: true }", StringComparison.Ordinal);
         int insert = body.IndexOf("InPlaceInsert", StringComparison.Ordinal);
         Assert.True(insert > guard,
