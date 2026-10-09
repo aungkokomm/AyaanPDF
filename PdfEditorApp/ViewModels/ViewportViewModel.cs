@@ -6243,7 +6243,7 @@ public partial class ViewportViewModel : ObservableObject, IDisposable
         if (_documentHandle == 0 || _selectedLine is not { } line) { return false; }
         if (_selectedLinePage < 0) { return false; }
 
-        newText = newText.Trim();
+        newText = TypedLine.ForWriting(newText);
         if (newText.Length == 0)
         {
             Status = "A line cannot be made empty. Delete is a different edit.";
