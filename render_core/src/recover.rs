@@ -3736,6 +3736,54 @@ mod tests {
             "read a page at a time, the retyped line says nothing");
     }
 
+    /// MEASUREMENT: what preparing costs when it is scoped to what the reader
+    /// clicked rather than to everything the document's fonts declare. Builds
+    /// one index over a line's glyphs, one over its paragraph's and one over
+    /// the page's declared set, times each, and says whether each reads the
+    /// line it was built for.
+    ///
+    ///     cargo test --release what_preparing_a_line_or_a_paragraph_costs -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a Myanmar PDF that is not in this repository"]
+    fn what_preparing_a_line_or_a_paragraph_costs() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file .pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        let doc = Document::load(FILE).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let lines = lines_of(&doc, page);
+        let widths = fonts_of(&doc, page);
+        let line = lines.iter().position(|l| (l.page_y - 396.43).abs() < 0.1).unwrap();
+        let paragraph = crate::shift::blocks_of(&lines)
+            .into_iter()
+            .find(|g| g.contains(&line))
+            .unwrap();
+        let glyphs_of = |which: &[usize]| -> BTreeSet<u16> {
+            which.iter().flat_map(|i| lines[*i].font_glyphs()).collect()
+        };
+        let declared: BTreeSet<u16> = wanted_for_page(&doc, page).by_font.into_values().flatten().collect();
+
+        for (label, scope) in [
+            ("the clicked line", glyphs_of(&[line])),
+            ("its paragraph", glyphs_of(&paragraph)),
+            ("the page, as today", declared),
+        ] {
+            let t = std::time::Instant::now();
+            let index = crate::reshape::Index::build(&bytes, None, Some(&scope)).unwrap();
+            let took = t.elapsed().as_secs_f64();
+            let reads = |i: usize| {
+                let mine = widths.get(&lines[i].resource).and_then(|(_, w)| w.as_ref());
+                read_line(&index, &face, &lines[i], mine).is_some()
+            };
+            println!("{label:20} {:4} glyphs  {took:5.1}s  reads the line {}  reads {} of {} paragraph lines",
+                scope.len(), reads(line), paragraph.iter().filter(|i| reads(**i)).count(),
+                paragraph.len());
+        }
+    }
+
     /// Where each line's word spaces come from: a space GLYPH the page draws,
     /// or a SKIP between two placements that draws nothing. Diagnostic.
     #[test]

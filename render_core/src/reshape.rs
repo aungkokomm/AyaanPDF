@@ -110,6 +110,81 @@ const TAILS: [&str; 10] = [
     "\u{1036}\u{1037}", "\u{103A}\u{1038}",
 ];
 
+/// Shapes spelling after spelling with one plan for every one of a kind.
+///
+/// ⚠️ A NEW PLAN FOR EVERY SPELLING WAS MOST OF THE COST OF AN INDEX.
+/// `rustybuzz::shape` compiles a shaping plan for the font on each call, and
+/// its own documentation calls that slow; an index shapes hundreds of
+/// thousands of spellings. Measured on one thread: 12.7s with a plan per
+/// spelling, 5.0s with this. The plan depends only on the direction, script and
+/// language the buffer is guessed to have, so one is made for each that turns
+/// up and used again, which is exactly what `shape` does with the plan it
+/// makes, every time.
+struct Shaper<'f, 'a> {
+    face: &'f rustybuzz::Face<'a>,
+    plans: Vec<(
+        (rustybuzz::Direction, rustybuzz::Script, Option<rustybuzz::Language>),
+        rustybuzz::ShapePlan,
+    )>,
+    buffer: Option<rustybuzz::UnicodeBuffer>,
+}
+
+impl<'f, 'a> Shaper<'f, 'a> {
+    fn new(face: &'f rustybuzz::Face<'a>) -> Self {
+        Shaper { face, plans: Vec::new(), buffer: None }
+    }
+
+    /// The glyphs `text` draws, as `rustybuzz::shape` would draw them.
+    fn draw(&mut self, text: &str) -> Vec<u16> {
+        let mut buffer = self.buffer.take().unwrap_or_default();
+        buffer.push_str(text);
+        buffer.guess_segment_properties();
+        let key = (buffer.direction(), buffer.script(), buffer.language());
+
+        // ⚠️ A SCRIPT NOTHING COULD GUESS IS LEFT TO `shape`, which plans it
+        // as no script at all; asking for a plan by the name UNKNOWN would not
+        // be the same question.
+        let shaped = if key.1 == rustybuzz::script::UNKNOWN {
+            rustybuzz::shape(self.face, &[], buffer)
+        } else {
+            let at = match self.plans.iter().position(|(k, _)| *k == key) {
+                Some(at) => at,
+                None => {
+                    let plan = rustybuzz::ShapePlan::new(
+                        self.face, key.0, Some(key.1), key.2.as_ref(), &[]);
+                    self.plans.push((key, plan));
+                    self.plans.len() - 1
+                }
+            };
+            rustybuzz::shape_with_plan(self.face, &self.plans[at].1, buffer)
+        };
+        let drawn = shaped.glyph_infos().iter().map(|i| i.glyph_id as u16).collect();
+        // ⚠️ THE BUFFER IS REUSED. A fresh `UnicodeBuffer` per spelling
+        // allocates; `GlyphBuffer::clear` hands the same one back.
+        self.buffer = Some(shaped.clear());
+        drawn
+    }
+}
+
+/// Keeps `text` as what `drawn` says, unless a spelling at least as short is
+/// already kept.
+///
+/// ⚠️ TWO SPELLINGS CAN DRAW IDENTICALLY, and the page cannot tell us which
+/// was typed. The shorter one is preferred: it is the one without a mark the
+/// font ignored. Between two as short, the one met first stays.
+fn keep_shorter(says: &mut HashMap<Vec<u16>, String>, drawn: Vec<u16>, text: String) {
+    match says.entry(drawn) {
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(text);
+        }
+        std::collections::hash_map::Entry::Occupied(mut o) => {
+            if text.chars().count() < o.get().chars().count() {
+                o.insert(text);
+            }
+        }
+    }
+}
+
 /// What a shaper draws under a sign that has no letter to sit on.
 const DOTTED_CIRCLE: char = '◌';
 
@@ -310,14 +385,35 @@ impl Index {
         glyphs: Option<&BTreeSet<u16>>,
         report: Option<&(dyn Fn(usize, usize) + Sync)>,
     ) -> Option<Index> {
-        let face = rustybuzz::Face::from_slice(font, 0)?;
-        let mut says: HashMap<Vec<u16>, String> = HashMap::new();
-        let mut longest = 1usize;
+        // ⚠️ SEVERAL CORES, NOT ALL OF THEM. Each spelling is shaped on its
+        // own, so the work splits cleanly, and one core shaping the lot was
+        // most of what the reader waited for as "Preparing". Measured on an
+        // eight-thread laptop: one thread 5.0s, two 3.4s, four 3.0s, seven
+        // 2.9s. Past four buys nothing, and a core is always left for the
+        // window.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .clamp(1, 4);
+        Index::build_on(font, chars, glyphs, report, threads)
+    }
 
-        // ⚠️ THE BUFFER IS REUSED, WHICH IS MOST OF THE COST. A fresh
-        // `UnicodeBuffer` per syllable allocates, and this shapes hundreds of
-        // thousands of them; `GlyphBuffer::clear` hands the same one back.
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
+    /// The same, on this many threads.
+    ///
+    /// ⚠️ THE SAME INDEX HOWEVER MANY THREADS BUILD IT. The enumeration is
+    /// cut into runs in its own order, each run keeps the first of the
+    /// shortest spellings for a drawing, and the runs are merged in order by
+    /// the same rule, which is exactly what one thread walking the whole list
+    /// keeps.
+    fn build_on(
+        font: &[u8],
+        chars: Option<&BTreeSet<char>>,
+        glyphs: Option<&BTreeSet<u16>>,
+        report: Option<&(dyn Fn(usize, usize) + Sync)>,
+        threads: usize,
+    ) -> Option<Index> {
+        let face = rustybuzz::Face::from_slice(font, 0)?;
         let all = syllables(chars, scope_of(&face, glyphs).as_ref());
         let total = all.len();
         let dotted = face.glyph_index(DOTTED_CIRCLE).map(|g| g.0);
@@ -328,46 +424,56 @@ impl Index {
         // reports a second at the measured rate, which no eye can tell from
         // continuous.
         let every = (total / 1000).max(1);
+        let done = std::sync::atomic::AtomicUsize::new(0);
 
-        for (n, text) in all.into_iter().enumerate() {
-            if let Some(report) = report {
-                if n % every == 0 {
-                    report(n, total);
-                }
-            }
-            buffer.push_str(&text);
-            let shaped = rustybuzz::shape(&face, &[], buffer);
-            let drawn: Vec<u16> =
-                shaped.glyph_infos().iter().map(|i| i.glyph_id as u16).collect();
-            buffer = shaped.clear();
-            // A syllable the font cannot spell draws `.notdef`, and no page
-            // contains one, so it can only add noise.
-            if drawn.is_empty() || drawn.contains(&0) {
-                continue;
-            }
-            // A lone sign counts only as the dotted circle the shaper gives it.
-            // See `syllables`.
-            if is_lone_sign(&text) && !dotted.is_some_and(|d| drawn.contains(&d)) {
-                continue;
-            }
-            if let Some(allowed) = glyphs {
-                if drawn.iter().any(|g| !allowed.contains(g)) {
-                    continue;
-                }
-            }
-            longest = longest.max(drawn.len());
-            match says.entry(drawn) {
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert(text);
-                }
-                std::collections::hash_map::Entry::Occupied(mut o) => {
-                    // ⚠️ TWO SPELLINGS CAN DRAW IDENTICALLY, and the page
-                    // cannot tell us which was typed. The shorter one is
-                    // preferred: it is the one without a mark the font ignored.
-                    if text.chars().count() < o.get().chars().count() {
-                        o.insert(text);
+        let shape_run = |run: &[String]| -> (HashMap<Vec<u16>, String>, usize) {
+            let mut says: HashMap<Vec<u16>, String> = HashMap::new();
+            let mut longest = 1usize;
+            let mut shaper = Shaper::new(&face);
+            for text in run {
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(report) = report {
+                    if n % every == 0 {
+                        report(n, total);
                     }
                 }
+                let drawn = shaper.draw(text);
+                // A syllable the font cannot spell draws `.notdef`, and no page
+                // contains one, so it can only add noise.
+                if drawn.is_empty() || drawn.contains(&0) {
+                    continue;
+                }
+                // A lone sign counts only as the dotted circle the shaper gives
+                // it. See `syllables`.
+                if is_lone_sign(text) && !dotted.is_some_and(|d| drawn.contains(&d)) {
+                    continue;
+                }
+                if let Some(allowed) = glyphs {
+                    if drawn.iter().any(|g| !allowed.contains(g)) {
+                        continue;
+                    }
+                }
+                longest = longest.max(drawn.len());
+                keep_shorter(&mut says, drawn, text.clone());
+            }
+            (says, longest)
+        };
+
+        let run = total.div_ceil(threads.max(1)).max(1);
+        let runs: Vec<(HashMap<Vec<u16>, String>, usize)> = std::thread::scope(|s| {
+            let started: Vec<_> = all.chunks(run).map(|r| s.spawn(|| shape_run(r))).collect();
+            started
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                .collect()
+        });
+
+        let mut says: HashMap<Vec<u16>, String> = HashMap::new();
+        let mut longest = 1usize;
+        for (part, part_longest) in runs {
+            longest = longest.max(part_longest);
+            for (drawn, text) in part {
+                keep_shorter(&mut says, drawn, text);
             }
         }
         if let Some(report) = report {
@@ -459,6 +565,48 @@ mod tests {
     use super::*;
 
     const MYANMAR_TEXT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
+
+    /// ⚠️ THE SAME INDEX ON ONE THREAD AND ON SEVERAL. The runs are shaped
+    /// apart and merged, and a merge that kept a different spelling for a
+    /// drawing would read a different text from the same page.
+    #[test]
+    fn the_index_is_the_same_however_many_threads_build_it() {
+        let Ok(font) = std::fs::read(MYANMAR_TEXT) else { return };
+        // Letters whose syllables include drawings with more than one spelling.
+        let chars: BTreeSet<char> = "\u{1000}\u{1019}\u{1014}\u{102D}\u{102F}\u{1037}\u{103A}\u{103E}\u{1031}\u{102C}\u{1038}"
+            .chars()
+            .collect();
+        let one = Index::build_on(&font, Some(&chars), None, None, 1).unwrap();
+        for threads in [2, 3, 7] {
+            let many = Index::build_on(&font, Some(&chars), None, None, threads).unwrap();
+            assert_eq!(many.says, one.says, "{threads} threads kept different spellings");
+            assert_eq!(many.longest, one.longest);
+        }
+        assert!(one.says.len() > 100, "too small a sample to mean anything: {}", one.says.len());
+    }
+
+    /// ⚠️ A PLAN USED AGAIN DRAWS WHAT A NEW ONE WOULD. The shaper keeps one
+    /// plan per kind of buffer instead of compiling one per spelling, and an
+    /// index built from a drawing `shape` would not make reads nothing.
+    #[test]
+    fn a_shaping_plan_used_again_draws_what_a_new_one_would() {
+        let Ok(font) = std::fs::read(MYANMAR_TEXT) else { return };
+        let face = rustybuzz::Face::from_slice(&font, 0).unwrap();
+        let chars: BTreeSet<char> = "\u{1000}\u{1015}\u{1019}\u{1014}\u{1039}\u{103C}\u{102D}\u{102F}\u{1037}\u{103A}\u{1031}\u{102C}\u{1038}\u{1036}"
+            .chars()
+            .collect();
+        let mut shaper = Shaper::new(&face);
+        let all = syllables(Some(&chars), None);
+        assert!(all.len() > 1000, "too small a sample: {}", all.len());
+        for text in all.iter().chain(["", "\u{102D}", "a", "\u{25CC}"].map(String::from).iter()) {
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.push_str(text);
+            let fresh: Vec<u16> = rustybuzz::shape(&face, &[], buffer)
+                .glyph_infos().iter().map(|i| i.glyph_id as u16).collect();
+            assert_eq!(shaper.draw(text), fresh, "{text:?} drew differently");
+        }
+    }
+
     /// Pyidaungsu installed for this user only, else for everyone.
     fn pyidaungsu() -> Option<Vec<u8>> {
         let own = std::env::var("LOCALAPPDATA")
