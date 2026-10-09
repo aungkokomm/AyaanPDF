@@ -2030,6 +2030,60 @@ public sealed partial class MainPage : Page
         ToolRailList.IsEnabled = hasDocument;
 
         ApplyRulerVisibility();
+
+        if (hasDocument)
+        {
+            MaybeShowEditTip();
+        }
+    }
+
+    /// <summary>
+    /// Points at Edit once, over the first document opened in the tab being
+    /// looked at. Recorded as shown when it opens rather than when it closes,
+    /// so several files opened together from Explorer show it on one tab only.
+    /// </summary>
+    private void MaybeShowEditTip()
+    {
+        if (SettingsStore.Current.EditTipShown || ViewModel.IsEditMode || EditTip.IsOpen
+            || !IsLoaded || App.Window is not MainWindow { IsFullScreen: false } window
+            || window.ActivePage != this)
+        {
+            return;
+        }
+
+        SettingsStore.Update(s => s with { EditTipShown = true });
+        // After layout, so the tip finds the button where it is drawn.
+        DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+        {
+            EditTip.Target = EditModeButton;
+            EditTip.IsOpen = true;
+            Diag.Log("edit tip: shown");
+        });
+    }
+
+    private void EditTip_ActionButtonClick(TeachingTip sender, object args)
+    {
+        sender.IsOpen = false;
+        SetMode(AppMode.Edit);
+    }
+
+    private async void WhatsNew_Click(object sender, RoutedEventArgs e) =>
+        await OpenProjectPage(HelpLinks.WhatsNew);
+
+    private async void ReportProblem_Click(object sender, RoutedEventArgs e) =>
+        await OpenProjectPage(HelpLinks.ReportProblem);
+
+    /// <summary>Opens one of the project's GitHub pages in the reader's own browser.</summary>
+    private static async Task OpenProjectPage(string url)
+    {
+        try
+        {
+            await Windows.System.Launcher.LaunchUriAsync(new Uri(url));
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"help: could not open {url} ({ex.GetType().Name})");
+        }
     }
 
     // ---------------- The bar in full screen ----------------

@@ -478,6 +478,8 @@
 
             <MenuBarItem Title="Help" Margin="2,3,2,3">
                 <MenuFlyoutItem Text="Keyboard shortcuts" Click="KeyboardShortcuts_Click" KeyboardAcceleratorTextOverride="F1" />
+                <MenuFlyoutItem Text="What's new" Click="WhatsNew_Click" />
+                <MenuFlyoutItem Text="Report a problem" Click="ReportProblem_Click" />
                 <MenuFlyoutSeparator />
                 <MenuFlyoutItem Text="About Ayaan PDF" Click="About_Click" />
             </MenuBarItem>
@@ -1817,6 +1819,20 @@
                         <FontIcon Glyph="&#xE932;" FontSize="16" />
                     </Button>
                 </StackPanel>
+
+                <!--
+                    Shown once, over the first document, by MaybeShowEditTip.
+                    The app opens in View and Edit is an icon in this rail, so
+                    without it a newcomer sees a viewer and never learns the
+                    page's own text can be changed.
+                -->
+                <TeachingTip x:Name="EditTip"
+                             Title="Change the words on the page"
+                             Subtitle="Switch to Edit, then click any line of text to change it. What you type stays real text you can search and copy."
+                             PreferredPlacement="Right"
+                             ActionButtonContent="Switch to Edit"
+                             CloseButtonContent="Got it"
+                             ActionButtonClick="EditTip_ActionButtonClick" />
 
                 <!--
                     The tools themselves come from ToolCatalog, one row each.

@@ -205,6 +205,13 @@ public sealed record AppSettings
     public string SkippedUpdateVersion { get; init; } = "";
 
     /// <summary>
+    /// Whether the tip that points at Edit has been shown. It appears once,
+    /// over the first document opened, because the app starts in View and a
+    /// newcomer otherwise never learns the page's own text can be changed.
+    /// </summary>
+    public bool EditTipShown { get; init; }
+
+    /// <summary>
     /// Which generation of this file's meaning the stored settings were
     /// written against.
     ///
