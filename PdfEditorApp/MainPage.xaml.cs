@@ -6607,7 +6607,7 @@ public sealed partial class MainPage : Page
         var picker = new Windows.Storage.Pickers.FileSavePicker();
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
-        picker.SuggestedFileName = flatten ? "flattened" : "edited";
+        picker.SuggestedFileName = SaveAsName.For(ViewModel.DocumentPath, flatten, System.IO.File.Exists);
         picker.FileTypeChoices.Add("PDF Document", new List<string> { ".pdf" });
 
         var file = await SafePickers.PickAsync(picker.PickSaveFileAsync, "Save As", ShowPickerFailure);
