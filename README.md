@@ -10,11 +10,17 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><b>Download for Windows</b></a>
-  &nbsp;·&nbsp;
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/aungkokomm/AyaanPDF?style=for-the-badge&label=Download%20for%20Windows&labelColor=4d40c3&color=2f2794" height="36" alt="Download Ayaan PDF for Windows"></a>
+  <br>
+  <sub>Free &nbsp;·&nbsp; about 90 MB &nbsp;·&nbsp; Windows 10 and 11, 64-bit</sub>
+</p>
+
+<p align="center">
   <a href="#screenshots">Screenshots</a>
   &nbsp;·&nbsp;
   <a href="#what-it-can-do">What it can do</a>
+  &nbsp;·&nbsp;
+  <a href="#get-it">Install</a>
   &nbsp;·&nbsp;
   <a href="#build-it-yourself">Build it yourself</a>
 </p>
@@ -23,8 +29,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4.svg" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/languages-English%20%7C%20%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80%20%7C%20%E1%80%99%E1%80%BC%E1%80%94%E1%80%BA%E1%80%99%E1%80%AC-orange.svg" alt="English, Hindi, Myanmar">
-  <a href="../../releases"><img src="https://img.shields.io/github/downloads/aungkokomm/AyaanPDF/total.svg" alt="Downloads"></a>
 </p>
+
+<!-- Paste the editing GIF here (8 to 10 seconds: switch to Edit, click a line, type, watch it reflow). -->
 
 ---
 
@@ -33,11 +40,34 @@ Most PDF apps let you add notes on top of a page. **Ayaan PDF lets you change th
 It also handles scripts that other editors get wrong. Hindi and Myanmar (Burmese) are shaped correctly as you type, so vowel signs, conjuncts and stacked consonants stay where they belong.
 
 ## Screenshots
-<img width="960" height="511" alt="Ayaan PDF with a document open" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
-<img width="960" height="337" alt="image" src="https://github.com/user-attachments/assets/e7e5c9c7-40f8-4580-9a6f-36232761bd53" />
-<img width="591" height="380" alt="image" src="https://github.com/user-attachments/assets/8389f7e1-875e-4dfb-a207-f86ca6eb471f" />
-<img width="960" height="399" alt="image" src="https://github.com/user-attachments/assets/142e3702-7717-4524-8aff-9d8047971cad" />
-<img width="687" height="456" alt="image" src="https://github.com/user-attachments/assets/478e92e1-aa7a-4d8b-9abe-a8f17d5ded91" />
+
+**Right-click any English word** for its meaning, with the Myanmar and Hindi translations underneath. No internet needed.
+
+<img width="960" alt="The Define popup over a page, showing an English meaning with Myanmar and Hindi translations" src="https://github.com/user-attachments/assets/142e3702-7717-4524-8aff-9d8047971cad" />
+
+<br>
+
+**Shapes with real effects:** rounded corners, soft shadows and glows, saved into the PDF so every reader shows them.
+
+<img width="960" alt="A rounded rectangle with a soft shadow, and the shape toolbar with colours, line widths and Effects" src="https://github.com/user-attachments/assets/e7e5c9c7-40f8-4580-9a6f-36232761bd53" />
+
+<br>
+
+**Insert pages** from another PDF, choosing exactly which pages and where they go.
+
+<img width="687" alt="The Insert pages window with page thumbnails and a choice of where to put them" src="https://github.com/user-attachments/assets/478e92e1-aa7a-4d8b-9abe-a8f17d5ded91" />
+
+<br>
+
+**Build bookmarks** from a document's headings, by how they look or by what they say.
+
+<img width="591" alt="The Create bookmarks window" src="https://github.com/user-attachments/assets/8389f7e1-875e-4dfb-a207-f86ca6eb471f" />
+
+<br>
+
+**Pick up where you left off:** your recent files, each with the page you were on.
+
+<img width="960" alt="The welcome screen in the dark theme, with recent files" src="https://github.com/user-attachments/assets/0822cb29-3df5-4420-8ed6-13959b389bb8" />
 
 ## What it can do
 
@@ -182,7 +212,7 @@ Drag pages to reorder them. Insert, extract, rotate or delete them, or merge PDF
 
 1. Download `AyaanPDF-Setup-<version>.exe` from the [latest release](../../releases/latest).
 2. Run it. It installs just for you, so no administrator rights are needed.
-3. Keep **Offer Ayaan PDF for PDF files** ticked to see it under Open with. To make it your default PDF app, pick it in Settings > Apps > Default apps.
+3. Keep **Offer Ayaan PDF for PDF files** ticked to see it under Open with, and the right-click option ticked to get **Open in Ayaan PDF** on every PDF. To make it your default PDF app, pick it in Settings > Apps > Default apps.
 
 > [!NOTE]
 > This free project isn't code-signed, so Windows SmartScreen may say it doesn't recognise the app. Click **More info**, then **Run anyway**.
@@ -192,6 +222,10 @@ Ayaan PDF runs on **Windows 10 (version 1809 or later) and Windows 11**, on 64-b
 ## Your files stay on your PC
 
 No account, no tracking, and nothing about you or your files ever leaves your PC. When it starts, Ayaan PDF asks GitHub whether a newer version is out and, if one is, offers it in a small bubble you can dismiss; it never downloads or installs anything by itself. Otherwise it goes online only when you ask it to: to download a recognition language, or to open a web link you clicked.
+
+## Tell me what you think
+
+Something not working, or a feature you miss? [Open an issue](../../issues/new). You can get there from the app too, with **Help > Report a problem**.
 
 ## Handy keys
 
