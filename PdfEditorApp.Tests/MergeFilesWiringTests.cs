@@ -72,7 +72,7 @@ public class MergeFilesWiringTests
     public void pdfs_and_pictures_come_in_by_picking_or_by_dropping()
     {
         Assert.Contains("ImagePages.Extensions", MethodBody(Code(), "private async void AddFiles_Click("), StringComparison.Ordinal);
-        Assert.Contains("PickMultipleFilesAsync()", MethodBody(Code(), "private async void AddFiles_Click("), StringComparison.Ordinal);
+        Assert.Contains("SafePickers.PickAsync(picker.PickMultipleFilesAsync", MethodBody(Code(), "private async void AddFiles_Click("), StringComparison.Ordinal);
         Assert.Contains("Drop=\"Files_Drop\"", Xaml(), StringComparison.Ordinal);
         Assert.Contains("AddPaths(", MethodBody(Code(), "private async void Files_Drop("), StringComparison.Ordinal);
     }
@@ -82,7 +82,7 @@ public class MergeFilesWiringTests
     {
         string merge = MethodBody(Code(), "private async void Merge_Click(");
 
-        int asked = IndexIn(merge, "PickSaveFileAsync()");
+        int asked = IndexIn(merge, "SafePickers.PickAsync(picker.PickSaveFileAsync");
         Assert.True(IndexIn(merge, "i.HasProblem") < asked);
         Assert.True(IndexIn(merge, "PageSelection.TryParse(") < asked);
     }

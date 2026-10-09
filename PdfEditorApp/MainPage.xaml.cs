@@ -3273,7 +3273,7 @@ public sealed partial class MainPage : Page
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.PicturesLibrary;
         picker.FileTypeFilter.Add(".png");
 
-        var file = await picker.PickSingleFileAsync();
+        var file = await SafePickers.PickAsync(picker.PickSingleFileAsync, "Add stamp", ShowPickerFailure);
         if (file is null)
         {
             return;
@@ -5309,6 +5309,9 @@ public sealed partial class MainPage : Page
         if (App.Window is MainWindow w) { await w.CloseDocumentTab(this); }
     }
 
+    /// <summary>A picker that failed, said in the status bar.</summary>
+    private void ShowPickerFailure(string message) => ViewModel.Status = message;
+
     private async void OpenFile_Click(object sender, RoutedEventArgs e)
     {
         var picker = new Windows.Storage.Pickers.FileOpenPicker();
@@ -5316,7 +5319,7 @@ public sealed partial class MainPage : Page
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
         picker.FileTypeFilter.Add(".pdf");
 
-        var file = await picker.PickSingleFileAsync();
+        var file = await SafePickers.PickAsync(picker.PickSingleFileAsync, "Open", ShowPickerFailure);
         if (file is null)
         {
             return;
@@ -5520,7 +5523,15 @@ public sealed partial class MainPage : Page
     /// the drop never fires, so a drop target that looks inert is the default
     /// rather than something you have to break.
     /// </summary>
-    private void EmptyState_DragOver(object sender, DragEventArgs e)
+    /// <summary>
+    /// A file dragged anywhere over the page, with or without a document open.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THIS USED TO BE THE WELCOME SCREEN'S ALONE. Once a document was open
+    /// a dropped PDF did nothing at all, and the reader took the window for one
+    /// that refuses drops.
+    /// </remarks>
+    private void Page_DragOver(object sender, DragEventArgs e)
     {
         if (!e.DataView.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems))
         {
@@ -5533,14 +5544,11 @@ public sealed partial class MainPage : Page
     }
 
     /// <summary>
-    /// Opens the first PDF among the dropped files, through the same path the
-    /// picker uses.
-    ///
-    /// Filtered by extension rather than trusting the drop: a folder, an image
-    /// or a Word file can all be dropped here, and handing any of them to
-    /// PDFium would be an error dialog rather than an answer.
+    /// Opens every dropped PDF as a double-click in Explorer would: each in a
+    /// tab, an open one shown rather than opened twice, and an untouched
+    /// welcome tab giving way to the first.
     /// </summary>
-    private async void EmptyState_Drop(object sender, DragEventArgs e)
+    private async void Page_Drop(object sender, DragEventArgs e)
     {
         if (!e.DataView.Contains(Windows.ApplicationModel.DataTransfer.StandardDataFormats.StorageItems))
         {
@@ -5548,17 +5556,23 @@ public sealed partial class MainPage : Page
         }
 
         var items = await e.DataView.GetStorageItemsAsync();
-        foreach (var item in items)
+        var pdfs = items.OfType<Windows.Storage.StorageFile>()
+            .Where(f => f.FileType.Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+            .Select(f => f.Path)
+            .ToList();
+
+        if (pdfs.Count == 0)
         {
-            if (item is Windows.Storage.StorageFile file
-                && file.FileType.Equals(".pdf", StringComparison.OrdinalIgnoreCase))
-            {
-                OpenPickedFile(file.Path);
-                return;
-            }
+            ViewModel.Status = "Only PDF files open when dropped here.";
+            Diag.Log("drop: nothing among the dropped items was a PDF");
+            return;
         }
 
-        Diag.Log("drop: nothing among the dropped items was a PDF");
+        Diag.Log($"drop: {pdfs.Count} PDF(s)");
+        if (App.Window is MainWindow w)
+        {
+            w.OpenLaunchedFiles(pdfs);
+        }
     }
 
     /// <summary>
@@ -6589,7 +6603,7 @@ public sealed partial class MainPage : Page
         picker.SuggestedFileName = flatten ? "flattened" : "edited";
         picker.FileTypeChoices.Add("PDF Document", new List<string> { ".pdf" });
 
-        var file = await picker.PickSaveFileAsync();
+        var file = await SafePickers.PickAsync(picker.PickSaveFileAsync, "Save As", ShowPickerFailure);
         if (file is null)
         {
             return false;
@@ -7243,7 +7257,7 @@ public sealed partial class MainPage : Page
             string extension = System.IO.Path.GetExtension(attached.Name);
             picker.SuggestedFileName = System.IO.Path.GetFileNameWithoutExtension(attached.Name);
             picker.FileTypeChoices.Add("Attached file", new List<string> { extension.Length > 1 ? extension : ".bin" });
-            var target = await picker.PickSaveFileAsync();
+            var target = await SafePickers.PickAsync(picker.PickSaveFileAsync, "Save attached file", ShowPickerFailure);
             if (target is null)
             {
                 return;
@@ -11807,7 +11821,7 @@ public sealed partial class MainPage : Page
         picker.SuggestedStartLocation = Windows.Storage.Pickers.PickerLocationId.DocumentsLibrary;
         picker.FileTypeFilter.Add(".pdf");
 
-        var file = await picker.PickSingleFileAsync();
+        var file = await SafePickers.PickAsync(picker.PickSingleFileAsync, "Insert pages", ShowPickerFailure);
         if (file is null)
         {
             return;
@@ -11865,7 +11879,7 @@ public sealed partial class MainPage : Page
         savePicker.SuggestedFileName = $"pages {PageSelection.Format(pages, ViewModel.PageCount)}";
         savePicker.FileTypeChoices.Add("PDF", new System.Collections.Generic.List<string> { ".pdf" });
 
-        var file = await savePicker.PickSaveFileAsync();
+        var file = await SafePickers.PickAsync(savePicker.PickSaveFileAsync, "Extract pages", ShowPickerFailure);
         if (file is null)
         {
             return;
@@ -11932,7 +11946,7 @@ public sealed partial class MainPage : Page
             WinRT.Interop.InitializeWithWindow.Initialize(folderPicker, App.WindowHandle);
             folderPicker.FileTypeFilter.Add("*");
 
-            var folder = await folderPicker.PickSingleFolderAsync();
+            var folder = await SafePickers.PickAsync(folderPicker.PickSingleFolderAsync, "Extract pages to a folder", ShowPickerFailure);
             if (folder is null)
             {
                 return;
@@ -11952,7 +11966,7 @@ public sealed partial class MainPage : Page
             savePicker.SuggestedFileName = $"pages {lo}-{hi}";
             savePicker.FileTypeChoices.Add("PDF", new System.Collections.Generic.List<string> { ".pdf" });
 
-            var file = await savePicker.PickSaveFileAsync();
+            var file = await SafePickers.PickAsync(savePicker.PickSaveFileAsync, "Extract pages", ShowPickerFailure);
             if (file is null)
             {
                 return;

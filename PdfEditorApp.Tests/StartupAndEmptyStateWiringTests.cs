@@ -165,32 +165,47 @@ public class StartupAndEmptyStateWiringTests
     }
 
     [Fact]
-    public void the_empty_state_actually_accepts_a_drop()
+    public void the_whole_page_accepts_a_drop_not_only_the_empty_state()
     {
         // Saying so and doing so are separate: without AllowDrop and a DragOver
         // that sets AcceptedOperation, the cursor shows "no" and Drop never
-        // fires.
-        string block = WelcomeBlock();
+        // fires. And it is the PAGE that takes it: when only the welcome screen
+        // did, a PDF dropped on an open document did nothing at all.
+        string xaml = MainPageXaml();
+        int root = xaml.IndexOf("<Grid x:Name=\"RootGrid\"", StringComparison.Ordinal);
+        Assert.True(root >= 0);
+        string rootTag = xaml[root..xaml.IndexOf('>', root)];
 
-        Assert.Contains("AllowDrop=\"True\"", block, StringComparison.Ordinal);
-        Assert.Contains("DragOver=\"EmptyState_DragOver\"", block, StringComparison.Ordinal);
-        Assert.Contains("Drop=\"EmptyState_Drop\"", block, StringComparison.Ordinal);
+        Assert.Contains("AllowDrop=\"True\"", rootTag, StringComparison.Ordinal);
+        Assert.Contains("DragOver=\"Page_DragOver\"", rootTag, StringComparison.Ordinal);
+        Assert.Contains("Drop=\"Page_Drop\"", rootTag, StringComparison.Ordinal);
+
+        // Once, on the page: a second handler on the welcome screen inside it
+        // would open the same drop twice.
+        Assert.DoesNotContain("Drop=\"EmptyState_Drop\"", xaml, StringComparison.Ordinal);
 
         Assert.Contains(
             "AcceptedOperation",
-            Section(MainPageCode(), "private void EmptyState_DragOver", 700),
+            Section(MainPageCode(), "private void Page_DragOver", 700),
             StringComparison.Ordinal);
     }
 
-    [Theory]
-    [InlineData("private async void EmptyState_Drop")]
-    [InlineData("private async void OpenFile_Click")]
-    public void every_way_of_opening_a_file_goes_through_the_same_place(string entry)
+    [Fact]
+    public void the_open_command_goes_through_the_same_place_as_the_welcome_button()
     {
-        // The picker, the empty state's button and a dropped file must land in
-        // the same tab logic. Three copies of "new tab or this one?" is how
-        // they drift.
-        Assert.Contains("OpenPickedFile(", Section(MainPageCode(), entry, 1800), StringComparison.Ordinal);
+        // The picker and the empty state's button must land in the same tab
+        // logic. Copies of "new tab or this one?" are how they drift.
+        Assert.Contains("OpenPickedFile(", Section(MainPageCode(), "private async void OpenFile_Click", 1800), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void dropped_files_open_as_a_double_click_in_explorer_would()
+    {
+        // Several PDFs can arrive in one drop, and the window's own path for
+        // files handed over from Explorer already opens each in a tab, shows
+        // one that is open rather than opening it twice, and lets an untouched
+        // welcome tab give way.
+        Assert.Contains("OpenLaunchedFiles(", Section(MainPageCode(), "private async void Page_Drop", 1400), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -201,7 +216,7 @@ public class StartupAndEmptyStateWiringTests
         // answer.
         Assert.Contains(
             "\".pdf\"",
-            Section(MainPageCode(), "private async void EmptyState_Drop", 1400),
+            Section(MainPageCode(), "private async void Page_Drop", 1400),
             StringComparison.Ordinal);
     }
 

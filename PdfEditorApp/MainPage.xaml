@@ -130,6 +130,7 @@
 
     <Grid x:Name="RootGrid" IsTabStop="True" KeyDown="RootGrid_KeyDown" KeyUp="RootGrid_KeyUp"
           CharacterReceived="RootGrid_CharacterReceived"
+          AllowDrop="True" DragOver="Page_DragOver" Drop="Page_Drop"
           KeyboardAcceleratorPlacementMode="Hidden">
         <!-- Ctrl chords are NOT declared as accelerators on this Grid, and the
              accelerators on the MenuFlyoutItems below are not what makes them
@@ -1621,9 +1622,6 @@
             canvas, and it is the same handler as the button.
         -->
         <Border x:Name="EmptyState" Grid.Column="2" Grid.Row="1" Background="Transparent"
-                AllowDrop="True"
-                DragOver="EmptyState_DragOver"
-                Drop="EmptyState_Drop"
                 DoubleTapped="EmptyState_DoubleTapped"
                 Visibility="{x:Bind ViewModel.EmptyStateVisibility, Mode=OneWay}">
             <!--

@@ -88,7 +88,12 @@ public sealed partial class MergeFilesWindow : Window
             picker.FileTypeFilter.Add(extension);
         }
 
-        var files = await picker.PickMultipleFilesAsync();
+        var files = await SafePickers.PickAsync(picker.PickMultipleFilesAsync, "Add files to merge", ShowMessage);
+        if (files is null)
+        {
+            return;
+        }
+
         AddPaths(files.Select(f => f.Path));
     }
 
@@ -429,7 +434,7 @@ public sealed partial class MergeFilesWindow : Window
         picker.SuggestedFileName = "Merged";
         picker.FileTypeChoices.Add("PDF", new List<string> { ".pdf" });
 
-        var file = await picker.PickSaveFileAsync();
+        var file = await SafePickers.PickAsync(picker.PickSaveFileAsync, "Save merged file", ShowMessage);
         if (file is null)
         {
             return;
