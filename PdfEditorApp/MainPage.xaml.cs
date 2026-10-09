@@ -6094,8 +6094,15 @@ public sealed partial class MainPage : Page
 
         // The zoom is restored even when the place is not, because reading at
         // 150% is a preference about the document, not about the page.
+        //
+        // ⚠️ AND AUTO-FIT IS DISARMED FIRST, exactly as the zoom presets do.
+        // OnLayoutRebuilt arms it, and left armed, the window settling a moment
+        // later re-fitted the page over the remembered zoom: the reader's file
+        // reopened as a whole page (zoom 0.44) every time, whatever they had
+        // left it at and whatever default view they had chosen.
         if (position.Zoom > 0)
         {
+            _autoFit = false;
             PageScroller.ZoomTo((float)position.Zoom, null,
                 new ScrollingZoomOptions(ScrollingAnimationMode.Disabled,
                                          ScrollingSnapPointsMode.Ignore));

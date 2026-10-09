@@ -156,6 +156,18 @@ public class ReadingPositionWiringTests
     }
 
     [Fact]
+    public void a_restored_zoom_is_not_refitted_when_the_window_settles()
+    {
+        // The reader's file reopened as a whole page every time: the layout
+        // arms auto-fit, and the window settling after the restore re-fitted
+        // over the zoom that had just been put back.
+        string body = MethodBody(PageCode(), "private bool RestoreReadingPosition");
+        int disarm = body.IndexOf("_autoFit = false;", StringComparison.Ordinal);
+        int zoom = body.IndexOf("PageScroller.ZoomTo((float)position.Zoom", StringComparison.Ordinal);
+        Assert.True(disarm >= 0 && disarm < zoom, "auto-fit is still armed when the zoom is restored");
+    }
+
+    [Fact]
     public void restoring_does_not_animate()
     {
         // A glide from page 1 to page 180 on open would be a long, pointless
