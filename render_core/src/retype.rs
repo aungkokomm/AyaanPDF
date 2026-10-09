@@ -3887,6 +3887,105 @@ mod tests {
         println!("rendered to {}", dir.display());
     }
 
+    /// ⚠️ THE READER'S EDIT OF A PARAGRAPH'S LAST LINE, 3.51.6. They typed two
+    /// words after the third word of the last line of the page's paragraph and the
+    /// line came back with its words run together and two gaps of about a
+    /// hundred points. The line had been READ without its six spaces, so the
+    /// rewrap wrote it without them and justified it at the only two spaces
+    /// left, the ones the reader typed. Writes before and after to
+    /// `%TEMP%\ayaan-myanmar-last-line`.
+    ///
+    ///     cargo test --release the_readers_edit_of_a_paragraph_s_last_line -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a PDF and fonts that are not in this repository"]
+    fn the_readers_edit_of_a_paragraph_s_last_line() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file .pdf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(MYANMAR_TEXT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let bytes = std::fs::read(FILE).unwrap();
+        let doc = Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let indexes = crate::recover::indexes_for_document(&doc);
+        let lines = crate::recover::lines_of(&doc, page);
+        let readings = crate::recover::read_page_with(&doc, page, &indexes);
+        let (baseline, was) = lines.iter().zip(&readings)
+            .find_map(|(l, r)| r.text.as_deref()
+                .filter(|_| (l.page_y - 396.43).abs() < BASELINE_TOLERANCE)
+                .map(|t| (l.page_y, t.to_string())))
+            .expect("the reader's line is not on the page");
+        assert_eq!(was.matches(' ').count(), 6,
+            "the line is not read with the six spaces the author typed: {was}");
+        let at = was.match_indices(' ').nth(2).unwrap().0;
+        let now = format!("{} နမူနာ ပစ္စည်းများ{}", &was[..at], &was[at..]);
+
+        let dir = std::env::temp_dir().join("ayaan-myanmar-last-line");
+        let _ = std::fs::create_dir_all(&dir);
+        raster(&bytes, &dir.join("before.bgra").to_string_lossy());
+
+        let handle = crate::open_document_from_bytes(bytes.as_ptr(), bytes.len());
+        let (want, text, path) = (was.as_bytes(), now.as_bytes(), MYANMAR_TEXT.as_bytes());
+        let buffer = crate::retype_recovered_line(
+            handle, 0, baseline as f32, -1.0,
+            want.as_ptr(), want.len(), text.as_ptr(), text.len(), path.as_ptr(), path.len());
+        let status = buffer.status;
+        let out = (status == crate::STATUS_OK_PDFIUM)
+            .then(|| unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) }.to_vec());
+        crate::free_byte_buffer(buffer);
+        crate::close_document(handle);
+        let out = out.unwrap_or_else(|| panic!("the app's own call refused with status {status}"));
+        raster(&out, &dir.join("after.bgra").to_string_lossy());
+        std::fs::write(dir.join("after.pdf"), &out).unwrap();
+
+        // ⚠️ AND EVERY WORD GAP AS WIDE AS THE FILE MAKES IT: the space glyph's
+        // own width plus the number written after it, which is where a
+        // justified line's stretch lives. Word's own widest gap on this page is
+        // the yardstick; the edit that was reported left two of about 100.
+        let words_gap = lines.iter()
+            .flat_map(|l| l.breaks.iter().map(|b| b.points))
+            .fold(0.0f64, f64::max);
+        let font_bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&font_bytes, 0).unwrap();
+        let space = crate::reshape::draws(&face, " ");
+        let leading = 415.99 - 396.43;
+        let doc_out = Document::load_mem(&out).unwrap();
+        let page_out = *doc_out.get_pages().values().next().unwrap();
+        let widths = crate::recover::fonts_of(&doc_out, page_out);
+        let lines_out = crate::recover::lines_of(&doc_out, page_out);
+        let read_out = crate::recover::read_page_with(
+            &doc_out, page_out, &crate::recover::indexes_for_document(&doc_out));
+        let mut said = Vec::new();
+        for y in [baseline, baseline - leading] {
+            let (l, r) = lines_out.iter().zip(&read_out)
+                .find(|(l, r)| (l.page_y - y).abs() < BASELINE_TOLERANCE && r.text.is_some())
+                .unwrap_or_else(|| panic!("the line the edit wrote at {y:.2} reads as nothing"));
+            let w = widths.get(&l.resource).and_then(|(_, w)| w.as_ref()).unwrap();
+            let gaps: Vec<f64> = l.glyphs.iter().enumerate()
+                .filter(|(_, g)| space.contains(g))
+                .map(|(i, g)| {
+                    let opened: f64 = l.nudges.iter()
+                        .filter(|(at, _)| *at == i + 1)
+                        .map(|(_, v)| -v)
+                        .sum();
+                    (w.of(*g) + opened) / 1000.0 * l.size
+                })
+                .collect();
+            println!("y {y:7.2}  {}\n           gaps {:?}", r.text.as_deref().unwrap(),
+                gaps.iter().map(|g| format!("{g:.2}")).collect::<Vec<_>>());
+            for g in &gaps {
+                assert!(*g <= words_gap,
+                    "a word gap on the line at {y:.2} is {g:.2} points, where Word's widest on \
+                     this page is {words_gap:.2}");
+            }
+            said.push(r.text.clone().unwrap());
+        }
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(words(&said.join(" ")), words(&now),
+            "the edited paragraph lost, gained or reordered a word");
+        println!("Word's widest gap {words_gap:.2}; rendered to {}", dir.display());
+    }
+
     /// ⚠️ WHY A CLICK ON THE PYIDAUNGSU LETTER SELECTS ONE LINE AND A FRAME
     /// THAT STOPS SHORT. The reader clicked the paragraph "၂။ သို့ဖြစ်ပါ၍ …" on
     /// page 3 and got a frame round one line, ending before "ဌာန၊", and a

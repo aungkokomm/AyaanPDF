@@ -1111,14 +1111,27 @@ fn merge_placements(
                 }
             }
         }
-        *joins.last_mut().unwrap() += 1;
+        // ⚠️ A RUN THAT DRAWS ONLY MARKS NEVER STARTS A WORD, SO NO GAP BEFORE
+        // IT IS A SPACE. Word places a mark where the font's positioning puts
+        // it, which is often past the end of the letter it sits on: measured on
+        // the reader's Myanmar page, the dot below (U+1037) of two words is
+        // drawn 2.88 points beyond its letter, which is a space wide. Read as a space,
+        // it cut a word in two, nothing proved the half that starts with the
+        // dot, and the whole line was read with none of its six real spaces.
+        // Nor does such a run move where the line ends, since it advances by
+        // nothing, and it is not a join of the kind letter spacing repeats.
+        let marks = draws_only_marks(&line);
+        if !marks {
+            *joins.last_mut().unwrap() += 1;
+        }
         let run_by_run = ends.last().copied().flatten().map(|end| line.x - end);
         let gap = match as_it_was {
+            _ if marks => None,
             Some(g) if g >= A_SPACE * line.size => Some(g),
             _ => run_by_run,
         };
         let own_end = ends_at(&line);
-        if let Some(last) = ends.last_mut() {
+        if let Some(last) = ends.last_mut().filter(|_| !marks) {
             *last = match (*last, own_end) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 _ => None,
@@ -2116,14 +2129,34 @@ pub(crate) fn wanted_for_page(doc: &Document, page: ObjectId) -> Wanted {
         .filter(|f| !by_font.contains_key(f))
         .collect();
     if !undeclared.is_empty() {
-        for line in lines_of(doc, page) {
-            if !line.only_latin() && undeclared.contains(&line.base_font) {
-                let glyphs: Vec<u16> = line.font_glyphs().collect();
-                by_font.entry(line.base_font).or_default().extend(glyphs);
+        for line in lines_of(doc, page).into_iter().filter(|l| !l.only_latin()) {
+            for font in undeclared.iter().filter(|u| counts_towards(&line, u)) {
+                by_font.entry(font.clone()).or_default().extend(line.font_glyphs());
             }
         }
     }
     Wanted { by_font, unbounded: undeclared.into_iter().collect(), widths }
+}
+
+/// Whether a line's glyphs count towards a font that declares nothing: they do
+/// when the line is named for it, or for another font of the same face.
+///
+/// ⚠️ A RETYPED LINE IS NAMED FOR THE PAGE'S SUBSET, NOT FOR THE FONT THAT
+/// DREW IT. Ayaan's writer draws the line in the face it embeds whole and then
+/// selects the page's font again, so the operators after it keep the font they
+/// had. The line is read with the subset's name, and the subset's `/W` cannot
+/// declare a letter the producer never used, so nothing ever asked for the face
+/// to be built over it: the reader typed a stacked letter into a line and the whole line
+/// then read as nothing. The font embedded whole is the one that declares
+/// nothing, so it is the one that answers for what the line draws.
+///
+/// ⚠️ AND THE LINE KEEPS ITS NAME. Naming it for the whole font instead lost
+/// eight lines an older retype had left on the Pyidaungsu test files: that
+/// whole font is a build no installed file agrees with, so it has no index, and
+/// those lines only ever read through the subset they are named for.
+fn counts_towards(line: &Line, font: &str) -> bool {
+    line.base_font == font
+        || installed(&line.base_font).is_some_and(|face| installed(font) == Some(face))
 }
 
 /// What one page needs, and how far the page can be trusted to know it.
@@ -2167,7 +2200,7 @@ fn wanted_for_font(doc: &Document, base_font: &str) -> BTreeSet<u16> {
                 Some(w) if declares_usage(base_font) => glyphs.extend(w.declared()),
                 _ => {
                     for line in lines_of(doc, page) {
-                        if line.base_font == base_font {
+                        if counts_towards(&line, base_font) {
                             glyphs.extend(line.font_glyphs());
                         }
                     }
@@ -2242,17 +2275,16 @@ pub(crate) fn indexes_for_document(doc: &Document) -> Indexes {
     // the 55-second whole-of-Burmese case. Falling back to what the pages
     // actually draw keeps such a font exactly as readable as it was before this
     // existed, and costs a content-stream walk only when one turns up.
-    let undeclared: Vec<String> = pages
+    let undeclared: BTreeSet<String> = pages
         .iter()
         .flat_map(|&page| fonts_of(doc, page).into_values().map(|(f, _)| f))
         .filter(|f| !wanted.contains_key(f))
         .collect();
     if !undeclared.is_empty() {
         for &page in &pages {
-            for line in lines_of(doc, page) {
-                if !line.only_latin() && undeclared.contains(&line.base_font) {
-                    let glyphs: Vec<u16> = line.font_glyphs().collect();
-                    wanted.entry(line.base_font).or_default().extend(glyphs);
+            for line in lines_of(doc, page).into_iter().filter(|l| !l.only_latin()) {
+                for font in undeclared.iter().filter(|u| counts_towards(&line, u)) {
+                    wanted.entry(font.clone()).or_default().extend(line.font_glyphs());
                 }
             }
         }
@@ -3592,6 +3624,116 @@ mod tests {
         assert_eq!(read.len(), 1, "the lifted mark was read as a line of its own");
         assert_eq!(read[0].text.as_deref(), Some(WORD),
             "the mark was dropped, so the word lost a letter");
+    }
+
+    /// ⚠️ AND A MARK DRAWN PAST ITS LETTER IS NOT A WORD SPACE. Word places the
+    /// dot below (U+1037) where the font's positioning puts it, a space's width
+    /// beyond the letter, and steps back for the rest of the word. Read as a
+    /// space it cut the word, the half that starts with the mark could not be
+    /// proven, and the line was read with none of its real spaces.
+    #[test]
+    fn a_mark_drawn_past_its_letter_is_not_a_word_space() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const WORD: &str = "\u{1000}\u{102F}\u{1014}\u{103A}";
+        const NEXT: &str = "\u{1019}\u{103E}\u{102C}";
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let glyphs = crate::reshape::draws(&face, WORD);
+        let mark = glyphs[1];
+        assert_eq!(face.glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(mark)), Some(0),
+            "this test needs a mark that advances by nothing");
+
+        let upem = face.units_per_em() as f64;
+        let advance = |run: &[u16]| -> f64 {
+            run.iter()
+                .map(|g| face.glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(*g)).unwrap_or(0) as f64)
+                .sum::<f64>() / upem * 12.0
+        };
+        let head = &glyphs[..1];
+        let tail = &glyphs[2..];
+        let after_head = 72.0 + advance(head);
+        let after_tail = after_head + advance(tail);
+
+        // The head, the mark three points past it and a little lower, the tail
+        // back where the head ended, and the next word one real space on.
+        let (doc, page) = a_page_measured_by(&face, vec![
+            Operation::new("BT", vec![]), pick(12.0), place(72.0, 700.0),
+            show(head), Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]), pick(12.0), place(after_head + 3.0, 699.4),
+            show(&[mark]), Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]), pick(12.0), place(after_head, 700.0),
+            show(tail), Operation::new("ET", vec![]),
+            Operation::new("BT", vec![]), pick(12.0), place(after_tail + 3.0, 700.0),
+            show(&crate::reshape::draws(&face, NEXT)), Operation::new("ET", vec![]),
+        ]);
+
+        let read = read_page_with(&doc, page, &an_index_of(&bytes, &format!("{WORD}{NEXT}")));
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].text.as_deref(), Some(format!("{WORD} {NEXT}").as_str()),
+            "the mark was read as a space, and the real one went with it");
+    }
+
+    /// ⚠️ A RETYPED LINE READS, WHATEVER LETTERS ITS PAGE'S SUBSET LACKS.
+    /// Ayaan's writer draws the line in the face it embeds whole and then
+    /// selects the page's subset again, so the line is named for the subset.
+    /// Nothing asked for the face to cover what the whole font drew, and the
+    /// reader's edit read back as nothing. Asked both ways the app asks: for
+    /// the document, and a page at a time.
+    #[test]
+    fn a_retyped_line_reads_with_letters_its_subset_never_declared() {
+        if !std::path::Path::new(MYANMAR_TEXT).exists() {
+            return;
+        }
+        const WORD: &str = "\u{1019}\u{103E}\u{102C}";
+        let bytes = std::fs::read(MYANMAR_TEXT).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let (mut doc, page) = a_page_measured_by(&face, vec![
+            Operation::new("BT", vec![]),
+            pick(12.0),
+            place(72.0, 700.0),
+            Operation::new("Tf", vec!["F2".into(), 12.into()]),
+            show(&crate::reshape::draws(&face, WORD)),
+            pick(12.0),
+            Operation::new("ET", vec![]),
+        ]);
+
+        // The writer's font: the same face embedded whole, as F2. And the
+        // page's own subset, F1, declaring only a space.
+        fn fonts(doc: &mut Document, page: ObjectId) -> &mut lopdf::Dictionary {
+            doc.get_dictionary_mut(page).unwrap()
+                .get_mut(b"Resources").unwrap().as_dict_mut().unwrap()
+                .get_mut(b"Font").unwrap().as_dict_mut().unwrap()
+        }
+        let subset = fonts(&mut doc, page).get(b"F1").unwrap().as_reference().unwrap();
+        let descendant = doc.get_dictionary(subset).unwrap()
+            .get(b"DescendantFonts").unwrap().as_array().unwrap()[0]
+            .as_reference().unwrap();
+        let whole_descendant = doc.add_object(doc.get_dictionary(descendant).unwrap().clone());
+        let mut whole = doc.get_dictionary(subset).unwrap().clone();
+        whole.set("BaseFont", "MyanmarText");
+        whole.set("DescendantFonts", vec![whole_descendant.into()]);
+        let whole = doc.add_object(whole);
+        fonts(&mut doc, page).set("F2", whole);
+        let space = crate::reshape::draws(&face, " ")[0];
+        doc.get_dictionary_mut(descendant).unwrap()
+            .set("W", vec![(space as i64).into(), vec![274.into()].into()]);
+
+        let lines = lines_of(&doc, page);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].base_font, "BCDEEE+MyanmarText",
+            "this is about a line named for the page's subset");
+
+        let whole_document = read_page_with(&doc, page, &indexes_for_document(&doc));
+        assert_eq!(whole_document[0].text.as_deref(), Some(WORD),
+            "read with the document's index, the retyped line says nothing");
+
+        let mut by_page = Indexes::default();
+        by_page.grow(&doc, &wanted_for_page(&doc, page));
+        let one_page = read_page_with(&doc, page, &by_page);
+        assert_eq!(one_page[0].text.as_deref(), Some(WORD),
+            "read a page at a time, the retyped line says nothing");
     }
 
     /// Where each line's word spaces come from: a space GLYPH the page draws,
