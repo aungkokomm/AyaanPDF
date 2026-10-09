@@ -31,8 +31,6 @@
   <img src="https://img.shields.io/badge/languages-English%20%7C%20%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80%20%7C%20%E1%80%99%E1%80%BC%E1%80%94%E1%80%BA%E1%80%99%E1%80%AC-orange.svg" alt="English, Hindi, Myanmar">
 </p>
 
-<!-- Paste the editing GIF here (8 to 10 seconds: switch to Edit, click a line, type, watch it reflow). -->
-
 ---
 
 Most PDF apps let you add notes on top of a page. **Ayaan PDF lets you change the page itself.** Click a line and type, and your edit stays real text: searchable and ready to copy. Around that sits everything else you expect from a PDF editor, from highlights and signatures to merging files and turning scans into text.
@@ -76,7 +74,7 @@ It also handles scripts that other editors get wrong. Hindi and Myanmar (Burmese
 <td width="50%" valign="top">
 
 ### ✍️ Edit the words on the page
-Click a line and type. English, Hindi and Myanmar are reshaped as you go, paragraphs reflow, and the result is real text you can search. Burmese typing through KeyMagic works too.
+Click a line and type. English, Hindi and Myanmar are reshaped as you go, paragraphs reflow, and the result is real text you can search. Type with the keyboard you already use, KeyMagic for Burmese and Hindi Phonetic included.
 
 </td>
 <td width="50%" valign="top">
@@ -170,7 +168,8 @@ Drag pages to reorder them. Insert, extract, rotate or delete them, or merge PDF
 ### Editing text
 - In Edit mode, click a line of text to change it right on the page
 - English, Hindi and Myanmar are shaped and written back as real, searchable text
-- Paragraphs reflow as you type
+- Paragraphs reflow when you finish editing a line
+- Type with the keyboard you already use, including KeyMagic for Burmese and Hindi Phonetic
 - For Myanmar, editing works on text set in Myanmar Text or Pyidaungsu
 
 ### Pages
@@ -212,7 +211,7 @@ Drag pages to reorder them. Insert, extract, rotate or delete them, or merge PDF
 
 1. Download `AyaanPDF-Setup-<version>.exe` from the [latest release](../../releases/latest).
 2. Run it. It installs just for you, so no administrator rights are needed.
-3. Keep **Offer Ayaan PDF for PDF files** ticked to see it under Open with, and the right-click option ticked to get **Open in Ayaan PDF** on every PDF. To make it your default PDF app, pick it in Settings > Apps > Default apps.
+3. In the installer, leave **Offer Ayaan PDF for PDF files** ticked so it appears under Open with, and leave the right-click option ticked to get **Open in Ayaan PDF** on every PDF. To make it your default PDF app, pick it in Settings > Apps > Default apps.
 
 > [!NOTE]
 > This free project isn't code-signed, so Windows SmartScreen may say it doesn't recognise the app. Click **More info**, then **Run anyway**.
