@@ -212,6 +212,13 @@ public sealed record AppSettings
     public bool EditTipShown { get; init; }
 
     /// <summary>
+    /// Whether Windows Text Services was found not to answer the page on this
+    /// PC, so a line is typed through a hidden text box from the first key.
+    /// See <see cref="TextSink"/> and <see cref="TypingWatch.KnownSilent"/>.
+    /// </summary>
+    public bool TextServicesSilent { get; init; }
+
+    /// <summary>
     /// Which generation of this file's meaning the stored settings were
     /// written against.
     ///

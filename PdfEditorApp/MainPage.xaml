@@ -3931,5 +3931,30 @@
                 </StackPanel>
             </Border>
         </Grid>
+
+        <!--
+            WHERE A LINE IS TYPED WHEN TEXT SERVICES DOES NOT ANSWER THE PAGE.
+            See PageTextSink. On the reader's PC the page's own text document is
+            never spoken to, and a Hindi Phonetic keyboard typed English letters
+            into it with no suggestions; in the Find box, an ordinary TextBox, it
+            typed Devanagari. So the line is typed through one of those, hidden.
+
+            OUTSIDE THE SCROLLING PAGE, deliberately: a text box that takes
+            focus inside a ScrollView asks to be scrolled into view, and the
+            document would jump. NOT IN InPlaceLayer, which is cleared on every
+            keystroke, and a focused box removed from the tree loses the keyboard.
+            Invisible, and the layer takes no clicks, so the page still gets them.
+            A tab stop only while a line is being typed through it.
+        -->
+        <Canvas x:Name="InPlaceInputLayer" Grid.Row="0" Grid.RowSpan="3" Grid.ColumnSpan="5"
+                IsHitTestVisible="False">
+            <TextBox x:Name="InPlaceTextSink"
+                     AutomationProperties.AccessibilityView="Raw"
+                     Opacity="0" IsTabStop="False"
+                     Width="2" MinWidth="0" MinHeight="0" Height="16" Padding="0" BorderThickness="0"
+                     AcceptsReturn="False" TextWrapping="NoWrap"
+                     IsSpellCheckEnabled="False" IsTextPredictionEnabled="False"
+                     PreviewKeyDown="InPlaceTextSink_PreviewKeyDown" />
+        </Canvas>
     </Grid>
 </Page>

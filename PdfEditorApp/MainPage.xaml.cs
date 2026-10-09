@@ -8652,9 +8652,14 @@ public sealed partial class MainPage : Page
     /// tool, Ctrl+C copied the page selection instead of the field. Losing an
     /// annotation while correcting a typo is the worst of those, and it was
     /// silent.
+    ///
+    /// ⚠️ EXCEPT THE HIDDEN BOX A LINE IS TYPED THROUGH (PageTextSink). That
+    /// box is the page's line, not a field: its keys are the page's keys.
     /// </summary>
     private bool IsTextInputFocused =>
-        FocusManager.GetFocusedElement(XamlRoot) is TextBox or RichEditBox or AutoSuggestBox or PasswordBox;
+        FocusManager.GetFocusedElement(XamlRoot) is var focused
+        && !ReferenceEquals(focused, InPlaceTextSink)
+        && focused is TextBox or RichEditBox or AutoSuggestBox or PasswordBox;
 
     /// <summary>
     /// DIAGNOSTIC (temporary). Reports every key seen at RootGrid with the
@@ -8808,6 +8813,7 @@ public sealed partial class MainPage : Page
         if (!ViewModel.IsEditingInPlace)
         {
             _textInput?.Leave();
+            LeaveTextSink();
             return;
         }
 
@@ -8817,9 +8823,29 @@ public sealed partial class MainPage : Page
         if (!TypingRoute.HostsTextServices(ViewModel.SelectedTextUnit?.Text))
         {
             _textInput.Leave();
+            LeaveTextSink();
             return;
         }
 
+        // ⚠️ WHERE TEXT SERVICES DOES NOT ANSWER THE PAGE, A TEXT BOX DOES.
+        // See PageTextSink: the reader's Hindi Phonetic keyboard typed English
+        // into the page and Devanagari into the Find box.
+        if (_textInput.IsSilent)
+        {
+            _textInput.Leave();
+            _textSink ??= new PageTextSink(ViewModel, InPlaceTextSink, CaretInTextSinkLayer);
+            if (_textSink.IsActive)
+            {
+                _textSink.Changed();
+            }
+            else
+            {
+                _textSink.Enter();
+            }
+            return;
+        }
+
+        LeaveTextSink();
         if (_textInput.IsActive)
         {
             _textInput.Changed();
@@ -8831,6 +8857,68 @@ public sealed partial class MainPage : Page
     }
 
     private PageTextInput? _textInput;
+    private PageTextSink? _textSink;
+
+    /// <summary>
+    /// Stops typing through the hidden box, and gives the keyboard back to the
+    /// page if the box had it, so the canvas's own keys work again.
+    /// </summary>
+    private void LeaveTextSink()
+    {
+        if (_textSink is not { IsActive: true } sink) { return; }
+
+        bool had = sink.HasFocus;
+        sink.Leave();
+        if (had)
+        {
+            RootGrid.Focus(FocusState.Programmatic);
+        }
+    }
+
+    /// <summary>
+    /// A key pressed while the hidden box has the keyboard. Anything that is
+    /// not text is the page's (see <see cref="TextSink.PageKey"/>), and goes to
+    /// the same handler it would reach with no box at all.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ IN PREVIEW, BEFORE THE BOX SEES IT. A TextBox acts on Backspace, the
+    /// arrows and its own Ctrl shortcuts as the key arrives, so letting it
+    /// through first would edit the copy as well as the line.
+    /// </remarks>
+    private void InPlaceTextSink_PreviewKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (!TextSink.PageKey((int)e.Key, _isCtrlDown, IsAltDown())) { return; }
+
+        RootGrid_KeyDown(RootGrid, e);
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Where the caret is, in the hidden box's own layer, so the box can sit on
+    /// it and a keyboard's suggestions open beside the word.
+    /// </summary>
+    private Windows.Foundation.Rect? CaretInTextSinkLayer()
+    {
+        if (!ViewModel.IsEditingInPlace) { return null; }
+
+        int page = ViewModel.InPlacePage;
+        double scale = ViewModel.OverlayScale;
+        if (page < 0 || scale <= 0) { return null; }
+        if (ViewModel.InPlaceCaretOnPage() is not { } caret) { return null; }
+
+        double top = (caret.Top * scale) + ViewModel.SlotTopOf(page);
+        var local = new Windows.Foundation.Rect(
+            caret.X * scale, top, 1, Math.Max(1, (caret.Bottom - caret.Top) * scale));
+        try
+        {
+            return InPlaceLayer.TransformToVisual(InPlaceInputLayer).TransformBounds(local);
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"text box: caret has no place: {ex.Message}");
+            return null;
+        }
+    }
 
     /// <summary>
     /// Where the caret is on the DESKTOP, for an input method to hang its
@@ -9333,6 +9421,10 @@ public sealed partial class MainPage : Page
         // Enter, Escape, Backspace and Tab arrive here too. They are keys, not
         // text, and RootGrid_KeyDown has already dealt with them.
         if (char.IsControl(args.Character)) { return; }
+
+        // ⚠️ THE HIDDEN BOX TYPES ITS OWN CHARACTERS, and the line follows it
+        // (PageTextSink). Taking them here as well types every letter twice.
+        if (_textSink is { IsActive: true, HasFocus: true }) { return; }
 
         // Text Services has the line, so it types this character itself,
         // unless it turns out to be delivering nothing at all: then what it

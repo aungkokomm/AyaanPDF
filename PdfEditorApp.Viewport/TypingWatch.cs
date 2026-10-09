@@ -31,6 +31,17 @@ public sealed class TypingWatch
     /// <summary>Text Services has been caught swallowing keystrokes and is not offered the page again.</summary>
     public bool Silent { get; private set; }
 
+    /// <summary>
+    /// Text Services was found silent in an earlier run on this PC, so it is
+    /// not offered the page at all.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ OR THE FIRST THREE KEYS OF EVERY RUN ARE LOST TO IT. Finding out
+    /// again costs three keystrokes, and on a composing keyboard those arrive
+    /// as plain English letters, because nothing was there to compose them.
+    /// </remarks>
+    public void KnownSilent() => Silent = true;
+
     /// <summary>A line has started being edited: Text Services gets a fresh hearing.</summary>
     public void EditStarted()
     {

@@ -68,6 +68,11 @@ public sealed class PageTextInput : IDisposable
         _host = host;
         _caretOnScreen = caretOnScreen;
 
+        if (SettingsStore.Current.TextServicesSilent)
+        {
+            s_watch.KnownSilent();
+        }
+
         try
         {
             var manager = CoreTextServicesManager.GetForCurrentView();
@@ -103,6 +108,12 @@ public sealed class PageTextInput : IDisposable
     /// </summary>
     private static readonly TypingWatch s_watch = new();
 
+    /// <summary>
+    /// Whether the page's text document cannot host input on this PC, so a
+    /// line must be typed through <see cref="PageTextSink"/> instead.
+    /// </summary>
+    public bool IsSilent => _context is null || s_watch.Silent;
+
     /// <summary>The line, as Text Services is entitled to see it.</summary>
     private string Line => _model.InPlaceText ?? string.Empty;
 
@@ -133,8 +144,9 @@ public sealed class PageTextInput : IDisposable
     /// <summary>
     /// A character that reached the window while this was active. Null leaves
     /// it to Text Services. Text means Text Services has stayed silent: it is
-    /// let go for the rest of the run, and the caller inserts the text, which
-    /// carries the characters held while that was being decided.
+    /// let go, on this PC for good, and the caller inserts the text, which
+    /// carries the characters held while that was being decided. The line is
+    /// then typed through <see cref="PageTextSink"/>.
     /// </summary>
     public string? Unclaimed(char c)
     {
@@ -143,7 +155,8 @@ public sealed class PageTextInput : IDisposable
         string? held = s_watch.Received(c);
         if (held is not null)
         {
-            Diag.Log($"text services: silent for {held.Length} characters, so typing goes by characters for the rest of this run");
+            Diag.Log($"text services: silent for {held.Length} characters, so the line is typed through a text box from now on");
+            SettingsStore.Update(s => s with { TextServicesSilent = true });
             Leave();
         }
         return held;

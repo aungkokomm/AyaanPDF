@@ -644,10 +644,16 @@ public class LineEditWiringTests
         int at = page.IndexOf("private void SyncTextInput()", StringComparison.Ordinal);
         Assert.True(at > 0, "nothing keeps text services in step with the edit");
 
-        string body = page[at..Math.Min(page.Length, at + 900)];
+        // The whole method: it routes to the page's text document, or to the
+        // hidden box where that is silent, and keeps whichever it is in step.
+        int end = page.IndexOf("private PageTextInput? _textInput;", at, StringComparison.Ordinal);
+        Assert.True(end > at, "the end of SyncTextInput was not found");
+        string body = page[at..end];
         Assert.Contains("_textInput?.Leave();", body, StringComparison.Ordinal);
-        Assert.Contains(".Enter();", body, StringComparison.Ordinal);
-        Assert.Contains(".Changed();", body, StringComparison.Ordinal);
+        Assert.Contains("_textInput.Enter();", body, StringComparison.Ordinal);
+        Assert.Contains("_textInput.Changed();", body, StringComparison.Ordinal);
+        Assert.Contains("_textSink.Enter();", body, StringComparison.Ordinal);
+        Assert.Contains("_textSink.Changed();", body, StringComparison.Ordinal);
 
         // ⚠️ AND IT DEGRADES TO WHAT WAS THERE BEFORE. A machine where the
         // manager cannot be had must keep typing on the character path rather
