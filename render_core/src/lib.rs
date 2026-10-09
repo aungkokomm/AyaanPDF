@@ -2356,6 +2356,27 @@ fn cached_indexes(doc_handle: u64) -> Option<Arc<recover::Indexes>> {
     held.as_ref().map(Arc::clone)
 }
 
+/// The same, waiting for one that is being built right now.
+///
+/// ⚠️ FOR A RETYPE, WAITING IS NEVER WORSE THAN NOT WAITING. A retype handed
+/// no index builds one for the whole document itself, on the UI thread, from
+/// the beginning; the build it would otherwise wait for started earlier and
+/// finishes sooner. Typing a letter the page never had sends the document off
+/// to be prepared again after the commit, and committing the next edit inside
+/// that window used to freeze the app for a second full preparation.
+///
+/// ⚠️ AND IT CANNOT DEADLOCK. Whoever holds the slot is building in
+/// `indexes_for_doc`, which takes no other lock while it holds this one, and a
+/// retype holds none while it waits.
+fn prepared_indexes(doc_handle: u64) -> Option<Arc<recover::Indexes>> {
+    let slot = {
+        let all = lock(&core().recoveries);
+        all.get(&doc_handle).cloned()
+    }?;
+    let held = lock(&slot);
+    held.as_ref().map(Arc::clone)
+}
+
 fn already_prepared(doc_handle: u64, page_index: i32) -> bool {
     let slot = {
         let all = lock(&core().recoveries);
@@ -2538,9 +2559,10 @@ pub extern "C" fn retype_recovered_line(
         };
         // ⚠️ LENT, NOT BUILT. The app has already reshaped this document's
         // font to READ the line it is now retyping, so handing that index over
-        // turns forty seconds of work into none. Asked without blocking: if
-        // nothing has prepared the document, retype builds its own as before.
-        let ready = cached_indexes(doc_handle);
+        // turns forty seconds of work into none. If nothing has prepared the
+        // document, retype builds its own as before; if a preparation is
+        // running, this waits for it. See `prepared_indexes`.
+        let ready = prepared_indexes(doc_handle);
 
         // ⚠️ BACK INTO PDF USER SPACE, WHERE THE PLACEMENTS ARE. The app
         // reports every x divided by the page WIDTH from the crop box's left,
@@ -2654,7 +2676,7 @@ fn paragraph_around(
     let widths = recover::fonts_of(&doc, page);
 
     let held;
-    let indexes = match cached_indexes(doc_handle) {
+    let indexes = match prepared_indexes(doc_handle) {
         Some(ready) => ready,
         None => {
             held = std::sync::Arc::new(recover::indexes_for_document(&doc));
@@ -29559,6 +29581,87 @@ p={spread_px:.4},c={rgba:08X})"
         for h in [handle, next, back] {
             close_document(h);
         }
+    }
+
+    /// ⚠️ A RETYPE WAITS FOR THE PREPARATION THAT IS RUNNING. Going without
+    /// it meant building a second index from the beginning on the UI thread.
+    #[test]
+    fn a_retype_waits_for_the_preparation_that_is_running() {
+        // A handle nothing ever opens, so the slot is this test's alone.
+        const HANDLE: u64 = 0x7E57_0000_0000_0001;
+        let slot = {
+            let mut all = lock(&core().recoveries);
+            Arc::clone(all.entry(HANDLE).or_default())
+        };
+        let (building, started) = std::sync::mpsc::channel();
+        let builder = std::thread::spawn(move || {
+            let mut held = lock(&slot);
+            building.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            *held = Some(Arc::new(recover::tests_only_at_generation(7)));
+        });
+        started.recv().unwrap();
+
+        assert!(cached_indexes(HANDLE).is_none(),
+            "the control: asked without waiting, a slot being built has nothing to give");
+        let waited = prepared_indexes(HANDLE)
+            .expect("the retype went on without the index being built for it");
+        assert_eq!(waited.generation(), 7);
+
+        builder.join().unwrap();
+        lock(&core().recoveries).remove(&HANDLE);
+    }
+
+    /// ⚠️ THE READER'S 13-SECOND COMMIT, 3.51.6. Two words typed into the last
+    /// line of a Myanmar paragraph froze the app for 13.2 seconds on Enter,
+    /// where an edit that fitted its line took 1.7. The paragraph had to grow
+    /// a line, and the second attempt at the rewrap was handed no index, so it
+    /// reshaped the whole font again on the UI thread. Replayed as the app
+    /// makes it: the page prepared first, then the commit timed.
+    #[test]
+    #[ignore = "needs a PDF and fonts that are not in this repository"]
+    fn a_commit_that_grows_a_myanmar_paragraph_does_not_prepare_again() {
+        const FILE: &str = r"D:\Ayaan PDF Test file\Myanmar Unicode Text test file .pdf";
+        const FONT: &str = r"C:\Windows\Fonts\mmrtext.ttf";
+        if !std::path::Path::new(FILE).exists() || !std::path::Path::new(FONT).exists() {
+            println!("not on this machine");
+            return;
+        }
+        let handle = open_fixture_named(FILE);
+        let bytes = document_bytes(handle);
+        let doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let t = std::time::Instant::now();
+        let ix = indexes_for_doc(handle, &doc, page);
+        mark_prepared(handle, 0, ix.generation());
+        println!("prepare page 0: {:5.1}s", t.elapsed().as_secs_f64());
+
+        let lines = recovered_lines(handle, 0);
+        let line = lines
+            .iter()
+            .find(|l| (l.pdf_baseline - 396.43).abs() < 0.5)
+            .expect("the reader's line is not on the page");
+        let at = line.text.match_indices(' ').nth(2).unwrap().0;
+        let now = format!("{} နမူနာ ပစ္စည်းများ{}", &line.text[..at], &line.text[at..]);
+
+        // Framed once first, as the reader's click already did in the app.
+        let t = std::time::Instant::now();
+        let framed = paragraph_around(handle, 0, line.pdf_baseline as f64, &line.text);
+        println!("paragraph_around, first time: {:5.1}s  {} lines", t.elapsed().as_secs_f64(),
+            framed.as_ref().map(|f| f.0.len()).unwrap_or(0));
+
+        let t = std::time::Instant::now();
+        let buffer = retype_recovered_line(
+            handle, 0, line.pdf_baseline, line.left,
+            line.text.as_ptr(), line.text.len(),
+            now.as_ptr(), now.len(),
+            FONT.as_ptr(), FONT.len());
+        let took = t.elapsed().as_secs_f64();
+        println!("retype_recovered_line: {took:5.1}s  status {}", buffer.status);
+        assert_eq!(buffer.status, STATUS_OK_PDFIUM, "the edit was refused");
+        free_byte_buffer(buffer);
+        close_document(handle);
+        assert!(took < 5.0, "the commit took {took:.1}s on the UI thread");
     }
 
     /// ⚠️ A SUBSET SAYS WHAT A DOCUMENT USES, A WHOLE FONT DOES NOT. Every

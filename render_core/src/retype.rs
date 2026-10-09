@@ -1367,8 +1367,12 @@ fn retype_in_paragraph_within(
             if para.baselines.len() >= growing.saturating_add(4) {
                 return Err(STATUS_TOO_WIDE);
             }
+            // ⚠️ AND THE SAME INDEX. The new line is a copy drawn with glyphs
+            // the page already had, so the index that read the paragraph reads
+            // it too. Handing it none reshaped the whole font again on the UI
+            // thread: the reader waited 13 seconds on Enter.
             return retype_in_paragraph_within(
-                &grown, page_index, &bigger, new_text, font_path, None, growing, at);
+                &grown, page_index, &bigger, new_text, font_path, Some(indexes), growing, at);
         }
     };
 
