@@ -317,3 +317,7 @@ It stands on the work of many others, each under its own licence. See [THIRD-PAR
 ## Thanks
 
 To the people behind PDFium, pdfium-render, rustybuzz, lopdf, SkiaSharp, Tesseract and Leptonica; to Kaung Sithu for mmpdfkit and the Myanmar recognition model; to Princeton University for WordNet; and to the makers of the Oswald font and Tabler Icons.
+
+---
+
+<p align="center"><sub>© 2026 Aung Ko Ko · <a href="https://aungkokomm.github.io/">more of my apps</a></sub></p>
