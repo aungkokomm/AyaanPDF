@@ -33,6 +33,7 @@ namespace PdfEditorApp.Tests;
 /// flaky; the bounds here are loose enough to catch an ORDER of magnitude,
 /// which is what "does it hitch" actually means.
 /// </summary>
+[Collection(TimedAlone.Name)]
 public class GradientOverlayCostTests
 {
     private const string Lib = "render_core";

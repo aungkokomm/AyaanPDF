@@ -55,6 +55,18 @@ public class SingleInstanceTests
 
     private static string UniqueName() => "AyaanPDF-test-" + Guid.NewGuid().ToString("N");
 
+    /// <summary>
+    /// How long a hand-off may take before it counts as lost.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ GENEROUS BECAUSE IT ONLY BOUNDS A FAILURE. The window receives on the
+    /// thread pool, and in a full parallel run the pool is held by other tests:
+    /// measured, a hand-off waited past five seconds there and failed while
+    /// taking milliseconds alone. A wait that succeeds returns the moment the
+    /// files arrive, so a long one costs a passing run nothing.
+    /// </remarks>
+    private static readonly TimeSpan Patience = TimeSpan.FromSeconds(30);
+
     [Fact]
     public void the_first_launch_claims_the_window_and_a_second_does_not()
     {
@@ -73,13 +85,13 @@ public class SingleInstanceTests
         Assert.NotNull(first);
 
         string[] files = [@"C:\Books\one.pdf", @"D:\Two words\two.pdf"];
-        Assert.True(SingleInstance.TrySend(name, files, TimeSpan.FromSeconds(5)));
-        Assert.True(received.TryTake(out var got, TimeSpan.FromSeconds(5)));
+        Assert.True(SingleInstance.TrySend(name, files, Patience));
+        Assert.True(received.TryTake(out var got, Patience));
         Assert.Equal(files, got);
 
         // A launch with nothing to open still reaches it, to bring it forward.
-        Assert.True(SingleInstance.TrySend(name, [], TimeSpan.FromSeconds(5)));
-        Assert.True(received.TryTake(out var none, TimeSpan.FromSeconds(5)));
+        Assert.True(SingleInstance.TrySend(name, [], Patience));
+        Assert.True(received.TryTake(out var none, Patience));
         Assert.Empty(none);
     }
 
@@ -93,11 +105,11 @@ public class SingleInstanceTests
         Assert.NotNull(first);
 
         var sent = Enumerable.Range(0, 6).Select(i => $@"C:\Books\book{i}.pdf").ToList();
-        var threads = sent.Select(f => new Thread(() => Assert.True(SingleInstance.TrySend(name, [f], TimeSpan.FromSeconds(10))))).ToList();
+        var threads = sent.Select(f => new Thread(() => Assert.True(SingleInstance.TrySend(name, [f], Patience)))).ToList();
         threads.ForEach(t => t.Start());
         threads.ForEach(t => t.Join());
 
-        SpinWait.SpinUntil(() => received.Count == sent.Count, TimeSpan.FromSeconds(5));
+        SpinWait.SpinUntil(() => received.Count == sent.Count, Patience);
         Assert.Equal(sent.OrderBy(f => f), received.OrderBy(f => f));
     }
 
