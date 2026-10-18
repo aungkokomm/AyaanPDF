@@ -103,8 +103,20 @@ fn installed(base_font: &str) -> Option<&'static str> {
     Some(if std::path::Path::new(heavy).exists() { heavy } else { regular })
 }
 
+/// Where the app carries its own Pyidaungsu builds, beside its exe.
+pub(crate) const BUNDLED_PYIDAUNGSU: &str = r"Assets\Fonts\Pyidaungsu";
+
 /// Every Pyidaungsu file installed on this machine, for everyone and for this
-/// user, found once. See `face_for`.
+/// user, and then every build the app carries, found once. See `face_for`.
+///
+/// ⚠️ THE APP CARRIES THE BUILDS BECAUSE WINDOWS SHIPS NONE. A document reads
+/// only with the build it was made with, and a friend of the user's opened a
+/// real Pyidaungsu file made with 1.008 on a PC without it: every line was
+/// refused as "not read back faithfully enough". The same file read 80 of 80
+/// lines on the user's PC only because that build happened to be installed.
+///
+/// ⚠️ AND THEY COME LAST, so a tie goes to the installed file and nothing that
+/// reads today reads differently.
 fn pyidaungsu_files() -> &'static [&'static str] {
     static FILES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     FILES.get_or_init(|| {
@@ -112,26 +124,47 @@ fn pyidaungsu_files() -> &'static [&'static str] {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             dirs.push(std::path::Path::new(&local).join(r"Microsoft\Windows\Fonts"));
         }
-        let mut out: Vec<&'static str> = Vec::new();
-        for dir in dirs {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            let mut found: Vec<String> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                        let n = n.to_ascii_lowercase();
-                        n.contains("pyidaungsu") && (n.ends_with(".ttf") || n.ends_with(".otf"))
-                    })
-                })
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            found.sort();
-            // Leaked once, like the fixed paths beside them: a handful of short
-            // strings for the life of the process.
-            out.extend(found.into_iter().map(|s| &*Box::leak(s.into_boxed_str())));
+        if let Some(app) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join(BUNDLED_PYIDAUNGSU)))
+        {
+            dirs.push(app);
         }
-        out
+        pyidaungsu_files_in(&dirs)
     })
+}
+
+/// The Pyidaungsu files in these folders, each folder's in name order.
+///
+/// ⚠️ NEVER THE NUMBERS FONT. "Pyidaungsu Numbers" is the page-number variant:
+/// measured on 1.8.3 and 2.5.3, the same cmap and the same GSUB and GPOS as the
+/// regular face, but 15 to 29 glyphs drawn differently, the Latin digits among
+/// them. It reads exactly as the regular face does, so it can only tie, and a
+/// tie goes to the first name, which is `_Numbers` before `_Regular`. The
+/// writer is then handed the Numbers file and draws the digits a reader types
+/// as something else.
+fn pyidaungsu_files_in(dirs: &[std::path::PathBuf]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let mut found: Vec<String> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.contains("pyidaungsu")
+                        && !n.contains("numbers")
+                        && (n.ends_with(".ttf") || n.ends_with(".otf"))
+                })
+            })
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        // Leaked once, like the fixed paths beside them: a handful of short
+        // strings for the life of the process.
+        out.extend(found.into_iter().map(|s| &*Box::leak(s.into_boxed_str())));
+    }
+    out
 }
 
 /// How many of the page's glyphs a font file draws at the width the page
@@ -228,8 +261,21 @@ fn face_for(
         return known;
     }
 
+    let candidates = std::iter::once(default).chain(pyidaungsu_files().iter().copied());
+    let chosen = best_build(candidates, glyphs, widths);
+    ANSWERS.lock().unwrap_or_else(|held| held.into_inner()).insert(key, chosen);
+    chosen
+}
+
+/// Of these files, the one the page agrees with, ranked as `face_for` says. A
+/// tie goes to the earlier file.
+fn best_build(
+    candidates: impl IntoIterator<Item = &'static str>,
+    glyphs: &BTreeSet<u16>,
+    widths: &crate::shaped::CidWidths,
+) -> Option<&'static str> {
     let mut best: Option<(&'static str, (f64, f64))> = None;
-    for path in std::iter::once(default).chain(pyidaungsu_files().iter().copied()) {
+    for path in candidates {
         let Some(all) = agreement(path, glyphs, widths) else { continue };
         let joined = joined_agreement(path, glyphs, widths).unwrap_or(all);
         let score = (joined, all);
@@ -237,9 +283,7 @@ fn face_for(
             best = Some((path, score));
         }
     }
-    let chosen = best.filter(|(_, (joined, _))| *joined >= AGREES).map(|(path, _)| path);
-    ANSWERS.lock().unwrap_or_else(|held| held.into_inner()).insert(key, chosen);
-    chosen
+    best.filter(|(_, (joined, _))| *joined >= AGREES).map(|(path, _)| path)
 }
 
 /// Adds one font's widths to those of every other font of the same name. See
@@ -8750,5 +8794,159 @@ mod tests {
         let after = read_page_with(&doc, page, &indexes_for_document(&doc));
         assert!(after.iter().any(|r| r.text.as_deref() == Some(now.as_str())),
             "the heading did not read back: {:#?}", said(&after));
+    }
+
+    /// The Pyidaungsu builds the app carries, where the reader finds them once
+    /// the app is built: beside the exe, at the same place under Assets.
+    fn carried() -> Vec<&'static str> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(r"..\PdfEditorApp")
+            .join(BUNDLED_PYIDAUNGSU);
+        pyidaungsu_files_in(&[dir])
+    }
+
+    /// What a page drawing `text` in this font file declares: the glyphs the
+    /// font shapes it to, at the widths the font gives them.
+    fn drawn_with(path: &str, text: &str) -> (Vec<u16>, crate::shaped::CidWidths) {
+        let bytes = std::fs::read(path).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let upem = f64::from(face.units_per_em());
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        let glyphs: Vec<u16> = rustybuzz::shape(&face, &[], buffer)
+            .glyph_infos()
+            .iter()
+            .map(|g| g.glyph_id as u16)
+            .collect();
+        let widths: Vec<(u16, f64)> = glyphs
+            .iter()
+            .map(|&g| {
+                let adv = face.glyph_hor_advance(rustybuzz::ttf_parser::GlyphId(g)).unwrap_or(0);
+                (g, f64::from(adv) * 1000.0 / upem)
+            })
+            .collect();
+        (glyphs, crate::shaped::CidWidths::of_these(0.0, &widths))
+    }
+
+    /// ⚠️ THE APP CARRIES THE BUILDS WHERE THE READER LOOKS, AND THE NUMBERS
+    /// FONT IS NEVER ONE OF THEM. The folder is copied beside the exe by the
+    /// project's `Assets\Fonts\**` rule, so the constant the reader looks under
+    /// is checked against the folder itself.
+    #[test]
+    fn the_app_carries_its_pyidaungsu_builds_where_the_reader_looks() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(r"..\PdfEditorApp")
+            .join(BUNDLED_PYIDAUNGSU);
+        let on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|_| panic!("{} is not there", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_lowercase()))
+            .collect();
+        assert_eq!(on_disk.iter().filter(|n| n.contains("numbers")).count(), 2,
+            "the control is gone: {on_disk:?}");
+
+        let found = carried();
+        assert_eq!(found.len(), 7, "{found:?}");
+        assert!(found.iter().all(|p| !p.to_lowercase().contains("numbers")), "{found:?}");
+
+        // The Open Font Licence travels with the fonts, and so does the notice.
+        let notices = std::fs::read_to_string(dir.join(r"..\THIRD-PARTY-NOTICES.txt")).unwrap();
+        assert!(notices.contains("Pyidaungsu") && notices.contains("SIL Open Font License"));
+        assert!(dir.join(r"..\OFL.txt").exists());
+    }
+
+    /// ⚠️ THE REPORTED FAILURE: a page made with Pyidaungsu 1.008 on a PC
+    /// that has only the current release. No installed file agrees with it, so
+    /// every line was refused; one of the builds the app carries does, and it
+    /// shapes the page's text back to the page's own glyphs.
+    #[test]
+    fn a_page_made_with_an_older_pyidaungsu_reads_without_it_installed() {
+        let carried = carried();
+        let file = |name: &str| *carried.iter().find(|p| p.ends_with(name)).unwrap();
+        let text = "မြန်မာနိုင်ငံ ကြိုတင်ပြင်ဆင်မှုများ";
+        let (drawn, widths) = drawn_with(file("Pyidaungsu-1.0.8_Regular.ttf"), text);
+        let glyphs: BTreeSet<u16> = drawn.iter().copied().collect();
+
+        let current = [file("Pyidaungsu-2.5.3_Regular.ttf"), file("Pyidaungsu-2.5.3_Bold.ttf")];
+        assert_eq!(best_build(current, &glyphs, &widths), None,
+            "the control: the current release should not agree with a 1.008 page");
+
+        let chosen = best_build(carried.iter().copied(), &glyphs, &widths)
+            .expect("none of the carried builds agrees with the page");
+        assert_eq!(drawn_with(chosen, text).0, drawn, "{chosen} does not draw the page's glyphs");
+    }
+
+    /// ⚠️ EVERY PYIDAUNGSU FONT IN THE TEST FILES RESOLVES WITHOUT ANY
+    /// INSTALLED FONT, to the same bytes it resolves to on this machine. Same
+    /// bytes is the same index and so the same reading, line for line.
+    #[test]
+    fn every_pyidaungsu_test_file_reads_with_only_the_builds_the_app_carries() {
+        let mut files: Vec<String> = std::fs::read_dir(r"D:\Ayaan PDF Test file")
+            .map(|d| d.filter_map(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().into_owned())
+                .filter(|p| p.to_lowercase().contains("pyidaungsu") && p.to_lowercase().ends_with(".pdf"))
+                .collect())
+            .unwrap_or_default();
+        if files.is_empty() {
+            return;
+        }
+        files.sort();
+        let carried = carried();
+        let mut compared = 0;
+        for file in &files {
+            let Ok(doc) = Document::load(file) else { continue };
+            let mut fonts: BTreeMap<String, crate::shaped::CidWidths> = BTreeMap::new();
+            for &page in doc.get_pages().values() {
+                for (_, (name, w)) in fonts_of(&doc, page) {
+                    if let Some(w) = w {
+                        pool(&mut fonts, name, w);
+                    }
+                }
+            }
+            for (name, w) in fonts.iter().filter(|(n, _)| n.contains("Pyidaungsu")) {
+                let glyphs: BTreeSet<u16> = w.declared().collect();
+                let Some(here) = face_for(name, &glyphs, Some(w)) else { continue };
+                let without = best_build(carried.iter().copied(), &glyphs, w)
+                    .unwrap_or_else(|| panic!("{file}: {name} reads here with {here} and with nothing the app carries"));
+                assert_eq!(std::fs::read(without).unwrap(), std::fs::read(here).unwrap(),
+                    "{file}: {name} reads here with {here} but would read with {without}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "no Pyidaungsu font was compared");
+    }
+
+    /// ⚠️ AND A LINE RETYPES WITH THE FILE FROM THE APP'S OWN FOLDER, which is
+    /// the path the writer is handed when that is the build that agreed.
+    #[test]
+    fn a_line_retypes_with_the_build_the_app_carries() {
+        let Some((bytes, indexes, read)) = std::fs::read_dir(r"D:\Ayaan PDF Test file")
+            .ok()
+            .and_then(|d| {
+                let mut files: Vec<String> = d.filter_map(|e| e.ok())
+                    .map(|e| e.path().to_string_lossy().into_owned())
+                    .filter(|p| p.to_lowercase().contains("pyidaungsu") && p.to_lowercase().ends_with(".pdf"))
+                    .collect();
+                files.sort();
+                files.first().and_then(|f| readings_in(f, 0))
+            })
+        else {
+            return;
+        };
+        let line = read.iter().find(|r| r.text.is_some()).expect("nothing on the page reads");
+        let here = std::fs::read(indexes.path_for(&line.font).unwrap()).unwrap();
+        let font = carried()
+            .into_iter()
+            .find(|p| std::fs::read(p).unwrap() == here)
+            .expect("the app carries no copy of the build this line reads with");
+
+        let was = line.text.clone().unwrap();
+        let now = format!("{was}\u{1000}");
+        let written = crate::retype::retype(&bytes, 0, line.y, &was, &now, font, Some(&indexes))
+            .expect("the retype was refused");
+        let doc = Document::load_mem(&written).unwrap();
+        let page = *doc.get_pages().values().next().unwrap();
+        let after = read_page_with(&doc, page, &indexes_for_document(&doc));
+        assert!(after.iter().any(|r| r.text.as_deref() == Some(now.as_str())),
+            "the line did not read back: {:#?}", said(&after));
     }
 }

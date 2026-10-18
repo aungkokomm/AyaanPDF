@@ -49,3 +49,22 @@ in OFL.txt beside this file. In summary, and without replacing that text:
   - the font may not be sold on its own
   - "Oswald" is a Reserved Font Name: a modified version must be renamed
   - this notice and OFL.txt must travel with the font
+
+
+Pyidaungsu
+----------
+Bundled in Assets/Fonts/Pyidaungsu: builds 1.2, 1.3, 1.0.8, 1.8.3 and 2.5.3
+(regular, bold and numbers where the build has them). Used to read and retype
+Burmese text in documents made with any of these builds, on a PC that does not
+have that build installed.
+
+Copyright (c) 2013-2016 by MCF (http://www.mcf.org.mm). Designed by Sun Tun.
+
+Licensed under the SIL Open Font License, Version 1.1, as each font file states.
+The full licence text is in OFL.txt beside this file. In summary, and without
+replacing that text:
+
+  - the fonts may be bundled and redistributed with this software, including
+    commercially
+  - the fonts may not be sold on their own
+  - this notice and OFL.txt must travel with the fonts
