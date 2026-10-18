@@ -478,6 +478,7 @@
             </MenuBarItem>
 
             <MenuBarItem Title="Help" Margin="2,3,2,3">
+                <MenuFlyoutItem Text="User guide" Click="UserGuide_Click" />
                 <MenuFlyoutItem Text="Keyboard shortcuts" Click="KeyboardShortcuts_Click" KeyboardAcceleratorTextOverride="F1" />
                 <MenuFlyoutItem Text="What's new" Click="WhatsNew_Click" />
                 <MenuFlyoutItem Text="Report a problem" Click="ReportProblem_Click" />

@@ -2073,6 +2073,9 @@ public sealed partial class MainPage : Page
         SetMode(AppMode.Edit);
     }
 
+    private async void UserGuide_Click(object sender, RoutedEventArgs e) =>
+        await OpenProjectPage(HelpLinks.UserGuide);
+
     private async void WhatsNew_Click(object sender, RoutedEventArgs e) =>
         await OpenProjectPage(HelpLinks.WhatsNew);
 

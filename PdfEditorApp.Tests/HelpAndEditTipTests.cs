@@ -48,6 +48,20 @@ public class HelpAndEditTipTests
     }
 
     [Fact]
+    public void help_opens_the_user_guide_first()
+    {
+        Assert.Equal("https://aungkokomm.github.io/ayaanpdf/guide/", HelpLinks.UserGuide);
+
+        string xaml = Read("PdfEditorApp", "MainPage.xaml");
+        int help = IndexIn(xaml, "<MenuBarItem Title=\"Help\"");
+        int guide = IndexIn(xaml, "Text=\"User guide\" Click=\"UserGuide_Click\"");
+        Assert.True(guide > help);
+        Assert.True(guide < IndexIn(xaml, "Text=\"Keyboard shortcuts\""), "the guide is not the first item");
+
+        IndexIn(Read("PdfEditorApp", "MainPage.xaml.cs"), "OpenProjectPage(HelpLinks.UserGuide)");
+    }
+
+    [Fact]
     public void the_edit_tip_waits_for_its_first_showing()
     {
         Assert.False(new AppSettings().EditTipShown);
