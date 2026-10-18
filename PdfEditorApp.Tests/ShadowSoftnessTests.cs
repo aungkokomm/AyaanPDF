@@ -69,7 +69,7 @@ public class ShadowSoftnessTests
     private static (int L, int T, int R, int B) Ink(SKBitmap bitmap)
     {
         int l = int.MaxValue, t = int.MaxValue, r = -1, b = -1;
-        var px = bitmap.GetPixelSpan();
+        var px = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)
@@ -101,7 +101,7 @@ public class ShadowSoftnessTests
     private static int PartWay(SKBitmap bitmap)
     {
         int count = 0;
-        var px = bitmap.GetPixelSpan();
+        var px = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)
@@ -118,8 +118,8 @@ public class ShadowSoftnessTests
 
     private static bool Same(SKBitmap a, SKBitmap b)
     {
-        var pa = a.GetPixelSpan();
-        var pb = b.GetPixelSpan();
+        var pa = SkiaPixels.Of(a);
+        var pb = SkiaPixels.Of(b);
         return pa.SequenceEqual(pb);
     }
 
@@ -206,7 +206,7 @@ public class ShadowSoftnessTests
     private static (double X, double Y) Centre(SKBitmap bitmap)
     {
         double sx = 0, sy = 0, w = 0;
-        var px = bitmap.GetPixelSpan();
+        var px = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)

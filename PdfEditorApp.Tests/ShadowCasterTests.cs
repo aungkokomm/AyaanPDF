@@ -64,7 +64,7 @@ public class ShadowCasterTests
     {
         int x = (int)Math.Round(nx * Scale);
         int y = (int)Math.Round(ny * Scale);
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         int at = (y * bitmap.RowBytes) + (x * 4);
         return (pixels[at], pixels[at + 1], pixels[at + 2]);
     }
@@ -79,7 +79,7 @@ public class ShadowCasterTests
     private static int InkCount(SKBitmap bitmap)
     {
         int count = 0;
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         for (int i = 0; i + 3 < pixels.Length; i += 4)
         {
             if (pixels[i] != 255 || pixels[i + 1] != 255 || pixels[i + 2] != 255) { count++; }
@@ -145,7 +145,7 @@ public class ShadowCasterTests
         var bitmap = Paint(Items(ShapeKind.Arrow, 0.20, 0.30, 0.60, 0.30, Shadow(0, 0.18)));
 
         var greys = new List<int>();
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         for (int i = 0; i + 3 < pixels.Length; i += 4)
         {
             if (pixels[i] == pixels[i + 1] && pixels[i + 1] == pixels[i + 2] && pixels[i] != 255)
@@ -192,7 +192,7 @@ public class ShadowCasterTests
             // How far right the ink gets, which is where the shadow's own edge
             // fades out.
             int furthest = 0;
-            var pixels = bitmap.GetPixelSpan();
+            var pixels = SkiaPixels.Of(bitmap);
             for (int y = 0; y < Surface; y++)
             {
                 for (int x = 0; x < Surface; x++)

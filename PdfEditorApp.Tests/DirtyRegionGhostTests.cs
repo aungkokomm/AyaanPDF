@@ -94,7 +94,7 @@ public class DirtyRegionGhostTests
     private static HashSet<(int X, int Y)> Lit(SKBitmap bitmap)
     {
         var lit = new HashSet<(int, int)>();
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)

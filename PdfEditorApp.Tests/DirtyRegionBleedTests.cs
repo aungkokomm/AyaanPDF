@@ -207,7 +207,7 @@ public class DirtyRegionBleedTests
     {
         int l = int.MaxValue, t = int.MaxValue, r = int.MinValue, b = int.MinValue;
 
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)

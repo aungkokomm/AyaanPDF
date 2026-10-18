@@ -60,7 +60,7 @@ public class EffectListTests
     /// <summary>The pixel at a normalized page point.</summary>
     private static (byte R, byte G, byte B) At(SKBitmap bitmap, double nx, double ny)
     {
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         int at = ((int)(ny * Scale) * bitmap.RowBytes) + ((int)(nx * Scale) * 4);
 
         return (pixels[at], pixels[at + 1], pixels[at + 2]);

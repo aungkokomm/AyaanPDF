@@ -80,7 +80,7 @@ public class ObjectShadowTests
     private static List<int> ShadowGreys(SKBitmap bitmap)
     {
         var greys = new List<int>();
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)
@@ -102,7 +102,7 @@ public class ObjectShadowTests
     private static int BlueCount(SKBitmap bitmap)
     {
         int count = 0;
-        var pixels = bitmap.GetPixelSpan();
+        var pixels = SkiaPixels.Of(bitmap);
         int stride = bitmap.RowBytes;
 
         for (int y = 0; y < bitmap.Height; y++)
